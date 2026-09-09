@@ -910,9 +910,13 @@ fn encode_registry_multi_sz(values: &[&str]) -> Result<Vec<u8>, nt_status::NtSta
 /// policy before the boot-driver launch snapshot is taken. No service name is embedded here.
 pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
 ) -> Result<(), nt_status::NtStatus> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
     let policy = config_manager_query_critical_device_binding(ACPI_ROOT_COMPATIBLE_ID)
         .map_err(nt_status::NtStatus)?
         .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    if policy.mount_generation != expected_generation {
+        return Err(nt_status::NtStatus(0xC000_0059u32 as i32));
+    }
     let service = policy
         .service_name
         .as_deref()
@@ -928,6 +932,9 @@ pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
         }
         Err(status) => return Err(nt_status::NtStatus(status)),
     };
+    if existing.as_ref().is_some_and(|snapshot| snapshot.mount_generation != expected_generation) {
+        return Err(nt_status::NtStatus(0xC000_0059u32 as i32));
+    }
     let hardware = encode_registry_multi_sz(&[ACPI_ROOT_HARDWARE_ID])?;
     let compatible = encode_registry_multi_sz(&[ACPI_ROOT_COMPATIBLE_ID])?;
     let class = encode_registry_sz(&policy.class_guid)?;
@@ -982,7 +989,7 @@ pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
             data,
         });
     }
-    let outcome = persist_and_publish_system_hive_mutation(&mutations)
+    let outcome = persist_and_publish_system_hive_mutation(expected_generation, &mutations)
         .map_err(|status| nt_status::NtStatus(status as i32))?;
     if outcome.wake_device_action {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);

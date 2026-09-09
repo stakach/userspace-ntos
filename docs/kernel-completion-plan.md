@@ -31361,9 +31361,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     captured subject and sends the information snapshot's physical path and generation. Native
     publication must retain those same owners and cannot recreate authority from these plain bytes.
     The following native/protocol prerequisites precede that activation:
-    - [ ] Give authorized native mutation preparation an explicit captured-generation input.
-      main.rs config_manager_prepare_system_hive_mutation currently rereads the live generation;
-      using that helper after authorization would permit stale parent policy at a newer generation.
+    - [x] Give native mutation preparation an explicit captured-generation input. All current
+      native callers now supply the generation of their decision or final exact-lease validation;
+      the preparation/persistence helpers no longer resample it. Future secured child publication
+      must pass its retained parent-authorization generation through this same explicit boundary.
     - [x] Add retained successful COMMIT identity/outcome with explicit ACK and exact client replay
       (host protocol checkpoint below). A Backend error status is conservatively uncertain, not
       evidence that the server rejected the mutation before an effect.
@@ -31434,6 +31435,61 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     log: `.tmp/build-cm-retained-commit-executive-20260909.log`. No native publication activation,
     microkernel change, VM run, or desktop proof is claimed by this slice. Strict win32k admission
     still has 27 missing imports; native suspension and desktop acceptance remain open.
+
+    Native captured-generation checkpoint (2026-09-09): removed implicit live-generation selection
+    from config_manager_prepare_system_hive_mutation and persist_and_publish_system_hive_mutation.
+    - [x] Thread explicit expected_generation through every native SYSTEM mutation caller and the
+      ExecNtHandler persistence wrapper. Capture before creation absence checks, descriptor
+      read/modify/write, locale comparisons and setup collection; use returned key-information
+      generation for handle-bound delete/overwrite operations. No captured decision is silently
+      re-authorized by loading a newer generation in the persistence helper.
+    - [x] Bind setup collectors to their initial generation, including acquired key leases and
+      value snapshots. Cached negative reads are checked against the same live-generation boundary
+      and collection completion rejects drift, even when no mutation is emitted. Network setup
+      uses its adapter-plan generation, not a new observation after collecting the plan.
+    - [x] Capture PnP registry generation at publication-stage entry, before baseline/policy reads.
+      Check baseline, critical-device binding and existing Enum snapshots against it, and reject
+      drift before publication, including negative lookup paths. Revision mismatch requests
+      recollection instead of publishing a mixed-generation policy batch. ACPI root provisioning
+      likewise checks its binding and existing-key snapshots against one generation.
+    - [x] Keep opaque upload bytes independent of unrelated registry mutations. At final COMMIT,
+      validate the upload's original lease and use that key-information generation for PREPARE.
+      Do not freeze generation at byte-upload BEGIN, reopen by path, or validate a replacement
+      handle's lease. Deleted/recreated paths cannot replace the original upload target.
+
+    This completes generation-input plumbing, not native secured creation or COMMIT recovery.
+    PnP's cached accepted baseline is still published before later preparation can return Retry;
+    baseline rollback and complete local continuation ownership remain part of the native cutover.
+    Four host regressions cover stale descriptor updates, absence-based creation plus setup-batch
+    atomic rejection, unrelated writes during opaque upload, and delete/recreate lease identity.
+    Focused validation passes in `.tmp/test-cm-captured-generation-focused-20260909.log`.
+    Serialized broad validation passes all 1,140 tests/doctests: nt-config-abi 7, nt-config-client
+    110, nt-config-server 76, nt-config-manager 35, nt-hive-core 106 plus 18 generator cases,
+    nt-security 223, nt-user-host 494 plus 49 integration cases, and 22 doctests. Log:
+    `.tmp/test-cm-captured-generation-full-20260909.log`. The final freestanding executive release
+    build passes in 35.96 seconds with 293 existing warnings in
+    `.tmp/build-cm-captured-generation-executive-final-20260909.log`. Independent native/protocol
+    reviews found no remaining issue in this scope. These regressions exercise the CM contracts;
+    native call-site wiring is compile-verified, not a new runtime proof. No VM or new desktop
+    acceptance is claimed. The 27 strict missing win32k imports remain open.
+
+    Durability review adjustment: before activating retained native COMMIT, close these storage
+    prerequisites alongside the retained caller owner:
+    - [ ] Replace WritableHiveIoProvider's unconditional flush_log/flush_image success with a
+      real per-mutation durability barrier. SYSTEM append currently modifies the mounted RAM
+      volume; ordinary MemFs flush only establishes memory coherence. Block persistence does exist
+      through checkpoint_dirty_volume -> commit_volume_snapshot -> SnapshotBlockStore, which
+      performs AHCI-backed payload/header flush ordering, but mutation publication currently does
+      not wait for that path. Reuse a real storage contract without claiming RAM coherence is
+      durable or adding a second ad hoc persistence format.
+    - [ ] Distinguish an unavailable log/storage authority from a genuinely absent/empty log in
+      log_len/read_log and carry storage errors through preparation/recovery. Retain uncertain
+      append/flush and failed truncate work with exact log extent and backend identity; never
+      blindly reappend a whole journal after partial append or return after dropping recovery state.
+    - [ ] Retain complete caller publication state and exact COMMIT/ACK attempts. Once COMMIT is
+      issued, disallow error-based truncate/ABORT; store its receipt before publishing local state,
+      publish local generation/event/handle state once, and retry ACK without repeating publication.
+      Remove the old one-shot operation/client API and native wrapper in the same caller cutover.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

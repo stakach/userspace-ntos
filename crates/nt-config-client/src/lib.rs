@@ -3745,6 +3745,7 @@ mod tests {
     mod hardware_profile;
     mod key_creation;
     mod secured_child_cm;
+    mod mutation_generation;
     use super::*;
     use alloc::format;
     use alloc::string::String;

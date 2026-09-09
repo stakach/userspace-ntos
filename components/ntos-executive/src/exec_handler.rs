@@ -822,6 +822,7 @@ impl CachedSystemSetupKey {
 }
 
 struct CollectSystemSetupSeedTarget {
+    expected_generation: u64,
     keys: core::cell::RefCell<alloc::vec::Vec<CachedSystemSetupKey>>,
     mutations: alloc::vec::Vec<OwnedSystemHiveMutation>,
     failed: core::cell::Cell<bool>,
@@ -829,8 +830,9 @@ struct CollectSystemSetupSeedTarget {
 }
 
 impl CollectSystemSetupSeedTarget {
-    fn new() -> Self {
+    fn new(expected_generation: u64) -> Self {
         Self {
+            expected_generation,
             keys: core::cell::RefCell::new(alloc::vec::Vec::new()),
             mutations: alloc::vec::Vec::new(),
             failed: core::cell::Cell::new(false),
@@ -853,6 +855,7 @@ impl CollectSystemSetupSeedTarget {
         &self,
         path: &str,
     ) -> Result<Option<nt_config_client::SystemHiveKeyLease>, u32> {
+        self.check_generation()?;
         if !self.owns_system_path(path) {
             self.note_failure(STATUS_OBJECT_PATH_SYNTAX_BAD);
             return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
@@ -879,10 +882,15 @@ impl CollectSystemSetupSeedTarget {
         match unsafe { config_manager_open_system_hive_key(path) } {
             Ok(opened) => {
                 let lease = opened.lease;
+                let generation = lease.opened_generation;
                 self.keys.borrow_mut().push(CachedSystemSetupKey::Open {
                     canonical_path,
                     lease,
                 });
+                if generation != self.expected_generation {
+                    self.note_failure(0xC000_0059); // STATUS_REVISION_MISMATCH
+                    return Err(0xC000_0059);
+                }
                 Ok(Some(lease))
             }
             Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => {
@@ -909,6 +917,10 @@ impl CollectSystemSetupSeedTarget {
             Err(_) => return None,
         };
         match unsafe { config_manager_query_leased_system_hive_value(lease, name) } {
+            Ok(value) if value.mount_generation != self.expected_generation => {
+                self.note_failure(0xC000_0059);
+                None
+            }
             Ok(value) => match nt_hive_core::RegistryValueType::from_u32(value.value_type) {
                 Some(value_type) => Some((value_type, value.data)),
                 None => {
@@ -947,12 +959,14 @@ impl CollectSystemSetupSeedTarget {
 
     fn finish(mut self) -> (alloc::vec::Vec<OwnedSystemHiveMutation>, bool) {
         self.close_leases();
+        let _ = self.check_generation();
         let mutations = core::mem::take(&mut self.mutations);
         (mutations, self.failed.get())
     }
 
     fn finish_required(mut self) -> Result<alloc::vec::Vec<OwnedSystemHiveMutation>, u32> {
         self.close_leases();
+        self.check_generation()?;
         let mutations = core::mem::take(&mut self.mutations);
         if self.failed.get() {
             Err(self.failure_status.get())
@@ -982,6 +996,20 @@ impl CollectSystemSetupSeedTarget {
                 }
                 _ => None,
             })
+    }
+
+    fn check_generation(&self) -> Result<(), u32> {
+        let status = if self.expected_generation == 0 {
+            crate::CONFIG_STATUS_DEVICE_NOT_READY as u32
+        } else if crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire)
+            != self.expected_generation
+        {
+            0xC000_0059 // STATUS_REVISION_MISMATCH
+        } else {
+            return Ok(());
+        };
+        self.note_failure(status);
+        Err(status)
     }
 }
 
@@ -3796,7 +3824,8 @@ pub(crate) enum HostedProcessDeletionOutcome {
 
 pub(crate) fn provision_reactos_installed_boot_state(
 ) -> Result<ReactOsInstalledBootProvision, u32> {
-    let mut target = CollectSystemSetupSeedTarget::new();
+    let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let mut target = CollectSystemSetupSeedTarget::new(expected_generation);
     let seed = nt_hive_core::seed_reactos_installed_boot_state_into_target(&mut target);
     let mutations = target.finish_required()?;
     let stats = seed.map_err(|error| match error {
@@ -3816,7 +3845,7 @@ pub(crate) fn provision_reactos_installed_boot_state(
         .iter()
         .map(OwnedSystemHiveMutation::as_client_mutation)
         .collect();
-    let outcome = unsafe { crate::persist_and_publish_system_hive_mutation(&client_mutations) }?;
+    let outcome = unsafe { crate::persist_and_publish_system_hive_mutation(expected_generation, &client_mutations) }?;
     assert!(
         outcome.journaled,
         "nonempty installed-state mutation must own a durable journal record"
@@ -4451,6 +4480,7 @@ impl ExecNtHandler {
     fn provision_reactos_time_zone_setup(
         &mut self,
     ) -> Result<nt_hive_core::ReactOsTimeZoneSeedOutcome, u32> {
+        let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
         const STATUS_REGISTRY_CORRUPT: u32 = 0xC000_014C;
 
         let (selected_index, selection_source): (u32, &[u8]) =
@@ -4497,7 +4527,7 @@ impl ExecNtHandler {
             | nt_hive_core::ReactOsTimeZoneDatabaseError::DaylightNameInvalid
             | nt_hive_core::ReactOsTimeZoneDatabaseError::TziInvalid => STATUS_REGISTRY_CORRUPT,
         })?;
-        let mut target = CollectSystemSetupSeedTarget::new();
+        let mut target = CollectSystemSetupSeedTarget::new(expected_generation);
         let outcome = nt_hive_core::seed_reactos_time_zone_setup_into_target(&mut target, &setup);
         let mutations = target.finish_required()?;
         let outcome = outcome.map_err(|error| match error {
@@ -4513,7 +4543,7 @@ impl ExecNtHandler {
             return Ok(outcome);
         }
         let generation =
-            self.persist_and_publish_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)?;
+            self.persist_and_publish_system_mutations(expected_generation, &mutations, SystemHiveMutationOrigin::Setup)?;
         print_str(b"[timezone-setup] ReactOS timezone index=");
         print_u64(selected_index as u64);
         print_str(b" selected from ");
@@ -4533,6 +4563,7 @@ impl ExecNtHandler {
 
     fn persist_and_publish_system_mutations(
         &mut self,
+        expected_generation: u64,
         mutations: &[OwnedSystemHiveMutation],
         origin: SystemHiveMutationOrigin,
     ) -> Result<u64, u32> {
@@ -4541,7 +4572,7 @@ impl ExecNtHandler {
             .map(OwnedSystemHiveMutation::as_client_mutation)
             .collect();
         let outcome =
-            match unsafe { crate::persist_and_publish_system_hive_mutation(&client_mutations) } {
+            match unsafe { crate::persist_and_publish_system_hive_mutation(expected_generation, &client_mutations) } {
                 Ok(outcome) => outcome,
                 Err(status) => {
                     if matches!(origin, SystemHiveMutationOrigin::Runtime) {
@@ -4603,12 +4634,13 @@ impl ExecNtHandler {
                 return;
             }
         };
+        let expected_generation = network_adapters.mount_generation;
         trace_setup_provision_phase(
             b"network-snapshot-end",
             network_adapters.adapters.len() as u64,
         );
         let (stats, mutations, failed, hostname_present) = {
-            let mut target = CollectSystemSetupSeedTarget::new();
+            let mut target = CollectSystemSetupSeedTarget::new(expected_generation);
             trace_setup_provision_phase(b"network-seed-core-begin", 0);
             let mut stats = nt_hive_core::seed_reactos_network_setup_into_target(&mut target);
             trace_setup_provision_phase(b"network-seed-core-end", stats.total_values() as u64);
@@ -4661,7 +4693,7 @@ impl ExecNtHandler {
             return;
         }
         let generation = match self
-            .persist_and_publish_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
+            .persist_and_publish_system_mutations(expected_generation, &mutations, SystemHiveMutationOrigin::Setup)
         {
             Ok(generation) => generation,
             Err(status) => {
@@ -4723,8 +4755,9 @@ impl ExecNtHandler {
     /// architecture. This lets `spoolsv`/`localspl` discover the print environment through real
     /// registry syscalls and then load `winprint.dll` from the real spool directory.
     fn provision_reactos_print_setup(&mut self) {
+        let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
         let (stats, mutations, failed, driver_present) = {
-            let mut target = CollectSystemSetupSeedTarget::new();
+            let mut target = CollectSystemSetupSeedTarget::new(expected_generation);
             trace_setup_provision_phase(b"print-seed-begin", 0);
             let stats = nt_hive_core::seed_reactos_print_setup_into_target(&mut target);
             trace_setup_provision_phase(
@@ -4758,7 +4791,7 @@ impl ExecNtHandler {
             return;
         }
         let generation = match self
-            .persist_and_publish_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
+            .persist_and_publish_system_mutations(expected_generation, &mutations, SystemHiveMutationOrigin::Setup)
         {
             Ok(generation) => generation,
             Err(status) => {
@@ -4940,6 +4973,7 @@ impl ExecNtHandler {
     /// # Safety
     /// Runs during construction; the overlay owns the strings it allocates.
     unsafe fn provision_default_user_locale(&mut self) {
+        let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
         const USER_INTERNATIONAL: &str = r"\Registry\User\.Default\Control Panel\International";
         const REG_SZ: u32 = 1;
         let mut locale_ascii = [0u8; 8];
@@ -4996,7 +5030,7 @@ impl ExecNtHandler {
         };
         trace_setup_provision_phase(b"locale-user-value-end", user_locale_changed as u64);
         trace_setup_provision_phase(b"locale-system-key-begin", 0);
-        let mut target = CollectSystemSetupSeedTarget::new();
+        let mut target = CollectSystemSetupSeedTarget::new(expected_generation);
         if !target.has_key(SYSTEM_NLS_LANGUAGE_PATH) {
             let (_, failed) = target.finish();
             if failed {
@@ -5033,7 +5067,7 @@ impl ExecNtHandler {
             None
         } else {
             match self
-                .persist_and_publish_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
+                .persist_and_publish_system_mutations(expected_generation, &mutations, SystemHiveMutationOrigin::Setup)
             {
                 Ok(generation) => {
                     Some(generation)
@@ -7788,6 +7822,7 @@ impl ExecNtHandler {
         &mut self,
         target: KeyRef,
         descriptor: &[u8],
+        expected_generation: u64,
     ) -> Result<(), u32> {
         if target == MACHINE_ROOT_KEY {
             self.registry_machine_root_security_descriptor = descriptor.to_vec();
@@ -7810,6 +7845,7 @@ impl ExecNtHandler {
             .map(|target| target.physical_path.clone())
         {
             self.persist_and_publish_system_mutations(
+                expected_generation,
                 &[OwnedSystemHiveMutation::SetKeySecurity {
                     path,
                     descriptor: descriptor.to_vec(),
@@ -8126,6 +8162,7 @@ impl ExecNtHandler {
         let mut data = [0u8; 18];
         let len = utf16le_ascii_z(ascii, &mut data).ok_or(STATUS_INVALID_PARAMETER)?;
         if !user_profile {
+            let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
             let value_type = nt_hive_core::RegistryValueType::Sz;
             if !system_hive_key_exists(&path)? {
                 return Err(STATUS_OBJECT_NAME_NOT_FOUND);
@@ -8136,6 +8173,7 @@ impl ExecNtHandler {
                 return Ok(());
             }
             self.persist_and_publish_system_mutations(
+                expected_generation,
                 &[OwnedSystemHiveMutation::SetValue {
                     path,
                     name: value_name.into(),
@@ -34378,6 +34416,7 @@ impl ExecNtHandler {
             // and paths outside mounted hives stay in the volatile overlay until D4 gives volatile
             // keys first-class hive ownership.
             NativeService::NtCreateKey => unsafe {
+                let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
                 let desired_access = nt_ulong_arg(args[1]);
                 if args[0] == 0 || !self.probe_user_output(args[0], 8) {
                     return 0xC000_0005;
@@ -34647,6 +34686,7 @@ impl ExecNtHandler {
                         if let Err(status) = crate::probe_seg!(
                             7,
                             self.persist_and_publish_system_mutations(
+                                expected_generation,
                                 &mutations,
                                 SystemHiveMutationOrigin::Runtime,
                             )
@@ -35162,7 +35202,11 @@ impl ExecNtHandler {
                     Ok(name) => name,
                     Err(_) => return 0xC000_0033,
                 };
-                if cm_lease.is_some() {
+                if let Some(lease) = cm_lease {
+                    let information = match crate::config_manager_query_leased_system_hive_key_information(lease) {
+                        Ok(information) => information,
+                        Err(status) => return status as u32,
+                    };
                     let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(ty) else {
                         return 0xC000_000D;
                     };
@@ -35182,6 +35226,7 @@ impl ExecNtHandler {
                         Err(_) => return 0xC000_003B,
                     };
                     if let Err(status) = self.persist_and_publish_system_mutations(
+                        information.mount_generation,
                         &[OwnedSystemHiveMutation::SetValue {
                             path,
                             name: durable_name.into(),
@@ -35409,6 +35454,7 @@ impl ExecNtHandler {
                         return STATUS_CANNOT_DELETE;
                     }
                     if let Err(status) = self.persist_and_publish_system_mutations(
+                        information.mount_generation,
                         &[OwnedSystemHiveMutation::DeleteKey { path }],
                         SystemHiveMutationOrigin::Runtime,
                     ) {
@@ -35452,6 +35498,7 @@ impl ExecNtHandler {
                 0xC000_0022 // STATUS_ACCESS_DENIED: borrowed regf keys are read-only.
             }
             NativeService::NtDeleteValueKey => unsafe {
+                let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
                 let key = match self.resolve_registry_key(args[0], 0x2) {
                     Ok(key) => key,
                     Err(status) => return status,
@@ -35502,6 +35549,7 @@ impl ExecNtHandler {
                         Err(_) => return 0xC000_003B,
                     };
                     if let Err(status) = self.persist_and_publish_system_mutations(
+                        expected_generation,
                         &[OwnedSystemHiveMutation::DeleteValue {
                             path,
                             name: name.into(),
@@ -39617,6 +39665,7 @@ impl ExecNtHandler {
                         Ok(descriptor) => descriptor,
                         Err(status) => return status,
                     };
+                let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
                 let current = match self.registry_key_security_descriptor(key) {
                     Ok(Some(descriptor)) => descriptor,
                     Ok(None) => {
@@ -39632,7 +39681,7 @@ impl ExecNtHandler {
                     Ok(descriptor) => descriptor,
                     Err(status) => return status,
                 };
-                match self.set_registry_key_security_descriptor(key, &updated) {
+                match self.set_registry_key_security_descriptor(key, &updated, expected_generation) {
                     Ok(()) => 0,
                     Err(status) => status,
                 }

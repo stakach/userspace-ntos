@@ -12455,7 +12455,8 @@ unsafe fn service_win32k_registry_commit_set(
         .take()
         .ok_or(STATUS_INVALID_PARAMETER_I32)?;
     let data = transfer.upload.complete_data()?;
-    crate::persist_and_publish_system_hive_mutation(&[
+    let information = crate::config_manager_query_leased_system_hive_key_information(transfer.lease)?;
+    crate::persist_and_publish_system_hive_mutation(information.mount_generation, &[
         nt_config_client::SystemHiveMutation::SetValue {
             path: &transfer.physical_path,
             name: &transfer.name,
@@ -12472,8 +12473,8 @@ unsafe fn service_win32k_registry_delete_value(handle: u64) -> Result<(), i32> {
         .ok_or(STATUS_INVALID_PARAMETER_I32)?;
     let name = alloc::string::String::from_utf8(name).map_err(|_| STATUS_INVALID_PARAMETER_I32)?;
     let (lease, physical_path) = clone_win32k_system_reg_target(handle)?;
-    crate::config_manager_query_leased_system_hive_key_information(lease)?;
-    crate::persist_and_publish_system_hive_mutation(&[
+    let information = crate::config_manager_query_leased_system_hive_key_information(lease)?;
+    crate::persist_and_publish_system_hive_mutation(information.mount_generation, &[
         nt_config_client::SystemHiveMutation::DeleteValue {
             path: &physical_path,
             name: &name,
@@ -12534,6 +12535,7 @@ unsafe fn service_win32k_registry_create(
         system_hive_relative_path_from_handle(root, &path)?
     };
 
+    let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
     match open_cm_system_hive_target(&absolute) {
         Ok(target) => {
             let handle = match register_win32k_reg_handle(target) {
@@ -12550,6 +12552,9 @@ unsafe fn service_win32k_registry_create(
     }
 
     let resolved = crate::config_manager_resolve_system_hive_path(&absolute)?;
+    if resolved.mount_generation != expected_generation {
+        return Err(0xC000_0059u32 as i32); // STATUS_REVISION_MISMATCH
+    }
     let Some(separator) = resolved.physical_path.rfind('\\') else {
         return Err(0xC000_003Au32 as i32); // STATUS_OBJECT_PATH_NOT_FOUND
     };
@@ -12577,7 +12582,7 @@ unsafe fn service_win32k_registry_create(
             class_name: Some(class),
         });
     }
-    crate::persist_and_publish_system_hive_mutation(&mutations)
+    crate::persist_and_publish_system_hive_mutation(expected_generation, &mutations)
         .map_err(|status| status as i32)?;
     let target = open_cm_system_hive_target(&resolved.physical_path)?;
     let handle = match register_win32k_reg_handle(target) {

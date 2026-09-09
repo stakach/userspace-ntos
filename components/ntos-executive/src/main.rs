@@ -15931,10 +15931,12 @@ pub(crate) unsafe fn config_manager_enumerate_leased_system_hive_value(
     Ok(value)
 }
 
+/// Use the generation captured with the caller's registry decisions. Never substitute the live
+/// generation here: CM must reject stale authorization, absence checks, and read/modify/write data.
 pub(crate) unsafe fn config_manager_prepare_system_hive_mutation(
+    expected_generation: u64,
     mutations: &[nt_config_client::SystemHiveMutation<'_>],
 ) -> Result<nt_config_client::PreparedSystemHiveMutation, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -15992,12 +15994,14 @@ pub(crate) struct DurableSystemHiveMutationOutcome {
 /// All executive callers share this path so registry syscalls and PnP topology have identical
 /// append, flush, abort, and rollback ownership.
 pub(crate) unsafe fn persist_and_publish_system_hive_mutation(
+    expected_generation: u64,
     mutations: &[nt_config_client::SystemHiveMutation<'_>],
 ) -> Result<DurableSystemHiveMutationOutcome, u32> {
     const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 
     let prepared =
-        config_manager_prepare_system_hive_mutation(mutations).map_err(|status| status as u32)?;
+        config_manager_prepare_system_hive_mutation(expected_generation, mutations)
+            .map_err(|status| status as u32)?;
     let mut provider =
         writable_fs::WritableHiveIoProvider::new(writable_fs::CONFIG_SYSTEM_HIVE_PATH);
     let previous_log_len = provider.log_len();

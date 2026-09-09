@@ -7137,7 +7137,7 @@ unsafe fn begin_hosted_system_registry_set(
 unsafe fn validate_hosted_system_registry_set_target(
     handle: u64,
     lease: nt_config_client::SystemHiveKeyLease,
-) -> Result<(), i32> {
+) -> Result<u64, i32> {
     let matches_target = driver_registry_handle_slot(handle).is_some_and(|slot| {
         matches!(
             slot.target,
@@ -7150,7 +7150,8 @@ unsafe fn validate_hosted_system_registry_set_target(
     if !matches_target {
         return Err(STATUS_INVALID_HANDLE);
     }
-    crate::config_manager_query_leased_system_hive_key_information(lease).map(|_| ())
+    crate::config_manager_query_leased_system_hive_key_information(lease)
+        .map(|information| information.mount_generation)
 }
 
 unsafe fn append_hosted_system_registry_set(
@@ -39306,6 +39307,7 @@ fn hosted_relation_error_from_config(status: i32) -> HostedRelationPublishError 
     let raw_status = status as u32;
     if raw_status == nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32
         || raw_status == nt_status::NtStatus::DEVICE_BUSY.raw() as u32
+        || raw_status == 0xC000_0059 // STATUS_REVISION_MISMATCH: recollect registry policy.
     {
         HostedRelationPublishError::Retry
     } else {
@@ -39515,6 +39517,7 @@ fn encode_hosted_relation_nt_path(path: &NtPath) -> Result<Vec<u8>, HostedRelati
 }
 
 unsafe fn seed_hosted_bus_relation_baseline(
+    expected_generation: u64,
     bus_object_id: u64,
     children: &[nt_pnp_manager::BusReportedChild],
 ) -> Result<(), HostedRelationPublishError> {
@@ -39539,6 +39542,9 @@ unsafe fn seed_hosted_bus_relation_baseline(
         &[],
     )
     .map_err(hosted_relation_error_from_config)?;
+    if snapshot.mount_generation != expected_generation {
+        return Err(HostedRelationPublishError::Retry);
+    }
     if snapshot.query_kind != nt_config_abi::pnp_query_kind::BUS_RELATIONS
         || !snapshot.payload.is_empty()
     {
@@ -39567,12 +39573,16 @@ unsafe fn seed_hosted_bus_relation_baseline(
 }
 
 unsafe fn resolve_hosted_relation_policy(
+    expected_generation: u64,
     child: &nt_pnp_manager::BusReportedChild,
 ) -> Result<Option<nt_config_client::CriticalDeviceBinding>, HostedRelationPublishError> {
     for id in child.hardware_ids.iter().chain(&child.compatible_ids) {
         if let Some(binding) = crate::config_manager_query_critical_device_binding(id)
             .map_err(hosted_relation_error_from_config)?
         {
+            if binding.mount_generation != expected_generation {
+                return Err(HostedRelationPublishError::Retry);
+            }
             return Ok(Some(binding));
         }
     }
@@ -39580,6 +39590,7 @@ unsafe fn resolve_hosted_relation_policy(
 }
 
 unsafe fn existing_hosted_relation_values(
+    expected_generation: u64,
     change: &nt_pnp_manager::BusRelationChange,
     enum_path: &str,
 ) -> Result<ExistingHostedRelationValues, HostedRelationPublishError> {
@@ -39588,6 +39599,9 @@ unsafe fn existing_hosted_relation_values(
     }
     let snapshot = crate::config_manager_query_system_hive_key(enum_path)
         .map_err(hosted_relation_error_from_config)?;
+    if snapshot.mount_generation != expected_generation {
+        return Err(HostedRelationPublishError::Retry);
+    }
     Ok(ExistingHostedRelationValues {
         class_guid: snapshot
             .values
@@ -39737,6 +39751,7 @@ unsafe fn build_hosted_relation_mutations(
 }
 
 unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishError> {
+    let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
     let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
         .as_ref()
         .ok_or(HostedRelationPublishError::Barrier(
@@ -39777,7 +39792,7 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
         ));
     }
 
-    seed_hosted_bus_relation_baseline(bus_object_id, &query.reported_children)?;
+    seed_hosted_bus_relation_baseline(expected_generation, bus_object_id, &query.reported_children)?;
     let prepared = hosted_bus_relations_mut()
         .prepare_bus_relations(bus_object_id, &query.reported_children)
         .map_err(hosted_relation_error_from_pnp)?;
@@ -39809,10 +39824,14 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             if change.kind == nt_pnp_manager::BusRelationChangeKind::Removal {
                 None
             } else {
-                resolve_hosted_relation_policy(&change.child)?
+                resolve_hosted_relation_policy(expected_generation, &change.child)?
             },
         );
-        existing.push(existing_hosted_relation_values(change, &enum_path)?);
+        existing.push(existing_hosted_relation_values(expected_generation, change, &enum_path)?);
+    }
+
+    if crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) != expected_generation {
+        return Err(HostedRelationPublishError::Retry);
     }
 
     let mutations = build_hosted_relation_mutations(&prepared, &policies, &existing)?;
@@ -39821,7 +39840,7 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             .iter()
             .map(HostedRelationRegistryMutation::as_client_mutation)
             .collect();
-        let outcome = crate::persist_and_publish_system_hive_mutation(&client_mutations)
+        let outcome = crate::persist_and_publish_system_hive_mutation(expected_generation, &client_mutations)
             .map_err(|status| hosted_relation_error_from_config(status as i32))?;
         if outcome.wake_device_action {
             crate::config_manager_request_device_action_wake();
@@ -53344,6 +53363,7 @@ unsafe fn service_hosted_driver_create_registry_path(
     if volatile {
         return (STATUS_NOT_SUPPORTED, 0, 0);
     }
+    let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
     let (status, handle, _) = service_hosted_driver_open_registry_path(path);
     if status == STATUS_SUCCESS {
         return (STATUS_SUCCESS, handle, REG_OPENED_EXISTING_KEY as u64);
@@ -53355,6 +53375,9 @@ unsafe fn service_hosted_driver_create_registry_path(
         Ok(resolved) => resolved,
         Err(status) => return (status, 0, 0),
     };
+    if resolved.mount_generation != expected_generation {
+        return (0xC000_0059u32 as i32, 0, 0);
+    }
     let Some(separator) = resolved.physical_path.rfind('\\') else {
         return (STATUS_OBJECT_PATH_NOT_FOUND, 0, 0);
     };
@@ -53371,7 +53394,7 @@ unsafe fn service_hosted_driver_create_registry_path(
     if let Err(status) = retire_driver_registry_handle(parent_owner.handle) {
         return (status, 0, 0);
     }
-    if let Err(status) = crate::persist_and_publish_system_hive_mutation(&[
+    if let Err(status) = crate::persist_and_publish_system_hive_mutation(expected_generation, &[
         nt_config_client::SystemHiveMutation::CreateKey {
             path: &resolved.physical_path,
         },
@@ -53629,8 +53652,8 @@ pub(crate) fn service_hosted_driver_registry(
                         lease,
                         physical_path,
                     } => crate::config_manager_query_leased_system_hive_key_information(lease)
-                        .and_then(|_| {
-                            crate::persist_and_publish_system_hive_mutation(&[
+                        .and_then(|information| {
+                            crate::persist_and_publish_system_hive_mutation(information.mount_generation, &[
                                 nt_config_client::SystemHiveMutation::DeleteValue {
                                     path: physical_path.as_str(),
                                     name: value_name.as_str(),
@@ -53676,8 +53699,8 @@ pub(crate) fn service_hosted_driver_registry(
                                 lease,
                                 physical_path,
                             } => validate_hosted_system_registry_set_target(a1, lease).and_then(
-                                |()| {
-                                    crate::persist_and_publish_system_hive_mutation(&[
+                                |expected_generation| {
+                                    crate::persist_and_publish_system_hive_mutation(expected_generation, &[
                                         nt_config_client::SystemHiveMutation::SetValue {
                                             path: physical_path.as_str(),
                                             name: value_name.as_str(),
@@ -53785,32 +53808,33 @@ pub(crate) fn service_hosted_driver_registry(
                     }
                     HOSTED_REGISTRY_OP_COMMIT_SET_HANDLE_VALUE => {
                         let result = match slot.target {
-                            DriverRegistryHandleTarget::System { lease, .. } => {
+                            DriverRegistryHandleTarget::System { .. } => {
                                 let transfer =
                                     match take_hosted_system_registry_set(a1, a2, a3 as usize) {
                                         Ok(transfer) => transfer,
                                         Err(status) => return (status, 0, 0),
                                     };
-                                if let Err(status) =
-                                    validate_hosted_system_registry_set_target(a1, lease)
-                                {
-                                    Err(status)
-                                } else {
-                                    match transfer.upload.complete_data() {
-                                        Ok(data) => {
-                                            crate::persist_and_publish_system_hive_mutation(&[
-                                                nt_config_client::SystemHiveMutation::SetValue {
-                                                    path: transfer.physical_path.as_str(),
-                                                    name: transfer.name.as_str(),
-                                                    value_type: transfer.value_type,
-                                                    data,
-                                                },
-                                            ])
-                                            .map(|_| ())
-                                            .map_err(|status| status as i32)
-                                        }
-                                        Err(status) => Err(status),
+                                let expected_generation = match validate_hosted_system_registry_set_target(
+                                    a1, transfer.lease,
+                                ) {
+                                    Ok(generation) => generation,
+                                    Err(status) => return (status, 0, 0),
+                                };
+                                match transfer.upload.complete_data() {
+                                    Ok(data) => {
+                                        crate::persist_and_publish_system_hive_mutation(
+                                            expected_generation,
+                                            &[nt_config_client::SystemHiveMutation::SetValue {
+                                                path: transfer.physical_path.as_str(),
+                                                name: transfer.name.as_str(),
+                                                value_type: transfer.value_type,
+                                                data,
+                                            }],
+                                        )
+                                        .map(|_| ())
+                                        .map_err(|status| status as i32)
                                     }
+                                    Err(status) => Err(status),
                                 }
                             }
                             DriverRegistryHandleTarget::Generic { .. } => {
