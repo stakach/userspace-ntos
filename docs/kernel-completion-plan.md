@@ -32753,6 +32753,67 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     accepted intermediate runtime state. LocalInline/Buffered/Flush currently reject Busy owners;
     their shape/retirement contracts must change with that complete native lifecycle cutover.
 
+    Canonical local File lifecycle prerequisite (2026-09-10, complete): put serialization and
+    deferred cleanup on the real nt-fs FileObject before changing native syscall admissions.
+    - [x] Embed shared Busy state and add checked acquire/promotion/adoption/cancel/release APIs.
+      Retain before contention, never reset while queued, and adopt a grant without retaining again.
+    - [x] Transfer the last handle reference to cleanup; preserve share claims and directory
+      notifications until acquired/queued owners drain. Idle close uses the same immediate path.
+      Cleanup samples current name/disposition after queued mutations, not at final-handle close.
+    - [x] Retain failed cleanup preparation with a visible error and checked redrive; prevent
+      ordinary I/O release from consuming cleanup or live Busy/waiter references.
+    - [x] Test canonical local lifetime, share/delete/notify ordering and failure retries, then run
+      host/native validation serially and review the remaining native route/cleanup wiring.
+
+    This is one canonical File lifecycle, not a legacy-mode switch. Existing backend operations
+    remain source operations; native callers will not acquire local Busy until every route and
+    release path supports it. Outstanding delivery references must not themselves delay cleanup:
+    directory notification completion may require cleanup to become terminal. A cleanup-owned
+    File row already pins its unlinked node, so no second node-lifetime registry is required.
+
+    Implementation: final-handle close now transfers its reference into the canonical cleanup
+    state; the old immediate-close implementation and separate retain/release bodies are removed.
+    Once close or reference release consumes its transition, later cleanup failure cannot change
+    that operation's success into an invitation to retry it. The retained File exposes the cleanup
+    error and exact redrive. Cleanup reads the current entry and delete disposition after admitted
+    mutations drain; an already-unlinked exact entry does not authorize deleting a same-name
+    replacement. Sharing survives until cleanup, but independent notification/delivery references
+    do not block cleanup. Ordinary release cannot consume the handle/cleanup/Busy/waiter minimum.
+
+    Native passive cleanup integration uses a focused writable_fs/file_cleanup.rs module. The
+    service-loop barrier enumerates retained rows without mounting an absent filesystem; the
+    no-pending path is constant time. Close/release/redrive publish sticky namespace and notification
+    effects, including unlink while a delivery reference still pins the node. Remove node-count
+    comparison as the close dirtying heuristic. Failed cleanup stays owned rather than becoming an
+    unrelated syscall's result, and each barrier attempts a retained row at most once. Nonfinal
+    ordinary reference release does not scan/reap the whole volume. This does not activate native
+    local Busy admissions or solve filesystem-wide exclusion/pre-admission native close refusal.
+    Notification completion still allocates; do not claim allocation-free cleanup or native OOM
+    acceptance from the host corruption/retry tests.
+
+    Validation: nine new nt-fs lifecycle contracts, one exact-grant core regression and four
+    composed filesystem tests passed. The focused five-crate suite passed 1,395 tests; the broad
+    twelve-crate suite passed 2,655 tests/doctests, all zero failures/ignored. The native executive
+    release build passed in 37.57s with the unchanged 294-warning baseline. Logs:
+    `.tmp/test-local-file-lifecycle-contract-20260910.log`,
+    `.tmp/test-local-file-lifecycle-focused-20260910.log`,
+    `.tmp/test-local-file-lifecycle-full-20260910.log`, and
+    `.tmp/build-local-file-lifecycle-executive-20260910.log`. Root serialized every runner;
+    independent source review found no additional blocker. No VM run or microkernel change
+    occurred. The 27 strict missing win32k imports and genuine desktop acceptance remain open.
+
+    Next-boundary review: convert SynchronousFileWaiter and all FIFO/promotion/retry keys from
+    raw file_id plus hosted-only device fields to typed hosted/local-overlay routes and keys.
+    Equal numeric File IDs from different domains must not alias; local File ID zero is valid.
+    Retain captured mode and granted access, adopt the queued reference after final handle close,
+    and distinguish hosted cancellation's separate reference release from local cancellation,
+    which consumes its own reference. Convert the existing native hosted adapters exhaustively
+    while leaving local admission disabled. LocalInline/Buffered/Flush must subsequently carry
+    checked Busy release through normal/abandoned completion before the whole-overlay cutover.
+    Implicit position, append/EOF and directory cursors must resolve after acquisition; explicit
+    ByteOffset/key values captured before waiting must survive as values, not merely replayed
+    pointers. FAT File/directory owners need equivalent canonical lifecycle support separately.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

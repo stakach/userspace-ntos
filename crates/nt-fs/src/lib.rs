@@ -37,12 +37,12 @@ pub use flush::file_flush_access_allowed;
 pub use fs::{
     installed_file_open_action, parse_file_basic_information_attributes,
     parse_move_cluster_information, parse_set_file_name_information, parse_short_name_information,
-    validate_file_create_parameters, CreateResult, FileMetadata, FileObjectInformation,
-    FileOpenPrivileges, FileRenameRoot, FileShareAccess, FileSystem, InstalledFileOpenAction, MemFs,
-    MemFsBlobCompactError, MemFsBlobCompaction, MemFsSnapshotError, MemFsSnapshotInfo,
-    MoveClusterInformation, SetFileNameInformation, StandardInformation, INVALID_HANDLE,
-    SnapshotJournal, SnapshotJournalDurability, SnapshotJournalError, SnapshotJournalOpenError,
-    SnapshotJournalPhase,
+    validate_file_create_parameters, CreateResult, FileCleanupEffects, FileIoState, FileMetadata,
+    FileObjectInformation, FileOpenPrivileges, FileRenameRoot, FileShareAccess, FileSystem,
+    InstalledFileOpenAction, MemFs, MemFsBlobCompactError, MemFsBlobCompaction, MemFsSnapshotError,
+    MemFsSnapshotInfo, MoveClusterInformation, SetFileNameInformation, StandardInformation,
+    INVALID_HANDLE, SnapshotJournal, SnapshotJournalDurability, SnapshotJournalError,
+    SnapshotJournalOpenError, SnapshotJournalPhase,
 };
 pub use hive_provider::NtFileHiveIoProvider;
 pub use notify::*;

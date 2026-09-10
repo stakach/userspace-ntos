@@ -6,19 +6,14 @@ impl FileSystem {
     /// Retain one I/O reference and clear the file signal without a fallible rollback boundary.
     /// Cleanup may retain existing I/O, but a new operation requires a live handle reference.
     pub fn zw_begin_file_io(&mut self, handle: u64) -> Result<(), u32> {
-        let index = usize::try_from(handle).map_err(|_| STATUS_INVALID_HANDLE)?;
-        let object = self
-            .handles
-            .get_mut(index)
-            .and_then(Option::as_mut)
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        if object.references < object.handle_references {
-            return Err(STATUS_DATA_ERROR);
-        }
+        let index = self.checked_file_io_index(handle)?;
+        let object = self.handles[index].as_mut().unwrap();
         if object.handle_references == 0 {
             return Err(STATUS_INVALID_HANDLE);
         }
-        self.volume.node(object.node_id).ok_or(STATUS_DATA_ERROR)?;
+        if object.serialization.has_live_io() || object.cleanup_reference_held {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
         let references = object
             .references
             .checked_add(1)

@@ -81,6 +81,21 @@ impl FileIoSerialization {
         Ok(FileIoAcquireResult::Contended { alertable: false })
     }
 
+    /// Adopt only an existing, unconsumed promoted grant. Unlike `begin_io`, this never acquires
+    /// idle Busy and never counts a new waiter or authorizes a new reference.
+    pub fn adopt_io_grant(&mut self, mode: FileIoMode, tid: u64) -> Result<(), u32> {
+        if tid == 0
+            || tid == Self::CLEANUP_LOCK_OWNER
+            || !mode.is_synchronous()
+            || self.owner_tid != tid
+            || self.grant_tid != tid
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.grant_tid = 0;
+        Ok(())
+    }
+
     pub fn cancel_io_waiter(&mut self) -> Result<u32, u32> {
         if self.waiters == 0 {
             return Err(STATUS_INVALID_PARAMETER);
@@ -176,6 +191,25 @@ impl FileIoSerialization {
 
     pub const fn io_waiter_count(&self) -> u32 {
         self.waiters
+    }
+
+    pub const fn io_grant_owner(&self) -> Option<u64> {
+        if self.grant_tid == 0 {
+            None
+        } else {
+            Some(self.grant_tid)
+        }
+    }
+
+    /// Minimum non-handle references required by ordinary acquired/promoted I/O and waiters.
+    /// Cleanup itself uses the embedding owner's separate transferred cleanup reference.
+    pub const fn ordinary_io_references(&self) -> u64 {
+        self.waiters as u64
+            + if self.owner_tid != 0 && self.owner_tid != Self::CLEANUP_LOCK_OWNER {
+                1
+            } else {
+                0
+            }
     }
 
     pub const fn cleanup_waiting(&self) -> bool {

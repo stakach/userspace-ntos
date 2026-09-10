@@ -117,8 +117,8 @@ fn promoted_operation_adopts_its_reference_after_the_final_handle_is_closed() {
         Ok(FileIoAcquireResult::Contended { alertable: false })
     );
 
-    // Current nt-fs close performs its local cleanup now. This proves retained-object adoption,
-    // not deferred native cleanup ordering; the standalone core test below covers that policy.
+    // This fixture keeps Busy outside nt-fs, so canonical Busy is idle and close cleans up now.
+    // Retained-object adoption here does not prove canonical or native cleanup ordering.
     assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
     assert_eq!(
         fs.zw_retain_io_reference(handle),
@@ -150,8 +150,8 @@ fn promoted_operation_adopts_its_reference_after_the_final_handle_is_closed() {
 
 #[test]
 fn cleanup_core_orders_behind_every_preexisting_ordinary_waiter() {
-    // This drives only the extracted core with a fixture-owned cleanup reference. It does not
-    // assert that the current local filesystem close adapter defers its cleanup side effects.
+    // This drives only the extracted core with a fixture-owned cleanup reference. The canonical
+    // filesystem embedding and its cleanup side effects are covered by local_file_cleanup.rs.
     for mode in [
         FileIoMode::SynchronousAlertable,
         FileIoMode::SynchronousNonAlertable,

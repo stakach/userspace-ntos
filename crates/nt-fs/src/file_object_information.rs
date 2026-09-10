@@ -42,7 +42,7 @@ impl FileSystem {
         })
     }
 
-    fn checked_object_entry(&self, object: &FileObject) -> Result<Option<(u64, usize)>, u32> {
+    pub(super) fn checked_object_entry(&self, object: &FileObject) -> Result<Option<(u64, usize)>, u32> {
         if object.entry_id == 0 {
             if object.node_id != 0 || !self.volume.is_dir(0) {
                 return Err(STATUS_DATA_ERROR);

@@ -33,6 +33,10 @@ pub use file_object_information::FileObjectInformation;
 #[path = "file_io_lifetime.rs"]
 mod file_io_lifetime;
 
+#[path = "file_io_serialization.rs"]
+mod file_io_serialization;
+pub use file_io_serialization::{FileCleanupEffects, FileIoState};
+
 #[path = "snapshot_journal.rs"]
 mod snapshot_journal;
 pub use snapshot_journal::*;
@@ -3431,17 +3435,20 @@ struct FileObject {
     signaled: bool,
     /// Create options retained as `FILE_OBJECT` mode flags for `FileModeInformation`.
     create_options: u32,
-    /// One share claim belongs to this open description. Duplicated handles increase both counts;
-    /// the claim is released when the final handle closes.
+    /// One share claim belongs to this open description, until final-handle cleanup completes.
     share: FileShareAccess,
     open_privileges: FileOpenPrivileges,
     /// Handles referring to this file object. `NtDuplicateObject` adds one, `ZwClose` removes one;
     /// the object (and any pending delete) is actioned when the last one goes.
     handle_references: u32,
-    /// Handles plus in-flight I/O references. The object survives last-handle cleanup until every
-    /// filesystem-owned completion has been published.
+    /// Handles, in-flight I/O and any transferred cleanup reference. The object survives cleanup
+    /// until every filesystem-owned completion has been published.
     references: u32,
-    /// `FCB->DeletePending` — set by `FileDispositionInformation`, actioned by `ZwClose`.
+    serialization: nt_io_completion::FileIoSerialization,
+    /// The final handle transfers its reference here until cleanup effects have committed.
+    cleanup_reference_held: bool,
+    cleanup_error: Option<u32>,
+    /// `FCB->DeletePending` — set by `FileDispositionInformation`, actioned by final-handle cleanup.
     delete_pending: bool,
     /// Per-`FILE_OBJECT` directory-enumeration cursor (spec §17): `NtQueryDirectoryFile` resumes
     /// from it, `RestartScan` rewinds it. Shared by handles duplicated from this file object.
@@ -3750,6 +3757,8 @@ pub struct FileSystem {
     mounts: MountManager,
     handles: Vec<Option<FileObject>>,
     notifications: crate::DirectoryNotifyTable<u64>,
+    pending_file_cleanup_count: usize,
+    file_cleanup_effects: FileCleanupEffects,
     #[cfg(test)]
     create_fail_at: Option<usize>,
 }
@@ -3771,6 +3780,8 @@ impl FileSystem {
             mounts: MountManager::new(),
             handles: Vec::new(),
             notifications: crate::DirectoryNotifyTable::new(),
+            pending_file_cleanup_count: 0,
+            file_cleanup_effects: FileCleanupEffects::default(),
             #[cfg(test)]
             create_fail_at: None,
         }
@@ -3980,7 +3991,10 @@ impl FileSystem {
             .handles
             .iter()
             .flatten()
-            .filter(|object| object.handle_references != 0 && object.node_id == node_id)
+            .filter(|object| {
+                (object.handle_references != 0 || object.cleanup_reference_held)
+                    && object.node_id == node_id
+            })
             .all(|object| requested.compatible_with(object.share))
         {
             Ok(())
@@ -5202,55 +5216,6 @@ impl FileSystem {
             .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)
     }
 
-    /// `ZwClose` (spec §8.7, §6.2): cleanup-before-close, then free the file object. A file object
-    /// with `DeletePending` set unlinks its node at cleanup, exactly like an FSD's `IRP_MJ_CLEANUP`.
-    pub fn zw_close(&mut self, handle: u64) -> u32 {
-        let Some(obj) = self
-            .handles
-            .get_mut(handle as usize)
-            .and_then(|object| object.as_mut())
-        else {
-            return STATUS_INVALID_HANDLE;
-        };
-        if obj.handle_references == 0 {
-            return STATUS_INVALID_HANDLE;
-        }
-        obj.handle_references -= 1;
-        obj.references -= 1;
-        if obj.handle_references != 0 {
-            return STATUS_SUCCESS;
-        }
-        let (entry_id, delete_pending, node_id, close_ready) = (
-            obj.entry_id,
-            obj.delete_pending,
-            obj.node_id,
-            obj.references == 0,
-        );
-        let deleted_name = delete_pending
-            .then(|| self.volume.opened_name(entry_id))
-            .flatten();
-        let deleted_filter = if self.volume.is_dir(node_id) {
-            crate::FILE_NOTIFY_CHANGE_DIR_NAME
-        } else {
-            crate::FILE_NOTIFY_CHANGE_FILE_NAME
-        };
-        self.notifications.cleanup_file_object(handle);
-        if close_ready {
-            self.handles[handle as usize] = None;
-        }
-        if delete_pending && entry_id != 0 && self.volume.unlink_entry(entry_id).is_ok() {
-            if let Some(deleted_name) = deleted_name {
-                self.notifications.report_change(crate::DirectoryChange {
-                    full_path: &deleted_name,
-                    filter: deleted_filter,
-                    action: crate::FILE_ACTION_REMOVED,
-                });
-            }
-        }
-        self.reap_unlinked_nodes();
-        STATUS_SUCCESS
-    }
-
     /// `ObDuplicateObject` on a file object: one more handle now names it (spec §6.2).
     pub fn zw_retain(&mut self, handle: u64) -> u32 {
         match self.obj_mut(handle) {
@@ -5269,32 +5234,7 @@ impl FileSystem {
         }
     }
 
-    pub fn zw_retain_io_reference(&mut self, handle: u64) -> Result<(), u32> {
-        let object = self.obj_mut(handle).ok_or(STATUS_INVALID_HANDLE)?;
-        if object.handle_references == 0 {
-            return Err(STATUS_INVALID_HANDLE);
-        }
-        object.references = object
-            .references
-            .checked_add(1)
-            .ok_or(STATUS_QUOTA_EXCEEDED)?;
-        Ok(())
-    }
-
-    pub fn zw_release_io_reference(&mut self, handle: u64) -> Result<(), u32> {
-        let object = self.obj_mut(handle).ok_or(STATUS_INVALID_HANDLE)?;
-        if object.references == object.handle_references {
-            return Err(STATUS_INVALID_HANDLE);
-        }
-        object.references -= 1;
-        if object.references == 0 {
-            self.handles[handle as usize] = None;
-            self.reap_unlinked_nodes();
-        }
-        Ok(())
-    }
-
-    /// Whether one `ZwClose` will issue cleanup/close for this FILE_OBJECT.
+    /// Whether one `ZwClose` will schedule final-handle cleanup, possibly behind admitted I/O.
     pub fn zw_is_final_reference(&self, handle: u64) -> Result<bool, u32> {
         self.obj(handle)
             .filter(|object| object.handle_references != 0)

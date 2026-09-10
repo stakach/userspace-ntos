@@ -36,6 +36,11 @@ use nt_fs::SnapshotBlockDevice;
 #[path = "writable_fs/snapshot_storage.rs"]
 pub(crate) mod snapshot_storage;
 
+#[path = "writable_fs/file_cleanup.rs"]
+mod file_cleanup;
+pub(crate) use file_cleanup::redrive_file_cleanup_work;
+use file_cleanup::publish_file_cleanup_effects;
+
 /// The namespace subtrees served by the writable volume, as canonical volume-relative paths
 /// (lowercase, `\`-separated, no leading separator — the form `nt_path_to_volume_relative` emits).
 ///
@@ -2044,7 +2049,10 @@ pub(crate) unsafe fn begin_file_io(file_id: u64) -> Result<(), u32> {
 }
 
 pub(crate) unsafe fn release_io_reference(file_id: u64) -> Result<(), u32> {
-    writable_fs()?.zw_release_io_reference(file_id)
+    let fs = writable_fs()?;
+    let result = fs.zw_release_io_reference(file_id);
+    publish_file_cleanup_effects(fs);
+    result
 }
 
 pub(crate) unsafe fn set_file_signaled(file_id: u64, signaled: bool) -> Result<(), u32> {
@@ -2103,13 +2111,10 @@ pub(crate) unsafe fn acknowledge_directory_notify_completion(
 /// `NtClose` on a writable-volume file object (honours a pending delete).
 pub(crate) unsafe fn close(file_id: u64) {
     if let Ok(fs) = writable_fs() {
-        let before = fs.node_count();
         if fs.zw_close(file_id) == nt_fs::STATUS_SUCCESS {
             OVERLAY_CLOSES.fetch_add(1, Ordering::Relaxed);
-            if fs.node_count() != before {
-                mark_snapshot_dirty();
-            }
         }
+        publish_file_cleanup_effects(fs);
     }
 }
 

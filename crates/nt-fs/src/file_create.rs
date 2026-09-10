@@ -329,6 +329,9 @@ impl FileSystem {
             open_privileges: FileOpenPrivileges::default(),
             handle_references: 1,
             references: 1,
+            serialization: nt_io_completion::FileIoSerialization::new(),
+            cleanup_reference_held: false,
+            cleanup_error: None,
             delete_pending: options & FILE_DELETE_ON_CLOSE != 0,
             query: DirectoryQueryState::new(),
         });

@@ -3392,6 +3392,7 @@ fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
             return status;
         }
     }
+    unsafe { crate::writable_fs::redrive_file_cleanup_work() };
     let writable_fs_mount_dirty = crate::writable_fs::take_mount_dirty();
     let writable_fs_runtime_dirty = crate::writable_fs::take_runtime_dirty();
     let writable_fs_touched =

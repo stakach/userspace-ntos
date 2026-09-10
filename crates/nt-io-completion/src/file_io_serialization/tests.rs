@@ -5,6 +5,35 @@ const ALERTABLE: FileIoMode = FileIoMode::SynchronousAlertable;
 const ASYNC: FileIoMode = FileIoMode::Asynchronous;
 
 #[test]
+fn adoption_requires_exact_unconsumed_grant_and_preserves_reference_floor() {
+    let mut busy = FileIoSerialization::new();
+    assert_eq!(busy.adopt_io_grant(SYNC, 1), Err(STATUS_INVALID_PARAMETER));
+    busy.begin_io(SYNC, 1, false).unwrap();
+    busy.begin_io(SYNC, 2, false).unwrap();
+    assert_eq!(busy.ordinary_io_references(), 2);
+    busy.release_io(SYNC, 1).unwrap();
+    busy.promote_io_waiter(SYNC, 2).unwrap();
+    assert_eq!(busy.ordinary_io_references(), 1);
+    assert_eq!(busy.io_grant_owner(), Some(2));
+    let before = busy;
+    for tid in [0, 1, u64::MAX] {
+        assert_eq!(
+            busy.adopt_io_grant(SYNC, tid),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(busy, before);
+    }
+    assert_eq!(busy.adopt_io_grant(ASYNC, 2), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(busy, before);
+    assert_eq!(busy.adopt_io_grant(SYNC, 2), Ok(()));
+    assert_eq!(busy.io_grant_owner(), None);
+    assert_eq!(busy.ordinary_io_references(), 1);
+    assert_eq!(busy.adopt_io_grant(SYNC, 2), Err(STATUS_INVALID_PARAMETER));
+    busy.release_io(SYNC, 2).unwrap();
+    assert_eq!(busy.ordinary_io_references(), 0);
+}
+
+#[test]
 fn empty_state_and_async_bypass_are_independent_of_file_signaling() {
     let mut busy = FileIoSerialization::new();
     assert_eq!(busy, FileIoSerialization::default());

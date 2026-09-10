@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 nt-hive-core = { workspace = true }
 nt-cache-manager = { workspace = true }
+nt-io-completion = { workspace = true }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
