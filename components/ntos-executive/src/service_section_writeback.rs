@@ -78,10 +78,11 @@ pub(crate) unsafe fn service_generic_section_writeback_plan(
     if !generic_section_writes_back(plan.section) {
         return WritebackResult::default();
     }
-    let Some(info) = crate::writable_fs::standard_information(plan.section.backing.overlay_file_id)
-    else {
-        return WritebackResult::failure(nt_fs::STATUS_INVALID_HANDLE);
-    };
+    let info =
+        match crate::writable_fs::file_object_information(plan.section.backing.overlay_file_id) {
+            Ok(info) => info.metadata,
+            Err(status) => return WritebackResult::failure(status),
+        };
     if let Err(status) = table.refresh_file_extent(plan.view.section_index, info.end_of_file) {
         return WritebackResult::failure(status);
     }

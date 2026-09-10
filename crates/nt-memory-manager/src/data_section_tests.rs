@@ -186,12 +186,13 @@ fn only_shared_writable_protection_can_extend() {
 
 #[test]
 fn query_and_extension_failures_are_propagated_and_false_success_is_rejected() {
-    let mut io = FileIo::new(10);
-    io.fail_query = 0xc000_0008;
-    assert_eq!(
-        prepare_data_section_file(20, 4, 3, &mut io),
-        Err(0xc000_0008)
-    );
+    for error in [0xc000_0008, 0x8000_0011, 0xc000_003e, 0xc000_0102, 0xc000_009a] {
+        let mut io = FileIo::new(10);
+        io.fail_query = error;
+        assert_eq!(prepare_data_section_file(20, 4, 3, &mut io), Err(error));
+        assert_eq!(io.info.end_of_file, 10);
+        assert_eq!(io.calls, [0]);
+    }
     for error in [0xc000_00a2, 0xc000_007f, STATUS_ACCESS_DENIED] {
         let mut io = FileIo::new(10);
         io.fail_extend = error;
@@ -356,10 +357,7 @@ struct MemFile {
 }
 impl DataSectionFileIo for MemFile {
     fn query_file(&mut self) -> Result<DataSectionFileInfo, u32> {
-        let info = self
-            .fs
-            .zw_query_standard_information(self.handle)
-            .ok_or(0xc000_0008u32)?;
+        let info = self.fs.query_file_object_information(self.handle)?.metadata;
         Ok(DataSectionFileInfo {
             end_of_file: info.end_of_file,
             is_directory: info.is_directory,
@@ -422,4 +420,36 @@ fn real_file_extension_is_visible_before_pagein_and_preserves_existing_bytes() {
     )
     .unwrap();
     assert_eq!(bytes, [0; DATA_PAGE_SIZE]);
+}
+
+#[test]
+fn real_section_backing_outlives_handle_but_not_final_io_reference() {
+    let mut fs = nt_fs::FileSystem::new(nt_fs::MemFs::new());
+    let file = fs.zw_create_file(r"\??\C:\retained", 3, 0, 0, nt_fs::FILE_CREATE, 0);
+    assert_eq!(file.status, 0);
+    assert_eq!(fs.zw_write_file(file.handle, Some(0), b"section"), (0, 7));
+    assert_eq!(fs.zw_retain_io_reference(file.handle), Ok(()));
+    assert_eq!(fs.zw_close(file.handle), 0);
+    let mut io = MemFile {
+        fs,
+        handle: file.handle,
+    };
+    let extent = prepare_data_section_file(0, 2, 1, &mut io).unwrap();
+    assert_eq!(extent.file_size, 7);
+    let mut bytes = [0xcc; DATA_PAGE_SIZE];
+    read_data_section_page(
+        0,
+        extent.section_size,
+        extent.file_size,
+        &mut bytes,
+        &mut io,
+    )
+    .unwrap();
+    assert_eq!(&bytes[..7], b"section");
+    assert!(bytes[7..].iter().all(|byte| *byte == 0));
+    assert_eq!(io.fs.zw_release_io_reference(file.handle), Ok(()));
+    assert_eq!(
+        prepare_data_section_file(0, 2, 1, &mut io),
+        Err(nt_fs::STATUS_INVALID_HANDLE)
+    );
 }

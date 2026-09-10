@@ -24521,9 +24521,7 @@ impl ExecNtHandler {
             }
             nt_process::HandleObject::OverlayFile(file_id) => {
                 // SAFETY: the executive service loop serializes every writable-volume access.
-                if unsafe { crate::writable_fs::standard_information(file_id) }.is_none() {
-                    return Err(STATUS_INVALID_HANDLE);
-                }
+                unsafe { crate::writable_fs::file_object_information(file_id) }?;
                 Ok(FileParseRoot::OverlayFile(file_id))
             }
             nt_process::HandleObject::RoutedFile { file_id, device_id } => {
@@ -24649,10 +24647,8 @@ impl ExecNtHandler {
         )?;
         match root {
             FileParseRoot::OverlayFile(root_file_id) => {
-                let Some(standard) = crate::writable_fs::standard_information(root_file_id) else {
-                    return Err(nt_fs::STATUS_INVALID_HANDLE);
-                };
-                if !standard.is_directory {
+                let info = crate::writable_fs::file_object_information(root_file_id)?;
+                if !info.metadata.is_directory {
                     return Err(nt_fs::STATUS_NOT_A_DIRECTORY);
                 }
                 if output.len() < file_name.len() {
@@ -29266,7 +29262,7 @@ impl ExecNtHandler {
                 (nt_fs::file_mode_from_create_options(open.create_options), 0)
             }
             nt_process::HandleObject::OverlayFile(file_id) => (
-                crate::writable_fs::file_mode(file_id).ok_or(nt_fs::STATUS_INVALID_HANDLE)?,
+                crate::writable_fs::file_object_information(file_id)?.mode,
                 0,
             ),
             _ => return Err(0xC000_0024), // STATUS_OBJECT_TYPE_MISMATCH
@@ -29444,8 +29440,7 @@ impl ExecNtHandler {
                 }))
             }
             nt_process::HandleObject::OverlayFile(file_id) => {
-                let mode =
-                    crate::writable_fs::file_mode(file_id).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                let mode = crate::writable_fs::file_object_information(file_id)?.mode;
                 Ok(Some(LocalDirectoryNotifyRoute::Overlay {
                     file_id,
                     file_object: LOCAL_OVERLAY_FILE_OBJECT_TAG | (file_id & LOCAL_ID_PAYLOAD_MASK),
@@ -29629,20 +29624,16 @@ impl ExecNtHandler {
                 }
             }
             nt_process::HandleObject::OverlayFile(file_object) => {
-                let metadata = crate::writable_fs::metadata(file_object)
-                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                let info = crate::writable_fs::file_object_information(file_object)?;
+                let metadata = info.metadata;
                 LocalByteLockRoute {
                     file_id: LOCAL_OVERLAY_FILE_ID_TAG | (metadata.file_id & LOCAL_ID_PAYLOAD_MASK),
                     file_object: LOCAL_OVERLAY_FILE_OBJECT_TAG
                         | (file_object & LOCAL_ID_PAYLOAD_MASK),
-                    synchronous: crate::writable_fs::file_mode(file_object)
-                        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+                    synchronous: info.mode
                         & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                         != 0,
-                    alertable: crate::writable_fs::file_mode(file_object)
-                        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
-                        & nt_fs::FILE_SYNCHRONOUS_IO_ALERT
-                        != 0,
+                    alertable: info.mode & nt_fs::FILE_SYNCHRONOUS_IO_ALERT != 0,
                 }
             }
             nt_process::HandleObject::File(_) | nt_process::HandleObject::RoutedFile { .. } => {
@@ -29787,20 +29778,15 @@ impl ExecNtHandler {
                 (open.metadata, 0, name, Some(open.alternate_name))
             }
             nt_process::HandleObject::OverlayFile(file_id) => {
-                let offset = crate::writable_fs::current_offset(file_id)
-                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-                let metadata =
-                    crate::writable_fs::metadata(file_id).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                let info = crate::writable_fs::file_object_information(file_id)?;
                 let name = if include_opened_name {
-                    let opened_name = crate::writable_fs::opened_name(file_id)
-                        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                    let opened_name = crate::writable_fs::opened_name(file_id)?;
                     Some(utf16_file_name(&opened_name)?)
                 } else {
                     None
                 };
-                let alternate_name =
-                    crate::writable_fs::short_name(file_id).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-                (metadata, offset, name, Some(alternate_name))
+                let alternate_name = crate::writable_fs::short_name(file_id)?;
+                (info.metadata, info.current_offset, name, Some(alternate_name))
             }
             nt_process::HandleObject::File(_) | nt_process::HandleObject::RoutedFile { .. } => {
                 return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
@@ -41097,9 +41083,9 @@ impl ExecNtHandler {
                             Ok(index) => index,
                             Err(status) => return status,
                         };
-                        let mode = match crate::writable_fs::file_mode(file_id) {
-                            Some(mode) => mode,
-                            None => return nt_fs::STATUS_INVALID_HANDLE,
+                        let mode = match crate::writable_fs::file_object_information(file_id) {
+                            Ok(info) => info.mode,
+                            Err(status) => return status,
                         };
                         let synchronous = mode
                             & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
@@ -43281,17 +43267,16 @@ impl ExecNtHandler {
                             if let Some(file_id) = overlay_file {
                                 operation_started = true;
                                 let route = self.local_file_io_route_for(fh);
-                                let current = crate::writable_fs::current_offset(file_id);
-                                let metadata = crate::writable_fs::metadata(file_id);
-                                match (route, current, metadata) {
-                                    (Ok(Some(route)), Some(current), Some(metadata)) => {
+                                let info = crate::writable_fs::file_object_information(file_id);
+                                match (route, info) {
+                                    (Ok(Some(route)), Ok(info)) => {
                                         let resolved =
                                             nt_io_manager::resolve_regular_file_write_offset(
                                                 (byte_offset != 0)
                                                     .then_some(i64::from_le_bytes(offset_bytes)),
                                                 route.synchronous,
-                                                current,
-                                                metadata.end_of_file,
+                                                info.current_offset,
+                                                info.metadata.end_of_file,
                                                 append_only,
                                             );
                                         let resolved = match resolved {
@@ -43345,7 +43330,7 @@ impl ExecNtHandler {
                                             }
                                         }
                                     }
-                                    (Err(status), _, _) => status,
+                                    (Err(status), _) | (_, Err(status)) => status,
                                     _ => nt_fs::STATUS_INVALID_HANDLE,
                                 }
                             } else {
@@ -43792,14 +43777,14 @@ impl ExecNtHandler {
                             } else if let Some(file_id) = overlay_file {
                                 operation_started = true;
                                 let route = self.local_file_io_route_for(fh);
-                                let current = crate::writable_fs::current_offset(file_id);
-                                match (route, current) {
-                                    (Ok(Some(route)), Some(current)) => {
+                                let info = crate::writable_fs::file_object_information(file_id);
+                                match (route, info) {
+                                    (Ok(Some(route)), Ok(info)) => {
                                         let resolved =
                                             nt_io_manager::resolve_regular_file_read_offset(
                                                 (byte_offset != 0).then_some(signed_offset),
                                                 route.synchronous,
-                                                current,
+                                                info.current_offset,
                                             );
                                         match resolved {
                                             Err(status) => status.raw() as u32,
@@ -43871,7 +43856,7 @@ impl ExecNtHandler {
                                             }
                                         }
                                     }
-                                    (Err(status), _) => status,
+                                    (Err(status), _) | (_, Err(status)) => status,
                                     _ => nt_fs::STATUS_INVALID_HANDLE,
                                 }
                             } else {

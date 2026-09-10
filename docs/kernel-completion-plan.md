@@ -32239,6 +32239,52 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Root serialized every build/test. No VM, microkernel change, filesystem exclusion or desktop
     acceptance is claimed by this checkpoint.
 
+    Checked file-object admission checkpoint (2026-09-10): preserve
+    writable storage failures in handle-based operations before native filesystem exclusion.
+    - [x] Add one allocation-free checked snapshot of FILE_OBJECT metadata, position and mode;
+      validate the retained object and actual file backing, distinguishing invalid handles from
+      storage corruption. File-object slot zero is valid; an I/O reference keeps the object
+      queryable after final handle cleanup until its own release.
+    - [x] Migrate native handle/root validation, read/write offset resolution, local lock/notify
+      routing, directory queries, section creation/page-in and section writeback. Remove the
+      replaced Option-shaped native metadata/position/mode helpers. Preserve checked name-query
+      admission, allocation and namespace errors rather than mapping them to invalid handles.
+      Retained opened spelling remains available after unlink, including when another hard link
+      survives; an unlinked object has no live alternate-name entry. Missing-entry tampering is
+      not distinguishable from legitimate unlink without a lifecycle receipt, so this slice makes
+      no claim to detect it. Present wrong-node entries and broken ancestor chains fail closed.
+    - [x] Run focused and broad serialized host regressions plus the native executive build.
+      Ten new filesystem tests cover checked snapshots/names, real open/node identity, corrupt
+      extents and namespace, duplicated handles, root directories and retained I/O-only lifetime.
+      A new real filesystem/section test proves backing remains readable after final handle close
+      and becomes invalid after final I/O release. Expanded section admission tests propagate
+      Busy, invalid-handle, corruption and resource failures without extension or publication.
+
+    Validation: 1,036 focused and 2,296 broad host tests/doctests passed, with no failures or ignored
+    tests. Broad packages: nt-fs, nt-memory-manager, nt-io-manager, nt-config-abi, nt-config-client,
+    nt-config-server, nt-config-manager, nt-hive-core, nt-security and nt-user-host. Evidence:
+    .tmp/test-checked-file-object-focused-20260910.log and
+    .tmp/test-checked-file-object-full-20260910.log. Native executive release build passed in 37.43s
+    with the existing 293 warnings unchanged (.tmp/build-checked-file-object-executive-20260910.log).
+    Root serialized every build/test. No VM run, microkernel change, native filesystem exclusion
+    or desktop acceptance is claimed by this checkpoint.
+
+    Close-lifecycle review adjustment: implement retained close authority before enabling Busy
+    admission. Every duplicated handle carries a separate close obligation; a per-file boolean or
+    deduplicated raw-ID queue is insufficient. Reserve ownership before fresh opens and reference
+    retains can escape, bind it to the physical mount/open incarnation, and consume an exact
+    per-reference token or PM-handle retirement identity. Raw file-object slots can be reused and
+    metadata file IDs identify nodes, not open incarnations. Final-handle byte-lock cleanup and
+    cleanup-generated notifications belong to that same retained lifecycle. Ordinary NtClose
+    must complete cleanup or retain its caller continuation, never report success just because
+    cleanup was queued. Unpublished create/duplicate/inheritance rollback, process teardown and
+    inline I/O rollback must preserve their obligations independently of ExecNtHandler lifetime.
+    Logical read/position completion still asserts infallible filesystem admission after data
+    transfer; retain that terminal metadata/accounting work as well, without replaying transferred
+    bytes or counting a retried completion twice.
+    Keep this work, private global filesystem exclusion, exact CM storage binding, bootstrap
+    optional-primary/log-only handling and genuine desktop acceptance open.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

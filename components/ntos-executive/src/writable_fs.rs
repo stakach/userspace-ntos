@@ -1776,38 +1776,32 @@ pub(crate) unsafe fn flush(file_id: u64) -> u32 {
     fs.zw_flush_buffers_file(file_id)
 }
 
-/// `NtQueryInformationFile` metadata for a writable-volume file object.
-pub(crate) unsafe fn standard_information(file_id: u64) -> Option<nt_fs::StandardInformation> {
-    writable_fs().ok()?.zw_query_standard_information(file_id)
+/// Capture file metadata, position and mode under the same writable-volume admission.
+pub(crate) unsafe fn file_object_information(file_id: u64) -> Result<nt_fs::FileObjectInformation, u32> {
+    writable_fs()?.query_file_object_information(file_id)
 }
 
-pub(crate) unsafe fn metadata(file_id: u64) -> Option<nt_fs::FileMetadata> {
-    writable_fs().ok()?.zw_query_metadata(file_id)
-}
-
-pub(crate) unsafe fn section_backing(file_id: u64) -> Result<nt_memory_manager::GenericSectionBacking, u32> {
-    let info = metadata(file_id).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+pub(crate) unsafe fn section_backing(
+    file_id: u64,
+) -> Result<nt_memory_manager::GenericSectionBacking, u32> {
+    let info = file_object_information(file_id)?.metadata;
     let mount = (*core::ptr::addr_of!(WRITABLE_MOUNT_ID)).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-    Ok(nt_memory_manager::GenericSectionBacking::overlay(file_id,
-        nt_memory_manager::SectionFileIdentity { mount, file_id: info.file_id }, info.end_of_file))
+    Ok(nt_memory_manager::GenericSectionBacking::overlay(
+        file_id,
+        nt_memory_manager::SectionFileIdentity {
+            mount,
+            file_id: info.file_id,
+        },
+        info.end_of_file,
+    ))
 }
 
-pub(crate) unsafe fn opened_name(file_id: u64) -> Option<alloc::string::String> {
-    writable_fs().ok()?.zw_query_opened_name(file_id)
+pub(crate) unsafe fn opened_name(file_id: u64) -> Result<alloc::string::String, u32> {
+    writable_fs()?.query_opened_name(file_id)
 }
 
-pub(crate) unsafe fn short_name(file_id: u64) -> Option<nt_fs::FileShortName> {
-    writable_fs().ok()?.zw_query_short_name(file_id)
-}
-
-/// Current byte offset for a writable-volume file object.
-pub(crate) unsafe fn current_offset(file_id: u64) -> Option<u64> {
-    writable_fs().ok()?.current_offset(file_id)
-}
-
-/// I/O-Manager-owned mode flags retained by a writable-volume file object.
-pub(crate) unsafe fn file_mode(file_id: u64) -> Option<u32> {
-    writable_fs().ok()?.file_mode(file_id)
+pub(crate) unsafe fn short_name(file_id: u64) -> Result<nt_fs::FileShortName, u32> {
+    writable_fs()?.query_short_name(file_id)
 }
 
 /// `NtSetInformationFile` on a writable-volume file object.

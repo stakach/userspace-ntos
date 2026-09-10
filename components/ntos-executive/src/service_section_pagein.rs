@@ -19,8 +19,8 @@ impl DataSectionFileIo for BackingIo {
             }),
             GENERIC_SECTION_BACKING_OVERLAY => {
                 let info =
-                    unsafe { crate::writable_fs::standard_information(self.0.overlay_file_id) }
-                        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                    unsafe { crate::writable_fs::file_object_information(self.0.overlay_file_id) }?
+                        .metadata;
                 Ok(DataSectionFileInfo {
                     end_of_file: info.end_of_file,
                     is_directory: info.is_directory,
