@@ -6258,29 +6258,6 @@ impl ExecNtHandler {
         print_str(b"\"\n");
     }
 
-    /// Read a whole file named by an NT path into `dst`, returning its byte length. Serves
-    /// `NtLoadKey`'s SourceFile: the writable volume first (where a copied profile's `ntuser.dat`
-    /// lives), then the read-only `\reactos` FAT reader.
-    ///
-    /// # Safety
-    /// Borrows the mounted writable volume for the duration of the copy; single-threaded executive.
-    unsafe fn read_file_by_nt_path(name16: &[u16], dst: &mut [u8]) -> Option<usize> {
-        let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
-        let mut relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
-        if let Some(relative_len) =
-            crate::writable_fs::writable_path_into(name16, &mut folded, &mut relative)
-        {
-            let fs = crate::writable_fs::writable_fs()?;
-            let bytes = fs.file_bytes_relative(&relative[..relative_len])?;
-            if bytes.len() > dst.len() {
-                return None;
-            }
-            dst[..bytes.len()].copy_from_slice(bytes);
-            return Some(bytes.len());
-        }
-        None
-    }
-
     unsafe fn nt_save_key(&mut self, key_handle: u64, file_handle: u64) -> u32 {
         self.nt_save_key_ex(key_handle, file_handle, 1)
     }
@@ -7269,12 +7246,22 @@ impl ExecNtHandler {
 
         // The SOURCE file: read the whole regf out of the filesystem into a durable static slot.
         let file16 = self.read_objattr_name_pe(source_oa);
-        let mut file_name = alloc::string::String::new();
-        for &unit in &file16 {
-            if let Some(c) = char::from_u32(unit as u32) {
-                file_name.push(c);
-            }
-        }
+        let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
+        let mut relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
+        let Some(relative_len) = crate::writable_fs::writable_path_into(
+            &file16,
+            &mut folded,
+            &mut relative,
+        ) else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        let relative = &relative[..relative_len];
+        // Initial read, journal replay and later flushes must retain the same canonical path.
+        let mut file_name = alloc::string::String::from(r"\??\C:\");
+        let Ok(relative_name) = core::str::from_utf8(relative) else {
+            return nt_fs::STATUS_OBJECT_NAME_INVALID;
+        };
+        file_name.push_str(relative_name);
         let Some(slot) = (0..USER_HIVE_SLOTS)
             .find(|s| USER_HIVE_SLOT_USED.load(Ordering::Relaxed) & (1 << s) == 0)
         else {
@@ -7284,11 +7271,14 @@ impl ExecNtHandler {
         // SAFETY: single-threaded executive; the slot is claimed below and only released by
         // `NtUnloadKey`, which drops the borrowing mount first.
         let buffer = &mut (*core::ptr::addr_of_mut!(USER_HIVE_BUF))[slot];
-        let Some(len) = Self::read_file_by_nt_path(&file16, buffer) else {
-            print_str(b"[cm-load] NtLoadKey: source file unreadable: ");
-            print_ascii_str(&file_name);
-            print_str(b"\n");
-            return STATUS_OBJECT_NAME_NOT_FOUND;
+        let len = match crate::writable_fs::read_file_relative_into(relative, buffer) {
+            Ok(Some(len)) => len,
+            result => {
+                print_str(b"[cm-load] NtLoadKey: source file unreadable: ");
+                print_ascii_str(&file_name);
+                print_str(b"\n");
+                return result.err().unwrap_or(STATUS_OBJECT_NAME_NOT_FOUND);
+            }
         };
         // SAFETY: the slot is a `'static` array; the borrow lives exactly as long as the mount.
         let bytes: &'static [u8] =
@@ -7300,7 +7290,10 @@ impl ExecNtHandler {
             hive.subkeys(hive.root()).len() as u64
         } else {
             let provider_core_hive =
-                if unsafe { crate::writable_fs::file_bytes_if_mounted(&file_name).is_some() } {
+                if match crate::writable_fs::file_len_if_mounted(&file_name) {
+                    Ok(length) => length.is_some(),
+                    Err(status) => return status,
+                } {
                     let mut manager = nt_hive_core::HiveManager::new(
                         crate::writable_fs::WritableHiveIoProvider::new(&file_name),
                     );
@@ -11676,7 +11669,12 @@ impl ExecNtHandler {
                     Err(status) => return (status, 0, 0),
                 };
                 let full_path = &full_path[..full_len];
-                if crate::writable_fs::query_attributes_relative_if_mounted(full_path).is_some() {
+                let overlay_hit =
+                    match crate::writable_fs::query_metadata_relative_if_mounted(full_path) {
+                        Ok(info) => info.is_some(),
+                        Err(status) => return (status, 0, 0),
+                    };
+                if overlay_hit {
                     return publish_overlay(
                         self,
                         crate::writable_fs::create(
@@ -11744,11 +11742,12 @@ impl ExecNtHandler {
                     return (nt_fs::STATUS_OBJECT_NAME_COLLISION, 0, 0);
                 }
                 if let Some(parent) = Self::volume_relative_parent(full_path) {
-                    if Self::readonly_volume_relative_is_dir(parent)
-                        && crate::writable_fs::provision_directory_relative_change(parent)
-                            == Some(true)
-                    {
-                        self.writable_fs_dirty = true;
+                    if Self::readonly_volume_relative_is_dir(parent) {
+                        match crate::writable_fs::ensure_installed_directory_relative(parent) {
+                            Ok(true) => self.writable_fs_dirty = true,
+                            Ok(false) => {}
+                            Err(status) => return (status, 0, 0),
+                        }
                     }
                 }
                 publish_overlay(
@@ -24771,6 +24770,17 @@ impl ExecNtHandler {
                 if open.first_cluster != first_cluster {
                     return Err(STATUS_INVALID_HANDLE);
                 }
+                let mut full_path = [0u8; nt_fs::DIRECTORY_OPEN_PATH_CAP];
+                let full_len = Self::join_volume_relative_path(
+                    open.volume_relative_path(),
+                    relative,
+                    &mut full_path,
+                )?;
+                if let Some(info) = crate::writable_fs::query_metadata_relative_if_mounted(
+                    &full_path[..full_len],
+                )? {
+                    return Ok(info);
+                }
                 let Some(entry) = exec_fs().and_then(|fs| {
                     crate::fs_loader::fat_open_path_metadata_from(&fs, first_cluster, relative)
                 }) else {
@@ -32617,9 +32627,13 @@ impl ExecNtHandler {
         if let Some(relative_len) =
             crate::writable_fs::writable_path_into(name16, folded_scratch, relative_scratch)
         {
-            if let Some(info) =
-                crate::writable_fs::query_metadata_relative(&relative_scratch[..relative_len])
-            {
+            let info = match crate::writable_fs::query_metadata_relative(
+                &relative_scratch[..relative_len],
+            ) {
+                Ok(info) => info,
+                Err(status) => return status,
+            };
+            if let Some(info) = info {
                 return if unsafe { self.write_file_basic_information(args[1], info) } {
                     nt_fs::STATUS_SUCCESS
                 } else {
@@ -32630,9 +32644,13 @@ impl ExecNtHandler {
         if let Some(relative_len) =
             crate::writable_fs::volume_path_into(name16, folded_scratch, relative_scratch)
         {
-            if let Some(info) = crate::writable_fs::query_metadata_relative_if_mounted(
+            let info = match crate::writable_fs::query_metadata_relative_if_mounted(
                 &relative_scratch[..relative_len],
             ) {
+                Ok(info) => info,
+                Err(status) => return status,
+            };
+            if let Some(info) = info {
                 return if self.write_file_basic_information(args[1], info) {
                     nt_fs::STATUS_SUCCESS
                 } else {
@@ -32728,9 +32746,13 @@ impl ExecNtHandler {
         if let Some(relative_len) =
             crate::writable_fs::writable_path_into(name16, folded_scratch, relative_scratch)
         {
-            if let Some(info) =
-                crate::writable_fs::query_metadata_relative(&relative_scratch[..relative_len])
-            {
+            let info = match crate::writable_fs::query_metadata_relative(
+                &relative_scratch[..relative_len],
+            ) {
+                Ok(info) => info,
+                Err(status) => return status,
+            };
+            if let Some(info) = info {
                 return if unsafe { self.write_file_network_open_information(args[1], info) } {
                     nt_fs::STATUS_SUCCESS
                 } else {
@@ -32741,9 +32763,13 @@ impl ExecNtHandler {
         if let Some(relative_len) =
             crate::writable_fs::volume_path_into(name16, folded_scratch, relative_scratch)
         {
-            if let Some(info) = crate::writable_fs::query_metadata_relative_if_mounted(
+            let info = match crate::writable_fs::query_metadata_relative_if_mounted(
                 &relative_scratch[..relative_len],
             ) {
+                Ok(info) => info,
+                Err(status) => return status,
+            };
+            if let Some(info) = info {
                 return if self.write_file_network_open_information(args[1], info) {
                     nt_fs::STATUS_SUCCESS
                 } else {
@@ -33116,7 +33142,18 @@ impl ExecNtHandler {
             crate::writable_fs::volume_path_into(name16, &mut path_folded, &mut path_relative);
         if let Some(relative_len) = volume_relative_len {
             let relative = &path_relative[..relative_len];
-            if crate::writable_fs::query_attributes_relative_if_mounted(relative).is_some() {
+            let overlay_hit = match crate::writable_fs::query_metadata_relative_if_mounted(relative) {
+                Ok(info) => info.is_some(),
+                Err(status) => {
+                    self.write_nt_open_file_handle_out(file_handle_out, 0);
+                    if args[3] != 0 {
+                        self.xas_write_buf(args[3], &status.to_le_bytes());
+                        self.xas_write_buf(args[3] + 8, &0u64.to_le_bytes());
+                    }
+                    return status;
+                }
+            };
+            if overlay_hit {
                 let (mut status, file_id, information) =
                     crate::writable_fs::open_existing_relative_if_mounted(
                         relative,
@@ -42764,15 +42801,29 @@ impl ExecNtHandler {
                     &mut writable_relative,
                 );
                 if let Some(length) = writable_relative_len {
-                    let _ =
-                        crate::writable_fs::query_metadata_relative(&writable_relative[..length]);
+                    if let Err(status) = crate::writable_fs::query_metadata_relative(
+                        &writable_relative[..length],
+                    ) {
+                        self.queue_write(file_handle_out, 0);
+                        self.xas_write_buf(iosb, &status.to_le_bytes());
+                        self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                        return status;
+                    }
                 }
-                let volume_overlay_hit = volume_relative_len.is_some_and(|length| {
-                    crate::writable_fs::query_attributes_relative_if_mounted(
+                let volume_overlay_hit = match volume_relative_len {
+                    Some(length) => match crate::writable_fs::query_metadata_relative_if_mounted(
                         &volume_relative[..length],
-                    )
-                    .is_some()
-                });
+                    ) {
+                        Ok(info) => info.is_some(),
+                        Err(status) => {
+                            self.queue_write(file_handle_out, 0);
+                            self.xas_write_buf(iosb, &status.to_le_bytes());
+                            self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                            return status;
+                        }
+                    },
+                    None => false,
+                };
                 if Self::is_named_pipe_root_path(name16) {
                     if create_disposition != nt_fs::FILE_OPEN {
                         status = nt_fs::STATUS_INVALID_PARAMETER;
@@ -42966,10 +43017,16 @@ impl ExecNtHandler {
                     } else {
                         if let Some(parent) = Self::volume_relative_parent(relative) {
                             if Self::readonly_volume_relative_is_dir(parent) {
-                                if crate::writable_fs::provision_directory_relative_change(parent)
-                                    == Some(true)
+                                match crate::writable_fs::ensure_installed_directory_relative(parent)
                                 {
-                                    self.writable_fs_dirty = true;
+                                    Ok(true) => self.writable_fs_dirty = true,
+                                    Ok(false) => {}
+                                    Err(status) => {
+                                        self.queue_write(file_handle_out, 0);
+                                        self.xas_write_buf(iosb, &status.to_le_bytes());
+                                        self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                                        return status;
+                                    }
                                 }
                             }
                         }

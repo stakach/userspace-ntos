@@ -243,8 +243,8 @@ pub(crate) fn hive_image_value_len_on(
 /// Single-threaded executive; borrows the mounted volume for the duration of the read.
 pub(crate) unsafe fn hive_image_len_at(path: &str) -> usize {
     match writable_fs() {
-        Some(fs) => hive_image_len_on(fs, path),
-        None => 0,
+        Ok(fs) => hive_image_len_on(fs, path),
+        Err(_) => 0,
     }
 }
 
@@ -258,8 +258,8 @@ pub(crate) unsafe fn hive_image_value_len_at(
     value_name: &str,
 ) -> usize {
     match writable_fs() {
-        Some(fs) => hive_image_value_len_on(fs, path, key_path, value_name),
-        None => 0,
+        Ok(fs) => hive_image_value_len_on(fs, path, key_path, value_name),
+        Err(_) => 0,
     }
 }
 
@@ -350,10 +350,10 @@ pub(crate) const COPIED_PROFILE_PROBE_FILE: &str =
 /// Single-threaded executive; borrows the mounted volume for the duration of the query.
 pub(crate) unsafe fn directory_exists_at(path: &str) -> bool {
     match writable_fs() {
-        Some(fs) => fs
+        Ok(fs) => fs
             .query_attributes(path)
             .is_some_and(|info| info.is_directory),
-        None => false,
+        Err(_) => false,
     }
 }
 
@@ -364,8 +364,8 @@ pub(crate) unsafe fn directory_exists_at(path: &str) -> bool {
 /// Single-threaded executive; borrows the mounted volume for the duration of the read.
 pub(crate) unsafe fn copied_profile_probe_ok() -> bool {
     match writable_fs() {
-        Some(fs) => fs.file_bytes(COPIED_PROFILE_PROBE_FILE) == Some(b"@start %1"),
-        None => false,
+        Ok(fs) => fs.file_bytes(COPIED_PROFILE_PROBE_FILE) == Some(b"@start %1"),
+        Err(_) => false,
     }
 }
 
@@ -898,16 +898,16 @@ unsafe fn provision_missing_installed_sources(fs: &mut nt_fs::FileSystem) -> boo
     changed
 }
 
-/// The live writable volume, mounting it on first use. `None` when the overlay is bypassed.
+/// The live writable volume, mounting it on first use. Admission failure is never file absence.
 ///
 /// # Safety
 /// Single-threaded executive; the returned reference must not outlive the calling syscall service.
-pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
+unsafe fn writable_fs() -> Result<&'static mut nt_fs::FileSystem, u32> {
     if !WRITABLE_OVERLAY_MOUNTED {
-        return None;
+        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     }
     if WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
-        return None;
+        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     }
     if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_none() {
         let (fs, restored) = match restore_snapshot_volume_once() {
@@ -916,7 +916,7 @@ pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
                 (fs, true)
             }
             Ok(None) => (nt_fs::FileSystem::new(nt_fs::MemFs::new()), false),
-            Err(snapshot_storage::BUSY) => return None,
+            Err(snapshot_storage::BUSY) => return Err(snapshot_storage::BUSY),
             Err(status) => {
                 WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
                 print_str(
@@ -924,17 +924,44 @@ pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
                 );
                 print_hex(status);
                 print_str(b"\n");
-                return None;
+                return Err(status);
             }
         };
-        if install_writable_fs(fs, restored).is_err() {
+        if let Err(status) = install_writable_fs(fs, restored) {
             WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-            return None;
+            return Err(status);
         }
     }
-    let fs = (&mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut()?;
+    let fs = (&mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS))
+        .as_mut()
+        .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
     fs.set_current_time_100ns(nt_system_time_100ns());
-    Some(fs)
+    Ok(fs)
+}
+
+/// Mount without lending filesystem ownership outside this module.
+pub(crate) unsafe fn ensure_mounted() -> Result<(), u32> {
+    writable_fs().map(|_| ())
+}
+
+/// A non-mounting namespace observation. An unread or unsuccessfully installed snapshot is not
+/// an absent upper layer. Only a disabled overlay or a confirmed empty reserve permits that result.
+unsafe fn mounted_namespace_fs() -> Result<Option<&'static mut nt_fs::FileSystem>, u32> {
+    if !WRITABLE_OVERLAY_MOUNTED {
+        return Ok(None);
+    }
+    if WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
+        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+    }
+    if let Some(fs) = (&mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut() {
+        fs.set_current_time_100ns(nt_system_time_100ns());
+        return Ok(Some(fs));
+    }
+    if WRITABLE_FS_SNAPSHOT_RESTORE_STATE.load(Ordering::Acquire) == SNAPSHOT_RESTORE_EMPTY {
+        Ok(None)
+    } else {
+        Err(nt_fs::STATUS_DEVICE_NOT_READY)
+    }
 }
 
 pub(crate) enum BootSystemPersistence {
@@ -1037,14 +1064,12 @@ pub(crate) unsafe fn writable_fs_mounted() -> bool {
     (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some()
 }
 
-/// Borrow a mounted writable-volume file's contents without forcing a mount. Used by boot-time CM
-/// restore to import persisted hive checkpoints after the volume has already been restored.
-///
-/// # Safety
-/// Single-threaded executive; callers must not mutate the writable volume while holding the slice.
-pub(crate) unsafe fn file_bytes_if_mounted(path: &str) -> Option<&'static [u8]> {
-    let fs = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref()?;
-    fs.file_bytes(path)
+/// Copy a complete internal file into caller-owned storage without exposing a filesystem borrow.
+pub(crate) unsafe fn read_file_relative_into(
+    relative: &[u8],
+    output: &mut [u8],
+) -> Result<Option<usize>, u32> {
+    writable_fs()?.try_read_file_relative_into(relative, output)
 }
 
 /// Copy a mounted writable-volume file's full contents. This is for append-heavy internal files
@@ -1055,9 +1080,7 @@ pub(crate) unsafe fn file_bytes_if_mounted(path: &str) -> Option<&'static [u8]> 
 pub(crate) unsafe fn file_bytes_owned_if_mounted(
     path: &str,
 ) -> Result<Option<alloc::vec::Vec<u8>>, u32> {
-    let fs = (*core::ptr::addr_of!(EXEC_WRITABLE_FS))
-        .as_ref()
-        .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let fs = mounted_namespace_fs()?.ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
     fs.try_file_bytes_owned(path)
 }
 
@@ -1066,9 +1089,7 @@ pub(crate) unsafe fn file_bytes_owned_if_mounted(
 /// # Safety
 /// Single-threaded executive; borrows the mounted volume for the duration of the query.
 pub(crate) unsafe fn file_len_if_mounted(path: &str) -> Result<Option<usize>, u32> {
-    let fs = (*core::ptr::addr_of!(EXEC_WRITABLE_FS))
-        .as_ref()
-        .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let fs = mounted_namespace_fs()?.ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
     fs.try_file_len(path)?
         .map(|len| usize::try_from(len).map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES))
         .transpose()
@@ -1140,8 +1161,9 @@ pub(crate) unsafe fn create(
     disposition: u32,
     options: u32,
 ) -> (u32, Option<u64>, u64) {
-    let Some(fs) = writable_fs() else {
-        return (nt_fs::STATUS_DEVICE_NOT_READY, None, 0);
+    let fs = match writable_fs() {
+        Ok(fs) => fs,
+        Err(status) => return (status, None, 0),
     };
     let result = fs.zw_create_file_relative(
         relative,
@@ -1188,8 +1210,9 @@ pub(crate) unsafe fn create_relative_to_directory(
     disposition: u32,
     options: u32,
 ) -> (u32, Option<u64>, u64) {
-    let Some(fs) = writable_fs() else {
-        return (nt_fs::STATUS_DEVICE_NOT_READY, None, 0);
+    let fs = match writable_fs() {
+        Ok(fs) => fs,
+        Err(status) => return (status, None, 0),
     };
     let result = fs.zw_create_file_relative_to_directory(
         root_file_id,
@@ -1225,50 +1248,41 @@ pub(crate) unsafe fn create_relative_to_directory(
     )
 }
 
-pub(crate) unsafe fn query_metadata_relative(relative: &[u8]) -> Option<nt_fs::FileMetadata> {
+pub(crate) unsafe fn query_metadata_relative(
+    relative: &[u8],
+) -> Result<Option<nt_fs::FileMetadata>, u32> {
     OVERLAY_ATTR_QUERIES.fetch_add(1, Ordering::Relaxed);
     let fs = writable_fs()?;
-    let info = fs.query_metadata_relative(relative)?;
-    OVERLAY_ATTR_HITS.fetch_add(1, Ordering::Relaxed);
-    Some(info)
+    let info = fs.try_query_metadata_relative(relative)?;
+    if info.is_some() {
+        OVERLAY_ATTR_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(info)
 }
 
 pub(crate) unsafe fn query_metadata_relative_to_directory(
     root_file_id: u64,
     relative: &[u8],
 ) -> Result<nt_fs::FileMetadata, u32> {
-    let Some(fs) = writable_fs() else {
-        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
-    };
+    let fs = writable_fs()?;
     fs.query_metadata_relative_to_directory(root_file_id, relative)
 }
 
 /// Query an existing writable-layer entry without mounting the writable volume. This is used by
 /// fixed-drive union paths: an existing writable entry wins, but a missing writable entry must leave
 /// the installed read-only FAT namespace visible.
-pub(crate) unsafe fn query_attributes_relative_if_mounted(
-    relative: &[u8],
-) -> Option<nt_fs::StandardInformation> {
-    let Some(fs) = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut() else {
-        return None;
-    };
-    OVERLAY_ATTR_QUERIES.fetch_add(1, Ordering::Relaxed);
-    let info = fs.query_attributes_relative(relative)?;
-    OVERLAY_ATTR_HITS.fetch_add(1, Ordering::Relaxed);
-    Some(info)
-}
-
 pub(crate) unsafe fn query_metadata_relative_if_mounted(
     relative: &[u8],
-) -> Option<nt_fs::FileMetadata> {
-    let Some(fs) = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut() else {
-        return None;
+) -> Result<Option<nt_fs::FileMetadata>, u32> {
+    let Some(fs) = mounted_namespace_fs()? else {
+        return Ok(None);
     };
-    fs.set_current_time_100ns(nt_system_time_100ns());
     OVERLAY_ATTR_QUERIES.fetch_add(1, Ordering::Relaxed);
-    let info = fs.query_metadata_relative(relative)?;
-    OVERLAY_ATTR_HITS.fetch_add(1, Ordering::Relaxed);
-    Some(info)
+    let info = fs.try_query_metadata_relative(relative)?;
+    if info.is_some() {
+        OVERLAY_ATTR_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(info)
 }
 
 /// Open an existing writable-layer entry without mounting the writable volume. Missing entries are
@@ -1280,8 +1294,10 @@ pub(crate) unsafe fn open_existing_relative_if_mounted(
     share_access: u32,
     options: u32,
 ) -> (u32, Option<u64>, u64) {
-    let Some(fs) = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut() else {
-        return (nt_fs::STATUS_OBJECT_NAME_NOT_FOUND, None, 0);
+    let fs = match mounted_namespace_fs() {
+        Ok(Some(fs)) => fs,
+        Ok(None) => return (nt_fs::STATUS_OBJECT_NAME_NOT_FOUND, None, 0),
+        Err(status) => return (status, None, 0),
     };
     let result = fs.zw_create_file_relative(
         relative,
@@ -1337,7 +1353,7 @@ pub(crate) unsafe fn copy_up_installed_file(
             alloc::vec::Vec::new()
         }
     };
-    let fs = writable_fs().ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let fs = writable_fs()?;
     let imported = fs.import_file_relative(relative, metadata, bytes)?;
     if imported {
         mark_runtime_dirty();
@@ -1346,32 +1362,10 @@ pub(crate) unsafe fn copy_up_installed_file(
     Ok(imported)
 }
 
-/// Provision a writable-layer directory by already-folded volume-relative path. This is not a
-/// syscall success path; it materializes directory objects that the installed read-only image proves
-/// exist so later creates can allocate children in the writable layer.
-/// Provision a writable-layer directory and report whether the mounted volume grew. Callers use the
-/// growth result to schedule persistence work only when the filesystem actually changed.
-pub(crate) unsafe fn provision_directory_relative_change(relative: &[u8]) -> Option<bool> {
-    let Some(fs) = writable_fs() else {
-        return None;
-    };
-    let before = fs.node_count();
-    let provisioned = fs.provision_directory_relative(relative);
-    if !provisioned {
-        return None;
-    }
-    let changed = fs.node_count() != before;
-    if changed {
-        mark_snapshot_dirty();
-    }
-    Some(changed)
-}
-
-/// Materialize a directory whose existence was proved by the installed volume. Unlike the
-/// observational helper above, this preserves the filesystem's path/type error for callers that
-/// are about to publish a copied-up child.
+/// Materialize a directory whose existence was proved by the installed volume. Admission errors
+/// must reach callers before they attempt to publish a copied-up child.
 pub(crate) unsafe fn ensure_installed_directory_relative(relative: &[u8]) -> Result<bool, u32> {
-    let fs = writable_fs().ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let fs = writable_fs()?;
     let before = fs.node_count();
     if !fs.provision_directory_relative(relative) {
         return Err(nt_fs::STATUS_OBJECT_PATH_NOT_FOUND);
@@ -1389,8 +1383,9 @@ pub(crate) unsafe fn read(
     byte_offset: Option<u64>,
     length: usize,
 ) -> (u32, alloc::vec::Vec<u8>) {
-    let Some(fs) = writable_fs() else {
-        return (nt_fs::STATUS_INVALID_HANDLE, alloc::vec::Vec::new());
+    let fs = match writable_fs() {
+        Ok(fs) => fs,
+        Err(status) => return (status, alloc::vec::Vec::new()),
     };
     let (status, bytes) = fs.zw_read_file(file_id, byte_offset, length);
     if status == nt_fs::STATUS_SUCCESS {
@@ -1408,8 +1403,9 @@ pub(crate) unsafe fn read_backing_into(
     offset: u64,
     output: &mut [u8],
 ) -> (u32, usize) {
-    let Some(fs) = writable_fs() else {
-        return (nt_fs::STATUS_INVALID_HANDLE, 0);
+    let fs = match writable_fs() {
+        Ok(fs) => fs,
+        Err(status) => return (status, 0),
     };
     fs.read_backing_into(file_id, offset, output)
 }
@@ -1456,8 +1452,9 @@ pub(crate) unsafe fn read_into(
     byte_offset: Option<u64>,
     output: &mut [u8],
 ) -> (u32, usize) {
-    let Some(fs) = writable_fs() else {
-        return (nt_fs::STATUS_INVALID_HANDLE, 0);
+    let fs = match writable_fs() {
+        Ok(fs) => fs,
+        Err(status) => return (status, 0),
     };
     let (status, read) = fs.zw_read_file_into(file_id, byte_offset, output);
     if status == nt_fs::STATUS_SUCCESS {
@@ -1471,8 +1468,9 @@ pub(crate) unsafe fn read_into(
 
 /// `NtWriteFile` on a writable-volume file object.
 pub(crate) unsafe fn write(file_id: u64, byte_offset: Option<u64>, data: &[u8]) -> (u32, usize) {
-    let Some(fs) = writable_fs() else {
-        return (nt_fs::STATUS_INVALID_HANDLE, 0);
+    let fs = match writable_fs() {
+        Ok(fs) => fs,
+        Err(status) => return (status, 0),
     };
     let (status, written) = fs.zw_write_file(file_id, byte_offset, data);
     if status == nt_fs::STATUS_SUCCESS || written != 0 {
@@ -1498,8 +1496,9 @@ pub(crate) unsafe fn append_file(path: &str, data: &[u8]) -> u32 {
         return nt_fs::STATUS_SUCCESS;
     }
     let status = 'append: {
-        let Some(fs) = writable_fs() else {
-            break 'append nt_fs::STATUS_INVALID_HANDLE;
+        let fs = match writable_fs() {
+            Ok(fs) => fs,
+            Err(status) => break 'append status,
         };
         let (write_status, written) = fs.append_file_by_path(path, data);
         if write_status == nt_fs::STATUS_SUCCESS && written != data.len() {
@@ -1527,8 +1526,9 @@ pub(crate) unsafe fn truncate_file(path: &str) -> u32 {
 pub(crate) unsafe fn truncate_file_to(path: &str, length: u64) -> u32 {
     let mut dirtied = false;
     let status = 'truncate: {
-        let Some(fs) = writable_fs() else {
-            break 'truncate nt_fs::STATUS_INVALID_HANDLE;
+        let fs = match writable_fs() {
+            Ok(fs) => fs,
+            Err(status) => break 'truncate status,
         };
         let file = fs.zw_create_file(
             path,
@@ -1604,8 +1604,9 @@ fn delete_open_file(fs: &mut nt_fs::FileSystem, handle: u64) {
 pub(crate) unsafe fn write_file_atomic_owned(path: &str, bytes: alloc::vec::Vec<u8>) -> u32 {
     let byte_len = bytes.len();
     let status = 'replace: {
-        let Some(fs) = writable_fs() else {
-            break 'replace nt_fs::STATUS_INVALID_HANDLE;
+        let fs = match writable_fs() {
+            Ok(fs) => fs,
+            Err(status) => break 'replace status,
         };
         let tmp_path = alloc::format!("{}.TMP", path);
         let create = fs.zw_create_file(
@@ -1768,19 +1769,20 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
 
 /// `NtFlushBuffersFile` on a writable-volume file object.
 pub(crate) unsafe fn flush(file_id: u64) -> u32 {
-    let Some(fs) = writable_fs() else {
-        return nt_fs::STATUS_INVALID_HANDLE;
+    let fs = match writable_fs() {
+        Ok(fs) => fs,
+        Err(status) => return status,
     };
     fs.zw_flush_buffers_file(file_id)
 }
 
 /// `NtQueryInformationFile` metadata for a writable-volume file object.
 pub(crate) unsafe fn standard_information(file_id: u64) -> Option<nt_fs::StandardInformation> {
-    writable_fs()?.zw_query_standard_information(file_id)
+    writable_fs().ok()?.zw_query_standard_information(file_id)
 }
 
 pub(crate) unsafe fn metadata(file_id: u64) -> Option<nt_fs::FileMetadata> {
-    writable_fs()?.zw_query_metadata(file_id)
+    writable_fs().ok()?.zw_query_metadata(file_id)
 }
 
 pub(crate) unsafe fn section_backing(file_id: u64) -> Result<nt_memory_manager::GenericSectionBacking, u32> {
@@ -1791,27 +1793,28 @@ pub(crate) unsafe fn section_backing(file_id: u64) -> Result<nt_memory_manager::
 }
 
 pub(crate) unsafe fn opened_name(file_id: u64) -> Option<alloc::string::String> {
-    writable_fs()?.zw_query_opened_name(file_id)
+    writable_fs().ok()?.zw_query_opened_name(file_id)
 }
 
 pub(crate) unsafe fn short_name(file_id: u64) -> Option<nt_fs::FileShortName> {
-    writable_fs()?.zw_query_short_name(file_id)
+    writable_fs().ok()?.zw_query_short_name(file_id)
 }
 
 /// Current byte offset for a writable-volume file object.
 pub(crate) unsafe fn current_offset(file_id: u64) -> Option<u64> {
-    writable_fs()?.current_offset(file_id)
+    writable_fs().ok()?.current_offset(file_id)
 }
 
 /// I/O-Manager-owned mode flags retained by a writable-volume file object.
 pub(crate) unsafe fn file_mode(file_id: u64) -> Option<u32> {
-    writable_fs()?.file_mode(file_id)
+    writable_fs().ok()?.file_mode(file_id)
 }
 
 /// `NtSetInformationFile` on a writable-volume file object.
 pub(crate) unsafe fn set_information(file_id: u64, class: u32, data: &[u8]) -> u32 {
-    let Some(fs) = writable_fs() else {
-        return nt_fs::STATUS_INVALID_HANDLE;
+    let fs = match writable_fs() {
+        Ok(fs) => fs,
+        Err(status) => return status,
     };
     let status = fs.zw_set_information_file(file_id, class, data);
     if status == nt_fs::STATUS_SUCCESS {
@@ -1827,8 +1830,9 @@ pub(crate) unsafe fn capture_open_privileges(
     file_id: u64,
     privileges: nt_fs::FileOpenPrivileges,
 ) -> u32 {
-    let Some(fs) = writable_fs() else {
-        return nt_fs::STATUS_INVALID_HANDLE;
+    let fs = match writable_fs() {
+        Ok(fs) => fs,
+        Err(status) => return status,
     };
     fs.capture_open_privileges(file_id, privileges)
 }
@@ -1841,8 +1845,9 @@ pub(crate) unsafe fn rename(
     target_name: &[u8],
     replace_if_exists: bool,
 ) -> u32 {
-    let Some(fs) = writable_fs() else {
-        return nt_fs::STATUS_INVALID_HANDLE;
+    let fs = match writable_fs() {
+        Ok(fs) => fs,
+        Err(status) => return status,
     };
     let status = fs.zw_rename_file(file_id, root, target_name, replace_if_exists);
     if status == nt_fs::STATUS_SUCCESS {
@@ -1860,8 +1865,9 @@ pub(crate) unsafe fn link(
     target_name: &[u8],
     replace_if_exists: bool,
 ) -> u32 {
-    let Some(fs) = writable_fs() else {
-        return nt_fs::STATUS_INVALID_HANDLE;
+    let fs = match writable_fs() {
+        Ok(fs) => fs,
+        Err(status) => return status,
     };
     let status = fs.zw_link_file(file_id, root, target_name, replace_if_exists);
     if status == nt_fs::STATUS_SUCCESS {
@@ -1880,11 +1886,11 @@ pub(crate) unsafe fn query_directory(
     restart_scan: bool,
     output: &mut [u8],
 ) -> nt_fs::DirectoryQueryResult {
-    let Some(fs) = writable_fs() else {
-        return nt_fs::DirectoryQueryResult {
-            status: nt_fs::STATUS_INVALID_HANDLE,
-            information: 0,
-        };
+    let fs = match writable_fs() {
+        Ok(fs) => fs,
+        Err(status) => {
+            return nt_fs::DirectoryQueryResult { status, information: 0 };
+        }
     };
     let result = fs.zw_query_directory_file(
         file_id,
@@ -1982,9 +1988,7 @@ pub(crate) fn trace_dir_refusal(
 
 /// `NtDuplicateObject` on a writable-volume file object.
 pub(crate) unsafe fn retain(file_id: u64) -> Result<(), u32> {
-    let Some(fs) = writable_fs() else {
-        return Err(nt_fs::STATUS_INVALID_HANDLE);
-    };
+    let fs = writable_fs()?;
     match fs.zw_retain(file_id) {
         nt_fs::STATUS_SUCCESS => {
             mark_runtime_dirty();
@@ -1995,33 +1999,23 @@ pub(crate) unsafe fn retain(file_id: u64) -> Result<(), u32> {
 }
 
 pub(crate) unsafe fn is_final_reference(file_id: u64) -> Result<bool, u32> {
-    writable_fs()
-        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
-        .zw_is_final_reference(file_id)
+    writable_fs()?.zw_is_final_reference(file_id)
 }
 
 pub(crate) unsafe fn retain_io_reference(file_id: u64) -> Result<(), u32> {
-    writable_fs()
-        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
-        .zw_retain_io_reference(file_id)
+    writable_fs()?.zw_retain_io_reference(file_id)
 }
 
 pub(crate) unsafe fn release_io_reference(file_id: u64) -> Result<(), u32> {
-    writable_fs()
-        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
-        .zw_release_io_reference(file_id)
+    writable_fs()?.zw_release_io_reference(file_id)
 }
 
 pub(crate) unsafe fn set_file_signaled(file_id: u64, signaled: bool) -> Result<(), u32> {
-    writable_fs()
-        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
-        .zw_set_file_signaled(file_id, signaled)
+    writable_fs()?.zw_set_file_signaled(file_id, signaled)
 }
 
 pub(crate) unsafe fn is_file_signaled(file_id: u64) -> Result<bool, u32> {
-    writable_fs()
-        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
-        .zw_is_file_signaled(file_id)
+    writable_fs()?.zw_is_file_signaled(file_id)
 }
 
 pub(crate) unsafe fn notify_change_directory(
@@ -2031,25 +2025,23 @@ pub(crate) unsafe fn notify_change_directory(
     buffer_length: u32,
     context: u64,
 ) -> Result<nt_fs::DirectoryNotifyId, u32> {
-    writable_fs()
-        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
-        .zw_notify_change_directory_file(
-            file_id,
-            completion_filter,
-            watch_tree,
-            buffer_length,
-            context,
-        )
+    writable_fs()?.zw_notify_change_directory_file(
+        file_id,
+        completion_filter,
+        watch_tree,
+        buffer_length,
+        context,
+    )
 }
 
 pub(crate) unsafe fn cancel_directory_notify(id: nt_fs::DirectoryNotifyId) -> bool {
-    writable_fs().is_some_and(|fs| fs.zw_cancel_directory_notify(id))
+    writable_fs().is_ok_and(|fs| fs.zw_cancel_directory_notify(id))
 }
 
 pub(crate) unsafe fn directory_notify_completion(
     id: nt_fs::DirectoryNotifyId,
 ) -> Option<(u32, u32)> {
-    writable_fs()?
+    writable_fs().ok()?
         .directory_notify_completion(id)
         .map(|completion| (completion.status, completion.information))
 }
@@ -2057,20 +2049,20 @@ pub(crate) unsafe fn directory_notify_completion(
 pub(crate) unsafe fn take_directory_notify_completion(
     id: nt_fs::DirectoryNotifyId,
 ) -> Option<nt_fs::DirectoryNotifyCompletion<u64>> {
-    writable_fs()?.take_directory_notify_completion(id)
+    writable_fs().ok()?.take_directory_notify_completion(id)
 }
 
 pub(crate) unsafe fn restore_directory_notify_completion(
     completion: nt_fs::DirectoryNotifyCompletion<u64>,
 ) {
-    if let Some(fs) = writable_fs() {
+    if let Ok(fs) = writable_fs() {
         fs.restore_directory_notify_completion(completion);
     }
 }
 
 /// `NtClose` on a writable-volume file object (honours a pending delete).
 pub(crate) unsafe fn close(file_id: u64) {
-    if let Some(fs) = writable_fs() {
+    if let Ok(fs) = writable_fs() {
         let before = fs.node_count();
         if fs.zw_close(file_id) == nt_fs::STATUS_SUCCESS {
             OVERLAY_CLOSES.fetch_add(1, Ordering::Relaxed);

@@ -32159,6 +32159,46 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     .tmp/build-prepared-storage-admission-executive-20260910.log. Root ran all validation serially;
     no native filesystem lease, microkernel change, VM run or desktop acceptance is claimed.
 
+    Checked writable namespace checkpoint (2026-09-10): make storage admission failure distinct
+    from namespace absence before introducing a retained native filesystem lease.
+    - [x] Replace native Option-shaped union probes with Result<Option<FileMetadata>, NTSTATUS>.
+      A mounted upper entry wins; a real missing subtree can expose the installed lower source;
+      invalid paths, non-directory ancestors and corrupt file backing cannot. Without a mounted
+      upper volume, only a disabled overlay or a confirmed EMPTY snapshot permits absence.
+      UNREAD, lost CONSUMED installation and blocked restore states fail closed. Lazy mount now
+      returns its actual admission error, including reserve BUSY, instead of collapsing it to None.
+    - [x] Propagate checked probes through NtQueryAttributesFile, NtQueryFullAttributesFile,
+      NtOpenFile, NtCreateFile and directory-relative create. Make directory-relative metadata
+      inspect the upper layer before FAT, using the retained directory path and joined child path.
+      Remove the redundant attributes-only probe and Option<bool> directory-provisioning helper;
+      both parent-materialization callers now stop on the existing checked helper's error.
+    - [x] Remove the public raw writable_fs reference accessor and file_bytes_if_mounted slice.
+      External callers now mount without borrowing or copy checked full file bytes into owned
+      staging. nt-fs reads validate complete extents and buffer capacity before changing output,
+      including sparse/extent-backed and empty files. NtLoadKey propagates read/presence errors
+      before publishing a hive, and retains one canonical path for read, sidecar replay and flush.
+      Review caught and fixed a dot-component mismatch between the initial canonical read and
+      the previously raw provider path; no read-error-to-decode fallback was added.
+
+    Review adjustment: external borrowing is closed, but this is NOT native filesystem exclusion.
+    Private raw filesystem access and direct global checkpoint/compaction/provisioning borrows
+    remain. Handle-query Option results, notification take/restore/cancel and void close also remain
+    migration targets: preserve their pending completion/resource owner on admission failure before
+    enabling a lease that can return Busy. Do not introduce a temporary guard that silently drops
+    close or notification work, and do not replace these paths with success-shaped observations.
+    Then bind the exact CM preparation to native writable mount, actual snapshot reserve, and
+    primary/log identities under the same exclusion. Bootstrap optional-primary/log-only semantics
+    and the later native publication/desktop acceptance items above remain open.
+
+    Validation: 1,458 host tests/doctests passed across nt-fs, nt-config-abi, nt-config-client,
+    nt-config-server, nt-config-manager, nt-hive-core, nt-security and nt-user-host. Eight new unit
+    tests plus expanded existing corruption/sparse tests cover unchanged output on failure,
+    dangling entries, file ancestors, absent subtrees, directories, complete extent reads and
+    canonical primary/sidecar identity. Evidence: .tmp/test-checked-overlay-full-20260910.log.
+    The final native executive release build passed in 36.25s with the existing 293 warnings
+    unchanged (.tmp/build-checked-overlay-executive-final-20260910.log). Root serialized every
+    build/test; no VM run, filesystem exclusion or desktop acceptance is claimed.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

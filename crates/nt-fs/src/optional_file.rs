@@ -1,8 +1,81 @@
-//! Checked whole-file reads for storage owners. Absence is a missing leaf, never a read failure.
+//! Checked file reads and union metadata probes. Absence is never a read or validation failure.
 
 use super::*;
 
 impl FileSystem {
+    fn optional_relative_node(&self, relative: &[u8]) -> Result<Option<u64>, u32> {
+        if relative.iter().any(|byte| {
+            !byte.is_ascii() || byte.is_ascii_uppercase() || matches!(byte, 0 | b'/' | b':')
+        }) || (!relative.is_empty()
+            && relative
+                .split(|byte| *byte == b'\\')
+                .any(|component| component.is_empty() || component == b"." || component == b".."))
+        {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        }
+        let mut id = 0;
+        for component in relative
+            .split(|byte| *byte == b'\\')
+            .filter(|part| !part.is_empty())
+        {
+            let parent = self.volume.node(id).ok_or(STATUS_DATA_ERROR)?;
+            if !parent.is_dir {
+                return Err(STATUS_NOT_A_DIRECTORY);
+            }
+            let Some(child) = self.volume.lookup_folded_from(id, component) else {
+                return Ok(None);
+            };
+            id = child;
+        }
+        self.volume.node(id).ok_or(STATUS_DATA_ERROR)?;
+        Ok(Some(id))
+    }
+
+    /// Query a canonical lowercase ASCII volume-relative path. A missing leaf or intermediate
+    /// directory returns None for union lookup, but an existing non-directory parent is an error.
+    /// The empty path names the volume root. Invalid backing cannot masquerade as shorter metadata.
+    pub fn try_query_metadata_relative(
+        &self,
+        relative: &[u8],
+    ) -> Result<Option<FileMetadata>, u32> {
+        let Some(id) = self.optional_relative_node(relative)? else {
+            return Ok(None);
+        };
+        let node = self.volume.node(id).ok_or(STATUS_DATA_ERROR)?;
+        if !node.is_dir {
+            node.data.checked_len(&self.volume.blobs)?;
+        }
+        self.volume
+            .metadata(id, false)
+            .map(Some)
+            .ok_or(STATUS_DATA_ERROR)
+    }
+
+    /// Read a complete file by canonical lowercase ASCII volume-relative path without allocating
+    /// or opening a FILE_OBJECT. Validate all backing and destination capacity before copying;
+    /// failures and missing entries leave the entire destination unchanged.
+    pub fn try_read_file_relative_into(
+        &self,
+        relative: &[u8],
+        dst: &mut [u8],
+    ) -> Result<Option<usize>, u32> {
+        let Some(id) = self.optional_relative_node(relative)? else {
+            return Ok(None);
+        };
+        let node = self.volume.node(id).ok_or(STATUS_DATA_ERROR)?;
+        if node.is_dir {
+            return Err(STATUS_FILE_IS_A_DIRECTORY);
+        }
+        let len = node.data.checked_len(&self.volume.blobs)?;
+        if len > dst.len() {
+            return Err(0xC000_0023); // STATUS_BUFFER_TOO_SMALL
+        }
+        // checked_len proves every extent and the sum before the first destination write.
+        let copied = node.data.read_into(&self.volume.blobs, 0, &mut dst[..len]);
+        debug_assert_eq!(copied, len);
+        Ok(Some(len))
+    }
+
     fn optional_file_node(&self, path: &str) -> Result<Option<u64>, u32> {
         if path.is_empty() || path.contains('\0') {
             return Err(STATUS_OBJECT_NAME_INVALID);

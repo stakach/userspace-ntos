@@ -23,6 +23,180 @@ fn missing_leaf_and_present_empty_file_are_distinct() {
 }
 
 #[test]
+fn relative_reads_copy_contiguous_and_extent_files_without_touching_the_tail() {
+    for extent_backed in [false, true] {
+        let mut fs = fs();
+        if extent_backed {
+            assert_eq!(
+                fs.append_file_by_path(PRIMARY, b"first"),
+                (STATUS_SUCCESS, 5)
+            );
+            assert_eq!(
+                fs.append_file_by_path(PRIMARY, b"second"),
+                (STATUS_SUCCESS, 6)
+            );
+        } else {
+            assert!(fs.provision_file(PRIMARY, b"firstsecond"));
+        }
+        let mut destination = [0xA5; 16];
+        assert_eq!(
+            fs.try_read_file_relative_into(b"config\\hive", &mut destination),
+            Ok(Some(11))
+        );
+        assert_eq!(&destination[..11], b"firstsecond");
+        assert_eq!(&destination[11..], &[0xA5; 5]);
+        assert_eq!(
+            fs.try_query_metadata_relative(b"config\\hive"),
+            Ok(fs.query_metadata(PRIMARY))
+        );
+    }
+}
+
+#[test]
+fn relative_reads_distinguish_empty_files_and_absent_overlay_subtrees() {
+    let mut fs = fs();
+    let mut destination = [0xA5; 4];
+    for relative in [b"config\\hive".as_slice(), b"missing\\nested\\hive"] {
+        assert_eq!(
+            fs.try_read_file_relative_into(relative, &mut destination),
+            Ok(None)
+        );
+        assert_eq!(fs.try_query_metadata_relative(relative), Ok(None));
+        assert_eq!(destination, [0xA5; 4]);
+    }
+    assert!(fs.provision_file(PRIMARY, &[]));
+    assert_eq!(
+        fs.try_read_file_relative_into(b"config\\hive", &mut destination),
+        Ok(Some(0))
+    );
+    assert_eq!(destination, [0xA5; 4]);
+    assert_eq!(
+        fs.try_read_file_relative_into(b"config\\hive", &mut []),
+        Ok(Some(0))
+    );
+    assert_eq!(
+        fs.try_query_metadata_relative(b"config\\hive")
+            .unwrap()
+            .unwrap()
+            .end_of_file,
+        0
+    );
+}
+
+#[test]
+fn relative_reads_validate_capacity_before_copying_any_bytes() {
+    let mut fs = fs();
+    assert_eq!(
+        fs.append_file_by_path(PRIMARY, b"first"),
+        (STATUS_SUCCESS, 5)
+    );
+    assert_eq!(
+        fs.append_file_by_path(PRIMARY, b"second"),
+        (STATUS_SUCCESS, 6)
+    );
+    let mut destination = [0xA5; 10];
+    assert_eq!(
+        fs.try_read_file_relative_into(b"config\\hive", &mut destination),
+        Err(0xC000_0023)
+    );
+    assert_eq!(destination, [0xA5; 10]);
+}
+
+#[test]
+fn relative_queries_preserve_directory_metadata_but_reads_refuse_directories() {
+    let fs = fs();
+    for relative in [b"".as_slice(), b"config"] {
+        assert_eq!(
+            fs.try_query_metadata_relative(relative),
+            Ok(fs.query_metadata_relative(relative))
+        );
+        assert!(
+            fs.try_query_metadata_relative(relative)
+                .unwrap()
+                .unwrap()
+                .is_directory
+        );
+        let mut destination = [0xA5; 4];
+        assert_eq!(
+            fs.try_read_file_relative_into(relative, &mut destination),
+            Err(STATUS_FILE_IS_A_DIRECTORY)
+        );
+        assert_eq!(destination, [0xA5; 4]);
+    }
+}
+
+#[test]
+fn relative_queries_reject_non_directory_ancestors_instead_of_falling_through() {
+    let mut fs = fs();
+    assert!(fs.provision_file(PRIMARY, b"data"));
+    for relative in [
+        b"config\\hive\\child".as_slice(),
+        b"config\\hive\\missing\\child",
+    ] {
+        let mut destination = [0xA5; 4];
+        assert_eq!(
+            fs.try_query_metadata_relative(relative),
+            Err(STATUS_NOT_A_DIRECTORY)
+        );
+        assert_eq!(
+            fs.try_read_file_relative_into(relative, &mut destination),
+            Err(STATUS_NOT_A_DIRECTORY)
+        );
+        assert_eq!(destination, [0xA5; 4]);
+    }
+}
+
+#[test]
+fn relative_queries_validate_the_complete_canonical_name_before_lookup() {
+    let fs = fs();
+    for relative in [
+        b"\\config".as_slice(),
+        b"config\\",
+        b"config\\\\hive",
+        b"config/hive",
+        b"config\\.\\hive",
+        b"config\\..\\hive",
+        b"Config\\hive",
+        b"config\\hive\0",
+        b"config\\\xFF",
+        b"c:\\config",
+        b"missing\\..\\hive",
+        b"missing\\invalid:name",
+    ] {
+        let mut destination = [0xA5; 4];
+        assert_eq!(
+            fs.try_query_metadata_relative(relative),
+            Err(STATUS_OBJECT_NAME_INVALID)
+        );
+        assert_eq!(
+            fs.try_read_file_relative_into(relative, &mut destination),
+            Err(STATUS_OBJECT_NAME_INVALID)
+        );
+        assert_eq!(destination, [0xA5; 4]);
+    }
+}
+
+#[test]
+fn relative_queries_report_dangling_directory_entries_as_corruption() {
+    let mut fs = fs();
+    assert!(fs.provision_file(PRIMARY, b"data"));
+    let id = fs.volume.lookup(&fs.to_relative(PRIMARY).unwrap()).unwrap();
+    fs.volume.nodes[id as usize] = None;
+    for relative in [b"config\\hive".as_slice(), b"config\\hive\\child"] {
+        let mut destination = [0xA5; 4];
+        assert_eq!(
+            fs.try_query_metadata_relative(relative),
+            Err(STATUS_DATA_ERROR)
+        );
+        assert_eq!(
+            fs.try_read_file_relative_into(relative, &mut destination),
+            Err(STATUS_DATA_ERROR)
+        );
+        assert_eq!(destination, [0xA5; 4]);
+    }
+}
+
+#[test]
 fn invalid_paths_wrong_volumes_and_directories_are_not_absent_files() {
     let mut fs = fs();
     assert!(fs.provision_file(PRIMARY, b"data"));
@@ -64,6 +238,37 @@ fn extent_backed_files_copy_every_byte_and_report_presence_without_contiguous_st
         Ok(Some(b"firstsecond".to_vec()))
     );
     assert_eq!(provider.read_log(), Ok(Vec::new()));
+}
+
+#[test]
+fn canonical_hive_source_path_names_the_same_primary_and_sidecar() {
+    let mut fs = fs();
+    assert!(fs.provision_file(PRIMARY, b"primary"));
+    assert!(fs.provision_file(LOG, b"journal"));
+    for source in [r"\??\C:\.\Config\HIVE", r"\DosDevices\C:\Config\.\HIVE"] {
+        let name: Vec<u16> = source.encode_utf16().collect();
+        let mut folded = [0; 128];
+        let mut relative = [0; 128];
+        let len =
+            crate::nt_path_to_volume_relative_into(&name, b"reactos", &mut folded, &mut relative)
+                .unwrap();
+        let relative = &relative[..len];
+        let mut destination = [0; 7];
+        assert_eq!(
+            fs.try_read_file_relative_into(relative, &mut destination),
+            Ok(Some(7))
+        );
+        let canonical = alloc::format!(r"\??\C:\{}", core::str::from_utf8(relative).unwrap());
+        assert_eq!(fs.try_file_len(&canonical), Ok(Some(7)));
+        assert_eq!(
+            fs.try_file_bytes_owned(&canonical),
+            Ok(Some(destination.to_vec()))
+        );
+        assert_eq!(
+            fs.try_file_bytes_owned(&alloc::format!("{canonical}.LOG")),
+            Ok(Some(b"journal".to_vec()))
+        );
+    }
 }
 
 #[test]
@@ -118,6 +323,16 @@ fn invalid_or_overflowing_extents_never_shorten_a_log_or_return_empty() {
         fs.volume.node_mut(id).unwrap().data = FileData::Extents(extents);
         assert_eq!(fs.try_file_len(LOG), Err(STATUS_DATA_ERROR));
         assert_eq!(fs.try_file_bytes_owned(LOG), Err(STATUS_DATA_ERROR));
+        assert_eq!(
+            fs.try_query_metadata_relative(b"config\\hive.log"),
+            Err(STATUS_DATA_ERROR)
+        );
+        let mut destination = [0xA5; 16];
+        assert_eq!(
+            fs.try_read_file_relative_into(b"config\\hive.log", &mut destination),
+            Err(STATUS_DATA_ERROR)
+        );
+        assert_eq!(destination, [0xA5; 16]);
     }
     let fs = RefCell::new(fs);
     let mut provider = NtFileHiveIoProvider::open(&fs, PRIMARY);
@@ -203,6 +418,13 @@ fn sparse_mixed_extents_preserve_offsets_and_zero_fill() {
         fs.try_file_bytes_owned(LOG),
         Ok(Some(b"AB\0\0\0CD".to_vec()))
     );
+    let mut destination = [0xA5; 9];
+    assert_eq!(
+        fs.try_read_file_relative_into(b"config\\hive.log", &mut destination),
+        Ok(Some(7))
+    );
+    assert_eq!(&destination[..7], b"AB\0\0\0CD");
+    assert_eq!(&destination[7..], &[0xA5; 2]);
 }
 
 #[test]
