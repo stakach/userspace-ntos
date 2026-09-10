@@ -66,8 +66,8 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
             FILE_NON_DIRECTORY_FILE,
         );
         if opened.status != STATUS_SUCCESS {
-            // Creation can mutate the namespace before file-object allocation fails. Only proved
-            // absence permits retry/cancellation; never adopt a file from an uncertain create.
+            // Verify the retained baseline before retry. Even after an admission error, never
+            // adopt a file merely because its path exists or infer that it is ours to delete.
             if self.fs.try_file_len(path) == Ok(None) {
                 self.phase = CreatePending;
             }

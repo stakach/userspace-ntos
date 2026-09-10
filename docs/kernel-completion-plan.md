@@ -31885,9 +31885,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     with uncertain namespace effects still cannot recover without an exact acquired file handle;
     they remain CreateInFlight and retain caller ownership. No name-based adoption/cleanup is
     allowed. The tests simulate that uncertainty, not actual post-create allocation failure.
-    - [ ] Before native creation activation, retain exact namespace/file-object acquisition through
-      allocation failure, or make that acquisition failure-atomic. Do not resolve CreateInFlight
-      by inferring ownership from the path or treating an unavailable handle as successful cleanup.
+    - [x] Make namespace/file-object acquisition failure-atomic for returned allocation failures;
+      see the checkpoint below. Keep CreateInFlight as defensive uncertainty containment, never
+      resolve it by inferring ownership from the path or assuming successful cleanup without a handle.
 
     Serialized host validation passes all 1,395 tests/doctests: nt-fs 172 plus one doctest,
     nt-config-client 153 plus 18 doctests, nt-config-abi 9, nt-config-server 103,
@@ -31902,6 +31902,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     status-constant and two older discarded-preparation test warnings remain unchanged.
     Freestanding executive release passes in 37.92 seconds with 293 existing executive warnings;
     log: `.tmp/build-first-journal-executive-20260910.log`.
+
+    Failure-atomic file acquisition checkpoint (2026-09-10): remove the post-mutation allocation
+    boundary that could orphan a first journal or truncate an existing file before returning error.
+    - [x] Split create into private preparation and apply stages shared by all three ZwCreateFile
+      entry points: absolute path, folded volume-relative path and directory-FILE_OBJECT-relative
+      path. Validate disposition and target type without changing file data or namespace state.
+    - [x] Reserve owned created/folded names, node and parent-entry capacity, checked identity
+      increments, canonical opened name and handle-table capacity before apply. Existing-file
+      overwrite/supersede waits for the same opened-name/handle admission as new creation.
+      Any returned allocation failure leaves bytes, allocation size, valid-data length, identity
+      counters, namespace, handle table and notifications unpublished. Reserved capacity is reusable.
+    - [x] Apply the prepared mutation and install its FILE_OBJECT without another returned-error
+      boundary, then report the change. Preserve selected directory-entry identity, long created
+      spelling, root paths, sharing admission and existing disposition results. No cleanup by name,
+      rollback-by-copy or success fallback is introduced.
+    - [x] Move focused create preparation/publication into file_create.rs. Delete the two old
+      duplicated disposition bodies and the post-mutation publish_file_object implementation.
+      The internal MemFs create and provisioning helper consume the same checked child plan rather
+      than retaining a second node/entry construction body. Provisioning retains its existing
+      infallible caller contract, but its failure now precedes identity/namespace publication.
+    - [x] Exercise actual file-acquisition allocation errors through retained SnapshotJournal
+      creation. All seven reservation boundaries return to checked CreatePending with absent file,
+      unchanged identities and retained caller; retry publishes exactly once or cancellation
+      durably preserves absence. Keep the uncertain-foreign-file refusal rather than weakening it.
+
+    Review adjustment: the guarantee is failure atomicity for returned errors, not recovery from
+    global allocator abort or arbitrary unwinding after commit. Directory notification reporting
+    still allocates its completion queue without a returned-error path and remains a separate
+    allocation-lifecycle audit. Native CM-to-log/mount authority, actual snapshot-reserve exclusion
+    and complete caller/PnP/Key integration remain the next prerequisites. Do not borrow mutable
+    global filesystem state across executive re-entry or treat this host change as native cutover.
+    No VM run or desktop acceptance is implied; the 27 strict missing win32k imports remain open.
+
+    Serialized validation passes 180 focused nt-fs tests/doctests and all 1,402 broad
+    tests/doctests: nt-fs 179 plus one doctest, nt-config-client 153 plus 18 doctests,
+    nt-config-abi 9, nt-config-server 103, nt-config-manager 35, nt-hive-core 106 plus 18
+    generator cases, nt-security 223 plus two doctests, and nt-user-host 494 plus 49 integration
+    cases and 12 doctests. Logs: `.tmp/test-file-create-atomic-focused-20260910.log` and
+    `.tmp/test-file-create-atomic-full-20260910.log`. Seven new tests contain the complete
+    allocation-checkpoint matrices for three create facades, new and existing dispositions,
+    directory creation, actual identity exhaustion, handle reuse, canonical aliases/hard links,
+    unchanged notification state, and retained first-journal retry/cancel with power-cut restore.
+    Allocation errors are deterministically injected at real reservation boundaries, not by a
+    global failing allocator. Independent create/protocol reviews found no remaining issue in
+    this scope. Only the root agent ran tests/builds, serially; existing client warnings remain.
+    Freestanding executive release passes in 36.96 seconds with 293 existing executive warnings;
+    log: `.tmp/build-file-create-atomic-executive-20260910.log`.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

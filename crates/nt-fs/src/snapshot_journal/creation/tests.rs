@@ -161,6 +161,45 @@ fn creation_admission_returns_inputs_for_collision_wrong_volume_parent_directory
 }
 
 #[test]
+fn file_acquisition_allocation_failures_retain_absence_then_retry_or_cancel() {
+    for stage in 0..7 {
+        for cancel_after_error in [false, true] {
+            let (mut fs, mut disk, store) = fixture();
+            let drops = Rc::new(Cell::new(0));
+            let mut work = create(&mut fs, &mut disk, store, &drops);
+            let file_id = work.fs.volume.next_file_id;
+            let entry_id = work.fs.volume.next_entry_id;
+            work.fs.create_fail_at = Some(stage);
+            assert_eq!(
+                work.make_durable(),
+                Err(SnapshotJournalError::File(STATUS_INSUFFICIENT_RESOURCES))
+            );
+            assert_eq!(work.phase(), SnapshotJournalPhase::CreatePending);
+            assert_eq!(work.fs.try_file_len(PATH), Ok(None));
+            assert_eq!(work.handle, INVALID_HANDLE);
+            assert_eq!(work.fs.volume.next_file_id, file_id);
+            assert_eq!(work.fs.volume.next_entry_id, entry_id);
+            assert!(work.dev.events.is_empty());
+            assert_eq!(drops.get(), 0);
+            if cancel_after_error {
+                drop(cancel(work));
+                assert_eq!(reboot(&mut disk), None);
+            } else {
+                work.make_durable().unwrap();
+                assert_eq!(work.file_id, file_id);
+                work.begin_publication().unwrap();
+                drop(match work.release_after_publication() {
+                    Ok(caller) => caller,
+                    Err(_) => panic!(),
+                });
+                assert_eq!(reboot(&mut disk), Some(BYTES.to_vec()));
+            }
+            assert_eq!(drops.get(), 1);
+        }
+    }
+}
+
+#[test]
 fn uncertain_create_never_adopts_or_deletes_a_colliding_file() {
     let (mut fs, mut disk, store) = fixture();
     let drops = Rc::new(Cell::new(0));

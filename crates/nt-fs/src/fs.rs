@@ -23,6 +23,9 @@ use crate::status::*;
 #[path = "optional_file.rs"]
 mod optional_file;
 
+#[path = "file_create.rs"]
+mod file_create;
+
 #[path = "snapshot_journal.rs"]
 mod snapshot_journal;
 pub use snapshot_journal::*;
@@ -1997,35 +2000,21 @@ impl MemFs {
     }
 
     fn create_child_with_entry(&mut self, parent: u64, name: &str, is_dir: bool) -> (u64, u64) {
-        let node_id = self.nodes.len() as u64;
-        let file_id = self.next_file_id;
-        self.next_file_id = self
-            .next_file_id
-            .checked_add(1)
-            .expect("MemFs file identity exhausted");
-        let now = self.current_time_100ns;
-        self.nodes.push(Some(MemFsNode {
-            file_id,
-            is_dir,
-            attributes: if is_dir {
-                FILE_ATTRIBUTE_DIRECTORY
-            } else {
-                FILE_ATTRIBUTE_ARCHIVE
-            },
-            creation_time: now,
-            last_access_time: now,
-            last_write_time: now,
-            change_time: now,
-            link_count: 0,
-            parent,
-            allocation_size: 0,
-            valid_data_length: 0,
-            data: FileData::empty(),
-            children: Vec::new(),
-        }));
-        let entry_id = self
-            .insert_entry(parent, name, node_id)
-            .expect("new child has a valid parent and entry capacity");
+        let options = if is_dir {
+            FILE_DIRECTORY_FILE
+        } else {
+            FILE_NON_DIRECTORY_FILE
+        };
+        let plan = self
+            .prepare_create_child(
+                parent,
+                name,
+                options,
+                0,
+                &mut file_create::CreateAllocator::default(),
+            )
+            .expect("provisioned child must have valid identity and capacity");
+        let (node_id, entry_id, _) = self.apply_create(plan);
         (node_id, entry_id)
     }
 
@@ -2604,8 +2593,6 @@ impl MemFs {
         }
     }
 
-    /// `NtFileSystemRuntime::create` (spec §11, §12.5): apply the create disposition, returning
-    /// `(node_id, information)` or an NTSTATUS.
     fn create(
         &mut self,
         rel_path: &str,
@@ -2613,152 +2600,14 @@ impl MemFs {
         options: u32,
         file_attributes: u32,
     ) -> Result<(u64, u64, u32), u32> {
-        let want_dir = options & FILE_DIRECTORY_FILE != 0;
-        let existing = self.lookup_entry_from(0, rel_path);
-        match existing {
-            Some((id, entry_id)) => {
-                let is_dir = self.node(id).unwrap().is_dir;
-                if want_dir && !is_dir {
-                    return Err(STATUS_NOT_A_DIRECTORY);
-                }
-                if !want_dir && is_dir && options & FILE_NON_DIRECTORY_FILE != 0 {
-                    return Err(STATUS_FILE_IS_A_DIRECTORY);
-                }
-                match disposition {
-                    FILE_OPEN | FILE_OPEN_IF => Ok((id, entry_id, FILE_OPENED)),
-                    FILE_CREATE => Err(STATUS_OBJECT_NAME_COLLISION),
-                    FILE_OVERWRITE | FILE_OVERWRITE_IF => {
-                        if !is_dir {
-                            let node = self.node_mut(id).unwrap();
-                            node.data = FileData::empty();
-                            node.allocation_size = 0;
-                            node.valid_data_length = 0;
-                        }
-                        Ok((id, entry_id, FILE_OVERWRITTEN))
-                    }
-                    FILE_SUPERSEDE => {
-                        if !is_dir {
-                            let node = self.node_mut(id).unwrap();
-                            node.data = FileData::empty();
-                            node.allocation_size = 0;
-                            node.valid_data_length = 0;
-                        }
-                        Ok((id, entry_id, FILE_SUPERSEDED))
-                    }
-                    _ => Err(STATUS_INVALID_PARAMETER),
-                }
-            }
-            None => match disposition {
-                FILE_OPEN | FILE_OVERWRITE => Err(STATUS_OBJECT_NAME_NOT_FOUND),
-                FILE_CREATE | FILE_OPEN_IF | FILE_OVERWRITE_IF | FILE_SUPERSEDE => {
-                    let (parent_path, leaf) =
-                        Self::parent_and_leaf(rel_path).ok_or(STATUS_INVALID_PARAMETER)?;
-                    let parent = self
-                        .lookup(parent_path)
-                        .ok_or(STATUS_OBJECT_PATH_NOT_FOUND)?;
-                    if !self.node(parent).unwrap().is_dir {
-                        return Err(STATUS_OBJECT_PATH_NOT_FOUND);
-                    }
-                    let (id, entry_id) = self.create_child_with_entry(parent, leaf, want_dir);
-                    // The caller's FileAttributes are honoured for a newly created file; a
-                    // directory always carries FILE_ATTRIBUTE_DIRECTORY (NT sets it, not the
-                    // caller). Zero means "defaults", which `create_child` already applied.
-                    let requested = file_attributes & FILE_ATTRIBUTE_SETTABLE;
-                    if requested != 0 {
-                        let node = self.node_mut(id).unwrap();
-                        node.attributes = if want_dir {
-                            requested | FILE_ATTRIBUTE_DIRECTORY
-                        } else {
-                            requested
-                        };
-                    }
-                    Ok((id, entry_id, FILE_CREATED))
-                }
-                _ => Err(STATUS_INVALID_PARAMETER),
-            },
-        }
-    }
-
-    fn create_folded_from(
-        &mut self,
-        start: u64,
-        rel_path: &[u8],
-        disposition: u32,
-        options: u32,
-        file_attributes: u32,
-    ) -> Result<(u64, u64, u32), u32> {
-        let want_dir = options & FILE_DIRECTORY_FILE != 0;
-        let existing = self.lookup_folded_entry_from(start, rel_path);
-        match existing {
-            Some((id, entry_id)) => {
-                let is_dir = self.node(id).unwrap().is_dir;
-                if want_dir && !is_dir {
-                    return Err(STATUS_NOT_A_DIRECTORY);
-                }
-                if !want_dir && is_dir && options & FILE_NON_DIRECTORY_FILE != 0 {
-                    return Err(STATUS_FILE_IS_A_DIRECTORY);
-                }
-                match disposition {
-                    FILE_OPEN | FILE_OPEN_IF => Ok((id, entry_id, FILE_OPENED)),
-                    FILE_CREATE => Err(STATUS_OBJECT_NAME_COLLISION),
-                    FILE_OVERWRITE | FILE_OVERWRITE_IF => {
-                        if !is_dir {
-                            let node = self.node_mut(id).unwrap();
-                            node.data = FileData::empty();
-                            node.allocation_size = 0;
-                            node.valid_data_length = 0;
-                        }
-                        Ok((id, entry_id, FILE_OVERWRITTEN))
-                    }
-                    FILE_SUPERSEDE => {
-                        if !is_dir {
-                            let node = self.node_mut(id).unwrap();
-                            node.data = FileData::empty();
-                            node.allocation_size = 0;
-                            node.valid_data_length = 0;
-                        }
-                        Ok((id, entry_id, FILE_SUPERSEDED))
-                    }
-                    _ => Err(STATUS_INVALID_PARAMETER),
-                }
-            }
-            None => match disposition {
-                FILE_OPEN | FILE_OVERWRITE => Err(STATUS_OBJECT_NAME_NOT_FOUND),
-                FILE_CREATE | FILE_OPEN_IF | FILE_OVERWRITE_IF | FILE_SUPERSEDE => {
-                    let (parent_path, leaf) =
-                        Self::parent_and_leaf_bytes(rel_path).ok_or(STATUS_INVALID_PARAMETER)?;
-                    let parent = self
-                        .lookup_folded_from(start, parent_path)
-                        .ok_or(STATUS_OBJECT_PATH_NOT_FOUND)?;
-                    if !self.node(parent).unwrap().is_dir {
-                        return Err(STATUS_OBJECT_PATH_NOT_FOUND);
-                    }
-                    let leaf = core::str::from_utf8(leaf).map_err(|_| STATUS_INVALID_PARAMETER)?;
-                    let (id, entry_id) = self.create_child_with_entry(parent, leaf, want_dir);
-                    let requested = file_attributes & FILE_ATTRIBUTE_SETTABLE;
-                    if requested != 0 {
-                        let node = self.node_mut(id).unwrap();
-                        node.attributes = if want_dir {
-                            requested | FILE_ATTRIBUTE_DIRECTORY
-                        } else {
-                            requested
-                        };
-                    }
-                    Ok((id, entry_id, FILE_CREATED))
-                }
-                _ => Err(STATUS_INVALID_PARAMETER),
-            },
-        }
-    }
-
-    fn create_folded_relative(
-        &mut self,
-        rel_path: &[u8],
-        disposition: u32,
-        options: u32,
-        file_attributes: u32,
-    ) -> Result<(u64, u64, u32), u32> {
-        self.create_folded_from(0, rel_path, disposition, options, file_attributes)
+        let plan = self.prepare_create(
+            rel_path,
+            disposition,
+            options,
+            file_attributes,
+            &mut file_create::CreateAllocator::default(),
+        )?;
+        Ok(self.apply_create(plan))
     }
 
     /// Query a volume-relative path's attributes WITHOUT opening a handle — the
@@ -3942,6 +3791,8 @@ pub struct FileSystem {
     mounts: MountManager,
     handles: Vec<Option<FileObject>>,
     notifications: crate::DirectoryNotifyTable<u64>,
+    #[cfg(test)]
+    create_fail_at: Option<usize>,
 }
 
 /// The result of `ZwCreateFile`: `(status, handle, information)` (spec §8.1).
@@ -3954,71 +3805,6 @@ pub struct CreateResult {
 pub const INVALID_HANDLE: u64 = u64::MAX;
 
 impl FileSystem {
-    fn publish_file_object(
-        &mut self,
-        node_id: u64,
-        entry_id: u64,
-        information: u32,
-        options: u32,
-        share: FileShareAccess,
-    ) -> CreateResult {
-        let Some(opened_name) = self.volume.opened_name(entry_id) else {
-            return CreateResult {
-                status: STATUS_INSUFFICIENT_RESOURCES,
-                handle: INVALID_HANDLE,
-                information: 0,
-            };
-        };
-        let handle = match self.handles.iter().position(|slot| slot.is_none()) {
-            Some(free) => free as u64,
-            None => {
-                self.handles.push(None);
-                (self.handles.len() - 1) as u64
-            }
-        };
-        let notify = match information {
-            FILE_CREATED => Some((
-                if self.volume.is_dir(node_id) {
-                    crate::FILE_NOTIFY_CHANGE_DIR_NAME
-                } else {
-                    crate::FILE_NOTIFY_CHANGE_FILE_NAME
-                },
-                crate::FILE_ACTION_ADDED,
-            )),
-            FILE_OVERWRITTEN | FILE_SUPERSEDED => Some((
-                crate::FILE_NOTIFY_CHANGE_SIZE | crate::FILE_NOTIFY_CHANGE_LAST_WRITE,
-                crate::FILE_ACTION_MODIFIED,
-            )),
-            _ => None,
-        };
-        if let Some((filter, action)) = notify {
-            self.notifications.report_change(crate::DirectoryChange {
-                full_path: &opened_name,
-                filter,
-                action,
-            });
-        }
-        self.handles[handle as usize] = Some(FileObject {
-            node_id,
-            entry_id,
-            opened_name,
-            current_offset: 0,
-            signaled: true,
-            create_options: options,
-            share,
-            open_privileges: FileOpenPrivileges::default(),
-            handle_references: 1,
-            references: 1,
-            delete_pending: options & FILE_DELETE_ON_CLOSE != 0,
-            query: DirectoryQueryState::new(),
-        });
-        CreateResult {
-            status: STATUS_SUCCESS,
-            handle,
-            information,
-        }
-    }
-
     /// A file system over `volume`, mounted with the required v0.1 mounts (spec §13.2).
     pub fn new(volume: MemFs) -> Self {
         FileSystem {
@@ -4026,6 +3812,8 @@ impl FileSystem {
             mounts: MountManager::new(),
             handles: Vec::new(),
             notifications: crate::DirectoryNotifyTable::new(),
+            #[cfg(test)]
+            create_fail_at: None,
         }
     }
 
@@ -4513,16 +4301,9 @@ impl FileSystem {
                 }
             }
         }
-        match self
-            .volume
-            .create(&rel, disposition, options, file_attributes)
-        {
-            // Directory/non-directory intent already validated in create().
-            Ok((node_id, entry_id, information)) => {
-                self.publish_file_object(node_id, entry_id, information, options, share)
-            }
-            Err(status) => fail(status),
-        }
+        self.create_and_publish(options, share, |volume, allocator| {
+            volume.prepare_create(&rel, disposition, options, file_attributes, allocator)
+        })
     }
 
     /// `ZwCreateFile` for a caller that already resolved and folded a path into this volume.
@@ -4560,15 +4341,11 @@ impl FileSystem {
                 }
             }
         }
-        match self
-            .volume
-            .create_folded_relative(relative, disposition, options, file_attributes)
-        {
-            Ok((node_id, entry_id, information)) => {
-                self.publish_file_object(node_id, entry_id, information, options, share)
-            }
-            Err(status) => fail(status),
-        }
+        self.create_and_publish(options, share, |volume, allocator| {
+            volume.prepare_create_folded(
+                0, relative, disposition, options, file_attributes, allocator,
+            )
+        })
     }
 
     /// Import a missing installed file into this volume before applying a caller's create
@@ -4680,18 +4457,11 @@ impl FileSystem {
                 }
             }
         }
-        match self.volume.create_folded_from(
-            root_node,
-            relative,
-            disposition,
-            options,
-            file_attributes,
-        ) {
-            Ok((node_id, entry_id, information)) => {
-                self.publish_file_object(node_id, entry_id, information, options, share)
-            }
-            Err(status) => fail(status),
-        }
+        self.create_and_publish(options, share, |volume, allocator| {
+            volume.prepare_create_folded(
+                root_node, relative, disposition, options, file_attributes, allocator,
+            )
+        })
     }
 
     /// `ZwReadFile` (spec §8.2). `byte_offset` `None` uses + advances the file object offset.
