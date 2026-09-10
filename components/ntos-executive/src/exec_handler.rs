@@ -10,6 +10,9 @@ use nt_io_abi::major;
 #[path = "exec_file_flush.rs"]
 mod file_flush;
 
+#[path = "exec_file_set_information.rs"]
+mod file_set_information;
+
 #[path = "exec_local_file_io.rs"]
 mod local_file_io;
 
@@ -43889,21 +43892,14 @@ impl ExecNtHandler {
                 if length < contract.minimum_length() {
                     return nt_fs::STATUS_INFO_LENGTH_MISMATCH;
                 }
-                let overlay_file = self.overlay_file_id_for(args[0]);
                 if iosb == 0 || !self.probe_user_output(iosb, 16) {
                     return STATUS_ACCESS_VIOLATION;
                 }
                 let mut payload = match try_zeroed_transfer_buffer(length) {
                     Ok(payload) => payload,
-                    Err(status) => {
-                        self.xas_write_buf(iosb, &status.to_le_bytes());
-                        self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
-                        return status;
-                    }
+                    Err(status) => return status,
                 };
                 if length != 0 && (args[2] == 0 || !self.xas_read(args[2], &mut payload)) {
-                    self.xas_write_buf(iosb, &STATUS_ACCESS_VIOLATION.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
                     return STATUS_ACCESS_VIOLATION;
                 }
                 if NT_SET_INFORMATION_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -43929,104 +43925,23 @@ impl ExecNtHandler {
                     print_str(b"\n");
                 }
                 let Some(granted_access) = self.hosted_file_access_for(args[0]) else {
-                    self.xas_write_buf(iosb, &nt_fs::STATUS_INVALID_HANDLE.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
                     return nt_fs::STATUS_INVALID_HANDLE;
                 };
                 if !contract.access_granted(nt_types::AccessMask::from_bits_retain(granted_access))
                 {
-                    self.xas_write_buf(iosb, &STATUS_ACCESS_DENIED.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
                     return STATUS_ACCESS_DENIED;
                 }
                 if information_class == nt_fs::FILE_SHORT_NAME_INFORMATION
                     && !self.current_token_has_privilege(nt_security::SE_RESTORE)
                 {
-                    self.xas_write_buf(iosb, &STATUS_PRIVILEGE_NOT_HELD.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
                     return STATUS_PRIVILEGE_NOT_HELD;
                 }
-                let mut information = 0u64;
-                // ★ THE WRITABLE FILESYSTEM OVERLAY owns its own file objects' information classes
-                // (position / end-of-file / disposition / basic). Checked first so an overlay handle
-                // never falls into the pipe-only classes below.
-                if let Some(file_id) = overlay_file {
-                    let status = if matches!(
-                        information_class,
-                        nt_fs::FILE_RENAME_INFORMATION | nt_fs::FILE_LINK_INFORMATION
-                    ) {
-                        match nt_fs::parse_set_file_name_information(&payload) {
-                            Err(status) => status,
-                            Ok(set_name) => {
-                                let mut target = [0u8; FILE_VOLUME_RELATIVE_CAP * 2];
-                                match self.resolve_local_set_file_name_target(
-                                    set_name.root_directory,
-                                    set_name.file_name,
-                                    &mut target,
-                                ) {
-                                    Err(status) => status,
-                                    Ok((root, target_len)) => {
-                                        let target = &target[..target_len];
-                                        if information_class == nt_fs::FILE_RENAME_INFORMATION {
-                                            crate::writable_fs::rename(
-                                                file_id,
-                                                root,
-                                                target,
-                                                set_name.replace_if_exists,
-                                            )
-                                        } else {
-                                            crate::writable_fs::link(
-                                                file_id,
-                                                root,
-                                                target,
-                                                set_name.replace_if_exists,
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        crate::writable_fs::set_information(file_id, information_class, &payload)
-                    };
-                    if status == nt_fs::STATUS_SUCCESS {
-                        self.writable_fs_dirty = true;
-                    }
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                if let Some(status) = self.try_set_local_file_information(
+                    args[0], iosb, information_class, &payload,
+                ) {
                     return status;
                 }
-                if information_class == nt_fs::FILE_POSITION_INFORMATION {
-                    let disk_file = self.pm_pid_for_pi(self.pi).and_then(|pid| {
-                        match self.pm.lookup_handle(pid, args[0] as nt_process::Handle) {
-                            Some(nt_process::HandleObject::DiskFile {
-                                first_cluster,
-                                size,
-                                object_id,
-                            }) => Some((first_cluster, size, object_id)),
-                            _ => None,
-                        }
-                    });
-                    if let Some((first_cluster, size, object_id)) = disk_file {
-                        let status = if length < 8 {
-                            nt_fs::STATUS_INFO_LENGTH_MISMATCH
-                        } else {
-                            match self.readonly_file_opens.get_mut(object_id) {
-                                Ok(open)
-                                    if open.first_cluster == first_cluster && open.size == size =>
-                                {
-                                    open.current_offset =
-                                        u64::from_le_bytes(payload[0..8].try_into().unwrap());
-                                    nt_fs::STATUS_SUCCESS
-                                }
-                                _ => nt_fs::STATUS_INVALID_HANDLE,
-                            }
-                        };
-                        self.xas_write_buf(iosb, &status.to_le_bytes());
-                        self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
-                        return status;
-                    }
-                }
+                let mut information = 0u64;
                 let status = match information_class {
                     23 if length < 8 => nt_fs::STATUS_INFO_LENGTH_MISMATCH,
                     30 => {

@@ -32655,6 +32655,58 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Position validation also needs NT5's signed-offset checks; any no-buffering alignment check
     must use actual device sector geometry. Retained delivery alone does not close that contract.
 
+    Retained local SET checkpoint (2026-09-10, complete): finish one accepted local metadata,
+    name or position mutation before retryable completion delivery, without re-running the source.
+    - [x] Add host-testable captured SET completion policy and signed Position/Allocation/EOF
+      validation. Fast synchronous Position retains without event reset/signal; ordinary inline
+      SET uses severity-three suppression in both modes. IOSB exceptions preserve source status.
+    - [x] Extract overlay SET and FAT Position into a focused native module, reserve pending/reply
+      ownership before reference acquisition/mutation, and stage LocalInline status/Information=0.
+      Remove replaced direct local IOSB writes and shared pre-I/O failure IOSB stores.
+    - [x] Compose real filesystem mutations and FAT position with IOSB, reply and reference retries,
+      closed-handle lifetime and abandonment. Run all validation serially and review the next target.
+
+    NT5 admission audit: qsinfo.c:1169 resets the ordinary SET File event before negative-scalar
+    validation at :1278. IopExceptionCleanup (internal.c:1998-2091) does not signal that event;
+    releasing the File lock wakes a different synchronization object. Local ordinary invalid
+    scalars therefore retain an error after begin/reset, skip mutation and suppress IOSB/File
+    publication. Fast synchronous Position rejects an invalid scalar without changing the event.
+    No original backend is pending here: the parked reply retains delivery ownership only.
+    No-buffering alignment still requires exact per-device geometry; local Busy serialization,
+    provider SET/flush and completion-port association remain separate work.
+
+    Implementation evidence: the native SET module captures exact local identity and original
+    synchronous mode, reserves delivery/reply ownership, acquires the required File reference and
+    then performs the mutation once. Rename/link resolution errors also reach retained terminal
+    staging; no local path returns after acquiring its reference without transferring it. Existing
+    LocalInline redrive handles typed IOSB faults without replacing the backing result and retains
+    the File through reply rejection, ACK and checked reference retirement. The host policy adds
+    six tests; four composed tests exercise real Position/EOF/Basic/Rename effects, both IOSB stores,
+    retry versus permanent fault, negative-scalar admission timing, readonly File-position signal
+    preservation, close and abandonment. These are host fixtures, not native user-fault proof.
+
+    Validation: 6 policy/validation tests passed, then the native executive release build passed
+    in 37.41s with the unchanged 294-warning baseline. The five-crate focused suite passed 1,366
+    tests and the twelve-crate cross-subsystem suite passed 2,626, all zero failures/ignored. Logs:
+    `.tmp/test-local-set-contract-20260910.log`, `.tmp/build-local-set-executive-20260910.log`,
+    `.tmp/test-local-set-focused-20260910.log`, and `.tmp/test-local-set-full-20260910.log`.
+    All runners were serialized; no VM run or microkernel change occurred. The 27 strict missing
+    win32k imports and real desktop acceptance remain open.
+
+    Next-boundary review: give local synchronous Files genuine Busy ownership using the existing
+    FIFO/retry contracts. Their present waiter and promotion route assumes a hosted device, and
+    teardown/release use hosted completion/reference stores. Introduce a typed local/hosted route
+    and exact retained-grant adoption before native cutover; do not invent a provider device ID.
+    A promoted local retry must consume its already-held File reference, not call begin/retain
+    again (the last user handle may have closed while queued). LocalInline/Buffered/Flush shape
+    validation and completion retirement must carry and release that exact Busy owner alongside
+    reply/IOSB delivery. Cover FIFO promotion, closed-handle retry, cancellation/abandonment and
+    failed lock/reference release in host tests before changing native local admissions.
+    Cut over one local backend's whole File lifecycle, not one syscall: READ/WRITE, SET/position,
+    directory cursors, flush, queries and final-handle cleanup must share its Busy owner. Resolve
+    mutable position/cursor state after acquisition. Settle required completion surfaces before
+    releasing Busy and replying, while retaining the independent I/O reference through ACK.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

@@ -115,20 +115,30 @@ impl ExecNtHandler {
     }
 
     pub(super) fn begin_local_file_io(&mut self, file_object: u64) -> Result<(), u32> {
-        let object_id = (file_object & LOCAL_ID_PAYLOAD_MASK) as u32;
-        match file_object & !LOCAL_ID_PAYLOAD_MASK {
-            LOCAL_FAT_FILE_OBJECT_TAG => self.readonly_file_opens.retain_io(object_id),
-            LOCAL_FAT_DIRECTORY_OBJECT_TAG => self.directory_opens.retain_io(object_id),
-            LOCAL_OVERLAY_FILE_OBJECT_TAG => unsafe {
+        if file_object & !LOCAL_ID_PAYLOAD_MASK == LOCAL_OVERLAY_FILE_OBJECT_TAG {
+            unsafe {
                 return crate::writable_fs::begin_file_io(file_object & LOCAL_ID_PAYLOAD_MASK);
-            },
-            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
-        }?;
+            }
+        }
+        self.retain_local_file_io_reference(file_object)?;
         if let Err(status) = self.set_local_file_object_signaled(file_object, false) {
             self.release_local_file_io_reference(file_object);
             return Err(status);
         }
         Ok(())
+    }
+
+    /// Retain a File for a fast operation that must leave its event state untouched.
+    pub(super) fn retain_local_file_io_reference(&mut self, file_object: u64) -> Result<(), u32> {
+        let object_id = (file_object & LOCAL_ID_PAYLOAD_MASK) as u32;
+        match file_object & !LOCAL_ID_PAYLOAD_MASK {
+            LOCAL_FAT_FILE_OBJECT_TAG => self.readonly_file_opens.retain_io(object_id),
+            LOCAL_FAT_DIRECTORY_OBJECT_TAG => self.directory_opens.retain_io(object_id),
+            LOCAL_OVERLAY_FILE_OBJECT_TAG => unsafe {
+                crate::writable_fs::retain_io_reference(file_object & LOCAL_ID_PAYLOAD_MASK)
+            },
+            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
+        }
     }
 
     pub(crate) fn release_local_file_io_reference(&mut self, file_object: u64) {

@@ -47,6 +47,7 @@ mod hosted_domain;
 mod hosted_device_pointer;
 mod irp;
 mod lock_control;
+mod local_set_information;
 mod mock_driver;
 mod object_port;
 mod open;
@@ -130,6 +131,9 @@ pub use irp::{
 pub use lock_control::{
     LockControlParameters, IRP_MN_LOCK, IRP_MN_UNLOCK_SINGLE, SL_EXCLUSIVE_LOCK,
     SL_FAIL_IMMEDIATELY,
+};
+pub use local_set_information::{
+    validate_local_set_information_value, LocalSetInformationPolicy,
 };
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
