@@ -15947,10 +15947,13 @@ pub(crate) unsafe fn config_manager_prepare_system_hive_mutation(
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT.ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    // Admission observation only: retained upload ownership must ultimately pin this incarnation.
-    client.validate_system_hive_mount(mount, expected_generation)?;
-    let prepared = client.prepare_system_hive_mutation(expected_generation, mutations)?;
-    if prepared.expected_generation() != expected_generation
+    let prepared = client.prepare_system_hive_mutation_for_mount(
+        mount,
+        expected_generation,
+        mutations,
+    )?;
+    if prepared.mount() != mount
+        || prepared.expected_generation() != expected_generation
         || prepared.next_generation() != expected_generation.checked_add(1).unwrap_or(0)
     {
         client.abort_prepared_system_hive_mutation(&prepared);

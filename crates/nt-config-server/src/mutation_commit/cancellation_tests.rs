@@ -118,6 +118,7 @@ fn cancellation_requires_discovery_ack_before_releasing_upload() {
         .grant(19, 1, &server.identities)
         .unwrap();
     let begin = Request {
+        expected_mount: server.system_hive.as_ref().unwrap().identity,
         server_nonce: authority,
         requester_nonce: 19,
         request_generation: 1,
@@ -126,7 +127,8 @@ fn cancellation_requires_discovery_ack_before_releasing_upload() {
         ..Request::default()
     };
     let (slot, _) = server.system_mutation_begins.claim(&begin).unwrap();
-    let token = server.acquire_system_mutation_upload(1, 4).unwrap();
+    let mount = server.system_hive.as_ref().unwrap().identity;
+    let token = server.acquire_system_mutation_upload(mount, 1, 4).unwrap();
     server.system_mutation_begins.finish(slot, Ok(token));
     let request = CmHiveMutationCommitRequest {
         abi_size: core::mem::size_of::<CmHiveMutationCommitRequest>() as u16,
@@ -145,6 +147,7 @@ fn cancellation_requires_discovery_ack_before_releasing_upload() {
         .system_mutation_begins
         .acknowledge(&Request {
             mutation_token: token,
+            expected_mount: 0,
             expected_generation: 0,
             semantic_journal_len: 0,
             ..begin

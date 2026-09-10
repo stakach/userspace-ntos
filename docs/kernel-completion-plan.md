@@ -32049,6 +32049,60 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     in a VM. Independent protocol/native review found no issue in this bounded scope. Only the root
     agent ran tests/builds, serially; no microkernel change or VM run occurred.
 
+    Mount-bound mutation acquisition checkpoint (2026-09-10): replace observation-only admission
+    with an atomic CM mount comparison at the actual writer acquisition boundary.
+    - [x] Require a nonzero exact expected_mount on both retained and synchronous BEGIN wire
+      requests. Validate it against mounted SYSTEM before allocating the upload. Zero identities
+      and old envelope sizes fail closed; a foreign incarnation fails with invalid handle and a
+      stale semantic generation with revision mismatch. QUERY/ACK and token-owned transfer
+      operations require zero in this field and cannot rebind an existing owner.
+    - [x] Capture the expected mount in the retained BEGIN journal alongside generation/length.
+      Claim the exact attempt before evaluating fresh acquisition; cache success or failure and
+      replay the original outcome without checking the current mount again. Never let a retry
+      substitute another identity. Discovery ACK retires only the receipt, not the writer, and
+      exact replay/cancellation remains resolvable even when test-injected authority disappears.
+    - [x] Require an opaque SystemHiveMount when reserving retained work; carry it unchanged
+      through upload, preparation and the non-Clone PreparedSystemHiveMutation used by durable
+      publication. Check echoed identity in every retained BEGIN outcome and reject contamination
+      of QUERY/ACK replies. Synchronous convenience preparation explicitly discovers once, then
+      calls the same exact-mount acquisition. Native callers use their retained boot mount with
+      the for_mount entry point and never rediscover a replacement. Delete the previous
+      validate-then-unbound-PREPARE sequence.
+    - [x] Preserve the existing token ownership boundary after admission. Tokens come from the
+      non-reusing service-lifetime identity source; public remount remains blocked while an upload,
+      preparation or terminal receipt is live. Transfer/commit/abort therefore name the admitted
+      owner by exact token/generation/length rather than repeating an independently mutable mount
+      choice. Foreign-service tokens cannot alter local work, even at the same semantic generation.
+    - [x] Derive mutation chunk capacity from the actual request-header size. The expanded header
+      initially exposed a full-frame APPEND regression; the shared limit now keeps header plus
+      payload within exactly 4096 bytes and multichunk tests exercise that bound.
+
+    Review adjustment: CM acquisition is now mount-bound, but native durable storage admission is
+    not complete. Next associate the retained prepared mount with its primary/log file identity,
+    writable overlay mount and physical snapshot reserve, with filesystem mutation ownership
+    excluding aliasing/re-entry. Complete native caller/PnP/Key migration and delete the old
+    one-shot best-effort abort wrappers and unconditional memory-only flush success together.
+    Synchronous BEGIN/import are not replay-safe under lost replies; this change does not claim
+    otherwise. Volatile/no-op publication remains a separate explicit path. No desktop or complete
+    kernel claim is made; 27 strict missing win32k imports and real desktop acceptance remain open.
+
+    Serialized host validation passes all 1,433 tests/doctests: nt-fs 188 plus two doctests,
+    nt-config-client 163 plus 19 doctests, nt-config-abi 10, nt-config-server 112,
+    nt-config-manager 35, nt-hive-core 106 plus 18 generator cases, nt-security 223 plus two
+    doctests, and nt-user-host 494 plus 49 integration cases and 12 doctests. Six new unit tests
+    and expanded existing matrices cover stale-mount cached outcomes, real remount and fresh
+    retries, foreign tokens, cleanup after injected authority loss, mandatory mount wire fields,
+    malformed echoed identities, retained identity through durable publication, and a real CM
+    replacement between convenience discovery and BEGIN. Existing multichunk/frame tests caught
+    and now cover the eight-byte header expansion. Logs:
+    `.tmp/test-mount-bound-begin-focused-20260910.log` and
+    `.tmp/test-mount-bound-begin-full-20260910.log`. The freestanding executive release,
+    including isolated CM server and client, passes in 37.32 seconds with 293 existing executive
+    warnings; `.tmp/build-mount-bound-begin-executive-20260910.log`. Native admission wiring
+    was source-reviewed and compile-verified, not exercised in a VM.
+    Independent integrated review found no correctness blocker within this scope. Existing
+    client warnings remain. Root is the sole build/test runner; no parallel build or VM run.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

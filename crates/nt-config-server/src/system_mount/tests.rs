@@ -290,6 +290,7 @@ fn mutation_and_checkpoint_preserve_mount_identity() {
         mount: hive_mount::SYSTEM,
         journal_len_bytes: bytes.len() as u32,
         expected_generation: 1,
+        expected_mount: identity,
         ..CmHiveMutationRequest::default()
     };
     let begin = server.dispatch(
@@ -299,6 +300,7 @@ fn mutation_and_checkpoint_preserve_mount_identity() {
     );
     assert_eq!(begin.status, STATUS_SUCCESS);
     request.lease_token = begin.detail1;
+    request.expected_mount = 0;
     request.operation = hive_mutation_transfer::APPEND;
     request.chunk_offset = request.abi_size as u32;
     request.chunk_len_bytes = bytes.len() as u32;

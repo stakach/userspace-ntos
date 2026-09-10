@@ -228,6 +228,11 @@ fn assert_pending_outcome_excludes_writers(op: u16) {
             abi_version: CM_ABI_VERSION,
             mount: hive_mount::SYSTEM,
             operation,
+            expected_mount: if operation == hive_mutation_transfer::BEGIN {
+                server.system_hive.as_ref().unwrap().identity
+            } else {
+                0
+            },
             expected_generation: if operation == hive_mutation_transfer::BEGIN {
                 current_generation
             } else {

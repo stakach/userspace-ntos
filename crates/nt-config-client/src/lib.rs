@@ -259,6 +259,7 @@ mod value_upload_tests {
 #[derive(Debug, PartialEq, Eq)]
 #[must_use = "retain the preparation until its publication or confirmed cleanup"]
 pub struct PreparedSystemHiveMutation {
+    mount: SystemHiveMount,
     expected_generation: u64,
     next_generation: u64,
     lease_token: u64,
@@ -267,6 +268,9 @@ pub struct PreparedSystemHiveMutation {
 }
 
 impl PreparedSystemHiveMutation {
+    pub fn mount(&self) -> SystemHiveMount {
+        self.mount
+    }
     pub fn expected_generation(&self) -> u64 {
         self.expected_generation
     }
@@ -1915,6 +1919,18 @@ impl<B: Backend> ConfigClient<B> {
         expected_generation: u64,
         mutations: &[SystemHiveMutation<'_>],
     ) -> Result<PreparedSystemHiveMutation, i32> {
+        let mount = self.query_system_hive_mount(expected_generation)?.mount();
+        self.prepare_system_hive_mutation_for_mount(mount, expected_generation, mutations)
+    }
+
+    /// Prepare against a retained mount observation. BEGIN atomically validates both the mount
+    /// and semantic generation; this method never discovers a replacement for a stale identity.
+    pub fn prepare_system_hive_mutation_for_mount(
+        &mut self,
+        mount: SystemHiveMount,
+        expected_generation: u64,
+        mutations: &[SystemHiveMutation<'_>],
+    ) -> Result<PreparedSystemHiveMutation, i32> {
         if expected_generation == 0 {
             return Err(STATUS_INVALID_PARAMETER);
         }
@@ -1922,6 +1938,7 @@ impl<B: Backend> ConfigClient<B> {
         let journal_len = u32::try_from(journal.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
         let begin = self.hive_mutation_call(
             hive_mutation_transfer::BEGIN,
+            mount.wire_identity(),
             0,
             expected_generation,
             0,
@@ -1945,6 +1962,7 @@ impl<B: Backend> ConfigClient<B> {
             let end = core::cmp::min(offset + CM_HIVE_MUTATION_CHUNK_BYTES, journal.len());
             let response = match self.hive_mutation_call(
                 hive_mutation_transfer::APPEND,
+                0,
                 token,
                 expected_generation,
                 offset as u32,
@@ -1973,6 +1991,7 @@ impl<B: Backend> ConfigClient<B> {
         }
         let prepare = match self.hive_mutation_call(
             hive_mutation_transfer::PREPARE,
+            0,
             token,
             expected_generation,
             journal_len,
@@ -2039,6 +2058,7 @@ impl<B: Backend> ConfigClient<B> {
             offset += written;
         }
         Ok(PreparedSystemHiveMutation {
+            mount,
             expected_generation,
             next_generation: prepare.detail0,
             lease_token: token,
@@ -2054,6 +2074,7 @@ impl<B: Backend> ConfigClient<B> {
     ) -> Result<SystemHivePublishOutcome, i32> {
         let response = self.hive_mutation_call(
             hive_mutation_transfer::COMMIT,
+            0,
             prepared.lease_token,
             prepared.expected_generation,
             prepared.semantic_journal_len,
@@ -3052,6 +3073,7 @@ impl<B: Backend> ConfigClient<B> {
     fn hive_mutation_call(
         &mut self,
         operation: u16,
+        expected_mount: u64,
         lease_token: u64,
         expected_generation: u64,
         journal_offset: u32,
@@ -3078,6 +3100,7 @@ impl<B: Backend> ConfigClient<B> {
             journal_len_bytes,
             expected_generation,
             lease_token,
+            expected_mount,
         };
         let mut request = Vec::new();
         request
@@ -3108,6 +3131,7 @@ impl<B: Backend> ConfigClient<B> {
         }
         let header_size = core::mem::size_of::<CmHiveMutationRequest>();
         let header = CmHiveMutationRequest {
+            expected_mount: 0,
             abi_size: header_size as u16,
             abi_version: CM_ABI_VERSION,
             operation,
@@ -3137,6 +3161,7 @@ impl<B: Backend> ConfigClient<B> {
         }
         let _ = self.hive_mutation_call(
             hive_mutation_transfer::ABORT,
+            0,
             lease_token,
             expected_generation,
             0,

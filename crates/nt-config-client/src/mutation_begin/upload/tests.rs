@@ -142,7 +142,8 @@ fn preparation<C>(
     caller: C,
 ) -> SystemHiveMutationPreparation<C> {
     let mut manager = CmMutationBeginAttempts::new();
-    let mut attempt = match manager.reserve(1, mutations, caller) {
+    let mount = client.query_system_hive_mount(1).unwrap().mount();
+    let mut attempt = match manager.reserve(mount, 1, mutations, caller) {
         Ok(attempt) => attempt,
         Err((status, _)) => panic!("reserve failed: {status:x}"),
     };
@@ -160,6 +161,7 @@ fn preparation<C>(
     let upload = manager.take_upload(&mut attempt).unwrap();
     let pointer = upload.journal().as_ptr();
     let owner = upload.into_preparation();
+    assert_eq!(owner.mount(), Some(mount));
     assert_eq!(owner.upload.as_ref().unwrap().journal().as_ptr(), pointer);
     owner
 }

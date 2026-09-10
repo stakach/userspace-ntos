@@ -171,6 +171,7 @@ fn invalid_prepared_identity_is_rejected_without_transport() {
     let prepared = prepare(&mut client, 1, "Child");
     // Malformed wire identities are crate-private fixtures, not cloneable public preparations.
     let mut invalid = core::array::from_fn::<_, 4, _>(|_| PreparedSystemHiveMutation {
+        mount: prepared.mount,
         expected_generation: prepared.expected_generation,
         next_generation: prepared.next_generation,
         lease_token: prepared.lease_token,

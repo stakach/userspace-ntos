@@ -18,6 +18,7 @@ impl CmServer {
             || req.abi_version != CM_ABI_VERSION
             || req.mount != hive_mount::SYSTEM
             || chunk_len > CM_HIVE_MUTATION_CHUNK_BYTES
+            || (req.operation == hive_mutation_transfer::BEGIN) != (req.expected_mount != 0)
         {
             return reply(STATUS_INVALID_PARAMETER, 0);
         }
@@ -49,7 +50,11 @@ impl CmServer {
                         current_generation,
                     );
                 }
-                match self.acquire_system_mutation_upload(current_generation, journal_len) {
+                match self.acquire_system_mutation_upload(
+                    req.expected_mount,
+                    current_generation,
+                    journal_len,
+                ) {
                     Ok(token) => reply_with_info(STATUS_SUCCESS, 0, current_generation, token),
                     Err(status) => reply(status, current_generation),
                 }

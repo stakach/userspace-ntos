@@ -35,6 +35,7 @@ fn begin(server: &mut CmServer, len: usize) -> CmHiveMutationRequest {
         mount: hive_mount::SYSTEM,
         operation: hive_mutation_transfer::BEGIN,
         expected_generation: server.system_hive.as_ref().unwrap().generation,
+        expected_mount: server.system_hive.as_ref().unwrap().identity,
         journal_len_bytes: len as u32,
         ..CmHiveMutationRequest::default()
     };
@@ -42,6 +43,7 @@ fn begin(server: &mut CmServer, len: usize) -> CmHiveMutationRequest {
     assert_eq!(reply.status, STATUS_SUCCESS);
     assert_eq!(reply.information, 0);
     request.lease_token = reply.detail1;
+    request.expected_mount = 0;
     request.operation = hive_mutation_transfer::PREPARE;
     request.journal_offset = len as u32;
     request
@@ -341,6 +343,7 @@ fn begin_is_not_deduplicated_by_equal_length_or_generation() {
     let repeat = CmHiveMutationRequest {
         operation: hive_mutation_transfer::BEGIN,
         lease_token: 0,
+        expected_mount: server.system_hive.as_ref().unwrap().identity,
         journal_offset: 0,
         ..request
     };
@@ -350,6 +353,102 @@ fn begin_is_not_deduplicated_by_equal_length_or_generation() {
         STATUS_SUCCESS
     );
     assert_upload(&server, request, &[1, 2, 3, 4]);
+}
+
+#[test]
+fn begin_requires_exact_mount_and_transfer_cannot_rebind_it() {
+    let mut server = server();
+    let mounted = server.system_hive.as_ref().unwrap();
+    let request = CmHiveMutationRequest {
+        abi_size: core::mem::size_of::<CmHiveMutationRequest>() as u16,
+        abi_version: CM_ABI_VERSION,
+        mount: hive_mount::SYSTEM,
+        operation: hive_mutation_transfer::BEGIN,
+        expected_generation: mounted.generation,
+        expected_mount: mounted.identity,
+        journal_len_bytes: 4,
+        ..CmHiveMutationRequest::default()
+    };
+    for (identity, status) in [
+        (0, STATUS_INVALID_PARAMETER),
+        (request.expected_mount + 1, STATUS_INVALID_HANDLE),
+    ] {
+        assert_eq!(
+            call(
+                &mut server,
+                CmHiveMutationRequest {
+                    expected_mount: identity,
+                    ..request
+                },
+                &[]
+            )
+            .status,
+            status
+        );
+        assert!(!server.system_mutation_leases.is_busy());
+    }
+    let acquired = call(&mut server, request, &[]);
+    assert_eq!(acquired.status, STATUS_SUCCESS);
+    let transfer = CmHiveMutationRequest {
+        operation: hive_mutation_transfer::APPEND,
+        lease_token: acquired.detail1,
+        chunk_offset: request.abi_size as u32,
+        chunk_len_bytes: 4,
+        ..request
+    };
+    assert_eq!(
+        call(&mut server, transfer, &[1, 2, 3, 4]).status,
+        STATUS_INVALID_PARAMETER
+    );
+    let transfer = CmHiveMutationRequest {
+        expected_mount: 0,
+        ..transfer
+    };
+    assert_eq!(
+        call(&mut server, transfer, &[1, 2, 3, 4]).status,
+        STATUS_SUCCESS
+    );
+    assert_upload(&server, transfer, &[1, 2, 3, 4]);
+}
+
+#[test]
+fn another_cm_incarnation_cannot_consume_an_admitted_upload() {
+    let mut original = server();
+    let first = begin(&mut original, 4);
+    let mut replacement = CmServer::new_for_incarnation(NonZeroU32::new(2).unwrap());
+    replacement.system_hive = server().system_hive.take();
+    replacement.system_hive.as_mut().unwrap().identity = replacement.identities.take().unwrap();
+    let second = begin(&mut replacement, 4);
+    assert_ne!(first.lease_token, second.lease_token);
+    assert_eq!(
+        append(&mut replacement, first, 0, &[1, 2, 3, 4]).status,
+        STATUS_INVALID_PARAMETER
+    );
+    assert_eq!(
+        append(&mut original, second, 0, &[1, 2, 3, 4]).status,
+        STATUS_INVALID_PARAMETER
+    );
+    let foreign_abort = CmHiveMutationRequest {
+        operation: hive_mutation_transfer::ABORT,
+        journal_offset: 0,
+        ..first
+    };
+    assert_eq!(
+        call(&mut replacement, foreign_abort, &[]).status,
+        STATUS_INVALID_PARAMETER
+    );
+    assert!(original.system_mutation_leases.is_busy());
+    assert!(replacement.system_mutation_leases.is_busy());
+    assert_eq!(
+        append(&mut original, first, 0, &[1, 2, 3, 4]).status,
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        append(&mut replacement, second, 0, &[5, 6, 7, 8]).status,
+        STATUS_SUCCESS
+    );
+    assert_upload(&original, first, &[1, 2, 3, 4]);
+    assert_upload(&replacement, second, &[5, 6, 7, 8]);
 }
 
 #[test]

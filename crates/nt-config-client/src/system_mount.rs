@@ -15,6 +15,12 @@ use nt_config_abi::{hive_mount, opcode, CmSystemHiveMountRequest, CM_ABI_VERSION
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SystemHiveMount(NonZeroU64);
 
+impl SystemHiveMount {
+    pub(crate) fn wire_identity(self) -> u64 {
+        self.0.get()
+    }
+}
+
 /// One successful read-only observation. It can become stale as soon as the query completes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SystemHiveMountState {

@@ -17,7 +17,8 @@ pub mod disposition {
 }
 
 /// QUERY registers a nonzero requester and slot count, with all other identity/input fields zero.
-/// BEGIN names the exact granted slot/next attempt and captures generation/length, with token zero.
+/// BEGIN names the exact granted slot/next attempt and captures mount identity/generation/length,
+/// with token zero. `expected_mount` must be nonzero for BEGIN and zero for QUERY/ACK.
 /// ACK retains that request identity and echoes the successful token (zero for a failed outcome);
 /// slot count, expected generation and semantic length are zero. ACK cannot retire an unexecuted
 /// BEGIN. The requester must first resolve any uncertain acquisition to learn its outcome.
@@ -36,6 +37,7 @@ pub struct Request {
     pub request_generation: u64,
     pub expected_generation: u64,
     pub mutation_token: u64,
+    pub expected_mount: u64,
 }
 
 /// Outer success means this fixed envelope is valid. OUTCOME carries the cached acquisition
@@ -58,6 +60,7 @@ pub struct Reply {
     pub mutation_token: u64,
     pub semantic_journal_len: u32,
     pub reserved: u32,
+    pub expected_mount: u64,
 }
 
 #[cfg(test)]
@@ -66,29 +69,33 @@ mod tests {
 
     #[test]
     fn fixed_envelopes_have_no_padding_and_roundtrip_unaligned() {
-        assert_eq!(core::mem::size_of::<Request>(), 64);
-        assert_eq!(core::mem::size_of::<Reply>(), 72);
+        assert_eq!(core::mem::size_of::<Request>(), 72);
+        assert_eq!(core::mem::size_of::<Reply>(), 80);
         assert_eq!(core::mem::offset_of!(Request, server_nonce), 16);
         assert_eq!(core::mem::offset_of!(Request, mutation_token), 56);
         assert_eq!(core::mem::offset_of!(Reply, semantic_journal_len), 64);
         assert_eq!(core::mem::offset_of!(Reply, reserved), 68);
+        assert_eq!(core::mem::offset_of!(Request, expected_mount), 64);
+        assert_eq!(core::mem::offset_of!(Reply, expected_mount), 72);
         let request = Request {
-            abi_size: 64,
+            abi_size: 72,
             mutation_token: u64::MAX,
+            expected_mount: 19,
             ..Request::default()
         };
         let reply = Reply {
-            abi_size: 72,
+            abi_size: 80,
             outcome_status: -1,
+            expected_mount: 19,
             ..Reply::default()
         };
-        let mut bytes = [0u8; 73];
-        bytes[1..65].copy_from_slice(request.as_bytes());
-        assert_eq!(Request::from_bytes(&bytes[1..65]), Some(request));
-        assert!(Request::from_bytes(&bytes[..63]).is_none());
+        let mut bytes = [0u8; 81];
+        bytes[1..73].copy_from_slice(request.as_bytes());
+        assert_eq!(Request::from_bytes(&bytes[1..73]), Some(request));
+        assert!(Request::from_bytes(&bytes[..71]).is_none());
         bytes[1..].copy_from_slice(reply.as_bytes());
         assert_eq!(Reply::from_bytes(&bytes[1..]), Some(reply));
-        assert!(Reply::from_bytes(&bytes[..71]).is_none());
+        assert!(Reply::from_bytes(&bytes[..79]).is_none());
         assert_eq!(crate::opcode::CM_OP_SYSTEM_HIVE_MUTATION_BEGIN, 0x2161);
     }
 }

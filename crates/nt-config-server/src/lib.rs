@@ -4418,6 +4418,7 @@ mod tests {
             chunk_len_bytes: 0,
             journal_len_bytes: 1,
             expected_generation: 2,
+            expected_mount: server.system_hive.as_ref().unwrap().identity,
             lease_token: 0,
         };
         assert_eq!(

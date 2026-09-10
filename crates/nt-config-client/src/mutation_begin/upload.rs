@@ -175,6 +175,9 @@ impl<B: Backend> ConfigClient<B> {
 }
 
 impl<C> SystemHiveMutationPreparation<C> {
+    pub fn mount(&self) -> Option<crate::SystemHiveMount> {
+        self.upload.as_ref().map(|upload| upload.mount)
+    }
     pub fn phase(&self) -> CmMutationPreparationPhase {
         self.phase
     }
@@ -458,6 +461,7 @@ impl<C> SystemHiveMutationPreparation<C> {
         self.phase = CmMutationPreparationPhase::Taken;
         Ok((
             PreparedSystemHiveMutation {
+                mount: upload.mount,
                 expected_generation: upload.expected_generation,
                 next_generation: upload
                     .expected_generation

@@ -30,6 +30,7 @@ impl CmServer {
                     && request.request_slot == 0
                     && request.request_generation == 0
                     && request.expected_generation == 0
+                    && request.expected_mount == 0
                     && request.semantic_journal_len == 0
                     && request.mutation_token == 0
             }
@@ -37,11 +38,13 @@ impl CmServer {
                 request.slot_count == 0
                     && request.mutation_token == 0
                     && request.expected_generation != 0
+                    && request.expected_mount != 0
                     && request.semantic_journal_len != 0
             }
             operation::ACKNOWLEDGE => {
                 request.slot_count == 0
                     && request.expected_generation == 0
+                    && request.expected_mount == 0
                     && request.semantic_journal_len == 0
             }
             _ => false,
@@ -83,6 +86,7 @@ impl CmServer {
                 };
                 if fresh {
                     let outcome = self.acquire_system_mutation_upload(
+                        request.expected_mount,
                         request.expected_generation,
                         request.semantic_journal_len as usize,
                     );
@@ -96,6 +100,7 @@ impl CmServer {
                 body.outcome_status = status;
                 body.mutation_token = token;
                 body.expected_generation = request.expected_generation;
+                body.expected_mount = request.expected_mount;
                 body.semantic_journal_len = request.semantic_journal_len;
             }
             operation::ACKNOWLEDGE => {
@@ -119,12 +124,16 @@ impl CmServer {
     /// caller reserves its result slot before this final fallible writer allocation.
     pub(super) fn acquire_system_mutation_upload(
         &mut self,
+        expected_mount: u64,
         expected: u64,
         len: usize,
     ) -> Result<u64, i32> {
         let mounted = self.system_hive.as_ref().ok_or(STATUS_DEVICE_NOT_READY)?;
-        if expected == 0 || len == 0 {
+        if expected_mount == 0 || expected == 0 || len == 0 {
             return Err(STATUS_INVALID_PARAMETER);
+        }
+        if expected_mount != mounted.identity {
+            return Err(STATUS_INVALID_HANDLE);
         }
         if expected != mounted.generation {
             return Err(STATUS_REVISION_MISMATCH);

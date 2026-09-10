@@ -28,6 +28,7 @@ fn retained_begin_publication(first_journal: bool) {
     let mut attempts = CmMutationBeginAttempts::with_slot_limit(1).unwrap();
     let drops = Rc::new(Cell::new(0));
     let mut attempt = match attempts.reserve(
+        client.query_system_hive_mount(1).unwrap().mount(),
         1,
         &[SystemHiveMutation::CreateKey {
             path: &alloc::format!("{PARENT}\\Child"),
@@ -66,7 +67,9 @@ fn retained_begin_publication(first_journal: bool) {
         let response = client.exchange_system_hive_mutation_preparation(&ticket);
         preparing.complete_exchange(&mut ticket, response).unwrap();
     }
+    let mount = preparing.mount().unwrap();
     let (prepared, caller) = preparing.take_prepared().unwrap();
+    assert_eq!(prepared.mount(), mount);
     assert_eq!(preparing.phase(), Phase::Taken);
     assert!(preparing.begin_exchange(Op::Cancel).is_err());
     assert_eq!(drops.get(), 0);

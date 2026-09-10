@@ -11,7 +11,25 @@ const PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Services\Device"
 const BUSY: i32 = 0x8000_0011u32 as i32;
 
 fn reserve<C>(manager: &mut CmMutationBeginAttempts, caller: C) -> CmMutationBeginAttempt<C> {
-    match manager.reserve(1, &[SystemHiveMutation::CreateKey { path: PATH }], caller) {
+    reserve_on(manager, &mut client(), caller)
+}
+
+fn mount() -> SystemHiveMount {
+    client().query_system_hive_mount(1).unwrap().mount()
+}
+
+fn reserve_on<C>(
+    manager: &mut CmMutationBeginAttempts,
+    client: &mut ConfigClient<Direct>,
+    caller: C,
+) -> CmMutationBeginAttempt<C> {
+    let mount = client.query_system_hive_mount(1).unwrap().mount();
+    match manager.reserve(
+        mount,
+        1,
+        &[SystemHiveMutation::CreateKey { path: PATH }],
+        caller,
+    ) {
         Ok(attempt) => attempt,
         Err((status, _)) => panic!("reserve failed: {status:x}"),
     }
@@ -51,6 +69,7 @@ fn response(
             0
         },
         mutation_token: if begin { token } else { 0 },
+        expected_mount: if begin { request.expected_mount } else { 0 },
         reserved: 0,
     };
     let mut bytes = [0; REPLY_BYTES];
@@ -110,7 +129,12 @@ fn successful_ack_moves_original_bytes_and_caller_once_without_exposing_writer()
     assert!(manager.take_upload(&mut attempt).is_err());
     assert!(manager.take_failure(&mut attempt).is_err());
     assert!(manager
-        .reserve(1, &[SystemHiveMutation::CreateKey { path: PATH }], ())
+        .reserve(
+            mount(),
+            1,
+            &[SystemHiveMutation::CreateKey { path: PATH }],
+            ()
+        )
         .is_err());
     complete(
         &mut manager,
@@ -124,6 +148,7 @@ fn successful_ack_moves_original_bytes_and_caller_once_without_exposing_writer()
     assert_eq!(upload.journal().as_ptr(), pointer);
     assert_eq!(upload.continuation(), "whole caller");
     assert_eq!(upload.expected_generation(), 1);
+    assert_eq!(upload.mount(), attempt.mount());
     assert_eq!(upload.mutation_token, 31);
     assert_eq!(upload.server, 19);
     assert_eq!(upload.identity, identity);
@@ -219,7 +244,7 @@ fn transport_errors_retain_exact_input_and_ack_retries() {
 
 #[test]
 fn malformed_begin_never_adopts_an_outcome_or_authorizes_ack() {
-    for variant in 0..20 {
+    for variant in 0..22 {
         let mut manager = CmMutationBeginAttempts::new();
         let mut attempt = reserve(&mut manager, 42);
         complete(
@@ -262,6 +287,8 @@ fn malformed_begin_never_adopts_an_outcome_or_authorizes_ack() {
                 body.outcome_status = 0x103;
                 body.mutation_token = 0;
             }),
+            20 => mutate(&mut reply, |body| body.expected_mount = 0),
+            21 => mutate(&mut reply, |body| body.expected_mount += 1),
             _ => unreachable!(),
         }
         assert_eq!(
@@ -290,7 +317,7 @@ fn malformed_query_and_ack_preserve_the_owned_phase() {
         CmMutationBeginOperation::Query,
         CmMutationBeginOperation::Acknowledge,
     ] {
-        for variant in 0..7 {
+        for variant in 0..8 {
             let mut manager = CmMutationBeginAttempts::new();
             let mut attempt = reserve(&mut manager, 7);
             if op == CmMutationBeginOperation::Acknowledge {
@@ -319,6 +346,7 @@ fn malformed_query_and_ack_preserve_the_owned_phase() {
                 4 => mutate(&mut reply, |body| body.outcome_status = BUSY),
                 5 => mutate(&mut reply, |body| body.disposition = disposition::OUTCOME),
                 6 => mutate(&mut reply, |body| body.request_slot += 1),
+                7 => mutate(&mut reply, |body| body.expected_mount = 1),
                 _ => unreachable!(),
             }
             assert_eq!(
@@ -379,18 +407,23 @@ fn dropped_wrong_manager_and_stale_tickets_never_release_an_inflight_attempt() {
 fn admission_errors_return_caller_without_allocating_a_request_identity() {
     let mut manager = CmMutationBeginAttempts::with_slot_limit(1).unwrap();
     assert!(matches!(
-        manager.reserve(0, &[], 7),
+        manager.reserve(mount(), 0, &[], 7),
         Err((STATUS_INVALID_PARAMETER, 7))
     ));
     assert_eq!(manager.requester, 0);
     assert!(manager.slots.is_empty());
     assert!(matches!(
-        manager.reserve(1, &[], 8),
+        manager.reserve(mount(), 1, &[], 8),
         Err((STATUS_INVALID_PARAMETER, 8))
     ));
     let _attempt = reserve(&mut manager, 9);
     assert!(matches!(
-        manager.reserve(1, &[SystemHiveMutation::CreateKey { path: PATH }], 10),
+        manager.reserve(
+            mount(),
+            1,
+            &[SystemHiveMutation::CreateKey { path: PATH }],
+            10
+        ),
         Err((STATUS_INSUFFICIENT_RESOURCES, 10))
     ));
     assert!(CmMutationBeginAttempts::with_slot_limit(0).is_err());
@@ -409,7 +442,7 @@ fn caller_drops_only_with_its_current_owner_and_dropped_attempt_does_not_reuse_s
     }
     let drops = Rc::new(Cell::new(0));
     let mut manager = CmMutationBeginAttempts::with_slot_limit(1).unwrap();
-    let failed = manager.reserve(0, &[], Caller(drops.clone()));
+    let failed = manager.reserve(mount(), 0, &[], Caller(drops.clone()));
     assert_eq!(drops.get(), 0);
     drop(failed);
     assert_eq!(drops.get(), 1);
@@ -444,7 +477,12 @@ fn caller_drops_only_with_its_current_owner_and_dropped_attempt_does_not_reuse_s
     drop(attempt);
     assert_eq!(drops.get(), 3);
     assert!(manager
-        .reserve(1, &[SystemHiveMutation::CreateKey { path: PATH }], ())
+        .reserve(
+            mount(),
+            1,
+            &[SystemHiveMutation::CreateKey { path: PATH }],
+            ()
+        )
         .is_err());
 }
 
@@ -552,7 +590,7 @@ fn exchange<C>(
 fn real_server_lost_begin_and_ack_transfer_one_still_live_upload() {
     let mut client = client();
     let mut manager = CmMutationBeginAttempts::with_slot_limit(1).unwrap();
-    let mut attempt = reserve(&mut manager, 42);
+    let mut attempt = reserve_on(&mut manager, &mut client, 42);
     for (op, wire) in [
         (CmMutationBeginOperation::Query, operation::QUERY),
         (CmMutationBeginOperation::Begin, operation::BEGIN),
@@ -577,7 +615,7 @@ fn real_server_lost_begin_and_ack_transfer_one_still_live_upload() {
     let upload = manager.take_upload(&mut attempt).unwrap();
     assert_eq!(upload.mutation_token, client.backend.tokens[0]);
     assert_eq!(upload.continuation(), &42);
-    let mut competitor = reserve(&mut manager, 9);
+    let mut competitor = reserve_on(&mut manager, &mut client, 9);
     exchange(
         &mut manager,
         &mut competitor,
@@ -590,6 +628,7 @@ fn real_server_lost_begin_and_ack_transfer_one_still_live_upload() {
     let appended = client
         .hive_mutation_call(
             hive_mutation_transfer::APPEND,
+            0,
             upload.mutation_token,
             upload.expected_generation,
             0,
@@ -601,6 +640,7 @@ fn real_server_lost_begin_and_ack_transfer_one_still_live_upload() {
     let aborted = client
         .hive_mutation_call(
             hive_mutation_transfer::ABORT,
+            0,
             upload.mutation_token,
             upload.expected_generation,
             0,
@@ -623,7 +663,7 @@ fn real_server_lost_begin_and_ack_transfer_one_still_live_upload() {
 fn real_server_lost_busy_outcome_remains_failed_after_writer_is_released() {
     let mut client = client();
     let mut manager = CmMutationBeginAttempts::with_slot_limit(2).unwrap();
-    let mut first = reserve(&mut manager, 1);
+    let mut first = reserve_on(&mut manager, &mut client, 1);
     exchange(
         &mut manager,
         &mut first,
@@ -646,7 +686,7 @@ fn real_server_lost_busy_outcome_remains_failed_after_writer_is_released() {
     )
     .unwrap();
     let upload = manager.take_upload(&mut first).unwrap();
-    let mut failed = reserve(&mut manager, 2);
+    let mut failed = reserve_on(&mut manager, &mut client, 2);
     client.backend.lose = Some(operation::BEGIN);
     assert_eq!(
         exchange(
@@ -664,6 +704,7 @@ fn real_server_lost_busy_outcome_remains_failed_after_writer_is_released() {
     let aborted = client
         .hive_mutation_call(
             hive_mutation_transfer::ABORT,
+            0,
             upload.mutation_token,
             upload.expected_generation,
             0,
@@ -688,7 +729,7 @@ fn real_server_lost_busy_outcome_remains_failed_after_writer_is_released() {
     )
     .unwrap();
     assert_eq!(manager.take_failure(&mut failed), Ok((BUSY, 2)));
-    let mut next = reserve(&mut manager, 3);
+    let mut next = reserve_on(&mut manager, &mut client, 3);
     exchange(
         &mut manager,
         &mut next,
@@ -703,7 +744,7 @@ fn real_server_lost_busy_outcome_remains_failed_after_writer_is_released() {
 fn real_server_unwind_after_begin_keeps_epoch_busy_and_caller_owned() {
     let mut client = client();
     let mut manager = CmMutationBeginAttempts::new();
-    let mut attempt = reserve(&mut manager, 42);
+    let mut attempt = reserve_on(&mut manager, &mut client, 42);
     exchange(
         &mut manager,
         &mut attempt,

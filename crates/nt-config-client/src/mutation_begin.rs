@@ -2,7 +2,7 @@
 //! The handoff still owns a live upload; APPEND/PREPARE and its cancellation are separate work.
 
 use crate::{
-    encode_hive_mutation_journal, Backend, ConfigClient, SystemHiveMutation,
+    encode_hive_mutation_journal, Backend, ConfigClient, SystemHiveMount, SystemHiveMutation,
     STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
 };
 use alloc::vec::Vec;
@@ -60,6 +60,7 @@ pub struct CmMutationBeginAttempts {
 #[must_use]
 pub struct CmMutationBeginAttempt<C> {
     identity: Identity,
+    mount: SystemHiveMount,
     server: Option<u64>,
     expected_generation: u64,
     journal: Vec<u8>,
@@ -74,6 +75,9 @@ pub struct CmMutationBeginAttempt<C> {
 }
 
 impl<C> CmMutationBeginAttempt<C> {
+    pub fn mount(&self) -> SystemHiveMount {
+        self.mount
+    }
     pub fn expected_generation(&self) -> u64 {
         self.expected_generation
     }
@@ -152,6 +156,7 @@ impl CmMutationBeginResponse {
 #[must_use]
 pub struct SystemHiveMutationUpload<C> {
     identity: Identity,
+    mount: SystemHiveMount,
     server: u64,
     mutation_token: u64,
     expected_generation: u64,
@@ -160,6 +165,9 @@ pub struct SystemHiveMutationUpload<C> {
 }
 
 impl<C> SystemHiveMutationUpload<C> {
+    pub fn mount(&self) -> SystemHiveMount {
+        self.mount
+    }
     pub fn expected_generation(&self) -> u64 {
         self.expected_generation
     }
@@ -220,6 +228,7 @@ impl CmMutationBeginAttempts {
     /// Reserve and encode before any IPC. Failed admission returns the complete caller unchanged.
     pub fn reserve<C>(
         &mut self,
+        mount: SystemHiveMount,
         expected_generation: u64,
         mutations: &[SystemHiveMutation<'_>],
         continuation: C,
@@ -279,6 +288,7 @@ impl CmMutationBeginAttempts {
         };
         Ok(CmMutationBeginAttempt {
             identity,
+            mount,
             server: self.server,
             expected_generation,
             journal,
@@ -351,6 +361,7 @@ impl CmMutationBeginAttempts {
             request.request_generation = attempt.identity.sequence;
         }
         if op == CmMutationBeginOperation::Begin {
+            request.expected_mount = attempt.mount.wire_identity();
             request.expected_generation = attempt.expected_generation;
             request.semantic_journal_len = attempt.journal.len() as u32;
         } else if op == CmMutationBeginOperation::Acknowledge {
@@ -417,6 +428,7 @@ impl CmMutationBeginAttempts {
                 || body.expected_generation != 0
                 || body.mutation_token != 0
                 || body.semantic_journal_len != 0
+                || body.expected_mount != 0
                 || self
                     .server
                     .is_some_and(|server| server != body.server_nonce)
@@ -439,6 +451,7 @@ impl CmMutationBeginAttempts {
                 if body.disposition != disposition::OUTCOME
                     || body.outcome_status > STATUS_SUCCESS
                     || body.expected_generation != attempt.expected_generation
+                    || body.expected_mount != attempt.mount.wire_identity()
                     || body.semantic_journal_len as usize != attempt.journal.len()
                     || (body.outcome_status == STATUS_SUCCESS) != (body.mutation_token != 0)
                 {
@@ -456,6 +469,7 @@ impl CmMutationBeginAttempts {
                     || body.expected_generation != 0
                     || body.semantic_journal_len != 0
                     || body.mutation_token != 0
+                    || body.expected_mount != 0
                 {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
@@ -492,6 +506,7 @@ impl CmMutationBeginAttempts {
         attempt.released = true;
         Ok(SystemHiveMutationUpload {
             identity: attempt.identity,
+            mount: attempt.mount,
             server,
             mutation_token,
             expected_generation: attempt.expected_generation,

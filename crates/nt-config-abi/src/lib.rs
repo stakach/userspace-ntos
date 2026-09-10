@@ -27,7 +27,8 @@ pub const CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES: usize = 16;
 /// Maximum payload carried by one SYSTEM-hive import request frame.
 pub const CM_HIVE_IMPORT_CHUNK_BYTES: usize = 4064;
 /// Maximum journal payload carried by one mounted-hive mutation request frame.
-pub const CM_HIVE_MUTATION_CHUNK_BYTES: usize = 4056;
+pub const CM_HIVE_MUTATION_CHUNK_BYTES: usize =
+    4096 - core::mem::size_of::<CmHiveMutationRequest>();
 /// Maximum SYSTEM checkpoint bytes returned in one SURT completion frame.
 pub const CM_HIVE_CHECKPOINT_CHUNK_BYTES: usize = 4096;
 pub const CM_HIVE_CHECKPOINT_MAGIC: u32 = 0x4843_4D43; // `CMCH`
@@ -746,6 +747,8 @@ pub struct CmHiveMutationRequest {
     pub journal_len_bytes: u32,
     pub expected_generation: u64,
     pub lease_token: u64,
+    /// Exact observed mount for BEGIN; zero for subsequent token-owned operations.
+    pub expected_mount: u64,
 }
 
 pub mod hive_mutation_commit_operation {
@@ -1271,21 +1274,24 @@ mod tests {
         assert_eq!(opcode::CM_OP_EXPORT_LEASED_HIVE, 0x215b);
         assert_eq!(core::mem::size_of::<CmHiveExportHeader>(), 24);
         assert_eq!(CM_HIVE_EXPORT_HEADER_BYTES, 24);
-        assert_eq!(core::mem::size_of::<CmHiveMutationRequest>(), 40);
+        assert_eq!(core::mem::size_of::<CmHiveMutationRequest>(), 48);
+        assert_eq!(CM_HIVE_MUTATION_CHUNK_BYTES + core::mem::size_of::<CmHiveMutationRequest>(), 4096);
+        assert_eq!(core::mem::offset_of!(CmHiveMutationRequest, expected_mount), 40);
         assert_eq!(core::mem::size_of::<CmHiveMutationRecord>(), 24);
         assert_eq!(CM_HIVE_MUTATION_RECORD_HEADER_BYTES, 24);
 
         let request = CmHiveMutationRequest {
-            abi_size: 40,
+            abi_size: 48,
             abi_version: CM_ABI_VERSION,
             operation: hive_mutation_transfer::APPEND,
             mount: hive_mount::SYSTEM,
             journal_offset: 0x1122_3344,
-            chunk_offset: 40,
+            chunk_offset: 48,
             chunk_len_bytes: 0x5566_7788,
             journal_len_bytes: 0x99aa_bbcc,
             expected_generation: 0x0102_0304_0506_0708,
             lease_token: 0x1112_1314_1516_1718,
+            expected_mount: 0,
         };
         assert_eq!(
             CmHiveMutationRequest::from_bytes(request.as_bytes()),
@@ -1294,9 +1300,9 @@ mod tests {
         assert_eq!(
             request.as_bytes(),
             &[
-                40, 0, 4, 0, 2, 0, 1, 0, 0x44, 0x33, 0x22, 0x11, 40, 0, 0, 0, 0x88, 0x77, 0x66,
+                48, 0, 4, 0, 2, 0, 1, 0, 0x44, 0x33, 0x22, 0x11, 48, 0, 0, 0, 0x88, 0x77, 0x66,
                 0x55, 0xcc, 0xbb, 0xaa, 0x99, 8, 7, 6, 5, 4, 3, 2, 1, 0x18, 0x17, 0x16, 0x15, 0x14,
-                0x13, 0x12, 0x11,
+                0x13, 0x12, 0x11, 0, 0, 0, 0, 0, 0, 0, 0,
             ]
         );
     }

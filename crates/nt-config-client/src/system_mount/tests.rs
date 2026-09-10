@@ -94,6 +94,7 @@ fn ordinary_publication_and_checkpoint_preserve_mount_identity() {
             }],
         )
         .unwrap();
+    assert_eq!(prepared.mount(), first.mount());
     assert_eq!(
         client.validate_system_hive_mount(first.mount(), 1),
         Ok(first)
@@ -249,4 +250,85 @@ fn failure_and_pending_replies_never_publish_mount_state() {
             Err(status)
         );
     }
+}
+
+#[test]
+fn explicit_preparation_never_rediscovers_a_foreign_mount() {
+    let source = source();
+    let mut first = client(source.clone());
+    let mut second = client(source);
+    first.import_system_hive(&image()).unwrap();
+    second.import_system_hive(&image()).unwrap();
+    let first_mount = first.query_system_hive_mount(1).unwrap().mount();
+    let second_mount = second.query_system_hive_mount(1).unwrap().mount();
+    let mutations = [SystemHiveMutation::CreateKey {
+        path: r"\Registry\Machine\System\ControlSet001\Services\Child",
+    }];
+    assert_eq!(
+        second.prepare_system_hive_mutation_for_mount(first_mount, 1, &mutations),
+        Err(0xC000_0008u32 as i32),
+    );
+    let prepared = second
+        .prepare_system_hive_mutation_for_mount(second_mount, 1, &mutations)
+        .unwrap();
+    assert_eq!(prepared.mount(), second_mount);
+    // A token admitted on this mount cannot publish on another service at the same generation.
+    assert!(first.publish_system_hive_mutation(&prepared).is_err());
+    assert_eq!(
+        second
+            .publish_system_hive_mutation(&prepared)
+            .unwrap()
+            .generation,
+        2
+    );
+}
+
+struct ReplaceAfterObservation {
+    active: CmServer,
+    replacement: Option<CmServer>,
+}
+
+impl Backend for ReplaceAfterObservation {
+    fn call(&mut self, opcode: u16, input: &[u8], output: &mut [u8]) -> CmReply {
+        let response = self.active.dispatch(opcode, input, output);
+        if opcode == opcode::CM_OP_QUERY_SYSTEM_HIVE_MOUNT {
+            if let Some(replacement) = self.replacement.take() {
+                self.active = replacement;
+            }
+        }
+        response
+    }
+}
+
+#[test]
+fn replacement_between_discovery_and_begin_cannot_acquire_a_writer() {
+    let source = source();
+    let mut first = client(source.clone());
+    let mut second = client(source);
+    first.import_system_hive(&image()).unwrap();
+    second.import_system_hive(&image()).unwrap();
+    let new_mount = second.query_system_hive_mount(1).unwrap().mount();
+    let mut client = ConfigClient::new(ReplaceAfterObservation {
+        active: first.backend.0,
+        replacement: Some(second.backend.0),
+    });
+    let mutations = [SystemHiveMutation::CreateKey {
+        path: r"\Registry\Machine\System\ControlSet001\Services\Child",
+    }];
+    assert_eq!(
+        client.prepare_system_hive_mutation(1, &mutations),
+        Err(0xC000_0008u32 as i32),
+    );
+    // Rejected stale admission left the replacement's writer available for a fresh operation.
+    let prepared = client
+        .prepare_system_hive_mutation_for_mount(new_mount, 1, &mutations)
+        .unwrap();
+    assert_eq!(prepared.mount(), new_mount);
+    assert_eq!(
+        client
+            .publish_system_hive_mutation(&prepared)
+            .unwrap()
+            .generation,
+        2
+    );
 }

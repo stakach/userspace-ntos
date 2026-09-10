@@ -1,8 +1,12 @@
 use super::*;
 use crate::mutation_commit::test_support::server;
+use nt_config_abi::{
+    hive_mutation_commit_disposition, hive_mutation_commit_operation, CmHiveMutationCommitReply,
+    CmHiveMutationCommitRequest,
+};
 
 fn exchange(server: &mut CmServer, request: Request) -> Result<Reply, i32> {
-    let mut out = [0u8; 72];
+    let mut out = [0u8; core::mem::size_of::<Reply>()];
     let reply = server.dispatch(
         opcode::CM_OP_SYSTEM_HIVE_MUTATION_BEGIN,
         request.as_bytes(),
@@ -11,11 +15,11 @@ fn exchange(server: &mut CmServer, request: Request) -> Result<Reply, i32> {
     if reply.status != STATUS_SUCCESS {
         return Err(reply.status);
     }
-    assert_eq!(reply.information, 72);
+    assert_eq!(reply.information as usize, out.len());
     let body = Reply::from_bytes(&out).unwrap();
     assert_eq!(reply.detail0, body.server_nonce);
     assert_eq!(reply.detail1, body.request_generation);
-    assert_eq!(body.abi_size, 72);
+    assert_eq!(body.abi_size as usize, out.len());
     assert_eq!(body.abi_version, CM_ABI_VERSION);
     assert_eq!(body.mount, hive_mount::SYSTEM);
     assert_eq!(body.reserved, 0);
@@ -24,7 +28,7 @@ fn exchange(server: &mut CmServer, request: Request) -> Result<Reply, i32> {
 
 fn query(requester: u64, slots: u32) -> Request {
     Request {
-        abi_size: 64,
+        abi_size: core::mem::size_of::<Request>() as u16,
         abi_version: CM_ABI_VERSION,
         mount: hive_mount::SYSTEM,
         operation: operation::QUERY,
@@ -46,6 +50,7 @@ fn register(server: &mut CmServer, requester: u64, slots: u32) -> Request {
         slot_count: 0,
         request_generation: 1,
         expected_generation: 1,
+        expected_mount: server.system_hive.as_ref().unwrap().identity,
         semantic_journal_len: 4,
         ..query
     }
@@ -55,6 +60,7 @@ fn ack(request: Request, token: u64) -> Request {
     Request {
         operation: operation::ACKNOWLEDGE,
         expected_generation: 0,
+        expected_mount: 0,
         semantic_journal_len: 0,
         mutation_token: token,
         ..request
@@ -93,6 +99,7 @@ fn exact_begin_replay_and_ack_handoff_preserve_live_upload() {
     let outcome = exchange(&mut server, request).unwrap();
     assert_eq!(outcome.disposition, disposition::OUTCOME);
     assert_eq!(outcome.outcome_status, STATUS_SUCCESS);
+    assert_eq!(outcome.expected_mount, request.expected_mount);
     assert_ne!(outcome.mutation_token, 0);
     for _ in 0..3 {
         assert_eq!(exchange(&mut server, request), Ok(outcome));
@@ -115,6 +122,7 @@ fn exact_begin_replay_and_ack_handoff_preserve_live_upload() {
     assert_eq!(acknowledged.disposition, disposition::ACKNOWLEDGED);
     assert_eq!(acknowledged.mutation_token, 0);
     assert_eq!(acknowledged.expected_generation, 0);
+    assert_eq!(acknowledged.expected_mount, 0);
     assert_eq!(acknowledged.semantic_journal_len, 0);
     assert_eq!(exchange(&mut server, request), Err(STATUS_INVALID_HANDLE));
     assert_eq!(
@@ -211,10 +219,86 @@ fn busy_and_stale_outcomes_are_cached_until_ack_not_re_evaluated() {
 }
 
 #[test]
+fn wrong_mount_is_cached_without_acquiring_even_at_the_same_generation() {
+    let mut server = server();
+    let admitted = register(&mut server, 1, 1);
+    let wrong = Request {
+        expected_mount: admitted.expected_mount + 1,
+        ..admitted
+    };
+    let failed = exchange(&mut server, wrong).unwrap();
+    assert_eq!(failed.outcome_status, STATUS_INVALID_HANDLE);
+    assert_eq!(failed.expected_mount, wrong.expected_mount);
+    assert_eq!(failed.mutation_token, 0);
+    assert!(!server.system_mutation_leases.is_busy());
+    assert_eq!(
+        exchange(&mut server, admitted),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    server.system_hive.as_mut().unwrap().identity = wrong.expected_mount;
+    assert_eq!(exchange(&mut server, wrong), Ok(failed));
+    assert!(!server.system_mutation_leases.is_busy());
+    exchange(&mut server, ack(wrong, 0)).unwrap();
+    let fresh = Request {
+        request_generation: wrong.request_generation + 1,
+        ..wrong
+    };
+    assert_eq!(
+        exchange(&mut server, fresh).unwrap().outcome_status,
+        STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn original_mount_upload_remains_discoverable_and_cancellable_after_authority_drift() {
+    let mut server = server();
+    let request = register(&mut server, 1, 1);
+    let outcome = exchange(&mut server, request).unwrap();
+    // Public import cannot do this while an upload is owned. Exercise cleanup even if an
+    // independent authority transition invalidates normal admission in the future.
+    server.system_hive.as_mut().unwrap().identity += 1;
+    assert_eq!(exchange(&mut server, request), Ok(outcome));
+    exchange(&mut server, ack(request, outcome.mutation_token)).unwrap();
+    let cancel = CmHiveMutationCommitRequest {
+        abi_size: core::mem::size_of::<CmHiveMutationCommitRequest>() as u16,
+        abi_version: CM_ABI_VERSION,
+        mount: hive_mount::SYSTEM,
+        operation: hive_mutation_commit_operation::ABORT_UNPUBLISHED,
+        mutation_token: outcome.mutation_token,
+        expected_generation: request.expected_generation,
+        semantic_journal_len: request.semantic_journal_len,
+        ..CmHiveMutationCommitRequest::default()
+    };
+    let mut output = [0; core::mem::size_of::<CmHiveMutationCommitReply>()];
+    assert_eq!(
+        server
+            .op_system_hive_mutation_commit(cancel.as_bytes(), &mut output)
+            .status,
+        STATUS_SUCCESS
+    );
+    let receipt = CmHiveMutationCommitReply::from_bytes(&output).unwrap();
+    assert_eq!(
+        receipt.disposition,
+        hive_mutation_commit_disposition::UNPUBLISHED_ABORTED
+    );
+    assert!(!server.system_mutation_leases.is_busy());
+    assert_eq!(
+        server
+            .op_system_hive_mutation_commit(cancel.as_bytes(), &mut output)
+            .status,
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        CmHiveMutationCommitReply::from_bytes(&output),
+        Some(receipt)
+    );
+}
+
+#[test]
 fn malformed_frames_and_changed_attempts_do_not_change_acquisition() {
     let mut server = server();
     let request = register(&mut server, 1, 1);
-    let mut short = [0; 71];
+    let mut short = [0; core::mem::size_of::<Reply>() - 1];
     assert_eq!(
         server
             .op_system_hive_mutation_begin(request.as_bytes(), &mut short)
@@ -226,7 +310,7 @@ fn malformed_frames_and_changed_attempts_do_not_change_acquisition() {
         exchange(&mut server, ack(request, 0)),
         Err(STATUS_INVALID_HANDLE)
     );
-    for field in 0..8 {
+    for field in 0..9 {
         let mut invalid = request;
         match field {
             0 => invalid.abi_size -= 1,
@@ -236,7 +320,8 @@ fn malformed_frames_and_changed_attempts_do_not_change_acquisition() {
             4 => invalid.slot_count = 1,
             5 => invalid.mutation_token = 1,
             6 => invalid.semantic_journal_len = 0,
-            _ => invalid.expected_generation = 0,
+            7 => invalid.expected_generation = 0,
+            _ => invalid.expected_mount = 0,
         }
         assert_eq!(
             exchange(&mut server, invalid),
@@ -245,7 +330,7 @@ fn malformed_frames_and_changed_attempts_do_not_change_acquisition() {
         assert!(!server.system_mutation_leases.is_busy());
     }
     let original = exchange(&mut server, request).unwrap();
-    for field in 0..6 {
+    for field in 0..7 {
         let mut changed = request;
         match field {
             0 => changed.server_nonce += 1,
@@ -253,7 +338,8 @@ fn malformed_frames_and_changed_attempts_do_not_change_acquisition() {
             2 => changed.request_slot = 1,
             3 => changed.request_generation = 2,
             4 => changed.expected_generation += 1,
-            _ => changed.semantic_journal_len += 1,
+            5 => changed.semantic_journal_len += 1,
+            _ => changed.expected_mount += 1,
         }
         assert!(exchange(&mut server, changed).is_err());
         assert_eq!(exchange(&mut server, request), Ok(original));
@@ -282,6 +368,10 @@ fn registration_capacity_and_incarnation_do_not_replace_live_grants() {
     );
     let outcome = exchange(&mut server, request).unwrap();
     let mut restarted = CmServer::new_for_incarnation(NonZeroU32::new(2).unwrap());
+    restarted.system_hive = crate::mutation_commit::test_support::server()
+        .system_hive
+        .take();
+    restarted.system_hive.as_mut().unwrap().identity = restarted.identities.take().unwrap();
     let replacement = register(&mut restarted, 1, 1);
     assert_ne!(replacement.server_nonce, request.server_nonce);
     assert_eq!(
@@ -391,4 +481,34 @@ fn imports_cannot_invalidate_upload_before_or_after_begin_ack() {
         STATUS_SUCCESS
     );
     assert_eq!(server.system_hive.as_ref().unwrap().generation, 2);
+    assert_ne!(
+        server.system_hive.as_ref().unwrap().identity,
+        request.expected_mount
+    );
+    let stale_mount = Request {
+        request_generation: 2,
+        expected_generation: 2,
+        ..request
+    };
+    let refused = exchange(&mut server, stale_mount).unwrap();
+    assert_eq!(refused.outcome_status, STATUS_INVALID_HANDLE);
+    assert!(!server.system_mutation_leases.is_busy());
+    let corrected = Request {
+        expected_mount: server.system_hive.as_ref().unwrap().identity,
+        ..stale_mount
+    };
+    assert_eq!(
+        exchange(&mut server, corrected),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(exchange(&mut server, stale_mount), Ok(refused));
+    exchange(&mut server, ack(stale_mount, 0)).unwrap();
+    let fresh = Request {
+        request_generation: 3,
+        ..corrected
+    };
+    assert_eq!(
+        exchange(&mut server, fresh).unwrap().outcome_status,
+        STATUS_SUCCESS
+    );
 }

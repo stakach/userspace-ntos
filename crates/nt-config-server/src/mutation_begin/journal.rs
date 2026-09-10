@@ -17,6 +17,7 @@ struct Outcome {
 struct Pending {
     generation: u64,
     expected_generation: u64,
+    expected_mount: u64,
     semantic_journal_len: u32,
     outcome: Option<Outcome>,
 }
@@ -116,6 +117,7 @@ impl BeginJournal {
             return Err(STATUS_INVALID_HANDLE);
         }
         if pending.expected_generation != request.expected_generation
+            || pending.expected_mount != request.expected_mount
             || pending.semantic_journal_len != request.semantic_journal_len
         {
             return Err(STATUS_INVALID_PARAMETER);
@@ -126,7 +128,10 @@ impl BeginJournal {
     /// The caller records every acquired outcome before replying. Journal transitions allocate
     /// nothing after claim, including when acquiring the upload fails.
     pub(crate) fn claim(&mut self, request: &Request) -> Result<((usize, usize), bool), i32> {
-        if request.expected_generation == 0 || request.semantic_journal_len == 0 {
+        if request.expected_mount == 0
+            || request.expected_generation == 0
+            || request.semantic_journal_len == 0
+        {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let position = self.locate(request)?;
@@ -144,6 +149,7 @@ impl BeginJournal {
         slot.pending = Some(Pending {
             generation: request.request_generation,
             expected_generation: request.expected_generation,
+            expected_mount: request.expected_mount,
             semantic_journal_len: request.semantic_journal_len,
             outcome: None,
         });
@@ -238,6 +244,7 @@ mod tests {
                 request_slot: 0,
                 request_generation: 1,
                 expected_generation: 7,
+                expected_mount: 3,
                 semantic_journal_len: 31,
                 ..Request::default()
             },
@@ -261,6 +268,7 @@ mod tests {
         let ack = Request {
             mutation_token: 71,
             expected_generation: 0,
+            expected_mount: 0,
             semantic_journal_len: 0,
             ..request
         };
@@ -333,6 +341,10 @@ mod tests {
                 ..request
             },
             Request {
+                expected_mount: 4,
+                ..request
+            },
+            Request {
                 expected_generation: 8,
                 ..request
             },
@@ -379,6 +391,7 @@ mod tests {
             request_slot: 0,
             request_generation: 1,
             expected_generation: 7,
+            expected_mount: 3,
             semantic_journal_len: 31,
             ..Request::default()
         };
