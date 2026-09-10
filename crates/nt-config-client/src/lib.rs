@@ -14,6 +14,8 @@ extern crate alloc;
 mod retained_snapshot_integration;
 
 mod active_driver_service;
+mod system_mount;
+pub use system_mount::{SystemHiveMount, SystemHiveMountState};
 mod retained_snapshot;
 pub use retained_snapshot::{
     CmSnapshotAttempt, CmSnapshotAttempts, CmSnapshotExchange, CmSnapshotOperation,

@@ -21,6 +21,7 @@ mod retained_snapshot;
 mod mutation;
 mod snapshot;
 mod system_hive_path;
+mod system_mount;
 
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -981,6 +982,7 @@ impl CmIdentitySource {
 
 struct MountedSystemHive {
     hive: Hive,
+    identity: u64,
     generation: u64,
     current_control_set: CurrentControlSet,
     hardware_profile: nt_hive_core::HardwareProfileAlias,
@@ -1150,6 +1152,7 @@ impl CmServer {
                 self.op_retained_snapshot(in_buf, out_buf)
             }
             opcode::CM_OP_IMPORT_HIVE => self.op_import_hive(in_buf),
+            opcode::CM_OP_QUERY_SYSTEM_HIVE_MOUNT => self.op_query_system_hive_mount(in_buf),
             opcode::CM_OP_MUTATE_SYSTEM_HIVE => self.op_mutate_system_hive(in_buf, out_buf),
             opcode::CM_OP_SYSTEM_HIVE_MUTATION_BEGIN => self.op_system_hive_mutation_begin(in_buf, out_buf),
             opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE => self.op_checkpoint_system_hive(in_buf, out_buf),
@@ -1934,6 +1937,10 @@ impl CmServer {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
                 let mut cm = config_manager_from_system_hive(&hive, &current_control_set);
+                // Reserve before the first import can seed externally retained PnP work.
+                let Some(identity) = self.identities.take() else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
                 if current_generation == 0 {
                     let publications = cm.devnode_publications();
                     if let Err(error) = self.device_action_journal.seed(generation, &publications) {
@@ -1944,6 +1951,7 @@ impl CmServer {
                 self.cm = cm;
                 self.system_hive = Some(MountedSystemHive {
                     hive,
+                    identity,
                     generation,
                     current_control_set,
                     hardware_profile,

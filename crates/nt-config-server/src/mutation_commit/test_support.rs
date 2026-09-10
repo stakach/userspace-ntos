@@ -11,6 +11,7 @@ pub(crate) fn server() -> CmServer {
         nt_hive_core::HardwareProfileAlias::capture(&hive, &current_control_set).unwrap();
     server.cm = config_manager_from_system_hive(&hive, &current_control_set);
     server.system_hive = Some(MountedSystemHive {
+        identity: server.identities.take().unwrap(),
         hive,
         generation: 1,
         current_control_set,

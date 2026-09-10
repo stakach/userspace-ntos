@@ -32001,6 +32001,54 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `.tmp/build-snapshot-reserve-executive-20260910.log`. Existing client warnings are unchanged.
     Only the root agent ran tests/builds, serially; no microkernel change or VM run occurred.
 
+    SYSTEM mount observation checkpoint (2026-09-10): establish a real CM mount incarnation
+    before attempting the native CM-to-storage association. Semantic generation and retained
+    BEGIN's service-journal nonce are not mount identities.
+    - [x] Allocate each mounted SYSTEM incarnation from the existing service-lifetime
+      CmIdentitySource. Allocate before first-import PnP baseline seeding or publication; exhaustion
+      must not modify the live mount. Preserve identity across ordinary mutation/checkpoint,
+      replace on successful import, and never reuse across reconstructed servers sharing the source.
+    - [x] Add the exact versioned CM_OP_QUERY_SYSTEM_HIVE_MOUNT request and separate client
+      discovery/revalidation APIs. Require a nonzero expected semantic generation, exact wire
+      size/version/SYSTEM selector, zero reserved fields and an exact checked response. Revalidation
+      carries an opaque previously observed mount identity, never a caller-constructed integer,
+      and accepts a new expected generation after legitimate edits. Wrong identity or generation
+      fails without silently discovering a replacement.
+    - [x] Native boot publishes its retained mount identity and semantic generation only after
+      import and observation both succeed. Client replacement invalidates both local observations.
+      Mutation preparation revalidates the boot-admitted incarnation before uploading any edits.
+      An observation failure after import is a boot admission error, not absence or permission to
+      retry import. No fallible post-durability check is inserted into the old rollback wrappers.
+
+    Review adjustment: this is read-only observation, not exclusive mount ownership, replay-safe
+    import, or a CM/storage binding. Another request can invalidate an observation immediately.
+    Next carry this exact incarnation through retained BEGIN/upload/prepared/publication ownership
+    and enforce it atomically server-side, then associate that owner with the primary/log file,
+    writable overlay mount and independently identified physical snapshot reserve. The overlay and
+    physical source mount IDs are distinct and must be retained as an association, not compared as
+    equal. Establish filesystem mutation exclusion before borrowing global state across re-entry;
+    finish native caller/PnP/Key migration and remove the old wrappers/unconditional flush success
+    together. Volatile/no-op publication remains separate. No desktop or plan completion is implied;
+    the 27 strict missing win32k imports and serialized real desktop validation remain open.
+
+    Serialized validation passes all 1,427 host tests/doctests: nt-fs 188 plus two doctests,
+    nt-config-client 161 plus 19 doctests, nt-config-abi 10, nt-config-server 108,
+    nt-config-manager 35, nt-hive-core 106 plus 18 generator cases, nt-security 223 plus two
+    doctests, and nt-user-host 494 plus 49 integration cases and 12 doctests. Fourteen new unit
+    tests and an opaque-construction compile-fail case cover exact wire layout, malformed requests
+    and replies, unchanged state/output, absent/stale mounts, real import/remount/reconstruction,
+    identity exhaustion before PnP baseline seeding, successful retry, failed import containment,
+    and identity preservation across actual mutation and checkpoint protocols. Four older direct
+    mount fixtures now allocate their identities from the same source. Review corrected one test
+    expectation: initial import seeds known topology, never synthetic device arrivals.
+    Logs: `.tmp/test-system-mount-focused-20260910.log` and
+    `.tmp/test-system-mount-full-20260910.log`. The freestanding executive release, including its
+    isolated CM server, passes in 36.67 seconds with 293 existing executive warnings;
+    `.tmp/build-system-mount-executive-20260910.log`. Existing client warnings are unchanged.
+    Native observation publication/clearing was source-reviewed and compile-verified, not exercised
+    in a VM. Independent protocol/native review found no issue in this bounded scope. Only the root
+    agent ran tests/builds, serially; no microkernel change or VM run occurred.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

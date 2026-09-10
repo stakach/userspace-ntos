@@ -15457,6 +15457,7 @@ impl nt_config_client::Backend for CmChan<'_> {
 }
 
 static mut CONFIG_CLIENT_PTR: *mut ConfigClient<CmChan<'static>> = core::ptr::null_mut();
+static mut LIVE_CONFIG_MANAGER_SYSTEM_MOUNT: Option<nt_config_client::SystemHiveMount> = None;
 static LIVE_CONFIG_MANAGER_SYSTEM_GENERATION: AtomicU64 = AtomicU64::new(0);
 static CONFIG_DEVICE_ACTION_PENDING: AtomicBool = AtomicBool::new(false);
 static CONFIG_DEVICE_ACTION_WAKE_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -15464,6 +15465,8 @@ const CONFIG_STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 const CONFIG_STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 
 unsafe fn install_config_manager_client(client: &mut ConfigClient<CmChan<'static>>) {
+    LIVE_CONFIG_MANAGER_SYSTEM_MOUNT = None;
+    LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(0, Ordering::Release);
     CONFIG_CLIENT_PTR = client as *mut _;
 }
 
@@ -15943,6 +15946,9 @@ pub(crate) unsafe fn config_manager_prepare_system_hive_mutation(
     let client = CONFIG_CLIENT_PTR
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT.ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    // Admission observation only: retained upload ownership must ultimately pin this incarnation.
+    client.validate_system_hive_mount(mount, expected_generation)?;
     let prepared = client.prepare_system_hive_mutation(expected_generation, mutations)?;
     if prepared.expected_generation() != expected_generation
         || prepared.next_generation() != expected_generation.checked_add(1).unwrap_or(0)
@@ -21839,6 +21845,9 @@ struct LiveConfigManagerMountReport {
 
 fn mount_live_config_manager_config_hive() -> LiveConfigManagerMountReport {
     let mut report = LiveConfigManagerMountReport::default();
+    unsafe {
+        LIVE_CONFIG_MANAGER_SYSTEM_MOUNT = None;
+    }
     LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(0, Ordering::Release);
     {
         let _transient = allocator::enter_transient();
@@ -21846,11 +21855,15 @@ fn mount_live_config_manager_config_hive() -> LiveConfigManagerMountReport {
             report.bytes = image.len() as u64;
             unsafe {
                 if let Some(client) = CONFIG_CLIENT_PTR.as_mut() {
-                    match client.import_system_hive(image) {
-                        Ok(generation) => {
-                            report.generation = generation;
+                    let mounted = client
+                        .import_system_hive(image)
+                        .and_then(|generation| client.query_system_hive_mount(generation));
+                    match mounted {
+                        Ok(state) => {
+                            report.generation = state.generation();
+                            LIVE_CONFIG_MANAGER_SYSTEM_MOUNT = Some(state.mount());
                             LIVE_CONFIG_MANAGER_SYSTEM_GENERATION
-                                .store(generation, Ordering::Release);
+                                .store(state.generation(), Ordering::Release);
                         }
                         Err(status) => {
                             report.status = status;

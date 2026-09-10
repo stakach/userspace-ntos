@@ -136,6 +136,8 @@ pub mod opcode {
     pub const CM_OP_RETAINED_SNAPSHOT: u16 = 0x2160;
     /// Register requester slots, acquire/replay a SYSTEM mutation upload, or acknowledge handoff.
     pub const CM_OP_SYSTEM_HIVE_MUTATION_BEGIN: u16 = 0x2161;
+    /// Observe or revalidate the exact mounted SYSTEM incarnation at a semantic generation.
+    pub const CM_OP_QUERY_SYSTEM_HIVE_MOUNT: u16 = 0x2162;
 }
 
 pub mod hive_key_open_operation {
@@ -565,6 +567,21 @@ pub struct CmHiveImportRequest {
     pub transfer_token: u64,
 }
 
+/// Read-only SYSTEM mount observation. Zero `expected_identity` discovers the current identity;
+/// a nonzero value requires that exact mount. `expected_generation` must always be nonzero.
+/// Success has no payload: information is zero, detail0 echoes the generation, and detail1 is the
+/// nonzero mount identity. Observation does not pin the mount or authorize a later mutation.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmSystemHiveMountRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub mount: u16,
+    pub _reserved: u16,
+    pub expected_generation: u64,
+    pub expected_identity: u64,
+}
+
 /// `query_hive_key`: a full NT key path plus an immutable snapshot-bank cursor.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -917,6 +934,7 @@ wire!(CmDriverServiceRequest);
 wire!(CmRetainedSnapshotRequest);
 wire!(CmRetainedSnapshotReply);
 wire!(CmHiveImportRequest);
+wire!(CmSystemHiveMountRequest);
 wire!(CmHiveKeyRequest);
 wire!(CmHivePathRequest);
 wire!(CmHiveKeyCloseRequest);
@@ -954,6 +972,29 @@ pub fn read_utf16(buf: &[u8], offset: u32, len_bytes: u32, out: &mut [u16]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_mount_query_wire_has_exact_identity_and_generation_offsets() {
+        assert_eq!(opcode::CM_OP_QUERY_SYSTEM_HIVE_MOUNT, 0x2162);
+        assert_eq!(core::mem::size_of::<CmSystemHiveMountRequest>(), 24);
+        let request = CmSystemHiveMountRequest {
+            abi_size: 24,
+            abi_version: CM_ABI_VERSION,
+            mount: hive_mount::SYSTEM,
+            _reserved: 0,
+            expected_generation: 0x0102_0304_0506_0708,
+            expected_identity: 0x1112_1314_1516_1718,
+        };
+        let bytes = request.as_bytes();
+        assert_eq!(&bytes[0..2], &24u16.to_le_bytes());
+        assert_eq!(&bytes[2..4], &CM_ABI_VERSION.to_le_bytes());
+        assert_eq!(&bytes[4..6], &hive_mount::SYSTEM.to_le_bytes());
+        assert_eq!(&bytes[6..8], &[0, 0]);
+        assert_eq!(&bytes[8..16], &request.expected_generation.to_le_bytes());
+        assert_eq!(&bytes[16..24], &request.expected_identity.to_le_bytes());
+        assert_eq!(CmSystemHiveMountRequest::from_bytes(bytes), Some(request));
+        assert_eq!(CmSystemHiveMountRequest::from_bytes(&bytes[..23]), None);
+    }
 
     #[test]
     fn prepared_abort_uses_exact_identity_and_no_publication_outcome() {

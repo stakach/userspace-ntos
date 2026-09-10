@@ -19,6 +19,7 @@ fn server(incarnation: u32) -> CmServer {
     );
     hive.finish_clean_import();
     server.system_hive = Some(MountedSystemHive {
+        identity: server.identities.take().unwrap(),
         hardware_profile: nt_hive_core::HardwareProfileAlias::capture(
             &hive, &hive.current_control_set().unwrap(),
         ).unwrap(),
