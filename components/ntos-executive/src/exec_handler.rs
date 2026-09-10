@@ -14146,7 +14146,8 @@ impl ExecNtHandler {
                     let _ =
                         self.cancel_local_directory_notify(pending.file_id, operation.notify_id);
                 }
-                nt_io_manager::PendingFileIoOperation::LocalInline(_) => {}
+                nt_io_manager::PendingFileIoOperation::LocalInline(_)
+                | nt_io_manager::PendingFileIoOperation::LocalBuffered(_) => {}
                 _ => {
                     let _ = driver_launch::cancel_irp_if_pending(pending.irp_id);
                 }
@@ -40850,7 +40851,6 @@ impl ExecNtHandler {
                 const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
                 const GENERIC_READ: u32 = 0x8000_0000;
                 const GENERIC_ALL: u32 = 0x1000_0000;
-                const DIR_QUERY_SCRATCH_CAP: usize = 64 * 1024;
 
                 let iosb = args[4];
                 let output = args[5];
@@ -40985,16 +40985,14 @@ impl ExecNtHandler {
                             != 0;
                         let file_object =
                             LOCAL_OVERLAY_FILE_OBJECT_TAG | (file_id & LOCAL_ID_PAYLOAD_MASK);
-                        let request_id = match self.begin_retained_local_file_io(file_object) {
+                        let request_id = match self.begin_retained_local_buffered_io(file_object, length) {
                             Ok(request_id) => request_id,
                             Err(status) => return status,
                         };
-                        let scratch_len = length.min(DIR_QUERY_SCRATCH_CAP);
-                        let encoded = core::slice::from_raw_parts_mut(
-                            core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
-                            scratch_len,
-                        );
-                        encoded.fill(0);
+                        let encoded = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                            .reserved_local_output_mut(self.pending_file_io_reservation
+                                .expect("directory query lost its output reservation"))
+                            .expect("directory query lost its reserved output");
                         let result = crate::writable_fs::query_directory(
                             file_id,
                             information_class,
@@ -41010,7 +41008,6 @@ impl ExecNtHandler {
                             synchronous,
                             event_index.map_or(u64::MAX, |index| index as u64),
                             result,
-                            encoded,
                         );
                     }
                     Some(_) => {
@@ -41062,18 +41059,12 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
 
-                let scratch_len = length.min(DIR_QUERY_SCRATCH_CAP);
-                let encoded = core::slice::from_raw_parts_mut(
-                    core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
-                    scratch_len,
-                );
-                encoded.fill(0);
                 let synchronous = open.create_options
                     & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                     != 0;
                 let file_object = LOCAL_FAT_DIRECTORY_OBJECT_TAG | object_id as u64;
                 // Reserve durable table capacity before entering the transient entry allocator.
-                let request_id = match self.reserve_local_file_io_delivery() {
+                let request_id = match self.reserve_local_file_io_output(length) {
                     Ok(request_id) => request_id,
                     Err(status) => return status,
                 };
@@ -41095,6 +41086,10 @@ impl ExecNtHandler {
                     if let Err(status) = self.begin_local_file_io(file_object) {
                         return status;
                     }
+                    let encoded = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                        .reserved_local_output_mut(self.pending_file_io_reservation
+                            .expect("FAT query lost its output reservation"))
+                        .expect("FAT query lost its reserved output");
                     let directory = self.directory_opens.get_mut(object_id)
                         .expect("retained FAT directory disappeared during query");
                     nt_fs::query_directory(
@@ -41114,7 +41109,6 @@ impl ExecNtHandler {
                     synchronous,
                     event_index.map_or(u64::MAX, |index| index as u64),
                     result,
-                    encoded,
                 )
             },
             // NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
@@ -43471,8 +43465,8 @@ impl ExecNtHandler {
                     self.npfs_read_file_route_for(fh).ok().is_some_and(|route| {
                         apc_routine != 0 && self.file_completion.binding(route.file_id).is_some()
                     });
-                // Disk and overlay reads copy directly to user memory. Hosted drivers get a full
-                // request-sized destination which the component fills through the banked transport.
+                // FAT reads still copy in chunks. Overlay reads reserve retained output before
+                // transfer; hosted drivers fill their destination through the banked transport.
                 let overlay_file = self.overlay_file_id_for(fh);
                 let overlay_read_access = overlay_file.is_none()
                     || self.hosted_file_access_for(fh).is_some_and(|access| {
@@ -43636,7 +43630,7 @@ impl ExecNtHandler {
                                             Err(status) => status.raw() as u32,
                                             Ok(resolved) => {
                                                 let actual_offset = resolved.value();
-                                                match self.begin_retained_local_file_io(route.file_object) {
+                                                match self.begin_retained_local_buffered_io(route.file_object, len) {
                                                     Err(status) => status,
                                                     Ok(request_id) => {
                                                         local_file_io = Some((
@@ -43660,34 +43654,19 @@ impl ExecNtHandler {
                                                         if lock_status != nt_fs::STATUS_SUCCESS {
                                                             lock_status
                                                         } else {
-                                                            let scratch =
-                                                                core::slice::from_raw_parts_mut(
-                                                                    core::ptr::addr_of_mut!(
-                                                                        OVERLAY_WRITE_SCRATCH
-                                                                    )
-                                                                        as *mut u8,
-                                                                    OVERLAY_IO_CAP,
-                                                                );
+                                                            let output = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                                                                .reserved_local_output_mut(self.pending_file_io_reservation
+                                                                    .expect("overlay read lost its output reservation"))
+                                                                .expect("overlay read lost its reserved output");
                                                             let (status, read) =
                                                                 crate::writable_fs::read_completed_into(
                                                                     file_id,
                                                                     resolved,
                                                                     route.synchronous,
-                                                                    &mut scratch[..len],
+                                                                    output,
                                                                 );
-                                                            // The transfer and file position are already accepted.
-                                                            // A terminal copy fault changes status, not Information.
                                                             information = read as u64;
-                                                            if status == nt_fs::STATUS_SUCCESS && read != 0 {
-                                                                match self.process_memory_write_status(
-                                                                    self.pi, buffer, &scratch[..read],
-                                                                ) {
-                                                                    Ok(()) => status,
-                                                                    Err(status) => status,
-                                                                }
-                                                            } else {
-                                                                status
-                                                            }
+                                                            status
                                                         }
                                                     }
                                                 }
@@ -43885,20 +43864,19 @@ impl ExecNtHandler {
                 }
                 if let Some((request_id, file_object, synchronous)) = local_file_io.take() {
                     assert_ne!(status, STATUS_PENDING, "local read unexpectedly pended");
-                    self.stage_terminal_local_file_io(
-                        request_id,
-                        nt_io_abi::major::IRP_MJ_READ,
-                        file_object,
-                        synchronous,
-                        event_obj_idx,
-                        self.current_tid,
-                        apc_routine,
-                        apc_context,
-                        iosb,
-                        status,
-                        information,
-                        completion_port_suppressed,
-                    );
+                    if overlay_file.is_some() {
+                        self.stage_terminal_local_buffered_io(
+                            request_id, nt_io_abi::major::IRP_MJ_READ, file_object,
+                            synchronous, event_obj_idx, apc_routine, apc_context, iosb,
+                            status, information, completion_port_suppressed, buffer, len as u32,
+                        );
+                    } else {
+                        self.stage_terminal_local_file_io(
+                            request_id, nt_io_abi::major::IRP_MJ_READ, file_object,
+                            synchronous, event_obj_idx, self.current_tid, apc_routine,
+                            apc_context, iosb, status, information, completion_port_suppressed,
+                        );
+                    }
                 }
                 if routed
                     && status != STATUS_PENDING

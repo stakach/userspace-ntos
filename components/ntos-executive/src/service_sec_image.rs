@@ -24302,7 +24302,8 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
         return false;
     };
     let alertable = match pending.operation {
-        nt_io_manager::PendingFileIoOperation::LocalInline(_) => false,
+        nt_io_manager::PendingFileIoOperation::LocalInline(_)
+        | nt_io_manager::PendingFileIoOperation::LocalBuffered(_) => false,
         nt_io_manager::PendingFileIoOperation::LocalByteLock(operation) => operation.alertable,
         nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
             operation.alertable
@@ -24332,7 +24333,8 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
         .expect("APC interruption candidate lost its exact pending File owner");
 
     let cancellation = match pending.operation {
-        nt_io_manager::PendingFileIoOperation::LocalInline(_) => Ok(false),
+        nt_io_manager::PendingFileIoOperation::LocalInline(_)
+        | nt_io_manager::PendingFileIoOperation::LocalBuffered(_) => Ok(false),
         nt_io_manager::PendingFileIoOperation::LocalByteLock(operation) => {
             let cancelled = nt_handler.cancel_local_byte_lock_wait(operation.wait_id);
             if cancelled {
@@ -25123,7 +25125,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         )
     });
     let mut delivered = 0u64;
-    for (slot, pending) in snapshot {
+    for (slot, mut pending) in snapshot {
         let set_file_name_id = match pending.operation {
             nt_io_manager::PendingFileIoOperation::SetFileName(operation) => {
                 nt_io_manager::PendingSetFileNameId::from_raw(operation.transaction_id)
@@ -25637,7 +25639,21 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                     .expect("pending CREATE handle owner disappeared");
             }
         }
-        if pending.output_va != 0
+        if matches!(pending.operation, nt_io_manager::PendingFileIoOperation::LocalBuffered(_)) {
+            pending = match nt_handler.deliver_local_buffered_output(slot, pending) {
+                Ok(pending) => pending,
+                Err(()) => {
+                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                    restore_file_io_mirrors!();
+                    continue;
+                }
+            };
+            // A definitive payload fault changes Status and may suppress inline surfaces.
+            // Use the refreshed owner, never the pre-copy snapshot, for the remaining delivery.
+            (terminal_status, terminal_information) = pending.local_terminal_result()
+                .expect("buffered local result disappeared during delivery");
+            delivery_state = pending.delivery_state;
+        } else if pending.output_va != 0
             && pending.output_len != 0
             && delivery_state & nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED == 0
         {
@@ -25658,7 +25674,8 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 let chunk = ((delivery_len - offset) as usize).min(4096);
                 let work = &mut *core::ptr::addr_of_mut!(FILE_IO_COPY_WORK);
                 let copy_result = match pending.operation {
-                    nt_io_manager::PendingFileIoOperation::LocalInline(_) => {
+                    nt_io_manager::PendingFileIoOperation::LocalInline(_)
+                    | nt_io_manager::PendingFileIoOperation::LocalBuffered(_) => {
                         Err(nt_fs::STATUS_INVALID_PARAMETER)
                     }
                     nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
@@ -25961,7 +25978,8 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             }
             nt_io_manager::PendingFileIoOperation::LocalByteLock(_)
             | nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(_)
-            | nt_io_manager::PendingFileIoOperation::LocalInline(_) => {}
+            | nt_io_manager::PendingFileIoOperation::LocalInline(_)
+            | nt_io_manager::PendingFileIoOperation::LocalBuffered(_) => {}
         }
         delivered += 1;
         let trace_completion = FILE_IO_COMPLETION_TRACE.fetch_add(1, Ordering::Relaxed) < 32

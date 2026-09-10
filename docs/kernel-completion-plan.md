@@ -32523,6 +32523,47 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     enable native filesystem exclusion or claim a fresh desktop boot. Those ownership boundaries
     and the strict provider import gate remain open.
 
+    Retained local buffered output checkpoint (2026-09-10): separate accepted
+    filesystem effects from retryable user-memory delivery.
+    - [x] Add exact-reservation-owned buffers to PendingFileIoTable and a LocalBuffered terminal
+      operation without weakening LocalInline. Retain immutable bytes until exact final removal;
+      validate copy ranges/progress and settle permanent output faults separately from publication.
+    - [x] Reserve request-sized output before overlay reads and overlay/FAT directory enumeration.
+      Fill owned storage directly; remove the shared directory scratch buffer and its 64 KiB cap.
+      Keep FAT entry capture transient but allocate the retained output before entering that scope.
+    - [x] Deliver local buffered output with typed memory-copy outcomes and page-contained progress.
+      Retry only refused output, preserve accepted Information and filesystem effects on a permanent
+      fault, and refresh the pending record before applying its final inline completion surfaces.
+      Exclude terminal local output from provider copy/cancellation and APC interruption machinery.
+    - [x] Compose real filesystem reads/queries with retained delivery tests; run focused, broad
+      and native validation serially, review teardown and update the next checkpoint.
+
+    Host validation: 916 focused and 2,591 broad tests/doctests passed, none ignored. Nine new
+    owner tests cover exact reservation/cancellation, immutable checked ranges, rejected premature
+    surfaces, explicit zero/noncopy settlement, permanent faults, slot reuse and teardown. Three
+    real filesystem composition tests cover page-contained read/directory retries, accepted cursor,
+    position and accounting preservation, guard versus access-violation completion policy, and
+    handle closure before output delivery. The memory fixture injects typed copy outcomes, not
+    native faults. Evidence: .tmp/test-local-buffered-output-focused-20260910.log and
+    .tmp/test-local-buffered-output-full-20260910.log. The native executive release build passed
+    in 37.25s with 294 unchanged warnings
+    (.tmp/build-local-buffered-output-executive-20260910.log). Root serialized every runner.
+    Independent native/core reviews found no blocking issues. Pending rows remain Copy snapshots
+    but their table is no longer Clone; final removal releases its uniquely owned output.
+
+    Review adjustment: finish ordinary FAT read migration before flush. Replace
+    readonly_disk_read_to_user with source-only reading into pre-reserved retained storage; preserve
+    large reads without introducing the overlay transfer cap. Commit accepted position/information
+    once before delivery and remove the old shared-scratch/user-copy loop. Test short device reads,
+    EOF/zero length and late output failures with the real ReadOnlyFileOpenTable. Flush remains a
+    separate completion policy: an asynchronous File used by a synchronous API has a kernel event
+    and local IOSB, and IopSynchronousApiServiceTail changes the syscall result on the final IOSB
+    copy exception (NT5 misc.c:584 / internal.c:7165). Do not apply ordinary ignored-IOSB-fault
+    semantics indiscriminately or repeat writeback during delivery retry. Local synchronous Busy
+    ownership, File completion-port association, ordinary close/unpublished rollback, filesystem
+    exclusion, exact CM storage binding and the 27 strict win32k imports remain open. No fresh
+    desktop/VM acceptance is claimed by this checkpoint.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

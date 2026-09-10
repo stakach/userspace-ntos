@@ -198,7 +198,7 @@ impl ExecNtHandler {
             .map_err(MemoryCopyFailure::status)
     }
 
-    unsafe fn process_memory_write_checked(
+    pub(crate) unsafe fn process_memory_write_checked(
         &mut self,
         pi: usize,
         address: u64,
