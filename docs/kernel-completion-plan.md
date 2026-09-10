@@ -32814,6 +32814,62 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     ByteOffset/key values captured before waiting must survive as values, not merely replayed
     pointers. FAT File/directory owners need equivalent canonical lifecycle support separately.
 
+    Typed synchronous File waiter routing (2026-09-10, complete): preserve the owning domain
+    and captured mode across FIFO wait, retry delivery, cancellation and teardown.
+    - [x] Replace loose hosted fields and raw File keys throughout FIFO/exact/retry APIs with
+      typed hosted/local-overlay routes and keys; derive alertability from captured File mode.
+    - [x] Convert native hosted adapters and extract shared routing for promotion/cancellation.
+      Never re-resolve a promoted route through a closed or reused process handle.
+    - [x] Test colliding IDs, local zero, retry refusal, grant adoption and domain-specific
+      cancellation with real File owners; validate host/native serially and review the cutover.
+    Local native acquisition remains disabled. This checkpoint does not yet carry local Busy
+    through terminal delivery or capture pointed-to arguments for blocked-operation replay.
+
+    Implementation: FileIoWaitRoute carries either the retained hosted File/device/context or a
+    canonical local-overlay File row; FileIoWaitKey tags every FIFO, exact removal/promotion,
+    retry lookup and acknowledged-retirement cursor by domain. Remove the old loose hosted fields,
+    independent alertable boolean and implicit Default waiter. Local zero remains valid; invalid
+    hosted routes, asynchronous waits and reserved thread IDs are rejected. Captured mode/access
+    remain immutable through reply refusal, uncertain delivery, ACK failure and grant adoption.
+
+    A focused synchronous_file_wait.rs module now routes native queue promotion/cancellation;
+    remove the duplicated hosted cancellation bodies and inline wake/release implementation.
+    Hosted cancellation releases its separately held reference with a checked helper independent
+    of current-operation release deferral; local cancellation consumes its own reference, publishes
+    cleanup effects and never mounts a filesystem to reconstruct a missing owner. No currently
+    reachable current-lock cancellation leak was reproduced: the dedicated release is ownership
+    boundary hardening, not a claimed runtime bug fix. Local no-waiter cleanup remains with nt-fs
+    transitions and the service-loop redrive barrier; preparation errors are retained, not panics.
+    Retry route/access lookup checks exact PI/TID/badge/service/handle, never crosses domains via
+    process-handle lookup, and validates captured full hosted route/mode before adopting the grant.
+
+    Validation: all 20 synchronous waiter/retry contracts passed, including five new typed-route
+    cases. Three new composed tests use real nt-fs and FileCompletionTable owners with injected
+    retry/ACK outcomes; they prove cross-domain isolation, closed-handle adoption and each domain's
+    reference contract, not native IPC or syscall capture. The five-crate suite passed 1,403 tests;
+    the twelve-crate cross-subsystem suite passed 2,663 tests/doctests, all zero failures/ignored.
+    The native executive release build passed in 37.28s with the unchanged 294-warning baseline.
+    Logs: `.tmp/test-typed-file-waiter-contract-20260910.log`,
+    `.tmp/test-typed-file-waiter-focused-20260910.log`,
+    `.tmp/test-typed-file-waiter-full-20260910.log`, and
+    `.tmp/build-typed-file-waiter-executive-20260910.log`. Root serialized every runner; independent
+    source review found no remaining blocker in this checkpoint. No VM or microkernel change;
+    the 27 strict missing win32k imports and genuine desktop acceptance remain open.
+
+    Next-boundary review: introduce a typed retained Busy owner and exact Busy-release receipt for
+    pending completion. Local pending file_id currently contains executive overlay/FAT-file/FAT-dir
+    tags, while the waiter uses a raw overlay row; do not compare these directly or move private
+    native tag encodings into the core. Make the pending route explicit before cross-domain shape
+    validation. Release refusal must retain Busy; successful release must be recorded before a
+    fallible wake/promotion attempt so redrive cannot unlock twice. Reply must wait for that release
+    receipt, while the independent I/O reference survives through reply settlement and backend ACK.
+    Before local ingress, also replace destructive queue removal followed by fallible cancellation
+    with exact retained cancellation ownership, including unpublished park rollback. A refusal must
+    retain the reference, count/grant, reply and error without consuming uncertain retry delivery.
+    Existing native local cancellation arms still treat transition refusal as an invariant failure;
+    this is not accepted for activated local admission. Preserve captured scalar arguments and
+    acquire-before-position resolution in the later whole-overlay cutover.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

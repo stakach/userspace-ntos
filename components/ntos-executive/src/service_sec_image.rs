@@ -10,6 +10,11 @@ mod component_terminal;
 mod component_callback_transfer;
 #[path = "synchronous_file_retry.rs"]
 mod synchronous_file_retry;
+#[path = "synchronous_file_wait.rs"]
+mod synchronous_file_wait;
+pub(crate) use synchronous_file_wait::{
+    synchronous_file_cancel_waiter, synchronous_file_release_and_wake,
+};
 
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -11843,8 +11848,7 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     } else {
                         PENDING_FILE_IO_TRANSFER_FAILURES.fetch_add(1, Ordering::Relaxed);
-                        let _ = nt_handler.file_completion.cancel_io_waiter(waiter.file_id);
-                        nt_handler.release_file_reference(waiter.file_id);
+                        synchronous_file_cancel_waiter(&mut nt_handler, waiter);
                         result = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
                     }
                 }
@@ -11862,11 +11866,7 @@ pub(crate) unsafe fn service_sec_image(
                     transfer_file_cleanup_wait = Some((pending, reservation));
                 }
                 if let Some(stale_grant) = nt_handler.active_synchronous_file_retry.take() {
-                    let _ = nt_handler
-                        .file_completion
-                        .cancel_promoted_io(stale_grant.file_id, stale_grant.tid);
-                    nt_handler.release_file_reference(stale_grant.file_id);
-                    let _ = synchronous_file_wake_next(&mut nt_handler, stale_grant.file_id);
+                    synchronous_file_cancel_waiter(&mut nt_handler, stale_grant);
                 }
                 if nt_handler.current_synchronous_file_lock != 0 {
                     let file_id =
@@ -24270,13 +24270,9 @@ unsafe fn reconcile_user_apc_file_acquisition_wait(
     }
 
     let removed = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-        .take_alertable_waiting_exact(slot, waiter.file_id, waiter.tid)
+        .take_alertable_waiting_exact(slot, waiter.key(), waiter.tid)
         .expect("staged File-wait APC lost its exact FIFO owner");
-    nt_handler
-        .file_completion
-        .cancel_io_waiter(removed.file_id)
-        .expect("staged File-wait APC lost its policy waiter");
-    nt_handler.release_file_reference(removed.file_id);
+    synchronous_file_cancel_waiter(nt_handler, removed);
     let _ = client_reply_on(removed.reply_cap, 0, 0, 0, 0, 0);
     release_reply_pool_cap(removed.reply_cap);
     thread_wait_state_clear_badge_ready(nt_handler, removed.badge);
@@ -24389,53 +24385,6 @@ unsafe fn synchronous_file_wait_park(mut waiter: nt_io_manager::SynchronousFileW
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     true
-}
-
-pub(crate) unsafe fn synchronous_file_wake_next(
-    nt_handler: &mut ExecNtHandler,
-    file_id: u64,
-) -> bool {
-    if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_promoted_for_file(file_id) {
-        synchronous_file_retry::deliver_file(nt_handler, file_id);
-        return true;
-    }
-    let next = (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).oldest_waiting_for_file(file_id);
-    let Some((slot, waiter)) = next else {
-        if nt_handler.file_completion.promote_cleanup_if_ready(file_id)
-            .expect("synchronous File cleanup lost its policy owner")
-        {
-            start_file_cleanup(nt_handler, file_id);
-            return true;
-        }
-        return false;
-    };
-    nt_handler.file_completion.promote_io_waiter(file_id, waiter.tid)
-        .expect("synchronous File waiter count lost its FIFO owner");
-    (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-        .promote_exact(slot, file_id, waiter.tid)
-        .expect("synchronous File FIFO promotion lost exact waiter");
-    synchronous_file_retry::deliver_file(nt_handler, file_id);
-    true
-}
-
-pub(crate) unsafe fn synchronous_file_release_and_wake(
-    nt_handler: &mut ExecNtHandler,
-    file_id: u64,
-    owner_tid: u64,
-) -> bool {
-    let release = nt_handler
-        .file_completion
-        .release_io(file_id, owner_tid)
-        .expect("synchronous File lock released by a stale owner");
-    if release.waiters != 0 {
-        assert!(
-            synchronous_file_wake_next(nt_handler, file_id),
-            "synchronous File waiter count has no FIFO owner"
-        );
-        true
-    } else {
-        synchronous_file_wake_next(nt_handler, file_id)
-    }
 }
 
 /// Start the one canonical lifecycle owned by the transferred final-handle
@@ -25082,7 +25031,7 @@ unsafe fn file_cleanup_wait_transfer(
 /// Publish terminal results for general pending File IRPs in NT completion order. The backend
 /// completion remains retained until every required surface and synchronous reply is visible.
 unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
-    synchronous_file_retry::redrive_local(nt_handler);
+    synchronous_file_retry::redrive_retirement(nt_handler);
     nt_handler.publish_local_byte_lock_completions();
     let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);

@@ -13771,6 +13771,14 @@ impl ExecNtHandler {
         }
     }
 
+    /// A cancelled acquisition owns a separate reference, never the current syscall's deferred
+    /// Busy reference. Release it independently and report a failed ownership transition.
+    pub(crate) fn release_hosted_file_waiter_reference(&mut self, file_id: u64) -> Result<(), u32> {
+        let release = self.file_completion.release_file(file_id)?;
+        self.complete_file_reference_release(file_id, release);
+        Ok(())
+    }
+
     fn release_file_handle_reference(&mut self, file_id: u64) {
         if let Ok(release) = self.file_completion.release_handle(file_id) {
             self.complete_file_reference_release(file_id, release);
@@ -14143,21 +14151,7 @@ impl ExecNtHandler {
                 release_reply_pool_cap(waiter.reply_cap);
             }
             thread_wait_state_clear_badge_ready(self, waiter.badge);
-            match waiter.state {
-                nt_io_manager::SynchronousFileWaitState::Waiting => {
-                    self.file_completion
-                        .cancel_io_waiter(waiter.file_id)
-                        .expect("teardown lost synchronous File waiter count");
-                }
-                nt_io_manager::SynchronousFileWaitState::Promoted => {
-                    self.file_completion
-                        .cancel_promoted_io(waiter.file_id, waiter.tid)
-                        .expect("teardown lost promoted synchronous File owner");
-                    let _ =
-                        crate::service_sec_image::synchronous_file_wake_next(self, waiter.file_id);
-                }
-            }
-            self.release_file_reference(waiter.file_id);
+            crate::service_sec_image::synchronous_file_cancel_waiter(self, waiter);
         }
         waiters.len()
     }
@@ -29093,19 +29087,24 @@ impl ExecNtHandler {
             .unwrap_or(0)
     }
 
+    fn synchronous_file_retry_for(&self, handle: u64) -> Option<nt_io_manager::SynchronousFileWaiter> {
+        self.active_synchronous_file_retry.filter(|retry| {
+            retry.handle as u64 == handle
+                && retry.service_number == self.current_service_number
+                && retry.pi as usize == self.pi
+                && retry.tid == self.current_tid
+                && retry.badge == self.current_badge
+        })
+    }
+
     /// Resolve a process-local routed File handle to its canonical File and owning device.
     pub(crate) fn hosted_file_route_for(&self, handle: u64) -> Option<HostedFileRoute> {
-        if let Some(retry) = self.active_synchronous_file_retry {
-            if retry.handle as u64 == handle
-                && retry.service_number == self.current_service_number
-                && retry.file_id != 0
-            {
-                return Some(HostedFileRoute {
-                    file_id: retry.file_id,
-                    device_id: retry.device_id,
-                    fs_context: retry.fs_context,
-                });
-            }
+        if let Some(retry) = self.synchronous_file_retry_for(handle) {
+            return match retry.route {
+                nt_io_manager::FileIoWaitRoute::Hosted { file_id, device_id, fs_context } =>
+                    Some(HostedFileRoute { file_id, device_id, fs_context }),
+                nt_io_manager::FileIoWaitRoute::LocalOverlay { .. } => None,
+            };
         }
         let Some(pid) = self.pm_pid_for_pi(self.pi) else {
             return None;
@@ -29165,13 +29164,11 @@ impl ExecNtHandler {
     }
 
     fn hosted_file_access_for(&self, handle: u64) -> Option<u32> {
-        if let Some(retry) = self.active_synchronous_file_retry {
-            if retry.handle as u64 == handle
-                && retry.service_number == self.current_service_number
-                && retry.file_id != 0
-            {
-                return Some(retry.granted_access);
-            }
+        if let Some(retry) = self.synchronous_file_retry_for(handle) {
+            return match retry.route {
+                nt_io_manager::FileIoWaitRoute::Hosted { .. } => Some(retry.granted_access),
+                nt_io_manager::FileIoWaitRoute::LocalOverlay { .. } => None,
+            };
         }
         let pid = self.pm_pid_for_pi(self.pi)?;
         self.pm.handle_access(pid, handle as nt_process::Handle)
@@ -29667,18 +29664,27 @@ impl ExecNtHandler {
         granted_access: u32,
     ) -> Result<bool, u32> {
         const STATUS_USER_APC: u32 = 0x0000_00C0;
-        let mode = self.file_completion.io_mode(route.file_id)?;
+        let wait_route = nt_io_manager::FileIoWaitRoute::Hosted {
+            file_id: route.file_id,
+            device_id: route.device_id,
+            fs_context: route.fs_context,
+        };
+        let live_mode = self.file_completion.io_mode(route.file_id)?;
+        let retry = self.synchronous_file_retry_for(handle);
+        let mode = if let Some(retry) = retry {
+            if retry.route != wait_route || retry.mode != live_mode {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            retry.mode
+        } else {
+            live_mode
+        };
         if mode == nt_io_completion::FileIoMode::Asynchronous {
             self.file_completion.retain_file(route.file_id)?;
             return Ok(true);
         }
 
-        let promoted = self.active_synchronous_file_retry.is_some_and(|retry| {
-            retry.file_id == route.file_id
-                && retry.handle as u64 == handle
-                && retry.service_number == self.current_service_number
-                && retry.tid == self.current_tid
-        });
+        let promoted = retry.is_some();
         if !promoted {
             if !reserve_synchronous_file_waiter()
                 || REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
@@ -29733,16 +29739,14 @@ impl ExecNtHandler {
                 };
                 self.pending_synchronous_file_wait =
                     Some(nt_io_manager::SynchronousFileWaiter::waiting(
-                        route.file_id,
-                        route.device_id,
-                        route.fs_context,
+                        wait_route,
                         handle as u32,
                         granted_access,
                         self.current_service_number,
                         self.pi as u32,
                         self.current_tid,
                         self.current_badge,
-                        alertable,
+                        mode,
                         self.current_native_call_transport,
                         retry_ip,
                         self.current_resume_ip,
@@ -29753,34 +29757,14 @@ impl ExecNtHandler {
             }
             Ok(nt_io_completion::FileIoAcquireResult::Bypassed) => {
                 if let Some(retry) = self.active_synchronous_file_retry.take() {
-                    let release = self
-                        .file_completion
-                        .cancel_promoted_io(retry.file_id, retry.tid)
-                        .expect("synchronous File retry changed to asynchronous mode");
-                    self.release_file_reference(retry.file_id);
-                    if release.waiters != 0 {
-                        let _ = crate::service_sec_image::synchronous_file_wake_next(
-                            self,
-                            retry.file_id,
-                        );
-                    }
+                    crate::service_sec_image::synchronous_file_cancel_waiter(self, retry);
                     return Err(STATUS_INVALID_PARAMETER);
                 }
                 Ok(true)
             }
             Err(status) => {
                 if let Some(retry) = self.active_synchronous_file_retry.take() {
-                    let release = self
-                        .file_completion
-                        .cancel_promoted_io(retry.file_id, retry.tid)
-                        .expect("synchronous File retry lost its policy grant");
-                    self.release_file_reference(retry.file_id);
-                    if release.waiters != 0 {
-                        let _ = crate::service_sec_image::synchronous_file_wake_next(
-                            self,
-                            retry.file_id,
-                        );
-                    }
+                    crate::service_sec_image::synchronous_file_cancel_waiter(self, retry);
                 } else {
                     self.release_file_reference(route.file_id);
                 }

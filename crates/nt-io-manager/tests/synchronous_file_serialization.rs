@@ -3,8 +3,8 @@
 
 use nt_io_completion::{FileCompletionTable, FileIoAcquireResult, FileIoMode};
 use nt_io_manager::{
-    SynchronousFileRetryIdentity, SynchronousFileRetryOutcome, SynchronousFileWaitTable,
-    SynchronousFileWaiter,
+    FileIoWaitKey, FileIoWaitRoute, SynchronousFileRetryIdentity, SynchronousFileRetryOutcome,
+    SynchronousFileWaitTable, SynchronousFileWaiter,
 };
 
 const FILE: u64 = 10;
@@ -14,16 +14,18 @@ const SERVICE: u32 = 191;
 
 fn park(waiters: &mut SynchronousFileWaitTable, tid: u64) {
     let mut waiter = SynchronousFileWaiter::waiting(
-        FILE,
-        DEVICE,
-        9,
+        FileIoWaitRoute::Hosted {
+            file_id: FILE,
+            device_id: DEVICE,
+            fs_context: 9,
+        },
         0x40,
         3,
         SERVICE,
         PI,
         tid,
         tid + 100,
-        false,
+        FileIoMode::SynchronousNonAlertable,
         true,
         0,
         0x1002,
@@ -40,11 +42,17 @@ fn promote(
     waiters: &mut SynchronousFileWaitTable,
     expected_tid: u64,
 ) -> SynchronousFileRetryIdentity {
-    let (slot, waiter) = waiters.oldest_waiting_for_file(FILE).unwrap();
+    let (slot, waiter) = waiters
+        .oldest_waiting_for_file(FileIoWaitKey::Hosted(FILE))
+        .unwrap();
     assert_eq!(waiter.tid, expected_tid);
     files.promote_io_waiter(FILE, waiter.tid).unwrap();
-    waiters.promote_exact(slot, FILE, waiter.tid).unwrap();
-    waiters.retry_identity(slot, FILE, waiter.tid).unwrap()
+    waiters
+        .promote_exact(slot, FileIoWaitKey::Hosted(FILE), waiter.tid)
+        .unwrap();
+    waiters
+        .retry_identity(slot, FileIoWaitKey::Hosted(FILE), waiter.tid)
+        .unwrap()
 }
 
 fn acknowledge_and_adopt(
@@ -68,7 +76,7 @@ fn acknowledge_and_adopt(
         .take_promoted(PI, tid, tid + 100, SERVICE + 1)
         .is_none());
     let consumed = waiters.take_promoted(PI, tid, tid + 100, SERVICE).unwrap();
-    assert_eq!(consumed.file_id, original.file_id);
+    assert_eq!(consumed.route, original.route);
     assert_eq!(consumed.reply_mrs, original.reply_mrs);
     assert_eq!(consumed.reply_cap, 0);
     // The promoted request already owns its File reference; no second retain occurs here.
@@ -116,7 +124,9 @@ fn fifo_grants_survive_retry_retirement_and_precede_last_handle_cleanup() {
             .record_retry(&mut rejected, SynchronousFileRetryOutcome::NotEntered(13))
             .unwrap();
         assert_eq!(files.io_lock_owner(FILE), Ok(Some(tid)));
-        assert!(waiters.oldest_waiting_for_file(FILE).is_none());
+        assert!(waiters
+            .oldest_waiting_for_file(FileIoWaitKey::Hosted(FILE))
+            .is_none());
         acknowledge_and_adopt(&mut files, &mut waiters, identity, tid);
         assert_eq!(
             files.release_io(FILE, tid).unwrap().waiters,
@@ -172,8 +182,13 @@ fn uncertain_retry_keeps_busy_and_cleanup_blocked_without_blocking_another_file(
         files.begin_cleanup(FILE),
         Ok(FileIoAcquireResult::Contended { alertable: false })
     );
-    assert_eq!(waiters.next_retry_for_file(FILE), None);
-    assert!(waiters.oldest_waiting_for_file(FILE).is_none());
+    assert_eq!(
+        waiters.next_retry_for_file(FileIoWaitKey::Hosted(FILE)),
+        None
+    );
+    assert!(waiters
+        .oldest_waiting_for_file(FileIoWaitKey::Hosted(FILE))
+        .is_none());
     assert!(waiters.take_promoted(PI, 20, 120, SERVICE).is_none());
     assert_eq!(
         waiters.take_thread_with(20, |_| panic!("uncertain reply is still owned")),

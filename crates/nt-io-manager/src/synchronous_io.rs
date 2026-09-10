@@ -6,13 +6,54 @@
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use nt_io_completion::FileIoMode;
 
 mod retry;
-pub use retry::{SynchronousFileRetryAttempt, SynchronousFileRetryError,
-    SynchronousFileRetryIdentity, SynchronousFileRetryOutcome, SynchronousFileRetryPhase,
-    SynchronousFileRetryStats, SynchronousFileRetryView};
+pub use retry::{
+    SynchronousFileRetryAttempt, SynchronousFileRetryError, SynchronousFileRetryIdentity,
+    SynchronousFileRetryOutcome, SynchronousFileRetryPhase, SynchronousFileRetryStats,
+    SynchronousFileRetryView,
+};
 
 static LAST_TABLE: AtomicU64 = AtomicU64::new(0);
+
+/// Canonical File identity, including the domain that owns its lifetime and Busy state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FileIoWaitKey {
+    Hosted(u64),
+    LocalOverlay(u64),
+}
+
+/// Referenced lookup result captured before a syscall waits for File ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileIoWaitRoute {
+    Hosted {
+        file_id: u64,
+        device_id: u64,
+        fs_context: u64,
+    },
+    LocalOverlay {
+        file_object: u64,
+    },
+}
+
+impl FileIoWaitRoute {
+    pub const fn key(self) -> FileIoWaitKey {
+        match self {
+            Self::Hosted { file_id, .. } => FileIoWaitKey::Hosted(file_id),
+            Self::LocalOverlay { file_object } => FileIoWaitKey::LocalOverlay(file_object),
+        }
+    }
+
+    pub const fn is_valid(self) -> bool {
+        match self {
+            Self::Hosted {
+                file_id, device_id, ..
+            } => file_id != 0 && device_id != 0,
+            Self::LocalOverlay { .. } => true,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SynchronousFileWaitState {
@@ -21,18 +62,16 @@ pub enum SynchronousFileWaitState {
     Promoted,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SynchronousFileWaiter {
-    pub file_id: u64,
-    pub device_id: u64,
-    pub fs_context: u64,
+    pub route: FileIoWaitRoute,
     pub handle: u32,
     pub granted_access: u32,
     pub service_number: u32,
     pub pi: u32,
     pub tid: u64,
     pub badge: u64,
-    pub alertable: bool,
+    pub mode: FileIoMode,
     pub native_call_transport: bool,
     pub reply_cap: u64,
     /// Address of the x64 `syscall` instruction used to replay the captured native call.
@@ -52,16 +91,14 @@ pub struct SynchronousFileWaiter {
 impl SynchronousFileWaiter {
     #[allow(clippy::too_many_arguments)]
     pub const fn waiting(
-        file_id: u64,
-        device_id: u64,
-        fs_context: u64,
+        route: FileIoWaitRoute,
         handle: u32,
         granted_access: u32,
         service_number: u32,
         pi: u32,
         tid: u64,
         badge: u64,
-        alertable: bool,
+        mode: FileIoMode,
         native_call_transport: bool,
         retry_ip: u64,
         resume_ip: u64,
@@ -69,16 +106,14 @@ impl SynchronousFileWaiter {
         resume_flags: u64,
     ) -> Self {
         Self {
-            file_id,
-            device_id,
-            fs_context,
+            route,
             handle,
             granted_access,
             service_number,
             pi,
             tid,
             badge,
-            alertable,
+            mode,
             native_call_transport,
             reply_cap: 0,
             retry_ip,
@@ -89,6 +124,14 @@ impl SynchronousFileWaiter {
             state: SynchronousFileWaitState::Waiting,
             sequence: 0,
         }
+    }
+
+    pub const fn key(&self) -> FileIoWaitKey {
+        self.route.key()
+    }
+
+    pub const fn is_alertable(&self) -> bool {
+        matches!(self.mode, FileIoMode::SynchronousAlertable)
     }
 }
 
@@ -117,7 +160,8 @@ struct WaitRecord {
 
 impl WaitRecord {
     fn delivery_retained(&self) -> bool {
-        self.retry.is_some_and(|phase| phase != SynchronousFileRetryPhase::Retired)
+        self.retry
+            .is_some_and(|phase| phase != SynchronousFileRetryPhase::Retired)
     }
 }
 
@@ -188,10 +232,11 @@ impl SynchronousFileWaitTable {
     }
 
     pub fn park(&mut self, mut waiter: SynchronousFileWaiter) -> Option<usize> {
-        if waiter.file_id == 0
-            || waiter.device_id == 0
+        if !waiter.route.is_valid()
+            || !waiter.mode.is_synchronous()
             || waiter.handle == 0
             || waiter.tid == 0
+            || waiter.tid == u64::MAX
             || waiter.badge == 0
             || waiter.reply_cap == 0
             || (!waiter.native_call_transport && waiter.retry_ip == 0)
@@ -206,13 +251,21 @@ impl SynchronousFileWaitTable {
             return None;
         }
         if self.identity == 0 {
-            self.identity = LAST_TABLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
-                |last| last.checked_add(1)).ok()? + 1;
+            self.identity = LAST_TABLE
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                    last.checked_add(1)
+                })
+                .ok()?
+                + 1;
         }
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.checked_add(1)?;
         waiter.sequence = sequence;
-        let record = WaitRecord { waiter, retry: None, next_attempt: 1 };
+        let record = WaitRecord {
+            waiter,
+            retry: None,
+            next_attempt: 1,
+        };
         if let Some((index, slot)) = self
             .slots
             .iter_mut()
@@ -229,8 +282,11 @@ impl SynchronousFileWaitTable {
         Some(self.slots.len() - 1)
     }
 
-    pub fn oldest_waiting_for_file(&self, file_id: u64) -> Option<(usize, SynchronousFileWaiter)> {
-        if self.has_promoted_for_file(file_id) {
+    pub fn oldest_waiting_for_file(
+        &self,
+        key: FileIoWaitKey,
+    ) -> Option<(usize, SynchronousFileWaiter)> {
+        if self.has_promoted_for_file(key) {
             return None;
         }
         self.slots
@@ -238,7 +294,7 @@ impl SynchronousFileWaitTable {
             .enumerate()
             .filter_map(|(slot, record)| record.as_ref().map(|record| (slot, record.waiter)))
             .filter(|(_, waiter)| {
-                waiter.file_id == file_id && waiter.state == SynchronousFileWaitState::Waiting
+                waiter.key() == key && waiter.state == SynchronousFileWaitState::Waiting
             })
             .min_by_key(|(_, waiter)| waiter.sequence)
     }
@@ -248,10 +304,12 @@ impl SynchronousFileWaitTable {
     /// wake wins and it is deliberately excluded.
     pub fn alertable_waiting_for_thread(&self, tid: u64) -> Option<(usize, SynchronousFileWaiter)> {
         self.slots.iter().enumerate().find_map(|(slot, record)| {
-            record.as_ref().map(|record| record.waiter)
+            record
+                .as_ref()
+                .map(|record| record.waiter)
                 .filter(|waiter| {
                     waiter.tid == tid
-                        && waiter.alertable
+                        && waiter.is_alertable()
                         && waiter.state == SynchronousFileWaitState::Waiting
                 })
                 .map(|waiter| (slot, waiter))
@@ -261,13 +319,13 @@ impl SynchronousFileWaitTable {
     pub fn take_alertable_waiting_exact(
         &mut self,
         slot: usize,
-        file_id: u64,
+        key: FileIoWaitKey,
         tid: u64,
     ) -> Option<SynchronousFileWaiter> {
         let waiter = &self.slots.get(slot)?.as_ref()?.waiter;
-        if waiter.file_id != file_id
+        if waiter.key() != key
             || waiter.tid != tid
-            || !waiter.alertable
+            || !waiter.is_alertable()
             || waiter.state != SynchronousFileWaitState::Waiting
         {
             return None;
@@ -280,15 +338,15 @@ impl SynchronousFileWaitTable {
     pub fn promote_exact(
         &mut self,
         slot: usize,
-        file_id: u64,
+        key: FileIoWaitKey,
         tid: u64,
     ) -> Option<SynchronousFileWaiter> {
-        if self.has_promoted_for_file(file_id) {
+        if self.has_promoted_for_file(key) {
             return None;
         }
         let record = self.slots.get_mut(slot)?.as_mut()?;
         let waiter = &mut record.waiter;
-        if waiter.file_id != file_id
+        if waiter.key() != key
             || waiter.tid != tid
             || waiter.state != SynchronousFileWaitState::Waiting
             || waiter.reply_cap == 0
@@ -327,12 +385,12 @@ impl SynchronousFileWaitTable {
     pub fn take_exact(
         &mut self,
         slot: usize,
-        file_id: u64,
+        key: FileIoWaitKey,
         tid: u64,
     ) -> Option<SynchronousFileWaiter> {
         let record = self.slots.get(slot)?.as_ref()?;
         let waiter = &record.waiter;
-        if waiter.file_id != file_id || waiter.tid != tid || record.delivery_retained() {
+        if waiter.key() != key || waiter.tid != tid || record.delivery_retained() {
             return None;
         }
         self.slots.get_mut(slot)?.take().map(|record| record.waiter)
@@ -344,7 +402,10 @@ impl SynchronousFileWaitTable {
     {
         let mut count = 0;
         for slot in self.slots.iter_mut() {
-            if slot.as_ref().is_some_and(|record| record.waiter.tid == tid && !record.delivery_retained()) {
+            if slot
+                .as_ref()
+                .is_some_and(|record| record.waiter.tid == tid && !record.delivery_retained())
+            {
                 take(slot.take().unwrap().waiter);
                 count += 1;
             }
@@ -354,28 +415,42 @@ impl SynchronousFileWaitTable {
 }
 
 #[cfg(test)]
+mod typed_routes;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn acknowledge_retry(table: &mut SynchronousFileWaitTable, slot: usize, file_id: u64, tid: u64) {
-        let identity = table.retry_identity(slot, file_id, tid).unwrap();
+    fn acknowledge_retry(
+        table: &mut SynchronousFileWaitTable,
+        slot: usize,
+        file_id: u64,
+        tid: u64,
+    ) {
+        let identity = table
+            .retry_identity(slot, FileIoWaitKey::Hosted(file_id), tid)
+            .unwrap();
         let mut attempt = table.begin_retry(identity).unwrap();
-        table.record_retry(&mut attempt, SynchronousFileRetryOutcome::Acknowledged).unwrap();
+        table
+            .record_retry(&mut attempt, SynchronousFileRetryOutcome::Acknowledged)
+            .unwrap();
         assert!(table.finish_retry(identity, Ok(())).unwrap());
     }
 
     fn waiter(file_id: u64, tid: u64, reply_cap: u64) -> SynchronousFileWaiter {
         SynchronousFileWaiter {
-            file_id,
-            device_id: 7,
-            fs_context: 9,
+            route: FileIoWaitRoute::Hosted {
+                file_id,
+                device_id: 7,
+                fs_context: 9,
+            },
             handle: 0x40,
             granted_access: 3,
             service_number: 191,
             pi: 2,
             tid,
             badge: tid + 100,
-            alertable: false,
+            mode: FileIoMode::SynchronousNonAlertable,
             native_call_transport: false,
             reply_cap,
             retry_ip: 0x1000,
@@ -394,15 +469,37 @@ mod tests {
         table.reset();
         let first = table.park(waiter(10, 1, 101)).unwrap();
         let second = table.park(waiter(10, 2, 102)).unwrap();
-        assert_eq!(table.oldest_waiting_for_file(10).unwrap().1.tid, 1);
-        let one = table.promote_exact(first, 10, 1).unwrap();
+        assert_eq!(
+            table
+                .oldest_waiting_for_file(FileIoWaitKey::Hosted(10))
+                .unwrap()
+                .1
+                .tid,
+            1
+        );
+        let one = table
+            .promote_exact(first, FileIoWaitKey::Hosted(10), 1)
+            .unwrap();
         assert_eq!(one.reply_cap, 101);
         acknowledge_retry(&mut table, first, 10, 1);
         assert_eq!(table.take_promoted(2, 1, 101, 191).unwrap().tid, 1);
         let third = table.park(waiter(10, 3, 103)).unwrap();
         assert_eq!(third, first, "the freed low slot is deliberately reused");
-        assert_eq!(table.oldest_waiting_for_file(10).unwrap().1.tid, 2);
-        assert_eq!(table.promote_exact(second, 10, 2).unwrap().tid, 2);
+        assert_eq!(
+            table
+                .oldest_waiting_for_file(FileIoWaitKey::Hosted(10))
+                .unwrap()
+                .1
+                .tid,
+            2
+        );
+        assert_eq!(
+            table
+                .promote_exact(second, FileIoWaitKey::Hosted(10), 2)
+                .unwrap()
+                .tid,
+            2
+        );
     }
 
     #[test]
@@ -410,15 +507,19 @@ mod tests {
         let mut table = SynchronousFileWaitTable::new();
         let slot = table.park(waiter(10, 1, 101)).unwrap();
         assert!(table.take_promoted(2, 1, 101, 191).is_none());
-        assert!(table.promote_exact(slot, 11, 1).is_none());
-        table.promote_exact(slot, 10, 1).unwrap();
+        assert!(table
+            .promote_exact(slot, FileIoWaitKey::Hosted(11), 1)
+            .is_none());
+        table
+            .promote_exact(slot, FileIoWaitKey::Hosted(10), 1)
+            .unwrap();
         assert!(table.take_promoted(2, 1, 101, 191).is_none());
         acknowledge_retry(&mut table, slot, 10, 1);
         assert!(table.take_promoted(3, 1, 101, 191).is_none());
         assert!(table.take_promoted(2, 1, 102, 191).is_none());
         assert!(table.take_promoted(2, 1, 101, 192).is_none());
         let ready = table.take_promoted(2, 1, 101, 191).unwrap();
-        assert_eq!(ready.file_id, 10);
+        assert_eq!(ready.key(), FileIoWaitKey::Hosted(10));
         assert!(table.is_empty());
     }
 
@@ -428,15 +529,25 @@ mod tests {
         let mut zero = waiter(10, 1, 101);
         zero.service_number = 0;
         let slot = table.park(zero).unwrap();
-        table.promote_exact(slot, 10, 1).unwrap();
+        table
+            .promote_exact(slot, FileIoWaitKey::Hosted(10), 1)
+            .unwrap();
         acknowledge_retry(&mut table, slot, 10, 1);
         let replay = table.take_promoted(2, 1, 101, 0).unwrap();
         assert_eq!(replay.service_number, 0);
-        assert_eq!(replay.file_id, zero.file_id);
+        assert_eq!(replay.route, zero.route);
 
         let slot = table.park(waiter(20, 2, 102)).unwrap();
-        assert!(table.take_exact(slot, 20, 3).is_none());
-        assert_eq!(table.take_exact(slot, 20, 2).unwrap().reply_cap, 102);
+        assert!(table
+            .take_exact(slot, FileIoWaitKey::Hosted(20), 3)
+            .is_none());
+        assert_eq!(
+            table
+                .take_exact(slot, FileIoWaitKey::Hosted(20), 2)
+                .unwrap()
+                .reply_cap,
+            102
+        );
     }
 
     #[test]
@@ -453,7 +564,9 @@ mod tests {
         let mut table = SynchronousFileWaitTable::new();
         table.park(waiter(10, 1, 101)).unwrap();
         let slot = table.park(waiter(20, 2, 102)).unwrap();
-        table.promote_exact(slot, 20, 2).unwrap();
+        table
+            .promote_exact(slot, FileIoWaitKey::Hosted(20), 2)
+            .unwrap();
         acknowledge_retry(&mut table, slot, 20, 2);
         let mut taken = alloc::vec::Vec::new();
         assert_eq!(table.take_thread_with(2, |waiter| taken.push(waiter)), 1);
@@ -465,13 +578,15 @@ mod tests {
     fn user_apc_selects_only_an_alertable_waiting_owner() {
         let mut table = SynchronousFileWaitTable::new();
         let mut alertable = waiter(10, 1, 101);
-        alertable.alertable = true;
+        alertable.mode = FileIoMode::SynchronousAlertable;
         let alertable_slot = table.park(alertable).unwrap();
         table.park(waiter(20, 2, 102)).unwrap();
         let mut promoted = waiter(30, 3, 103);
-        promoted.alertable = true;
+        promoted.mode = FileIoMode::SynchronousAlertable;
         let promoted_slot = table.park(promoted).unwrap();
-        table.promote_exact(promoted_slot, 30, 3).unwrap();
+        table
+            .promote_exact(promoted_slot, FileIoWaitKey::Hosted(30), 3)
+            .unwrap();
 
         assert!(table.alertable_waiting_for_thread(2).is_none());
         assert!(table.alertable_waiting_for_thread(3).is_none());
@@ -479,16 +594,23 @@ mod tests {
         assert_eq!(slot, alertable_slot);
         assert_eq!(selected.resume_ip, 0x1002);
         assert!(table
-            .take_alertable_waiting_exact(slot, selected.file_id + 1, selected.tid)
+            .take_alertable_waiting_exact(slot, FileIoWaitKey::Hosted(11), selected.tid)
             .is_none());
         assert_eq!(
             table
-                .take_alertable_waiting_exact(slot, selected.file_id, selected.tid)
+                .take_alertable_waiting_exact(slot, selected.key(), selected.tid)
                 .unwrap(),
             selected
         );
         assert_eq!(table.len(), 2);
-        assert_eq!(table.oldest_waiting_for_file(20).unwrap().1.tid, 2);
+        assert_eq!(
+            table
+                .oldest_waiting_for_file(FileIoWaitKey::Hosted(20))
+                .unwrap()
+                .1
+                .tid,
+            2
+        );
         assert!(table.alertable_waiting_for_thread(3).is_none());
     }
 }

@@ -2,6 +2,28 @@
 
 use super::*;
 
+pub(crate) unsafe fn cancel_file_io_waiter(file_id: u64) -> Result<u32, u32> {
+    let fs = mounted_namespace_fs()?.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    let result = fs.zw_cancel_file_io_waiter(file_id);
+    publish_file_cleanup_effects(fs);
+    result
+}
+
+pub(crate) unsafe fn cancel_promoted_file_io(file_id: u64, tid: u64) -> Result<u32, u32> {
+    let fs = mounted_namespace_fs()?.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    let result = fs
+        .zw_cancel_promoted_file_io(file_id, tid)
+        .map(|release| release.waiters);
+    publish_file_cleanup_effects(fs);
+    result
+}
+
+pub(crate) unsafe fn promote_file_io_waiter(file_id: u64, tid: u64) -> Result<u32, u32> {
+    mounted_namespace_fs()?
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+        .zw_promote_file_io_waiter(file_id, tid)
+}
+
 pub(super) fn publish_file_cleanup_effects(fs: &mut nt_fs::FileSystem) {
     let effects = fs.take_file_cleanup_effects();
     if effects.namespace_changed {

@@ -178,6 +178,7 @@ pub use retained_completion::{
 };
 pub use store::{GenStore, IoId};
 pub use synchronous_io::{
+    FileIoWaitKey, FileIoWaitRoute,
     SynchronousFileWaitState, SynchronousFileWaitTable, SynchronousFileWaiter,
     SynchronousFileRetryAttempt, SynchronousFileRetryError, SynchronousFileRetryIdentity,
     SynchronousFileRetryOutcome, SynchronousFileRetryPhase, SynchronousFileRetryStats,
