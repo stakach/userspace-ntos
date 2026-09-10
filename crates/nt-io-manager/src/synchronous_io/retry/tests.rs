@@ -273,7 +273,7 @@ fn foreign_tables_and_reused_slots_cannot_accept_old_identity_or_attempt() {
 fn exhausted_attempt_or_admission_leaves_existing_owner_untouched() {
     let mut table = SynchronousFileWaitTable::new();
     let identity = promoted(&mut table, 10, 1);
-    table.slots[identity.slot].as_mut().unwrap().next_attempt = u64::MAX;
+    table.record_mut(identity.slot).unwrap().next_attempt = u64::MAX;
     assert!(matches!(
         table.begin_retry(identity),
         Err(SynchronousFileRetryError::Exhausted)

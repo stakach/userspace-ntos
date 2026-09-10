@@ -32948,12 +32948,65 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     desktop acceptance remain open. Typed routing does not by itself authorize local Busy or
     local completion-port association.
 
-    Next checkpoint: retain exact waiter cancellation and prepublication park rollback across
+    Cancellation checkpoint scope: retain exact waiter cancellation and prepublication park rollback across
     count/grant release, reference release, reply-cap settlement and any follow-on wake. Replace
     remove-then-fallible-cancel adapters; preserve definite refusal and entered/uncertain ownership
     without replaying committed effects. Keep captured routes/access/mode and raw-zero handling.
     Separately type remaining byte-lock conflict/owner and readonly-notification namespace keys
     before claiming that all local scalar identity encoding has been removed.
+
+    Retained acquisition-cancellation contract (2026-09-11, complete; host contract only):
+    - [x] Reserve an exact waiter slot before externally owned File effects; commit ordinary
+      publication or failed-publication cleanup without allocating the first owner after failure.
+    - [x] Retain cancellation intent and separate policy, wake, hosted-reference, reference-followup,
+      reply-revocation and reply-cap-retirement effects in the original waiter row with exact
+      non-Clone tickets.
+    - [x] Defer cancellation behind entered/uncertain retry delivery and accepted reply retirement;
+      exclude cancelled owners from promotion, replay, extraction and reset without losing counts.
+    - [x] Compose real hosted/local policy and File references with refusal/uncertainty tests,
+      run serialized host/native validation, then review native cutover prerequisites.
+
+    Audit adjustment: this is the testable ownership contract, not native activation. Native
+    preflight currently reserves capacity only; promoted ingress still extracts a Copy waiter.
+    Both producers need exact retained transfers before native cancellation can consume the new
+    contract. Existing parked APC cancellation also stages/consumes an APC and sends/recycles its
+    reply without separate receipts. Preserve those as explicit follow-on work; replacing panic
+    with Err while leaving destructive extraction would orphan the count/grant/reference.
+    Hosted policy cancellation consumes only count/grant, while local nt-fs cancellation also
+    consumes its reference atomically. Accepted local receipts must never release that reference
+    again. Cancelling the last Waiting row may need wake work even without a promoted grant.
+    Hosted reference release must retain its full cleanup/close/completion-port receipt before
+    entering follow-up work; failure of that work must not re-arm the reference decrement.
+    Reservation identity and FIFO publication order are separate: a nested waiter published first
+    stays first, while an earlier reservation still owns allocation-free rollback even if normal
+    publication is rejected by the nested row's matching TID. Cancellation requests carry the
+    captured table/slot/generation identity, not a fresh lookup by reusable slot/key/TID alone.
+
+    Validation: all 36 synchronous File contract tests passed, including 16 new cancellation
+    unit tests. Five new integration tests compose real FileCompletionTable/nt-fs counts,
+    grants, references and cleanup with explicit host wake/capability outcomes; they are not
+    native IPC proof. They cover allocation-free reserved rollback, promoted cancellation,
+    definite refusal, dropped/uncertain effects, raw local File zero, equal numeric hosted/local
+    identity, and local final-Waiting cancellation that retires the File before later settlement.
+    A compile-fail check prevents cancellation-ticket cloning. All 1,460 focused and 2,720 broad
+    host/doc tests passed; the executive release build passed in 37.72s with the unchanged
+    294 warnings. Evidence: `.tmp/test-file-wait-cancellation-contract-20260911.log`,
+    `.tmp/test-file-wait-cancellation-focused-20260911.log`,
+    `.tmp/test-file-wait-cancellation-full-20260911.log`, and
+    `.tmp/build-file-wait-cancellation-executive-20260911.log`. All runners were serialized.
+    Independent contract review found no outstanding ownership-transition issue. No VM run or
+    microkernel change occurred; the 27 strict missing win32k imports and desktop acceptance
+    remain open.
+
+    Next native checkpoint, reviewed after contract completion:
+    - [ ] Carry exact reservations from acquisition preflight through successful park or retained
+      rollback; do not allocate the cancellation owner after the File effect has occurred.
+    - [ ] Keep promoted ingress in its original row through adoption/teardown. Replace destructive
+      cancellation transfers with exact effect receipts, including hosted reference followups,
+      and guard thread/process retirement while cancellation still owns work.
+    - [ ] Retain parked APC staging, Reply and capability retirement independently before routing
+      APC interruption through the cancellation contract. Remove the replaced adapters only when
+      every producer transfers ownership through the retained path; no ignored-error fallback.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

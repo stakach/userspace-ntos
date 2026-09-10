@@ -181,11 +181,14 @@ pub use retained_completion::{
 };
 pub use store::{GenStore, IoId};
 pub use synchronous_io::{
-    FileIoWaitKey, FileIoWaitRoute,
-    SynchronousFileWaitState, SynchronousFileWaitTable, SynchronousFileWaiter,
-    SynchronousFileRetryAttempt, SynchronousFileRetryError, SynchronousFileRetryIdentity,
+    FileIoWaitKey, FileIoWaitRoute, SynchronousFileCancelAttempt, SynchronousFileCancelEffect,
+    SynchronousFileCancelError, SynchronousFileCancelIdentity, SynchronousFileCancelOutcome,
+    SynchronousFileCancelOwnership, SynchronousFileCancelPhase, SynchronousFileCancelReceipt,
+    SynchronousFileCancelView, SynchronousFileRetryAttempt, SynchronousFileRetryError,
+    SynchronousFileRetryIdentity,
     SynchronousFileRetryOutcome, SynchronousFileRetryPhase, SynchronousFileRetryStats,
-    SynchronousFileRetryView,
+    SynchronousFileRetryView, SynchronousFileWaitIdentity, SynchronousFileWaitReservation,
+    SynchronousFileWaitState, SynchronousFileWaitTable, SynchronousFileWaiter,
 };
 pub use volume_information::{
     query_volume_information_contract, set_volume_information_contract,

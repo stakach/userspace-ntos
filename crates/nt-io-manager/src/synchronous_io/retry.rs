@@ -80,7 +80,7 @@ impl SynchronousFileWaitTable {
         key: FileIoWaitKey,
         tid: u64,
     ) -> Option<SynchronousFileRetryIdentity> {
-        let record = self.slots.get(slot)?.as_ref()?;
+        let record = self.record(slot)?;
         (record.waiter.key() == key && record.waiter.tid == tid && record.retry.is_some())
             .then_some(self.retry_record_identity(slot, record))
     }
@@ -104,9 +104,7 @@ impl SynchronousFileWaitTable {
         if identity.table == 0 || identity.table != self.identity {
             return Err(SynchronousFileRetryError::WrongIdentity);
         }
-        self.slots
-            .get(identity.slot)
-            .and_then(Option::as_ref)
+        self.record(identity.slot)
             .filter(|record| record.waiter.sequence == identity.sequence && record.retry.is_some())
             .ok_or(SynchronousFileRetryError::WrongIdentity)
     }
@@ -123,11 +121,8 @@ impl SynchronousFileWaitTable {
     }
 
     pub fn next_retry_for_file(&self, key: FileIoWaitKey) -> Option<SynchronousFileRetryIdentity> {
-        self.slots
-            .iter()
-            .enumerate()
+        self.records()
             .filter_map(|(slot, record)| {
-                let record = record.as_ref()?;
                 (record.waiter.key() == key
                     && matches!(
                         record.retry,
@@ -135,11 +130,13 @@ impl SynchronousFileWaitTable {
                             SynchronousFileRetryPhase::Ready { .. }
                                 | SynchronousFileRetryPhase::Acknowledged { .. }
                         )
-                    ))
-                .then_some((
-                    record.waiter.sequence,
-                    self.retry_record_identity(slot, record),
-                ))
+                    )
+                    && (record.cancellation.is_none()
+                        || matches!(
+                            record.retry,
+                            Some(SynchronousFileRetryPhase::Acknowledged { .. })
+                        )))
+                .then_some((record.queue_order, self.retry_record_identity(slot, record)))
             })
             .min_by_key(|(sequence, _)| *sequence)
             .map(|(_, identity)| identity)
@@ -150,11 +147,8 @@ impl SynchronousFileWaitTable {
         &self,
         previous_key: Option<FileIoWaitKey>,
     ) -> Option<SynchronousFileRetryIdentity> {
-        self.slots
-            .iter()
-            .enumerate()
+        self.records()
             .filter_map(|(slot, record)| {
-                let record = record.as_ref()?;
                 (previous_key.is_none_or(|previous| record.waiter.key() > previous)
                     && matches!(
                         record.retry,
@@ -170,15 +164,14 @@ impl SynchronousFileWaitTable {
     }
 
     pub fn has_waiter_for_pi(&self, pi: u32) -> bool {
-        self.slots
-            .iter()
-            .flatten()
-            .any(|record| record.waiter.pi == pi)
+        self.records().any(|(_, record)| record.waiter.pi == pi)
     }
 
     pub fn has_promoted_for_file(&self, key: FileIoWaitKey) -> bool {
-        self.slots.iter().flatten().any(|record| {
-            record.waiter.key() == key && record.waiter.state == SynchronousFileWaitState::Promoted
+        self.records().any(|(_, record)| {
+            record.waiter.key() == key
+                && record.waiter.state == SynchronousFileWaitState::Promoted
+                && record.cancellation.is_none()
         })
     }
 
@@ -186,10 +179,8 @@ impl SynchronousFileWaitTable {
         &self,
         mut matches: impl FnMut(&SynchronousFileWaiter) -> bool,
     ) -> bool {
-        self.slots
-            .iter()
-            .flatten()
-            .any(|record| record.delivery_retained() && matches(&record.waiter))
+        self.records()
+            .any(|(_, record)| record.delivery_retained() && matches(&record.waiter))
     }
 
     pub fn has_retry_delivery_for_thread(&self, tid: u64) -> bool {
@@ -206,7 +197,7 @@ impl SynchronousFileWaitTable {
 
     pub fn retry_stats(&self) -> SynchronousFileRetryStats {
         let mut stats = SynchronousFileRetryStats::default();
-        for record in self.slots.iter().flatten() {
+        for (_, record) in self.records() {
             match record.retry {
                 None => stats.waiting += 1,
                 Some(SynchronousFileRetryPhase::Ready { .. }) => stats.ready += 1,
@@ -225,7 +216,9 @@ impl SynchronousFileWaitTable {
         identity: SynchronousFileRetryIdentity,
     ) -> Result<SynchronousFileRetryAttempt, SynchronousFileRetryError> {
         let record = self.retry_record(identity)?;
-        if !matches!(record.retry, Some(SynchronousFileRetryPhase::Ready { .. })) {
+        if record.cancellation.is_some()
+            || !matches!(record.retry, Some(SynchronousFileRetryPhase::Ready { .. }))
+        {
             return Err(SynchronousFileRetryError::InvalidPhase);
         }
         let attempt = record.next_attempt;
@@ -238,7 +231,7 @@ impl SynchronousFileWaitTable {
             waiter: record.waiter,
             consumed: false,
         };
-        let record = self.slots[identity.slot].as_mut().unwrap();
+        let record = self.record_mut(identity.slot).unwrap();
         record.next_attempt = next;
         record.retry = Some(SynchronousFileRetryPhase::Invoking { attempt });
         Ok(ticket)
@@ -259,7 +252,8 @@ impl SynchronousFileWaitTable {
         {
             return Err(SynchronousFileRetryError::InvalidPhase);
         }
-        self.slots[ticket.identity.slot].as_mut().unwrap().retry = Some(match outcome {
+        let record = self.record_mut(ticket.identity.slot).unwrap();
+        record.retry = Some(match outcome {
             SynchronousFileRetryOutcome::Acknowledged => {
                 SynchronousFileRetryPhase::Acknowledged { local_error: None }
             }
@@ -270,6 +264,7 @@ impl SynchronousFileWaitTable {
                 SynchronousFileRetryPhase::Indeterminate { status }
             }
         });
+        record.activate_deferred_cancellation();
         ticket.consumed = true;
         Ok(())
     }
@@ -288,7 +283,7 @@ impl SynchronousFileWaitTable {
         ) {
             return Err(SynchronousFileRetryError::InvalidPhase);
         }
-        let record = self.slots[identity.slot].as_mut().unwrap();
+        let record = self.record_mut(identity.slot).unwrap();
         if let Err(status) = local_retirement {
             record.retry = Some(SynchronousFileRetryPhase::Acknowledged {
                 local_error: Some(status),
@@ -297,6 +292,7 @@ impl SynchronousFileWaitTable {
         }
         record.waiter.reply_cap = 0;
         record.retry = Some(SynchronousFileRetryPhase::Retired);
+        record.activate_deferred_cancellation();
         Ok(true)
     }
 }

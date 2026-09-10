@@ -8,7 +8,14 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use nt_io_completion::FileIoMode;
 
+mod cancellation;
 mod retry;
+pub use cancellation::{
+    SynchronousFileCancelAttempt, SynchronousFileCancelEffect, SynchronousFileCancelError,
+    SynchronousFileCancelIdentity, SynchronousFileCancelOutcome, SynchronousFileCancelOwnership,
+    SynchronousFileCancelPhase, SynchronousFileCancelReceipt, SynchronousFileCancelView,
+    SynchronousFileWaitIdentity,
+};
 pub use retry::{
     SynchronousFileRetryAttempt, SynchronousFileRetryError, SynchronousFileRetryIdentity,
     SynchronousFileRetryOutcome, SynchronousFileRetryPhase, SynchronousFileRetryStats,
@@ -145,23 +152,69 @@ const DEFAULT_INITIAL_RESERVE: usize = 16;
 /// ```
 #[derive(Debug)]
 pub struct SynchronousFileWaitTable {
-    slots: Vec<Option<WaitRecord>>,
+    slots: Vec<Option<WaitSlot>>,
     initial_reserve: usize,
     next_sequence: u64,
+    next_queue_order: u64,
     identity: u64,
 }
 
 #[derive(Debug)]
 struct WaitRecord {
     waiter: SynchronousFileWaiter,
+    queue_order: u64,
     retry: Option<SynchronousFileRetryPhase>,
     next_attempt: u64,
+    cancellation: Option<cancellation::CancelState>,
+}
+
+#[derive(Debug)]
+enum WaitSlot {
+    Reserved(u64),
+    Owned(WaitRecord),
+}
+
+impl WaitSlot {
+    fn record(&self) -> Option<&WaitRecord> {
+        match self {
+            Self::Owned(record) => Some(record),
+            Self::Reserved(_) => None,
+        }
+    }
+
+    fn record_mut(&mut self) -> Option<&mut WaitRecord> {
+        match self {
+            Self::Owned(record) => Some(record),
+            Self::Reserved(_) => None,
+        }
+    }
+
+    fn into_record(self) -> Option<WaitRecord> {
+        match self {
+            Self::Owned(record) => Some(record),
+            Self::Reserved(_) => None,
+        }
+    }
+}
+
+/// Exact pre-effect storage for either successful waiter publication or retained rollback.
+/// This caller-owned claim is not thread-bound until publication. Thread/PI ownership queries
+/// exclude reservations; the caller must publish or cancel its claim before retiring its context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SynchronousFileWaitReservation {
+    table: u64,
+    slot: usize,
+    sequence: u64,
 }
 
 impl WaitRecord {
     fn delivery_retained(&self) -> bool {
         self.retry
             .is_some_and(|phase| phase != SynchronousFileRetryPhase::Retired)
+    }
+
+    fn transferable(&self) -> bool {
+        self.cancellation.is_none() && !self.delivery_retained()
     }
 }
 
@@ -172,6 +225,21 @@ impl Default for SynchronousFileWaitTable {
 }
 
 impl SynchronousFileWaitTable {
+    fn record(&self, slot: usize) -> Option<&WaitRecord> {
+        self.slots.get(slot)?.as_ref()?.record()
+    }
+
+    fn record_mut(&mut self, slot: usize) -> Option<&mut WaitRecord> {
+        self.slots.get_mut(slot)?.as_mut()?.record_mut()
+    }
+
+    fn records(&self) -> impl Iterator<Item = (usize, &WaitRecord)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, entry)| entry.as_ref()?.record().map(|record| (slot, record)))
+    }
+
     pub const fn new() -> Self {
         Self::with_initial_reserve(DEFAULT_INITIAL_RESERVE)
     }
@@ -181,6 +249,7 @@ impl SynchronousFileWaitTable {
             slots: Vec::new(),
             initial_reserve,
             next_sequence: 1,
+            next_queue_order: 1,
             identity: 0,
         }
     }
@@ -231,7 +300,68 @@ impl SynchronousFileWaitTable {
         self.slots.iter().all(Option::is_none)
     }
 
-    pub fn park(&mut self, mut waiter: SynchronousFileWaiter) -> Option<usize> {
+    /// Claim storage before retaining a File or counting an acquisition waiter.
+    pub fn reserve(&mut self) -> Option<SynchronousFileWaitReservation> {
+        // Every outstanding claim has a future publication order budget. Committing an admitted
+        // waiter therefore cannot fail after its File count/reference effects have occurred.
+        let reserved = self
+            .slots
+            .iter()
+            .filter(|slot| matches!(slot, Some(WaitSlot::Reserved(_))))
+            .count();
+        self.next_queue_order
+            .checked_add(u64::try_from(reserved).ok()?.checked_add(1)?)?;
+        if self.identity == 0 {
+            self.identity = LAST_TABLE
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                    last.checked_add(1)
+                })
+                .ok()?
+                + 1;
+        }
+        let sequence = self.next_sequence;
+        let next = sequence.checked_add(1)?;
+        let slot = if let Some(slot) = self.slots.iter().position(Option::is_none) {
+            slot
+        } else {
+            if !self.grow_reservation() {
+                return None;
+            }
+            self.slots.push(None);
+            self.slots.len() - 1
+        };
+        self.next_sequence = next;
+        self.slots[slot] = Some(WaitSlot::Reserved(sequence));
+        Some(SynchronousFileWaitReservation {
+            table: self.identity,
+            slot,
+            sequence,
+        })
+    }
+
+    fn reservation_matches(&self, reservation: SynchronousFileWaitReservation) -> bool {
+        reservation.table != 0
+            && reservation.table == self.identity
+            && matches!(self.slots.get(reservation.slot), Some(Some(WaitSlot::Reserved(sequence))) if *sequence == reservation.sequence)
+    }
+
+    /// Release a pre-effect claim only. This cannot discard a published or rollback owner.
+    pub fn cancel_reservation(&mut self, reservation: SynchronousFileWaitReservation) -> bool {
+        if !self.reservation_matches(reservation) {
+            return false;
+        }
+        self.slots[reservation.slot] = None;
+        true
+    }
+
+    pub fn park_reserved(
+        &mut self,
+        reservation: SynchronousFileWaitReservation,
+        mut waiter: SynchronousFileWaiter,
+    ) -> Option<usize> {
+        if !self.reservation_matches(reservation) {
+            return None;
+        }
         if !waiter.route.is_valid()
             || !waiter.mode.is_synchronous()
             || waiter.handle == 0
@@ -242,77 +372,68 @@ impl SynchronousFileWaitTable {
             || (!waiter.native_call_transport && waiter.retry_ip == 0)
             || waiter.resume_sp == 0
             || waiter.state != SynchronousFileWaitState::Waiting
-            || self.slots.iter().any(|slot| {
-                slot.as_ref().is_some_and(|record| {
-                    record.waiter.tid == waiter.tid || record.waiter.reply_cap == waiter.reply_cap
-                })
+            || waiter.sequence != 0
+            || self.records().any(|(_, record)| {
+                record.waiter.tid == waiter.tid || record.waiter.reply_cap == waiter.reply_cap
             })
         {
             return None;
         }
-        if self.identity == 0 {
-            self.identity = LAST_TABLE
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
-                    last.checked_add(1)
-                })
-                .ok()?
-                + 1;
-        }
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.checked_add(1)?;
-        waiter.sequence = sequence;
+        waiter.sequence = reservation.sequence;
         let record = WaitRecord {
             waiter,
+            queue_order: self.next_queue_order,
             retry: None,
             next_attempt: 1,
+            cancellation: None,
         };
-        if let Some((index, slot)) = self
-            .slots
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| slot.is_none())
-        {
-            *slot = Some(record);
-            return Some(index);
+        self.next_queue_order = self
+            .next_queue_order
+            .checked_add(1)
+            .expect("reserved File waiter lost its publication-order budget");
+        self.slots[reservation.slot] = Some(WaitSlot::Owned(record));
+        Some(reservation.slot)
+    }
+
+    /// Convenience for callers that have not entered fallible external ownership effects.
+    pub fn park(&mut self, waiter: SynchronousFileWaiter) -> Option<usize> {
+        let reservation = self.reserve()?;
+        let parked = self.park_reserved(reservation, waiter);
+        if parked.is_none() {
+            self.cancel_reservation(reservation);
         }
-        if !self.grow_reservation() {
-            return None;
-        }
-        self.slots.push(Some(record));
-        Some(self.slots.len() - 1)
+        parked
     }
 
     pub fn oldest_waiting_for_file(
         &self,
         key: FileIoWaitKey,
     ) -> Option<(usize, SynchronousFileWaiter)> {
-        if self.has_promoted_for_file(key) {
+        if self.has_promoted_for_file(key) || self.cancellation_ownership(key).promoted != 0 {
             return None;
         }
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, record)| record.as_ref().map(|record| (slot, record.waiter)))
-            .filter(|(_, waiter)| {
-                waiter.key() == key && waiter.state == SynchronousFileWaitState::Waiting
+        self.records()
+            .filter(|(_, record)| {
+                record.cancellation.is_none()
+                    && record.waiter.key() == key
+                    && record.waiter.state == SynchronousFileWaitState::Waiting
             })
-            .min_by_key(|(_, waiter)| waiter.sequence)
+            .min_by_key(|(_, record)| record.queue_order)
+            .map(|(slot, record)| (slot, record.waiter))
     }
 
     /// Resolve the exact pre-dispatch File acquisition wait that a queued user
     /// APC may interrupt. A promoted record already owns Busy, so the File-lock
     /// wake wins and it is deliberately excluded.
     pub fn alertable_waiting_for_thread(&self, tid: u64) -> Option<(usize, SynchronousFileWaiter)> {
-        self.slots.iter().enumerate().find_map(|(slot, record)| {
-            record
-                .as_ref()
-                .map(|record| record.waiter)
-                .filter(|waiter| {
-                    waiter.tid == tid
-                        && waiter.is_alertable()
-                        && waiter.state == SynchronousFileWaitState::Waiting
-                })
-                .map(|waiter| (slot, waiter))
+        self.records().find_map(|(slot, record)| {
+            let waiter = record.waiter;
+            (record.cancellation.is_none() && {
+                waiter.tid == tid
+                    && waiter.is_alertable()
+                    && waiter.state == SynchronousFileWaitState::Waiting
+            })
+            .then_some((slot, waiter))
         })
     }
 
@@ -322,15 +443,21 @@ impl SynchronousFileWaitTable {
         key: FileIoWaitKey,
         tid: u64,
     ) -> Option<SynchronousFileWaiter> {
-        let waiter = &self.slots.get(slot)?.as_ref()?.waiter;
+        let record = self.record(slot)?;
+        let waiter = &record.waiter;
         if waiter.key() != key
             || waiter.tid != tid
             || !waiter.is_alertable()
             || waiter.state != SynchronousFileWaitState::Waiting
+            || record.cancellation.is_some()
         {
             return None;
         }
-        self.slots.get_mut(slot)?.take().map(|record| record.waiter)
+        self.slots
+            .get_mut(slot)?
+            .take()?
+            .into_record()
+            .map(|record| record.waiter)
     }
 
     /// Mark one exact FIFO waiter as the promoted Busy owner. Reply ownership remains on the
@@ -341,10 +468,13 @@ impl SynchronousFileWaitTable {
         key: FileIoWaitKey,
         tid: u64,
     ) -> Option<SynchronousFileWaiter> {
-        if self.has_promoted_for_file(key) {
+        if self.has_promoted_for_file(key) || self.cancellation_ownership(key).promoted != 0 {
             return None;
         }
-        let record = self.slots.get_mut(slot)?.as_mut()?;
+        let record = self.record_mut(slot)?;
+        if record.cancellation.is_some() {
+            return None;
+        }
         let waiter = &mut record.waiter;
         if waiter.key() != key
             || waiter.tid != tid
@@ -368,18 +498,21 @@ impl SynchronousFileWaitTable {
         service_number: u32,
     ) -> Option<SynchronousFileWaiter> {
         let slot = self.slots.iter_mut().find(|slot| {
-            slot.as_ref().is_some_and(|record| {
-                let waiter = &record.waiter;
-                waiter.pi == pi
-                    && waiter.tid == tid
-                    && waiter.badge == badge
-                    && waiter.service_number == service_number
-                    && waiter.state == SynchronousFileWaitState::Promoted
-                    && waiter.reply_cap == 0
-                    && record.retry == Some(SynchronousFileRetryPhase::Retired)
-            })
+            slot.as_ref()
+                .and_then(WaitSlot::record)
+                .is_some_and(|record| {
+                    let waiter = &record.waiter;
+                    waiter.pi == pi
+                        && waiter.tid == tid
+                        && waiter.badge == badge
+                        && waiter.service_number == service_number
+                        && waiter.state == SynchronousFileWaitState::Promoted
+                        && waiter.reply_cap == 0
+                        && record.retry == Some(SynchronousFileRetryPhase::Retired)
+                        && record.cancellation.is_none()
+                })
         })?;
-        slot.take().map(|record| record.waiter)
+        slot.take()?.into_record().map(|record| record.waiter)
     }
 
     pub fn take_exact(
@@ -388,12 +521,16 @@ impl SynchronousFileWaitTable {
         key: FileIoWaitKey,
         tid: u64,
     ) -> Option<SynchronousFileWaiter> {
-        let record = self.slots.get(slot)?.as_ref()?;
+        let record = self.record(slot)?;
         let waiter = &record.waiter;
-        if waiter.key() != key || waiter.tid != tid || record.delivery_retained() {
+        if waiter.key() != key || waiter.tid != tid || !record.transferable() {
             return None;
         }
-        self.slots.get_mut(slot)?.take().map(|record| record.waiter)
+        self.slots
+            .get_mut(slot)?
+            .take()?
+            .into_record()
+            .map(|record| record.waiter)
     }
 
     pub fn take_thread_with<F>(&mut self, tid: u64, mut take: F) -> usize
@@ -404,9 +541,10 @@ impl SynchronousFileWaitTable {
         for slot in self.slots.iter_mut() {
             if slot
                 .as_ref()
-                .is_some_and(|record| record.waiter.tid == tid && !record.delivery_retained())
+                .and_then(WaitSlot::record)
+                .is_some_and(|record| record.waiter.tid == tid && record.transferable())
             {
-                take(slot.take().unwrap().waiter);
+                take(slot.take().unwrap().into_record().unwrap().waiter);
                 count += 1;
             }
         }
