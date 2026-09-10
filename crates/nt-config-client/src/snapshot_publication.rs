@@ -11,6 +11,8 @@ use nt_fs::{
 };
 
 mod cancellation;
+mod admission;
+pub use admission::{SystemHiveStorageAdmission, SystemHiveStorageAdmissionPhase, ValidatedSystemHivePreparation};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotSystemHivePublicationPhase {
@@ -60,12 +62,15 @@ pub struct SnapshotSystemHivePublicationOpenError<C> {
 /// a native adapter supplied every handle/PnP reservation. Dropping this owner is not cancellation.
 ///
 /// ```compile_fail
-/// use nt_config_client::{Backend, ConfigClient, PreparedSystemHiveMutation, SnapshotSystemHivePublication};
+/// use nt_config_client::{Backend, ConfigClient, PreparedSystemHiveMutation, SnapshotSystemHivePublication, SystemHiveStorageAdmission};
 /// use nt_fs::{FileSystem, SnapshotBlockDevice, SnapshotBlockStore};
 /// fn bypass<B: Backend, D: SnapshotBlockDevice>(client: &mut ConfigClient<B>, fs: &mut FileSystem,
 ///     dev: &mut D, prepared: PreparedSystemHiveMutation) {
-///     let mut work = SnapshotSystemHivePublication::<B, D, (), ()>::open(client, fs, dev,
-///         SnapshotBlockStore::new(0, 64), r"\??\C:\Config\SYSTEM.LOG", prepared, ()).unwrap();
+///     let mut admission = SystemHiveStorageAdmission::new(client, prepared, ());
+///     admission.validate().unwrap();
+///     let (checked, caller) = admission.take_validated().unwrap();
+///     let mut work = SnapshotSystemHivePublication::<B, D, (), ()>::open(checked, fs, dev,
+///         SnapshotBlockStore::new(0, 64), r"\??\C:\Config\SYSTEM.LOG", caller).unwrap();
 ///     let _ = client.import_system_hive(&[]);
 ///     work.make_durable().unwrap();
 /// }
@@ -84,25 +89,23 @@ pub struct SnapshotSystemHivePublication<'a, B: Backend, D: SnapshotBlockDevice,
 
 impl<'a, B: Backend, D: SnapshotBlockDevice, C, R> SnapshotSystemHivePublication<'a, B, D, C, R> {
     /// Move the exact prepared bytes into storage without a second journal allocation. Failed
-    /// admission restores the preparation and returns all caller state without a CM operation.
+    /// admission restores the preparation and returns all caller state without a CM mutation.
     /// Admission must select this CM SYSTEM hive's actual backing log; storage borrows alone cannot
     /// prove that mapping. The log must already exist. Volatile-only preparations are not handled.
     pub fn open(
-        client: &'a mut ConfigClient<B>,
+        validated: ValidatedSystemHivePreparation<'a, B>,
         fs: &'a mut FileSystem,
         dev: &'a mut D,
         store: SnapshotBlockStore,
         log_path: &str,
-        prepared: PreparedSystemHiveMutation,
         continuation: C,
     ) -> Result<Self, SnapshotSystemHivePublicationOpenError<C>> {
         Self::admit(
-            client,
+            validated,
             fs,
             dev,
             store,
             log_path,
-            prepared,
             continuation,
             false,
         )
@@ -113,36 +116,34 @@ impl<'a, B: Backend, D: SnapshotBlockDevice, C, R> SnapshotSystemHivePublication
     /// the first journal durable; pre-COMMIT cancellation restores durable absence before CM ABORT.
     /// Native admission must still bind this exact path, mount and store to the CM authority.
     pub fn create(
-        client: &'a mut ConfigClient<B>,
+        validated: ValidatedSystemHivePreparation<'a, B>,
         fs: &'a mut FileSystem,
         dev: &'a mut D,
         store: SnapshotBlockStore,
         log_path: &str,
-        prepared: PreparedSystemHiveMutation,
         continuation: C,
     ) -> Result<Self, SnapshotSystemHivePublicationOpenError<C>> {
         Self::admit(
-            client,
+            validated,
             fs,
             dev,
             store,
             log_path,
-            prepared,
             continuation,
             true,
         )
     }
 
     fn admit(
-        client: &'a mut ConfigClient<B>,
+        validated: ValidatedSystemHivePreparation<'a, B>,
         fs: &'a mut FileSystem,
         dev: &'a mut D,
         store: SnapshotBlockStore,
         log_path: &str,
-        mut prepared: PreparedSystemHiveMutation,
         continuation: C,
         create: bool,
     ) -> Result<Self, SnapshotSystemHivePublicationOpenError<C>> {
+        let ValidatedSystemHivePreparation { client, mut prepared } = validated;
         let journal = core::mem::take(&mut prepared.durable_journal);
         let admitted = if create {
             SnapshotJournal::create(fs, dev, store, log_path, journal, ())

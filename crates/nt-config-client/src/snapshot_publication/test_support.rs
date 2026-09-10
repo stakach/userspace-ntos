@@ -9,6 +9,7 @@ pub(super) const LOG: &str = r"\??\C:\Config\SYSTEM.LOG";
 
 #[derive(Default)]
 pub(super) struct Controls {
+    pub(super) reads: Cell<usize>,
     pub(super) flushes: Cell<usize>,
     pub(super) writes: Cell<usize>,
     pub(super) fail_flush: Cell<Option<usize>>,
@@ -30,6 +31,7 @@ impl SnapshotBlockDevice for Disk {
         (self.cache.len() / 512) as u64
     }
     fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.controls.reads.set(self.controls.reads.get() + 1);
         out.copy_from_slice(&self.cache[lba as usize * 512..(lba as usize + 1) * 512]);
         Ok(())
     }
@@ -100,12 +102,11 @@ pub(super) fn open<'a>(
     drops: &Rc<Cell<usize>>,
 ) -> Work<'a> {
     match Work::open(
-        client,
+        checked(client, prepared),
         fs,
         dev,
         SnapshotBlockStore::new(0, 64),
         LOG,
-        prepared,
         Caller {
             drops: drops.clone(),
             publications: 0,
@@ -114,6 +115,15 @@ pub(super) fn open<'a>(
         Ok(work) => work,
         Err(_) => panic!("admission failed"),
     }
+}
+
+pub(super) fn checked<B: Backend>(
+    client: &mut ConfigClient<B>,
+    prepared: PreparedSystemHiveMutation,
+) -> ValidatedSystemHivePreparation<'_, B> {
+    let mut admission = SystemHiveStorageAdmission::new(client, prepared, ());
+    admission.validate().unwrap();
+    admission.take_validated().unwrap().0
 }
 
 pub(super) fn publish(work: &mut Work<'_>) {

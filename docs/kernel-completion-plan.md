@@ -32103,6 +32103,62 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Independent integrated review found no correctness blocker within this scope. Existing
     client warnings remain. Root is the sole build/test runner; no parallel build or VM run.
 
+    Checked prepared-storage admission checkpoint (2026-09-10): close the gap where a preparation
+    could be paired with a foreign CM client, or reused after abort, and write the journal before
+    COMMIT eventually rejected it. A mount-only observation is insufficient for a retired token.
+    - [x] Add read-only VALIDATE_PREPARED to the existing mutation protocol. Require the exact
+      live mount, generation, prepared token, semantic journal length, durable journal length and
+      next generation. Validate only an existing preparation: never turn an upload into one,
+      resurrect a retired token, allocate a receipt or modify hive/PnP/output state. Zero durable
+      length is valid evidence for a genuine no-op, not permission to use the durable journal path.
+    - [x] Retain preparation and complete caller in SystemHiveStorageAdmission before IPC.
+      validate(&mut self) marks InFlight first; returned failures permit exact retry or explicit
+      pre-storage release, while unwind retains InFlight and cannot authorize either. Successful
+      observation also permits explicit withdrawal before storage: release_before_storage returns
+      prepared/caller, and an extracted checked value can return its exact client/preparation via
+      into_preparation. Neither withdrawal aborts remote work or claims caller completion. Construction
+      and unstarted release perform no IPC. A successful single-use handoff creates an opaque,
+      non-Clone ValidatedSystemHivePreparation holding the same exclusive client borrow and exact
+      preparation. No raw validation result can substitute for that checked value.
+    - [x] Replace the public unchecked SnapshotSystemHivePublication open/create signatures.
+      They now require the checked preparation and perform no CM calls during journal acquisition.
+      Invalid/foreign/retired authority cannot reach either existing-log or first-log acquisition.
+      Keep the current storage-error return of original prepared bytes and caller without copying
+      the journal; there is no unchecked compatibility constructor or automatic abort on failure.
+
+    Review found and removed an intermediate by-value constructor validation: a Backend unwind
+    there would have dropped the moved preparation/caller before the caller received an owner.
+    Validation now runs only through an already-retained admission object. This guarantees returned
+    error/unwind ownership at the new IPC boundary, not recovery from allocator abort during the
+    separate, existing non-IPC filesystem constructor. A second review added explicit withdrawal
+    after successful validation, so unavailable native storage cannot force dropping a live CM
+    preparation. The caller still owns its later completion or acknowledged cancellation.
+
+    Review adjustment: this binds publication to a live CM preparation, NOT to its physical files.
+    Next replace native raw writable_fs() -> &'static mut FileSystem and direct global borrows
+    with owned filesystem access, including escaping file_bytes_if_mounted slices, checkpoint and
+    compaction bypasses. Preserve Busy/unavailable versus absent in union lookup helpers first;
+    otherwise refusing a lease could silently expose the installed FAT entry or discard close/
+    notify completion work. Do not claim unforgeable mount/file identity for a public DerefMut guard
+    that permits replacing FileSystem while retaining an outer mount ID. Keep replacement private
+    or bind identity to the actual replaceable filesystem state.
+
+    Then associate prepared CM ownership with the writable mount and existing physical reserve
+    lease, and inspect exact primary/log state under filesystem exclusion. First boot deliberately
+    defers SYSTEM copy-up; restored snapshots may be log-only. Represent genuine primary absence
+    plus installed-source authority, not a fabricated primary file ID or a missing-file fallback.
+    Native caller/PnP/Key migration, one-shot wrapper/unconditional flush removal, volatile/no-op
+    publication, 27 strict missing win32k imports and real desktop acceptance remain open.
+
+    Validation: 1,450 host tests/doctests passed across nt-fs, nt-config-abi, nt-config-client,
+    nt-config-server, nt-config-manager, nt-hive-core, nt-security and nt-user-host. This includes
+    15 new unit tests and two compile-fail doctests covering exact preparation validation, foreign/
+    retired authority, malformed replies, retained unwind state, retry and explicit withdrawal.
+    The native executive release build passed in 37.29s with the existing 293 warnings unchanged.
+    Evidence: .tmp/test-prepared-storage-admission-full-final-20260910.log and
+    .tmp/build-prepared-storage-admission-executive-20260910.log. Root ran all validation serially;
+    no native filesystem lease, microkernel change, VM run or desktop acceptance is claimed.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

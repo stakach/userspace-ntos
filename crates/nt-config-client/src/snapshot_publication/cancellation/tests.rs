@@ -17,12 +17,11 @@ fn first_journal_cancellation_removes_file_durably_before_abort_and_ack() {
             let (mut fs, mut dev, controls) = disk_without_log();
             let drops = Rc::new(Cell::new(0));
             let mut work = match Work::create(
-                &mut client,
+                checked(&mut client, prepared),
                 &mut fs,
                 &mut dev,
                 SnapshotBlockStore::new(0, 64),
                 LOG,
-                prepared,
                 Caller {
                     drops: drops.clone(),
                     publications: 0,

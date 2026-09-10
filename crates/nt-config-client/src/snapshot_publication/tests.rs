@@ -85,12 +85,11 @@ fn retained_begin_publication(first_journal: bool) {
         Work::open
     };
     let mut work = match admit(
-        &mut client,
+        checked(&mut client, prepared),
         &mut fs,
         &mut dev,
         SnapshotBlockStore::new(0, 64),
         LOG,
-        prepared,
         caller,
     ) {
         Ok(work) => work,
@@ -141,7 +140,7 @@ fn repeated_storage_failure_blocks_commit_until_real_durability() {
                 work.commit(),
                 Err(SnapshotSystemHivePublicationError::InvalidPhase)
             );
-            assert_eq!(work.client.backend.calls, before);
+            assert_eq!(work.client.backend.calls, before + 1); // Read-only admission, no COMMIT.
             assert_eq!(drops.get(), 0);
             assert!(work.take_completion().is_none());
         }
@@ -311,12 +310,11 @@ fn failed_admission_returns_original_preparation_and_caller_without_copying_jour
     let (mut fs, mut dev, controls) = disk();
     let drops = Rc::new(Cell::new(0));
     let error = match Work::open(
-        &mut client,
+        checked(&mut client, prepared),
         &mut fs,
         &mut dev,
         SnapshotBlockStore::new(0, 64),
         r"\??\C:\Config\Missing.LOG",
-        prepared,
         Caller {
             drops: drops.clone(),
             publications: 0,
@@ -327,15 +325,14 @@ fn failed_admission_returns_original_preparation_and_caller_without_copying_jour
     };
     assert_eq!(error.prepared.durable_journal().as_ptr(), address);
     assert_eq!(error.prepared.durable_journal(), expected);
-    assert_eq!(client.backend.calls, before);
+    assert_eq!(client.backend.calls, before + 1);
     assert_eq!(drops.get(), 0);
     let mut work = Work::open(
-        &mut client,
+        checked(&mut client, error.prepared),
         &mut fs,
         &mut dev,
         SnapshotBlockStore::new(0, 64),
         LOG,
-        error.prepared,
         error.continuation,
     )
     .ok()
@@ -368,12 +365,11 @@ fn local_result_and_caller_survive_lost_ack_until_one_completion() {
     let caller_drops = Rc::new(Cell::new(0));
     let result_drops = Rc::new(Cell::new(0));
     let mut work = SnapshotSystemHivePublication::open(
-        &mut client,
+        checked(&mut client, prepared),
         &mut fs,
         &mut dev,
         SnapshotBlockStore::new(0, 64),
         LOG,
-        prepared,
         Caller {
             drops: caller_drops.clone(),
             publications: 0,

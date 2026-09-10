@@ -18,7 +18,10 @@ impl CmServer {
             || req.abi_version != CM_ABI_VERSION
             || req.mount != hive_mount::SYSTEM
             || chunk_len > CM_HIVE_MUTATION_CHUNK_BYTES
-            || (req.operation == hive_mutation_transfer::BEGIN) != (req.expected_mount != 0)
+            || matches!(
+                req.operation,
+                hive_mutation_transfer::BEGIN | hive_mutation_transfer::VALIDATE_PREPARED
+            ) != (req.expected_mount != 0)
         {
             return reply(STATUS_INVALID_PARAMETER, 0);
         }
@@ -30,6 +33,38 @@ impl CmServer {
         };
 
         match req.operation {
+            hive_mutation_transfer::VALIDATE_PREPARED => {
+                if req.lease_token == 0
+                    || req.expected_generation == 0
+                    || journal_len == 0
+                    || req.chunk_offset != 0
+                    || req.chunk_len_bytes != 0
+                    || buf.len() != header_size
+                {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let mounted = self.system_hive.as_ref().unwrap();
+                if req.expected_mount != mounted.identity {
+                    return reply(STATUS_INVALID_HANDLE, current_generation);
+                }
+                if req.expected_generation != current_generation {
+                    return reply(STATUS_REVISION_MISMATCH, current_generation);
+                }
+                // Admission observes an existing preparation only. In particular, a complete
+                // upload must not become prepared, and a retired token must not acquire authority.
+                let Some(prepared) = self.prepared_system_mutation.as_ref() else {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                };
+                if prepared.token != req.lease_token
+                    || prepared.expected_generation != req.expected_generation
+                    || prepared.semantic_journal_len != journal_len
+                    || prepared.durable_journal.len() != req.journal_offset as usize
+                    || Some(prepared.next_generation) != current_generation.checked_add(1)
+                {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                reply_with_info(STATUS_SUCCESS, 0, prepared.next_generation, prepared.token)
+            }
             hive_mutation_transfer::BEGIN => {
                 if req.lease_token != 0
                     || req.expected_generation == 0

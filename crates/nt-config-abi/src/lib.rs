@@ -228,6 +228,8 @@ pub mod hive_mutation_transfer {
     /// Publish the prepared mutation after its replay records are durable.
     pub const COMMIT: u16 = 5;
     pub const ABORT: u16 = 6;
+    /// Read-only exact prepared-owner validation before admitting storage effects.
+    pub const VALIDATE_PREPARED: u16 = 7;
 }
 
 /// Operation carried by [`CmHiveCheckpointRequest::operation`].
@@ -734,6 +736,10 @@ pub struct CmLeasedHiveRecordRequest {
 /// APPEND may replay a fully accepted byte-identical range, but cannot extend an overlapping range.
 /// PREPARE retains the upload on failure and replays a matching prepared result without revalidation.
 /// BEGIN still requires separate requester identity before a lost acquisition reply can be retried.
+/// VALIDATE_PREPARED is read-only: exact mount/token/generation/semantic length are required,
+/// `journal_offset` carries expected durable length, and both chunk fields are zero. It cannot
+/// prepare an upload, publish, abort or allocate a receipt. Success has no payload/information;
+/// detail0 is next generation and detail1 is the prepared token. It is not a storage binding.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CmHiveMutationRequest {
@@ -747,7 +753,7 @@ pub struct CmHiveMutationRequest {
     pub journal_len_bytes: u32,
     pub expected_generation: u64,
     pub lease_token: u64,
-    /// Exact observed mount for BEGIN; zero for subsequent token-owned operations.
+    /// Exact mount for BEGIN or VALIDATE_PREPARED; zero for other token-owned operations.
     pub expected_mount: u64,
 }
 
@@ -1270,6 +1276,7 @@ mod tests {
 
     #[test]
     fn mounted_hive_mutation_has_stable_wire_layout() {
+        assert_eq!(hive_mutation_transfer::VALIDATE_PREPARED, 7);
         assert_eq!(opcode::CM_OP_MUTATE_SYSTEM_HIVE, 0x2156);
         assert_eq!(opcode::CM_OP_EXPORT_LEASED_HIVE, 0x215b);
         assert_eq!(core::mem::size_of::<CmHiveExportHeader>(), 24);

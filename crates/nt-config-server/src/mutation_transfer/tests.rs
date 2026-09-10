@@ -2,6 +2,8 @@ use super::*;
 use crate::mutation_commit::test_support::server;
 use nt_config_abi::{hive_mutation_kind as kind, CmHiveMutationRecord};
 
+mod validation;
+
 const SERVICES: &str = r"\Registry\Machine\System\CurrentControlSet\Services";
 
 fn record(kind: u16, path: &str, name: &str, ty: u32, data: &[u8]) -> Vec<u8> {

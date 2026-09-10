@@ -53,6 +53,7 @@ pub use mutation_commit::{
 
 mod snapshot_publication;
 pub use snapshot_publication::{
+    SystemHiveStorageAdmission, SystemHiveStorageAdmissionPhase, ValidatedSystemHivePreparation,
     SnapshotSystemHivePublication, SnapshotSystemHivePublicationError,
     SnapshotSystemHivePublicationOpenError, SnapshotSystemHivePublicationPhase,
 };
