@@ -32602,6 +32602,59 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     exclusion, exact CM binding and strict provider imports remain open. No boot or screenshot
     acceptance is claimed here.
 
+    Retained local flush checkpoint (2026-09-10, complete): implement the synchronous-file
+    versus synchronous-API distinction without repeating completed writeback during delivery.
+    - [x] Add a typed LocalFlush owner with immutable backing status and separate syscall result.
+      Synchronous File inline errors suppress IOSB/File publication; other completions ignore
+      permanent IOSB faults. Asynchronous File opens always perform the final API IOSB copy,
+      never signal the File, and return a copy exception without replacing the backing result.
+    - [x] Reserve pending/reply/File ownership before local writeback, stage its terminal result
+      and remove direct IOSB stores, unconditional File signaling and destructive reference release.
+      Exclude LocalFlush from provider cancellation/output and user-APC interruption paths.
+    - [x] Test ordered IOSB retry/fault, reply rejection, source result preservation and retained
+      writeback/File lifetime; run host and native validation serially and review the next boundary.
+
+    Source audit: NT5 misc.c:508-623 captures File mode, clears the File event in both cases,
+    and uses a private event/kernel IOSB only for the asynchronous-open synchronous API.
+    internal.c:1298-1425 controls ordinary inline severity/signaling and ignores permanent IOSB
+    faults; IopSynchronousApiServiceTail at internal.c:7165-7259 instead replaces the syscall
+    result on final user-IOSB copy failure. NT5's immediate-error asynchronous path can copy an
+    uninitialized local IOSB. Do not reproduce undefined bytes: initialize the retained kernel
+    IOSB from the actual backing result even on error. The local writeback adapter already returns
+    terminally, so no dispatcher event is needed to wait for an outstanding backend; parking solely
+    for delivery does not manufacture a pending IRP or change its original inline policy.
+
+    Implementation evidence: exact reservation-derived local identity, shape validation and typed
+    fault settlement prevent provider crossover or completion-surface bypass. IOSB settlement gates
+    required File signaling and reply claim; rejected replies preserve the stored syscall result.
+    Backend ACK and checked File-reference retirement remain mandatory. Eight contract tests cover
+    mode/severity/fault matrices, malformed owners, reply/reference retries and abandonment. Four
+    composed tests use real GenericSectionTable dirty-page writeback and nt-fs write/flush before
+    injecting external barrier outcomes and first/second IOSB-store faults; accepted write/persist
+    counts remain one across delivery retries and closing the user handle. The host fixture does
+    not prove native frame mapping, persistent disk failure or fault delivery.
+
+    Validation: 8 focused flush contracts passed; the five-crate address-space/filesystem/I/O/
+    completion/memory suite passed 1,356 tests; the twelve-crate cross-subsystem suite passed 2,616
+    tests, all with zero failures/ignored. The native executive release build passed in 38.95s with
+    the unchanged 294-warning baseline. Logs: `.tmp/test-local-flush-contract-20260910.log`,
+    `.tmp/test-local-flush-focused-20260910.log`, `.tmp/test-local-flush-full-20260910.log`, and
+    `.tmp/build-local-flush-executive-20260910.log`. All runners were serialized. No microkernel
+    change or VM run occurred; the 27 strict missing win32k imports and desktop acceptance remain
+    open.
+
+    Next-boundary review: local NtSetInformationFile still mutates overlay metadata/names and FAT
+    FilePosition before unretained Status-first IOSB stores. Retain its result and File reference
+    before mutation, then remove those local direct stores. Do not reuse LocalFlush's asynchronous
+    final-copy policy: NT5 qsinfo.c:1737-1755 routes already-inline SET directly through ordinary
+    completion, with severity-three suppression and ignored permanent IOSB faults in both open
+    modes. Its synchronous FilePosition fast path (qsinfo.c:1059-1144) retains the File without
+    clearing/signaling its event; other inline SET paths clear it and signal on success/warning.
+    Existing LocalInline ownership can carry the result, with an explicit retain-only fast path.
+    Local synchronous File Busy ownership and hosted SET/flush completion remain separate debt.
+    Position validation also needs NT5's signed-offset checks; any no-buffering alignment check
+    must use actual device sector geometry. Retained delivery alone does not close that contract.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

@@ -14101,7 +14101,8 @@ impl ExecNtHandler {
                         self.cancel_local_directory_notify(pending.file_id, operation.notify_id);
                 }
                 nt_io_manager::PendingFileIoOperation::LocalInline(_)
-                | nt_io_manager::PendingFileIoOperation::LocalBuffered(_) => {}
+                | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
+                | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => {}
                 _ => {
                     let _ = driver_launch::cancel_irp_if_pending(pending.irp_id);
                 }

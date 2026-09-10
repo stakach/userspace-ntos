@@ -7,6 +7,8 @@
 
 use alloc::vec::Vec;
 
+pub use local_flush::{LocalFlushMode, PendingLocalFlush};
+
 pub const IO_DELIVERY_BUFFER_PUBLISHED: u16 = 1 << 0;
 pub const IO_DELIVERY_IOSB_PUBLISHED: u16 = 1 << 1;
 pub const IO_DELIVERY_APC_PUBLISHED: u16 = 1 << 2;
@@ -107,6 +109,7 @@ pub enum PendingFileIoOperation {
     LocalDirectoryNotify(PendingLocalDirectoryNotify),
     LocalInline(PendingLocalInline),
     LocalBuffered(PendingLocalBuffered),
+    LocalFlush(PendingLocalFlush),
 }
 
 /// One pending File-bound operation and every completion surface owned by that exact IRP.
@@ -180,6 +183,7 @@ impl PendingFileIo {
                 | PendingFileIoOperation::LocalDirectoryNotify(_)
                 | PendingFileIoOperation::LocalInline(_)
                 | PendingFileIoOperation::LocalBuffered(_)
+                | PendingFileIoOperation::LocalFlush(_)
         )
     }
 
@@ -197,9 +201,18 @@ impl PendingFileIo {
             PendingFileIoOperation::LocalBuffered(operation) => {
                 (operation.status, operation.information)
             }
+            PendingFileIoOperation::LocalFlush(operation) => (operation.status(), 0),
             _ => return None,
         };
         (status != nt_status::NtStatus::PENDING.raw() as u32).then_some((status, information))
+    }
+
+    /// Syscall return status may differ from the backing result for a synchronous API's IOSB copy.
+    pub fn local_syscall_status(&self) -> Option<u32> {
+        match self.operation {
+            PendingFileIoOperation::LocalFlush(operation) => Some(operation.syscall_status()),
+            _ => self.local_terminal_result().map(|(status, _)| status),
+        }
     }
 }
 
@@ -407,6 +420,9 @@ impl PendingFileIoTable {
                     && pending.sync_lock_owner_tid == 0
                     && !pending.consumer_abandoned
             }
+            PendingFileIoOperation::LocalFlush(operation) => {
+                Self::local_flush_shape_is_valid(pending, operation)
+            }
         };
         let control_valid = matches!(
             pending.major,
@@ -507,6 +523,11 @@ impl PendingFileIoTable {
         if self.contains_irp(pending.irp_id) {
             return Err(PendingFileIoParkError::DuplicateIrp);
         }
+        if matches!(pending.operation, PendingFileIoOperation::LocalFlush(_))
+            && self.local_operation_id(reservation) != Some(pending.irp_id)
+        {
+            return Err(PendingFileIoParkError::InvalidRecord);
+        }
         match pending.operation {
             PendingFileIoOperation::LocalBuffered(operation) => {
                 if self.local_operation_id(reservation) != Some(pending.irp_id)
@@ -534,7 +555,8 @@ impl PendingFileIoTable {
 
     /// Insert one exact pending owner. A canonical IRP may have only one delivery owner.
     pub fn park(&mut self, pending: PendingFileIo) -> Option<usize> {
-        if matches!(pending.operation, PendingFileIoOperation::LocalBuffered(_))
+        if matches!(pending.operation,
+            PendingFileIoOperation::LocalBuffered(_) | PendingFileIoOperation::LocalFlush(_))
             || !Self::pending_shape_is_valid(pending) || self.contains_irp(pending.irp_id)
         {
             return None;
@@ -985,6 +1007,7 @@ impl PendingFileIoTable {
         }
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id
+            || !Self::local_flush_delivery_flag_is_valid(*pending, flag)
             || (matches!(pending.operation, PendingFileIoOperation::LocalBuffered(_))
                 && (flag == IO_DELIVERY_BUFFER_PUBLISHED || !Self::local_output_settled(*pending)))
             || (flag == IO_DELIVERY_IOSB_PUBLISHED
@@ -1007,6 +1030,7 @@ impl PendingFileIoTable {
     ) -> Option<u16> {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id
+            || matches!(pending.operation, PendingFileIoOperation::LocalFlush(_))
             || expected_iosb_va == 0
             || pending.iosb_va != expected_iosb_va
             || pending.consumer_abandoned
@@ -1046,7 +1070,8 @@ impl PendingFileIoTable {
         }
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id
-            || matches!(pending.operation, PendingFileIoOperation::LocalInline(_))
+            || matches!(pending.operation,
+                PendingFileIoOperation::LocalInline(_) | PendingFileIoOperation::LocalFlush(_))
             || terminal_output_len > pending.output_len
             || pending.output_offset > terminal_output_len
         {
@@ -1090,6 +1115,7 @@ impl PendingFileIoTable {
         if pending.irp_id != irp_id
             || !pending.reply_required
             || !Self::local_output_settled(*pending)
+            || !Self::local_flush_reply_ready(*pending)
             || (pending.user_apc_interrupt_requested
                 && pending.delivery_state & IO_DELIVERY_USER_APC_STAGED == 0)
         {
@@ -1246,6 +1272,9 @@ impl PendingFileIoTable {
 
 #[path = "pending_io/local_output.rs"]
 mod local_output;
+
+#[path = "pending_io/local_flush.rs"]
+mod local_flush;
 
 #[cfg(test)]
 #[path = "pending_io/local_delivery_tests.rs"]

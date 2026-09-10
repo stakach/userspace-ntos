@@ -24303,7 +24303,8 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
     };
     let alertable = match pending.operation {
         nt_io_manager::PendingFileIoOperation::LocalInline(_)
-        | nt_io_manager::PendingFileIoOperation::LocalBuffered(_) => false,
+        | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
+        | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => false,
         nt_io_manager::PendingFileIoOperation::LocalByteLock(operation) => operation.alertable,
         nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
             operation.alertable
@@ -24334,7 +24335,8 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
 
     let cancellation = match pending.operation {
         nt_io_manager::PendingFileIoOperation::LocalInline(_)
-        | nt_io_manager::PendingFileIoOperation::LocalBuffered(_) => Ok(false),
+        | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
+        | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => Ok(false),
         nt_io_manager::PendingFileIoOperation::LocalByteLock(operation) => {
             let cancelled = nt_handler.cancel_local_byte_lock_wait(operation.wait_id);
             if cancelled {
@@ -25675,7 +25677,8 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 let work = &mut *core::ptr::addr_of_mut!(FILE_IO_COPY_WORK);
                 let copy_result = match pending.operation {
                     nt_io_manager::PendingFileIoOperation::LocalInline(_)
-                    | nt_io_manager::PendingFileIoOperation::LocalBuffered(_) => {
+                    | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
+                    | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => {
                         Err(nt_fs::STATUS_INVALID_PARAMETER)
                     }
                     nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
@@ -25752,9 +25755,15 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 Ok(()) => table.mark_delivery_exact(
                     slot, pending.irp_id, nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED,
                 ),
-                Err(nt_address_space::copy::MemoryCopyFailure::UserFault(_)) => {
-                    // NT completes the I/O despite a permanent IOSB fault. Keep its pointer for APCs.
-                    table.mark_iosb_faulted_exact(slot, pending.irp_id, pending.iosb_va)
+                Err(nt_address_space::copy::MemoryCopyFailure::UserFault(status)) => {
+                    if matches!(pending.operation, nt_io_manager::PendingFileIoOperation::LocalFlush(_)) {
+                        table.mark_local_flush_iosb_faulted_exact(
+                            slot, pending.irp_id, pending.iosb_va, status,
+                        )
+                    } else {
+                        // Ordinary completion keeps its source result despite a permanent IOSB fault.
+                        table.mark_iosb_faulted_exact(slot, pending.irp_id, pending.iosb_va)
+                    }
                 }
                 Err(nt_address_space::copy::MemoryCopyFailure::Retry(_)) => {
                     FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
@@ -25763,6 +25772,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 }
             }
             .expect("pending File IOSB owner disappeared");
+            pending = table.get(slot).expect("settled File IOSB owner disappeared");
         }
 
         if pending.event_obj_idx != u64::MAX
@@ -25895,7 +25905,9 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             let replied = if pending.user_apc_interrupt_requested {
                 client_reply_on(cap, 0, 0, 0, 0, 0)
             } else {
-                reply_parked_syscall(cap, terminal_status as u64)
+                reply_parked_syscall(
+                    cap, pending.local_syscall_status().unwrap_or(terminal_status) as u64,
+                )
             };
             if !replied {
                 (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
@@ -25979,7 +25991,8 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             nt_io_manager::PendingFileIoOperation::LocalByteLock(_)
             | nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(_)
             | nt_io_manager::PendingFileIoOperation::LocalInline(_)
-            | nt_io_manager::PendingFileIoOperation::LocalBuffered(_) => {}
+            | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
+            | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => {}
         }
         delivered += 1;
         let trace_completion = FILE_IO_COMPLETION_TRACE.fetch_add(1, Ordering::Relaxed) < 32

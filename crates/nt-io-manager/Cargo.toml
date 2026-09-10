@@ -26,6 +26,7 @@ bitflags = { workspace = true }
 nt-address-space = { workspace = true }
 nt-fs = { workspace = true }
 nt-io-completion = { workspace = true }
+nt-memory-manager = { workspace = true }
 proptest = "1"
 
 [lints.clippy]

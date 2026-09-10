@@ -18,27 +18,52 @@ impl ExecNtHandler {
         if !nt_fs::file_flush_access_allowed(access, false) {
             return Some(STATUS_ACCESS_DENIED);
         }
+        let information = match crate::writable_fs::file_object_information(file_id) {
+            Ok(information) => information,
+            Err(status) => return Some(status),
+        };
+        let mode = if information.mode
+            & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+            != 0
+        {
+            nt_io_manager::LocalFlushMode::SynchronousFile
+        } else {
+            nt_io_manager::LocalFlushMode::SynchronousApi
+        };
         let Some(context) = self.loop_ctx else {
             return Some(STATUS_DEVICE_NOT_READY);
         };
-        if let Err(status) = self.begin_local_file_io(file_object) {
-            return Some(status);
-        }
-        let mut status = crate::service_sec_image::service_generic_section_writeback_file(
+        let request_id = match self.begin_retained_local_file_io(file_object) {
+            Ok(request_id) => request_id,
+            Err(status) => return Some(status),
+        };
+        let status = crate::service_sec_image::service_generic_section_writeback_file(
             &mut *context.generic_sections,
             file_id,
             context.scratch_base,
             Some(context),
         )
         .status;
-        // Copyout may fault and revisit the memory owner: the table borrow must have ended.
-        if !self.write_current_iosb(iosb, status, 0) {
-            status = STATUS_ACCESS_VIOLATION;
-        }
-        // Flush has no event argument and completes synchronously even for an async open.
-        let completion = self.signal_local_file_completion(file_object);
-        assert_eq!(completion, nt_fs::STATUS_SUCCESS);
-        self.release_local_file_io_reference(file_object);
-        Some(status)
+        let completion = nt_io_manager::PendingLocalFlush::new(status, mode)
+            .expect("local writeback unexpectedly returned a pending operation");
+        // The backend has completed inline. This retained result is the kernel IOSB for the
+        // synchronous-API mode; it needs no pending-driver event or user-visible File signal.
+        assert!(self.pending_file_io_transfer.is_none());
+        self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+            file_id: file_object,
+            irp_id: request_id,
+            major: major::IRP_MJ_FLUSH_BUFFERS,
+            operation: nt_io_manager::PendingFileIoOperation::LocalFlush(completion),
+            pi: self.pi as u32,
+            tid: self.current_tid,
+            badge: self.current_badge,
+            iosb_va: if completion.publishes_iosb() { iosb } else { 0 },
+            signal_file: completion.signals_file(),
+            completion_port_suppressed: true,
+            event_obj_idx: u64::MAX,
+            ..nt_io_manager::PendingFileIo::default()
+        });
+        self.pending_file_io_wait = true;
+        Some(STATUS_PENDING)
     }
 }
