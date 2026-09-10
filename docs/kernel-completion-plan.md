@@ -32285,6 +32285,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Keep this work, private global filesystem exclusion, exact CM storage binding, bootstrap
     optional-primary/log-only handling and genuine desktop acceptance open.
 
+    Single-admission local I/O checkpoint (2026-09-10): remove avoidable
+    filesystem reacquisition rather than queuing work that never needs to leave admission.
+    - [x] Make begin-I/O retain its operation reference and clear the FILE_OBJECT signal in one
+      checked core transition. Invalid objects, exhausted reference counts and corrupt ownership
+      must leave both fields unchanged. Route native overlay begin through one admission and
+      remove its old retain/set-signal/rollback path.
+    - [x] Hold one writable filesystem admission across native logical read/write transfer,
+      position calculation, read access metadata, notification generation and accounting. The
+      transfer and metadata primitives do not call out or re-enter the service loop. Remove the
+      separate native complete_read/complete_file_position helpers and share existing write
+      accounting with raw section/other backing writes. Preserve checked backing errors before
+      transfer and fail-stop impossible post-transfer extent violations rather than returning a
+      retryable error after accepting bytes. User copy and completion surfaces remain afterward.
+    - [x] Validate with real filesystem/I/O Manager composition tests, core begin-I/O transition
+      tests and the serialized native executive build. Host composition tests prove the underlying
+      semantics; native single-admission ordering is source-reviewed, not a simulated lease test.
+
+    Validation: 1,051 focused and 2,311 broad host tests/doctests passed, with no failures or ignored
+    tests. Eight new core tests cover atomic begin, quota and corrupt-reference failures, valid
+    zero IDs, duplicate handles, directories and cleanup-only retained lifetimes. Seven new
+    composition tests cover explicit/current/end offsets, asynchronous position preservation,
+    short/zero-length/EOF reads, one logical access notification, rejected writes and final I/O
+    lifetime. Evidence: .tmp/test-single-admission-io-focused-20260910.log and
+    .tmp/test-single-admission-io-full-20260910.log. The native release build passed in 37.62s
+    (.tmp/build-single-admission-io-executive-20260910.log). Its 294 warnings include the existing
+    293 plus the raw read_backing_into facade, now used only by the dormant canonical section-read
+    adapter rather than the native logical-read path. The raw fragment API remains for that distinct
+    metadata-free contract; do not replace it with logical read accounting. Root serialized every
+    runner. No VM run, native filesystem lease or desktop acceptance is claimed.
+
+    Review adjustment: the logical metadata reacquisition identified above needs no deferred
+    owner because its complete non-reentrant operation stays inside admission. EOF and zero-length
+    requests retain their existing position/accounting rules; do not reject an EOF read merely
+    because offset plus requested length would overflow. Late user-copy failure cannot undo the
+    accepted transfer. This does NOT close inline IOSB/event/File/APC/reply delivery or final local
+    I/O-reference retirement. Those paths still require retained terminal ownership before a Busy
+    lease is enabled, as do ordinary handle close and unpublished rollback. Native exclusion,
+    exact CM storage binding and desktop acceptance remain open.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

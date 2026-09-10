@@ -29305,20 +29305,16 @@ impl ExecNtHandler {
         }
     }
 
-    fn retain_local_file_io_reference(&mut self, file_object: u64) -> Result<(), u32> {
+    fn begin_local_file_io(&mut self, file_object: u64) -> Result<(), u32> {
         let object_id = (file_object & LOCAL_ID_PAYLOAD_MASK) as u32;
         match file_object & !LOCAL_ID_PAYLOAD_MASK {
             LOCAL_FAT_FILE_OBJECT_TAG => self.readonly_file_opens.retain_io(object_id),
             LOCAL_FAT_DIRECTORY_OBJECT_TAG => self.directory_opens.retain_io(object_id),
             LOCAL_OVERLAY_FILE_OBJECT_TAG => unsafe {
-                crate::writable_fs::retain_io_reference(file_object & LOCAL_ID_PAYLOAD_MASK)
+                return crate::writable_fs::begin_file_io(file_object & LOCAL_ID_PAYLOAD_MASK);
             },
             _ => Err(nt_fs::STATUS_INVALID_HANDLE),
-        }
-    }
-
-    fn begin_local_file_io(&mut self, file_object: u64) -> Result<(), u32> {
-        self.retain_local_file_io_reference(file_object)?;
+        }?;
         if let Err(status) = self.set_local_file_object_signaled(file_object, false) {
             self.release_local_file_io_reference(file_object);
             return Err(status);
@@ -43310,17 +43306,12 @@ impl ExecNtHandler {
                                                         len,
                                                     );
                                                     let (status, written) =
-                                                        crate::writable_fs::write(
+                                                        crate::writable_fs::write_completed(
                                                             file_id,
-                                                            Some(actual_offset),
+                                                            resolved,
+                                                            route.synchronous,
                                                             scratch,
                                                         );
-                                                    let position = resolved.completion_position(
-                                                        route.synchronous, len, status, written,
-                                                    ).expect("regular file write reports bounded progress");
-                                                    crate::writable_fs::complete_file_position(
-                                                        file_id, position,
-                                                    );
                                                     if written != 0 {
                                                         self.writable_fs_dirty = true;
                                                     }
@@ -43822,22 +43813,12 @@ impl ExecNtHandler {
                                                                     OVERLAY_IO_CAP,
                                                                 );
                                                             let (status, read) =
-                                                                crate::writable_fs::read_backing_into(
+                                                                crate::writable_fs::read_completed_into(
                                                                     file_id,
-                                                                    actual_offset,
+                                                                    resolved,
+                                                                    route.synchronous,
                                                                     &mut scratch[..len],
                                                                 );
-                                                            let position = resolved.completion_position(
-                                                                route.synchronous, len, status, read,
-                                                            ).expect("regular file read reports bounded progress");
-                                                            crate::writable_fs::complete_read(
-                                                                file_id,
-                                                                actual_offset,
-                                                                len,
-                                                                status,
-                                                                read,
-                                                                position,
-                                                            );
                                                             if status == nt_fs::STATUS_SUCCESS
                                                                 && read != 0
                                                                 && !self.xas_try_write_buf(

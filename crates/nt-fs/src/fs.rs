@@ -30,6 +30,9 @@ mod file_create;
 mod file_object_information;
 pub use file_object_information::FileObjectInformation;
 
+#[path = "file_io_lifetime.rs"]
+mod file_io_lifetime;
+
 #[path = "snapshot_journal.rs"]
 mod snapshot_journal;
 pub use snapshot_journal::*;

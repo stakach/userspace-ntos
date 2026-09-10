@@ -1410,16 +1410,25 @@ pub(crate) unsafe fn read_backing_into(
     fs.read_backing_into(file_id, offset, output)
 }
 
-/// Complete one logical read independently of how many backing fragments were needed.
-pub(crate) unsafe fn complete_read(
+/// Transfer and account for one logical read before releasing writable-volume admission.
+/// User copy and completion surfaces must follow this operation, never split its filesystem borrow.
+pub(crate) unsafe fn read_completed_into(
     file_id: u64,
-    offset: u64,
-    requested: usize,
-    status: u32,
-    transferred: usize,
-    position: Option<u64>,
-) {
-    let fs = writable_fs().expect("completed read retains its filesystem");
+    resolved: nt_io_manager::ResolvedFileOffset,
+    synchronous: bool,
+    output: &mut [u8],
+) -> (u32, usize) {
+    let fs = match writable_fs() {
+        Ok(fs) => fs,
+        Err(status) => return (status, 0),
+    };
+    if let Err(status) = fs.query_file_object_information(file_id) {
+        return (status, 0);
+    }
+    let (status, transferred) = fs.read_backing_into(file_id, resolved.value(), output);
+    let position = resolved
+        .completion_position(synchronous, output.len(), status, transferred)
+        .expect("regular file read reports bounded progress");
     if status == nt_fs::STATUS_SUCCESS || transferred != 0 || position.is_some() {
         assert_eq!(
             fs.complete_read(file_id, transferred, position),
@@ -1434,16 +1443,35 @@ pub(crate) unsafe fn complete_read(
         mark_snapshot_dirty();
     }
     if status != nt_fs::STATUS_SUCCESS {
-        trace_io_refusal(b"read", file_id, Some(offset), requested, status);
+        trace_io_refusal(b"read", file_id, Some(resolved.value()), output.len(), status);
     }
+    (status, transferred)
 }
 
-pub(crate) unsafe fn complete_file_position(file_id: u64, position: Option<u64>) {
-    let fs = writable_fs().expect("completed transfer retains its filesystem");
+/// Transfer and publish the I/O Manager's completed position under the same admission.
+pub(crate) unsafe fn write_completed(
+    file_id: u64,
+    resolved: nt_io_manager::ResolvedFileOffset,
+    synchronous: bool,
+    data: &[u8],
+) -> (u32, usize) {
+    let fs = match writable_fs() {
+        Ok(fs) => fs,
+        Err(status) => return (status, 0),
+    };
+    if let Err(status) = fs.query_file_object_information(file_id) {
+        return (status, 0);
+    }
+    let (status, written) = fs.zw_write_file(file_id, Some(resolved.value()), data);
+    let position = resolved
+        .completion_position(synchronous, data.len(), status, written)
+        .expect("regular file write reports bounded progress");
     assert_eq!(
         fs.complete_file_position(file_id, position),
         nt_fs::STATUS_SUCCESS
     );
+    account_write(file_id, Some(resolved.value()), data.len(), status, written);
+    (status, written)
 }
 
 /// `NtReadFile` on a writable-volume file object into caller-owned staging.
@@ -1473,6 +1501,17 @@ pub(crate) unsafe fn write(file_id: u64, byte_offset: Option<u64>, data: &[u8]) 
         Err(status) => return (status, 0),
     };
     let (status, written) = fs.zw_write_file(file_id, byte_offset, data);
+    account_write(file_id, byte_offset, data.len(), status, written);
+    (status, written)
+}
+
+fn account_write(
+    file_id: u64,
+    byte_offset: Option<u64>,
+    requested: usize,
+    status: u32,
+    written: usize,
+) {
     if status == nt_fs::STATUS_SUCCESS || written != 0 {
         OVERLAY_WRITES.fetch_add(1, Ordering::Relaxed);
         OVERLAY_BYTES_WRITTEN.fetch_add(written as u64, Ordering::Relaxed);
@@ -1481,9 +1520,8 @@ pub(crate) unsafe fn write(file_id: u64, byte_offset: Option<u64>, data: &[u8]) 
         }
     }
     if status != nt_fs::STATUS_SUCCESS {
-        trace_io_refusal(b"write", file_id, byte_offset, data.len(), status);
+        trace_io_refusal(b"write", file_id, byte_offset, requested, status);
     }
-    (status, written)
 }
 
 /// Append bytes to a writable-volume file through the same Zw facade hosted callers use.
@@ -1998,6 +2036,11 @@ pub(crate) unsafe fn is_final_reference(file_id: u64) -> Result<bool, u32> {
 
 pub(crate) unsafe fn retain_io_reference(file_id: u64) -> Result<(), u32> {
     writable_fs()?.zw_retain_io_reference(file_id)
+}
+
+/// Retain the operation reference and clear the file signal as one checked transition.
+pub(crate) unsafe fn begin_file_io(file_id: u64) -> Result<(), u32> {
+    writable_fs()?.zw_begin_file_io(file_id)
 }
 
 pub(crate) unsafe fn release_io_reference(file_id: u64) -> Result<(), u32> {
