@@ -3,10 +3,19 @@
 
 use super::*;
 use crate::FileIoWaitKey;
-use core::sync::atomic::{AtomicU64, Ordering};
 use nt_io_completion::FileIoMode;
 
-static NEXT_BUSY_IDENTITY: AtomicU64 = AtomicU64::new(1);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BusyIdentity {
+    table: u64,
+    generation: u64,
+}
+
+impl BusyIdentity {
+    const fn is_published(self) -> bool {
+        self.table != 0 && self.generation != 0
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileIoBusyOwner {
@@ -41,7 +50,7 @@ pub enum PendingFileBusyPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingFileBusy {
     owner: FileIoBusyOwner,
-    identity: u64,
+    identity: BusyIdentity,
     next_attempt: u64,
     phase: PendingFileBusyPhase,
 }
@@ -50,7 +59,10 @@ impl PendingFileBusy {
     pub const fn new(owner: FileIoBusyOwner) -> Self {
         Self {
             owner,
-            identity: 0,
+            identity: BusyIdentity {
+                table: 0,
+                generation: 0,
+            },
             next_attempt: 1,
             phase: PendingFileBusyPhase::ReleaseReady { last_error: None },
         }
@@ -77,7 +89,7 @@ impl PendingFileBusy {
     }
 
     pub(super) fn valid_unpublished_owner(self, pending: PendingFileIo) -> bool {
-        self.identity == 0
+        self.identity == BusyIdentity::default()
             && self.release_unstarted()
             && self.owner.tid != 0
             && self.owner.tid != u64::MAX
@@ -91,16 +103,11 @@ impl PendingFileBusy {
             && !matches!(pending.operation, PendingFileIoOperation::Create(_))
     }
 
-    pub(super) fn publish_identity(&mut self) -> bool {
-        let Ok(identity) =
-            NEXT_BUSY_IDENTITY.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-                next.checked_add(1)
-            })
-        else {
-            return false;
+    pub(super) fn publish_reserved_identity(&mut self, reservation: PendingFileIoReservation) {
+        self.identity = BusyIdentity {
+            table: reservation.table,
+            generation: reservation.generation,
         };
-        self.identity = identity;
-        true
     }
 }
 
@@ -122,7 +129,7 @@ pub enum PendingFileBusyError {
 struct BusyAttempt {
     slot: usize,
     irp_id: u64,
-    identity: u64,
+    identity: BusyIdentity,
     owner: FileIoBusyOwner,
     attempt: u64,
     consumed: bool,
@@ -174,7 +181,7 @@ impl PendingFileIoTable {
             .ok_or(PendingFileBusyError::WrongIdentity)?;
         let busy = pending.busy.ok_or(PendingFileBusyError::WrongIdentity)?;
         if pending.irp_id != attempt.irp_id
-            || busy.identity == 0
+            || !busy.identity.is_published()
             || busy.identity != attempt.identity
             || busy.owner != attempt.owner
         {
@@ -193,7 +200,7 @@ impl PendingFileIoTable {
     ) -> Result<PendingFileBusyReleaseAttempt, PendingFileBusyError> {
         let pending = self.get(slot).ok_or(PendingFileBusyError::WrongIdentity)?;
         let busy = pending.busy.ok_or(PendingFileBusyError::WrongIdentity)?;
-        if pending.irp_id != irp_id || busy.identity == 0 {
+        if pending.irp_id != irp_id || !busy.identity.is_published() {
             return Err(PendingFileBusyError::WrongIdentity);
         }
         if !busy.release_pending() {
@@ -278,7 +285,7 @@ impl PendingFileIoTable {
     ) -> Result<PendingFileBusyWakeAttempt, PendingFileBusyError> {
         let pending = self.get(slot).ok_or(PendingFileBusyError::WrongIdentity)?;
         let busy = pending.busy.ok_or(PendingFileBusyError::WrongIdentity)?;
-        if pending.irp_id != irp_id || busy.identity == 0 {
+        if pending.irp_id != irp_id || !busy.identity.is_published() {
             return Err(PendingFileBusyError::WrongIdentity);
         }
         let PendingFileBusyPhase::WakeReady { waiters, .. } = busy.phase else {

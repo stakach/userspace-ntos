@@ -16,6 +16,8 @@ mod synchronous_file_wait;
 pub(crate) mod synchronous_file_cancellation;
 #[path = "pending_file_busy.rs"]
 mod pending_file_busy;
+#[path = "file_dispatch_handoff.rs"]
+mod file_dispatch_handoff;
 pub(crate) use synchronous_file_wait::{
     synchronous_file_cancel_waiter, synchronous_file_release_and_wake,
 };
@@ -11203,11 +11205,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_io_completion_apc_out: u64 = 0;
             let mut park_io_completion_iosb_out: u64 = 0;
             let mut park_io_completion_deadline = nt_delay_execution::Deadline::Infinite;
-            let mut transfer_pending_file_io: Option<(
-                nt_io_manager::PendingFileIo,
-                bool,
-                nt_io_manager::PendingFileIoReservation,
-            )> = None;
+            let mut published_file_io: Option<file_dispatch_handoff::PublishedFileIo> = None;
             let mut transfer_pending_driver_start: Option<PendingDriverStartTransfer> = None;
             let mut transfer_pending_pnp_operation: Option<PendingPnpOperationTransfer> = None;
             let mut transfer_file_irp_drain: Option<(
@@ -11249,7 +11247,8 @@ pub(crate) unsafe fn service_sec_image(
             nt_handler.current_user_memory = SyscallUserMemory::CurrentProcess;
             nt_handler.current_server_client_pid =
                 nt_handler.hosted_thread_lpc_client_process(badge);
-            nt_handler.current_synchronous_file_lock = 0;
+            assert_eq!(nt_handler.current_synchronous_file_lock, 0,
+                "previous syscall retained acquired File Busy");
             assert!(nt_handler.active_synchronous_file_retry.is_none(),
                 "previous syscall retained an unconsumed File ingress claim");
             nt_handler.active_synchronous_file_retry = match (&mut *core::ptr::addr_of_mut!(
@@ -11356,7 +11355,8 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.pending_file_io_reservation.is_none(),
                     "previous syscall leaked a pending File owner reservation"
                 );
-                nt_handler.pending_file_io_transfer = None;
+                assert!(nt_handler.pending_file_io_transfer.is_none(),
+                    "previous syscall retained an accepted File transfer");
                 nt_handler.pending_file_io_wait = false;
                 assert!(
                     nt_handler.pending_driver_start_transfer.is_none(),
@@ -11536,6 +11536,9 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
+                published_file_io = file_dispatch_handoff::before_post_action(
+                    &mut nt_handler, post_action, resume_ip, sp, flags,
+                );
                 let post_action_process = match post_action {
                     ExecPostAction::TerminateProcess { process_index, .. } => Some(process_index),
                     _ => None,
@@ -11867,42 +11870,6 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.io_signal_event >= 0 {
                     let _ = wait_wake_dispatcher_set(&mut nt_handler);
                 }
-                if nt_handler.pending_file_io_transfer.is_some() {
-                    if nt_handler.current_synchronous_file_lock != 0 {
-                        let pending = nt_handler
-                            .pending_file_io_transfer
-                            .as_mut()
-                            .expect("pending File lock owner disappeared");
-                        let file_id = pending.route.hosted_file_id()
-                            .expect("hosted File Busy transfer has a local route");
-                        assert_eq!(file_id, nt_handler.current_synchronous_file_lock);
-                        pending.busy = Some(nt_io_manager::PendingFileBusy::new(
-                            nt_io_manager::FileIoBusyOwner {
-                                key: nt_io_manager::FileIoWaitKey::Hosted(file_id),
-                                tid: nt_handler.current_tid,
-                                mode: nt_handler.file_completion.io_mode(file_id)
-                                    .expect("pending File transfer lost its captured mode"),
-                            },
-                        ));
-                        nt_handler.current_synchronous_file_lock = 0;
-                    }
-                    let pending = nt_handler
-                        .pending_file_io_transfer
-                        .take()
-                        .expect("pending File transfer disappeared");
-                    let reservation = nt_handler
-                        .pending_file_io_reservation
-                        .take()
-                        .expect("pending File IRP has no pre-dispatch owner reservation");
-                    transfer_pending_file_io =
-                        Some((pending, nt_handler.pending_file_io_wait, reservation));
-                } else if let Some(reservation) = nt_handler.pending_file_io_reservation.take() {
-                    assert!(
-                        (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-                            .cancel_reservation(reservation),
-                        "unused pending File reservation became stale"
-                    );
-                }
                 if let Some(transfer) = nt_handler.pending_driver_start_transfer.take() {
                     transfer_pending_driver_start = Some(transfer);
                 }
@@ -11921,13 +11888,6 @@ pub(crate) unsafe fn service_sec_image(
                         ..nt_io_manager::PendingFileCleanupWait::default()
                     };
                     transfer_file_cleanup_wait = Some((pending, reservation));
-                }
-                if nt_handler.current_synchronous_file_lock != 0 {
-                    let file_id =
-                        core::mem::replace(&mut nt_handler.current_synchronous_file_lock, 0);
-                    let owner_tid = nt_handler.current_tid;
-                    let _ = synchronous_file_release_and_wake(&mut nt_handler, file_id, owner_tid);
-                    nt_handler.release_file_reference(file_id);
                 }
                 if nt_handler.system_time_change.take().is_some() {
                     publish_kuser_clocks();
@@ -17672,25 +17632,14 @@ pub(crate) unsafe fn service_sec_image(
                 m3 = nm3;
                 continue;
             }
-            // Transfer each general pending File IRP before the specialized endpoint waiters.
-            // Synchronous APIs/Files transfer the live reply cap and wait; asynchronous Files keep
-            // the caller's STATUS_PENDING reply and transfer only their terminal delivery owner.
-            if let Some((pending, wait_for_completion, reservation)) =
-                transfer_pending_file_io.take()
-            {
-                let pending_tid = pending.tid;
-                pending_file_io_transfer(
-                    pending,
-                    wait_for_completion,
-                    reservation,
-                    resume_ip,
-                    sp,
-                    flags,
-                );
-                if wait_for_completion {
-                    let _ = reconcile_user_apc_file_wait(&mut nt_handler, pending_tid);
+            // File ownership and reply attachment were committed before post-actions. Only
+            // scheduling remains here; completion may already have retired the published owner.
+            if let Some(published) = published_file_io.take() {
+                let wait_for_completion = published.wait_for_completion;
+                if published.still_waiting() {
+                    let _ = reconcile_user_apc_file_wait(&mut nt_handler, published.tid);
                 }
-                if wait_for_completion {
+                if published.still_waiting() {
                     trace_indefinite_wait_park(
                         &nt_handler,
                         badge,
@@ -17701,7 +17650,7 @@ pub(crate) unsafe fn service_sec_image(
                     mark_wait_parked!(pi, resume_ip);
                 }
                 // The manager may already hold the terminal result (for example a completion
-                // published during the post-dispatch pump before reply ownership moved here).
+                // published during the post-dispatch pump after early ownership publication).
                 let _ = pending_file_io_redrive_all(&mut nt_handler);
                 let _ = file_cleanup_redrive_all(&mut nt_handler);
                 if wait_for_completion {
@@ -24985,7 +24934,7 @@ unsafe fn pending_file_io_transfer(
     resume_ip: u64,
     sp: u64,
     flags: u64,
-) {
+) -> usize {
     fn commit_error_code(error: nt_io_manager::PendingFileIoParkError) -> u64 {
         match error {
             nt_io_manager::PendingFileIoParkError::StaleReservation => 1,
@@ -25000,48 +24949,49 @@ unsafe fn pending_file_io_transfer(
         reservation: nt_io_manager::PendingFileIoReservation,
         pending: nt_io_manager::PendingFileIo,
         synchronous: bool,
-    ) {
-        if let Err(error) = table.park_reserved(reservation, pending) {
-            print_str(b"[pending-file-owner] commit rejected error/file/irp/major/pi/tid/badge/sync/reply=");
-            print_u64(commit_error_code(error));
-            print_str(b"/");
-            print_pending_file_route(pending.route);
-            print_str(b"/");
-            print_u64(pending.irp_id);
-            print_str(b"/");
-            print_u64(pending.major as u64);
-            print_str(b"/");
-            print_u64(pending.pi as u64);
-            print_str(b"/");
-            print_u64(pending.tid);
-            print_str(b"/");
-            print_u64(pending.badge);
-            print_str(b"/");
-            print_u64(synchronous as u64);
-            print_str(b"/");
-            print_u64(pending.reply_required as u64);
-            print_str(b" output/iosb/apc/iocp/event=0x");
-            print_hex((pending.output_va >> 32) as u32);
-            print_hex(pending.output_va as u32);
-            print_str(b"/0x");
-            print_hex((pending.iosb_va >> 32) as u32);
-            print_hex(pending.iosb_va as u32);
-            print_str(b"/0x");
-            print_hex((pending.apc_routine >> 32) as u32);
-            print_hex(pending.apc_routine as u32);
-            print_str(b"/");
-            print_u64(pending.publish_iocp as u64);
-            print_str(b"/");
-            print_u64(pending.event_obj_idx);
-            print_str(b"\n");
-            panic!("pre-dispatch pending File reservation rejected its exact IRP");
-        }
+    ) -> usize {
+        let error = match table.park_reserved(reservation, pending) {
+            Ok(slot) => return slot,
+            Err(error) => error,
+        };
+        print_str(b"[pending-file-owner] commit rejected error/file/irp/major/pi/tid/badge/sync/reply=");
+        print_u64(commit_error_code(error));
+        print_str(b"/");
+        print_pending_file_route(pending.route);
+        print_str(b"/");
+        print_u64(pending.irp_id);
+        print_str(b"/");
+        print_u64(pending.major as u64);
+        print_str(b"/");
+        print_u64(pending.pi as u64);
+        print_str(b"/");
+        print_u64(pending.tid);
+        print_str(b"/");
+        print_u64(pending.badge);
+        print_str(b"/");
+        print_u64(synchronous as u64);
+        print_str(b"/");
+        print_u64(pending.reply_required as u64);
+        print_str(b" output/iosb/apc/iocp/event=0x");
+        print_hex((pending.output_va >> 32) as u32);
+        print_hex(pending.output_va as u32);
+        print_str(b"/0x");
+        print_hex((pending.iosb_va >> 32) as u32);
+        print_hex(pending.iosb_va as u32);
+        print_str(b"/0x");
+        print_hex((pending.apc_routine >> 32) as u32);
+        print_hex(pending.apc_routine as u32);
+        print_str(b"/");
+        print_u64(pending.publish_iocp as u64);
+        print_str(b"/");
+        print_u64(pending.event_obj_idx);
+        print_str(b"\n");
+        panic!("pre-dispatch pending File reservation rejected its exact IRP");
     }
 
     if !wait_for_completion {
         let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
-        commit_or_panic(table, reservation, pending, false);
-        return;
+        return commit_or_panic(table, reservation, pending, false);
     }
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     assert_ne!(
@@ -25056,9 +25006,10 @@ unsafe fn pending_file_io_transfer(
     pending.resume_sp = sp;
     pending.resume_flags = flags;
     let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
-    commit_or_panic(table, reservation, pending, true);
+    let slot = commit_or_panic(table, reservation, pending, true);
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    slot
 }
 
 unsafe fn file_irp_drain_transfer(

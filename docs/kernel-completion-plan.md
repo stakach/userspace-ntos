@@ -33007,10 +33007,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
       followups, and guard thread/process retirement while cancellation still owns work.
     - [ ] Convert published-waiter thread teardown, including live saved Replies, to retained
       cancellation. Delete the remaining remove-then-cancel teardown adapter after that cutover.
-    - [ ] Close the pre-existing acquired-Busy/pending-IRP post-action handoff: successful
+    - [x] Close the pre-existing acquired-Busy/pending-IRP post-action handoff: successful
       acquisition can precede a job-termination early exit before the normal service-tail
       transfer/retirement. Retain the accepted operation before that exit; do not treat it as a
       still-promoted grant or release Busy before its accepted I/O has finished.
+    - [ ] Replace the inline terminal Busy/reference retirement's existing fail-stop adapter with
+      retained effect receipts. Inline operations may already have ACKed their real IRP; do not
+      invent a pending IRP to represent this separate retirement obligation.
     - [ ] Retain parked APC staging, Reply and capability retirement independently before routing
       APC interruption through the cancellation contract. Remove the replaced adapters only when
       every producer transfers ownership through the retained path; no ignored-error fallback.
@@ -33058,8 +33061,56 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `.tmp/build-file-ingress-executive-verified-20260911.log`. All runners were serialized.
     Final independent review found no remaining issue in this scoped native cutover. No VM run
     or microkernel change occurred; the 27 strict missing win32k imports and genuine desktop
-    acceptance remain open. Next: accepted-Busy post-action handoff, published-waiter teardown,
-    and parked APC staging/Reply/capability settlement, removing each replaced adapter as it lands.
+    acceptance remain open. The accepted-Busy post-action handoff is addressed below;
+    published-waiter teardown and parked APC staging/Reply/capability settlement remain open.
+
+    Accepted File post-action handoff (2026-09-11, complete; runtime acceptance open):
+    - [x] Publish the exact reserved pending owner before service post-actions or job teardown.
+      Transfer acquired Busy/reference only after publication succeeds, and remove the late Copy
+      transfer local and reset-based ownership loss. Continuing synchronous calls attach their
+      real saved Reply in that same commit; asynchronous calls keep their normal pending reply.
+    - [x] Publish terminating callers without transferring their main Reply, then abandon only
+      the exact new operation before general teardown can refuse or reenter. Share source-specific
+      cancellation with thread teardown. CREATE retains its specialized unpublished-handle and
+      backend rollback; generic transfer abandonment never consumes it.
+    - [x] Publish native Waiting state before reentrant completion is possible. The late scheduling
+      tail checks the original slot/IRP/TID/badge and outstanding saved Reply before marking a
+      wait, so completion during post-actions cannot restore stale Waiting state.
+    - [x] Bind pending reservations to their table and generation. Reserve eventual Busy identity
+      before dispatch and remove park-time identity allocation; commit after backend acceptance
+      remains allocation-free. Reject foreign, stale, cancelled and exhausted claims before effects.
+    - [x] Retire already-terminal inline Busy/reference before post-action exits using the existing
+      adapter. Its independent failure-retention debt remains explicitly open above.
+    - [x] Finish serialized contract/focused/broad host tests and native release compilation.
+
+    Review: exact abandonment avoids touching unrelated live Replies while terminating a newly
+    accepted cap0 operation. The full park/gate macro cannot move before post-actions because it
+    may break to the gate; only non-reentrant Waiting publication moves early. Completion and
+    thread-teardown composition tests use real I/O Manager IRPs and File policy with controlled
+    backend/capability outcomes, not native IPC proof. No VM run or microkernel change occurred;
+    the last measured 27 strict missing win32k imports and genuine desktop acceptance remain open.
+
+    Validation: all 120 pending-I/O contract tests passed, including ten new exact-reservation and
+    abandonment tests. Five new integration tests cover fresh/promoted acquisition through actual
+    pending IRPs, cancellation completion, completion during teardown, saved-Reply settlement,
+    inline FIFO release without manufacturing an IRP, and specialized CREATE rollback. An
+    allocator-counted check verifies post-dispatch reserved commit performs no allocation. All
+    1,492 focused and 2,752 broad host/doc tests passed. The executive release build passed in
+    37.80s with the unchanged 294 warnings. Evidence:
+    `.tmp/test-file-post-action-contract-20260911.log`,
+    `.tmp/test-file-post-action-focused-20260911.log`,
+    `.tmp/test-file-post-action-full-20260911.log`, and
+    `.tmp/build-file-post-action-executive-20260911.log`. All runners were serialized; independent
+    native review found no remaining issue in this scoped handoff.
+
+    Next boundary review: published acquisition-waiter teardown must request retained cancellation
+    before thread/process retry-delivery guards can return early, then defer physical teardown
+    while cancellation or retry delivery remains. Add checked final-cap Reply deletion and record
+    its receipt before exact-slot Reply retyping; keep the pool slot owned until retyping succeeds.
+    Reuse the checked GUI waiter teardown precedent, not CNode_Revoke or the generic slot-recycle
+    helper. Expand the bounded cancellation driver for the two additional effect stages. APC
+    staging/Reply settlement and inline terminal Busy/reference failure retention remain separate
+    follow-ons; do not widen this completed handoff into a claim that those adapters are fixed.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

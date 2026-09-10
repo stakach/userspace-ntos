@@ -14115,35 +14115,68 @@ impl ExecNtHandler {
         status
     }
 
+    unsafe fn cancel_abandoned_file_transfer(&mut self, pending: nt_io_manager::PendingFileIo) {
+        match pending.operation {
+            nt_io_manager::PendingFileIoOperation::LocalByteLock(operation) => {
+                if let Some(wait_id) = nt_fs::ByteRangeWaitId::from_raw(operation.wait_id) {
+                    let _ = self.byte_range_locks.cancel_wait(wait_id);
+                }
+            }
+            nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
+                let _ = self.cancel_local_directory_notify(
+                    pending.route.local_file_object().expect("local notify lost its route"),
+                    operation.notify_id,
+                );
+            }
+            nt_io_manager::PendingFileIoOperation::LocalInline(_)
+            | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
+            | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => {}
+            _ => {
+                let _ = driver_launch::cancel_irp_if_pending(pending.irp_id);
+            }
+        }
+        if pending.reply_cap != 0 {
+            release_reply_pool_cap(pending.reply_cap);
+        }
+        thread_wait_state_clear_badge_ready(self, pending.badge);
+    }
+
+    unsafe fn abandon_file_create(&mut self, pending: nt_io_manager::PendingFileIo) {
+        let _ = driver_launch::abandon_pending_irp(pending.irp_id);
+        if pending.reply_cap != 0 {
+            release_reply_pool_cap(pending.reply_cap);
+        }
+        thread_wait_state_clear_badge_ready(self, pending.badge);
+        self.release_unpublished_hosted_create(pending);
+    }
+
+    /// Detach a just-published terminating caller before general teardown can refuse or reenter.
+    /// Its main Reply remains with the post-action, not with this exact pending operation.
+    pub(crate) unsafe fn abandon_new_file_io_exact(&mut self, slot: usize, irp_id: u64) {
+        let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
+        let pending = table.get(slot).expect("new File owner disappeared before abandonment");
+        assert_eq!(pending.irp_id, irp_id);
+        assert_eq!(pending.reply_cap, 0);
+        assert!(!pending.reply_required);
+        if matches!(pending.operation, nt_io_manager::PendingFileIoOperation::Create(_)) {
+            let pending = table.take_create_exact(slot, irp_id)
+                .expect("new CREATE refused its unpublished-handle rollback");
+            self.abandon_file_create(pending);
+        } else {
+            let pending = table.abandon_transfer_exact(slot, irp_id)
+                .expect("new File transfer refused consumer abandonment");
+            self.cancel_abandoned_file_transfer(pending);
+            self.publish_local_byte_lock_completions();
+            crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+        }
+    }
+
     unsafe fn abandon_pending_file_io_for_thread(&mut self, tid: u64) -> usize {
         let mut transfers = Vec::new();
         (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
             .abandon_thread_transfers_with(tid, |pending| transfers.push(pending));
         for pending in transfers.iter().copied() {
-            match pending.operation {
-                nt_io_manager::PendingFileIoOperation::LocalByteLock(operation) => {
-                    if let Some(wait_id) = nt_fs::ByteRangeWaitId::from_raw(operation.wait_id) {
-                        let _ = self.byte_range_locks.cancel_wait(wait_id);
-                    }
-                }
-                nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
-                    let _ =
-                        self.cancel_local_directory_notify(
-                            pending.route.local_file_object().expect("local notify lost its route"),
-                            operation.notify_id,
-                        );
-                }
-                nt_io_manager::PendingFileIoOperation::LocalInline(_)
-                | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
-                | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => {}
-                _ => {
-                    let _ = driver_launch::cancel_irp_if_pending(pending.irp_id);
-                }
-            }
-            if pending.reply_cap != 0 {
-                release_reply_pool_cap(pending.reply_cap);
-            }
-            thread_wait_state_clear_badge_ready(self, pending.badge);
+            self.cancel_abandoned_file_transfer(pending);
         }
         if !transfers.is_empty() {
             self.publish_local_byte_lock_completions();
@@ -14154,12 +14187,7 @@ impl ExecNtHandler {
         (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
             .take_thread_creates_with(tid, |pending| creates.push(pending));
         for pending in creates.iter().copied() {
-            let _ = driver_launch::abandon_pending_irp(pending.irp_id);
-            if pending.reply_cap != 0 {
-                release_reply_pool_cap(pending.reply_cap);
-            }
-            thread_wait_state_clear_badge_ready(self, pending.badge);
-            self.release_unpublished_hosted_create(pending);
+            self.abandon_file_create(pending);
         }
         transfers.len() + creates.len()
     }

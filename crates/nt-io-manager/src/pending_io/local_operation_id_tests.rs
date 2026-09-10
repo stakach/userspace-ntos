@@ -41,18 +41,22 @@ fn invalid_and_crossed_claims_cannot_derive_an_identity() {
     let second = table.reserve().unwrap();
     for invalid in [
         PendingFileIoReservation {
+            table: first.table,
             slot: usize::MAX,
             generation: first.generation,
         },
         PendingFileIoReservation {
+            table: first.table,
             slot: first.slot,
             generation: 0,
         },
         PendingFileIoReservation {
+            table: first.table,
             slot: first.slot,
             generation: second.generation,
         },
         PendingFileIoReservation {
+            table: first.table,
             slot: second.slot,
             generation: first.generation,
         },

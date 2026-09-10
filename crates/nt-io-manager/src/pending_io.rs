@@ -6,6 +6,9 @@
 //! memory, APC/event/File/IOCP surfaces, and an optional synchronous syscall reply.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TABLE_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 pub use local_flush::{LocalFlushMode, PendingLocalFlush};
 pub use route::{LocalFileObject, PendingFileRoute};
@@ -224,10 +227,11 @@ const DEFAULT_INITIAL_RESERVE: usize = 16;
 const LOCAL_OPERATION_ID_TAG: u64 = 0x8000_0000_0000_0000;
 const LOCAL_OPERATION_ID_GENERATION_MASK: u64 = 0x0fff_ffff_ffff_ffff;
 
-/// Generation-exact claim on one table slot. Dispatch code reserves before creating an IRP and
-/// commits that exact claim afterward, so re-entrant work cannot consume the promised owner slot.
+/// Table- and generation-exact claim on one slot, including its eventual Busy identity budget.
+/// Dispatch reserves before creating an IRP; commit requires no further identity allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingFileIoReservation {
+    table: u64,
     slot: usize,
     generation: u64,
 }
@@ -248,6 +252,7 @@ pub struct PendingFileIoTable {
     local_outputs: Vec<Option<Vec<u8>>>,
     next_reservation_generation: u64,
     initial_reserve: usize,
+    identity: u64,
 }
 
 impl Default for PendingFileIoTable {
@@ -279,6 +284,7 @@ impl PendingFileIoTable {
             local_outputs: Vec::new(),
             next_reservation_generation: 1,
             initial_reserve,
+            identity: 0,
         }
     }
 
@@ -459,9 +465,23 @@ impl PendingFileIoTable {
 
     /// Claim one exact owner slot before dispatching an IRP.
     pub fn reserve(&mut self) -> Option<PendingFileIoReservation> {
+        self.reserve_with_identity_source(&NEXT_TABLE_IDENTITY)
+    }
+
+    fn reserve_with_identity_source(
+        &mut self,
+        source: &AtomicU64,
+    ) -> Option<PendingFileIoReservation> {
         let generation = self.next_reservation_generation;
         if generation == 0 {
             return None;
+        }
+        if self.identity == 0 {
+            self.identity = source
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+                    (identity != 0).then(|| identity.checked_add(1)).flatten()
+                })
+                .ok()?;
         }
         let slot = self
             .slots
@@ -478,17 +498,30 @@ impl PendingFileIoTable {
             })?;
         self.next_reservation_generation = generation.checked_add(1).unwrap_or(0);
         self.reservations[slot] = generation;
-        Some(PendingFileIoReservation { slot, generation })
+        Some(PendingFileIoReservation {
+            table: self.identity,
+            slot,
+            generation,
+        })
+    }
+
+    fn reservation_matches(&self, reservation: PendingFileIoReservation) -> bool {
+        reservation.table != 0
+            && reservation.table == self.identity
+            && reservation.generation != 0
+            && self.reservations.get(reservation.slot).copied() == Some(reservation.generation)
+            && self
+                .slots
+                .get(reservation.slot)
+                .is_some_and(Option::is_none)
     }
 
     /// Derive a local correlation from an exact, still-unoccupied owner reservation.
     /// Repeated observation is stable; cancelling or committing the claim invalidates it. Local
     /// IDs exhaust at 60 bits rather than truncate a generation and alias an earlier operation.
     pub fn local_operation_id(&self, reservation: PendingFileIoReservation) -> Option<u64> {
-        if reservation.generation == 0
+        if !self.reservation_matches(reservation)
             || reservation.generation > LOCAL_OPERATION_ID_GENERATION_MASK
-            || self.reservations.get(reservation.slot).copied() != Some(reservation.generation)
-            || !self.slots.get(reservation.slot).is_some_and(Option::is_none)
         {
             return None;
         }
@@ -496,13 +529,10 @@ impl PendingFileIoTable {
     }
 
     pub fn cancel_reservation(&mut self, reservation: PendingFileIoReservation) -> bool {
-        let Some(generation) = self.reservations.get_mut(reservation.slot) else {
-            return false;
-        };
-        if *generation != reservation.generation || self.slots[reservation.slot].is_some() {
+        if !self.reservation_matches(reservation) {
             return false;
         }
-        *generation = 0;
+        self.reservations[reservation.slot] = 0;
         self.local_outputs[reservation.slot] = None;
         true
     }
@@ -513,7 +543,11 @@ impl PendingFileIoTable {
         reservation: PendingFileIoReservation,
         mut pending: PendingFileIo,
     ) -> Result<usize, PendingFileIoParkError> {
-        if self.reservations.get(reservation.slot).copied() != Some(reservation.generation) {
+        if reservation.table == 0
+            || reservation.table != self.identity
+            || reservation.generation == 0
+            || self.reservations.get(reservation.slot).copied() != Some(reservation.generation)
+        {
             return Err(PendingFileIoParkError::StaleReservation);
         }
         if self
@@ -534,15 +568,11 @@ impl PendingFileIoTable {
         {
             return Err(PendingFileIoParkError::InvalidRecord);
         }
-        if let Some(busy) = pending.busy.as_mut() {
-            if !busy.publish_identity() {
-                return Err(PendingFileIoParkError::InvalidRecord);
-            }
-        }
         match pending.operation {
             PendingFileIoOperation::LocalBuffered(operation) => {
                 if self.local_operation_id(reservation) != Some(pending.irp_id)
-                    || !self.local_outputs[reservation.slot].as_ref()
+                    || !self.local_outputs[reservation.slot]
+                        .as_ref()
                         .is_some_and(|output| output.len() == pending.output_len as usize)
                 {
                     return Err(PendingFileIoParkError::InvalidRecord);
@@ -552,12 +582,18 @@ impl PendingFileIoTable {
                 } else {
                     0
                 };
-                self.local_outputs[reservation.slot].as_mut().unwrap().truncate(initialized);
+                self.local_outputs[reservation.slot]
+                    .as_mut()
+                    .unwrap()
+                    .truncate(initialized);
             }
             _ if self.local_outputs[reservation.slot].is_some() => {
                 return Err(PendingFileIoParkError::InvalidRecord);
             }
             _ => {}
+        }
+        if let Some(busy) = pending.busy.as_mut() {
+            busy.publish_reserved_identity(reservation);
         }
         self.slots[reservation.slot] = Some(pending);
         self.reservations[reservation.slot] = 0;
@@ -1210,6 +1246,43 @@ impl PendingFileIoTable {
         Some(pending.delivery_state)
     }
 
+    fn abandon_transfer(pending: &mut PendingFileIo) -> Option<PendingFileIo> {
+        if pending.consumer_abandoned
+            || pending.reply_claim_in_flight()
+            || matches!(pending.operation, PendingFileIoOperation::Create(_))
+        {
+            return None;
+        }
+        let original = *pending;
+        pending.consumer_abandoned = true;
+        pending.user_apc_interrupt_requested = false;
+        pending.output_va = 0;
+        pending.output_len = 0;
+        pending.output_offset = 0;
+        pending.iosb_va = 0;
+        pending.apc_routine = 0;
+        pending.apc_context = 0;
+        pending.signal_file = false;
+        pending.publish_iocp = false;
+        pending.event_obj_idx = u64::MAX;
+        pending.reply_cap = 0;
+        pending.reply_required = false;
+        pending.resume_ip = 0;
+        pending.resume_sp = 0;
+        pending.resume_flags = 0;
+        Some(original)
+    }
+
+    /// Detach only this accepted transfer's consumer. The returned snapshot transfers any held
+    /// reply obligation to teardown; the row retains the IRP, Busy receipts, and File reference.
+    pub fn abandon_transfer_exact(&mut self, slot: usize, irp_id: u64) -> Option<PendingFileIo> {
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        if pending.irp_id != irp_id {
+            return None;
+        }
+        Self::abandon_transfer(pending)
+    }
+
     /// Detach the dead thread's user-visible surfaces without retiring the exact IRP owner. The
     /// caller releases any transferred reply cap and requests cancellation; terminal redrive still
     /// owns backend ACK, Busy release, and the retained File reference.
@@ -1220,34 +1293,29 @@ impl PendingFileIoTable {
     {
         let mut count = 0;
         for pending in self.slots.iter_mut().flatten() {
-            if pending.tid != tid
-                || pending.consumer_abandoned
-                || pending.reply_claim_in_flight()
-                || matches!(pending.operation, PendingFileIoOperation::Create(_))
-            {
+            if pending.tid != tid {
                 continue;
             }
-            let original = *pending;
-            pending.consumer_abandoned = true;
-            pending.user_apc_interrupt_requested = false;
-            pending.output_va = 0;
-            pending.output_len = 0;
-            pending.output_offset = 0;
-            pending.iosb_va = 0;
-            pending.apc_routine = 0;
-            pending.apc_context = 0;
-            pending.signal_file = false;
-            pending.publish_iocp = false;
-            pending.event_obj_idx = u64::MAX;
-            pending.reply_cap = 0;
-            pending.reply_required = false;
-            pending.resume_ip = 0;
-            pending.resume_sp = 0;
-            pending.resume_flags = 0;
-            abandon(original);
-            count += 1;
+            if let Some(original) = Self::abandon_transfer(pending) {
+                abandon(original);
+                count += 1;
+            }
         }
         count
+    }
+
+    /// CREATE retains its reserved-handle rollback protocol and cannot use transfer abandonment.
+    pub fn take_create_exact(&mut self, slot: usize, irp_id: u64) -> Option<PendingFileIo> {
+        let pending = self.slots.get(slot)?.as_ref()?;
+        if pending.irp_id != irp_id
+            || pending.reply_claim_in_flight()
+            || pending.busy.is_some()
+            || !matches!(pending.operation, PendingFileIoOperation::Create(_))
+        {
+            return None;
+        }
+        self.local_outputs[slot] = None;
+        self.slots[slot].take()
     }
 
     pub fn take_thread_creates_with<F>(&mut self, tid: u64, mut take: F) -> usize
@@ -1255,15 +1323,12 @@ impl PendingFileIoTable {
         F: FnMut(PendingFileIo),
     {
         let mut count = 0;
-        for (index, slot) in self.slots.iter_mut().enumerate() {
-            if slot.is_some_and(|pending| {
-                pending.tid == tid
-                    && !pending.reply_claim_in_flight()
-                    && matches!(pending.operation, PendingFileIoOperation::Create(_))
-            }) {
-                self.local_outputs[index] = None;
-                take(slot.take().unwrap());
-                count += 1;
+        for index in 0..self.slots.len() {
+            if let Some(pending) = self.slots[index].filter(|pending| pending.tid == tid) {
+                if let Some(pending) = self.take_create_exact(index, pending.irp_id) {
+                    take(pending);
+                    count += 1;
+                }
             }
         }
         count
@@ -1313,6 +1378,14 @@ mod local_operation_id_tests;
 #[cfg(test)]
 #[path = "pending_io/iosb_fault_tests.rs"]
 mod iosb_fault_tests;
+
+#[cfg(test)]
+#[path = "pending_io/reservation_tests.rs"]
+mod reservation_tests;
+
+#[cfg(test)]
+#[path = "pending_io/abandonment_tests.rs"]
+mod abandonment_tests;
 
 #[cfg(test)]
 fn test_busy(file_id: u64, tid: u64) -> PendingFileBusy {
