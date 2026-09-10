@@ -54,6 +54,48 @@ impl ExecNtHandler {
         Ok(request_id)
     }
 
+    pub(super) unsafe fn read_retained_fat_file(
+        &mut self,
+        object_id: u32,
+        first_cluster: u32,
+        file_size: u32,
+        synchronous: bool,
+        plan: nt_io_manager::BoundedFileReadPlan,
+    ) -> (u32, usize) {
+        let read = if plan.transfer_len() == 0 {
+            0
+        } else {
+            let Some(fs) = exec_fs() else {
+                return (STATUS_DEVICE_NOT_READY, 0);
+            };
+            let output = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .reserved_local_output_mut(
+                    self.pending_file_io_reservation
+                        .expect("FAT read lost its output reservation"),
+                )
+                .expect("FAT read lost its reserved output");
+            assert_eq!(output.len(), plan.transfer_len());
+            // FAT reads poll the device and copy its DMA buffer without pumping other requests.
+            fat_read_file_range(
+                &fs,
+                first_cluster,
+                file_size,
+                u32::try_from(plan.offset()).expect("nonempty FAT extent exceeds ULONG"),
+                output,
+            )
+        };
+        let completed = plan
+            .complete(synchronous, read)
+            .expect("FAT reader exceeded its admitted extent");
+        if let Some(position) = completed.position {
+            self.readonly_file_opens
+                .get_mut(object_id)
+                .expect("retained FAT File disappeared during read")
+                .current_offset = position;
+        }
+        (completed.status, completed.information)
+    }
+
     fn set_local_file_object_signaled(
         &mut self,
         file_object: u64,

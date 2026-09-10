@@ -11803,52 +11803,6 @@ impl ExecNtHandler {
         }
     }
 
-    unsafe fn readonly_disk_read_to_user(
-        &mut self,
-        first_cluster: u32,
-        file_size: u32,
-        offset: u32,
-        buffer: u64,
-        len: usize,
-    ) -> Result<usize, u32> {
-        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
-        const STATUS_IO_DEVICE_ERROR: u32 = 0xC000_0185;
-        const READ_SCRATCH_CAP: usize = 64 * 1024;
-
-        let Some(fs) = exec_fs() else {
-            return Err(STATUS_DEVICE_NOT_READY);
-        };
-        let total = len.min(file_size.saturating_sub(offset) as usize);
-        let scratch = core::slice::from_raw_parts_mut(
-            core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
-            READ_SCRATCH_CAP,
-        );
-        let mut copied = 0usize;
-        while copied < total {
-            let chunk = (total - copied).min(scratch.len());
-            let file_offset = offset + copied as u32;
-            let read = fat_read_file_range(
-                &fs,
-                first_cluster,
-                file_size,
-                file_offset,
-                &mut scratch[..chunk],
-            );
-            if read != chunk {
-                return Err(STATUS_IO_DEVICE_ERROR);
-            }
-            let Some(dst) = buffer.checked_add(copied as u64) else {
-                return Err(STATUS_ACCESS_VIOLATION);
-            };
-            if read != 0 && !self.xas_try_write_buf(dst, &scratch[..read]) {
-                return Err(STATUS_ACCESS_VIOLATION);
-            }
-            copied += read;
-        }
-        Ok(copied)
-    }
-
     /// Mint a process-local handle for a file or directory on the WRITABLE overlay volume.
     /// `file_id` is that volume's own file-object id (see `writable_fs`).
     pub(crate) fn mint_overlay_file_handle(&mut self, file_id: u64, access: u32) -> Option<u64> {
@@ -43465,8 +43419,8 @@ impl ExecNtHandler {
                     self.npfs_read_file_route_for(fh).ok().is_some_and(|route| {
                         apc_routine != 0 && self.file_completion.binding(route.file_id).is_some()
                     });
-                // FAT reads still copy in chunks. Overlay reads reserve retained output before
-                // transfer; hosted drivers fill their destination through the banked transport.
+                // Local reads reserve retained output before transfer; hosted drivers fill their
+                // destination through the banked transport.
                 let overlay_file = self.overlay_file_id_for(fh);
                 let overlay_read_access = overlay_file.is_none()
                     || self.hosted_file_access_for(fh).is_some_and(|access| {
@@ -43549,13 +43503,21 @@ impl ExecNtHandler {
                                         let offset = resolved.value();
                                         match self.local_file_io_route_for(fh) {
                                             Ok(Some(route)) => {
-                                                match self.begin_retained_local_file_io(route.file_object) {
+                                                let plan = match nt_io_manager::BoundedFileReadPlan::new(
+                                                    resolved, u64::from(file_size), len,
+                                                ) {
+                                                    Ok(plan) => plan,
+                                                    Err(status) => return status.raw() as u32,
+                                                };
+                                                let output_len = plan.transfer_len();
+                                                match self.begin_retained_local_buffered_io(route.file_object, output_len) {
                                                     Err(status) => status,
                                                     Ok(request_id) => {
                                                         local_file_io = Some((
                                                             request_id,
                                                             route.file_object,
                                                             route.synchronous,
+                                                            output_len as u32,
                                                         ));
                                                         let lock_status =
                                                             self.byte_range_locks.check_read(
@@ -43572,39 +43534,13 @@ impl ExecNtHandler {
                                                             );
                                                         if lock_status != nt_fs::STATUS_SUCCESS {
                                                             lock_status
-                                                        } else if len == 0 {
-                                                            nt_fs::STATUS_SUCCESS
-                                                        } else if offset >= file_size as u64 {
-                                                            if synchronous {
-                                                                self.readonly_file_opens.get_mut(object_id)
-                                                                    .expect("retained FAT File disappeared at EOF")
-                                                                    .current_offset = offset;
-                                                            }
-                                                            0xC000_0011 // STATUS_END_OF_FILE
                                                         } else {
-                                                            match self.readonly_disk_read_to_user(
-                                                                first_cluster,
-                                                                file_size,
-                                                                offset as u32,
-                                                                buffer,
-                                                                len,
-                                                            ) {
-                                                                Ok(read) => {
-                                                                    information = read as u64;
-                                                                    let position = resolved.completion_position(
-                                                                        synchronous, len, nt_fs::STATUS_SUCCESS, read,
-                                                                    ).expect("FAT transfer fits its file extent");
-                                                                    if let Some(position) = position
-                                                                    {
-                                                                        self.readonly_file_opens
-                                                                            .get_mut(object_id)
-                                                                            .expect("retained FAT File disappeared during read")
-                                                                            .current_offset = position;
-                                                                    }
-                                                                    nt_fs::STATUS_SUCCESS
-                                                                }
-                                                                Err(status) => status,
-                                                            }
+                                                            let (status, read) = self.read_retained_fat_file(
+                                                                object_id, first_cluster, file_size,
+                                                                synchronous, plan,
+                                                            );
+                                                            information = read as u64;
+                                                            status
                                                         }
                                                     }
                                                 }
@@ -43637,6 +43573,7 @@ impl ExecNtHandler {
                                                             request_id,
                                                             route.file_object,
                                                             route.synchronous,
+                                                            len as u32,
                                                         ));
                                                         let lock_status =
                                                             self.byte_range_locks.check_read(
@@ -43862,21 +43799,13 @@ impl ExecNtHandler {
                 if file_retained && status != STATUS_PENDING {
                     self.release_file_reference(completion_file_id);
                 }
-                if let Some((request_id, file_object, synchronous)) = local_file_io.take() {
+                if let Some((request_id, file_object, synchronous, output_len)) = local_file_io.take() {
                     assert_ne!(status, STATUS_PENDING, "local read unexpectedly pended");
-                    if overlay_file.is_some() {
-                        self.stage_terminal_local_buffered_io(
-                            request_id, nt_io_abi::major::IRP_MJ_READ, file_object,
-                            synchronous, event_obj_idx, apc_routine, apc_context, iosb,
-                            status, information, completion_port_suppressed, buffer, len as u32,
-                        );
-                    } else {
-                        self.stage_terminal_local_file_io(
-                            request_id, nt_io_abi::major::IRP_MJ_READ, file_object,
-                            synchronous, event_obj_idx, self.current_tid, apc_routine,
-                            apc_context, iosb, status, information, completion_port_suppressed,
-                        );
-                    }
+                    self.stage_terminal_local_buffered_io(
+                        request_id, nt_io_abi::major::IRP_MJ_READ, file_object,
+                        synchronous, event_obj_idx, apc_routine, apc_context, iosb,
+                        status, information, completion_port_suppressed, buffer, output_len,
+                    );
                 }
                 if routed
                     && status != STATUS_PENDING

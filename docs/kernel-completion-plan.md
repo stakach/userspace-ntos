@@ -32564,6 +32564,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     exclusion, exact CM storage binding and the 27 strict win32k imports remain open. No fresh
     desktop/VM acceptance is claimed by this checkpoint.
 
+    Retained FAT read checkpoint (2026-09-10): move ordinary read-only FAT reads
+    onto the same buffered delivery owner as overlay reads and directory queries.
+    - [x] Add a host-tested bounded source-read plan: reserve only the transferable file extent,
+      distinguish zero-length success from EOF, validate the source byte count, and preserve the
+      existing short-source IO_DEVICE_ERROR/zero-Information/no-position-change contract.
+    - [x] Read FAT directly into the pre-reserved buffer and commit accepted synchronous position
+      before user-memory delivery. Retain large-read support and full-width EOF offsets; remove
+      readonly_disk_read_to_user and its shared-scratch/user-copy loop.
+    - [x] Compose the real ReadOnlyFileOpenTable and pending output owner in tests covering late
+      typed retry/fault, handle closure, source failure, EOF and reads larger than 64 KiB. Run host
+      and native validation serially, then review the remaining flush/completion-policy boundary.
+
+    Host validation: the nine new bounded source-contract tests passed first; 929 focused and
+    2,604 broad tests/doctests then passed, none ignored. Four new composition tests use the real
+    ReadOnlyFileOpenTable and retained output owner with explicit source/memory fixtures. They
+    cover a 96 KiB accepted read surviving handle closure and copy refusal without rereading a
+    changed source, extent-truncated requests, sync/async positions, permanent guard/access faults,
+    zero/EOF without a disk call, and short source data that must not become partial success.
+    Evidence: .tmp/test-fat-buffered-read-contract-20260910.log,
+    .tmp/test-fat-buffered-read-focused-20260910.log and
+    .tmp/test-fat-buffered-read-full-20260910.log. The native executive release build passed in
+    38.09s with 294 unchanged warnings (.tmp/build-fat-buffered-read-executive-20260910.log).
+    Root serialized every runner. Independent source/native review found no new blocking issue.
+
+    Review adjustment: FAT source reads are allocation-free AHCI polling and DMA-buffer copies;
+    they do not pump provider requests or access user memory, so the scoped reserved-buffer borrow
+    does not cross reentrant work. All local ordinary reads now use LocalBuffered, with accepted
+    position independent of copy delivery. Keep the shared scratch for its unrelated write/name
+    callers; only the replaced FAT read loop is removed. The existing ResolvedFileOffset EOF
+    position policy is preserved, not claimed identical to FastFAT's early high-offset branch.
+    Pure u64::MAX plan tests are not native admission proof: the existing requested-length byte-lock
+    range check can reject overflow before EOF handling. Next implement explicit local flush
+    synchronous-API completion policy and retain completed writeback through delivery retries,
+    including the final IOSB-copy exception status for asynchronous File opens. Local synchronous
+    Busy ownership, completion-port association, ordinary close/unpublished rollback, filesystem
+    exclusion, exact CM binding and strict provider imports remain open. No boot or screenshot
+    acceptance is claimed here.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

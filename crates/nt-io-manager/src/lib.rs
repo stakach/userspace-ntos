@@ -18,6 +18,7 @@ use nt_status::NtStatus;
 use nt_types::{ClientId, NtPath, ObjectId};
 
 mod banked_transfer;
+mod bounded_file_read;
 mod cancel;
 mod cancel_wait;
 mod cleanup_wait;
@@ -62,6 +63,7 @@ mod volume_information;
 mod wdm_x64;
 
 pub use banked_transfer::{BankedTransferCursor, BankedTransferError};
+pub use bounded_file_read::{BoundedFileReadCompletion, BoundedFileReadPlan};
 pub use cancel::FileThreadIrpDrainState;
 pub use cancel_wait::{
     PendingFileIrpDrain, PendingFileIrpDrainReservation, PendingFileIrpDrainTable,
