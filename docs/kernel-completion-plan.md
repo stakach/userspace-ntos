@@ -32707,6 +32707,52 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     mutable position/cursor state after acquisition. Settle required completion surfaces before
     releasing Busy and replying, while retaining the independent I/O reference through ACK.
 
+    Shared File Busy prerequisite (2026-09-10, complete): extract the existing hosted lock
+    transitions into reusable core logic before activating any local backend admissions.
+    - [x] Move owner/grant/waiter/cleanup ordering into FileIoSerialization and delegate the
+      existing FileCompletionTable API to it; remove the superseded per-entry lock machinery.
+    - [x] Reject zero/reserved ordinary owners and prevent a new arrival from bypassing queued
+      waiters between release and promotion. Cover failed transitions without state loss.
+    - [x] Compose the core with real local File references and state; run host/native validation
+      serially and update the whole-backend cutover requirements from source review.
+
+    Review refinement: queued local operations must retain without resetting the active File's
+    event. Promotion adopts that exact reference and performs reset-only, not begin/retain again.
+    Captured local route/access must take precedence over process-handle lookup after final close.
+    The native waiter route, wake/cancel/teardown/release and final-handle cleanup remain hosted-only
+    today; this prerequisite does not activate local Busy or claim that local cleanup is ordered.
+
+    Implementation evidence: FileCompletionTable embeds the allocation-free serialization state
+    and delegates acquire/release, grant promotion/consumption/cancellation and cleanup ordering.
+    File mode, references, cleanup lifecycle, event state and completion bindings remain in their
+    existing owners; the old per-entry Busy/grant/waiter fields and transition bodies are removed.
+    Nine new contract tests cover reentry, exact grant adoption, overflow, invalid/stale transitions,
+    cleanup ordering and the hosted adapter. Four local composition tests use real nt-fs references
+    and position effects, explicitly separating reference survival after close from deferred cleanup.
+    Two additional tests combine FileCompletionTable with the actual FIFO/retry table: new arrivals
+    cannot overtake older waiters, retry ACK/retirement preserves the grant, and indeterminate Reply
+    retains Busy/cleanup exclusion while an unrelated File can continue. Reply outcomes are supplied
+    by a host fixture, not native IPC. Anti-barging enforces this kernel's existing FIFO contract;
+    it is not a claim that NT5's interlocked Busy implementation guarantees strict FIFO fairness.
+
+    Validation: all 42 nt-io-completion unit tests passed, including the nine new contracts; the
+    five-crate focused suite passed 1,381 tests, and the twelve-crate cross-subsystem suite passed
+    2,641 tests, all zero failures/ignored. The native executive release build passed in 36.19s
+    with the unchanged 294-warning baseline. Logs: `.tmp/test-file-serialization-contract-20260910.log`,
+    `.tmp/test-file-serialization-focused-20260910.log`, `.tmp/test-file-serialization-full-20260910.log`,
+    and `.tmp/build-file-serialization-executive-20260910.log`. All runners were serialized. No VM
+    run or microkernel change occurred; the 27 strict missing win32k imports and desktop acceptance
+    remain open.
+
+    Next cutover prerequisites remain explicit: attach serialization to the canonical local File
+    owner; represent hosted versus local captured waiter routes without sentinel driver IDs; provide
+    checked retain-only, grant adoption/reset-only and release operations for IO-only objects; and
+    transfer the final handle reference into deferred cleanup behind acquired/queued operations.
+    Then route local admission, promotion, APC cancellation, teardown, completion unlock and cleanup
+    by that same typed ownership. Enabling one local syscall before those paths agree is not an
+    accepted intermediate runtime state. LocalInline/Buffered/Flush currently reject Busy owners;
+    their shape/retirement contracts must change with that complete native lifecycle cutover.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

@@ -6,6 +6,9 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+mod file_io_serialization;
+pub use file_io_serialization::FileIoSerialization;
+
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_TIMEOUT: u32 = 0x0000_0102;
 pub const STATUS_PENDING: u32 = 0x0000_0103;
@@ -130,20 +133,12 @@ struct FileCompletionEntry {
     handle_references: u32,
     handle_publication_reserved: bool,
     io_mode: FileIoMode,
-    /// Thread owning the synchronous FILE_OBJECT Busy lock, or zero while unlocked.
-    lock_owner_tid: u64,
-    /// A promoted waiter owns Busy before it runs again. Its first acquisition consumes this grant;
-    /// a genuinely re-entrant I/O from the same thread still contends like NT's Busy exchange.
-    lock_grant_tid: u64,
-    lock_waiters: u32,
+    serialization: FileIoSerialization,
     signaled: bool,
     cleanup_sent: bool,
     /// The final handle reference has become the close procedure's cleanup
     /// reference and must be released only after CLEANUP has drained.
     cleanup_reference_held: bool,
-    /// A synchronous cleanup owner is ordered after every already-referenced
-    /// ordinary waiter without masquerading as a user thread.
-    cleanup_waiting: bool,
     cleanup_lifecycle_started: bool,
     notification_modes: u32,
     binding: Option<FileCompletionBinding>,
@@ -157,8 +152,6 @@ pub struct FileCompletionTable<const FILES: usize> {
 }
 
 impl<const FILES: usize> FileCompletionTable<FILES> {
-    const CLEANUP_LOCK_OWNER: u64 = u64::MAX;
-
     pub const fn new() -> Self {
         assert!(FILES > 0);
         Self {
@@ -169,13 +162,10 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
                 handle_references: 0,
                 handle_publication_reserved: false,
                 io_mode: FileIoMode::Asynchronous,
-                lock_owner_tid: 0,
-                lock_grant_tid: 0,
-                lock_waiters: 0,
+                serialization: FileIoSerialization::new(),
                 signaled: false,
                 cleanup_sent: false,
                 cleanup_reference_held: false,
-                cleanup_waiting: false,
                 cleanup_lifecycle_started: false,
                 notification_modes: 0,
                 binding: None,
@@ -245,13 +235,10 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             handle_references: 1,
             handle_publication_reserved: false,
             io_mode,
-            lock_owner_tid: 0,
-            lock_grant_tid: 0,
-            lock_waiters: 0,
+            serialization: FileIoSerialization::new(),
             signaled: true,
             cleanup_sent: false,
             cleanup_reference_held: false,
-            cleanup_waiting: false,
             cleanup_lifecycle_started: false,
             notification_modes: 0,
             binding: None,
@@ -303,13 +290,10 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             handle_references: 0,
             handle_publication_reserved: true,
             io_mode,
-            lock_owner_tid: 0,
-            lock_grant_tid: 0,
-            lock_waiters: 0,
+            serialization: FileIoSerialization::new(),
             signaled: true,
             cleanup_sent: false,
             cleanup_reference_held: false,
-            cleanup_waiting: false,
             cleanup_lifecycle_started: false,
             notification_modes: 0,
             binding: None,
@@ -407,8 +391,8 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
         if !entry.cleanup_reference_held
             || entry.handle_references != 0
-            || entry.cleanup_waiting
-            || entry.lock_owner_tid == Self::CLEANUP_LOCK_OWNER
+            || entry.serialization.cleanup_waiting()
+            || entry.serialization.is_cleanup_owner()
             || !entry.cleanup_lifecycle_started
         {
             return Err(STATUS_INVALID_PARAMETER);
@@ -476,36 +460,11 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
     /// Acquire the synchronous FILE_OBJECT Busy lock. Contention records one executive-owned
     /// waiter; the caller must either enqueue that waiter or immediately call `cancel_io_waiter`.
     pub fn begin_io(&mut self, file_id: u64, tid: u64) -> Result<FileIoAcquireResult, u32> {
-        if tid == 0 {
+        if tid == 0 || tid == u64::MAX {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if !entry.io_mode.is_synchronous() {
-            if entry.cleanup_reference_held {
-                return Err(STATUS_INVALID_HANDLE);
-            }
-            return Ok(FileIoAcquireResult::Bypassed);
-        }
-        if entry.cleanup_reference_held
-            && !(entry.lock_owner_tid == tid && entry.lock_grant_tid == tid)
-        {
-            return Err(STATUS_INVALID_HANDLE);
-        }
-        if entry.lock_owner_tid == 0 {
-            entry.lock_owner_tid = tid;
-            return Ok(FileIoAcquireResult::Acquired);
-        }
-        if entry.lock_owner_tid == tid && entry.lock_grant_tid == tid {
-            entry.lock_grant_tid = 0;
-            return Ok(FileIoAcquireResult::Acquired);
-        }
-        entry.lock_waiters = entry
-            .lock_waiters
-            .checked_add(1)
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        Ok(FileIoAcquireResult::Contended {
-            alertable: entry.io_mode.is_alertable(),
-        })
+        entry.serialization.begin_io(entry.io_mode, tid, entry.cleanup_reference_held)
     }
 
     /// Acquire Busy for the internal, non-alertable CLEANUP owner. A contended
@@ -515,66 +474,31 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
         if !entry.cleanup_reference_held
             || entry.handle_references != 0
-            || entry.cleanup_waiting
-            || entry.lock_owner_tid == Self::CLEANUP_LOCK_OWNER
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        if !entry.io_mode.is_synchronous() {
-            return Ok(FileIoAcquireResult::Bypassed);
-        }
-        if entry.lock_owner_tid == 0 && entry.lock_waiters == 0 {
-            entry.lock_owner_tid = Self::CLEANUP_LOCK_OWNER;
-            return Ok(FileIoAcquireResult::Acquired);
-        }
-        entry.cleanup_waiting = true;
-        Ok(FileIoAcquireResult::Contended { alertable: false })
+        entry.serialization.begin_cleanup(entry.io_mode)
     }
 
     /// Undo a contention count when the executive could not publish or no longer needs a waiter.
     pub fn cancel_io_waiter(&mut self, file_id: u64) -> Result<u32, u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if entry.lock_waiters == 0 {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        entry.lock_waiters -= 1;
-        Ok(entry.lock_waiters)
+        entry.serialization.cancel_io_waiter()
     }
 
     /// Transfer an unlocked synchronous File to one exact FIFO waiter before waking it. The grant
     /// prevents a racing new caller from stealing Busy before the promoted syscall runs again.
     pub fn promote_io_waiter(&mut self, file_id: u64, tid: u64) -> Result<u32, u32> {
-        if tid == 0 {
+        if tid == 0 || tid == u64::MAX {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if !entry.io_mode.is_synchronous()
-            || entry.lock_owner_tid != 0
-            || entry.lock_grant_tid != 0
-            || entry.lock_waiters == 0
-        {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        entry.lock_waiters -= 1;
-        entry.lock_owner_tid = tid;
-        entry.lock_grant_tid = tid;
-        Ok(entry.lock_waiters)
+        entry.serialization.promote_io_waiter(entry.io_mode, tid)
     }
 
     pub fn promote_cleanup_if_ready(&mut self, file_id: u64) -> Result<bool, u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if !entry.cleanup_waiting {
-            return Ok(false);
-        }
-        if !entry.cleanup_reference_held || !entry.io_mode.is_synchronous() {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        if entry.lock_owner_tid != 0 || entry.lock_grant_tid != 0 || entry.lock_waiters != 0 {
-            return Ok(false);
-        }
-        entry.cleanup_waiting = false;
-        entry.lock_owner_tid = Self::CLEANUP_LOCK_OWNER;
-        Ok(true)
+        entry.serialization.promote_cleanup_if_ready(entry.io_mode, entry.cleanup_reference_held)
     }
 
     /// Mark the canonical manager lifecycle active before crossing the driver
@@ -582,10 +506,12 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
     /// rather than dispatching a second cleanup generation.
     pub fn mark_cleanup_lifecycle_started(&mut self, file_id: u64) -> Result<bool, u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if !entry.cleanup_reference_held || entry.handle_references != 0 || entry.cleanup_waiting {
+        if !entry.cleanup_reference_held || entry.handle_references != 0
+            || entry.serialization.cleanup_waiting()
+        {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        if entry.io_mode.is_synchronous() && entry.lock_owner_tid != Self::CLEANUP_LOCK_OWNER {
+        if entry.io_mode.is_synchronous() && !entry.serialization.is_cleanup_owner() {
             return Err(STATUS_INVALID_PARAMETER);
         }
         if entry.cleanup_lifecycle_started {
@@ -614,51 +540,29 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
     /// promote exactly one FIFO acquisition owner before making that thread runnable.
     pub fn release_io(&mut self, file_id: u64, tid: u64) -> Result<FileIoRelease, u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if !entry.io_mode.is_synchronous()
-            || entry.lock_owner_tid != tid
-            || entry.lock_grant_tid != 0
-        {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        entry.lock_owner_tid = 0;
-        Ok(FileIoRelease {
-            waiters: entry.lock_waiters,
-        })
+        entry.serialization.release_io(entry.io_mode, tid)
     }
 
     pub fn release_cleanup_io(&mut self, file_id: u64) -> Result<FileIoRelease, u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if entry.lock_owner_tid != Self::CLEANUP_LOCK_OWNER || entry.lock_grant_tid != 0 {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        entry.lock_owner_tid = 0;
-        Ok(FileIoRelease {
-            waiters: entry.lock_waiters,
-        })
+        entry.serialization.release_cleanup_io()
     }
 
     /// Drop a promoted owner whose thread terminated before consuming its grant.
     pub fn cancel_promoted_io(&mut self, file_id: u64, tid: u64) -> Result<FileIoRelease, u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if entry.lock_owner_tid != tid || entry.lock_grant_tid != tid {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        entry.lock_owner_tid = 0;
-        entry.lock_grant_tid = 0;
-        Ok(FileIoRelease {
-            waiters: entry.lock_waiters,
-        })
+        entry.serialization.cancel_promoted_io(tid)
     }
 
     pub fn io_lock_owner(&self, file_id: u64) -> Result<Option<u64>, u32> {
         self.entry(file_id)
-            .map(|entry| (entry.lock_owner_tid != 0).then_some(entry.lock_owner_tid))
+            .map(|entry| entry.serialization.io_lock_owner())
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
     pub fn io_waiter_count(&self, file_id: u64) -> Result<u32, u32> {
         self.entry(file_id)
-            .map(|entry| entry.lock_waiters)
+            .map(|entry| entry.serialization.io_waiter_count())
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
@@ -739,9 +643,7 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         let close_required = entry.references == 0;
         assert!(
             !close_required
-                || (entry.lock_owner_tid == 0
-                    && entry.lock_grant_tid == 0
-                    && entry.lock_waiters == 0),
+                || !entry.serialization.has_live_io(),
             "last File reference released while synchronous I/O still owns it"
         );
         let release = FileReferenceRelease {
