@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-09-09
+Last updated: 2026-09-10
 
 ## Objective
 
@@ -32333,8 +32333,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     - [x] Migrate immediately granted/failed local byte-range locks and local directory-notify
       registration failures. Both services reserve their owner and local request identity before
       begin-I/O. Capture inline publication policy before parking; inline errors still suppress
-      IOSB/event/APC publication, while File signaling follows the original synchronous/event
-      policy. Park the caller even on asynchronous FILE_OBJECTs and return its real stored status,
+      IOSB/event/APC publication. This checkpoint retained the previous File signaling policy;
+      the transfer checkpoint below corrects inline-error File signaling against NT5.
+      Park the caller even on asynchronous FILE_OBJECTs and return its real stored status,
       never reissue the lock/registration or claim that an inline error became pending I/O.
       Remove complete_terminal_local_file_io and its three destructive completion/release calls.
     - [x] Retain the exact reply cap through rejected sends in shared pending-I/O redrive. A failed
@@ -32371,6 +32372,54 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     before their destructive completion/release calls can be removed. Ordinary handle close,
     unpublished rollback, native filesystem exclusion and exact CM storage binding remain open.
     No fresh desktop acceptance is implied by this host/native ownership checkpoint.
+
+    Retained local transfer completion checkpoint (2026-09-10): extend the terminal owner to
+    native local READ/WRITE before enabling filesystem admission failures.
+    - [x] Reserve an exact pending owner, preflight reply capacity and derive a request identity
+      before beginning overlay reads/writes or read-only FAT reads. Stage immutable LocalInline
+      status/information after transfer and inline output copy, retaining the FILE_OBJECT I/O
+      reference until completion surfaces, parked reply and final release have settled.
+      The real terminal status remains available to instrumentation; only the service-loop return
+      becomes the transport's pending sentinel. Asynchronous Files also return their original
+      inline result through the retained reply, without reporting fabricated pending I/O.
+    - [x] Remove direct READ/WRITE completion publication and finish_local_file_io calls for
+      accepted local operations. Delivery retries do not repeat writes, read access accounting,
+      file-position updates or output copy. Overlay read-copy failure preserves accepted byte
+      count/metadata and propagates the checked copy status rather than replacing every error
+      with ACCESS_VIOLATION. FAT's chunked transfer/copy contract is unchanged in this slice.
+    - [x] Replace separate wrapping lock/notify counters with a generic local request ID derived
+      from an exact still-reserved slot generation. Reject stale/occupied claims and exhausted
+      60-bit local generations. Full-width provider reservation generations also stop at exhaustion
+      rather than wrapping. Remove both native counters, initializers and operation-specific tags.
+    - [x] Correct the prior LocalInline File-event policy against NT5 IopCompleteRequest
+      (references/nt5/base/ntos/io/iomgr/internal.c:1549): an original inline severity-3 error
+      leaves both user and File events unsignaled, even for a synchronous File or omitted user
+      event. Release ownership and return the stored status without signaling. Warning/success
+      completion retains the original synchronous/event choice; truly pending operation errors
+      retain their separate pending completion policy.
+    - [x] Complete serialized host/native validation and review the remaining inline owners.
+
+    Validation: 693 focused and 2,369 final broad host tests/doctests passed, none ignored.
+    Six new reservation identity cases and three real filesystem/I/O
+    Manager composition cases exercise stale/crossed claims, local/provider exhaustion, one-time
+    read/write effects, inline copy failure, surface/reply/release retries and asynchronous consumer
+    abandonment; an additional warning matrix distinguishes inline warning and error signaling.
+    The final native release build passed in 36.33s with 294 unchanged warnings. Evidence:
+    .tmp/test-local-transfer-delivery-focused-20260910.log,
+    .tmp/test-local-transfer-delivery-full-20260910.log and
+    .tmp/build-local-transfer-delivery-executive-20260910.log. An initial test compile caught an
+    unavailable NtStatus constant while the integration test was still being prepared; it was
+    corrected before the passing runs. Root serialized all runners.
+    Native copy and admission are external boundaries, not simulated runtime proof.
+    Directory-query completion, ordinary close/unpublished rollback, native filesystem exclusion
+    and exact CM storage binding remain open. No VM or desktop acceptance is claimed.
+
+    Review adjustment: the next directory-query migration must remove FAT enumeration rollback
+    after late output/IOSB faults, preserve warning completion and delete the last direct local
+    finish helper. Shared pending IOSB publication also needs Information-before-Status ordering
+    (NT5 internal.c:1340) and a distinction between retryable admission failures and definitive
+    IOSB copy faults. Ordinary inaccessible IOSBs must not cause indefinite completion retry;
+    record an explicit failed output disposition rather than pretending publication succeeded.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

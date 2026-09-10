@@ -34,7 +34,7 @@ fn terminal(status: u32, major: u8, synchronous: bool, event: u64) -> PendingFil
         iosb_va: if publish { 0x1000 } else { 0 },
         apc_routine: if publish { 0x2000 } else { 0 },
         event_obj_idx: if publish { event } else { u64::MAX },
-        signal_file: synchronous || event == u64::MAX,
+        signal_file: publish && (synchronous || event == u64::MAX),
         reply_required: true,
         reply_cap: REPLY,
         ..PendingFileIo::default()
@@ -136,7 +136,7 @@ fn granted_lock_survives_surface_reply_and_reference_release_retries() {
 }
 
 #[test]
-fn failed_notification_keeps_inline_error_policy_and_original_file_signal_policy() {
+fn failed_notification_leaves_file_and_event_unsignaled_for_every_open_mode() {
     for synchronous in [false, true] {
         for event in [u64::MAX, 9] {
             let (mut fs, handle) = file();
@@ -163,15 +163,14 @@ fn failed_notification_keeps_inline_error_policy_and_original_file_signal_policy
             assert_eq!(pending.iosb_va, 0);
             assert_eq!(pending.apc_routine, 0);
             assert_eq!(pending.event_obj_idx, u64::MAX);
-            assert_eq!(pending.signal_file, synchronous || event == u64::MAX);
+            assert!(!pending.signal_file);
             let slot = table.park_reserved(reservation, pending).unwrap();
-            if pending.signal_file {
-                fs.zw_set_file_signaled(handle, true).unwrap();
-                table
-                    .mark_delivery_exact(slot, REQUEST, IO_DELIVERY_FILE_PUBLISHED)
-                    .unwrap();
-            }
             reply_and_ack(&mut table, slot);
+            assert_eq!(
+                table.get(slot).unwrap().delivery_state
+                    & (IO_DELIVERY_FILE_PUBLISHED | IO_DELIVERY_EVENT_PUBLISHED),
+                0
+            );
             assert_eq!(
                 table.get(slot).unwrap().local_terminal_result(),
                 Some((status, 0))
@@ -181,8 +180,75 @@ fn failed_notification_keeps_inline_error_policy_and_original_file_signal_policy
                 .mark_local_reference_released_exact(slot, REQUEST)
                 .unwrap();
             table.finish_exact(slot, REQUEST).unwrap();
-            assert_eq!(fs.zw_is_file_signaled(handle), Ok(pending.signal_file));
+            assert_eq!(fs.zw_is_file_signaled(handle), Ok(false));
             assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
+        }
+    }
+}
+
+#[test]
+fn inline_warnings_keep_completion_surfaces_and_file_signal_policy() {
+    for status in [0x8000_0005u32, 0x8000_0006] {
+        // BUFFER_OVERFLOW, NO_MORE_FILES
+        for synchronous in [false, true] {
+            for event in [u64::MAX, 9] {
+                let (mut fs, handle) = file();
+                let mut table = PendingFileIoTable::new();
+                let reservation = table.reserve().unwrap();
+                fs.zw_begin_file_io(handle).unwrap();
+                let pending = terminal(
+                    status,
+                    nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL,
+                    synchronous,
+                    event,
+                );
+                assert_ne!(pending.iosb_va, 0);
+                assert_ne!(pending.apc_routine, 0);
+                assert_eq!(pending.event_obj_idx, event);
+                assert_eq!(pending.signal_file, synchronous || event == u64::MAX);
+                let slot = table.park_reserved(reservation, pending).unwrap();
+                assert!(table.mark_backend_acked_exact(slot, REQUEST).is_none());
+                table
+                    .mark_delivery_exact(slot, REQUEST, IO_DELIVERY_IOSB_PUBLISHED)
+                    .unwrap();
+                table
+                    .mark_delivery_exact(slot, REQUEST, IO_DELIVERY_APC_PUBLISHED)
+                    .unwrap();
+                if event != u64::MAX {
+                    table
+                        .mark_delivery_exact(slot, REQUEST, IO_DELIVERY_EVENT_PUBLISHED)
+                        .unwrap();
+                }
+                if pending.signal_file {
+                    fs.zw_set_file_signaled(handle, true).unwrap();
+                    table
+                        .mark_delivery_exact(slot, REQUEST, IO_DELIVERY_FILE_PUBLISHED)
+                        .unwrap();
+                }
+                reply_and_ack(&mut table, slot);
+                assert_eq!(fs.zw_is_file_signaled(handle), Ok(pending.signal_file));
+                let progress = table.get(slot).unwrap().delivery_state;
+                assert_eq!(
+                    progress & IO_DELIVERY_FILE_PUBLISHED != 0,
+                    pending.signal_file
+                );
+                assert_eq!(
+                    progress & IO_DELIVERY_EVENT_PUBLISHED != 0,
+                    event != u64::MAX
+                );
+                fs.zw_release_io_reference(handle).unwrap();
+                table
+                    .mark_local_reference_released_exact(slot, REQUEST)
+                    .unwrap();
+                assert_eq!(
+                    table
+                        .finish_exact(slot, REQUEST)
+                        .unwrap()
+                        .local_terminal_result(),
+                    Some((status, 0))
+                );
+                assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
+            }
         }
     }
 }

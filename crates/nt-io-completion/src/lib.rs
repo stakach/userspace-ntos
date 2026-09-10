@@ -96,7 +96,8 @@ pub const fn io_event_suppresses_completion_port(handle: u64) -> bool {
 }
 
 /// Whether a returned I/O status owns caller-visible completion publication. Warnings are terminal
-/// completions, but an error returned inline leaves the IOSB, event, APC, and completion port alone.
+/// completions, but an error returned inline leaves the IOSB, user/File events, APC, and completion
+/// port alone.
 /// An error delivered after the operation returned pending is still a real completion.
 pub const fn file_io_status_publishes_completion(status: u32, completed_inline: bool) -> bool {
     status & 0xC000_0000 != 0xC000_0000 || !completed_inline

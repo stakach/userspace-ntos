@@ -23554,11 +23554,9 @@ struct ExecNtHandler {
     /// Filesystem-owned byte ranges for local FAT and MemFs FILE_OBJECTs. Provider-backed Files
     /// keep their lock state in the receiving FSD through `IRP_MJ_LOCK_CONTROL`.
     byte_range_locks: nt_fs::ByteRangeLockTable<u64>,
-    next_local_byte_lock_irp: u64,
     /// One-shot directory watches for the read-only FAT owner. Writable MemFs notifications remain
     /// inside its `nt-fs::FileSystem`; provider-backed watches remain inside the receiving FSD.
     readonly_directory_notifications: nt_fs::DirectoryNotifyTable<u64>,
-    next_local_directory_notify_irp: u64,
     /// Per-call context the dispatch loop refreshes before each `dispatch` (Workstream A: the
     /// converged table-driven path carries executive context on the handler rather than a parallel
     /// mechanism). `pi` = process index (0 = smss, 1 = csrss); `stop` = a side-signal a handler

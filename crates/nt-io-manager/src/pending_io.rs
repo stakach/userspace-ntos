@@ -190,6 +190,8 @@ impl PendingFileIo {
 }
 
 const DEFAULT_INITIAL_RESERVE: usize = 16;
+const LOCAL_OPERATION_ID_TAG: u64 = 0x8000_0000_0000_0000;
+const LOCAL_OPERATION_ID_GENERATION_MASK: u64 = 0x0fff_ffff_ffff_ffff;
 
 /// Generation-exact claim on one table slot. Dispatch code reserves before creating an IRP and
 /// commits that exact claim afterward, so re-entrant work cannot consume the promised owner slot.
@@ -382,6 +384,10 @@ impl PendingFileIoTable {
 
     /// Claim one exact owner slot before dispatching an IRP.
     pub fn reserve(&mut self) -> Option<PendingFileIoReservation> {
+        let generation = self.next_reservation_generation;
+        if generation == 0 {
+            return None;
+        }
         let slot = self
             .slots
             .iter()
@@ -394,10 +400,23 @@ impl PendingFileIoTable {
                     self.slots.len() - 1
                 })
             })?;
-        let generation = self.next_reservation_generation.max(1);
-        self.next_reservation_generation = generation.wrapping_add(1).max(1);
+        self.next_reservation_generation = generation.checked_add(1).unwrap_or(0);
         self.reservations[slot] = generation;
         Some(PendingFileIoReservation { slot, generation })
+    }
+
+    /// Derive a local correlation from an exact, still-unoccupied owner reservation.
+    /// Repeated observation is stable; cancelling or committing the claim invalidates it. Local
+    /// IDs exhaust at 60 bits rather than truncate a generation and alias an earlier operation.
+    pub fn local_operation_id(&self, reservation: PendingFileIoReservation) -> Option<u64> {
+        if reservation.generation == 0
+            || reservation.generation > LOCAL_OPERATION_ID_GENERATION_MASK
+            || self.reservations.get(reservation.slot).copied() != Some(reservation.generation)
+            || !self.slots.get(reservation.slot).is_some_and(Option::is_none)
+        {
+            return None;
+        }
+        Some(LOCAL_OPERATION_ID_TAG | reservation.generation)
     }
 
     pub fn cancel_reservation(&mut self, reservation: PendingFileIoReservation) -> bool {
@@ -1081,6 +1100,10 @@ mod local_delivery_tests;
 #[cfg(test)]
 #[path = "pending_io/local_inline_tests.rs"]
 mod local_inline_tests;
+
+#[cfg(test)]
+#[path = "pending_io/local_operation_id_tests.rs"]
+mod local_operation_id_tests;
 
 #[cfg(test)]
 mod tests {

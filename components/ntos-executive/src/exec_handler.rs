@@ -3093,8 +3093,6 @@ const LOCAL_OVERLAY_FILE_OBJECT_TAG: u64 = 0x2000_0000_0000_0000;
 const LOCAL_FAT_FILE_ID_TAG: u64 = 0x3000_0000_0000_0000;
 const LOCAL_OVERLAY_FILE_ID_TAG: u64 = 0x4000_0000_0000_0000;
 const LOCAL_FAT_DIRECTORY_OBJECT_TAG: u64 = 0x5000_0000_0000_0000;
-const LOCAL_BYTE_LOCK_IRP_TAG: u64 = 0x8000_0000_0000_0000;
-const LOCAL_DIRECTORY_NOTIFY_IRP_TAG: u64 = 0x9000_0000_0000_0000;
 const LOCAL_ID_PAYLOAD_MASK: u64 = 0x0fff_ffff_ffff_ffff;
 
 struct SystemTimeConfiguration {
@@ -4100,12 +4098,10 @@ impl ExecNtHandler {
         write_field!(directory_opens, ExecDirectoryOpens::reset());
         write_field!(readonly_file_opens, ExecReadOnlyFileOpens::reset());
         write_field!(byte_range_locks, nt_fs::ByteRangeLockTable::new());
-        write_field!(next_local_byte_lock_irp, 1);
         write_field!(
             readonly_directory_notifications,
             nt_fs::DirectoryNotifyTable::new()
         );
-        write_field!(next_local_directory_notify_irp, 1);
         write_field!(pi, 0);
         write_field!(current_tid, 0);
         write_field!(current_badge, 0);
@@ -14468,7 +14464,10 @@ impl ExecNtHandler {
         }
 
         if let Some(route) = local_route {
-            let request_id = self.allocate_local_directory_notify_irp_id();
+            let request_id = match self.reserved_local_file_io_id() {
+                Ok(request_id) => request_id,
+                Err(status) => return status,
+            };
             let file_object = route.file_object();
             if let Err(status) = self.begin_local_file_io(file_object) {
                 return status;
@@ -14732,7 +14731,10 @@ impl ExecNtHandler {
         }
 
         if let Some(route) = local_route {
-            let request_id = self.allocate_local_byte_lock_irp_id();
+            let request_id = match self.reserved_local_file_io_id() {
+                Ok(request_id) => request_id,
+                Err(status) => return status,
+            };
             if let Err(status) = self.begin_local_file_io(route.file_object) {
                 return status;
             }
@@ -29279,16 +29281,24 @@ impl ExecNtHandler {
         })
     }
 
-    fn allocate_local_byte_lock_irp_id(&mut self) -> u64 {
-        let sequence = self.next_local_byte_lock_irp.max(1) & LOCAL_ID_PAYLOAD_MASK;
-        self.next_local_byte_lock_irp = sequence.wrapping_add(1).max(1);
-        LOCAL_BYTE_LOCK_IRP_TAG | sequence
+    unsafe fn reserved_local_file_io_id(&self) -> Result<u64, u32> {
+        let pending = &*core::ptr::addr_of!(PENDING_FILE_IO);
+        self.pending_file_io_reservation
+            .and_then(|reservation| pending.local_operation_id(reservation))
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)
     }
 
-    fn allocate_local_directory_notify_irp_id(&mut self) -> u64 {
-        let sequence = self.next_local_directory_notify_irp.max(1) & LOCAL_ID_PAYLOAD_MASK;
-        self.next_local_directory_notify_irp = sequence.wrapping_add(1).max(1);
-        LOCAL_DIRECTORY_NOTIFY_IRP_TAG | sequence
+    unsafe fn begin_retained_local_file_io(&mut self, file_object: u64) -> Result<u64, u32> {
+        // Inline asynchronous operations also need a parked reply if delivery must retry.
+        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+            || !wait_reply_pool_has_free()
+            || !self.reserve_pending_file_io_owner()
+        {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let request_id = self.reserved_local_file_io_id()?;
+        self.begin_local_file_io(file_object)?;
+        Ok(request_id)
     }
 
     fn set_local_file_object_signaled(
@@ -29396,7 +29406,7 @@ impl ExecNtHandler {
             apc_routine: if publish { apc_routine } else { 0 },
             apc_context,
             completion_port_suppressed,
-            signal_file: synchronous || event_obj_idx == u64::MAX,
+            signal_file: publish && (synchronous || event_obj_idx == u64::MAX),
             event_obj_idx: if publish { event_obj_idx } else { u64::MAX },
             ..nt_io_manager::PendingFileIo::default()
         });
@@ -43297,11 +43307,14 @@ impl ExecNtHandler {
                                             Err(status) => return status.raw() as u32,
                                         };
                                         let actual_offset = resolved.value();
-                                        match self.begin_local_file_io(route.file_object) {
+                                        match self.begin_retained_local_file_io(route.file_object) {
                                             Err(status) => status,
-                                            Ok(()) => {
-                                                local_file_io =
-                                                    Some((route.file_object, route.synchronous));
+                                            Ok(request_id) => {
+                                                local_file_io = Some((
+                                                    request_id,
+                                                    route.file_object,
+                                                    route.synchronous,
+                                                ));
                                                 let owner = nt_fs::ByteRangeLockOwner::new(
                                                     route.file_object,
                                                     self.pm_pid_for_pi(self.pi).unwrap() as u64,
@@ -43473,7 +43486,8 @@ impl ExecNtHandler {
                 let publish_terminal = operation_started
                     && status != STATUS_PENDING
                     && nt_io_completion::file_io_status_publishes_completion(status, true);
-                if publish_terminal {
+                let local_terminal = local_file_io.is_some();
+                if publish_terminal && !local_terminal {
                     self.complete_terminal_file_io(
                         if terminal_file_owned {
                             completion_file_id
@@ -43494,9 +43508,22 @@ impl ExecNtHandler {
                 if file_retained && status != STATUS_PENDING {
                     self.release_file_reference(completion_file_id);
                 }
-                if let Some((file_object, synchronous)) = local_file_io.take() {
+                if let Some((request_id, file_object, synchronous)) = local_file_io.take() {
                     assert_ne!(status, STATUS_PENDING, "local write unexpectedly pended");
-                    self.finish_local_file_io(file_object, synchronous, event_obj_idx);
+                    self.stage_terminal_local_file_io(
+                        request_id,
+                        nt_io_abi::major::IRP_MJ_WRITE,
+                        file_object,
+                        synchronous,
+                        event_obj_idx,
+                        self.current_tid,
+                        apc_routine,
+                        apc_context,
+                        iosb,
+                        status,
+                        information,
+                        completion_port_suppressed,
+                    );
                 }
                 // A dispatched write may have queued bytes or freed peer queue capacity even when
                 // its own IRP remains pending. The service loop uses this only as an endpoint
@@ -43597,7 +43624,7 @@ impl ExecNtHandler {
                     print_u64(information);
                     print_str(b"\n");
                 }
-                status
+                if local_terminal { STATUS_PENDING } else { status }
             },
             // NtReadFile captured args: FileHandle=args[0], Event=args[1], ApcRoutine=args[2],
             // ApcContext=args[3], *IoStatusBlock=args[4], Buffer=args[5], Length=args[6],
@@ -43718,10 +43745,11 @@ impl ExecNtHandler {
                                         let offset = resolved.value();
                                         match self.local_file_io_route_for(fh) {
                                             Ok(Some(route)) => {
-                                                match self.begin_local_file_io(route.file_object) {
+                                                match self.begin_retained_local_file_io(route.file_object) {
                                                     Err(status) => status,
-                                                    Ok(()) => {
+                                                    Ok(request_id) => {
                                                         local_file_io = Some((
+                                                            request_id,
                                                             route.file_object,
                                                             route.synchronous,
                                                         ));
@@ -43798,10 +43826,11 @@ impl ExecNtHandler {
                                             Err(status) => status.raw() as u32,
                                             Ok(resolved) => {
                                                 let actual_offset = resolved.value();
-                                                match self.begin_local_file_io(route.file_object) {
+                                                match self.begin_retained_local_file_io(route.file_object) {
                                                     Err(status) => status,
-                                                    Ok(()) => {
+                                                    Ok(request_id) => {
                                                         local_file_io = Some((
+                                                            request_id,
                                                             route.file_object,
                                                             route.synchronous,
                                                         ));
@@ -43836,16 +43865,17 @@ impl ExecNtHandler {
                                                                     route.synchronous,
                                                                     &mut scratch[..len],
                                                                 );
-                                                            if status == nt_fs::STATUS_SUCCESS
-                                                                && read != 0
-                                                                && !self.xas_try_write_buf(
-                                                                    buffer,
-                                                                    &scratch[..read],
-                                                                )
-                                                            {
-                                                                0xC000_0005 // STATUS_ACCESS_VIOLATION
+                                                            // The transfer and file position are already accepted.
+                                                            // A terminal copy fault changes status, not Information.
+                                                            information = read as u64;
+                                                            if status == nt_fs::STATUS_SUCCESS && read != 0 {
+                                                                match self.process_memory_write_status(
+                                                                    self.pi, buffer, &scratch[..read],
+                                                                ) {
+                                                                    Ok(()) => status,
+                                                                    Err(status) => status,
+                                                                }
                                                             } else {
-                                                                information = read as u64;
                                                                 status
                                                             }
                                                         }
@@ -44021,7 +44051,8 @@ impl ExecNtHandler {
                 }
                 let event_obj_idx = completion_event_index.map_or(u64::MAX, |index| index as u64);
                 let terminal_file_owned = file_retained && status != STATUS_PENDING;
-                if operation_started && status != STATUS_PENDING {
+                let local_terminal = local_file_io.is_some();
+                if operation_started && status != STATUS_PENDING && !local_terminal {
                     self.complete_terminal_file_io(
                         if terminal_file_owned {
                             completion_file_id
@@ -44042,9 +44073,22 @@ impl ExecNtHandler {
                 if file_retained && status != STATUS_PENDING {
                     self.release_file_reference(completion_file_id);
                 }
-                if let Some((file_object, synchronous)) = local_file_io.take() {
+                if let Some((request_id, file_object, synchronous)) = local_file_io.take() {
                     assert_ne!(status, STATUS_PENDING, "local read unexpectedly pended");
-                    self.finish_local_file_io(file_object, synchronous, event_obj_idx);
+                    self.stage_terminal_local_file_io(
+                        request_id,
+                        nt_io_abi::major::IRP_MJ_READ,
+                        file_object,
+                        synchronous,
+                        event_obj_idx,
+                        self.current_tid,
+                        apc_routine,
+                        apc_context,
+                        iosb,
+                        status,
+                        information,
+                        completion_port_suppressed,
+                    );
                 }
                 if routed
                     && status != STATUS_PENDING
@@ -44109,7 +44153,7 @@ impl ExecNtHandler {
                     print_u64(information);
                     print_str(b"\n");
                 }
-                status
+                if local_terminal { STATUS_PENDING } else { status }
             },
             // NtSetInformationFile captured args: FileHandle=args[0], *IoStatusBlock=args[1],
             // FileInformation=args[2], Length=args[3], FileInformationClass=args[4].
