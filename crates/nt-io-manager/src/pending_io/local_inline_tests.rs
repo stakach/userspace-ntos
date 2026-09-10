@@ -108,7 +108,7 @@ fn invalid_local_shapes_do_not_consume_the_reservation() {
         |request| request.output_len = 1,
         |request| request.output_offset = 1,
         |request| request.publish_iocp = true,
-        |request| request.sync_lock_owner_tid = TID,
+        |request| request.busy = Some(test_busy(request.file_id, TID)),
         |request| request.control_code = 1,
         |request| request.delivery_state = IO_DELIVERY_BACKEND_ACKED,
         |request| request.user_apc_interrupt_requested = true,
@@ -411,7 +411,7 @@ fn user_apc_redirect_stages_once_across_definitively_rejected_reply() {
     let mut request = inline();
     request.operation = PendingFileIoOperation::Transfer;
     request.major = nt_io_abi::major::IRP_MJ_READ;
-    request.sync_lock_owner_tid = TID;
+    request.busy = Some(test_busy(request.file_id, TID));
     let slot = table.park(request).unwrap();
     assert!(table.mark_user_apc_staged_exact(slot, ID).is_none());
     assert!(table
@@ -424,6 +424,14 @@ fn user_apc_redirect_stages_once_across_definitively_rejected_reply() {
     assert!(table.claim_reply_cap_exact(slot, ID).is_none());
     assert!(table.mark_user_apc_staged_exact(slot, ID + 1).is_none());
     assert_eq!(table.get(slot), unstaged);
+    assert!(table.mark_user_apc_staged_exact(slot, ID).is_none());
+    for flag in [
+        IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_APC_PUBLISHED,
+        IO_DELIVERY_FILE_PUBLISHED, IO_DELIVERY_EVENT_PUBLISHED,
+    ] {
+        table.mark_delivery_exact(slot, ID, flag).unwrap();
+    }
+    settle_test_busy(&mut table, slot, ID);
     table.mark_user_apc_staged_exact(slot, ID).unwrap();
     assert!(table.mark_user_apc_staged_exact(slot, ID).is_none());
     assert!(table

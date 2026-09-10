@@ -62,7 +62,7 @@ impl PendingFileIoTable {
             && pending.event_obj_idx == u64::MAX
             && !pending.publish_iocp
             && pending.completion_port_suppressed
-            && pending.sync_lock_owner_tid == 0
+            && pending.busy.is_none()
             && !pending.consumer_abandoned
             && (pending.iosb_va != 0) == operation.publishes_iosb()
             && pending.signal_file == operation.signals_file()

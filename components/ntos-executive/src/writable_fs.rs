@@ -39,7 +39,7 @@ pub(crate) mod snapshot_storage;
 #[path = "writable_fs/file_cleanup.rs"]
 mod file_cleanup;
 pub(crate) use file_cleanup::{
-    cancel_file_io_waiter, cancel_promoted_file_io, promote_file_io_waiter,
+    cancel_file_io_waiter, cancel_promoted_file_io, file_io_waiter_count, promote_file_io_waiter,
     redrive_file_cleanup_work,
 };
 use file_cleanup::publish_file_cleanup_effects;

@@ -8,6 +8,13 @@
 use alloc::vec::Vec;
 
 pub use local_flush::{LocalFlushMode, PendingLocalFlush};
+pub use busy::{
+    FileIoBusyOwner, PendingFileBusy, PendingFileBusyError, PendingFileBusyPhase,
+    PendingFileBusyReleaseAttempt, PendingFileBusyWakeAttempt,
+};
+
+#[path = "pending_io/busy.rs"]
+mod busy;
 
 pub const IO_DELIVERY_BUFFER_PUBLISHED: u16 = 1 << 0;
 pub const IO_DELIVERY_IOSB_PUBLISHED: u16 = 1 << 1;
@@ -32,7 +39,7 @@ const IO_DELIVERY_PUBLIC_FLAGS: u16 = IO_DELIVERY_BUFFER_PUBLISHED
     | IO_DELIVERY_FILE_PUBLISHED
     | IO_DELIVERY_IOCP_PUBLISHED
     | IO_DELIVERY_EVENT_PUBLISHED;
-const IO_DELIVERY_MARKABLE_FLAGS: u16 = IO_DELIVERY_PUBLIC_FLAGS | IO_DELIVERY_FILE_LOCK_RELEASED;
+const IO_DELIVERY_MARKABLE_FLAGS: u16 = IO_DELIVERY_PUBLIC_FLAGS;
 
 /// State needed to turn one successful terminal CREATE into a process-visible handle. The provider
 /// context is opaque to the generic owner; the executive interprets it only after resolving the
@@ -130,9 +137,9 @@ pub struct PendingFileIo {
     /// Owning process index, thread id, and hosted fault badge.
     pub pi: u32,
     pub tid: u64,
-    /// Thread owning the synchronous FILE_OBJECT lock until terminal delivery. Zero for an
-    /// asynchronous File or an always-synchronous API waiting on its own completion owner.
-    pub sync_lock_owner_tid: u64,
+    /// Exact File Busy ownership retained through release and the deferred FIFO wake pass.
+    /// Absent for asynchronous Files and synchronous APIs using an independent completion owner.
+    pub busy: Option<PendingFileBusy>,
     pub badge: u64,
     /// The initiating thread is gone, but the canonical IRP owner must remain until terminal
     /// completion so its synchronous File lock and retained reference are released in order.
@@ -312,8 +319,11 @@ impl PendingFileIoTable {
         true
     }
 
-    /// Clear stale records and reserve bootstrap storage before an allocator watermark is taken.
+    /// Reserve bootstrap storage only when no live delivery or pre-dispatch reservation remains.
     pub fn reset(&mut self) -> bool {
+        if !self.is_empty() {
+            return false;
+        }
         self.slots.clear();
         self.reservations.clear();
         self.local_outputs.clear();
@@ -409,7 +419,7 @@ impl PendingFileIoTable {
                     && pending.output_va == 0
                     && pending.output_len == 0
                     && !pending.publish_iocp
-                    && pending.sync_lock_owner_tid == 0
+                    && pending.busy.is_none()
             }
             PendingFileIoOperation::LocalBuffered(operation) => {
                 matches!(pending.major,
@@ -417,7 +427,7 @@ impl PendingFileIoTable {
                     && operation.status != nt_status::NtStatus::PENDING.raw() as u32
                     && operation.information <= u64::from(pending.output_len)
                     && !pending.publish_iocp
-                    && pending.sync_lock_owner_tid == 0
+                    && pending.busy.is_none()
                     && !pending.consumer_abandoned
             }
             PendingFileIoOperation::LocalFlush(operation) => {
@@ -434,9 +444,7 @@ impl PendingFileIoTable {
             && control_valid
             && pending.delivery_state == 0
             && pending.output_offset == 0
-            && (pending.sync_lock_owner_tid == 0 || pending.sync_lock_owner_tid == pending.tid)
-            && (!matches!(pending.operation, PendingFileIoOperation::Create(_))
-                || pending.sync_lock_owner_tid == 0)
+            && pending.busy.is_none_or(|busy| busy.valid_unpublished_owner(pending))
             && (!pending.consumer_abandoned
                 || !matches!(pending.operation, PendingFileIoOperation::Create(_)))
             && !pending.user_apc_interrupt_requested
@@ -505,7 +513,7 @@ impl PendingFileIoTable {
     pub fn park_reserved(
         &mut self,
         reservation: PendingFileIoReservation,
-        pending: PendingFileIo,
+        mut pending: PendingFileIo,
     ) -> Result<usize, PendingFileIoParkError> {
         if self.reservations.get(reservation.slot).copied() != Some(reservation.generation) {
             return Err(PendingFileIoParkError::StaleReservation);
@@ -527,6 +535,11 @@ impl PendingFileIoTable {
             && self.local_operation_id(reservation) != Some(pending.irp_id)
         {
             return Err(PendingFileIoParkError::InvalidRecord);
+        }
+        if let Some(busy) = pending.busy.as_mut() {
+            if !busy.publish_identity() {
+                return Err(PendingFileIoParkError::InvalidRecord);
+            }
         }
         match pending.operation {
             PendingFileIoOperation::LocalBuffered(operation) => {
@@ -561,24 +574,14 @@ impl PendingFileIoTable {
         {
             return None;
         }
-        for (index, (slot, reservation)) in self
-            .slots
-            .iter_mut()
-            .zip(self.reservations.iter())
-            .enumerate()
-        {
-            if slot.is_none() && *reservation == 0 {
-                *slot = Some(pending);
-                return Some(index);
+        let reservation = self.reserve()?;
+        match self.park_reserved(reservation, pending) {
+            Ok(slot) => Some(slot),
+            Err(_) => {
+                self.cancel_reservation(reservation);
+                None
             }
         }
-        if !self.grow_reservation() {
-            return None;
-        }
-        self.slots.push(Some(pending));
-        self.reservations.push(0);
-        self.local_outputs.push(None);
-        Some(self.slots.len() - 1)
     }
 
     pub fn len(&self) -> usize {
@@ -631,8 +634,8 @@ impl PendingFileIoTable {
     }
 
     /// Find one synchronous operation owner whose alertable wait can be
-    /// interrupted. File-mode alertability remains canonical in the File policy
-    /// table and must be checked by the caller before marking this record.
+    /// interrupted. Provider-backed transfers use the captured File mode and cannot be
+    /// interrupted once Busy retirement has started.
     pub fn user_apc_interrupt_candidate(&self, tid: u64) -> Option<(usize, PendingFileIo)> {
         self.slots.iter().enumerate().find_map(|(slot, pending)| {
             pending
@@ -643,7 +646,11 @@ impl PendingFileIoTable {
                         && !pending.user_apc_interrupt_requested
                         && pending.delivery_state == 0
                         && match pending.operation {
-                            PendingFileIoOperation::Transfer => pending.sync_lock_owner_tid == tid,
+                            PendingFileIoOperation::Transfer => pending.busy.is_some_and(|busy| {
+                                busy.owner().tid == tid
+                                    && busy.owner().mode == nt_io_completion::FileIoMode::SynchronousAlertable
+                                    && busy.release_unstarted()
+                            }),
                             PendingFileIoOperation::LocalByteLock(operation) => {
                                 operation.alertable
                                     && operation.status == nt_status::NtStatus::PENDING.raw() as u32
@@ -668,7 +675,11 @@ impl PendingFileIoTable {
     ) -> Option<()> {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         let interruptible_operation = match pending.operation {
-            PendingFileIoOperation::Transfer => pending.sync_lock_owner_tid == tid,
+            PendingFileIoOperation::Transfer => pending.busy.is_some_and(|busy| {
+                busy.owner().tid == tid
+                    && busy.owner().mode == nt_io_completion::FileIoMode::SynchronousAlertable
+                    && busy.release_unstarted()
+            }),
             PendingFileIoOperation::LocalByteLock(operation) => {
                 operation.alertable && operation.status == nt_status::NtStatus::PENDING.raw() as u32
             }
@@ -752,6 +763,7 @@ impl PendingFileIoTable {
             || pending.major != nt_io_abi::major::IRP_MJ_CREATE
             || !matches!(pending.operation, PendingFileIoOperation::SetFileName(_))
             || pending.delivery_state != 0
+            || pending.busy.is_some_and(|busy| !busy.release_unstarted())
         {
             return None;
         }
@@ -785,6 +797,7 @@ impl PendingFileIoTable {
             || target_file_id == 0
             || target_file_id == pending.file_id
             || pending.delivery_state != 0
+            || pending.busy.is_some_and(|busy| !busy.release_unstarted())
         {
             return None;
         }
@@ -908,7 +921,7 @@ impl PendingFileIoTable {
         if pending.reply_required {
             required |= IO_DELIVERY_REPLY_CLAIMED | IO_DELIVERY_REPLY_PUBLISHED;
         }
-        if pending.sync_lock_owner_tid != 0 {
+        if pending.busy.is_some() {
             required |= IO_DELIVERY_FILE_LOCK_RELEASED;
         }
         required
@@ -920,6 +933,7 @@ impl PendingFileIoTable {
     pub fn completion_surfaces_settled_exact(&self, slot: usize, irp_id: u64) -> bool {
         self.get(slot).is_some_and(|pending| {
             pending.irp_id == irp_id
+                && pending.busy_is_settled()
                 && pending.delivery_state
                     & (Self::required_delivery_state(pending) & !IO_DELIVERY_BACKEND_ACKED)
                     == Self::required_delivery_state(pending) & !IO_DELIVERY_BACKEND_ACKED
@@ -983,6 +997,7 @@ impl PendingFileIoTable {
         let entry = self.slots.get_mut(slot)?;
         let finished = if entry.is_some_and(|pending| {
             pending.irp_id == irp_id
+                && pending.busy_is_settled()
                 && pending.delivery_state & Self::required_delivery_state(pending)
                     == Self::required_delivery_state(pending)
                 && (!pending.is_local()
@@ -1094,6 +1109,7 @@ impl PendingFileIoTable {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id
             || !Self::local_output_settled(*pending)
+            || !pending.busy_is_settled()
             || !pending.user_apc_interrupt_requested
             || !pending.reply_required
             || pending.delivery_state
@@ -1116,6 +1132,7 @@ impl PendingFileIoTable {
             || !pending.reply_required
             || !Self::local_output_settled(*pending)
             || !Self::local_flush_reply_ready(*pending)
+            || !pending.busy_is_settled()
             || (pending.user_apc_interrupt_requested
                 && pending.delivery_state & IO_DELIVERY_USER_APC_STAGED == 0)
         {
@@ -1164,6 +1181,7 @@ impl PendingFileIoTable {
     pub fn mark_backend_acked_exact(&mut self, slot: usize, irp_id: u64) -> Option<u16> {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id
+            || !pending.busy_is_settled()
             || pending.delivery_state & IO_DELIVERY_BACKEND_ACKED != 0
             || pending.delivery_state
                 & (Self::required_delivery_state(*pending) & !IO_DELIVERY_BACKEND_ACKED)
@@ -1250,16 +1268,19 @@ impl PendingFileIoTable {
         count
     }
 
-    /// Remove every request owned by a terminating thread. The caller must release any reply cap,
-    /// request cancellation/abandonment, and release the retained File reference.
-    /// Active reply claims are not transferred; the caller must retry their teardown later.
+    /// Transfer requests without Busy ownership to teardown. The caller must release any reply
+    /// cap, request cancellation/abandonment, and release the retained File reference.
+    /// Busy owners remain in terminal redrive even after wake settles; active reply claims are
+    /// also retained. Teardown must abandon those consumers instead of discarding their receipts.
     pub fn take_thread_with<F>(&mut self, tid: u64, mut take: F) -> usize
     where
         F: FnMut(PendingFileIo),
     {
         let mut count = 0;
         for (index, slot) in self.slots.iter_mut().enumerate() {
-            if slot.is_some_and(|pending| pending.tid == tid && !pending.reply_claim_in_flight()) {
+            if slot.is_some_and(|pending| {
+                pending.tid == tid && !pending.reply_claim_in_flight() && pending.busy.is_none()
+            }) {
                 let pending = slot.take().unwrap();
                 self.local_outputs[index] = None;
                 take(pending);
@@ -1293,6 +1314,23 @@ mod local_operation_id_tests;
 mod iosb_fault_tests;
 
 #[cfg(test)]
+fn test_busy(file_id: u64, tid: u64) -> PendingFileBusy {
+    PendingFileBusy::new(FileIoBusyOwner {
+        key: crate::FileIoWaitKey::Hosted(file_id),
+        tid,
+        mode: nt_io_completion::FileIoMode::SynchronousAlertable,
+    })
+}
+
+#[cfg(test)]
+fn settle_test_busy(table: &mut PendingFileIoTable, slot: usize, irp_id: u64) {
+    let mut release = table.begin_busy_release_exact(slot, irp_id).unwrap();
+    table.record_busy_release(&mut release, Ok(0)).unwrap();
+    let mut wake = table.begin_busy_wake_exact(slot, irp_id).unwrap();
+    table.record_busy_wake(&mut wake, Ok(())).unwrap();
+}
+
+#[cfg(test)]
 mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
@@ -1308,7 +1346,7 @@ mod tests {
             operation: PendingFileIoOperation::Transfer,
             pi: 3,
             tid,
-            sync_lock_owner_tid: 0,
+            busy: None,
             badge: 9,
             consumer_abandoned: false,
             user_apc_interrupt_requested: false,
@@ -1537,7 +1575,7 @@ mod tests {
         request.apc_routine = 0;
         request.publish_iocp = true;
         request.signal_file = true;
-        request.sync_lock_owner_tid = request.tid;
+        request.busy = Some(test_busy(request.file_id, request.tid));
         let slot = table.park(request).unwrap();
 
         table.advance_output_exact(slot, 2, 8, 8).unwrap();
@@ -1550,12 +1588,10 @@ mod tests {
             table.mark_delivery_exact(slot, 2, flag).unwrap();
         }
         assert!(!table.completion_surfaces_settled_exact(slot, 2));
+        assert!(table.claim_reply_cap_exact(slot, 2).is_none());
+        settle_test_busy(&mut table, slot, 2);
         assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
         table.mark_reply_published_exact(slot, 2).unwrap();
-        assert!(!table.completion_surfaces_settled_exact(slot, 2));
-        table
-            .mark_delivery_exact(slot, 2, IO_DELIVERY_FILE_LOCK_RELEASED)
-            .unwrap();
         assert!(table.completion_surfaces_settled_exact(slot, 2));
     }
 
@@ -1564,7 +1600,7 @@ mod tests {
         let mut table = PendingFileIoTable::new();
         let asynchronous_slot = table.park(pending(1, 2, 7)).unwrap();
         let mut synchronous = pending(3, 4, 7);
-        synchronous.sync_lock_owner_tid = 7;
+        synchronous.busy = Some(test_busy(synchronous.file_id, 7));
         let synchronous_slot = table.park(synchronous).unwrap();
 
         let (slot, candidate) = table.user_apc_interrupt_candidate(7).unwrap();
@@ -1723,7 +1759,7 @@ mod tests {
         request.apc_routine = 0;
         request.publish_iocp = true;
         request.signal_file = true;
-        request.sync_lock_owner_tid = request.tid;
+        request.busy = Some(test_busy(request.file_id, request.tid));
         let slot = table.park(request).unwrap();
 
         for flag in [
@@ -1734,12 +1770,10 @@ mod tests {
         ] {
             table.mark_delivery_exact(slot, 2, flag).unwrap();
         }
+        assert!(table.claim_reply_cap_exact(slot, 2).is_none());
+        settle_test_busy(&mut table, slot, 2);
         assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
         table.mark_reply_published_exact(slot, 2).unwrap();
-        assert!(!table.completion_surfaces_settled_exact(slot, 2));
-        table
-            .mark_delivery_exact(slot, 2, IO_DELIVERY_FILE_LOCK_RELEASED)
-            .unwrap();
         assert!(table.completion_surfaces_settled_exact(slot, 2));
     }
 
@@ -1808,7 +1842,7 @@ mod tests {
     fn abandoned_synchronous_transfer_retains_terminal_lock_owner_only() {
         let mut table = PendingFileIoTable::new();
         let mut request = pending(1, 2, 7);
-        request.sync_lock_owner_tid = 7;
+        request.busy = Some(test_busy(request.file_id, 7));
         request.reply_required = true;
         request.reply_cap = 0x50;
         request.resume_ip = 0x1000;
@@ -1826,9 +1860,7 @@ mod tests {
         assert_eq!(owner.reply_cap, 0);
         assert!(!owner.reply_required);
         assert!(!table.completion_surfaces_settled_exact(slot, 2));
-        table
-            .mark_delivery_exact(slot, 2, IO_DELIVERY_FILE_LOCK_RELEASED)
-            .unwrap();
+        settle_test_busy(&mut table, slot, 2);
         assert!(table.completion_surfaces_settled_exact(slot, 2));
         table.mark_backend_acked_exact(slot, 2).unwrap();
         assert!(table.finish_exact(slot, 2).is_some());
@@ -1883,7 +1915,7 @@ mod tests {
         request.apc_routine = 0;
         request.event_obj_idx = u64::MAX;
         request.signal_file = true;
-        request.sync_lock_owner_tid = 7;
+        request.busy = Some(test_busy(request.file_id, 7));
         let slot = table.park(request).unwrap();
 
         assert!(table.matches_completion_exact(slot, 21, 12, 7, nt_io_abi::major::IRP_MJ_CREATE,));
@@ -1920,7 +1952,7 @@ mod tests {
         request.apc_routine = 0;
         request.event_obj_idx = u64::MAX;
         request.signal_file = true;
-        request.sync_lock_owner_tid = 7;
+        request.busy = Some(test_busy(request.file_id, 7));
         let slot = table.park(request).unwrap();
 
         assert!(table.matches_completion_exact(
@@ -1955,7 +1987,7 @@ mod tests {
         direct.apc_routine = 0;
         direct.event_obj_idx = u64::MAX;
         direct.signal_file = true;
-        direct.sync_lock_owner_tid = 9;
+        direct.busy = Some(test_busy(direct.file_id, 9));
         let direct_slot = table.park(direct).unwrap();
         table
             .retarget_set_file_name_query_exact(

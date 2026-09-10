@@ -138,7 +138,7 @@ fn provider_fault_does_not_skip_payload_signals_apc_reply_or_file_lock() {
         apc_routine: 0x3000,
         reply_cap: 5,
         reply_required: true,
-        sync_lock_owner_tid: TID,
+        busy: Some(test_busy(provider().file_id, TID)),
         ..provider()
     };
     let slot = table.park(request).unwrap();
@@ -152,12 +152,13 @@ fn provider_fault_does_not_skip_payload_signals_apc_reply_or_file_lock() {
         IO_DELIVERY_FILE_PUBLISHED,
         IO_DELIVERY_EVENT_PUBLISHED,
         IO_DELIVERY_APC_PUBLISHED,
-        IO_DELIVERY_FILE_LOCK_RELEASED,
     ] {
         assert!(!table.completion_surfaces_settled_exact(slot, IRP));
         assert!(table.mark_backend_acked_exact(slot, IRP).is_none());
         table.mark_delivery_exact(slot, IRP, flag).unwrap();
     }
+    assert!(table.claim_reply_cap_exact(slot, IRP).is_none());
+    settle_test_busy(&mut table, slot, IRP);
     assert_eq!(table.claim_reply_cap_exact(slot, IRP), Some(Some(5)));
     assert!(table.mark_backend_acked_exact(slot, IRP).is_none());
     table.mark_reply_published_exact(slot, IRP).unwrap();

@@ -24496,6 +24496,21 @@ impl ExecFileCompletion {
         unsafe { (&*self.table).io_mode(file_id) }
     }
 
+    fn io_waiter_count(&self, file_id: u64) -> Result<u32, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).io_waiter_count(file_id) }
+    }
+
+    fn io_lock_owner(&self, file_id: u64) -> Result<Option<u64>, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).io_lock_owner(file_id) }
+    }
+
+    fn io_grant_owner(&self, file_id: u64) -> Result<Option<u64>, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).io_grant_owner(file_id) }
+    }
+
     fn begin_io(
         &mut self,
         file_id: u64,

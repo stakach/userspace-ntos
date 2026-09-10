@@ -138,6 +138,8 @@ pub use local_set_information::{
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
 pub use pending_io::{
+    FileIoBusyOwner, PendingFileBusy, PendingFileBusyError, PendingFileBusyPhase,
+    PendingFileBusyReleaseAttempt, PendingFileBusyWakeAttempt,
     PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoParkError,
     LocalFlushMode, PendingFileIoReservation, PendingFileIoTable, PendingLocalBuffered,
     PendingLocalByteLock, PendingLocalDirectoryNotify, PendingLocalFlush, PendingLocalInline,

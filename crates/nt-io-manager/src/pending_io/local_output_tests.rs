@@ -403,6 +403,8 @@ fn extraction_reset_and_reused_slots_do_not_retain_previous_buffers() {
     let next = table.reserve().unwrap();
     assert_eq!(next.slot, slot);
     table.reserve_local_output(next, 1).unwrap();
+    assert!(!table.reset());
+    assert!(table.cancel_reservation(next));
     assert!(table.reset());
     assert!(table.local_outputs.is_empty());
     assert!(table.is_empty());

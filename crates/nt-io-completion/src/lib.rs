@@ -560,6 +560,12 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
+    pub fn io_grant_owner(&self, file_id: u64) -> Result<Option<u64>, u32> {
+        self.entry(file_id)
+            .map(|entry| entry.serialization.io_grant_owner())
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
     pub fn io_waiter_count(&self, file_id: u64) -> Result<u32, u32> {
         self.entry(file_id)
             .map(|entry| entry.serialization.io_waiter_count())

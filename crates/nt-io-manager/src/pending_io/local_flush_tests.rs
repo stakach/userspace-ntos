@@ -139,7 +139,7 @@ fn malformed_shapes_do_not_consume_the_exact_reservation() {
         |p| p.event_obj_idx = 1,
         |p| p.publish_iocp = true,
         |p| p.completion_port_suppressed = false,
-        |p| p.sync_lock_owner_tid = p.tid,
+        |p| p.busy = Some(test_busy(p.file_id, p.tid)),
         |p| p.signal_file = true,
         |p| p.iosb_va = 0,
         |p| p.consumer_abandoned = true,

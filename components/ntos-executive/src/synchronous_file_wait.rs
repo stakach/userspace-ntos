@@ -47,22 +47,24 @@ pub(crate) unsafe fn synchronous_file_cancel_waiter(
     }
 }
 
-pub(crate) unsafe fn synchronous_file_wake_next(
+pub(super) unsafe fn try_synchronous_file_wake_next(
     nt_handler: &mut ExecNtHandler,
     key: FileIoWaitKey,
-) -> bool {
+) -> Result<bool, u32> {
     if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_promoted_for_file(key) {
         synchronous_file_retry::deliver_file(nt_handler, key);
-        return true;
+        return Ok(true);
     }
     let next = (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).oldest_waiting_for_file(key);
     let Some((slot, waiter)) = next else {
-        return match key {
+        return Ok(match key {
             FileIoWaitKey::Hosted(file_id) => {
+                if nt_handler.file_completion.io_waiter_count(file_id)? != 0 {
+                    return Err(nt_fs::STATUS_DATA_ERROR);
+                }
                 if nt_handler
                     .file_completion
-                    .promote_cleanup_if_ready(file_id)
-                    .expect("synchronous File cleanup lost its policy owner")
+                    .promote_cleanup_if_ready(file_id)?
                 {
                     start_file_cleanup(nt_handler, file_id);
                     true
@@ -72,8 +74,13 @@ pub(crate) unsafe fn synchronous_file_wake_next(
             }
             // nt-fs transitions already attempt ready cleanup. Failed preparation remains owned
             // for the service-loop cleanup barrier, not an invariant failure or a second close.
-            FileIoWaitKey::LocalOverlay(_) => false,
-        };
+            FileIoWaitKey::LocalOverlay(file_id) => {
+                if crate::writable_fs::file_io_waiter_count(file_id)? != 0 {
+                    return Err(nt_fs::STATUS_DATA_ERROR);
+                }
+                false
+            }
+        });
     };
     match waiter.route {
         FileIoWaitRoute::Hosted { file_id, .. } => nt_handler
@@ -82,13 +89,17 @@ pub(crate) unsafe fn synchronous_file_wake_next(
         FileIoWaitRoute::LocalOverlay { file_object } => {
             crate::writable_fs::promote_file_io_waiter(file_object, waiter.tid)
         }
-    }
-    .expect("synchronous File waiter count lost its FIFO owner");
+    }?;
     (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
         .promote_exact(slot, key, waiter.tid)
         .expect("synchronous File FIFO promotion lost exact waiter");
     synchronous_file_retry::deliver_file(nt_handler, key);
-    true
+    Ok(true)
+}
+
+unsafe fn synchronous_file_wake_next(nt_handler: &mut ExecNtHandler, key: FileIoWaitKey) -> bool {
+    try_synchronous_file_wake_next(nt_handler, key)
+        .expect("synchronous File wake lost its policy owner")
 }
 
 /// Existing terminal/current-syscall ownership is still hosted-only. Local admission must not

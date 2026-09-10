@@ -12,6 +12,9 @@ mod component_callback_transfer;
 mod synchronous_file_retry;
 #[path = "synchronous_file_wait.rs"]
 mod synchronous_file_wait;
+use synchronous_file_wait::try_synchronous_file_wake_next;
+#[path = "pending_file_busy.rs"]
+mod pending_file_busy;
 pub(crate) use synchronous_file_wait::{
     synchronous_file_cancel_waiter, synchronous_file_release_and_wake,
 };
@@ -11792,7 +11795,14 @@ pub(crate) unsafe fn service_sec_image(
                             .as_mut()
                             .expect("pending File lock owner disappeared");
                         assert_eq!(pending.file_id, nt_handler.current_synchronous_file_lock);
-                        pending.sync_lock_owner_tid = nt_handler.current_tid;
+                        pending.busy = Some(nt_io_manager::PendingFileBusy::new(
+                            nt_io_manager::FileIoBusyOwner {
+                                key: nt_io_manager::FileIoWaitKey::Hosted(pending.file_id),
+                                tid: nt_handler.current_tid,
+                                mode: nt_handler.file_completion.io_mode(pending.file_id)
+                                    .expect("pending File transfer lost its captured mode"),
+                            },
+                        ));
                         nt_handler.current_synchronous_file_lock = 0;
                     }
                     let pending = nt_handler
@@ -25031,8 +25041,23 @@ unsafe fn file_cleanup_wait_transfer(
 /// Publish terminal results for general pending File IRPs in NT completion order. The backend
 /// completion remains retained until every required surface and synchronous reply is visible.
 unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
-    synchronous_file_retry::redrive_retirement(nt_handler);
-    nt_handler.publish_local_byte_lock_completions();
+    let (delivered, settled) = pending_file_io_redrive_pass(nt_handler, false);
+    if settled == 0 {
+        return delivered;
+    }
+    // Complete newly settled Busy owners before sleeping on the fault endpoint. This bounded
+    // pass cannot create more release/wake work or require an unrelated syscall to deliver replies.
+    delivered + pending_file_io_redrive_pass(nt_handler, true).0
+}
+
+unsafe fn pending_file_io_redrive_pass(
+    nt_handler: &mut ExecNtHandler,
+    finish_settled_busy_only: bool,
+) -> (u64, usize) {
+    if !finish_settled_busy_only {
+        synchronous_file_retry::redrive_retirement(nt_handler);
+        nt_handler.publish_local_byte_lock_completions();
+    }
     let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
     let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
@@ -25066,6 +25091,8 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
 
     let mut snapshot: alloc::vec::Vec<_> = (&*core::ptr::addr_of!(PENDING_FILE_IO))
         .drain_all()
+        .filter(|(_, pending)| !finish_settled_busy_only
+            || pending.busy.is_some_and(|busy| busy.is_settled()))
         .collect();
     // Publish provider CREATE metadata before transfers whose completion depends on that endpoint
     // transition. In particular, a client pipe CREATE records/consumes its exact server-instance
@@ -25078,6 +25105,10 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     });
     let mut delivered = 0u64;
     for (slot, mut pending) in snapshot {
+        let Some(live) = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+            .get(slot).filter(|live| live.irp_id == pending.irp_id)
+        else { continue; };
+        pending = live;
         let set_file_name_id = match pending.operation {
             nt_io_manager::PendingFileIoOperation::SetFileName(operation) => {
                 nt_io_manager::PendingSetFileNameId::from_raw(operation.transaction_id)
@@ -25170,10 +25201,14 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         nt_handler.current_sp = pending.resume_sp;
         nt_handler.current_flags = pending.resume_flags;
 
-        let mut delivery_state = (&*core::ptr::addr_of!(PENDING_FILE_IO))
-            .get(slot)
-            .expect("pending File owner disappeared")
-            .delivery_state;
+        let Some(live) = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+            .get(slot).filter(|live| live.irp_id == pending.irp_id)
+        else {
+            restore_file_io_mirrors!();
+            continue;
+        };
+        pending = live;
+        let mut delivery_state = pending.delivery_state;
         let mut terminal_status = transaction_terminal
             .map(|result| result.0)
             .or_else(|| local_terminal.map(|result| result.0))
@@ -25816,21 +25851,12 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 .expect("pending File IOCP owner disappeared");
         }
 
-        if pending.sync_lock_owner_tid != 0
-            && delivery_state & nt_io_manager::IO_DELIVERY_FILE_LOCK_RELEASED == 0
-        {
-            let _ = synchronous_file_release_and_wake(
-                nt_handler,
-                pending.file_id,
-                pending.sync_lock_owner_tid,
-            );
-            delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-                .mark_delivery_exact(
-                    slot,
-                    pending.irp_id,
-                    nt_io_manager::IO_DELIVERY_FILE_LOCK_RELEASED,
-                )
-                .expect("pending File lock-release owner disappeared");
+        if pending.busy.is_some_and(|busy| !busy.is_settled()) {
+            pending_file_busy::release_if_ready(nt_handler, slot, pending);
+            // Waking may enter provider cleanup and re-enter this loop. It runs only after the
+            // snapshot walk, with a separate retained attempt; this owner cannot reply/ACK yet.
+            restore_file_io_mirrors!();
+            continue;
         }
 
         if pending.reply_required
@@ -25968,7 +25994,13 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     }
     restore_file_io_mirrors!();
     nt_handler.loop_ctx = saved_ctx;
-    delivered
+    let settled = if finish_settled_busy_only {
+        0
+    } else {
+        pending_file_busy::redrive_wakes(nt_handler)
+    };
+    restore_file_io_mirrors!();
+    (delivered, settled)
 }
 
 /// Resume `NtCancelIoFile` only after every canonical IRP selected for its exact File/thread pair

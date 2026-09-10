@@ -32870,6 +32870,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     this is not accepted for activated local admission. Preserve captured scalar arguments and
     acquire-before-position resolution in the later whole-overlay cutover.
 
+    Retained pending File Busy retirement (2026-09-11, complete): replace the raw lock-owner
+    TID and generic lock-release bit publication with typed ownership and checked receipts.
+    - [x] Capture key/TID/mode in private-state Busy ownership; publish a fresh identity per
+      admitted record and protect release/wake attempts from cross-table or stale-slot results.
+    - [x] Separate definite release from retryable wake work. Generic delivery flags cannot forge
+      either receipt; gate reply/ACK/reference retirement and preserve abandoned/entered owners.
+    - [x] Wire native release-only followed by receipt publication, then defer reentrant wake work
+      until after the completion snapshot walk. Keep all local pending shapes rejecting Busy.
+    - [x] Compose real policy/FIFO/reference ownership with release/wake/refusal/reentry tests,
+      run serialized host/native validation and review the remaining local cutover requirements.
+
+    Audit refinement: synchronous_file_release_and_wake previously entered provider cleanup before
+    the pending owner recorded FILE_LOCK_RELEASED. Provider cleanup can re-enter the service loop,
+    exposing an already-consumed lock as unreleased. Record release before any wake callback and
+    retain wake work separately; a wake refusal may never re-authorize release. Release and wake
+    each need an entered ticket so dropped/uncertain invocation cannot be replayed. The pending
+    table must preserve such owners across teardown and refuse reset while occupied/reserved.
+    Wake runs after restoring the saved service context: lifecycle dispatch uses canonical File
+    client/device/driver context, not the arbitrary completing client's active process mirrors.
+    Review caught two delayed-wake ordering requirements. A later ordinary/cleanup Busy owner
+    inherits future FIFO wake responsibility; the older completion must settle independently,
+    without attempting promotion through the new owner. Validate missing count/grant ownership
+    rather than treating an empty queue as success. After successful wake settlement, run one
+    bounded finish-only pass over settled Busy owners before blocking on the fault endpoint;
+    that pass must not introduce further release/wake work or wait for an unrelated syscall.
+    The current immediate-dispatch lock remains hosted-only; local admission still awaits typed
+    pending routes, retained cancellation/prepublication rollback and complete lifecycle wiring.
+
+    Validation: 97 pending-I/O contract tests, 1425 focused host tests and 2685 broader host tests
+    passed, including 15 new Busy unit cases, two non-Clone compile-fail checks and five policy/FIFO/
+    reference composition cases. Composition covers definite release refusal, wake-only retry,
+    abandonment, dropped tickets, final-handle cleanup and a newer Busy owner with its own waiter.
+    Source/IPC outcomes in host fixtures are explicit test inputs, not native runtime proof.
+    The executive release build passed in 38.29s with the unchanged 294-warning baseline. Logs:
+    `.tmp/test-pending-file-busy-contract-20260911.log`,
+    `.tmp/test-pending-file-busy-focused-20260911.log`,
+    `.tmp/test-pending-file-busy-full-20260911.log`, and
+    `.tmp/build-pending-file-busy-executive-20260911.log`. All runners were serialized.
+    No VM run or microkernel change occurred; the 27 strict missing win32k imports and genuine
+    desktop acceptance remain open. Immediate-syscall release/cancellation still fail-stop on
+    invariant refusal; only pending Busy retirement has the checked release/wake receipts here.
+
+    Next checkpoint: replace privately encoded pending File IDs with explicit backend routes and
+    preserve raw canonical File keys across completion. Retained waiter cancellation and failed
+    prepublication park rollback must land before activating local Busy admission; do not weaken
+    the current local shape rejection or discard owned references/counts/replies on refusal.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.
