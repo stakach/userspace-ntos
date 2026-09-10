@@ -19,6 +19,7 @@ pub const IO_DELIVERY_BACKEND_ACKED: u16 = 1 << 8;
 pub const IO_DELIVERY_CREATE_COMMITTED: u16 = 1 << 9;
 pub const IO_DELIVERY_HANDLE_PUBLISHED: u16 = 1 << 10;
 pub const IO_DELIVERY_FILE_LOCK_RELEASED: u16 = 1 << 11;
+pub const IO_DELIVERY_LOCAL_REFERENCE_RELEASED: u16 = 1 << 12;
 
 const IO_DELIVERY_PUBLIC_FLAGS: u16 = IO_DELIVERY_BUFFER_PUBLISHED
     | IO_DELIVERY_IOSB_PUBLISHED
@@ -143,6 +144,21 @@ pub struct PendingFileIo {
     pub resume_ip: u64,
     pub resume_sp: u64,
     pub resume_flags: u64,
+}
+
+impl PendingFileIo {
+    /// The retained local result remains authoritative after filesystem bytes have been delivered
+    /// or acknowledged. Provider-backed operations obtain terminal metadata from their own owner.
+    pub fn local_terminal_result(&self) -> Option<(u32, u64)> {
+        let (status, information) = match self.operation {
+            PendingFileIoOperation::LocalByteLock(operation) => (operation.status, 0),
+            PendingFileIoOperation::LocalDirectoryNotify(operation) => {
+                (operation.status, u64::from(operation.information))
+            }
+            _ => return None,
+        };
+        (status != nt_status::NtStatus::PENDING.raw() as u32).then_some((status, information))
+    }
 }
 
 const DEFAULT_INITIAL_RESERVE: usize = 16;
@@ -671,7 +687,7 @@ impl PendingFileIoTable {
         if operation.status != nt_status::NtStatus::PENDING.raw() as u32 {
             return operation.status == status && operation.information == information;
         }
-        if information > pending.output_len
+        if (!pending.consumer_abandoned && information > pending.output_len)
             || (pending.output_va != 0 && pending.output_len != 0 && !output_published)
         {
             return false;
@@ -778,12 +794,18 @@ impl PendingFileIoTable {
     }
 
     /// Remove an exact owner only after all required surfaces and backend ACK were committed.
+    /// Local files additionally retain their owner until the final reference release succeeds.
     pub fn finish_exact(&mut self, slot: usize, irp_id: u64) -> Option<PendingFileIo> {
         let entry = self.slots.get_mut(slot)?;
         if entry.is_some_and(|pending| {
             pending.irp_id == irp_id
                 && pending.delivery_state & Self::required_delivery_state(pending)
                     == Self::required_delivery_state(pending)
+                && (!matches!(
+                    pending.operation,
+                    PendingFileIoOperation::LocalByteLock(_)
+                        | PendingFileIoOperation::LocalDirectoryNotify(_)
+                ) || pending.delivery_state & IO_DELIVERY_LOCAL_REFERENCE_RELEASED != 0)
         }) {
             entry.take()
         } else {
@@ -873,6 +895,22 @@ impl PendingFileIoTable {
         Some(pending.delivery_state)
     }
 
+    /// Acknowledge the final local FILE_OBJECT reference release only after terminal delivery and
+    /// filesystem ACK. A failed release leaves the pending record intact for an exact retry.
+    pub fn mark_local_reference_released_exact(&mut self, slot: usize, irp_id: u64) -> Option<u16> {
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        if pending.irp_id != irp_id
+            || pending.local_terminal_result().is_none()
+            || pending.delivery_state & IO_DELIVERY_LOCAL_REFERENCE_RELEASED != 0
+            || pending.delivery_state & Self::required_delivery_state(*pending)
+                != Self::required_delivery_state(*pending)
+        {
+            return None;
+        }
+        pending.delivery_state |= IO_DELIVERY_LOCAL_REFERENCE_RELEASED;
+        Some(pending.delivery_state)
+    }
+
     /// Detach the dead thread's user-visible surfaces without retiring the exact IRP owner. The
     /// caller releases any transferred reply cap and requests cancellation; terminal redrive still
     /// owns backend ACK, Busy release, and the retained File reference.
@@ -944,6 +982,10 @@ impl PendingFileIoTable {
         count
     }
 }
+
+#[cfg(test)]
+#[path = "pending_io/local_delivery_tests.rs"]
+mod local_delivery_tests;
 
 #[cfg(test)]
 mod tests {

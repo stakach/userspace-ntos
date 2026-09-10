@@ -14280,7 +14280,16 @@ impl ExecNtHandler {
             matched = requests.len();
             for (directory_notify, request_id) in requests {
                 terminal += if directory_notify {
-                    self.cancel_local_directory_notify(file_object, request_id) as usize
+                    match self.cancel_local_directory_notify(file_object, request_id) {
+                        Ok(cancelled) => cancelled as usize,
+                        Err(status) => {
+                            crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING
+                                .store(true, Ordering::Release);
+                            self.xas_write_buf(iosb, &status.to_le_bytes());
+                            self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                            return status;
+                        }
+                    }
                 } else {
                     nt_fs::ByteRangeWaitId::from_raw(request_id)
                         .is_some_and(|wait_id| self.byte_range_locks.cancel_wait(wait_id))
@@ -29330,16 +29339,20 @@ impl ExecNtHandler {
     }
 
     pub(crate) fn release_local_file_io_reference(&mut self, file_object: u64) {
+        self.try_release_local_file_io_reference(file_object)
+            .expect("local pending I/O lost its FILE_OBJECT reference");
+    }
+
+    pub(crate) fn try_release_local_file_io_reference(&mut self, file_object: u64) -> Result<(), u32> {
         let object_id = (file_object & LOCAL_ID_PAYLOAD_MASK) as u32;
-        let result = match file_object & !LOCAL_ID_PAYLOAD_MASK {
+        match file_object & !LOCAL_ID_PAYLOAD_MASK {
             LOCAL_FAT_FILE_OBJECT_TAG => self.readonly_file_opens.release_io(object_id),
             LOCAL_FAT_DIRECTORY_OBJECT_TAG => self.directory_opens.release_io(object_id),
             LOCAL_OVERLAY_FILE_OBJECT_TAG => unsafe {
                 crate::writable_fs::release_io_reference(file_object & LOCAL_ID_PAYLOAD_MASK)
             },
             _ => Err(nt_fs::STATUS_INVALID_HANDLE),
-        };
-        result.expect("local pending I/O lost its FILE_OBJECT reference");
+        }
     }
 
     pub(crate) fn signal_local_file_completion(&mut self, file_object: u64) -> u32 {
@@ -29481,50 +29494,59 @@ impl ExecNtHandler {
         &self,
         file_object: u64,
         notify_id: u64,
-    ) -> Option<(u32, u32)> {
-        let notify_id = nt_fs::DirectoryNotifyId::from_raw(notify_id)?;
+        irp_id: u64,
+    ) -> Result<Option<(u32, u32)>, u32> {
+        let notify_id = nt_fs::DirectoryNotifyId::from_raw(notify_id)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
         match file_object & !LOCAL_ID_PAYLOAD_MASK {
-            LOCAL_FAT_DIRECTORY_OBJECT_TAG => self
+            LOCAL_FAT_DIRECTORY_OBJECT_TAG => Ok(self
                 .readonly_directory_notifications
-                .completion(notify_id)
-                .map(|completion| (completion.status, completion.information)),
+                .completion_exact(notify_id, &irp_id)?
+                .map(|completion| (completion.status, completion.information))),
             LOCAL_OVERLAY_FILE_OBJECT_TAG => {
-                crate::writable_fs::directory_notify_completion(notify_id)
+                crate::writable_fs::directory_notify_completion(notify_id, irp_id)
             }
-            _ => None,
+            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
         }
     }
 
-    pub(crate) unsafe fn take_local_directory_notify_completion(
+    pub(crate) unsafe fn copy_local_directory_notify_completion(
         &mut self,
         file_object: u64,
         notify_id: u64,
-    ) -> Option<nt_fs::DirectoryNotifyCompletion<u64>> {
-        let notify_id = nt_fs::DirectoryNotifyId::from_raw(notify_id)?;
+        irp_id: u64,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<usize, u32> {
+        let notify_id = nt_fs::DirectoryNotifyId::from_raw(notify_id)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
         match file_object & !LOCAL_ID_PAYLOAD_MASK {
             LOCAL_FAT_DIRECTORY_OBJECT_TAG => self
                 .readonly_directory_notifications
-                .take_completion(notify_id),
+                .copy_completion_bytes(notify_id, &irp_id, offset, output),
             LOCAL_OVERLAY_FILE_OBJECT_TAG => {
-                crate::writable_fs::take_directory_notify_completion(notify_id)
+                crate::writable_fs::copy_directory_notify_completion(notify_id, irp_id, offset, output)
             }
-            _ => None,
+            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
         }
     }
 
-    pub(crate) unsafe fn restore_local_directory_notify_completion(
+    pub(crate) unsafe fn acknowledge_local_directory_notify_completion(
         &mut self,
         file_object: u64,
-        completion: nt_fs::DirectoryNotifyCompletion<u64>,
-    ) {
+        notify_id: u64,
+        irp_id: u64,
+    ) -> Result<(), u32> {
+        let notify_id = nt_fs::DirectoryNotifyId::from_raw(notify_id)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
         match file_object & !LOCAL_ID_PAYLOAD_MASK {
             LOCAL_FAT_DIRECTORY_OBJECT_TAG => self
                 .readonly_directory_notifications
-                .restore_completion_front(completion),
+                .acknowledge_completion(notify_id, &irp_id),
             LOCAL_OVERLAY_FILE_OBJECT_TAG => {
-                crate::writable_fs::restore_directory_notify_completion(completion)
+                crate::writable_fs::acknowledge_directory_notify_completion(notify_id, irp_id)
             }
-            _ => panic!("local directory notification lost its filesystem owner"),
+            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
         }
     }
 
@@ -29532,16 +29554,16 @@ impl ExecNtHandler {
         &mut self,
         file_object: u64,
         notify_id: u64,
-    ) -> bool {
+    ) -> Result<bool, u32> {
         let Some(notify_id) = nt_fs::DirectoryNotifyId::from_raw(notify_id) else {
-            return false;
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
         };
         match file_object & !LOCAL_ID_PAYLOAD_MASK {
             LOCAL_FAT_DIRECTORY_OBJECT_TAG => {
-                self.readonly_directory_notifications.cancel(notify_id)
+                Ok(self.readonly_directory_notifications.cancel(notify_id))
             }
             LOCAL_OVERLAY_FILE_OBJECT_TAG => crate::writable_fs::cancel_directory_notify(notify_id),
-            _ => false,
+            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
         }
     }
 

@@ -3863,18 +3863,30 @@ impl FileSystem {
         self.notifications.completion(id)
     }
 
-    pub fn take_directory_notify_completion(
-        &mut self,
+    pub fn directory_notify_completion_exact(
+        &self,
         id: crate::DirectoryNotifyId,
-    ) -> Option<crate::DirectoryNotifyCompletion<u64>> {
-        self.notifications.take_completion(id)
+        context: u64,
+    ) -> Result<Option<&crate::DirectoryNotifyCompletion<u64>>, u32> {
+        self.notifications.completion_exact(id, &context)
     }
 
-    pub fn restore_directory_notify_completion(
+    pub fn copy_directory_notify_completion(
+        &self,
+        id: crate::DirectoryNotifyId,
+        context: u64,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<usize, u32> {
+        self.notifications.copy_completion_bytes(id, &context, offset, output)
+    }
+
+    pub fn acknowledge_directory_notify_completion(
         &mut self,
-        completion: crate::DirectoryNotifyCompletion<u64>,
-    ) {
-        self.notifications.restore_completion_front(completion);
+        id: crate::DirectoryNotifyId,
+        context: u64,
+    ) -> Result<(), u32> {
+        self.notifications.acknowledge_completion(id, &context)
     }
 
     fn report_handle_change(&mut self, handle: u64, filter: u32) {

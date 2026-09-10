@@ -2034,30 +2034,33 @@ pub(crate) unsafe fn notify_change_directory(
     )
 }
 
-pub(crate) unsafe fn cancel_directory_notify(id: nt_fs::DirectoryNotifyId) -> bool {
-    writable_fs().is_ok_and(|fs| fs.zw_cancel_directory_notify(id))
+pub(crate) unsafe fn cancel_directory_notify(id: nt_fs::DirectoryNotifyId) -> Result<bool, u32> {
+    Ok(writable_fs()?.zw_cancel_directory_notify(id))
 }
 
 pub(crate) unsafe fn directory_notify_completion(
     id: nt_fs::DirectoryNotifyId,
-) -> Option<(u32, u32)> {
-    writable_fs().ok()?
-        .directory_notify_completion(id)
-        .map(|completion| (completion.status, completion.information))
+    context: u64,
+) -> Result<Option<(u32, u32)>, u32> {
+    Ok(writable_fs()?
+        .directory_notify_completion_exact(id, context)?
+        .map(|completion| (completion.status, completion.information)))
 }
 
-pub(crate) unsafe fn take_directory_notify_completion(
+pub(crate) unsafe fn copy_directory_notify_completion(
     id: nt_fs::DirectoryNotifyId,
-) -> Option<nt_fs::DirectoryNotifyCompletion<u64>> {
-    writable_fs().ok()?.take_directory_notify_completion(id)
+    context: u64,
+    offset: usize,
+    output: &mut [u8],
+) -> Result<usize, u32> {
+    writable_fs()?.copy_directory_notify_completion(id, context, offset, output)
 }
 
-pub(crate) unsafe fn restore_directory_notify_completion(
-    completion: nt_fs::DirectoryNotifyCompletion<u64>,
-) {
-    if let Ok(fs) = writable_fs() {
-        fs.restore_directory_notify_completion(completion);
-    }
+pub(crate) unsafe fn acknowledge_directory_notify_completion(
+    id: nt_fs::DirectoryNotifyId,
+    context: u64,
+) -> Result<(), u32> {
+    writable_fs()?.acknowledge_directory_notify_completion(id, context)
 }
 
 /// `NtClose` on a writable-volume file object (honours a pending delete).

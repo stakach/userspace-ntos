@@ -32199,6 +32199,46 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     unchanged (.tmp/build-checked-overlay-executive-final-20260910.log). Root serialized every
     build/test; no VM run, filesystem exclusion or desktop acceptance is claimed.
 
+    Retained directory-notification delivery checkpoint (2026-09-10): close the destructive
+    take/restore gap before writable filesystem access can become Busy.
+    - [x] Keep encoded notification bytes in their FSD table until exact final acknowledgement.
+      Add context-checked terminal observation and allocation-free range copies; malformed state,
+      crossed request identity and invalid range do not change output or remove the completion.
+      Remove native take/restore routes, their filesystem facade, and the old unchecked by-ID
+      take/restore table APIs. The ordinary pop API remains for direct in-process consumers.
+    - [x] Use the existing staged pending-I/O output loop and recorded offset for local notifications.
+      Copy failure retains the payload and progress; only fully copied output commits the local
+      terminal result. Redrive uses that retained result for subsequent IOSB/event/File/APC/reply
+      work, including after FSD ACK. This fixes an existing stall: the old path consumed the FSD
+      completion before IOSB publication, then could not find its terminal result on a late retry.
+    - [x] Preserve explicit admission errors in notification inspection/copy/cancellation/ACK.
+      Teardown retains the pending owner and retries cancellation when access becomes available;
+      an already completed namespace change keeps its genuine result. An abandoned consumer can
+      retain nonzero terminal information after its user buffer was removed, without publishing it.
+    - [x] Require a typed, one-shot local-reference-release acknowledgement after all surfaces and
+      backend ACK, before PendingFileIo retirement. Failed local byte-lock/notification reference
+      release now leaves the delivery owner available for exact retry instead of removing it first.
+      Successful FSD ACK is recorded and never repeated on a later reference-release retry.
+
+    Review adjustment: the immediate runtime bug was notification retry, so this checkpoint closes
+    that full delivery path rather than adding a partial filesystem guard. Ordinary overlay handle
+    close still removes Ps ownership before a void volume close, and create/duplicate/inheritance
+    rollback owns only raw file IDs. Reserve a retained close/reference owner before those transfers;
+    include final-handle byte-lock cleanup and cleanup-generated notifications in that ownership.
+    Inline begin/finish-local-I/O rollback still uses an infallible release assertion and must be
+    migrated with that owner. Handle-query Option results and private global filesystem borrows
+    remain open. No Busy-producing native filesystem lease is enabled until those paths are ready.
+
+    Validation: 1,871 host tests/doctests passed across nt-fs, nt-io-manager, nt-config-abi,
+    nt-config-client, nt-config-server, nt-config-manager, nt-hive-core, nt-security and nt-user-host.
+    Nineteen new tests cover checked FSD copies/ACK, exact local-reference retirement, consumer
+    abandonment and FSD/I/O Manager integration across partial output and late-surface/release
+    retries. Evidence: .tmp/test-retained-notify-focused-20260910.log and
+    .tmp/test-retained-notify-full-20260910.log. The native executive release build passed in 37.96s
+    with the existing 293 warnings unchanged (.tmp/build-retained-notify-executive-20260910.log).
+    Root serialized every build/test. No VM, microkernel change, filesystem exclusion or desktop
+    acceptance is claimed by this checkpoint.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

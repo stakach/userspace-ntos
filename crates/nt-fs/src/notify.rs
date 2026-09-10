@@ -9,8 +9,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::{
-    STATUS_CANCELLED, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER,
-    STATUS_NOTIFY_CLEANUP, STATUS_NOTIFY_ENUM_DIR, STATUS_SUCCESS,
+    STATUS_CANCELLED, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_HANDLE,
+    STATUS_INVALID_PARAMETER, STATUS_NOTIFY_CLEANUP, STATUS_NOTIFY_ENUM_DIR, STATUS_SUCCESS,
 };
 
 pub const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
@@ -213,23 +213,6 @@ impl<C> DirectoryNotifyTable<C> {
             .find(|completion| completion.id == id)
     }
 
-    pub fn take_completion(
-        &mut self,
-        id: DirectoryNotifyId,
-    ) -> Option<DirectoryNotifyCompletion<C>> {
-        let index = self
-            .completions
-            .iter()
-            .position(|completion| completion.id == id)?;
-        self.completions.remove(index)
-    }
-
-    /// Restore a completion whose user-buffer publication could not finish. The immediately
-    /// preceding removal leaves capacity for this infallible retry path.
-    pub fn restore_completion_front(&mut self, completion: DirectoryNotifyCompletion<C>) {
-        self.completions.push_front(completion);
-    }
-
     fn complete_matching(
         &mut self,
         predicate: impl Fn(&DirectoryNotifyRequest<C>) -> bool,
@@ -247,6 +230,74 @@ impl<C> DirectoryNotifyTable<C> {
             bytes: Vec::new(),
         });
         true
+    }
+}
+
+impl<C: PartialEq> DirectoryNotifyTable<C> {
+    /// Inspect one retained terminal completion without consuming its bytes. Only an unknown
+    /// nonzero identity returns None; a crossed request context or malformed result is an error.
+    pub fn completion_exact(
+        &self,
+        id: DirectoryNotifyId,
+        expected_context: &C,
+    ) -> Result<Option<&DirectoryNotifyCompletion<C>>, u32> {
+        if id.raw() == 0 {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let Some(completion) = self.completion(id) else {
+            return Ok(None);
+        };
+        if &completion.context != expected_context {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        if completion.status == 0x0000_0103 // STATUS_PENDING
+            || completion.information as usize != completion.bytes.len()
+            || (completion.status != STATUS_SUCCESS && completion.information != 0)
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(Some(completion))
+    }
+
+    /// Copy an exact byte range while retaining the completion for further copies or retries.
+    /// Invalid identity, result shape, or range leaves the entire destination unchanged.
+    pub fn copy_completion_bytes(
+        &self,
+        id: DirectoryNotifyId,
+        expected_context: &C,
+        offset: usize,
+        out: &mut [u8],
+    ) -> Result<usize, u32> {
+        let completion = self
+            .completion_exact(id, expected_context)?
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let end = offset
+            .checked_add(out.len())
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let bytes = completion
+            .bytes
+            .get(offset..end)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        out.copy_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    /// Retire exactly one checked completion after its consumer has finished delivery. Errors
+    /// retain the original record, and repeated acknowledgement cannot consume a later result.
+    pub fn acknowledge_completion(
+        &mut self,
+        id: DirectoryNotifyId,
+        expected_context: &C,
+    ) -> Result<(), u32> {
+        self.completion_exact(id, expected_context)?
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let index = self
+            .completions
+            .iter()
+            .position(|completion| completion.id == id)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        self.completions.remove(index);
+        Ok(())
     }
 }
 
@@ -331,6 +382,10 @@ fn previous_record_offset(encoded: &[u8]) -> usize {
         offset += next;
     }
 }
+
+#[cfg(test)]
+#[path = "notify_delivery/tests.rs"]
+mod delivery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -452,9 +507,7 @@ mod tests {
             table.completion(cancelled).unwrap().status,
             STATUS_CANCELLED
         );
-        let completion = table.take_completion(cancelled).unwrap();
-        table.restore_completion_front(completion);
-        assert_eq!(table.pop_completion().unwrap().status, STATUS_CANCELLED);
+        table.acknowledge_completion(cancelled, &2).unwrap();
 
         table
             .register(3, r"\", FILE_NOTIFY_CHANGE_FILE_NAME, true, 64, 3)
