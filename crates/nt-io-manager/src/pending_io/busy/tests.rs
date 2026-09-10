@@ -7,7 +7,7 @@ const ERROR: u32 = 0xc000_009a;
 
 fn request() -> PendingFileIo {
     PendingFileIo {
-        file_id: FILE,
+        route: PendingFileRoute::Hosted(FILE),
         irp_id: IRP,
         major: nt_io_abi::major::IRP_MJ_READ,
         tid: TID,
@@ -245,6 +245,7 @@ fn admission_rejects_wrong_file_domain_tid_mode_and_local_variants() {
         assert!(PendingFileIoTable::new().park(pending).is_none());
     }
     let mut notify = request();
+    notify.route = PendingFileRoute::Local(LocalFileObject::Overlay(FILE));
     notify.major = nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL;
     notify.iosb_va = 0x1000;
     notify.operation = PendingFileIoOperation::LocalDirectoryNotify(PendingLocalDirectoryNotify {
@@ -390,7 +391,7 @@ fn apc_interruption_requires_captured_alertable_mode_and_unstarted_release() {
     let slot = table.park(pending).unwrap();
     assert!(table.user_apc_interrupt_candidate(TID).is_none());
     assert!(table
-        .mark_user_apc_interrupt_requested_exact(slot, IRP, FILE, TID)
+        .mark_user_apc_interrupt_requested_exact(slot, IRP, PendingFileRoute::Hosted(FILE), TID)
         .is_none());
 
     let (mut alertable, slot) = parked();
@@ -398,7 +399,7 @@ fn apc_interruption_requires_captured_alertable_mode_and_unstarted_release() {
     let mut release = alertable.begin_busy_release_exact(slot, IRP).unwrap();
     assert!(alertable.user_apc_interrupt_candidate(TID).is_none());
     assert!(alertable
-        .mark_user_apc_interrupt_requested_exact(slot, IRP, FILE, TID)
+        .mark_user_apc_interrupt_requested_exact(slot, IRP, PendingFileRoute::Hosted(FILE), TID)
         .is_none());
     alertable
         .record_busy_release(&mut release, Err(ERROR))

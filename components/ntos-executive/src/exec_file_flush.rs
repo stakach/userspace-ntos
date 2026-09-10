@@ -11,7 +11,7 @@ impl ExecNtHandler {
         else {
             return None;
         };
-        let file_object = LOCAL_OVERLAY_FILE_OBJECT_TAG | (file_id & LOCAL_ID_PAYLOAD_MASK);
+        let file_object = LocalFileObject::Overlay(file_id);
         let Some(access) = self.pm.handle_access(pid, process_handle) else {
             return Some(STATUS_INVALID_HANDLE);
         };
@@ -50,7 +50,7 @@ impl ExecNtHandler {
         // synchronous-API mode; it needs no pending-driver event or user-visible File signal.
         assert!(self.pending_file_io_transfer.is_none());
         self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-            file_id: file_object,
+            route: PendingFileRoute::Local(file_object),
             irp_id: request_id,
             major: major::IRP_MJ_FLUSH_BUFFERS,
             operation: nt_io_manager::PendingFileIoOperation::LocalFlush(completion),

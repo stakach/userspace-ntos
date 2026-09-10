@@ -11794,12 +11794,14 @@ pub(crate) unsafe fn service_sec_image(
                             .pending_file_io_transfer
                             .as_mut()
                             .expect("pending File lock owner disappeared");
-                        assert_eq!(pending.file_id, nt_handler.current_synchronous_file_lock);
+                        let file_id = pending.route.hosted_file_id()
+                            .expect("hosted File Busy transfer has a local route");
+                        assert_eq!(file_id, nt_handler.current_synchronous_file_lock);
                         pending.busy = Some(nt_io_manager::PendingFileBusy::new(
                             nt_io_manager::FileIoBusyOwner {
-                                key: nt_io_manager::FileIoWaitKey::Hosted(pending.file_id),
+                                key: nt_io_manager::FileIoWaitKey::Hosted(file_id),
                                 tid: nt_handler.current_tid,
-                                mode: nt_handler.file_completion.io_mode(pending.file_id)
+                                mode: nt_handler.file_completion.io_mode(file_id)
                                     .expect("pending File transfer lost its captured mode"),
                             },
                         ));
@@ -24317,7 +24319,8 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
             operation.alertable
         }
         _ => {
-            nt_handler.file_completion.io_mode(pending.file_id)
+            nt_handler.file_completion.io_mode(pending.route.hosted_file_id()
+                .expect("provider APC candidate lost its File route"))
                 == Ok(nt_io_completion::FileIoMode::SynchronousAlertable)
         }
     };
@@ -24337,7 +24340,7 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
         return false;
     }
     (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-        .mark_user_apc_interrupt_requested_exact(slot, pending.irp_id, pending.file_id, pending.tid)
+        .mark_user_apc_interrupt_requested_exact(slot, pending.irp_id, pending.route, pending.tid)
         .expect("APC interruption candidate lost its exact pending File owner");
 
     let cancellation = match pending.operation {
@@ -24352,7 +24355,10 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
             Ok(cancelled)
         }
         nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
-            nt_handler.cancel_local_directory_notify(pending.file_id, operation.notify_id)
+            nt_handler.cancel_local_directory_notify(
+                pending.route.local_file_object().expect("local notify lost its route"),
+                operation.notify_id,
+            )
         }
         _ => driver_launch::cancel_irp_if_pending(pending.irp_id),
     };
@@ -24905,6 +24911,28 @@ pub(crate) unsafe fn pending_driver_start_abandon_thread(
     abandoned
 }
 
+pub(crate) fn print_pending_file_route(route: nt_io_manager::PendingFileRoute) {
+    use nt_io_manager::{LocalFileObject, PendingFileRoute};
+    match route {
+        PendingFileRoute::Hosted(id) => {
+            print_str(b"hosted/");
+            print_u64(id);
+        }
+        PendingFileRoute::Local(LocalFileObject::ReadonlyFile(id)) => {
+            print_str(b"readonly-file/");
+            print_u64(u64::from(id));
+        }
+        PendingFileRoute::Local(LocalFileObject::ReadonlyDirectory(id)) => {
+            print_str(b"readonly-directory/");
+            print_u64(u64::from(id));
+        }
+        PendingFileRoute::Local(LocalFileObject::Overlay(id)) => {
+            print_str(b"overlay/");
+            print_u64(id);
+        }
+    }
+}
+
 unsafe fn pending_file_io_transfer(
     mut pending: nt_io_manager::PendingFileIo,
     wait_for_completion: bool,
@@ -24932,7 +24960,7 @@ unsafe fn pending_file_io_transfer(
             print_str(b"[pending-file-owner] commit rejected error/file/irp/major/pi/tid/badge/sync/reply=");
             print_u64(commit_error_code(error));
             print_str(b"/");
-            print_u64(pending.file_id);
+            print_pending_file_route(pending.route);
             print_str(b"/");
             print_u64(pending.irp_id);
             print_str(b"/");
@@ -25109,6 +25137,8 @@ unsafe fn pending_file_io_redrive_pass(
             .get(slot).filter(|live| live.irp_id == pending.irp_id)
         else { continue; };
         pending = live;
+        let hosted_file_id = pending.route.hosted_file_id();
+        let local_file_object = pending.route.local_file_object();
         let set_file_name_id = match pending.operation {
             nt_io_manager::PendingFileIoOperation::SetFileName(operation) => {
                 nt_io_manager::PendingSetFileNameId::from_raw(operation.transaction_id)
@@ -25127,14 +25157,14 @@ unsafe fn pending_file_io_redrive_pass(
         } else if let nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) = pending.operation {
             if pending.consumer_abandoned
                 && nt_handler.cancel_local_directory_notify(
-                    pending.file_id, operation.notify_id,
+                    local_file_object.expect("local notify lost its File route"), operation.notify_id,
                 ).is_err()
             {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 continue;
             }
             match nt_handler.local_directory_notify_terminal(
-                pending.file_id, operation.notify_id, pending.irp_id,
+                local_file_object.expect("local notify lost its File route"), operation.notify_id, pending.irp_id,
             ) {
                 Ok(terminal) => terminal.map(|(status, information)| (status, u64::from(information))),
                 Err(_) => {
@@ -25174,9 +25204,9 @@ unsafe fn pending_file_io_redrive_pass(
             && pending.major == nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
             && pending.control_code == crate::exec_handler::FSCTL_PIPE_LISTEN;
         let pipe_listen_server_context = is_pipe_listen
-            .then(|| driver_launch::hosted_file_route(pending.file_id).map(|(_, context)| context))
+            .then(|| hosted_file_id.and_then(driver_launch::hosted_file_route).map(|(_, context)| context))
             .flatten();
-        if !pending.is_local() && nt_handler.hosted_file_is_named_pipe(pending.file_id)
+        if hosted_file_id.is_some_and(|id| nt_handler.hosted_file_is_named_pipe(id))
             && (matches!(
                 pending.major,
                 nt_io_abi::major::IRP_MJ_READ | nt_io_abi::major::IRP_MJ_WRITE
@@ -25546,11 +25576,12 @@ unsafe fn pending_file_io_redrive_pass(
             }
         }
         if let nt_io_manager::PendingFileIoOperation::Create(create) = pending.operation {
+            let file_id = hosted_file_id.expect("provider CREATE lost its File route");
             let completed = completed.expect("pending process-visible CREATE has no completion");
             if delivery_state & nt_io_manager::IO_DELIVERY_CREATE_COMMITTED == 0 {
                 let reservation = ExecNtHandler::pending_create_reservation(create);
                 let publication = if (completed.status as i32) < 0 {
-                    nt_handler.cancel_hosted_create_publication(pending.file_id, reservation);
+                    nt_handler.cancel_hosted_create_publication(file_id, reservation);
                     HostedCreatePublication {
                         status: completed.status,
                         information: completed.information,
@@ -25560,7 +25591,7 @@ unsafe fn pending_file_io_redrive_pass(
                 } else {
                     match nt_handler.publish_npfs_create(
                         pending.major,
-                        pending.file_id,
+                        file_id,
                         completed.file_context.unwrap_or(0),
                         reservation,
                         create.desired_access,
@@ -25571,7 +25602,7 @@ unsafe fn pending_file_io_redrive_pass(
                         Ok(publication) => publication,
                         Err(status) => {
                             nt_handler
-                                .cancel_hosted_create_publication(pending.file_id, reservation);
+                                .cancel_hosted_create_publication(file_id, reservation);
                             HostedCreatePublication {
                                 status,
                                 information: 0,
@@ -25668,7 +25699,8 @@ unsafe fn pending_file_io_redrive_pass(
                     }
                     nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
                         nt_handler.copy_local_directory_notify_completion(
-                            pending.file_id, operation.notify_id, pending.irp_id,
+                            local_file_object.expect("local notify lost its File route"),
+                            operation.notify_id, pending.irp_id,
                             offset as usize, &mut work[..chunk],
                         )
                     }
@@ -25688,9 +25720,9 @@ unsafe fn pending_file_io_redrive_pass(
                     copy_failed = true;
                     break;
                 }
-                if pending.major == nt_io_abi::major::IRP_MJ_READ || is_pipe_transceive {
+                if let Some(file_id) = hosted_file_id.filter(|_| pending.major == nt_io_abi::major::IRP_MJ_READ || is_pipe_transceive) {
                     nt_handler.observe_completed_npfs_read(
-                        pending.file_id,
+                        file_id,
                         pending.badge,
                         terminal_status,
                         terminal_information,
@@ -25783,9 +25815,9 @@ unsafe fn pending_file_io_redrive_pass(
         }
         if pending.signal_file && delivery_state & nt_io_manager::IO_DELIVERY_FILE_PUBLISHED == 0 {
             let status = if pending.is_local() {
-                nt_handler.signal_local_file_completion(pending.file_id)
+                nt_handler.signal_local_file_completion(local_file_object.expect("local completion lost its File route"))
             } else {
-                nt_handler.signal_file_completion(pending.file_id, terminal_status)
+                nt_handler.signal_file_completion(hosted_file_id.expect("provider completion lost its File route"), terminal_status)
             };
             if status != nt_fs::STATUS_SUCCESS {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
@@ -25827,7 +25859,7 @@ unsafe fn pending_file_io_redrive_pass(
             && delivery_state & nt_io_manager::IO_DELIVERY_IOCP_PUBLISHED == 0
         {
             let status = nt_handler.post_file_completion_packet(
-                pending.file_id,
+                hosted_file_id.expect("provider IOCP completion lost its File route"),
                 pending.apc_context,
                 terminal_status,
                 terminal_information,
@@ -25909,7 +25941,7 @@ unsafe fn pending_file_io_redrive_pass(
             let acknowledged = match pending.operation {
                 nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
                     nt_handler.acknowledge_local_directory_notify_completion(
-                        pending.file_id, operation.notify_id, pending.irp_id,
+                        local_file_object.expect("local notify lost its File route"), operation.notify_id, pending.irp_id,
                     )
                 }
                 _ if backend_ack_required => driver_launch::acknowledge_completed_irp(pending.irp_id),
@@ -25927,7 +25959,7 @@ unsafe fn pending_file_io_redrive_pass(
         if pending.is_local()
             && delivery_state & nt_io_manager::IO_DELIVERY_LOCAL_REFERENCE_RELEASED == 0
         {
-            if nt_handler.try_release_local_file_io_reference(pending.file_id).is_err() {
+            if nt_handler.try_release_local_file_io_reference(local_file_object.expect("local completion lost its File route")).is_err() {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 restore_file_io_mirrors!();
                 continue;
@@ -25942,7 +25974,7 @@ unsafe fn pending_file_io_redrive_pass(
             .expect("completed pending File owner did not retire");
         match finished.operation {
             nt_io_manager::PendingFileIoOperation::Transfer => {
-                nt_handler.release_file_reference(finished.file_id);
+                nt_handler.release_file_reference(finished.route.hosted_file_id().expect("provider completion lost its File route"));
             }
             nt_io_manager::PendingFileIoOperation::Create(create) => {
                 if create.handle_value == 0 {
@@ -25962,7 +25994,7 @@ unsafe fn pending_file_io_redrive_pass(
                     let _ =
                         driver_launch::abandon_unpublished_hosted_file(transaction.target_file_id);
                 }
-                nt_handler.release_file_reference(finished.file_id);
+                nt_handler.release_file_reference(finished.route.hosted_file_id().expect("provider rename lost its File route"));
             }
             nt_io_manager::PendingFileIoOperation::LocalByteLock(_)
             | nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(_)
@@ -25977,8 +26009,8 @@ unsafe fn pending_file_io_redrive_pass(
         if trace_completion {
             print_str(b"[file-io-complete] irp=0x");
             print_hex_u64(pending.irp_id);
-            print_str(b" file=0x");
-            print_hex_u64(pending.file_id);
+            print_str(b" file=");
+            print_pending_file_route(pending.route);
             print_str(b" major=0x");
             print_hex(pending.major as u32);
             if pending.control_code != 0 {

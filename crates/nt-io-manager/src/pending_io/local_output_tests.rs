@@ -6,7 +6,7 @@ fn prepared(length: usize) -> (PendingFileIoTable, PendingFileIoReservation, Pen
     let irp_id = table.local_operation_id(reservation).unwrap();
     table.reserve_local_output(reservation, length).unwrap();
     let pending = PendingFileIo {
-        file_id: 1,
+        route: PendingFileRoute::Local(LocalFileObject::Overlay(1)),
         irp_id,
         major: nt_io_abi::major::IRP_MJ_READ,
         operation: PendingFileIoOperation::LocalBuffered(PendingLocalBuffered {
@@ -97,6 +97,7 @@ fn failed_commit_retains_buffer_and_claim_for_corrected_exact_commit() {
     });
     let mut provider = pending;
     provider.operation = PendingFileIoOperation::Transfer;
+    provider.route = PendingFileRoute::Hosted(1);
     for invalid in [wrong_id, wrong_length, wrong_info, provider] {
         assert_eq!(
             table.park_reserved(reservation, invalid),
@@ -207,7 +208,7 @@ fn output_must_settle_before_other_surfaces_and_reply() {
         .is_none());
     assert!(table.claim_reply_cap_exact(slot, id).is_none());
     assert!(table
-        .mark_user_apc_interrupt_requested_exact(slot, id, pending.file_id, pending.tid)
+        .mark_user_apc_interrupt_requested_exact(slot, id, pending.route, pending.tid)
         .is_none());
     table.slots[slot]
         .as_mut()
@@ -359,6 +360,7 @@ fn completed_output_and_provider_rows_cannot_be_fault_rewritten() {
     let mut provider = pending;
     provider.irp_id += 1;
     provider.operation = PendingFileIoOperation::Transfer;
+    provider.route = PendingFileRoute::Hosted(1);
     assert_eq!(table.park(provider), Some(slot));
     assert!(table
         .settle_local_output_fault_exact(slot, provider.irp_id, provider.output_va, 0xc000_0005)

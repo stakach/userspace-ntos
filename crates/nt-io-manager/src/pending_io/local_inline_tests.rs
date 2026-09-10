@@ -6,7 +6,7 @@ const TID: u64 = 73;
 
 fn inline() -> PendingFileIo {
     PendingFileIo {
-        file_id: FILE,
+        route: PendingFileRoute::Local(LocalFileObject::Overlay(FILE)),
         irp_id: ID,
         major: nt_io_abi::major::IRP_MJ_LOCK_CONTROL,
         operation: PendingFileIoOperation::LocalInline(PendingLocalInline {
@@ -108,11 +108,11 @@ fn invalid_local_shapes_do_not_consume_the_reservation() {
         |request| request.output_len = 1,
         |request| request.output_offset = 1,
         |request| request.publish_iocp = true,
-        |request| request.busy = Some(test_busy(request.file_id, TID)),
+        |request| request.busy = Some(test_busy(FILE, TID)),
         |request| request.control_code = 1,
         |request| request.delivery_state = IO_DELIVERY_BACKEND_ACKED,
         |request| request.user_apc_interrupt_requested = true,
-        |request| request.file_id = 0,
+        |request| request.route = PendingFileRoute::Hosted(0),
         |request| request.irp_id = 0,
     ];
     for change in changes {
@@ -252,7 +252,7 @@ fn terminal_inline_cannot_be_replaced_or_treated_as_pending_provider_work() {
     assert!(!table.matches_completion_exact(slot, ID, FILE, TID, inline().major));
     assert!(table.user_apc_interrupt_candidate(TID).is_none());
     assert!(table
-        .mark_user_apc_interrupt_requested_exact(slot, ID, FILE, TID)
+        .mark_user_apc_interrupt_requested_exact(slot, ID, PendingFileRoute::Local(LocalFileObject::Overlay(FILE)), TID)
         .is_none());
     assert!(table.advance_output_exact(slot, ID, 0, 0).is_none());
     assert!(!table.complete_local_byte_lock_exact(ID, 1, 0xc000_0120));
@@ -377,6 +377,7 @@ fn teardown_defers_claimed_reply_until_rejection_or_publication_settles_it() {
     assert!(table.restore_reply_cap_exact(slot, ID, 76).is_none());
 
     let mut create = inline();
+    create.route = PendingFileRoute::Hosted(FILE);
     create.irp_id += 1;
     create.major = nt_io_abi::major::IRP_MJ_CREATE;
     create.operation = PendingFileIoOperation::Create(PendingFileCreate {
@@ -410,15 +411,16 @@ fn user_apc_redirect_stages_once_across_definitively_rejected_reply() {
     let mut table = PendingFileIoTable::new();
     let mut request = inline();
     request.operation = PendingFileIoOperation::Transfer;
+    request.route = PendingFileRoute::Hosted(FILE);
     request.major = nt_io_abi::major::IRP_MJ_READ;
-    request.busy = Some(test_busy(request.file_id, TID));
+    request.busy = Some(test_busy(FILE, TID));
     let slot = table.park(request).unwrap();
     assert!(table.mark_user_apc_staged_exact(slot, ID).is_none());
     assert!(table
         .mark_delivery_exact(slot, ID, IO_DELIVERY_USER_APC_STAGED)
         .is_none());
     table
-        .mark_user_apc_interrupt_requested_exact(slot, ID, FILE, TID)
+        .mark_user_apc_interrupt_requested_exact(slot, ID, PendingFileRoute::Hosted(FILE), TID)
         .unwrap();
     let unstaged = table.get(slot);
     assert!(table.claim_reply_cap_exact(slot, ID).is_none());

@@ -5,7 +5,7 @@ use nt_address_space::copy::MemoryCopyFailure;
 use nt_fs::*;
 use nt_io_manager::*;
 
-const FILE: u64 = 0xe400_0000_0000_0000;
+const FILE: u64 = 0;
 const OUTPUT: u64 = 0x1ffc;
 const IOSB: u64 = 0x9000;
 const REPLY: u64 = 81;
@@ -22,7 +22,7 @@ fn terminal(
     information: usize,
 ) -> PendingFileIo {
     PendingFileIo {
-        file_id: FILE,
+        route: PendingFileRoute::Local(LocalFileObject::Overlay(FILE)),
         irp_id: id,
         tid: 80,
         major,

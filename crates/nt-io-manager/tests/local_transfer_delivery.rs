@@ -5,7 +5,7 @@ use nt_fs::*;
 use nt_io_manager::*;
 
 const ID: u64 = 0xf100_0000_0000_0001;
-const FILE: u64 = 0xe100_0000_0000_0000;
+const FILE: u64 = 0;
 const TID: u64 = 51;
 const REPLY: u64 = 52;
 const PATH: &str = r"\??\C:\transfer";
@@ -33,7 +33,7 @@ fn fixture(synchronous: bool) -> (FileSystem, u64) {
 fn terminal(major: u8, status: u32, information: u64, synchronous: bool) -> PendingFileIo {
     let publish = nt_io_completion::file_io_status_publishes_completion(status, true);
     PendingFileIo {
-        file_id: FILE,
+        route: PendingFileRoute::Local(LocalFileObject::Overlay(FILE)),
         irp_id: ID,
         major,
         operation: PendingFileIoOperation::LocalInline(PendingLocalInline {

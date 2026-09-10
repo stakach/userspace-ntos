@@ -8,7 +8,6 @@ use nt_io_manager::*;
 const OUTPUT: u64 = 0x1ffc;
 const IOSB: u64 = 0x9000;
 const REPLY: u64 = 91;
-const FILE: u64 = 0xe500_0000_0000_0000;
 const INITIAL_POSITION: u64 = 17;
 const AV: u32 = 0xc000_0005;
 const GUARD: u32 = 0x8000_0001;
@@ -103,7 +102,7 @@ impl Work {
             .park_reserved(
                 reservation,
                 PendingFileIo {
-                    file_id: FILE | object as u64,
+                    route: PendingFileRoute::Local(LocalFileObject::ReadonlyFile(object)),
                     irp_id: id,
                     tid: 90,
                     major: nt_io_abi::major::IRP_MJ_READ,

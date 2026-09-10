@@ -8,6 +8,10 @@
 use alloc::vec::Vec;
 
 pub use local_flush::{LocalFlushMode, PendingLocalFlush};
+pub use route::{LocalFileObject, PendingFileRoute};
+
+#[path = "pending_io/route.rs"]
+mod route;
 pub use busy::{
     FileIoBusyOwner, PendingFileBusy, PendingFileBusyError, PendingFileBusyPhase,
     PendingFileBusyReleaseAttempt, PendingFileBusyWakeAttempt,
@@ -122,8 +126,8 @@ pub enum PendingFileIoOperation {
 /// One pending File-bound operation and every completion surface owned by that exact IRP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PendingFileIo {
-    /// Generation-protected I/O Manager File identity used for lifetime, cancellation, and signal.
-    pub file_id: u64,
+    /// Canonical File route used for lifetime, cancellation, and completion publication.
+    pub route: PendingFileRoute,
     /// Canonical provider IRP identity, or an exact local operation correlation for local variants.
     /// Local correlations never authorize provider terminal copy, cancellation or acknowledgement.
     pub irp_id: u64,
@@ -184,14 +188,7 @@ impl PendingFileIo {
     }
 
     pub const fn is_local(&self) -> bool {
-        matches!(
-            self.operation,
-            PendingFileIoOperation::LocalByteLock(_)
-                | PendingFileIoOperation::LocalDirectoryNotify(_)
-                | PendingFileIoOperation::LocalInline(_)
-                | PendingFileIoOperation::LocalBuffered(_)
-                | PendingFileIoOperation::LocalFlush(_)
-        )
+        self.route.local_file_object().is_some()
     }
 
     /// The retained local result remains authoritative after filesystem bytes have been delivered
@@ -379,7 +376,7 @@ impl PendingFileIoTable {
                         nt_io_abi::major::IRP_MJ_CREATE
                         | nt_io_abi::major::IRP_MJ_SET_INFORMATION => {
                             operation.target_file_id != 0
-                                && operation.target_file_id != pending.file_id
+                                && pending.hosted_file_id() != Some(operation.target_file_id)
                         }
                         _ => false,
                     }
@@ -438,7 +435,8 @@ impl PendingFileIoTable {
             pending.major,
             nt_io_abi::major::IRP_MJ_DEVICE_CONTROL | nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
         ) || pending.control_code == 0;
-        pending.file_id != 0
+        pending.route.is_valid()
+            && pending.route_matches_operation()
             && pending.irp_id != 0
             && create_valid
             && control_valid
@@ -670,7 +668,7 @@ impl PendingFileIoTable {
         &mut self,
         slot: usize,
         irp_id: u64,
-        file_id: u64,
+        route: PendingFileRoute,
         tid: u64,
     ) -> Option<()> {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
@@ -689,7 +687,7 @@ impl PendingFileIoTable {
             _ => false,
         };
         if pending.irp_id != irp_id
-            || pending.file_id != file_id
+            || pending.route != route
             || pending.tid != tid
             || !pending.reply_required
             || pending.consumer_abandoned
@@ -733,13 +731,16 @@ impl PendingFileIoTable {
         major: u8,
     ) -> bool {
         self.get(slot).is_some_and(|pending| {
+            let Some(source_file_id) = pending.hosted_file_id() else {
+                return false;
+            };
             let expected_file_id = match pending.operation {
                 PendingFileIoOperation::SetFileName(operation)
                     if pending.major == nt_io_abi::major::IRP_MJ_CREATE =>
                 {
                     operation.target_file_id
                 }
-                _ => pending.file_id,
+                _ => source_file_id,
             };
             !pending.is_local()
                 && pending.irp_id == irp_id
@@ -795,7 +796,7 @@ impl PendingFileIoTable {
             )
             || operation.target_file_id != 0
             || target_file_id == 0
-            || target_file_id == pending.file_id
+            || pending.hosted_file_id() == Some(target_file_id)
             || pending.delivery_state != 0
             || pending.busy.is_some_and(|busy| !busy.release_unstarted())
         {
@@ -1339,7 +1340,7 @@ mod tests {
 
     fn pending(file_id: u64, irp_id: u64, tid: u64) -> PendingFileIo {
         PendingFileIo {
-            file_id,
+            route: PendingFileRoute::Hosted(file_id),
             irp_id,
             major: nt_io_abi::major::IRP_MJ_DEVICE_CONTROL,
             control_code: 0,
@@ -1484,7 +1485,7 @@ mod tests {
         assert!(table.completion_surfaces_settled_exact(slot, 2));
         table.mark_backend_acked_exact(slot, 2).unwrap();
         let finished = table.finish_exact(slot, 2).unwrap();
-        assert_eq!(finished.file_id, request.file_id);
+        assert_eq!(finished.route, request.route);
         assert_eq!(finished.irp_id, request.irp_id);
         assert_eq!(finished.major, nt_io_abi::major::IRP_MJ_WRITE);
     }
@@ -1575,7 +1576,7 @@ mod tests {
         request.apc_routine = 0;
         request.publish_iocp = true;
         request.signal_file = true;
-        request.busy = Some(test_busy(request.file_id, request.tid));
+        request.busy = Some(test_busy(request.hosted_file_id().unwrap(), request.tid));
         let slot = table.park(request).unwrap();
 
         table.advance_output_exact(slot, 2, 8, 8).unwrap();
@@ -1600,17 +1601,17 @@ mod tests {
         let mut table = PendingFileIoTable::new();
         let asynchronous_slot = table.park(pending(1, 2, 7)).unwrap();
         let mut synchronous = pending(3, 4, 7);
-        synchronous.busy = Some(test_busy(synchronous.file_id, 7));
+        synchronous.busy = Some(test_busy(synchronous.hosted_file_id().unwrap(), 7));
         let synchronous_slot = table.park(synchronous).unwrap();
 
         let (slot, candidate) = table.user_apc_interrupt_candidate(7).unwrap();
         assert_eq!(slot, synchronous_slot);
         assert_eq!(candidate.irp_id, 4);
         assert!(table
-            .mark_user_apc_interrupt_requested_exact(slot, 5, 3, 7)
+            .mark_user_apc_interrupt_requested_exact(slot, 5, PendingFileRoute::Hosted(3), 7)
             .is_none());
         table
-            .mark_user_apc_interrupt_requested_exact(slot, 4, 3, 7)
+            .mark_user_apc_interrupt_requested_exact(slot, 4, PendingFileRoute::Hosted(3), 7)
             .unwrap();
         assert!(table.user_apc_interrupt_candidate(7).is_none());
         assert!(
@@ -1710,7 +1711,7 @@ mod tests {
         assert!(table.completion_surfaces_settled_exact(slot, 2));
         table.mark_backend_acked_exact(slot, 2).unwrap();
         let finished = table.finish_exact(slot, 2).unwrap();
-        assert_eq!(finished.file_id, request.file_id);
+        assert_eq!(finished.route, request.route);
         assert_eq!(finished.irp_id, request.irp_id);
         assert_eq!(finished.control_code, FSCTL_PIPE_LISTEN);
     }
@@ -1759,7 +1760,7 @@ mod tests {
         request.apc_routine = 0;
         request.publish_iocp = true;
         request.signal_file = true;
-        request.busy = Some(test_busy(request.file_id, request.tid));
+        request.busy = Some(test_busy(request.hosted_file_id().unwrap(), request.tid));
         let slot = table.park(request).unwrap();
 
         for flag in [
@@ -1842,7 +1843,7 @@ mod tests {
     fn abandoned_synchronous_transfer_retains_terminal_lock_owner_only() {
         let mut table = PendingFileIoTable::new();
         let mut request = pending(1, 2, 7);
-        request.busy = Some(test_busy(request.file_id, 7));
+        request.busy = Some(test_busy(request.hosted_file_id().unwrap(), 7));
         request.reply_required = true;
         request.reply_cap = 0x50;
         request.resume_ip = 0x1000;
@@ -1915,7 +1916,7 @@ mod tests {
         request.apc_routine = 0;
         request.event_obj_idx = u64::MAX;
         request.signal_file = true;
-        request.busy = Some(test_busy(request.file_id, 7));
+        request.busy = Some(test_busy(request.hosted_file_id().unwrap(), 7));
         let slot = table.park(request).unwrap();
 
         assert!(table.matches_completion_exact(slot, 21, 12, 7, nt_io_abi::major::IRP_MJ_CREATE,));
@@ -1952,7 +1953,7 @@ mod tests {
         request.apc_routine = 0;
         request.event_obj_idx = u64::MAX;
         request.signal_file = true;
-        request.busy = Some(test_busy(request.file_id, 7));
+        request.busy = Some(test_busy(request.hosted_file_id().unwrap(), 7));
         let slot = table.park(request).unwrap();
 
         assert!(table.matches_completion_exact(
@@ -1987,7 +1988,7 @@ mod tests {
         direct.apc_routine = 0;
         direct.event_obj_idx = u64::MAX;
         direct.signal_file = true;
-        direct.busy = Some(test_busy(direct.file_id, 9));
+        direct.busy = Some(test_busy(direct.hosted_file_id().unwrap(), 9));
         let direct_slot = table.park(direct).unwrap();
         table
             .retarget_set_file_name_query_exact(
@@ -2136,6 +2137,7 @@ mod tests {
             status: nt_status::NtStatus::PENDING.raw() as u32,
             alertable: true,
         });
+        request.route = PendingFileRoute::Local(LocalFileObject::Overlay(1));
         request.output_va = 0;
         request.output_len = 0;
         request.apc_routine = 0;
@@ -2180,6 +2182,7 @@ mod tests {
     fn local_directory_notify_requires_exact_output_publication() {
         let mut table = PendingFileIoTable::new();
         let mut request = pending(0x2000_0000_0000_0001, 0x9000_0000_0000_0002, 7);
+        request.route = PendingFileRoute::Local(LocalFileObject::Overlay(1));
         request.major = nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL;
         request.operation =
             PendingFileIoOperation::LocalDirectoryNotify(PendingLocalDirectoryNotify {

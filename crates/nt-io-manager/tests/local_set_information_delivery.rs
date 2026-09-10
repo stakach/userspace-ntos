@@ -37,9 +37,9 @@ fn payload(class: u32) -> Vec<u8> {
     }
 }
 
-fn terminal(id: u64, file: u64, policy: LocalSetInformationPolicy, status: u32) -> PendingFileIo {
+fn terminal(id: u64, file: LocalFileObject, policy: LocalSetInformationPolicy, status: u32) -> PendingFileIo {
     PendingFileIo {
-        file_id: file,
+        route: PendingFileRoute::Local(file),
         irp_id: id,
         tid: TID,
         major: nt_io_abi::major::IRP_MJ_SET_INFORMATION,
@@ -180,7 +180,7 @@ fn accepted_metadata_name_and_position_changes_survive_iosb_and_reply_retry() {
                     let slot = table
                         .park_reserved(
                             reservation,
-                            terminal(id, 0xe700_0000_0000_0000 | handle, policy, status),
+                            terminal(id, LocalFileObject::Overlay(handle), policy, status),
                         )
                         .unwrap();
                     let before = table.get(slot).unwrap();
@@ -275,7 +275,7 @@ fn negative_signed_scalar_uses_fast_or_dispatched_error_timing_without_mutation(
                     let id = table.local_operation_id(reservation).unwrap();
                     let pending = terminal(
                         id,
-                        0xe700_0000_0000_0000 | handle,
+                        LocalFileObject::Overlay(handle),
                         policy,
                         nt_status::NtStatus::INVALID_PARAMETER.raw() as u32,
                     );
@@ -333,7 +333,7 @@ fn readonly_fast_position_retains_without_reset_or_signal_even_after_iosb_fault(
                 reservation,
                 terminal(
                     id,
-                    0xe800_0000_0000_0000 | object as u64,
+                    LocalFileObject::ReadonlyFile(object),
                     policy,
                     STATUS_SUCCESS,
                 ),
@@ -383,7 +383,7 @@ fn abandoned_completed_rename_keeps_namespace_change_and_releases_exact_referenc
     let slot = table
         .park_reserved(
             reservation,
-            terminal(id, 0xe700_0000_0000_0000 | handle, policy, STATUS_SUCCESS),
+            terminal(id, LocalFileObject::Overlay(handle), policy, STATUS_SUCCESS),
         )
         .unwrap();
     let mut memory = Memory::new();

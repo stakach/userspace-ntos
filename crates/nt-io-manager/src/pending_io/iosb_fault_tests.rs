@@ -6,7 +6,7 @@ const TID: u64 = 11;
 
 fn provider() -> PendingFileIo {
     PendingFileIo {
-        file_id: 3,
+        route: PendingFileRoute::Hosted(3),
         irp_id: IRP,
         major: nt_io_abi::major::IRP_MJ_READ,
         tid: TID,
@@ -18,6 +18,7 @@ fn provider() -> PendingFileIo {
 
 fn local() -> PendingFileIo {
     PendingFileIo {
+        route: PendingFileRoute::Local(LocalFileObject::Overlay(3)),
         operation: PendingFileIoOperation::LocalInline(PendingLocalInline {
             status: 0x8000_0005,
             information: 41,
@@ -138,7 +139,7 @@ fn provider_fault_does_not_skip_payload_signals_apc_reply_or_file_lock() {
         apc_routine: 0x3000,
         reply_cap: 5,
         reply_required: true,
-        busy: Some(test_busy(provider().file_id, TID)),
+        busy: Some(test_busy(provider().hosted_file_id().unwrap(), TID)),
         ..provider()
     };
     let slot = table.park(request).unwrap();

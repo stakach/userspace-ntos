@@ -26,7 +26,7 @@ fn fixture() -> (FileCompletionTable<1>, PendingFileIoTable, usize) {
     let mut pending = PendingFileIoTable::new();
     let slot = pending
         .park(PendingFileIo {
-            file_id: FILE,
+            route: PendingFileRoute::Hosted(FILE),
             irp_id: IRP,
             major: 3,
             pi: PI,
@@ -169,7 +169,7 @@ fn refused_release_keeps_busy_and_reference_until_one_checked_release_commits() 
     assert!(pending.finish_exact(slot, IRP).is_none());
     assert!(pending.begin_busy_release_exact(slot, IRP).is_err());
     assert!(record_backend_ack(&mut pending, slot, Ok(())));
-    assert_eq!(pending.finish_exact(slot, IRP).unwrap().file_id, FILE);
+    assert_eq!(pending.finish_exact(slot, IRP).unwrap().route, PendingFileRoute::Hosted(FILE));
     assert!(files.release_file(FILE).unwrap().close_required);
     assert!(files.io_mode(FILE).is_err());
 }

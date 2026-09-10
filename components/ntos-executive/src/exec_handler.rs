@@ -6,6 +6,7 @@
 #![allow(clippy::all)]
 use crate::*;
 use nt_io_abi::major;
+use nt_io_manager::{LocalFileObject, PendingFileRoute};
 
 #[path = "exec_file_flush.rs"]
 mod file_flush;
@@ -3054,28 +3055,29 @@ struct LocalFileQueryState {
 #[derive(Clone, Copy)]
 struct LocalByteLockRoute {
     file_id: u64,
-    file_object: u64,
+    file_object: nt_io_manager::LocalFileObject,
+    lock_owner_key: u64,
     synchronous: bool,
     alertable: bool,
 }
 
 enum LocalDirectoryNotifyRoute {
     Fat {
-        file_object: u64,
+        file_object: nt_io_manager::LocalFileObject,
         directory: alloc::string::String,
         synchronous: bool,
         alertable: bool,
     },
     Overlay {
         file_id: u64,
-        file_object: u64,
+        file_object: nt_io_manager::LocalFileObject,
         synchronous: bool,
         alertable: bool,
     },
 }
 
 impl LocalDirectoryNotifyRoute {
-    fn file_object(&self) -> u64 {
+    fn file_object(&self) -> nt_io_manager::LocalFileObject {
         match self {
             Self::Fat { file_object, .. } | Self::Overlay { file_object, .. } => *file_object,
         }
@@ -3100,6 +3102,20 @@ const LOCAL_FAT_FILE_ID_TAG: u64 = 0x3000_0000_0000_0000;
 const LOCAL_OVERLAY_FILE_ID_TAG: u64 = 0x4000_0000_0000_0000;
 const LOCAL_FAT_DIRECTORY_OBJECT_TAG: u64 = 0x5000_0000_0000_0000;
 const LOCAL_ID_PAYLOAD_MASK: u64 = 0x0fff_ffff_ffff_ffff;
+
+/// Scalar keys remain confined to the byte-lock and readonly notification tables. Pending I/O
+/// carries the typed object instead; encoding must never truncate its canonical identity.
+fn local_file_object_namespace_key(file: nt_io_manager::LocalFileObject) -> Result<u64, u32> {
+    use nt_io_manager::LocalFileObject;
+    match file {
+        LocalFileObject::ReadonlyFile(id) => Ok(LOCAL_FAT_FILE_OBJECT_TAG | u64::from(id)),
+        LocalFileObject::ReadonlyDirectory(id) => Ok(LOCAL_FAT_DIRECTORY_OBJECT_TAG | u64::from(id)),
+        LocalFileObject::Overlay(id) if id & !LOCAL_ID_PAYLOAD_MASK == 0 => {
+            Ok(LOCAL_OVERLAY_FILE_OBJECT_TAG | id)
+        }
+        LocalFileObject::Overlay(_) => Err(nt_fs::STATUS_INVALID_HANDLE),
+    }
+}
 
 struct SystemTimeConfiguration {
     information: nt_kernel_exec::timezone::TimeZoneInformation,
@@ -13708,7 +13724,7 @@ impl ExecNtHandler {
                         pending.delivery_state == 0
                             && pending.major == major::IRP_MJ_FILE_SYSTEM_CONTROL
                             && pending.control_code == FSCTL_PIPE_LISTEN
-                            && driver_launch::hosted_file_route(pending.file_id)
+                            && pending.route.hosted_file_id().and_then(driver_launch::hosted_file_route)
                                 .is_some_and(|(_, context)| context == server_context)
                     })
             }
@@ -14038,7 +14054,7 @@ impl ExecNtHandler {
                 self.release_file_reference(route.file_id);
             } else {
                 self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                    file_id: route.file_id,
+                    route: PendingFileRoute::Hosted(route.file_id),
                     irp_id: pending_irp_id,
                     major: major::IRP_MJ_DEVICE_CONTROL,
                     control_code: ioctl,
@@ -14109,7 +14125,10 @@ impl ExecNtHandler {
                 }
                 nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
                     let _ =
-                        self.cancel_local_directory_notify(pending.file_id, operation.notify_id);
+                        self.cancel_local_directory_notify(
+                            pending.route.local_file_object().expect("local notify lost its route"),
+                            operation.notify_id,
+                        );
                 }
                 nt_io_manager::PendingFileIoOperation::LocalInline(_)
                 | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
@@ -14216,7 +14235,7 @@ impl ExecNtHandler {
             let requests: alloc::vec::Vec<_> = (&*core::ptr::addr_of!(PENDING_FILE_IO))
                 .drain_all()
                 .filter_map(|(_, pending)| {
-                    if pending.file_id != file_object || pending.tid != self.current_tid {
+                    if pending.route != PendingFileRoute::Local(file_object) || pending.tid != self.current_tid {
                         return None;
                     }
                     match pending.operation {
@@ -14322,8 +14341,13 @@ impl ExecNtHandler {
             print_u64(self.current_tid);
             print_str(b" handle=0x");
             print_hex(file_handle as u32);
-            print_str(b" fid=0x");
-            print_hex(file_id.or(local_file_object).unwrap_or(0) as u32);
+            print_str(b" file=");
+            match file_id.map(PendingFileRoute::Hosted)
+                .or_else(|| local_file_object.map(PendingFileRoute::Local))
+            {
+                Some(route) => crate::service_sec_image::print_pending_file_route(route),
+                None => print_str(b"none"),
+            }
             print_str(b" cancelled=");
             print_u64(cancelled as u64);
             print_str(b" terminal=");
@@ -14434,7 +14458,8 @@ impl ExecNtHandler {
                     directory,
                     ..
                 } => self.readonly_directory_notifications.register(
-                    *file_object,
+                    local_file_object_namespace_key(*file_object)
+                        .expect("readonly directory namespace key is always representable"),
                     directory,
                     completion_filter,
                     watch_tree,
@@ -14472,7 +14497,7 @@ impl ExecNtHandler {
                 }
             };
             self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                file_id: file_object,
+                route: PendingFileRoute::Local(file_object),
                 irp_id: request_id,
                 major: major::IRP_MJ_DIRECTORY_CONTROL,
                 control_code: 0,
@@ -14550,7 +14575,7 @@ impl ExecNtHandler {
         }
         if status == STATUS_PENDING {
             self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                file_id: route.file_id,
+                route: PendingFileRoute::Hosted(route.file_id),
                 irp_id: pending_irp_id,
                 major: major::IRP_MJ_DIRECTORY_CONTROL,
                 control_code: 0,
@@ -14696,7 +14721,7 @@ impl ExecNtHandler {
             }
             let request = nt_fs::ByteRangeLockRequest::new(
                 route.file_id,
-                nt_fs::ByteRangeLockOwner::new(route.file_object, pid as u64, key),
+                nt_fs::ByteRangeLockOwner::new(route.lock_owner_key, pid as u64, key),
                 byte_offset,
                 length,
                 exclusive,
@@ -14741,7 +14766,7 @@ impl ExecNtHandler {
                 }
                 nt_fs::ByteRangeLockResult::Pending(wait_id) => {
                     self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                        file_id: route.file_object,
+                        route: PendingFileRoute::Local(route.file_object),
                         irp_id: request_id,
                         major: major::IRP_MJ_LOCK_CONTROL,
                         control_code: 0,
@@ -14821,7 +14846,7 @@ impl ExecNtHandler {
             }
             if status == STATUS_PENDING {
                 self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                    file_id: route.file_id,
+                    route: PendingFileRoute::Hosted(route.file_id),
                     irp_id: pending_irp_id,
                     major: major::IRP_MJ_LOCK_CONTROL,
                     control_code: 0,
@@ -14900,7 +14925,7 @@ impl ExecNtHandler {
                 .byte_range_locks
                 .unlock_single(nt_fs::ByteRangeLockRequest::new(
                     route.file_id,
-                    nt_fs::ByteRangeLockOwner::new(route.file_object, pid as u64, key),
+                    nt_fs::ByteRangeLockOwner::new(route.lock_owner_key, pid as u64, key),
                     byte_offset,
                     length,
                     true,
@@ -14952,7 +14977,7 @@ impl ExecNtHandler {
         }
         if status == STATUS_PENDING {
             self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                file_id: route.file_id,
+                route: PendingFileRoute::Hosted(route.file_id),
                 irp_id: pending_irp_id,
                 major: major::IRP_MJ_LOCK_CONTROL,
                 control_code: 0,
@@ -21365,7 +21390,9 @@ impl ExecNtHandler {
                 if self.directory_opens.is_final_reference(object_id) == Ok(true) {
                     let completed = self
                         .readonly_directory_notifications
-                        .cleanup_file_object(LOCAL_FAT_DIRECTORY_OBJECT_TAG | object_id as u64);
+                        .cleanup_file_object(local_file_object_namespace_key(
+                            LocalFileObject::ReadonlyDirectory(object_id),
+                        ).expect("readonly directory namespace key is always representable"));
                     if completed != 0 {
                         crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING
                             .store(true, Ordering::Release);
@@ -21377,7 +21404,9 @@ impl ExecNtHandler {
                 if self.readonly_file_opens.is_final_reference(object_id) == Ok(true) {
                     let status = self
                         .byte_range_locks
-                        .cleanup_file_object_all(LOCAL_FAT_FILE_OBJECT_TAG | object_id as u64);
+                        .cleanup_file_object_all(local_file_object_namespace_key(
+                            LocalFileObject::ReadonlyFile(object_id),
+                        ).expect("readonly file namespace key is always representable"));
                     assert_eq!(status, nt_fs::STATUS_SUCCESS);
                     unsafe {
                         self.publish_local_byte_lock_completions();
@@ -21403,10 +21432,11 @@ impl ExecNtHandler {
             // (which actions a pending delete) and free the FILE_OBJECT.
             nt_process::HandleObject::OverlayFile(file_id) => {
                 if unsafe { crate::writable_fs::is_final_reference(file_id) } == Ok(true) {
-                    let status = self.byte_range_locks.cleanup_file_object_all(
-                        LOCAL_OVERLAY_FILE_OBJECT_TAG | (file_id & LOCAL_ID_PAYLOAD_MASK),
-                    );
-                    assert_eq!(status, nt_fs::STATUS_SUCCESS);
+                    // An unrepresentable auxiliary key was never admitted to the lock table.
+                    if let Ok(key) = local_file_object_namespace_key(LocalFileObject::Overlay(file_id)) {
+                        let status = self.byte_range_locks.cleanup_file_object_all(key);
+                        assert_eq!(status, nt_fs::STATUS_SUCCESS);
+                    }
                     unsafe {
                         self.publish_local_byte_lock_completions();
                     }
@@ -27637,7 +27667,7 @@ impl ExecNtHandler {
         NPFS_ROUTED_IRPS.fetch_add(1, Ordering::Relaxed);
         if let Some(irp_id) = pending_irp_id {
             self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                file_id: canonical_file_id,
+                route: PendingFileRoute::Hosted(canonical_file_id),
                 irp_id: irp_id.raw(),
                 major,
                 control_code: 0,
@@ -27907,7 +27937,7 @@ impl ExecNtHandler {
             return;
         }
         self.release_hosted_create_reservation(
-            pending.file_id,
+            pending.route.hosted_file_id().expect("hosted CREATE lost its File route"),
             Self::pending_create_reservation(create),
         );
     }
@@ -28175,7 +28205,7 @@ impl ExecNtHandler {
                 self.release_file_reference(file_id);
             } else {
                 self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                    file_id,
+                    route: PendingFileRoute::Hosted(file_id),
                     irp_id: pending_irp_id,
                     major: major::IRP_MJ_QUERY_EA,
                     control_code: 0,
@@ -28267,7 +28297,7 @@ impl ExecNtHandler {
                 self.release_file_reference(file_id);
             } else {
                 self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                    file_id,
+                    route: PendingFileRoute::Hosted(file_id),
                     irp_id: pending_irp_id,
                     major: major::IRP_MJ_SET_EA,
                     control_code: 0,
@@ -28358,7 +28388,7 @@ impl ExecNtHandler {
                 self.release_file_reference(file_id);
             } else {
                 self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                    file_id,
+                    route: PendingFileRoute::Hosted(file_id),
                     irp_id: pending_irp_id,
                     major: major::IRP_MJ_QUERY_QUOTA,
                     control_code: 0,
@@ -28450,7 +28480,7 @@ impl ExecNtHandler {
                 self.release_file_reference(file_id);
             } else {
                 self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                    file_id,
+                    route: PendingFileRoute::Hosted(file_id),
                     irp_id: pending_irp_id,
                     major: major::IRP_MJ_SET_QUOTA,
                     control_code: 0,
@@ -28539,7 +28569,7 @@ impl ExecNtHandler {
                 self.release_file_reference(file_id);
             } else {
                 self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                    file_id,
+                    route: PendingFileRoute::Hosted(file_id),
                     irp_id: pending_irp_id,
                     major: major::IRP_MJ_QUERY_VOLUME_INFORMATION,
                     control_code: 0,
@@ -28632,7 +28662,7 @@ impl ExecNtHandler {
                 self.release_file_reference(file_id);
             } else {
                 self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                    file_id,
+                    route: PendingFileRoute::Hosted(file_id),
                     irp_id: pending_irp_id,
                     major: major::IRP_MJ_SET_VOLUME_INFORMATION,
                     control_code: 0,
@@ -28717,7 +28747,7 @@ impl ExecNtHandler {
                 self.release_file_reference(file_id);
             } else {
                 self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                    file_id,
+                    route: PendingFileRoute::Hosted(file_id),
                     irp_id: pending_irp_id,
                     major: major::IRP_MJ_SET_INFORMATION,
                     control_code: 0,
@@ -29043,7 +29073,7 @@ impl ExecNtHandler {
             .expect("reserved set-file-name transaction rejected its captured buffers");
         // Both captured buffers transfer into the pending I/O owner before this dispatch returns.
         self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-            file_id: route.file_id,
+            route: PendingFileRoute::Hosted(route.file_id),
             irp_id: pending_irp,
             major: pending_major,
             control_code: 0,
@@ -29281,7 +29311,7 @@ impl ExecNtHandler {
                     & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                     != 0;
                 Ok(Some(LocalDirectoryNotifyRoute::Fat {
-                    file_object: LOCAL_FAT_DIRECTORY_OBJECT_TAG | object_id as u64,
+                    file_object: LocalFileObject::ReadonlyDirectory(object_id),
                     directory,
                     synchronous,
                     alertable: open.create_options & nt_fs::FILE_SYNCHRONOUS_IO_ALERT != 0,
@@ -29291,7 +29321,7 @@ impl ExecNtHandler {
                 let mode = crate::writable_fs::file_object_information(file_id)?.mode;
                 Ok(Some(LocalDirectoryNotifyRoute::Overlay {
                     file_id,
-                    file_object: LOCAL_OVERLAY_FILE_OBJECT_TAG | (file_id & LOCAL_ID_PAYLOAD_MASK),
+                    file_object: LocalFileObject::Overlay(file_id),
                     synchronous: mode
                         & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                         != 0,
@@ -29306,7 +29336,7 @@ impl ExecNtHandler {
         }
     }
 
-    fn local_file_object_for_handle(&self, handle: u64) -> Result<Option<u64>, u32> {
+    fn local_file_object_for_handle(&self, handle: u64) -> Result<Option<LocalFileObject>, u32> {
         let pid = self
             .pm_pid_for_pi(self.pi)
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
@@ -29318,14 +29348,14 @@ impl ExecNtHandler {
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
         {
             nt_process::HandleObject::Directory { object_id, .. } => {
-                Ok(Some(LOCAL_FAT_DIRECTORY_OBJECT_TAG | object_id as u64))
+                Ok(Some(LocalFileObject::ReadonlyDirectory(object_id)))
             }
             nt_process::HandleObject::DiskFile { object_id, .. } => {
-                Ok(Some(LOCAL_FAT_FILE_OBJECT_TAG | object_id as u64))
+                Ok(Some(LocalFileObject::ReadonlyFile(object_id)))
             }
-            nt_process::HandleObject::OverlayFile(file_id) => Ok(Some(
-                LOCAL_OVERLAY_FILE_OBJECT_TAG | (file_id & LOCAL_ID_PAYLOAD_MASK),
-            )),
+            nt_process::HandleObject::OverlayFile(file_id) => {
+                Ok(Some(LocalFileObject::Overlay(file_id)))
+            }
             nt_process::HandleObject::File(_) | nt_process::HandleObject::RoutedFile { .. } => {
                 Ok(None)
             }
@@ -29335,18 +29365,18 @@ impl ExecNtHandler {
 
     pub(crate) unsafe fn local_directory_notify_terminal(
         &self,
-        file_object: u64,
+        file_object: LocalFileObject,
         notify_id: u64,
         irp_id: u64,
     ) -> Result<Option<(u32, u32)>, u32> {
         let notify_id = nt_fs::DirectoryNotifyId::from_raw(notify_id)
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-        match file_object & !LOCAL_ID_PAYLOAD_MASK {
-            LOCAL_FAT_DIRECTORY_OBJECT_TAG => Ok(self
+        match file_object {
+            LocalFileObject::ReadonlyDirectory(_) => Ok(self
                 .readonly_directory_notifications
                 .completion_exact(notify_id, &irp_id)?
                 .map(|completion| (completion.status, completion.information))),
-            LOCAL_OVERLAY_FILE_OBJECT_TAG => {
+            LocalFileObject::Overlay(_) => {
                 crate::writable_fs::directory_notify_completion(notify_id, irp_id)
             }
             _ => Err(nt_fs::STATUS_INVALID_HANDLE),
@@ -29355,7 +29385,7 @@ impl ExecNtHandler {
 
     pub(crate) unsafe fn copy_local_directory_notify_completion(
         &mut self,
-        file_object: u64,
+        file_object: LocalFileObject,
         notify_id: u64,
         irp_id: u64,
         offset: usize,
@@ -29363,11 +29393,11 @@ impl ExecNtHandler {
     ) -> Result<usize, u32> {
         let notify_id = nt_fs::DirectoryNotifyId::from_raw(notify_id)
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-        match file_object & !LOCAL_ID_PAYLOAD_MASK {
-            LOCAL_FAT_DIRECTORY_OBJECT_TAG => self
+        match file_object {
+            LocalFileObject::ReadonlyDirectory(_) => self
                 .readonly_directory_notifications
                 .copy_completion_bytes(notify_id, &irp_id, offset, output),
-            LOCAL_OVERLAY_FILE_OBJECT_TAG => {
+            LocalFileObject::Overlay(_) => {
                 crate::writable_fs::copy_directory_notify_completion(notify_id, irp_id, offset, output)
             }
             _ => Err(nt_fs::STATUS_INVALID_HANDLE),
@@ -29376,17 +29406,17 @@ impl ExecNtHandler {
 
     pub(crate) unsafe fn acknowledge_local_directory_notify_completion(
         &mut self,
-        file_object: u64,
+        file_object: LocalFileObject,
         notify_id: u64,
         irp_id: u64,
     ) -> Result<(), u32> {
         let notify_id = nt_fs::DirectoryNotifyId::from_raw(notify_id)
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-        match file_object & !LOCAL_ID_PAYLOAD_MASK {
-            LOCAL_FAT_DIRECTORY_OBJECT_TAG => self
+        match file_object {
+            LocalFileObject::ReadonlyDirectory(_) => self
                 .readonly_directory_notifications
                 .acknowledge_completion(notify_id, &irp_id),
-            LOCAL_OVERLAY_FILE_OBJECT_TAG => {
+            LocalFileObject::Overlay(_) => {
                 crate::writable_fs::acknowledge_directory_notify_completion(notify_id, irp_id)
             }
             _ => Err(nt_fs::STATUS_INVALID_HANDLE),
@@ -29395,17 +29425,17 @@ impl ExecNtHandler {
 
     pub(crate) unsafe fn cancel_local_directory_notify(
         &mut self,
-        file_object: u64,
+        file_object: LocalFileObject,
         notify_id: u64,
     ) -> Result<bool, u32> {
         let Some(notify_id) = nt_fs::DirectoryNotifyId::from_raw(notify_id) else {
             return Err(nt_fs::STATUS_INVALID_HANDLE);
         };
-        match file_object & !LOCAL_ID_PAYLOAD_MASK {
-            LOCAL_FAT_DIRECTORY_OBJECT_TAG => {
+        match file_object {
+            LocalFileObject::ReadonlyDirectory(_) => {
                 Ok(self.readonly_directory_notifications.cancel(notify_id))
             }
-            LOCAL_OVERLAY_FILE_OBJECT_TAG => crate::writable_fs::cancel_directory_notify(notify_id),
+            LocalFileObject::Overlay(_) => crate::writable_fs::cancel_directory_notify(notify_id),
             _ => Err(nt_fs::STATUS_INVALID_HANDLE),
         }
     }
@@ -29464,7 +29494,8 @@ impl ExecNtHandler {
                 LocalByteLockRoute {
                     file_id: LOCAL_FAT_FILE_ID_TAG
                         | (open.metadata.file_id & LOCAL_ID_PAYLOAD_MASK),
-                    file_object: LOCAL_FAT_FILE_OBJECT_TAG | object_id as u64,
+                    file_object: LocalFileObject::ReadonlyFile(object_id),
+                    lock_owner_key: local_file_object_namespace_key(LocalFileObject::ReadonlyFile(object_id))?,
                     synchronous: open.create_options
                         & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                         != 0,
@@ -29476,8 +29507,8 @@ impl ExecNtHandler {
                 let metadata = info.metadata;
                 LocalByteLockRoute {
                     file_id: LOCAL_OVERLAY_FILE_ID_TAG | (metadata.file_id & LOCAL_ID_PAYLOAD_MASK),
-                    file_object: LOCAL_OVERLAY_FILE_OBJECT_TAG
-                        | (file_object & LOCAL_ID_PAYLOAD_MASK),
+                    file_object: LocalFileObject::Overlay(file_object),
+                    lock_owner_key: local_file_object_namespace_key(LocalFileObject::Overlay(file_object))?,
                     synchronous: info.mode
                         & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                         != 0,
@@ -36074,7 +36105,7 @@ impl ExecNtHandler {
                         information = 0;
                     } else {
                         self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                            file_id: fid,
+                            route: PendingFileRoute::Hosted(fid),
                             irp_id: pending_endpoint_irp_id,
                             major: major::IRP_MJ_FILE_SYSTEM_CONTROL,
                             control_code: fsctl as u32,
@@ -40925,8 +40956,7 @@ impl ExecNtHandler {
                             & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
                                 | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                             != 0;
-                        let file_object =
-                            LOCAL_OVERLAY_FILE_OBJECT_TAG | (file_id & LOCAL_ID_PAYLOAD_MASK);
+                        let file_object = LocalFileObject::Overlay(file_id);
                         let request_id = match self.begin_retained_local_buffered_io(file_object, length) {
                             Ok(request_id) => request_id,
                             Err(status) => return status,
@@ -41004,7 +41034,7 @@ impl ExecNtHandler {
                 let synchronous = open.create_options
                     & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                     != 0;
-                let file_object = LOCAL_FAT_DIRECTORY_OBJECT_TAG | object_id as u64;
+                let file_object = LocalFileObject::ReadonlyDirectory(object_id);
                 // Reserve durable table capacity before entering the transient entry allocator.
                 let request_id = match self.reserve_local_file_io_output(length) {
                     Ok(request_id) => request_id,
@@ -41243,7 +41273,7 @@ impl ExecNtHandler {
                             }
                         } else {
                             self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                                file_id,
+                                route: PendingFileRoute::Hosted(file_id),
                                 irp_id: pending_irp_id,
                                 major: major::IRP_MJ_QUERY_INFORMATION,
                                 control_code: 0,
@@ -43062,7 +43092,7 @@ impl ExecNtHandler {
                                                     route.synchronous,
                                                 ));
                                                 let owner = nt_fs::ByteRangeLockOwner::new(
-                                                    route.file_object,
+                                                    route.lock_owner_key,
                                                     self.pm_pid_for_pi(self.pi).unwrap() as u64,
                                                     key_value,
                                                 );
@@ -43197,7 +43227,7 @@ impl ExecNtHandler {
                     let event_obj_idx =
                         completion_event_index.map_or(u64::MAX, |index| index as u64);
                     self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                        file_id: completion_file_id,
+                        route: PendingFileRoute::Hosted(completion_file_id),
                         irp_id: pending_write_irp_id,
                         major: major::IRP_MJ_WRITE,
                         control_code: 0,
@@ -43511,7 +43541,7 @@ impl ExecNtHandler {
                                                             self.byte_range_locks.check_read(
                                                                 route.file_id,
                                                                 nt_fs::ByteRangeLockOwner::new(
-                                                                    route.file_object,
+                                                                    route.lock_owner_key,
                                                                     self.pm_pid_for_pi(self.pi)
                                                                         .unwrap()
                                                                         as u64,
@@ -43567,7 +43597,7 @@ impl ExecNtHandler {
                                                             self.byte_range_locks.check_read(
                                                                 route.file_id,
                                                                 nt_fs::ByteRangeLockOwner::new(
-                                                                    route.file_object,
+                                                                    route.lock_owner_key,
                                                                     self.pm_pid_for_pi(self.pi)
                                                                         .unwrap()
                                                                         as u64,
@@ -43733,7 +43763,7 @@ impl ExecNtHandler {
                     let event_obj_idx =
                         completion_event_index.map_or(u64::MAX, |index| index as u64);
                     self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                        file_id: completion_file_id,
+                        route: PendingFileRoute::Hosted(completion_file_id),
                         irp_id: pending_read_irp_id,
                         major: major::IRP_MJ_READ,
                         control_code: 0,
@@ -44197,7 +44227,7 @@ impl ExecNtHandler {
                         information = 0;
                     } else {
                         self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                            file_id,
+                            route: PendingFileRoute::Hosted(file_id),
                             irp_id: pending_irp_id,
                             major: major::IRP_MJ_FLUSH_BUFFERS,
                             control_code: 0,

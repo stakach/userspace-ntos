@@ -48,26 +48,25 @@ impl ExecNtHandler {
         // No user-memory access or delivery retry may repeat the accepted mutation below.
         let status = match value {
             Err(status) => status.raw() as u32,
-            Ok(()) => match route.file_object & !LOCAL_ID_PAYLOAD_MASK {
-                LOCAL_OVERLAY_FILE_OBJECT_TAG => {
-                    let status = self.set_overlay_file_information(
-                        route.file_object & LOCAL_ID_PAYLOAD_MASK,
-                        information_class,
-                        payload,
-                    );
+            Ok(()) => match route.file_object {
+                LocalFileObject::Overlay(file_id) => {
+                    let status =
+                        self.set_overlay_file_information(file_id, information_class, payload);
                     if status == nt_fs::STATUS_SUCCESS {
                         self.writable_fs_dirty = true;
                     }
                     status
                 }
-                LOCAL_FAT_FILE_OBJECT_TAG => {
+                LocalFileObject::ReadonlyFile(object_id) => {
                     self.readonly_file_opens
-                        .get_mut((route.file_object & LOCAL_ID_PAYLOAD_MASK) as u32)
+                        .get_mut(object_id)
                         .expect("retained FAT File disappeared during position SET")
                         .current_offset = u64::from_le_bytes(payload[..8].try_into().unwrap());
                     nt_fs::STATUS_SUCCESS
                 }
-                _ => unreachable!("local SET admitted an unsupported File kind"),
+                LocalFileObject::ReadonlyDirectory(_) => {
+                    unreachable!("local SET admitted an unsupported File kind")
+                }
             },
         };
         assert_ne!(
@@ -76,7 +75,7 @@ impl ExecNtHandler {
         );
         assert!(self.pending_file_io_transfer.is_none());
         self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-            file_id: route.file_object,
+            route: PendingFileRoute::Local(route.file_object),
             irp_id: request_id,
             major: major::IRP_MJ_SET_INFORMATION,
             operation: nt_io_manager::PendingFileIoOperation::LocalInline(

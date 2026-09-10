@@ -7,7 +7,7 @@ const PENDING: u32 = nt_status::NtStatus::PENDING.raw() as u32;
 
 fn notify() -> PendingFileIo {
     PendingFileIo {
-        file_id: 10,
+        route: PendingFileRoute::Local(LocalFileObject::Overlay(10)),
         irp_id: IRP,
         major: nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL,
         operation: PendingFileIoOperation::LocalDirectoryNotify(PendingLocalDirectoryNotify {
@@ -146,6 +146,7 @@ fn nonterminal_local_request_cannot_release_even_with_all_delivery_bits() {
 fn provider_transfer_cannot_receive_a_local_reference_release_mark() {
     let mut request = notify();
     request.operation = PendingFileIoOperation::Transfer;
+    request.route = PendingFileRoute::Hosted(10);
     let mut table = PendingFileIoTable::new();
     let slot = table.park(request).unwrap();
     table

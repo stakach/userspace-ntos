@@ -23,7 +23,7 @@ impl ExecNtHandler {
 
     pub(super) unsafe fn begin_retained_local_file_io(
         &mut self,
-        file_object: u64,
+        file_object: LocalFileObject,
     ) -> Result<u64, u32> {
         let request_id = self.reserve_local_file_io_delivery()?;
         self.begin_local_file_io(file_object)?;
@@ -46,7 +46,7 @@ impl ExecNtHandler {
 
     pub(super) unsafe fn begin_retained_local_buffered_io(
         &mut self,
-        file_object: u64,
+        file_object: LocalFileObject,
         capacity: usize,
     ) -> Result<u64, u32> {
         let request_id = self.reserve_local_file_io_output(capacity)?;
@@ -98,26 +98,26 @@ impl ExecNtHandler {
 
     fn set_local_file_object_signaled(
         &mut self,
-        file_object: u64,
+        file_object: LocalFileObject,
         signaled: bool,
     ) -> Result<(), u32> {
-        let object_id = (file_object & LOCAL_ID_PAYLOAD_MASK) as u32;
-        match file_object & !LOCAL_ID_PAYLOAD_MASK {
-            LOCAL_FAT_FILE_OBJECT_TAG => self.readonly_file_opens.set_signaled(object_id, signaled),
-            LOCAL_FAT_DIRECTORY_OBJECT_TAG => {
+        match file_object {
+            LocalFileObject::ReadonlyFile(object_id) => {
+                self.readonly_file_opens.set_signaled(object_id, signaled)
+            }
+            LocalFileObject::ReadonlyDirectory(object_id) => {
                 self.directory_opens.set_signaled(object_id, signaled)
             }
-            LOCAL_OVERLAY_FILE_OBJECT_TAG => unsafe {
-                crate::writable_fs::set_file_signaled(file_object & LOCAL_ID_PAYLOAD_MASK, signaled)
+            LocalFileObject::Overlay(file_id) => unsafe {
+                crate::writable_fs::set_file_signaled(file_id, signaled)
             },
-            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
         }
     }
 
-    pub(super) fn begin_local_file_io(&mut self, file_object: u64) -> Result<(), u32> {
-        if file_object & !LOCAL_ID_PAYLOAD_MASK == LOCAL_OVERLAY_FILE_OBJECT_TAG {
+    pub(super) fn begin_local_file_io(&mut self, file_object: LocalFileObject) -> Result<(), u32> {
+        if let LocalFileObject::Overlay(file_id) = file_object {
             unsafe {
-                return crate::writable_fs::begin_file_io(file_object & LOCAL_ID_PAYLOAD_MASK);
+                return crate::writable_fs::begin_file_io(file_id);
             }
         }
         self.retain_local_file_io_reference(file_object)?;
@@ -129,39 +129,46 @@ impl ExecNtHandler {
     }
 
     /// Retain a File for a fast operation that must leave its event state untouched.
-    pub(super) fn retain_local_file_io_reference(&mut self, file_object: u64) -> Result<(), u32> {
-        let object_id = (file_object & LOCAL_ID_PAYLOAD_MASK) as u32;
-        match file_object & !LOCAL_ID_PAYLOAD_MASK {
-            LOCAL_FAT_FILE_OBJECT_TAG => self.readonly_file_opens.retain_io(object_id),
-            LOCAL_FAT_DIRECTORY_OBJECT_TAG => self.directory_opens.retain_io(object_id),
-            LOCAL_OVERLAY_FILE_OBJECT_TAG => unsafe {
-                crate::writable_fs::retain_io_reference(file_object & LOCAL_ID_PAYLOAD_MASK)
+    pub(super) fn retain_local_file_io_reference(
+        &mut self,
+        file_object: LocalFileObject,
+    ) -> Result<(), u32> {
+        match file_object {
+            LocalFileObject::ReadonlyFile(object_id) => {
+                self.readonly_file_opens.retain_io(object_id)
+            }
+            LocalFileObject::ReadonlyDirectory(object_id) => {
+                self.directory_opens.retain_io(object_id)
+            }
+            LocalFileObject::Overlay(file_id) => unsafe {
+                crate::writable_fs::retain_io_reference(file_id)
             },
-            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
         }
     }
 
-    pub(crate) fn release_local_file_io_reference(&mut self, file_object: u64) {
+    pub(crate) fn release_local_file_io_reference(&mut self, file_object: LocalFileObject) {
         self.try_release_local_file_io_reference(file_object)
             .expect("local pending I/O lost its FILE_OBJECT reference");
     }
 
     pub(crate) fn try_release_local_file_io_reference(
         &mut self,
-        file_object: u64,
+        file_object: LocalFileObject,
     ) -> Result<(), u32> {
-        let object_id = (file_object & LOCAL_ID_PAYLOAD_MASK) as u32;
-        match file_object & !LOCAL_ID_PAYLOAD_MASK {
-            LOCAL_FAT_FILE_OBJECT_TAG => self.readonly_file_opens.release_io(object_id),
-            LOCAL_FAT_DIRECTORY_OBJECT_TAG => self.directory_opens.release_io(object_id),
-            LOCAL_OVERLAY_FILE_OBJECT_TAG => unsafe {
-                crate::writable_fs::release_io_reference(file_object & LOCAL_ID_PAYLOAD_MASK)
+        match file_object {
+            LocalFileObject::ReadonlyFile(object_id) => {
+                self.readonly_file_opens.release_io(object_id)
+            }
+            LocalFileObject::ReadonlyDirectory(object_id) => {
+                self.directory_opens.release_io(object_id)
+            }
+            LocalFileObject::Overlay(file_id) => unsafe {
+                crate::writable_fs::release_io_reference(file_id)
             },
-            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
         }
     }
 
-    pub(crate) fn signal_local_file_completion(&mut self, file_object: u64) -> u32 {
+    pub(crate) fn signal_local_file_completion(&mut self, file_object: LocalFileObject) -> u32 {
         match self.set_local_file_object_signaled(file_object, true) {
             Ok(()) => {
                 unsafe {
@@ -177,7 +184,7 @@ impl ExecNtHandler {
         &mut self,
         request_id: u64,
         major: u8,
-        file_object: u64,
+        file_object: LocalFileObject,
         synchronous: bool,
         event_obj_idx: u64,
         tid: u64,
@@ -193,7 +200,7 @@ impl ExecNtHandler {
         assert!(self.pending_file_io_transfer.is_none());
         assert!(self.pending_file_io_reservation.is_some());
         self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-            file_id: file_object,
+            route: PendingFileRoute::Local(file_object),
             irp_id: request_id,
             major,
             operation: nt_io_manager::PendingFileIoOperation::LocalInline(
@@ -222,7 +229,7 @@ impl ExecNtHandler {
         &mut self,
         request_id: u64,
         major: u8,
-        file_object: u64,
+        file_object: LocalFileObject,
         synchronous: bool,
         event_obj_idx: u64,
         apc_routine: u64,
@@ -266,7 +273,7 @@ impl ExecNtHandler {
         &mut self,
         args: &[u64],
         request_id: u64,
-        file_object: u64,
+        file_object: LocalFileObject,
         synchronous: bool,
         event_obj_idx: u64,
         result: nt_fs::DirectoryQueryResult,

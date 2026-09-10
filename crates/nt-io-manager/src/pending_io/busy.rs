@@ -82,7 +82,7 @@ impl PendingFileBusy {
             && self.owner.tid != 0
             && self.owner.tid != u64::MAX
             && self.owner.tid == pending.tid
-            && self.owner.key == FileIoWaitKey::Hosted(pending.file_id)
+            && pending.hosted_file_id().map(FileIoWaitKey::Hosted) == Some(self.owner.key)
             && matches!(
                 self.owner.mode,
                 FileIoMode::SynchronousAlertable | FileIoMode::SynchronousNonAlertable

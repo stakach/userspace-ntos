@@ -43,8 +43,8 @@ unsafe fn release_policy(
                 .release_io(file_id, owner.tid)
                 .map(|release| release.waiters)
         }
-        // Local pending identities still contain private backend tags. Their shape validation
-        // rejects Busy until typed pending routes and complete local admission are implemented.
+        // Local routes are typed, but shape validation still rejects Busy until retained
+        // cancellation/rollback and the complete local admission lifecycle are implemented.
         FileIoWaitKey::LocalOverlay(_) => Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST),
     }
 }

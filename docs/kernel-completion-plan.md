@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-09-10
+Last updated: 2026-09-11
 
 ## Objective
 
@@ -32912,10 +32912,48 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     desktop acceptance remain open. Immediate-syscall release/cancellation still fail-stop on
     invariant refusal; only pending Busy retirement has the checked release/wake receipts here.
 
-    Next checkpoint: replace privately encoded pending File IDs with explicit backend routes and
-    preserve raw canonical File keys across completion. Retained waiter cancellation and failed
+    Typed-route requirements (completed below): replace privately encoded pending File IDs with
+    explicit backend routes and preserve raw canonical File keys across completion. Retained waiter cancellation and failed
     prepublication park rollback must land before activating local Busy admission; do not weaken
     the current local shape rejection or discard owned references/counts/replies on refusal.
+
+    Typed pending File routes (2026-09-11, complete):
+    - [x] Replace PendingFileIo.file_id with explicit Hosted or Local routing; local object
+      variants distinguish readonly File, readonly directory and overlay File, including raw zero.
+    - [x] Preserve whole typed identities through APC cancellation, provider completion checks,
+      terminal delivery, local signal/reference release and hosted Busy transfer.
+    - [x] Remove private object-tag decoding from local delivery helpers and capture raw routes
+      at admission. Keep scalar byte-lock/readonly-notify owner namespaces separate and explicit.
+    - [x] Test cross-domain numeric collisions, full-width overlay identities and invalid
+      route/operation combinations, then run serialized host/native validation and review.
+
+    Scope review: existing byte-lock inode conflict keys and scalar owner keys are different from
+    pending File routes. The one-way object-owner namespace adapter remains until those table
+    contracts are typed; it rejects unrepresentable payloads instead of masking identity bits.
+    Metadata conflict keys retain their existing encoding as separate debt. Validate any fallible
+    object-key conversion before retaining local I/O. Native local Busy admission
+    remains disabled and requires retained cancellation/prepublication rollback after this cutover.
+
+    Validation: 110 pending-I/O contract tests, 1438 focused host tests and 2698 broader host
+    tests passed. Thirteen new route tests cover local zero in all three object domains, equal
+    numeric identities, full-width hosted/overlay IDs, readonly u32 bounds, provider/local and
+    readonly File/directory separation, exact APC route matching, and abandonment through final
+    reference retirement. Existing local/hosted policy composition fixtures were migrated to raw
+    typed routes. The executive release build passed in 36.76s with the unchanged 294 warnings.
+    Evidence: `.tmp/test-typed-pending-route-contract-20260911.log`,
+    `.tmp/test-typed-pending-route-focused-20260911.log`,
+    `.tmp/test-typed-pending-route-full-20260911.log`, and
+    `.tmp/build-typed-pending-route-executive-20260911.log`. All runners were serialized.
+    No VM run or microkernel change occurred; the 27 strict missing win32k imports and genuine
+    desktop acceptance remain open. Typed routing does not by itself authorize local Busy or
+    local completion-port association.
+
+    Next checkpoint: retain exact waiter cancellation and prepublication park rollback across
+    count/grant release, reference release, reply-cap settlement and any follow-on wake. Replace
+    remove-then-fallible-cancel adapters; preserve definite refusal and entered/uncertain ownership
+    without replaying committed effects. Keep captured routes/access/mode and raw-zero handling.
+    Separately type remaining byte-lock conflict/owner and readonly-notification namespace keys
+    before claiming that all local scalar identity encoding has been removed.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

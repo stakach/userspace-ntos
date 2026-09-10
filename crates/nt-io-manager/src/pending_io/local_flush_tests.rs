@@ -9,7 +9,7 @@ const CAP: u64 = 55;
 fn request(id: u64, status: u32, mode: LocalFlushMode) -> PendingFileIo {
     let flush = PendingLocalFlush::new(status, mode).unwrap();
     PendingFileIo {
-        file_id: 1,
+        route: PendingFileRoute::Local(LocalFileObject::Overlay(1)),
         irp_id: id,
         major: nt_io_abi::major::IRP_MJ_FLUSH_BUFFERS,
         operation: PendingFileIoOperation::LocalFlush(flush),
@@ -139,7 +139,7 @@ fn malformed_shapes_do_not_consume_the_exact_reservation() {
         |p| p.event_obj_idx = 1,
         |p| p.publish_iocp = true,
         |p| p.completion_port_suppressed = false,
-        |p| p.busy = Some(test_busy(p.file_id, p.tid)),
+        |p| p.busy = Some(test_busy(1, p.tid)),
         |p| p.signal_file = true,
         |p| p.iosb_va = 0,
         |p| p.consumer_abandoned = true,
@@ -351,6 +351,9 @@ fn flush_fault_api_cannot_rewrite_other_local_or_provider_operations() {
         let mut table = PendingFileIoTable::new();
         let mut pending = request(8, 0, LocalFlushMode::SynchronousApi);
         pending.operation = operation;
+        if matches!(operation, PendingFileIoOperation::Transfer) {
+            pending.route = PendingFileRoute::Hosted(1);
+        }
         let slot = table.park(pending).unwrap();
         assert!(table
             .mark_local_flush_iosb_faulted_exact(slot, 8, IOSB, ACCESS_VIOLATION)

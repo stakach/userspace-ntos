@@ -2,7 +2,7 @@ use super::*;
 
 fn terminal(id: u64) -> PendingFileIo {
     PendingFileIo {
-        file_id: 1,
+        route: PendingFileRoute::Local(LocalFileObject::Overlay(1)),
         irp_id: id,
         major: nt_io_abi::major::IRP_MJ_LOCK_CONTROL,
         operation: PendingFileIoOperation::LocalInline(PendingLocalInline {
@@ -103,7 +103,7 @@ fn local_generation_exhaustion_does_not_truncate_or_block_provider_reservations(
     assert_eq!(exhausted.generation, LOCAL_OPERATION_ID_GENERATION_MASK + 1);
     assert_eq!(table.local_operation_id(exhausted), None);
     let provider = PendingFileIo {
-        file_id: 1,
+        route: PendingFileRoute::Hosted(1),
         irp_id: 2,
         major: nt_io_abi::major::IRP_MJ_READ,
         ..PendingFileIo::default()

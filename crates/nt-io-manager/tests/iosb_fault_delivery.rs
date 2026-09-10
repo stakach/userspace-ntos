@@ -7,7 +7,7 @@ use nt_fs::*;
 use nt_io_manager::*;
 
 const ID: u64 = 0xf300_0000_0000_0001;
-const FILE: u64 = 0xe300_0000_0000_0000;
+const FILE: u64 = 0;
 const IOSB: u64 = 0x1000;
 const REPLY: u64 = 71;
 const APC: u64 = 0x2000;
@@ -68,7 +68,7 @@ fn fixture() -> (FileSystem, u64, PendingFileIoTable, usize) {
         .park_reserved(
             reservation,
             PendingFileIo {
-                file_id: FILE,
+                route: PendingFileRoute::Local(LocalFileObject::Overlay(FILE)),
                 irp_id: ID,
                 tid: 70,
                 major: nt_io_abi::major::IRP_MJ_WRITE,

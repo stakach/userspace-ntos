@@ -24,7 +24,7 @@ fn start() -> (
     let mut io = PendingFileIoTable::new();
     let slot = io
         .park(PendingFileIo {
-            file_id: 9,
+            route: PendingFileRoute::Local(LocalFileObject::ReadonlyDirectory(9)),
             irp_id: IRP,
             tid: TID,
             major: nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL,

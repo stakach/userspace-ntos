@@ -138,7 +138,7 @@ impl Work {
             .park_reserved(
                 reservation,
                 PendingFileIo {
-                    file_id: 0xe600_0000_0000_0000 | opened.handle,
+                    route: PendingFileRoute::Local(LocalFileObject::Overlay(opened.handle)),
                     irp_id: id,
                     tid: TID,
                     major: nt_io_abi::major::IRP_MJ_FLUSH_BUFFERS,

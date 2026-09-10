@@ -5,7 +5,7 @@ use nt_fs::*;
 use nt_io_manager::*;
 
 const ID: u64 = 0xf200_0000_0000_0001;
-const FILE: u64 = 0xe200_0000_0000_0000;
+const FILE: u64 = 0;
 const REPLY: u64 = 61;
 const PATTERN: [u16; 5] = [
     b'*' as u16,
@@ -62,7 +62,7 @@ fn name(output: &[u8], information: usize) -> String {
 fn terminal(status: u32, information: usize, synchronous: bool, event: u64) -> PendingFileIo {
     let publish = nt_io_completion::file_io_status_publishes_completion(status, true);
     PendingFileIo {
-        file_id: FILE,
+        route: PendingFileRoute::Local(LocalFileObject::Overlay(FILE)),
         irp_id: ID,
         major: nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL,
         operation: PendingFileIoOperation::LocalInline(PendingLocalInline {

@@ -23,7 +23,7 @@ fn file() -> (FileSystem, u64) {
 fn terminal(status: u32, major: u8, synchronous: bool, event: u64) -> PendingFileIo {
     let publish = nt_io_completion::file_io_status_publishes_completion(status, true);
     PendingFileIo {
-        file_id: FILE_OBJECT,
+        route: PendingFileRoute::Local(LocalFileObject::Overlay(0)),
         irp_id: REQUEST,
         tid: 37,
         major,
