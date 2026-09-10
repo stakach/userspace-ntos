@@ -31,6 +31,10 @@
 //!   like every other executive object.
 
 use crate::*;
+use nt_fs::SnapshotBlockDevice;
+
+#[path = "writable_fs/snapshot_storage.rs"]
+pub(crate) mod snapshot_storage;
 
 /// The namespace subtrees served by the writable volume, as canonical volume-relative paths
 /// (lowercase, `\`-separated, no leading separator — the form `nt_path_to_volume_relative` emits).
@@ -390,7 +394,10 @@ static WRITABLE_FS_MOUNT_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_RUNTIME_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED: AtomicBool = AtomicBool::new(false);
-static WRITABLE_FS_SNAPSHOT_RESTORE_PROBED: AtomicBool = AtomicBool::new(false);
+static WRITABLE_FS_SNAPSHOT_RESTORE_STATE: AtomicU64 = AtomicU64::new(0);
+const SNAPSHOT_RESTORE_UNREAD: u64 = 0;
+const SNAPSHOT_RESTORE_EMPTY: u64 = 1;
+const SNAPSHOT_RESTORE_CONSUMED: u64 = 2;
 
 pub(crate) static WRITABLE_FS_SNAPSHOT_RESTORES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_RESTORE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -485,143 +492,6 @@ pub(crate) fn note_profile_file_create(pi: usize, relative: &[u8]) {
     }
 }
 
-struct AhciSnapshotDevice {
-    fat: Fat32,
-    start_lba: u64,
-    sectors: u32,
-    flush_command: Option<nt_ahci::FlushCommand>,
-}
-
-impl AhciSnapshotDevice {
-    unsafe fn from_exec_fs() -> Option<Self> {
-        let fat = crate::fs_loader::exec_fs()?;
-        let (start_lba, sectors) = crate::fs_loader::writable_snapshot_reserve(&fat)?;
-        Some(Self {
-            fat,
-            start_lba,
-            sectors,
-            flush_command: None,
-        })
-    }
-
-    fn absolute_lba(&self, lba: u64) -> Result<u64, nt_fs::SnapshotBlockStoreError> {
-        if lba >= u64::from(self.sectors) {
-            return Err(nt_fs::SnapshotBlockStoreError::InvalidGeometry);
-        }
-        self.start_lba
-            .checked_add(lba)
-            .ok_or(nt_fs::SnapshotBlockStoreError::InvalidGeometry)
-    }
-}
-
-impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
-    fn flush(&mut self) -> Result<(), nt_fs::SnapshotBlockStoreError> {
-        unsafe { crate::ahci_maintenance::flush(&self.fat, &mut self.flush_command) }
-            .map_err(|_| nt_fs::SnapshotBlockStoreError::Io)
-    }
-
-    fn sector_size(&self) -> usize {
-        512
-    }
-
-    fn sector_count(&self) -> u64 {
-        self.sectors as u64
-    }
-
-    fn read_sector(
-        &mut self,
-        lba: u64,
-        out: &mut [u8],
-    ) -> Result<(), nt_fs::SnapshotBlockStoreError> {
-        if out.len() != self.sector_size() {
-            return Err(nt_fs::SnapshotBlockStoreError::InvalidGeometry);
-        }
-        let absolute = self.absolute_lba(lba)?;
-        let tfd = unsafe {
-            ahci_read_sector(
-                self.fat.ahci_vaddr,
-                self.fat.dma_vaddr,
-                self.fat.dma_paddr,
-                absolute,
-            )
-        };
-        if tfd & nt_ahci::TASK_FILE_FAILURE != 0 {
-            return Err(nt_fs::SnapshotBlockStoreError::Io);
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (self.fat.dma_vaddr + 0x800) as *const u8,
-                out.as_mut_ptr(),
-                out.len(),
-            );
-        }
-        Ok(())
-    }
-
-    fn write_sector(
-        &mut self,
-        lba: u64,
-        data: &[u8],
-    ) -> Result<(), nt_fs::SnapshotBlockStoreError> {
-        self.write_sectors(lba, data)
-    }
-
-    fn write_sectors(
-        &mut self,
-        lba: u64,
-        data: &[u8],
-    ) -> Result<(), nt_fs::SnapshotBlockStoreError> {
-        let sector_size = self.sector_size();
-        if sector_size == 0 || data.is_empty() || data.len() % sector_size != 0 {
-            return Err(nt_fs::SnapshotBlockStoreError::InvalidGeometry);
-        }
-        let total_sectors = u64::try_from(data.len() / sector_size)
-            .map_err(|_| nt_fs::SnapshotBlockStoreError::InvalidGeometry)?;
-        let end = lba
-            .checked_add(total_sectors)
-            .ok_or(nt_fs::SnapshotBlockStoreError::InvalidGeometry)?;
-        if end > self.sectors as u64 {
-            return Err(nt_fs::SnapshotBlockStoreError::InvalidGeometry);
-        }
-
-        let max_chunk = AHCI_MAX_SECTORS_PER_WRITE as usize;
-        let mut sector_index = 0usize;
-        while sector_index < total_sectors as usize {
-            let chunk_sectors = (total_sectors as usize - sector_index).min(max_chunk);
-            let relative_lba = lba + sector_index as u64;
-            let absolute = self.absolute_lba(relative_lba)?;
-            let byte_start = sector_index * sector_size;
-            let byte_end = byte_start + chunk_sectors * sector_size;
-            let tfd = unsafe {
-                ahci_write_sectors(
-                    self.fat.ahci_vaddr,
-                    self.fat.dma_vaddr,
-                    self.fat.dma_paddr,
-                    absolute,
-                    &data[byte_start..byte_end],
-                )
-            };
-            if tfd & nt_ahci::TASK_FILE_FAILURE != 0 {
-                return Err(nt_fs::SnapshotBlockStoreError::Io);
-            }
-            let n = WRITABLE_FS_SNAPSHOT_WRITE_SECTORS
-                .fetch_add(chunk_sectors as u64, Ordering::Relaxed);
-            if n < 8 || (n / 2048) != ((n + chunk_sectors as u64) / 2048) {
-                print_str(b"[writable-fs-snapshot] write-sector #");
-                print_u64(n.saturating_add(chunk_sectors as u64));
-                print_str(b" rel-lba=");
-                print_u64(relative_lba);
-                print_str(b" abs-lba=");
-                print_u64(absolute as u64);
-                print_str(b" count=");
-                print_u64(chunk_sectors as u64);
-                print_str(b"\n");
-            }
-            sector_index += chunk_sectors;
-        }
-        Ok(())
-    }
-}
 
 fn mark_runtime_dirty() {
     WRITABLE_FS_RUNTIME_DIRTY.store(true, Ordering::Release);
@@ -657,19 +527,16 @@ fn print_snapshot_store_error(err: nt_fs::SnapshotBlockStoreError) {
     });
 }
 
-unsafe fn restore_snapshot_volume() -> Result<Option<(nt_fs::FileSystem, u64, usize)>, u32> {
-    let Some(mut dev) = AhciSnapshotDevice::from_exec_fs() else {
-        WRITABLE_FS_SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed);
-        print_str(b"[writable-fs-snapshot] no executable FAT/reserve geometry for restore\n");
-        return Err(0xC000_0001);
-    };
-    let store = nt_fs::SnapshotBlockStore::new(0, dev.sectors as u64);
-    match nt_fs::FileSystem::restore_volume_snapshot_from_store(&store, &mut dev) {
+unsafe fn restore_snapshot_volume(
+    dev: &mut snapshot_storage::Lease,
+) -> Result<Option<(nt_fs::FileSystem, u64, usize)>, u32> {
+    let store = dev.store();
+    match nt_fs::FileSystem::restore_volume_snapshot_from_store(&store, dev) {
         Ok(Some((fs, generation, bytes))) => Ok(Some((fs, generation, bytes))),
         Ok(None) => {
             WRITABLE_FS_SNAPSHOT_EMPTY_MOUNTS.fetch_add(1, Ordering::Relaxed);
             print_str(b"[writable-fs-snapshot] no stored snapshot in reserve sectors=");
-            print_u64(dev.sectors as u64);
+            print_u64(dev.sector_count());
             print_str(b"\n");
             Ok(None)
         }
@@ -684,10 +551,21 @@ unsafe fn restore_snapshot_volume() -> Result<Option<(nt_fs::FileSystem, u64, us
 }
 
 unsafe fn restore_snapshot_volume_once() -> Result<Option<(nt_fs::FileSystem, u64, usize)>, u32> {
-    if WRITABLE_FS_SNAPSHOT_RESTORE_PROBED.swap(true, Ordering::AcqRel) {
-        return Ok(None);
+    let mut dev = snapshot_storage::acquire()?;
+    match WRITABLE_FS_SNAPSHOT_RESTORE_STATE.load(Ordering::Acquire) {
+        SNAPSHOT_RESTORE_EMPTY => return Ok(None),
+        SNAPSHOT_RESTORE_UNREAD => {}
+        // A previously returned volume is not evidence of absence if its caller lost installation.
+        _ => return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST),
     }
-    restore_snapshot_volume()
+    let result = restore_snapshot_volume(&mut dev);
+    if let Ok(restored) = &result {
+        WRITABLE_FS_SNAPSHOT_RESTORE_STATE.store(
+            if restored.is_some() { SNAPSHOT_RESTORE_CONSUMED } else { SNAPSHOT_RESTORE_EMPTY },
+            Ordering::Release,
+        );
+    }
+    result
 }
 
 unsafe fn snapshot_reserve_available() -> bool {
@@ -731,23 +609,19 @@ unsafe fn install_writable_fs(mut fs: nt_fs::FileSystem, restored: bool) -> Resu
     Ok(())
 }
 
-unsafe fn checkpoint_volume_snapshot() -> Result<(u64, usize), u32> {
+unsafe fn checkpoint_volume_snapshot(dev: &mut snapshot_storage::Lease) -> Result<(u64, usize), u32> {
     let Some(fs) = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref() else {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     };
-    let Some(mut dev) = AhciSnapshotDevice::from_exec_fs() else {
-        print_str(b"[writable-fs-snapshot] no executable FAT/reserve geometry for commit\n");
-        return Err(0xC000_0001);
-    };
-    let store = nt_fs::SnapshotBlockStore::new(0, dev.sectors as u64);
+    let store = dev.store();
     print_str(b"[writable-fs-snapshot] dirty commit begin nodes=");
     print_u64(fs.node_count() as u64);
     print_str(b" reserve-sectors=");
-    print_u64(dev.sectors as u64);
+    print_u64(dev.sector_count());
     print_str(b" written-sectors=");
     print_u64(WRITABLE_FS_SNAPSHOT_WRITE_SECTORS.load(Ordering::Relaxed));
     print_str(b"\n");
-    match fs.commit_volume_snapshot(&store, &mut dev) {
+    match fs.commit_volume_snapshot(&store, dev) {
         Ok((generation, bytes)) => Ok((generation, bytes)),
         Err(err) => {
             print_str(b"[writable-fs-snapshot] commit failed err=");
@@ -761,10 +635,13 @@ unsafe fn checkpoint_volume_snapshot() -> Result<(u64, usize), u32> {
 /// Commit pending volume bytes. `Ok(true)` means a new durable snapshot was published, while
 /// `Ok(false)` means the volume was already clean.
 pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
+    // Even a clean observation needs exclusion: another owner may have cleared the bit but not
+    // yet finished its barrier. Refusal cannot consume dirty state or authorize caller completion.
+    let mut dev = snapshot_storage::acquire()?;
     if !WRITABLE_FS_SNAPSHOT_DIRTY.swap(false, Ordering::AcqRel) {
         return Ok(false);
     }
-    match checkpoint_volume_snapshot() {
+    match checkpoint_volume_snapshot(&mut dev) {
         Ok((generation, bytes)) => {
             WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
             WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
@@ -1032,14 +909,14 @@ pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
     if WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
         return None;
     }
-    let slot = &mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS);
-    if slot.is_none() {
+    if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_none() {
         let (fs, restored) = match restore_snapshot_volume_once() {
             Ok(Some((fs, generation, bytes))) => {
                 note_restored_snapshot(generation, bytes, fs.node_count());
                 (fs, true)
             }
             Ok(None) => (nt_fs::FileSystem::new(nt_fs::MemFs::new()), false),
+            Err(snapshot_storage::BUSY) => return None,
             Err(status) => {
                 WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
                 print_str(
@@ -1055,7 +932,7 @@ pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
             return None;
         }
     }
-    let fs = slot.as_mut()?;
+    let fs = (&mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut()?;
     fs.set_current_time_100ns(nt_system_time_100ns());
     Some(fs)
 }
@@ -1112,7 +989,7 @@ pub(crate) unsafe fn restore_boot_system_persistence(
     if !snapshot_reserve_available() {
         return Err(BootSystemRestoreError::GeometryUnavailable);
     }
-    match restore_snapshot_volume_once() {
+    let result = (|| match restore_snapshot_volume_once() {
         Ok(Some((fs, generation, bytes))) => {
             let primary = owned_file_before_publish(
                 &fs,
@@ -1136,6 +1013,7 @@ pub(crate) unsafe fn restore_boot_system_persistence(
             }))
         }
         Ok(None) => Ok(BootSystemPersistence::Absent),
+        Err(snapshot_storage::BUSY) => Err(BootSystemRestoreError::Snapshot(snapshot_storage::BUSY)),
         Err(status) => {
             WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
             print_str(b"[writable-fs-snapshot] refusing writable mount after restore status=0x");
@@ -1143,7 +1021,15 @@ pub(crate) unsafe fn restore_boot_system_persistence(
             print_str(b"\n");
             Err(BootSystemRestoreError::Snapshot(status))
         }
+    })();
+    // Once a present snapshot was consumed, failure to inspect or install it must never permit
+    // a later fresh-volume mount. Only admission contention is retryable without poisoning mount.
+    if result.is_err()
+        && !matches!(result, Err(BootSystemRestoreError::Snapshot(snapshot_storage::BUSY)))
+    {
+        WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
     }
+    result
 }
 
 /// Whether the volume has been mounted (i.e. something actually resolved into it).

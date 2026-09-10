@@ -23,6 +23,7 @@ mod partition;
 mod path;
 mod query;
 mod snapshot_store;
+mod snapshot_reserve;
 #[cfg(test)]
 mod snapshot_test_device;
 mod status;
@@ -56,6 +57,7 @@ pub use snapshot_store::{
     PayloadSectorReader, PayloadSectorWriter, SnapshotBlockDevice, SnapshotBlockStore,
     SnapshotBlockStoreError, SnapshotPayloadReader, SnapshotPayloadSink, StoredSnapshot,
 };
+pub use snapshot_reserve::{SnapshotReserve, SnapshotReserveLease};
 pub use status::*;
 pub use volume::*;
 

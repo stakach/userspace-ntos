@@ -1023,6 +1023,7 @@ pub(crate) unsafe fn publish_exec_fs(fs: Fat32) -> Result<(), u32> {
     let slot = &mut *core::ptr::addr_of_mut!(EXEC_FS);
     if slot.is_some() { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); }
     let id = crate::mounted_volume::allocate_mount_id()?;
+    crate::writable_fs::snapshot_storage::publish(fs, id)?;
     *core::ptr::addr_of_mut!(EXEC_FS_MOUNT_ID) = Some(id);
     *slot = Some(fs);
     Ok(())
@@ -1032,6 +1033,10 @@ pub(crate) unsafe fn exec_fs_file_identity(file_id: u64) -> Option<nt_memory_man
     Some(nt_memory_manager::SectionFileIdentity {
         mount: (*core::ptr::addr_of!(EXEC_FS_MOUNT_ID))?, file_id,
     })
+}
+
+pub(crate) unsafe fn exec_fs_mount_identity() -> Option<nt_memory_manager::SectionMountId> {
+    *core::ptr::addr_of!(EXEC_FS_MOUNT_ID)
 }
 
 /// Copy of the executive's mounted FAT32 handle (Fat32 is Copy), or None if not yet mounted.

@@ -31930,8 +31930,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Review adjustment: the guarantee is failure atomicity for returned errors, not recovery from
     global allocator abort or arbitrary unwinding after commit. Directory notification reporting
     still allocates its completion queue without a returned-error path and remains a separate
-    allocation-lifecycle audit. Native CM-to-log/mount authority, actual snapshot-reserve exclusion
-    and complete caller/PnP/Key integration remain the next prerequisites. Do not borrow mutable
+    allocation-lifecycle audit. The reserve checkpoint below adds actual snapshot-I/O exclusion;
+    native CM-to-log/mount authority and complete caller/PnP/Key integration remain open. Do not borrow mutable
     global filesystem state across executive re-entry or treat this host change as native cutover.
     No VM run or desktop acceptance is implied; the 27 strict missing win32k imports remain open.
 
@@ -31949,6 +31949,57 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     this scope. Only the root agent ran tests/builds, serially; existing client warnings remain.
     Freestanding executive release passes in 36.96 seconds with 293 existing executive warnings;
     log: `.tmp/build-file-create-atomic-executive-20260910.log`.
+
+    Published snapshot reserve checkpoint (2026-09-10): enforce one owned native backend for all
+    actual snapshot reads and writes, rather than independently reconstructing AHCI wrappers.
+    - [x] Add generic SnapshotReserve<D, I> in nt-fs, owning the immutable identity/store and
+      backend. A non-Clone, nonblocking lease is the only device access. Acquire/Release exclusion
+      supports Send backends without incorrectly making a lease Sync when its backend is not Sync.
+      Independent reserve owners remain independent; there is no global device-count or image-name
+      policy. Drop releases access only, never durability or caller completion.
+    - [x] Bind the native reserve once before executable-filesystem publication, using its real
+      allocated mount identity and captured AHCI/DMA/range authority. Reject replacement and check
+      the published mount again on acquisition. Move the private backend/constructor into focused
+      writable_fs/snapshot_storage.rs; delete the old from_exec_fs reconstruction path. Restore and
+      checkpoint consume the same leased device and store, including its retained flush-command
+      selection. No raw snapshot backend is exposed to callers.
+    - [x] Acquire before changing dirty/restore bookkeeping. Even a clean observation requires
+      the lease: another owner may have cleared the dirty bit while its barrier remains pending.
+      Busy cannot authorize writeback or CM completion and cannot consume dirty state. Existing
+      service-loop and mapped-writeback error paths retain their pending work on refusal.
+    - [x] Distinguish unread reserve, positively empty disk and already-consumed restored volume.
+      A failed read or admission leaves restore unread; a consumed volume can never be returned as
+      absence. Busy does not permanently block mounting. After a present restore, all primary/log
+      inspection, state validation and installation failures block a later fresh-volume mount.
+      Remove the live mutable global slot borrow across restore/installation.
+
+    Review adjustment: this is native snapshot-I/O exclusion, not yet native retained CM journal
+    publication. Next bind the exact CM SYSTEM authority to its primary/log path and writable mount,
+    and establish filesystem mutation ownership across retained work. A device lease does not
+    exclude EXEC_WRITABLE_FS mutation or unrelated AHCI/FAT users; preserve the existing serialized
+    executive and synchronous hardware-I/O contracts. Do not hold mutable global filesystem borrows
+    through CM/provider re-entry. Complete caller/PnP/Key migration and remove old one-shot wrappers
+    and unconditional flush success together. Volatile/no-op publication remains separate. No VM
+    run, simultaneous native hardware I/O or desktop acceptance is claimed; 27 strict missing
+    win32k imports remain open.
+
+    Review found and corrected a clean-bit bypass: an early Ok(false) could have let another caller
+    complete while the first owner's snapshot was still in flight. Acquisition now precedes all
+    clean-state observation. Independent reserve/native reviews found no remaining issue in scope.
+
+    Serialized host validation passes all 1,412 tests/doctests: nt-fs 188 plus two doctests,
+    nt-config-client 153 plus 18 doctests, nt-config-abi 9, nt-config-server 103,
+    nt-config-manager 35, nt-hive-core 106 plus 18 generator cases, nt-security 223 plus two
+    doctests, and nt-user-host 494 plus 49 integration cases and 12 doctests. Log:
+    `.tmp/test-snapshot-reserve-full-final-20260910.log`. Nine new unit tests and a non-Clone
+    compile-fail case cover competing access, independent reserves, retained identity/backend,
+    read/write/flush errors, drop/unwind without false durability, real journal publication and
+    rollback with power-cut recovery, negative lease-Sync assertions and four-thread contention
+    on a Send-but-not-Sync backend. Native flag ordering and restore-error containment were source
+    reviewed and compile-verified, not exercised in a VM. The freestanding executive release
+    passes in 37.76 seconds with 293 existing executive warnings;
+    `.tmp/build-snapshot-reserve-executive-20260910.log`. Existing client warnings are unchanged.
+    Only the root agent ran tests/builds, serially; no microkernel change or VM run occurred.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
