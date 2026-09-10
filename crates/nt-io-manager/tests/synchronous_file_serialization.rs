@@ -69,18 +69,29 @@ fn acknowledge_and_adopt(
         .record_retry(&mut attempt, SynchronousFileRetryOutcome::Acknowledged)
         .unwrap();
     assert!(!waiters.finish_retry(identity, Err(0xc000_0001)).unwrap());
-    assert!(waiters.take_promoted(PI, tid, tid + 100, SERVICE).is_none());
+    assert!(waiters.begin_ingress(PI, tid, tid + 100, SERVICE).is_err());
     assert_eq!(files.io_lock_owner(FILE), Ok(Some(tid)));
     assert!(waiters.finish_retry(identity, Ok(())).unwrap());
     assert!(waiters
-        .take_promoted(PI, tid, tid + 100, SERVICE + 1)
-        .is_none());
-    let consumed = waiters.take_promoted(PI, tid, tid + 100, SERVICE).unwrap();
+        .begin_ingress(PI, tid, tid + 100, SERVICE + 1)
+        .is_err());
+    let mut ingress = waiters
+        .begin_ingress(PI, tid, tid + 100, SERVICE)
+        .unwrap()
+        .unwrap();
+    let mut adoption = waiters.begin_adoption(&mut ingress).unwrap();
+    let result = files.adopt_io_grant(FILE, tid);
+    assert_eq!(result, Ok(()));
+    let consumed = waiters
+        .record_adoption(&mut adoption, result)
+        .unwrap()
+        .unwrap()
+        .waiter();
     assert_eq!(consumed.route, original.route);
     assert_eq!(consumed.reply_mrs, original.reply_mrs);
     assert_eq!(consumed.reply_cap, 0);
-    // The promoted request already owns its File reference; no second retain occurs here.
-    assert_eq!(files.begin_io(FILE, tid), Ok(FileIoAcquireResult::Acquired));
+    // The promoted request adopted its existing reference; no second retain occurred.
+    assert_eq!(files.io_grant_owner(FILE), Ok(None));
 }
 
 #[test]
@@ -189,7 +200,7 @@ fn uncertain_retry_keeps_busy_and_cleanup_blocked_without_blocking_another_file(
     assert!(waiters
         .oldest_waiting_for_file(FileIoWaitKey::Hosted(FILE))
         .is_none());
-    assert!(waiters.take_promoted(PI, 20, 120, SERVICE).is_none());
+    assert!(waiters.begin_ingress(PI, 20, 120, SERVICE).is_err());
     assert_eq!(
         waiters.take_thread_with(20, |_| panic!("uncertain reply is still owned")),
         0

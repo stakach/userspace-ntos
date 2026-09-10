@@ -343,11 +343,6 @@ fn file_io_mode_from_create(
     )
 }
 
-unsafe fn reserve_synchronous_file_waiter() -> bool {
-    let waiters = &mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS);
-    waiters.ensure_capacity()
-}
-
 unsafe fn reserve_file_irp_drain_waiter() -> Option<nt_io_manager::PendingFileIrpDrainReservation> {
     let waiters = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS);
     waiters.reserve()
@@ -10559,8 +10554,12 @@ impl ExecNtHandler {
         &mut self,
         tid: u64,
     ) -> Option<HostedThreadRuntime> {
-        if unsafe { (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS))
-            .has_retry_delivery_for_thread(tid) }
+        if unsafe {
+            let waiters = &*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS);
+            waiters.has_retry_delivery_for_thread(tid)
+                || waiters.has_cancellation_for_thread(tid)
+                || waiters.has_ingress_for_thread(tid)
+        }
         {
             return None;
         }
@@ -13832,16 +13831,20 @@ impl ExecNtHandler {
 
     /// Drop one body reference and unlink a named completion port after its final reference goes.
     pub(crate) fn release_io_completion_reference(&mut self, id: u32) {
-        if self.io_completion_ports.release(id).is_err()
-            || self.io_completion_ports.depth(id).is_ok()
-        {
-            return;
+        let _ = self.try_release_io_completion_reference(id);
+    }
+
+    pub(crate) fn try_release_io_completion_reference(&mut self, id: u32) -> Result<(), u32> {
+        self.io_completion_ports.release(id)?;
+        if self.io_completion_ports.depth(id).is_ok() {
+            return Ok(());
         }
         for entry in self.obj_ns.iter_mut().filter(|entry| {
             entry.is_live() && entry.kind == OBJ_KIND_IO_COMPLETION && entry.payload == id as u64
         }) {
             entry.unlink();
         }
+        Ok(())
     }
 
     pub(crate) fn release_file_cleanup_reference(&mut self, file_id: u64) {
@@ -29118,7 +29121,7 @@ impl ExecNtHandler {
     }
 
     fn synchronous_file_retry_for(&self, handle: u64) -> Option<nt_io_manager::SynchronousFileWaiter> {
-        self.active_synchronous_file_retry.filter(|retry| {
+        self.active_synchronous_file_retry.as_ref().map(|ingress| ingress.waiter()).filter(|retry| {
             retry.handle as u64 == handle
                 && retry.service_number == self.current_service_number
                 && retry.pi as usize == self.pi
@@ -29129,7 +29132,8 @@ impl ExecNtHandler {
 
     /// Resolve a process-local routed File handle to its canonical File and owning device.
     pub(crate) fn hosted_file_route_for(&self, handle: u64) -> Option<HostedFileRoute> {
-        if let Some(retry) = self.synchronous_file_retry_for(handle) {
+        if self.active_synchronous_file_retry.is_some() {
+            let retry = self.synchronous_file_retry_for(handle)?;
             return match retry.route {
                 nt_io_manager::FileIoWaitRoute::Hosted { file_id, device_id, fs_context } =>
                     Some(HostedFileRoute { file_id, device_id, fs_context }),
@@ -29194,7 +29198,8 @@ impl ExecNtHandler {
     }
 
     fn hosted_file_access_for(&self, handle: u64) -> Option<u32> {
-        if let Some(retry) = self.synchronous_file_retry_for(handle) {
+        if self.active_synchronous_file_retry.is_some() {
+            let retry = self.synchronous_file_retry_for(handle)?;
             return match retry.route {
                 nt_io_manager::FileIoWaitRoute::Hosted { .. } => Some(retry.granted_access),
                 nt_io_manager::FileIoWaitRoute::LocalOverlay { .. } => None,
@@ -29702,6 +29707,9 @@ impl ExecNtHandler {
         };
         let live_mode = self.file_completion.io_mode(route.file_id)?;
         let retry = self.synchronous_file_retry_for(handle);
+        if self.active_synchronous_file_retry.is_some() && retry.is_none() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
         let mode = if let Some(retry) = retry {
             if retry.route != wait_route || retry.mode != live_mode {
                 return Err(STATUS_INVALID_PARAMETER);
@@ -29715,90 +29723,117 @@ impl ExecNtHandler {
             return Ok(true);
         }
 
-        let promoted = retry.is_some();
-        if !promoted {
-            if !reserve_synchronous_file_waiter()
-                || REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
-                || !wait_reply_pool_has_free()
+        if retry.is_some() {
+            let mut ingress = self.active_synchronous_file_retry.take()
+                .expect("promoted File acquisition lost its ingress claim");
+            let identity = ingress.identity();
+            let mut attempt = match (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
+                .begin_adoption(&mut ingress)
             {
-                return Err(STATUS_INSUFFICIENT_RESOURCES);
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    let status = if error == nt_io_manager::SynchronousFileIngressError::Exhausted {
+                        STATUS_INSUFFICIENT_RESOURCES
+                    } else {
+                        nt_fs::STATUS_CANCELLED
+                    };
+                    let identity = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
+                        .reject_ingress(&mut ingress, status)
+                        .expect("unstarted File adoption lost its claim");
+                    crate::service_sec_image::synchronous_file_cancellation::drive(self, identity);
+                    return Err(status);
+                }
+            };
+            let result = self.file_completion.adopt_io_grant(route.file_id, self.current_tid);
+            let adopted = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
+                .record_adoption(&mut attempt, result)
+                .expect("File adoption receipt lost its entered owner");
+            if let Some(owner) = adopted {
+                // The policy transition and transfer are memory-only. No callback can request
+                // cancellation between grant adoption and publication of current-syscall Busy.
+                assert!(!owner.cancellation_requested());
+                assert_eq!(self.current_synchronous_file_lock, 0);
+                self.current_synchronous_file_lock = route.file_id;
+                return Ok(true);
             }
-            self.file_completion.retain_file(route.file_id)?;
+            crate::service_sec_image::synchronous_file_cancellation::drive(self, identity);
+            return Err(result.expect_err("rejected File adoption reported success"));
         }
 
-        match self
-            .file_completion
-            .begin_io(route.file_id, self.current_tid)
-        {
+        let reservation = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
+            .reserve().ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
+            assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
+                .cancel_reservation(reservation));
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let mut waiter = nt_io_manager::SynchronousFileWaiter::waiting(
+            wait_route, handle as u32, granted_access, self.current_service_number,
+            self.pi as u32, self.current_tid, self.current_badge, mode,
+            self.current_native_call_transport, 0, self.current_resume_ip,
+            self.current_sp, self.current_flags,
+        );
+        // Capture before counting contention: copyin can re-enter the executive. A bad retry
+        // frame matters only if this acquisition actually needs to park.
+        let retry_ip = if waiter.native_call_transport {
+            Ok(0)
+        } else if let Some(ip) = waiter.resume_ip.checked_sub(2) {
+            let mut syscall = [0u8; 2];
+            if self.xas_read(ip, &mut syscall) && syscall == [0x0f, 0x05] {
+                Ok(ip)
+            } else {
+                Err(STATUS_ACCESS_VIOLATION)
+            }
+        } else {
+            Err(STATUS_ACCESS_VIOLATION)
+        };
+        if self.file_completion.io_mode(route.file_id) != Ok(mode) {
+            assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
+                .cancel_reservation(reservation));
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        match self.file_completion.acquire_file_io(route.file_id, waiter.tid) {
             Ok(nt_io_completion::FileIoAcquireResult::Acquired) => {
+                assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
+                    .cancel_reservation(reservation));
                 assert_eq!(
                     self.current_synchronous_file_lock, 0,
                     "one syscall acquired more than one synchronous File"
                 );
                 self.current_synchronous_file_lock = route.file_id;
-                if promoted {
-                    self.active_synchronous_file_retry = None;
-                }
                 Ok(true)
             }
             Ok(nt_io_completion::FileIoAcquireResult::Contended { alertable }) => {
-                debug_assert!(!promoted);
-                if alertable && self.pm.peek_user_apc(self.current_tid as u32).is_some() {
-                    let _ = self.file_completion.cancel_io_waiter(route.file_id);
-                    self.release_file_reference(route.file_id);
+                let apc_queued = alertable && self.pm.peek_user_apc(waiter.tid as u32).is_some();
+                if apc_queued || retry_ip.is_err() {
+                    if !crate::service_sec_image::synchronous_file_cancellation::cancel_unpublished(
+                        self, reservation, waiter,
+                    ) {
+                        return Err(STATUS_UNSUCCESSFUL);
+                    }
+                    if !apc_queued {
+                        return Err(retry_ip.expect_err("File rollback lost its retry-frame refusal"));
+                    }
+                    // No counted File acquisition remains when APC staging takes ownership of
+                    // the current syscall's still-untransferred reply.
                     return match self.try_deliver_current_user_apc() {
                         Ok(true) => Err(STATUS_USER_APC),
                         Ok(false) => Err(STATUS_UNSUCCESSFUL),
                         Err(status) => Err(status),
                     };
                 }
-                let retry_ip = if self.current_native_call_transport {
-                    0
-                } else {
-                    let Some(ip) = self.current_resume_ip.checked_sub(2) else {
-                        let _ = self.file_completion.cancel_io_waiter(route.file_id);
-                        self.release_file_reference(route.file_id);
-                        return Err(STATUS_ACCESS_VIOLATION);
-                    };
-                    let mut syscall = [0u8; 2];
-                    if !self.xas_read(ip, &mut syscall) || syscall != [0x0f, 0x05] {
-                        let _ = self.file_completion.cancel_io_waiter(route.file_id);
-                        self.release_file_reference(route.file_id);
-                        return Err(STATUS_ACCESS_VIOLATION);
-                    }
-                    ip
-                };
-                self.pending_synchronous_file_wait =
-                    Some(nt_io_manager::SynchronousFileWaiter::waiting(
-                        wait_route,
-                        handle as u32,
-                        granted_access,
-                        self.current_service_number,
-                        self.pi as u32,
-                        self.current_tid,
-                        self.current_badge,
-                        mode,
-                        self.current_native_call_transport,
-                        retry_ip,
-                        self.current_resume_ip,
-                        self.current_sp,
-                        self.current_flags,
-                    ));
+                waiter.retry_ip = retry_ip.expect("parked File lost its captured retry frame");
+                assert!(self.pending_synchronous_file_wait.is_none());
+                self.pending_synchronous_file_wait = Some((waiter, reservation));
                 Ok(false)
             }
             Ok(nt_io_completion::FileIoAcquireResult::Bypassed) => {
-                if let Some(retry) = self.active_synchronous_file_retry.take() {
-                    crate::service_sec_image::synchronous_file_cancel_waiter(self, retry);
-                    return Err(STATUS_INVALID_PARAMETER);
-                }
-                Ok(true)
+                unreachable!("synchronous File admission bypassed its captured mode")
             }
             Err(status) => {
-                if let Some(retry) = self.active_synchronous_file_retry.take() {
-                    crate::service_sec_image::synchronous_file_cancel_waiter(self, retry);
-                } else {
-                    self.release_file_reference(route.file_id);
-                }
+                // Atomic admission rejected before retaining a reference or counting a waiter.
+                assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
+                    .cancel_reservation(reservation));
                 Err(status)
             }
         }

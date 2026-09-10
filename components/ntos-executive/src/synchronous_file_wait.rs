@@ -51,6 +51,12 @@ pub(super) unsafe fn try_synchronous_file_wake_next(
     nt_handler: &mut ExecNtHandler,
     key: FileIoWaitKey,
 ) -> Result<bool, u32> {
+    let cancellation =
+        (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).cancellation_ownership(key);
+    if cancellation.promoted != 0 {
+        // The retained cancellation still owns this grant and its eventual wake.
+        return Ok(true);
+    }
     if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_promoted_for_file(key) {
         synchronous_file_retry::deliver_file(nt_handler, key);
         return Ok(true);
@@ -59,8 +65,13 @@ pub(super) unsafe fn try_synchronous_file_wake_next(
     let Some((slot, waiter)) = next else {
         return Ok(match key {
             FileIoWaitKey::Hosted(file_id) => {
-                if nt_handler.file_completion.io_waiter_count(file_id)? != 0 {
-                    return Err(nt_fs::STATUS_DATA_ERROR);
+                let waiters = nt_handler.file_completion.io_waiter_count(file_id)?;
+                if waiters != 0 {
+                    return if waiters as usize == cancellation.waiting {
+                        Ok(true)
+                    } else {
+                        Err(nt_fs::STATUS_DATA_ERROR)
+                    };
                 }
                 if nt_handler
                     .file_completion
@@ -75,8 +86,13 @@ pub(super) unsafe fn try_synchronous_file_wake_next(
             // nt-fs transitions already attempt ready cleanup. Failed preparation remains owned
             // for the service-loop cleanup barrier, not an invariant failure or a second close.
             FileIoWaitKey::LocalOverlay(file_id) => {
-                if crate::writable_fs::file_io_waiter_count(file_id)? != 0 {
-                    return Err(nt_fs::STATUS_DATA_ERROR);
+                let waiters = crate::writable_fs::file_io_waiter_count(file_id)?;
+                if waiters != 0 {
+                    return if waiters as usize == cancellation.waiting {
+                        Ok(true)
+                    } else {
+                        Err(nt_fs::STATUS_DATA_ERROR)
+                    };
                 }
                 false
             }
@@ -95,6 +111,34 @@ pub(super) unsafe fn try_synchronous_file_wake_next(
         .expect("synchronous File FIFO promotion lost exact waiter");
     synchronous_file_retry::deliver_file(nt_handler, key);
     Ok(true)
+}
+
+/// A later Busy or retained cancellation owner inherits the outstanding FIFO wake. Accepted
+/// promotion transfers delivery to the retry table, even when that Reply remains uncertain.
+pub(super) unsafe fn settle_synchronous_file_wake(
+    nt_handler: &mut ExecNtHandler,
+    key: FileIoWaitKey,
+) -> Result<(), u32> {
+    if let FileIoWaitKey::Hosted(file_id) = key {
+        let owner = nt_handler.file_completion.io_lock_owner(file_id)?;
+        let grant = nt_handler.file_completion.io_grant_owner(file_id)?;
+        let fifo = &*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS);
+        let cancellation = fifo.cancellation_ownership(key);
+        if grant.is_some() && !fifo.has_promoted_for_file(key) && cancellation.promoted == 0 {
+            return Err(nt_fs::STATUS_DATA_ERROR);
+        }
+        if owner.is_some() && grant.is_none() {
+            let waiters = nt_handler.file_completion.io_waiter_count(file_id)?;
+            if waiters != 0
+                && fifo.oldest_waiting_for_file(key).is_none()
+                && waiters as usize != cancellation.waiting
+            {
+                return Err(nt_fs::STATUS_DATA_ERROR);
+            }
+            return Ok(());
+        }
+    }
+    try_synchronous_file_wake_next(nt_handler, key).map(|_| ())
 }
 
 unsafe fn synchronous_file_wake_next(nt_handler: &mut ExecNtHandler, key: FileIoWaitKey) -> bool {

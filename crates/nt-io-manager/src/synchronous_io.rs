@@ -9,12 +9,17 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use nt_io_completion::FileIoMode;
 
 mod cancellation;
+mod ingress;
 mod retry;
 pub use cancellation::{
     SynchronousFileCancelAttempt, SynchronousFileCancelEffect, SynchronousFileCancelError,
     SynchronousFileCancelIdentity, SynchronousFileCancelOutcome, SynchronousFileCancelOwnership,
     SynchronousFileCancelPhase, SynchronousFileCancelReceipt, SynchronousFileCancelView,
     SynchronousFileWaitIdentity,
+};
+pub use ingress::{
+    SynchronousFileAdoptedOwner, SynchronousFileAdoptionAttempt, SynchronousFileIngress,
+    SynchronousFileIngressError, SynchronousFileIngressPhase,
 };
 pub use retry::{
     SynchronousFileRetryAttempt, SynchronousFileRetryError, SynchronousFileRetryIdentity,
@@ -166,6 +171,7 @@ struct WaitRecord {
     retry: Option<SynchronousFileRetryPhase>,
     next_attempt: u64,
     cancellation: Option<cancellation::CancelState>,
+    ingress: Option<SynchronousFileIngressPhase>,
 }
 
 #[derive(Debug)]
@@ -214,7 +220,7 @@ impl WaitRecord {
     }
 
     fn transferable(&self) -> bool {
-        self.cancellation.is_none() && !self.delivery_retained()
+        self.cancellation.is_none() && self.ingress.is_none() && !self.delivery_retained()
     }
 }
 
@@ -386,6 +392,7 @@ impl SynchronousFileWaitTable {
             retry: None,
             next_attempt: 1,
             cancellation: None,
+            ingress: None,
         };
         self.next_queue_order = self
             .next_queue_order
@@ -488,31 +495,21 @@ impl SynchronousFileWaitTable {
         Some(*waiter)
     }
 
-    /// Consume the canonical route retained for the promoted syscall. A mismatched service number
-    /// cannot steal another call's grant.
-    pub fn take_promoted(
+    /// Model the pure adoption receipt in table-only tests. Integration tests use canonical File
+    /// policy effects, and native callers must retain their claim across argument validation.
+    #[cfg(test)]
+    fn adopt_promoted_fixture(
         &mut self,
         pi: u32,
         tid: u64,
         badge: u64,
         service_number: u32,
     ) -> Option<SynchronousFileWaiter> {
-        let slot = self.slots.iter_mut().find(|slot| {
-            slot.as_ref()
-                .and_then(WaitSlot::record)
-                .is_some_and(|record| {
-                    let waiter = &record.waiter;
-                    waiter.pi == pi
-                        && waiter.tid == tid
-                        && waiter.badge == badge
-                        && waiter.service_number == service_number
-                        && waiter.state == SynchronousFileWaitState::Promoted
-                        && waiter.reply_cap == 0
-                        && record.retry == Some(SynchronousFileRetryPhase::Retired)
-                        && record.cancellation.is_none()
-                })
-        })?;
-        slot.take()?.into_record().map(|record| record.waiter)
+        let mut ingress = self.begin_ingress(pi, tid, badge, service_number).ok()??;
+        let mut attempt = self.begin_adoption(&mut ingress).ok()?;
+        self.record_adoption(&mut attempt, Ok(()))
+            .ok()?
+            .map(|owner| owner.waiter())
     }
 
     pub fn take_exact(
@@ -620,7 +617,7 @@ mod tests {
             .unwrap();
         assert_eq!(one.reply_cap, 101);
         acknowledge_retry(&mut table, first, 10, 1);
-        assert_eq!(table.take_promoted(2, 1, 101, 191).unwrap().tid, 1);
+        assert_eq!(table.adopt_promoted_fixture(2, 1, 101, 191).unwrap().tid, 1);
         let third = table.park(waiter(10, 3, 103)).unwrap();
         assert_eq!(third, first, "the freed low slot is deliberately reused");
         assert_eq!(
@@ -644,19 +641,19 @@ mod tests {
     fn promotion_and_retry_are_exact() {
         let mut table = SynchronousFileWaitTable::new();
         let slot = table.park(waiter(10, 1, 101)).unwrap();
-        assert!(table.take_promoted(2, 1, 101, 191).is_none());
+        assert!(table.adopt_promoted_fixture(2, 1, 101, 191).is_none());
         assert!(table
             .promote_exact(slot, FileIoWaitKey::Hosted(11), 1)
             .is_none());
         table
             .promote_exact(slot, FileIoWaitKey::Hosted(10), 1)
             .unwrap();
-        assert!(table.take_promoted(2, 1, 101, 191).is_none());
+        assert!(table.adopt_promoted_fixture(2, 1, 101, 191).is_none());
         acknowledge_retry(&mut table, slot, 10, 1);
-        assert!(table.take_promoted(3, 1, 101, 191).is_none());
-        assert!(table.take_promoted(2, 1, 102, 191).is_none());
-        assert!(table.take_promoted(2, 1, 101, 192).is_none());
-        let ready = table.take_promoted(2, 1, 101, 191).unwrap();
+        assert!(table.adopt_promoted_fixture(3, 1, 101, 191).is_none());
+        assert!(table.adopt_promoted_fixture(2, 1, 102, 191).is_none());
+        assert!(table.adopt_promoted_fixture(2, 1, 101, 192).is_none());
+        let ready = table.adopt_promoted_fixture(2, 1, 101, 191).unwrap();
         assert_eq!(ready.key(), FileIoWaitKey::Hosted(10));
         assert!(table.is_empty());
     }
@@ -671,7 +668,7 @@ mod tests {
             .promote_exact(slot, FileIoWaitKey::Hosted(10), 1)
             .unwrap();
         acknowledge_retry(&mut table, slot, 10, 1);
-        let replay = table.take_promoted(2, 1, 101, 0).unwrap();
+        let replay = table.adopt_promoted_fixture(2, 1, 101, 0).unwrap();
         assert_eq!(replay.service_number, 0);
         assert_eq!(replay.route, zero.route);
 

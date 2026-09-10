@@ -70,7 +70,7 @@ fn assert_retained(table: &mut SynchronousFileWaitTable, identity: SynchronousFi
         0
     );
     assert!(table
-        .take_promoted(
+        .adopt_promoted_fixture(
             original.pi,
             original.tid,
             original.badge,
@@ -124,7 +124,7 @@ fn retry_ack_and_local_retirement_preserve_exact_arguments_grant_and_reply() {
     assert_eq!(table.next_retry_for_file(FileIoWaitKey::Hosted(10)), None);
     assert!(table.finish_retry(identity, Ok(())).is_err());
     let consumed = table
-        .take_promoted(
+        .adopt_promoted_fixture(
             original.pi,
             original.tid,
             original.badge,
@@ -219,7 +219,7 @@ fn indeterminate_delivery_blocks_teardown_and_younger_file_waiter_not_other_file
     let peer = promoted(&mut table, 20, 3);
     acknowledged(&mut table, peer);
     table.finish_retry(peer, Ok(())).unwrap();
-    assert!(table.take_promoted(2, 3, 103, 191).is_some());
+    assert!(table.adopt_promoted_fixture(2, 3, 103, 191).is_some());
     assert_eq!(table.retry_stats().indeterminate, 1);
     assert_eq!(table.retry_stats().waiting, 1);
 }
@@ -253,7 +253,7 @@ fn foreign_tables_and_reused_slots_cannot_accept_old_identity_or_attempt() {
         .record_retry(&mut attempt, SynchronousFileRetryOutcome::Acknowledged)
         .unwrap();
     first.finish_retry(a, Ok(())).unwrap();
-    first.take_promoted(2, 1, 101, 191).unwrap();
+    first.adopt_promoted_fixture(2, 1, 101, 191).unwrap();
     assert!(first.reset());
     let replacement = promoted(&mut first, 10, 1);
     assert_eq!(a.slot, replacement.slot);
@@ -363,7 +363,7 @@ fn retired_unconsumed_grant_still_excludes_younger_file_promotion() {
         table.promote_exact(younger, FileIoWaitKey::Hosted(10), 2),
         None
     );
-    table.take_promoted(2, 1, 101, 191).unwrap();
+    table.adopt_promoted_fixture(2, 1, 101, 191).unwrap();
     assert!(!table.has_promoted_for_file(FileIoWaitKey::Hosted(10)));
     assert_eq!(
         table

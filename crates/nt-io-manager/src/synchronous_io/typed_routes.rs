@@ -96,7 +96,7 @@ fn uncertain_local_reply_does_not_capture_hosted_numeric_peer() {
     acknowledge(&mut table, peer);
     table.finish_retry(peer, Ok(())).unwrap();
     assert_eq!(
-        table.take_promoted(2, 2, 102, 191).unwrap().route,
+        table.adopt_promoted_fixture(2, 2, 102, 191).unwrap().route,
         hosted(10)
     );
     assert_eq!(table.retry_stats().indeterminate, 1);
@@ -160,7 +160,7 @@ fn retry_preserves_captured_route_mode_access_independently_of_copied_input() {
                 .record_retry(&mut attempt, SynchronousFileRetryOutcome::Acknowledged)
                 .unwrap();
             table.finish_retry(identity, Ok(())).unwrap();
-            let replay = table.take_promoted(2, 1, 101, 191).unwrap();
+            let replay = table.adopt_promoted_fixture(2, 1, 101, 191).unwrap();
             assert_eq!(replay.route, route);
             assert_eq!(replay.mode, mode);
             assert_eq!(replay.granted_access, original.granted_access);

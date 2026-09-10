@@ -198,14 +198,30 @@ fn retire_reply(table: &mut SynchronousFileWaitTable, identity: SynchronousFileC
     );
 }
 
-fn adopt(table: &mut SynchronousFileWaitTable, slot: usize, key: FileIoWaitKey, tid: u64) {
+fn adopt(
+    table: &mut SynchronousFileWaitTable,
+    slot: usize,
+    key: FileIoWaitKey,
+    tid: u64,
+    source: impl FnOnce() -> Result<(), u32>,
+) {
     let identity = table.retry_identity(slot, key, tid).unwrap();
     let mut retry = table.begin_retry(identity).unwrap();
     table
         .record_retry(&mut retry, SynchronousFileRetryOutcome::Acknowledged)
         .unwrap();
     assert!(table.finish_retry(identity, Ok(())).unwrap());
-    table.take_promoted(2, tid, tid + 100, 191).unwrap();
+    let mut ingress = table
+        .begin_ingress(2, tid, tid + 100, 191)
+        .unwrap()
+        .unwrap();
+    let mut adoption = table.begin_adoption(&mut ingress).unwrap();
+    let result = source();
+    assert_eq!(result, Ok(()));
+    table
+        .record_adoption(&mut adoption, result)
+        .unwrap()
+        .unwrap();
 }
 
 #[test]
@@ -341,10 +357,12 @@ fn hosted_promoted_cancellation_retains_receipts_through_wake_and_capability_ret
     );
     table.finish_cancellation(identity).unwrap();
     assert_eq!(files.io_grant_owner(FILE), Ok(Some(THIRD)));
-    adopt(&mut table, slots[1], FileIoWaitKey::Hosted(FILE), THIRD);
-    assert_eq!(
-        files.begin_io(FILE, THIRD),
-        Ok(FileIoAcquireResult::Acquired)
+    adopt(
+        &mut table,
+        slots[1],
+        FileIoWaitKey::Hosted(FILE),
+        THIRD,
+        || files.adopt_io_grant(FILE, THIRD),
     );
     files.release_io(FILE, THIRD).unwrap();
     assert!(!files.release_file(FILE).unwrap().close_required);
@@ -423,8 +441,9 @@ fn local_zero_and_equal_numeric_hosted_files_keep_cancellation_and_references_se
                 .0,
             hosted_slot
         );
-        adopt(&mut table, slots[1], key, THIRD);
-        local.zw_adopt_file_io(file, THIRD).unwrap();
+        adopt(&mut table, slots[1], key, THIRD, || {
+            local.zw_adopt_file_io(file, THIRD)
+        });
         local.zw_release_file_io(file, THIRD).unwrap();
         let state = local.zw_file_io_state(file).unwrap();
         assert!(!state.cleanup_pending);

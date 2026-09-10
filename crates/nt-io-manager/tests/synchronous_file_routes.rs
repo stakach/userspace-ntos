@@ -136,7 +136,7 @@ fn equal_numeric_routes_and_local_zero_have_independent_fifo_grants() {
     assert!(queue.has_retry_delivery_for_file(FileIoWaitKey::LocalOverlay(same_id)));
     assert!(queue.has_retry_delivery_for_file(FileIoWaitKey::LocalOverlay(zero)));
 
-    // Retire each reply and abandon the unadopted grant through its owning domain.
+    // Retire each reply and adopt the retained grant through its owning domain.
     for (route, tid) in [
         (local(zero), 11),
         (local(same_id), 21),
@@ -149,15 +149,30 @@ fn equal_numeric_routes_and_local_zero_have_independent_fifo_grants() {
             .record_retry(&mut attempt, SynchronousFileRetryOutcome::Acknowledged)
             .unwrap();
         queue.finish_retry(identity, Ok(())).unwrap();
-        let captured = queue.take_promoted(PI, tid, tid + 100, SERVICE).unwrap();
+        let mut ingress = queue
+            .begin_ingress(PI, tid, tid + 100, SERVICE)
+            .unwrap()
+            .unwrap();
+        let mut adoption = queue.begin_adoption(&mut ingress).unwrap();
+        let captured = adoption.waiter();
         assert_eq!(captured.route, route);
+        let result = match captured.route {
+            FileIoWaitRoute::Hosted { file_id, .. } => files.adopt_io_grant(file_id, tid),
+            FileIoWaitRoute::LocalOverlay { file_object } => fs.zw_adopt_file_io(file_object, tid),
+        };
+        assert_eq!(result, Ok(()));
+        queue
+            .record_adoption(&mut adoption, result)
+            .unwrap()
+            .unwrap();
         match captured.route {
             FileIoWaitRoute::Hosted { file_id, .. } => {
-                files.cancel_promoted_io(file_id, tid).unwrap();
+                files.release_io(file_id, tid).unwrap();
                 files.release_file(file_id).unwrap();
             }
             FileIoWaitRoute::LocalOverlay { file_object } => {
-                fs.zw_cancel_promoted_file_io(file_object, tid).unwrap();
+                fs.zw_release_file_io(file_object, tid).unwrap();
+                fs.zw_release_io_reference(file_object).unwrap();
                 assert_eq!(fs.zw_file_io_state(file_object).unwrap().references, 1);
             }
         }
@@ -228,12 +243,14 @@ fn closed_local_handle_keeps_captured_route_access_mode_and_adopts_once_after_re
     assert!(!queue
         .finish_retry(identity, Err(STATUS_ACCESS_DENIED))
         .unwrap());
-    assert!(queue.take_promoted(PI, 20, 120, SERVICE).is_none());
+    assert!(queue.begin_ingress(PI, 20, 120, SERVICE).is_err());
     assert!(queue.take_exact(slot, original.key(), 20).is_none());
     assert_eq!(fs.zw_file_io_state(file), Ok(owned));
     assert!(queue.finish_retry(identity, Ok(())).unwrap());
-    assert!(queue.take_promoted(PI, 20, 120, SERVICE + 1).is_none());
-    let retry = queue.take_promoted(PI, 20, 120, SERVICE).unwrap();
+    assert!(queue.begin_ingress(PI, 20, 120, SERVICE + 1).is_err());
+    let mut ingress = queue.begin_ingress(PI, 20, 120, SERVICE).unwrap().unwrap();
+    let mut adoption = queue.begin_adoption(&mut ingress).unwrap();
+    let retry = adoption.waiter();
     assert_eq!(
         (retry.route, retry.mode, retry.granted_access),
         (original.route, MODE, ACCESS)
@@ -242,7 +259,12 @@ fn closed_local_handle_keeps_captured_route_access_mode_and_adopts_once_after_re
     let FileIoWaitRoute::LocalOverlay { file_object } = retry.route else {
         panic!("the retry must retain its original local File route");
     };
-    fs.zw_adopt_file_io(file_object, retry.tid).unwrap();
+    let result = fs.zw_adopt_file_io(file_object, retry.tid);
+    assert_eq!(result, Ok(()));
+    queue
+        .record_adoption(&mut adoption, result)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         fs.zw_file_io_state(file),
         Ok(owned),

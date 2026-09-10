@@ -181,6 +181,8 @@ pub use retained_completion::{
 };
 pub use store::{GenStore, IoId};
 pub use synchronous_io::{
+    SynchronousFileAdoptedOwner, SynchronousFileAdoptionAttempt, SynchronousFileIngress,
+    SynchronousFileIngressError, SynchronousFileIngressPhase,
     FileIoWaitKey, FileIoWaitRoute, SynchronousFileCancelAttempt, SynchronousFileCancelEffect,
     SynchronousFileCancelError, SynchronousFileCancelIdentity, SynchronousFileCancelOutcome,
     SynchronousFileCancelOwnership, SynchronousFileCancelPhase, SynchronousFileCancelReceipt,

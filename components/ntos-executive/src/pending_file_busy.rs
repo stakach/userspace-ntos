@@ -77,28 +77,6 @@ pub(super) unsafe fn release_if_ready(
     FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
 }
 
-unsafe fn wake_policy(nt_handler: &mut ExecNtHandler, key: FileIoWaitKey) -> Result<(), u32> {
-    if let FileIoWaitKey::Hosted(file_id) = key {
-        let owner = nt_handler.file_completion.io_lock_owner(file_id)?;
-        let grant = nt_handler.file_completion.io_grant_owner(file_id)?;
-        let fifo = &*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS);
-        if grant.is_some() && !fifo.has_promoted_for_file(key) {
-            return Err(nt_fs::STATUS_DATA_ERROR);
-        }
-        if owner.is_some() && grant.is_none() {
-            if nt_handler.file_completion.io_waiter_count(file_id)? != 0
-                && fifo.oldest_waiting_for_file(key).is_none()
-            {
-                return Err(nt_fs::STATUS_DATA_ERROR);
-            }
-            // A later acquisition or cleanup already owns Busy and its eventual FIFO wake.
-            // The older completed operation must not wait for that new operation to release it.
-            return Ok(());
-        }
-    }
-    try_synchronous_file_wake_next(nt_handler, key).map(|_| ())
-}
-
 /// Run outside the pending snapshot walk; return newly settled owners needing a finish pass.
 pub(super) unsafe fn redrive_wakes(nt_handler: &mut ExecNtHandler) -> usize {
     let mut settled = 0;
@@ -113,7 +91,8 @@ pub(super) unsafe fn redrive_wakes(nt_handler: &mut ExecNtHandler) -> usize {
         let mut attempt = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
             .begin_busy_wake_exact(slot, pending.irp_id)
             .expect("pending File wake lost its exact ready owner");
-        let result = wake_policy(nt_handler, busy.owner().key);
+        let result =
+            synchronous_file_wait::settle_synchronous_file_wake(nt_handler, busy.owner().key);
         (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
             .record_busy_wake(&mut attempt, result)
             .expect("pending File wake outcome lost its entered owner");

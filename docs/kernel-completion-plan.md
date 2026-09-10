@@ -32966,10 +32966,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     - [x] Compose real hosted/local policy and File references with refusal/uncertainty tests,
       run serialized host/native validation, then review native cutover prerequisites.
 
-    Audit adjustment: this is the testable ownership contract, not native activation. Native
-    preflight currently reserves capacity only; promoted ingress still extracts a Copy waiter.
-    Both producers need exact retained transfers before native cancellation can consume the new
-    contract. Existing parked APC cancellation also stages/consumes an APC and sends/recycles its
+    Pre-cutover audit: the testable ownership contract alone did not activate native cancellation.
+    Native preflight reserved capacity only and promoted ingress extracted a Copy waiter.
+    Both producers required exact retained transfers before consuming the new contract, now
+    addressed by the native cutover below. Existing parked APC cancellation still stages/consumes
+    an APC and sends/recycles its
     reply without separate receipts. Preserve those as explicit follow-on work; replacing panic
     with Err while leaving destructive extraction would orphan the count/grant/reference.
     Hosted policy cancellation consumes only count/grant, while local nt-fs cancellation also
@@ -32998,15 +32999,67 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     microkernel change occurred; the 27 strict missing win32k imports and desktop acceptance
     remain open.
 
-    Next native checkpoint, reviewed after contract completion:
-    - [ ] Carry exact reservations from acquisition preflight through successful park or retained
+    Native follow-ons, reviewed after contract completion:
+    - [x] Carry exact reservations from acquisition preflight through successful park or retained
       rollback; do not allocate the cancellation owner after the File effect has occurred.
-    - [ ] Keep promoted ingress in its original row through adoption/teardown. Replace destructive
-      cancellation transfers with exact effect receipts, including hosted reference followups,
-      and guard thread/process retirement while cancellation still owns work.
+    - [x] Keep promoted ingress in its original row through adoption/rejection. Replace those
+      destructive cancellation transfers with exact effect receipts, including hosted reference
+      followups, and guard thread/process retirement while cancellation still owns work.
+    - [ ] Convert published-waiter thread teardown, including live saved Replies, to retained
+      cancellation. Delete the remaining remove-then-cancel teardown adapter after that cutover.
+    - [ ] Close the pre-existing acquired-Busy/pending-IRP post-action handoff: successful
+      acquisition can precede a job-termination early exit before the normal service-tail
+      transfer/retirement. Retain the accepted operation before that exit; do not treat it as a
+      still-promoted grant or release Busy before its accepted I/O has finished.
     - [ ] Retain parked APC staging, Reply and capability retirement independently before routing
       APC interruption through the cancellation contract. Remove the replaced adapters only when
       every producer transfers ownership through the retained path; no ignored-error fallback.
+
+    Native acquisition/ingress cutover (2026-09-11, complete; runtime acceptance open):
+    - [x] Use exact pre-effect reservations and atomic hosted reference/Busy admission. Capture
+      retry-frame refusal before contention, but report it only when the call must park. Publish
+      the counted waiter or its retained rollback before post-action/job-teardown exits.
+    - [x] Claim promoted ingress in its original row before argument validation; use checked
+      grant-only adoption and transfer Busy/reference to the current syscall without callbacks.
+      Reject duplicate/mismatched ingress without creating another counted waiter. Remove the
+      destructive take_promoted API and the replaced acquisition rollback paths.
+    - [x] Drive reply-free cancellation through separate policy, wake, reference and checked
+      reference-followup receipts. Share wake-handoff logic with pending Busy retirement and
+      retain thread/process lifetime while a cancellation or ingress claim still owns work.
+    - [x] Validate exact claims, adoption, refused fresh admission and cancellation handoffs with
+      real hosted policy composition, serialized host tests and an executive release build.
+
+    Boundary review: saved Reply revocation cannot use CNode_Revoke, which only revokes
+    descendants and leaves the source binding alive. Held-reply teardown needs checked final-cap
+    CNode_Delete, followed by retained exact-slot Reply retyping before pool reuse. This cutover
+    deliberately handles only unpublished (never-transferred reply) and reply-retired ingress
+    cancellations. Parked teardown/APC adapters remain open until that full capability lifecycle
+    and APC staging/Reply receipts are wired; no native capability-success receipt is synthesized.
+    Native review also closed two ingress gaps: full-width handle mismatch now refuses dispatch
+    rather than falling back to fresh handle lookup/acquisition, and rejected requests run bounded
+    cancellation redrive after their own Reply but before the next receive. This preserves their
+    received argument frame and prevents retryable cancellation from depending on an unrelated
+    successful syscall. Unconsumed ingress and counted wait publication/rollback now precede
+    service post-actions, including job-termination early exits.
+
+    Validation: all 42 synchronous File contract tests passed, including six ingress tests;
+    five additional hosted-policy unit tests exercise atomic reference/admission failure and
+    checked grant adoption. Five new integration tests compose those contracts with real hosted
+    policy through refused acquisition, rejected copyin, exactly-once adoption, independent retry
+    uncertainty, and final-reference followup after File-row removal. Older local/hosted fixtures
+    now adopt the real policy grant inside the entered ticket rather than extracting a Copy row.
+    A compile-fail check prevents ingress-claim cloning. All 1,477 focused and 2,737 broad host/doc
+    tests passed. Native compilation initially exposed two missing ExecFileCompletion forwarding
+    methods; those are now wired and its unused begin_io entry point is removed. The final
+    executive release build passed in 36.68s with the unchanged 294 warnings. Evidence:
+    `.tmp/test-file-ingress-contract-20260911.log`,
+    `.tmp/test-file-ingress-focused-20260911.log`,
+    `.tmp/test-file-ingress-full-20260911.log`, and
+    `.tmp/build-file-ingress-executive-verified-20260911.log`. All runners were serialized.
+    Final independent review found no remaining issue in this scoped native cutover. No VM run
+    or microkernel change occurred; the 27 strict missing win32k imports and genuine desktop
+    acceptance remain open. Next: accepted-Busy post-action handoff, published-waiter teardown,
+    and parked APC staging/Reply/capability settlement, removing each replaced adapter as it lands.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

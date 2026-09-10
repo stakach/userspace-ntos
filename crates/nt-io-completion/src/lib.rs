@@ -467,6 +467,41 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         entry.serialization.begin_io(entry.io_mode, tid, entry.cleanup_reference_held)
     }
 
+    /// Atomically retain a new operation and acquire Busy or count one waiting operation.
+    /// The caller reserves waiter storage first. Refused admission changes neither ownership
+    /// nor references; a promoted grant must instead use the explicit adoption operation.
+    pub fn acquire_file_io(&mut self, file_id: u64, tid: u64) -> Result<FileIoAcquireResult, u32> {
+        if tid == 0 || tid == u64::MAX {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if entry.handle_publication_reserved || entry.serialization.io_grant_owner() == Some(tid) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if entry.cleanup_sent {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let references = entry.references.checked_add(1).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let mut serialization = entry.serialization;
+        let result = serialization.begin_io(entry.io_mode, tid, entry.cleanup_reference_held)?;
+        entry.references = references;
+        entry.serialization = serialization;
+        Ok(result)
+    }
+
+    /// Consume only an exact promoted grant, including after the final handle closes. The
+    /// original queued operation already owns its reference; no new retain or wait is allowed.
+    pub fn adopt_io_grant(&mut self, file_id: u64, tid: u64) -> Result<(), u32> {
+        if tid == 0 || tid == u64::MAX {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if entry.handle_publication_reserved {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        entry.serialization.adopt_io_grant(entry.io_mode, tid)
+    }
+
     /// Acquire Busy for the internal, non-alertable CLEANUP owner. A contended
     /// cleanup is held behind the ordinary waiter count and becomes eligible
     /// only after the final pre-existing operation releases Busy.
@@ -1027,6 +1062,9 @@ impl<const PORTS: usize, const PACKETS: usize> Default for CompletionPortTable<P
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod file_io_admission_tests;
 
 #[cfg(test)]
 mod tests {

@@ -23579,7 +23579,7 @@ struct ExecNtHandler {
     /// client-owned handles without an image-specific transport.
     current_server_client_pid: u32,
     /// Promoted acquisition whose retained route replaces process-handle lookup on retry.
-    active_synchronous_file_retry: Option<nt_io_manager::SynchronousFileWaiter>,
+    active_synchronous_file_retry: Option<nt_io_manager::SynchronousFileIngress>,
     /// File lock acquired by this call; inline completion releases it at the dispatch boundary.
     current_synchronous_file_lock: u64,
     user_apc_redirected: bool,
@@ -23696,7 +23696,10 @@ struct ExecNtHandler {
     pending_pnp_operations: nt_driver_start::PendingOperationTable<PendingPnpOperation>,
     pending_pnp_operation_transfer: Option<PendingPnpOperationTransfer>,
     /// Contended synchronous File acquisition transferred into the FIFO owner at the reply site.
-    pending_synchronous_file_wait: Option<nt_io_manager::SynchronousFileWaiter>,
+    pending_synchronous_file_wait: Option<(
+        nt_io_manager::SynchronousFileWaiter,
+        nt_io_manager::SynchronousFileWaitReservation,
+    )>,
     /// Final-handle `NtClose` continuation reserved before removing the process handle. File Busy
     /// ordering and CLEANUP/CLOSE ownership remain in their canonical policy/manager tables.
     pending_file_cleanup_wait: Option<(u64, nt_io_manager::PendingFileCleanupWaitReservation)>,
@@ -24511,13 +24514,18 @@ impl ExecFileCompletion {
         unsafe { (&*self.table).io_grant_owner(file_id) }
     }
 
-    fn begin_io(
+    fn acquire_file_io(
         &mut self,
         file_id: u64,
         tid: u64,
     ) -> Result<nt_io_completion::FileIoAcquireResult, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).begin_io(file_id, tid) }
+        unsafe { (&mut *self.table).acquire_file_io(file_id, tid) }
+    }
+
+    fn adopt_io_grant(&mut self, file_id: u64, tid: u64) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).adopt_io_grant(file_id, tid) }
     }
 
     fn begin_cleanup(

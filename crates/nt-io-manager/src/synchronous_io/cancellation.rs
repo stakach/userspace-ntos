@@ -66,9 +66,9 @@ pub enum SynchronousFileCancelError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SynchronousFileWaitIdentity {
-    table: u64,
-    slot: usize,
-    sequence: u64,
+    pub(super) table: u64,
+    pub(super) slot: usize,
+    pub(super) sequence: u64,
 }
 
 impl SynchronousFileWaitIdentity {
@@ -87,7 +87,7 @@ pub struct SynchronousFileCancelOwnership {
 
 #[derive(Debug)]
 pub(super) struct CancelState {
-    phase: SynchronousFileCancelPhase,
+    pub(super) phase: SynchronousFileCancelPhase,
     policy_waiters: Option<u32>,
     reference_release: Option<FileReferenceRelease>,
 }
@@ -152,6 +152,9 @@ impl SynchronousFileCancelAttempt {
 impl WaitRecord {
     fn cancellation_must_defer(&self) -> bool {
         matches!(
+            self.ingress,
+            Some(SynchronousFileIngressPhase::Adopting { .. })
+        ) || matches!(
             self.retry,
             Some(
                 SynchronousFileRetryPhase::Invoking { .. }
@@ -203,6 +206,7 @@ impl SynchronousFileWaitTable {
             retry: None,
             next_attempt: 1,
             cancellation: Some(CancelState::new(false)),
+            ingress: None,
         }));
         Some(SynchronousFileCancelIdentity {
             table: self.identity,

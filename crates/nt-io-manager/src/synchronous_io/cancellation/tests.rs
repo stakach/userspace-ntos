@@ -428,7 +428,9 @@ fn accepted_retry_finishes_cap_retirement_before_deferred_grant_cancellation() {
     assert!(!table.finish_retry(retry, Err(ERROR)).unwrap());
     assert!(table.begin_cancellation(cancel).is_err());
     assert!(table.finish_retry(retry, Ok(())).unwrap());
-    assert!(table.take_promoted(2, TID, TID + 100, 191).is_none());
+    assert!(table
+        .adopt_promoted_fixture(2, TID, TID + 100, 191)
+        .is_none());
     finish_hosted(&mut table, cancel, false);
 }
 

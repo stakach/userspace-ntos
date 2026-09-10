@@ -102,6 +102,24 @@ fn close_last_handle(files: &mut FileCompletionTable<1>) {
     assert_eq!(files.promote_cleanup_if_ready(FILE), Ok(false));
 }
 
+fn adopt_grant(
+    files: &mut FileCompletionTable<1>,
+    waiters: &mut SynchronousFileWaitTable,
+    tid: u64,
+) {
+    let mut ingress = waiters
+        .begin_ingress(PI, tid, tid + 100, SERVICE)
+        .unwrap()
+        .unwrap();
+    let mut adoption = waiters.begin_adoption(&mut ingress).unwrap();
+    let result = files.adopt_io_grant(FILE, tid);
+    assert_eq!(result, Ok(()));
+    waiters
+        .record_adoption(&mut adoption, result)
+        .unwrap()
+        .unwrap();
+}
+
 fn cleanup_retains_delivery_reference(files: &mut FileCompletionTable<1>) {
     assert_eq!(files.promote_cleanup_if_ready(FILE), Ok(true));
     assert_eq!(files.mark_cleanup_lifecycle_started(FILE), Ok(true));
@@ -169,7 +187,10 @@ fn refused_release_keeps_busy_and_reference_until_one_checked_release_commits() 
     assert!(pending.finish_exact(slot, IRP).is_none());
     assert!(pending.begin_busy_release_exact(slot, IRP).is_err());
     assert!(record_backend_ack(&mut pending, slot, Ok(())));
-    assert_eq!(pending.finish_exact(slot, IRP).unwrap().route, PendingFileRoute::Hosted(FILE));
+    assert_eq!(
+        pending.finish_exact(slot, IRP).unwrap().route,
+        PendingFileRoute::Hosted(FILE)
+    );
     assert!(files.release_file(FILE).unwrap().close_required);
     assert!(files.io_mode(FILE).is_err());
 }
@@ -220,13 +241,7 @@ fn wake_retry_preserves_fifo_grant_without_releasing_busy_twice() {
         .record_retry(&mut retry, SynchronousFileRetryOutcome::Acknowledged)
         .unwrap();
     assert!(waiters.finish_retry(identity, Ok(())).unwrap());
-    waiters
-        .take_promoted(PI, SECOND, SECOND + 100, SERVICE)
-        .unwrap();
-    assert_eq!(
-        files.begin_io(FILE, SECOND),
-        Ok(FileIoAcquireResult::Acquired)
-    );
+    adopt_grant(&mut files, &mut waiters, SECOND);
     pending.record_busy_wake(&mut wake, Ok(())).unwrap();
     assert!(pending.get(slot).unwrap().busy.unwrap().is_settled());
     assert_eq!(files.io_lock_owner(FILE), Ok(Some(SECOND)));
@@ -348,13 +363,7 @@ fn newer_busy_owner_takes_wake_responsibility_from_an_older_completion() {
         .record_retry(&mut retry, SynchronousFileRetryOutcome::Acknowledged)
         .unwrap();
     assert!(waiters.finish_retry(identity, Ok(())).unwrap());
-    waiters
-        .take_promoted(PI, THIRD, THIRD + 100, SERVICE)
-        .unwrap();
-    assert_eq!(
-        files.begin_io(FILE, THIRD),
-        Ok(FileIoAcquireResult::Acquired)
-    );
+    adopt_grant(&mut files, &mut waiters, THIRD);
     assert_eq!(files.release_io(FILE, THIRD).unwrap().waiters, 0);
     assert!(!files.release_file(FILE).unwrap().close_required);
     assert!(files.promote_cleanup_if_ready(FILE).unwrap());

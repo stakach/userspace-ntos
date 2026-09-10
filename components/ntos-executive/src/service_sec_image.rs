@@ -12,7 +12,8 @@ mod component_callback_transfer;
 mod synchronous_file_retry;
 #[path = "synchronous_file_wait.rs"]
 mod synchronous_file_wait;
-use synchronous_file_wait::try_synchronous_file_wake_next;
+#[path = "synchronous_file_cancellation.rs"]
+pub(crate) mod synchronous_file_cancellation;
 #[path = "pending_file_busy.rs"]
 mod pending_file_busy;
 pub(crate) use synchronous_file_wait::{
@@ -10791,14 +10792,22 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                     0
                 });
-            if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS))
-                .has_retry_delivery_for_thread(current_tid)
+            if {
+                let waiters = &*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS);
+                waiters.has_retry_delivery_for_thread(current_tid)
+                    || waiters.has_cancellation_for_thread(current_tid)
+                    || waiters.has_ingress_for_thread(current_tid)
+            }
             {
                 // An uncertain earlier retry is not a fresh File acquisition. Reject only this
                 // new request; its distinct main Reply cannot retire the old grant or reply.
                 let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                 assert!(reply_parked_syscall(reply_main, 0xC000_00A3),
                     "retained File retry ingress refusal lost its new reply");
+                // Once this request has been refused, its IPC words are no longer needed.
+                // Progress retained cancellation even when rejected ingress is the only activity.
+                synchronous_file_cancellation::redrive(&mut nt_handler);
+                let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
                 badge = nb;
                 mi = nmi;
@@ -11241,10 +11250,29 @@ pub(crate) unsafe fn service_sec_image(
             nt_handler.current_server_client_pid =
                 nt_handler.hosted_thread_lpc_client_process(badge);
             nt_handler.current_synchronous_file_lock = 0;
-            nt_handler.active_synchronous_file_retry = (&mut *core::ptr::addr_of_mut!(
+            assert!(nt_handler.active_synchronous_file_retry.is_none(),
+                "previous syscall retained an unconsumed File ingress claim");
+            nt_handler.active_synchronous_file_retry = match (&mut *core::ptr::addr_of_mut!(
                 SYNCHRONOUS_FILE_WAITERS
-            ))
-                .take_promoted(pi as u32, current_tid, badge, m0 as u32);
+            )).begin_ingress(pi as u32, current_tid, badge, m0 as u32) {
+                Ok(ingress) => ingress,
+                Err(_) => {
+                    // A mismatched request cannot consume an existing thread's grant.
+                    let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    assert!(reply_parked_syscall(reply_main, 0xC000_00A3),
+                        "File ingress refusal lost its new reply");
+                    synchronous_file_cancellation::redrive(&mut nt_handler);
+                    let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                }
+            };
             // SEAM: if this SSN is in the real service table, dispatch it through the NT syscall
             // dispatcher -> real handler; otherwise fall through to the broker match. The x64 native
             // ABI passes args in r10(=rcx),rdx,r8,r9 then the stack; here we forward the register
@@ -11338,7 +11366,8 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.pending_pnp_operation_transfer.is_none(),
                     "previous syscall leaked a PnP operation continuation reservation"
                 );
-                nt_handler.pending_synchronous_file_wait = None;
+                assert!(nt_handler.pending_synchronous_file_wait.is_none(),
+                    "previous syscall retained an unpublished File waiter");
                 assert!(
                     nt_handler.pending_file_cleanup_wait.is_none(),
                     "previous syscall leaked a File cleanup continuation reservation"
@@ -11375,6 +11404,10 @@ pub(crate) unsafe fn service_sec_image(
                 // adapter (skipping the native ReactOS dispatch).
                 if !stack_args_valid {
                     result = 0xC000_0005;
+                } else if nt_handler.active_synchronous_file_retry.as_ref()
+                    .is_some_and(|ingress| !ingress.matches_handle(argv[0]))
+                {
+                    result = nt_fs::STATUS_INVALID_PARAMETER as u64;
                 } else if let Some(st) = try_route_alpc_ssn(m0, &[], &mut [0u8; 8]) {
                     result = st;
                     handled = true;
@@ -11456,6 +11489,52 @@ pub(crate) unsafe fn service_sec_image(
                         current_tid: nt_handler.current_tid,
                         drop_reply: true,
                     };
+                }
+                if let Some(mut ingress) = nt_handler.active_synchronous_file_retry.take() {
+                    let identity = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
+                        .reject_ingress(&mut ingress, result as u32)
+                        .expect("unconsumed File ingress lost its exact claim");
+                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                    synchronous_file_cancellation::drive(&mut nt_handler, identity);
+                }
+                if let Some((mut waiter, reservation)) = nt_handler.pending_synchronous_file_wait.take() {
+                    // Counted acquisition must be published or rolled back before job teardown
+                    // and post-action exits can release another owner of this File.
+                    if !matches!(post_action, ExecPostAction::None) {
+                        synchronous_file_cancellation::cancel_unpublished(
+                            &mut nt_handler, reservation, waiter,
+                        );
+                    } else {
+                        if waiter.native_call_transport {
+                            waiter.reply_mrs[0] = waiter.service_number as u64;
+                            waiter.reply_mrs[1] = sp;
+                            waiter.reply_mrs[2] = argv[0];
+                            waiter.reply_mrs[3] = argv[1];
+                            waiter.reply_mrs[4] = argv[2];
+                            waiter.reply_mrs[5] = argv[3];
+                        } else {
+                            waiter.reply_mrs = syscall_reply_context.regs;
+                        }
+                        if synchronous_file_wait_park(waiter, reservation) {
+                            synchronous_file_wait_parked = true;
+                            let waiter_tid = nt_handler.current_tid;
+                            let apc_interrupted =
+                                reconcile_user_apc_file_wait(&mut nt_handler, waiter_tid);
+                            if !apc_interrupted {
+                                trace_indefinite_wait_park(
+                                    &nt_handler, badge, live_top_badges(&nt_handler),
+                                    crash_parked, wait_parked,
+                                );
+                                mark_wait_parked!(pi, resume_ip);
+                            }
+                        } else {
+                            PENDING_FILE_IO_TRANSFER_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            synchronous_file_cancellation::cancel_unpublished(
+                                &mut nt_handler, reservation, waiter,
+                            );
+                            result = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
+                        }
+                    }
                 }
                 let post_action_process = match post_action {
                     ExecPostAction::TerminateProcess { process_index, .. } => Some(process_index),
@@ -11830,40 +11909,6 @@ pub(crate) unsafe fn service_sec_image(
                 if let Some(transfer) = nt_handler.pending_pnp_operation_transfer.take() {
                     transfer_pending_pnp_operation = Some(transfer);
                 }
-                if let Some(mut waiter) = nt_handler.pending_synchronous_file_wait.take() {
-                    // Publish the exact FIFO owner before any post-dispatch completion can release
-                    // the current Busy owner and inspect the policy waiter count.
-                    if waiter.native_call_transport {
-                        waiter.reply_mrs[0] = waiter.service_number as u64;
-                        waiter.reply_mrs[1] = sp;
-                        waiter.reply_mrs[2] = argv[0];
-                        waiter.reply_mrs[3] = argv[1];
-                        waiter.reply_mrs[4] = argv[2];
-                        waiter.reply_mrs[5] = argv[3];
-                    } else {
-                        waiter.reply_mrs = syscall_reply_context.regs;
-                    }
-                    if synchronous_file_wait_park(waiter) {
-                        synchronous_file_wait_parked = true;
-                        let waiter_tid = nt_handler.current_tid;
-                        let apc_interrupted =
-                            reconcile_user_apc_file_wait(&mut nt_handler, waiter_tid);
-                        if !apc_interrupted {
-                            trace_indefinite_wait_park(
-                                &nt_handler,
-                                badge,
-                                live_top_badges(&nt_handler),
-                                crash_parked,
-                                wait_parked,
-                            );
-                            mark_wait_parked!(pi, resume_ip);
-                        }
-                    } else {
-                        PENDING_FILE_IO_TRANSFER_FAILURES.fetch_add(1, Ordering::Relaxed);
-                        synchronous_file_cancel_waiter(&mut nt_handler, waiter);
-                        result = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
-                    }
-                }
                 if let Some((pending, reservation)) = nt_handler.pending_file_irp_drain.take() {
                     transfer_file_irp_drain = Some((pending, reservation));
                 }
@@ -11876,9 +11921,6 @@ pub(crate) unsafe fn service_sec_image(
                         ..nt_io_manager::PendingFileCleanupWait::default()
                     };
                     transfer_file_cleanup_wait = Some((pending, reservation));
-                }
-                if let Some(stale_grant) = nt_handler.active_synchronous_file_retry.take() {
-                    synchronous_file_cancel_waiter(&mut nt_handler, stale_grant);
                 }
                 if nt_handler.current_synchronous_file_lock != 0 {
                     let file_id =
@@ -24385,7 +24427,10 @@ pub(crate) unsafe fn reconcile_user_apc_waits(nt_handler: &mut ExecNtHandler, ti
 
 /// Transfer one general File syscall into its exact pending-IRP delivery owner. Synchronous
 /// operations also move the live syscall reply into that owner; asynchronous operations do not.
-unsafe fn synchronous_file_wait_park(mut waiter: nt_io_manager::SynchronousFileWaiter) -> bool {
+unsafe fn synchronous_file_wait_park(
+    mut waiter: nt_io_manager::SynchronousFileWaiter,
+    reservation: nt_io_manager::SynchronousFileWaitReservation,
+) -> bool {
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if stolen == 0 {
         return false;
@@ -24395,7 +24440,7 @@ unsafe fn synchronous_file_wait_park(mut waiter: nt_io_manager::SynchronousFileW
     };
     waiter.reply_cap = stolen;
     let table = &mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS);
-    if table.park(waiter).is_none() {
+    if table.park_reserved(reservation, waiter).is_none() {
         return false;
     }
     wait_reply_pool_mark_used(fresh_index);
@@ -25084,6 +25129,7 @@ unsafe fn pending_file_io_redrive_pass(
 ) -> (u64, usize) {
     if !finish_settled_busy_only {
         synchronous_file_retry::redrive_retirement(nt_handler);
+        synchronous_file_cancellation::redrive(nt_handler);
         nt_handler.publish_local_byte_lock_completions();
     }
     let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
