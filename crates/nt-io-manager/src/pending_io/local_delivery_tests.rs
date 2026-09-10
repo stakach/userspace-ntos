@@ -59,7 +59,7 @@ fn notification_terminal_survives_surface_ack_and_reference_release_retries() {
         assert_eq!(table.get(slot), Some(before_retry));
         table.mark_delivery_exact(slot, IRP, flag).unwrap();
     }
-    assert!(table.completion_surfaces_published_exact(slot, IRP));
+    assert!(table.completion_surfaces_settled_exact(slot, IRP));
     let awaiting_ack = table.get(slot).unwrap();
     assert!(table.finish_exact(slot, IRP).is_none());
     assert_eq!(table.get(slot), Some(awaiting_ack));
@@ -178,7 +178,7 @@ fn local_byte_lock_retains_reference_after_terminal_backend_ack() {
         Some((0xC000_0120, 0))
     );
     publish_surfaces(&mut table, slot, IRP);
-    assert!(table.completion_surfaces_published_exact(slot, IRP));
+    assert!(table.completion_surfaces_settled_exact(slot, IRP));
     table.mark_backend_acked_exact(slot, IRP).unwrap();
     assert!(table.finish_exact(slot, IRP).is_none());
     table
@@ -206,7 +206,7 @@ fn abandoned_consumer_accepts_real_terminal_information_without_output_capacity(
         table.get(slot).unwrap().local_terminal_result(),
         Some((0, 24))
     );
-    assert!(table.completion_surfaces_published_exact(slot, IRP));
+    assert!(table.completion_surfaces_settled_exact(slot, IRP));
     table.mark_backend_acked_exact(slot, IRP).unwrap();
     assert!(table.finish_exact(slot, IRP).is_none());
     table

@@ -25722,22 +25722,30 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 ), "local directory completion lost its pending I/O owner");
         }
 
-        if pending.iosb_va != 0 && delivery_state & nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED == 0 {
-            if nt_handler
-                .publish_file_io_status(pending.iosb_va, terminal_status, terminal_information)
-                .is_err()
-            {
-                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                restore_file_io_mirrors!();
-                continue;
+        if pending.iosb_va != 0
+            && delivery_state
+                & (nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED | nt_io_manager::IO_DELIVERY_IOSB_FAULTED)
+                == 0
+        {
+            let result = nt_handler.publish_file_io_status(
+                pending.iosb_va, terminal_status, terminal_information,
+            );
+            let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
+            delivery_state = match result {
+                Ok(()) => table.mark_delivery_exact(
+                    slot, pending.irp_id, nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED,
+                ),
+                Err(nt_address_space::copy::MemoryCopyFailure::UserFault(_)) => {
+                    // NT completes the I/O despite a permanent IOSB fault. Keep its pointer for APCs.
+                    table.mark_iosb_faulted_exact(slot, pending.irp_id, pending.iosb_va)
+                }
+                Err(nt_address_space::copy::MemoryCopyFailure::Retry(_)) => {
+                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                    restore_file_io_mirrors!();
+                    continue;
+                }
             }
-            delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-                .mark_delivery_exact(
-                    slot,
-                    pending.irp_id,
-                    nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED,
-                )
-                .expect("pending File IOSB owner disappeared");
+            .expect("pending File IOSB owner disappeared");
         }
 
         if pending.event_obj_idx != u64::MAX
@@ -25888,7 +25896,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         }
 
         if !(&*core::ptr::addr_of!(PENDING_FILE_IO))
-            .completion_surfaces_published_exact(slot, pending.irp_id)
+            .completion_surfaces_settled_exact(slot, pending.irp_id)
         {
             panic!("pending File completion reached ACK before required surfaces");
         }

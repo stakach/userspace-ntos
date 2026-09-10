@@ -32476,6 +32476,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     NT5 misc.c:390 / ReactOS iofunc.c:1487 synchronous-API semantics: an asynchronous File uses an
     internal completion event and kernel IOSB, not the ordinary no-user-event File signal policy.
 
+    Typed IOSB fault completion checkpoint (2026-09-10): distinguish failed user output from
+    temporarily refused memory ownership before deciding whether completion may settle.
+    - [x] Carry MemoryCopyFailure::UserFault/Retry through checked page planning, bounded kernel
+      copy and ordered IOSB publication. Existing status-only APIs project the same shared logic
+      for callers that do not yet own deferred delivery. Invalid spans and real protection faults
+      are user faults; malformed metadata, unavailable context, ownership/residency/guard-transition
+      refusals and final physical-copy admission remain retained failures. A consumed guard becomes
+      a user fault only after its protection transition succeeds.
+    - [x] Add an exact IOSB_FAULTED acknowledgement distinct from IOSB_PUBLISHED. Preserve the
+      IOSB pointer, operation result and every other completion obligation. Reject stale/crossed
+      identities, repeated or contradictory settlement and settlement after ACK/reference release.
+      Native completion continues after a definitive IOSB fault but retains temporary refusals.
+      Rename the common surface predicate to completion_surfaces_settled_exact, because a fault
+      can settle its output obligation without publishing bytes.
+    - [x] Validate shared copy/planning semantics, fault/retry composition and remaining completion
+      gates in host tests, then run the serialized native build and review the next frontier.
+
+    Host validation: 904 focused and 2,579 broad tests/doctests passed, none ignored. Nine new
+    copy/publication tests cover identical statuses with distinct origins, malformed metadata,
+    guard/COW policy, accepted prefixes and ordered IOSB stores. Eight pending-owner tests cover
+    exact fault acknowledgement, mutual exclusion, stale slots, preserved local/provider state,
+    payload/CREATE/IOCP/reply/lock gates and final reference release. Three real filesystem plus
+    checked-publisher composition tests cover first/second-store refusal, guard faults and no
+    fabricated publication. The initial composition run caught an incorrect test expectation that
+    surfaces were settled before the required reply; the corrected test checks the reply gate too.
+    Evidence: .tmp/test-typed-iosb-fault-focused-20260910.log and
+    .tmp/test-typed-iosb-fault-full-20260910.log. The native executive release build passed in
+    37.32s with 294 unchanged warnings (.tmp/build-typed-iosb-fault-executive-20260910.log).
+    Root serialized all runners. The native failure-origin routing was independently reviewed;
+    the integration memory fixture supplies explicit failure outcomes, not native fault proof.
+
+    Review adjustment: next migrate retained local buffered output for overlay reads and both
+    directory providers before flush. Allocate exact output capacity and reserve the pending
+    owner/reply/File reference before the filesystem accepts data or advances its cursor; read/query
+    directly into owned storage instead of retaining shared OVERLAY_WRITE_SCRATCH. Keep immutable
+    bytes, destination and accepted transfer metadata until memory delivery settles. Retry repeats
+    only copy, never read/query/accounting/position changes. A definitive buffered-output fault
+    replaces completion Status while preserving Information and accepted filesystem state, then
+    applies the final inline severity policy (a consumed guard is a warning). This differs from
+    IOSB fault settlement, which leaves the original operation result unchanged. Use a distinct
+    retained-output owner; do not weaken LocalInline's no-payload invariant. FAT's chunked ordinary
+    read copy contract and flush's synchronous-API completion rules remain separate follow-ons.
+
+    This slice does not introduce deferred read/directory payloads, change local flush completion,
+    enable native filesystem exclusion or claim a fresh desktop boot. Those ownership boundaries
+    and the strict provider import gate remain open.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

@@ -8,6 +8,21 @@ use crate::{
 pub const STATUS_PARTIAL_COPY: u32 = 0x8000_000D;
 pub const STATUS_GUARD_PAGE_VIOLATION: u32 = 0x8000_0001;
 
+/// A status alone cannot distinguish rejected user access from unavailable backing or ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryCopyFailure {
+    UserFault(u32),
+    Retry(u32),
+}
+
+impl MemoryCopyFailure {
+    pub const fn status(self) -> u32 {
+        match self {
+            Self::UserFault(status) | Self::Retry(status) => status,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CopyPagePlan {
     Resident(VmResidencyPagePlan),
@@ -18,18 +33,59 @@ pub enum CopyPagePlan {
 /// it before raising the guard exception, and must not consume another process's guard.
 pub fn copy_page_plan(
     page: u64,
-    mut info: VmBasicInformation,
+    info: VmBasicInformation,
     access: FaultAccess,
     attached: bool,
 ) -> Result<CopyPagePlan, u32> {
+    copy_page_plan_checked(page, info, access, attached).map_err(MemoryCopyFailure::status)
+}
+
+/// Malformed mapping metadata is not evidence that the user's access is forbidden. Residency
+/// admission and guard consumption remain separate fallible operations owned by the caller.
+pub fn copy_page_plan_checked(
+    page: u64,
+    mut info: VmBasicInformation,
+    access: FaultAccess,
+    attached: bool,
+) -> Result<CopyPagePlan, MemoryCopyFailure> {
+    let info_end = info
+        .base_address
+        .checked_add(info.region_size)
+        .ok_or(MemoryCopyFailure::Retry(STATUS_ACCESS_VIOLATION))?;
+    if page & (PAGE_SIZE - 1) != 0
+        || info.base_address & (PAGE_SIZE - 1) != 0
+        || info.region_size == 0
+        || page < info.base_address
+        || page >= info_end
+        || (info.state == crate::MEM_COMMIT
+            && !matches!(
+                info.type_,
+                crate::MEM_PRIVATE | crate::MEM_MAPPED | crate::MEM_IMAGE
+            ))
+    {
+        return Err(MemoryCopyFailure::Retry(STATUS_ACCESS_VIOLATION));
+    }
+    if !matches!(
+        info.state,
+        crate::MEM_COMMIT | crate::MEM_RESERVE | crate::MEM_FREE
+    ) {
+        return Err(MemoryCopyFailure::Retry(crate::STATUS_NOT_COMMITTED));
+    }
     let guarded = info.protect & PAGE_GUARD != 0;
+    let valid_protection = crate::valid_allocate_protection(info.protect);
     info.protect &= !PAGE_GUARD;
-    let plan = vm_access_page_plan(page, info, access)?;
+    let plan = vm_access_page_plan(page, info, access).map_err(|status| {
+        if info.state == crate::MEM_COMMIT && !valid_protection {
+            MemoryCopyFailure::Retry(status)
+        } else {
+            MemoryCopyFailure::UserFault(status)
+        }
+    })?;
     if !guarded {
         return Ok(CopyPagePlan::Resident(plan));
     }
     if attached {
-        return Err(STATUS_ACCESS_VIOLATION);
+        return Err(MemoryCopyFailure::UserFault(STATUS_ACCESS_VIOLATION));
     }
     Ok(CopyPagePlan::ConsumeGuard(plan))
 }
@@ -65,14 +121,44 @@ pub fn write_kernel_buffer(
     user_limit: u64,
     mut write_page: impl FnMut(u64, &[u8]) -> Result<(), u32>,
 ) -> Result<(), u32> {
+    write_kernel_buffer_checked(address, input, user_limit, |address, bytes| {
+        write_page(address, bytes).map_err(MemoryCopyFailure::Retry)
+    })
+    .map_err(MemoryCopyFailure::status)
+}
+
+/// Validate the entire destination before any write. An empty range requires no user address.
+pub fn validate_kernel_write_range(
+    address: u64,
+    len: usize,
+    user_limit: u64,
+) -> Result<(), MemoryCopyFailure> {
+    if len == 0 {
+        return Ok(());
+    }
+    let len =
+        u64::try_from(len).map_err(|_| MemoryCopyFailure::UserFault(STATUS_ACCESS_VIOLATION))?;
+    address
+        .checked_add(len)
+        .filter(|end| *end <= user_limit)
+        .ok_or(MemoryCopyFailure::UserFault(STATUS_ACCESS_VIOLATION))?;
+    Ok(())
+}
+
+/// Preserve the backend's failure origin and completed prefix without retrying any chunk.
+/// Backends must classify admission failures separately from definitive user-access faults.
+pub fn write_kernel_buffer_checked(
+    address: u64,
+    input: &[u8],
+    user_limit: u64,
+    mut write_page: impl FnMut(u64, &[u8]) -> Result<(), MemoryCopyFailure>,
+) -> Result<(), MemoryCopyFailure> {
+    validate_kernel_write_range(address, input.len(), user_limit)?;
     if input.is_empty() {
         return Ok(());
     }
-    address
-        .checked_add(input.len() as u64)
-        .filter(|end| *end <= user_limit)
-        .ok_or(STATUS_ACCESS_VIOLATION)?;
-    let chunks = crate::page_chunks(address, input.len()).ok_or(STATUS_ACCESS_VIOLATION)?;
+    let chunks = crate::page_chunks(address, input.len())
+        .ok_or(MemoryCopyFailure::UserFault(STATUS_ACCESS_VIOLATION))?;
     let mut copied = 0;
     for chunk in chunks {
         write_page(
@@ -121,6 +207,10 @@ mod read_kernel_buffer_tests;
 #[cfg(test)]
 #[path = "copy_kernel_buffer_tests.rs"]
 mod kernel_buffer_tests;
+
+#[cfg(test)]
+#[path = "copy_checked_tests.rs"]
+mod checked_tests;
 
 /// The native SIZE_T output probe captures the complete value before its self-write. This differs
 /// from probing a range page by page when an unaligned count straddles a guard page.

@@ -21,6 +21,7 @@ pub const IO_DELIVERY_HANDLE_PUBLISHED: u16 = 1 << 10;
 pub const IO_DELIVERY_FILE_LOCK_RELEASED: u16 = 1 << 11;
 pub const IO_DELIVERY_LOCAL_REFERENCE_RELEASED: u16 = 1 << 12;
 pub const IO_DELIVERY_USER_APC_STAGED: u16 = 1 << 13;
+pub const IO_DELIVERY_IOSB_FAULTED: u16 = 1 << 14;
 
 const IO_DELIVERY_PUBLIC_FLAGS: u16 = IO_DELIVERY_BUFFER_PUBLISHED
     | IO_DELIVERY_IOSB_PUBLISHED
@@ -774,7 +775,11 @@ impl PendingFileIoTable {
             required |= IO_DELIVERY_BUFFER_PUBLISHED;
         }
         if pending.iosb_va != 0 {
-            required |= IO_DELIVERY_IOSB_PUBLISHED;
+            required |= if pending.delivery_state & IO_DELIVERY_IOSB_FAULTED != 0 {
+                IO_DELIVERY_IOSB_FAULTED
+            } else {
+                IO_DELIVERY_IOSB_PUBLISHED
+            };
         }
         if pending.signal_file {
             required |= IO_DELIVERY_FILE_PUBLISHED;
@@ -796,7 +801,9 @@ impl PendingFileIoTable {
         required
     }
 
-    pub fn completion_surfaces_published_exact(&self, slot: usize, irp_id: u64) -> bool {
+    /// All requested surfaces must be delivered, except an IOSB with an exact permanent-fault
+    /// disposition. Backend acknowledgement and local reference retirement remain separate.
+    pub fn completion_surfaces_settled_exact(&self, slot: usize, irp_id: u64) -> bool {
         self.get(slot).is_some_and(|pending| {
             pending.irp_id == irp_id
                 && pending.delivery_state
@@ -856,7 +863,7 @@ impl PendingFileIoTable {
         Some(pending.delivery_state)
     }
 
-    /// Remove an exact owner only after all required surfaces and backend ACK were committed.
+    /// Remove an exact owner only after all required surfaces are settled and backend ACK commits.
     /// Local files additionally retain their owner until the final reference release succeeds.
     pub fn finish_exact(&mut self, slot: usize, irp_id: u64) -> Option<PendingFileIo> {
         let entry = self.slots.get_mut(slot)?;
@@ -881,10 +888,40 @@ impl PendingFileIoTable {
             return None;
         }
         let pending = self.slots.get_mut(slot)?.as_mut()?;
-        if pending.irp_id != irp_id {
+        if pending.irp_id != irp_id
+            || (flag == IO_DELIVERY_IOSB_PUBLISHED
+                && pending.delivery_state & IO_DELIVERY_IOSB_FAULTED != 0)
+        {
             return None;
         }
         pending.delivery_state |= flag;
+        Some(pending.delivery_state)
+    }
+
+    /// Settle only the IOSB obligation after a definitive permanent user-memory fault. The caller
+    /// classifies that failure; transient admission/resource errors must retain their retry path.
+    /// Keep the original destination and terminal result, without claiming a successful write.
+    pub fn mark_iosb_faulted_exact(
+        &mut self,
+        slot: usize,
+        irp_id: u64,
+        expected_iosb_va: u64,
+    ) -> Option<u16> {
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        if pending.irp_id != irp_id
+            || expected_iosb_va == 0
+            || pending.iosb_va != expected_iosb_va
+            || pending.consumer_abandoned
+            || pending.delivery_state
+                & (IO_DELIVERY_IOSB_PUBLISHED
+                    | IO_DELIVERY_IOSB_FAULTED
+                    | IO_DELIVERY_BACKEND_ACKED
+                    | IO_DELIVERY_LOCAL_REFERENCE_RELEASED)
+                != 0
+        {
+            return None;
+        }
+        pending.delivery_state |= IO_DELIVERY_IOSB_FAULTED;
         Some(pending.delivery_state)
     }
 
@@ -1106,6 +1143,10 @@ mod local_inline_tests;
 mod local_operation_id_tests;
 
 #[cfg(test)]
+#[path = "pending_io/iosb_fault_tests.rs"]
+mod iosb_fault_tests;
+
+#[cfg(test)]
 mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
@@ -1248,7 +1289,7 @@ mod tests {
         let slot = table.park(request).unwrap();
 
         assert_eq!(table.get(slot).unwrap().output_offset, 0);
-        assert!(!table.completion_surfaces_published_exact(slot, 2));
+        assert!(!table.completion_surfaces_settled_exact(slot, 2));
         for flag in [
             IO_DELIVERY_IOSB_PUBLISHED,
             IO_DELIVERY_FILE_PUBLISHED,
@@ -1256,7 +1297,7 @@ mod tests {
         ] {
             table.mark_delivery_exact(slot, 2, flag).unwrap();
         }
-        assert!(table.completion_surfaces_published_exact(slot, 2));
+        assert!(table.completion_surfaces_settled_exact(slot, 2));
         table.mark_backend_acked_exact(slot, 2).unwrap();
         let finished = table.finish_exact(slot, 2).unwrap();
         assert_eq!(finished.file_id, request.file_id);
@@ -1313,7 +1354,7 @@ mod tests {
         ] {
             table.mark_delivery_exact(slot, 2, flag).unwrap();
         }
-        assert!(table.completion_surfaces_published_exact(slot, 2));
+        assert!(table.completion_surfaces_settled_exact(slot, 2));
         table.mark_backend_acked_exact(slot, 2).unwrap();
         assert_eq!(
             table.finish_exact(slot, 2).unwrap().major,
@@ -1362,14 +1403,14 @@ mod tests {
         ] {
             table.mark_delivery_exact(slot, 2, flag).unwrap();
         }
-        assert!(!table.completion_surfaces_published_exact(slot, 2));
+        assert!(!table.completion_surfaces_settled_exact(slot, 2));
         assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
         table.mark_reply_published_exact(slot, 2).unwrap();
-        assert!(!table.completion_surfaces_published_exact(slot, 2));
+        assert!(!table.completion_surfaces_settled_exact(slot, 2));
         table
             .mark_delivery_exact(slot, 2, IO_DELIVERY_FILE_LOCK_RELEASED)
             .unwrap();
-        assert!(table.completion_surfaces_published_exact(slot, 2));
+        assert!(table.completion_surfaces_settled_exact(slot, 2));
     }
 
     #[test]
@@ -1434,7 +1475,7 @@ mod tests {
         ] {
             table.mark_delivery_exact(slot, 2, flag).unwrap();
         }
-        assert!(table.completion_surfaces_published_exact(slot, 2));
+        assert!(table.completion_surfaces_settled_exact(slot, 2));
     }
 
     #[test]
@@ -1458,7 +1499,7 @@ mod tests {
         }
         assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
         table.mark_reply_published_exact(slot, 2).unwrap();
-        assert!(table.completion_surfaces_published_exact(slot, 2));
+        assert!(table.completion_surfaces_settled_exact(slot, 2));
     }
 
     #[test]
@@ -1484,7 +1525,7 @@ mod tests {
         ] {
             table.mark_delivery_exact(slot, 2, flag).unwrap();
         }
-        assert!(table.completion_surfaces_published_exact(slot, 2));
+        assert!(table.completion_surfaces_settled_exact(slot, 2));
         table.mark_backend_acked_exact(slot, 2).unwrap();
         let finished = table.finish_exact(slot, 2).unwrap();
         assert_eq!(finished.file_id, request.file_id);
@@ -1520,8 +1561,8 @@ mod tests {
         ] {
             table.mark_delivery_exact(first_slot, 2, flag).unwrap();
         }
-        assert!(table.completion_surfaces_published_exact(first_slot, 2));
-        assert!(!table.completion_surfaces_published_exact(second_slot, 3));
+        assert!(table.completion_surfaces_settled_exact(first_slot, 2));
+        assert!(!table.completion_surfaces_settled_exact(second_slot, 3));
     }
 
     #[test]
@@ -1549,11 +1590,11 @@ mod tests {
         }
         assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
         table.mark_reply_published_exact(slot, 2).unwrap();
-        assert!(!table.completion_surfaces_published_exact(slot, 2));
+        assert!(!table.completion_surfaces_settled_exact(slot, 2));
         table
             .mark_delivery_exact(slot, 2, IO_DELIVERY_FILE_LOCK_RELEASED)
             .unwrap();
-        assert!(table.completion_surfaces_published_exact(slot, 2));
+        assert!(table.completion_surfaces_settled_exact(slot, 2));
     }
 
     #[test]
@@ -1638,11 +1679,11 @@ mod tests {
         assert!(owner.consumer_abandoned);
         assert_eq!(owner.reply_cap, 0);
         assert!(!owner.reply_required);
-        assert!(!table.completion_surfaces_published_exact(slot, 2));
+        assert!(!table.completion_surfaces_settled_exact(slot, 2));
         table
             .mark_delivery_exact(slot, 2, IO_DELIVERY_FILE_LOCK_RELEASED)
             .unwrap();
-        assert!(table.completion_surfaces_published_exact(slot, 2));
+        assert!(table.completion_surfaces_settled_exact(slot, 2));
         table.mark_backend_acked_exact(slot, 2).unwrap();
         assert!(table.finish_exact(slot, 2).is_some());
     }
@@ -1816,7 +1857,7 @@ mod tests {
         }
         assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
         table.mark_reply_published_exact(slot, 2).unwrap();
-        assert!(table.completion_surfaces_published_exact(slot, 2));
+        assert!(table.completion_surfaces_settled_exact(slot, 2));
         assert!(table.finish_exact(slot, 2).is_none());
         table.mark_backend_acked_exact(slot, 2).unwrap();
         assert!(table.finish_exact(slot, 2).is_some());
@@ -1858,7 +1899,7 @@ mod tests {
         request.event_obj_idx = u64::MAX;
         let slot = table.park(request).unwrap();
 
-        assert!(!table.completion_surfaces_published_exact(slot, 2));
+        assert!(!table.completion_surfaces_settled_exact(slot, 2));
         assert!(table.commit_create_exact(slot, 2, 0, 1, 0x44).is_some());
         assert_eq!(
             table.commit_create_exact(slot, 2, 0, 1, 0x48),
@@ -1871,7 +1912,7 @@ mod tests {
             .unwrap();
         assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
         table.mark_reply_published_exact(slot, 2).unwrap();
-        assert!(table.completion_surfaces_published_exact(slot, 2));
+        assert!(table.completion_surfaces_settled_exact(slot, 2));
         table.mark_backend_acked_exact(slot, 2).unwrap();
         assert!(table.finish_exact(slot, 2).is_some());
     }
@@ -1939,7 +1980,7 @@ mod tests {
             table.get(slot).unwrap().operation,
             PendingFileIoOperation::LocalByteLock(PendingLocalByteLock { status: 0, .. })
         ));
-        assert!(!table.completion_surfaces_published_exact(slot, request.irp_id));
+        assert!(!table.completion_surfaces_settled_exact(slot, request.irp_id));
         table
             .mark_delivery_exact(slot, request.irp_id, IO_DELIVERY_IOSB_PUBLISHED)
             .unwrap();
@@ -1950,11 +1991,11 @@ mod tests {
         table
             .mark_reply_published_exact(slot, request.irp_id)
             .unwrap();
-        assert!(!table.completion_surfaces_published_exact(slot, request.irp_id));
+        assert!(!table.completion_surfaces_settled_exact(slot, request.irp_id));
         table
             .mark_delivery_exact(slot, request.irp_id, IO_DELIVERY_FILE_PUBLISHED)
             .unwrap();
-        assert!(table.completion_surfaces_published_exact(slot, request.irp_id));
+        assert!(table.completion_surfaces_settled_exact(slot, request.irp_id));
     }
 
     #[test]
@@ -1993,7 +2034,7 @@ mod tests {
                 ..
             })
         ));
-        assert!(!table.completion_surfaces_published_exact(slot, request.irp_id));
+        assert!(!table.completion_surfaces_settled_exact(slot, request.irp_id));
         table
             .mark_delivery_exact(slot, request.irp_id, IO_DELIVERY_IOSB_PUBLISHED)
             .unwrap();
@@ -2004,10 +2045,10 @@ mod tests {
         table
             .mark_reply_published_exact(slot, request.irp_id)
             .unwrap();
-        assert!(!table.completion_surfaces_published_exact(slot, request.irp_id));
+        assert!(!table.completion_surfaces_settled_exact(slot, request.irp_id));
         table
             .mark_delivery_exact(slot, request.irp_id, IO_DELIVERY_FILE_PUBLISHED)
             .unwrap();
-        assert!(table.completion_surfaces_published_exact(slot, request.irp_id));
+        assert!(table.completion_surfaces_settled_exact(slot, request.irp_id));
     }
 }

@@ -23,6 +23,7 @@ nt-object-manager = { workspace = true, optional = true }
 bitflags = { workspace = true }
 
 [dev-dependencies]
+nt-address-space = { workspace = true }
 nt-fs = { workspace = true }
 nt-io-completion = { workspace = true }
 proptest = "1"

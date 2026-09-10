@@ -2,8 +2,9 @@
 
 use super::*;
 use nt_address_space::copy::{
-    copy_page_plan, copy_virtual_memory, probe_write_scalar, probe_write_user_range, CopyPagePlan,
-    VirtualMemoryCopy, WriteProbeMemory, STATUS_GUARD_PAGE_VIOLATION,
+    copy_page_plan_checked, copy_virtual_memory, probe_write_scalar, probe_write_user_range,
+    CopyPagePlan, MemoryCopyFailure, VirtualMemoryCopy, WriteProbeMemory,
+    STATUS_GUARD_PAGE_VIOLATION,
 };
 use nt_address_space::{FaultAccess, PAGE_SIZE};
 
@@ -63,13 +64,19 @@ impl WriteProbeMemory for ProcessWriteProbe<'_> {
     }
 
     fn write_scalar<const N: usize>(&mut self, address: u64, value: [u8; N]) -> Result<(), u32> {
-        unsafe { self.handler.process_memory_write_status(self.pi, address, &value) }
+        unsafe {
+            self.handler
+                .process_memory_write_status(self.pi, address, &value)
+        }
     }
 }
 
 impl nt_address_space::native_output::VmOutputMemory for ProcessWriteProbe<'_> {
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), u32> {
-        unsafe { self.handler.process_memory_write_status(self.pi, address, bytes) }
+        unsafe {
+            self.handler
+                .process_memory_write_status(self.pi, address, bytes)
+        }
     }
 }
 
@@ -99,12 +106,12 @@ impl ExecNtHandler {
         iosb: u64,
         status: u32,
         information: u64,
-    ) -> Result<(), u32> {
-        nt_address_space::native_output::publish_file_io_status(
-            &mut ProcessWriteProbe::current(self),
+    ) -> Result<(), MemoryCopyFailure> {
+        nt_address_space::native_output::publish_file_io_status_checked(
             iosb,
             status,
             information,
+            |address, bytes| self.process_memory_write_checked(self.pi, address, bytes),
         )
     }
 
@@ -187,12 +194,29 @@ impl ExecNtHandler {
         address: u64,
         input: &[u8],
     ) -> Result<(), u32> {
-        hosted_thread_memory_access(pi as u64, address, input.len() as u64)?;
-        nt_address_space::copy::write_kernel_buffer(
+        self.process_memory_write_checked(pi, address, input)
+            .map_err(MemoryCopyFailure::status)
+    }
+
+    unsafe fn process_memory_write_checked(
+        &mut self,
+        pi: usize,
+        address: u64,
+        input: &[u8],
+    ) -> Result<(), MemoryCopyFailure> {
+        nt_address_space::copy::validate_kernel_write_range(
+            address,
+            input.len(),
+            USER_ADDRESS_LIMIT,
+        )?;
+        // Ownership exclusion can report the same status as an invalid address. Keep its origin.
+        hosted_thread_memory_access(pi as u64, address, input.len() as u64)
+            .map_err(MemoryCopyFailure::Retry)?;
+        nt_address_space::copy::write_kernel_buffer_checked(
             address,
             input,
             USER_ADDRESS_LIMIT,
-            |va, bytes| self.copy_write_page(pi, va, bytes),
+            |va, bytes| self.copy_write_page_checked(pi, va, bytes),
         )
     }
 
@@ -217,7 +241,15 @@ impl ExecNtHandler {
         page: u64,
         write: bool,
     ) -> Result<u64, u32> {
-        self.prepare_copy_page(pi, page, if write { FaultAccess::Write } else { FaultAccess::Read })?;
+        self.prepare_copy_page(
+            pi,
+            page,
+            if write {
+                FaultAccess::Write
+            } else {
+                FaultAccess::Read
+            },
+        )?;
         Ok(if write { RW_NX } else { RO_NX })
     }
 
@@ -227,25 +259,46 @@ impl ExecNtHandler {
         address: u64,
         access: FaultAccess,
     ) -> Result<(), u32> {
-        hosted_thread_memory_access(pi as u64, address & !(PAGE_SIZE - 1), PAGE_SIZE)?;
+        self.prepare_copy_page_checked(pi, address, access)
+            .map_err(MemoryCopyFailure::status)
+    }
+
+    unsafe fn prepare_copy_page_checked(
+        &mut self,
+        pi: usize,
+        address: u64,
+        access: FaultAccess,
+    ) -> Result<(), MemoryCopyFailure> {
+        hosted_thread_memory_access(pi as u64, address & !(PAGE_SIZE - 1), PAGE_SIZE)
+            .map_err(MemoryCopyFailure::Retry)?;
         // Guard consumption mutates VAD metadata too, so validate ownership before either path.
         self.loop_ctx
             .and_then(|ctx| ctx.for_process(pi))
-            .ok_or(STATUS_INVALID_HANDLE)?;
+            .ok_or(MemoryCopyFailure::Retry(STATUS_INVALID_HANDLE))?;
         let page = address & !(PAGE_SIZE - 1);
-        let info = self.query_memory_basic_information(pi, page)?;
-        let plan = copy_page_plan(page, info, access, pi != self.pi).map_err(|status| {
-            if status == nt_address_space::STATUS_NOT_COMMITTED {
-                STATUS_ACCESS_VIOLATION
-            } else {
-                status
-            }
-        })?;
+        let info = self
+            .query_memory_basic_information(pi, page)
+            .map_err(MemoryCopyFailure::Retry)?;
+        let plan =
+            copy_page_plan_checked(page, info, access, pi != self.pi).map_err(|failure| {
+                match failure {
+                    MemoryCopyFailure::UserFault(nt_address_space::STATUS_NOT_COMMITTED) => {
+                        MemoryCopyFailure::UserFault(STATUS_ACCESS_VIOLATION)
+                    }
+                    MemoryCopyFailure::Retry(nt_address_space::STATUS_NOT_COMMITTED) => {
+                        MemoryCopyFailure::Retry(STATUS_ACCESS_VIOLATION)
+                    }
+                    other => other,
+                }
+            })?;
         match plan {
-            CopyPagePlan::Resident(plan) => self.ensure_residency_page(pi, plan),
+            CopyPagePlan::Resident(plan) => self
+                .ensure_residency_page(pi, plan)
+                .map_err(MemoryCopyFailure::Retry),
             CopyPagePlan::ConsumeGuard(plan) => {
-                self.consume_copy_guard(pi, info, plan)?;
-                Err(STATUS_GUARD_PAGE_VIOLATION)
+                self.consume_copy_guard(pi, info, plan)
+                    .map_err(MemoryCopyFailure::Retry)?;
+                Err(MemoryCopyFailure::UserFault(STATUS_GUARD_PAGE_VIOLATION))
             }
         }
     }
@@ -400,17 +453,27 @@ impl ExecNtHandler {
     }
 
     unsafe fn copy_write_page(&mut self, pi: usize, address: u64, input: &[u8]) -> Result<(), u32> {
+        self.copy_write_page_checked(pi, address, input)
+            .map_err(MemoryCopyFailure::status)
+    }
+
+    unsafe fn copy_write_page_checked(
+        &mut self,
+        pi: usize,
+        address: u64,
+        input: &[u8],
+    ) -> Result<(), MemoryCopyFailure> {
         if input.is_empty() {
             return Ok(());
         }
         if input.len() as u64 > PAGE_SIZE - address % PAGE_SIZE {
-            return Err(STATUS_ACCESS_VIOLATION);
+            return Err(MemoryCopyFailure::Retry(STATUS_ACCESS_VIOLATION));
         }
-        self.prepare_copy_page(pi, address, FaultAccess::Write)?;
+        self.prepare_copy_page_checked(pi, address, FaultAccess::Write)?;
         let ctx = self
             .loop_ctx
             .and_then(|ctx| ctx.for_process(pi))
-            .ok_or(STATUS_INVALID_HANDLE)?;
+            .ok_or(MemoryCopyFailure::Retry(STATUS_INVALID_HANDLE))?;
         if crate::img_spawn::client_copyout_mapped_admitted(
             pi as u64,
             address,
@@ -421,7 +484,8 @@ impl ExecNtHandler {
         ) {
             Ok(())
         } else {
-            Err(STATUS_ACCESS_VIOLATION)
+            // Admitted physical copy can still meet a retained alias or backing owner.
+            Err(MemoryCopyFailure::Retry(STATUS_ACCESS_VIOLATION))
         }
     }
 

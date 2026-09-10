@@ -142,7 +142,7 @@ fn suppressed_inline_failure_can_omit_iosb_and_other_consumer_surfaces() {
     request.apc_routine = 0;
     request.event_obj_idx = u64::MAX;
     let slot = table.park(request).unwrap();
-    assert!(!table.completion_surfaces_published_exact(slot, ID));
+    assert!(!table.completion_surfaces_settled_exact(slot, ID));
     table
         .mark_delivery_exact(slot, ID, IO_DELIVERY_FILE_PUBLISHED)
         .unwrap();
@@ -183,7 +183,7 @@ fn each_surface_and_both_final_acknowledgements_gate_retirement() {
     assert_eq!(table.claim_reply_cap_exact(slot, ID), Some(Some(76)));
     assert!(table.mark_backend_acked_exact(slot, ID).is_none());
     table.mark_reply_published_exact(slot, ID).unwrap();
-    assert!(table.completion_surfaces_published_exact(slot, ID));
+    assert!(table.completion_surfaces_settled_exact(slot, ID));
     assert!(table
         .mark_local_reference_released_exact(slot, ID)
         .is_none());

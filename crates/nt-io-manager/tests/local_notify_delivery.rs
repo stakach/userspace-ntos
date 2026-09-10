@@ -69,7 +69,7 @@ fn publish_surfaces(io: &mut PendingFileIoTable, slot: usize) {
     }
     assert_eq!(io.claim_reply_cap_exact(slot, IRP), Some(Some(11)));
     io.mark_reply_published_exact(slot, IRP).unwrap();
-    assert!(io.completion_surfaces_published_exact(slot, IRP));
+    assert!(io.completion_surfaces_settled_exact(slot, IRP));
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn consumer_teardown_after_change_keeps_nonempty_terminal_result_for_ack() {
     assert_eq!(io.abandon_thread_transfers_with(TID, |_| {}), 1);
     assert!(!fsd.cancel(notify)); // The real namespace result already won cancellation.
     assert!(io.complete_local_directory_notify_exact(IRP, notify.raw(), 0, information, false));
-    assert!(io.completion_surfaces_published_exact(slot, IRP));
+    assert!(io.completion_surfaces_settled_exact(slot, IRP));
     fsd.acknowledge_completion(notify, &IRP).unwrap();
     io.mark_backend_acked_exact(slot, IRP).unwrap();
     assert!(io.finish_exact(slot, IRP).is_none());

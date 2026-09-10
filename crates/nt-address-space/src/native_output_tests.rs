@@ -20,6 +20,80 @@ const QUERY: VmBasicQueryOutput = VmBasicQueryOutput {
 };
 
 #[test]
+fn checked_file_status_preserves_failure_origin_at_either_store_and_exact_retry() {
+    for failure in [
+        MemoryCopyFailure::UserFault(STATUS_ACCESS_VIOLATION),
+        MemoryCopyFailure::Retry(STATUS_ACCESS_VIOLATION),
+    ] {
+        for failed_store in [1, 2] {
+            let mut memory = Memory::default();
+            memory.seed(OLD, &[0xa5; 16]);
+            memory.seed(OLD, &0x103u32.to_le_bytes());
+            let before = memory.bytes.clone();
+            let mut calls = Vec::new();
+            let status = 0x8000_0005u32;
+            let information = 0x1_0000_0042u64;
+            assert_eq!(
+                publish_file_io_status_checked(OLD, status, information, |address, bytes| {
+                    calls.push((address, bytes.to_vec()));
+                    if calls.len() == failed_store {
+                        return Err(failure);
+                    }
+                    memory.seed(address, bytes);
+                    Ok(())
+                }),
+                Err(failure)
+            );
+            assert_eq!(calls.len(), failed_store);
+            assert_eq!(calls[0], (OLD + 8, information.to_le_bytes().to_vec()));
+            for address in OLD..OLD + 8 {
+                assert_eq!(memory.bytes[&address], before[&address]);
+            }
+            if failed_store == 1 {
+                assert_eq!(memory.bytes, before);
+            } else {
+                assert_eq!(calls[1], (OLD, status.to_le_bytes().to_vec()));
+                for (offset, byte) in information.to_le_bytes().iter().enumerate() {
+                    assert_eq!(memory.bytes[&(OLD + 8 + offset as u64)], *byte);
+                }
+            }
+            calls.clear();
+            assert_eq!(
+                publish_file_io_status_checked(OLD, status, information, |address, bytes| {
+                    calls.push((address, bytes.to_vec()));
+                    memory.seed(address, bytes);
+                    Ok(())
+                }),
+                Ok(())
+            );
+            assert_eq!(
+                calls,
+                [
+                    (OLD + 8, information.to_le_bytes().to_vec()),
+                    (OLD, status.to_le_bytes().to_vec()),
+                ]
+            );
+            for address in OLD + 4..OLD + 8 {
+                assert_eq!(memory.bytes[&address], 0xa5);
+            }
+            for (offset, byte) in status.to_le_bytes().iter().enumerate() {
+                assert_eq!(memory.bytes[&(OLD + offset as u64)], *byte);
+            }
+        }
+    }
+}
+
+#[test]
+fn checked_file_status_overflow_is_a_user_fault_without_backend_access() {
+    for iosb in [u64::MAX, u64::MAX - 7, u64::MAX - 8, u64::MAX - 14] {
+        assert_eq!(
+            publish_file_io_status_checked(iosb, 0, 42, |_, _| panic!("overflow reached store")),
+            Err(MemoryCopyFailure::UserFault(STATUS_ACCESS_VIOLATION))
+        );
+    }
+}
+
+#[test]
 fn file_status_publication_stores_information_before_status_and_preserves_padding() {
     for iosb in [0x1000, 0x1001] {
         let mut memory = Memory::default();

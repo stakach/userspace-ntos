@@ -90,7 +90,7 @@ fn settle_surfaces(fs: &mut FileSystem, handle: u64, table: &mut PendingFileIoTa
         if required {
             // A refused external admission performs no effect and preserves terminal state.
             let before = table.get(slot);
-            assert!(!table.completion_surfaces_published_exact(slot, ID));
+            assert!(!table.completion_surfaces_settled_exact(slot, ID));
             assert!(table.mark_backend_acked_exact(slot, ID).is_none());
             assert!(table.finish_exact(slot, ID).is_none());
             assert_eq!(table.get(slot), before);

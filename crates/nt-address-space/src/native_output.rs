@@ -1,7 +1,9 @@
 //! Native parameter capture and ordered output stores. The caller owns operation status and
 //! decides whether a late output exception is reported; publication never rolls back VM state.
 
-use crate::copy::{probe_write_scalar, probe_write_user_range, WriteProbeMemory};
+use crate::copy::{
+    probe_write_scalar, probe_write_user_range, MemoryCopyFailure, WriteProbeMemory,
+};
 
 pub trait VmOutputMemory: WriteProbeMemory {
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), u32>;
@@ -18,11 +20,30 @@ pub fn publish_file_io_status(
     status: u32,
     information: u64,
 ) -> Result<(), u32> {
-    iosb.checked_add(15).ok_or(crate::STATUS_ACCESS_VIOLATION)?;
-    let information_address = iosb.checked_add(8).ok_or(crate::STATUS_ACCESS_VIOLATION)?;
-    memory.write_bytes(information_address, &information.to_le_bytes())?;
+    publish_file_io_status_checked(iosb, status, information, |address, bytes| {
+        memory
+            .write_bytes(address, bytes)
+            .map_err(MemoryCopyFailure::Retry)
+    })
+    .map_err(MemoryCopyFailure::status)
+}
+
+/// Ordered publication with the backend's exact failure origin retained. Overflow is a user
+/// address fault; an accepted Information store remains accepted if the Status store fails.
+pub fn publish_file_io_status_checked(
+    iosb: u64,
+    status: u32,
+    information: u64,
+    mut write_bytes: impl FnMut(u64, &[u8]) -> Result<(), MemoryCopyFailure>,
+) -> Result<(), MemoryCopyFailure> {
+    iosb.checked_add(15)
+        .ok_or(MemoryCopyFailure::UserFault(crate::STATUS_ACCESS_VIOLATION))?;
+    let information_address = iosb
+        .checked_add(8)
+        .ok_or(MemoryCopyFailure::UserFault(crate::STATUS_ACCESS_VIOLATION))?;
+    write_bytes(information_address, &information.to_le_bytes())?;
     core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-    memory.write_bytes(iosb, &status.to_le_bytes())
+    write_bytes(iosb, &status.to_le_bytes())
 }
 
 /// Admit file I/O before event reset or dispatch. The full (possibly unaligned) IOSB is captured
