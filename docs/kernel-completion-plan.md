@@ -32421,6 +32421,61 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     IOSB copy faults. Ordinary inaccessible IOSBs must not cause indefinite completion retry;
     record an explicit failed output disposition rather than pretending publication succeeded.
 
+    Retained local directory completion checkpoint (2026-09-10): use the same completion owner
+    for accepted directory enumeration, not a second direct publication path.
+    - [x] Migrate overlay and FAT NtQueryDirectoryFile to exact pre-dispatch reservations and
+      LocalInline terminal delivery. FAT reserves durable capacity before its transient entry
+      allocator, captures entries before begin-I/O, and stages after that allocator has ended.
+      Copy only eligible output once; preserve accepted cursor and byte count on terminal copy
+      failure. Do not repeat enumeration during IOSB/event/APC/reply/reference-release retries.
+    - [x] Remove the manual directory IOSB/APC/event publication, destructive release paths and
+      FAT cursor rollback. Delete finish_local_file_io after removing directory callers and
+      inlining its sole remaining use in the separate, not-yet-migrated flush adapter. Extract
+      local request reservation, begin-I/O, terminal staging, signaling and reference lifetime to
+      components/ntos-executive/src/exec_local_file_io.rs under the existing handler namespace.
+    - [x] Add host-testable ordered x64 IOSB publication: checked address arithmetic before any
+      stores, eight-byte Information, release fence, then four-byte Status; leave union padding
+      untouched and stop at the first checked copy failure. Wire the shared pending-I/O native
+      publisher through the existing VM copy/admission backend, replacing Status-first stores.
+    - [x] Complete serialized host/native validation and update the remaining ownership frontier.
+
+    Validation: 884 focused and 2,559 broad host tests/doctests passed, none ignored. Four real
+    directory-query/delivery composition tests and five ordered
+    IOSB memory tests cover cursor stability, partial output copy failure, warning/error completion,
+    aligned/unaligned stores, padding, address overflow and exact failed-store retry. The first
+    new integration run exposed an incorrect test assumption that reply claiming itself is gated
+    by completion surfaces; the test now observes the real surface/ACK/retirement gates without
+    claiming early. The final native executive release build passed in 35.01s with 294 unchanged
+    warnings after its first attempt identified the flush-helper caller described below. Evidence:
+    .tmp/test-local-directory-delivery-focused-20260910.log,
+    .tmp/test-local-directory-delivery-full-20260910.log and
+    .tmp/build-local-directory-delivery-executive-20260910.log. Root serialized all runners.
+    Native copy
+    and admission are explicit external boundaries. Definitive inaccessible IOSB disposition is
+    still open: this checkpoint fixes store ordering, not the existing all-failures-retry policy.
+    Local flush completion, ordinary close/unpublished rollback, filesystem exclusion and exact
+    CM binding remain
+    open, as do local File completion-port association and the 27 strict win32k imports blocking
+    fresh desktop acceptance. No boot/screenshot proof is claimed.
+
+    Review adjustment: do not classify an IOSB failure as definitive from its NTSTATUS alone.
+    hosted_thread_memory_access (components/ntos-executive/src/hosted_thread_runtime.rs:865)
+    currently returns ACCESS_VIOLATION for retained frame/pagefile/temporary-alias exclusion and
+    thread-memory retirement as well as invalid ranges. Preserve typed admission origin through
+    the copy backend: validated span/protection/uncommitted faults and consumed guard exceptions
+    are distinguishable from ownership, residency, resource, backing or mapping refusal. Retain
+    the latter until their owner can settle; a permanently unwritable IOSB needs a separate typed
+    failed-output acknowledgement, not IO_DELIVERY_IOSB_PUBLISHED. No native
+    MULTIPLE_FAULT_VIOLATION completion-retry protocol exists to copy from NT5. Apply the same
+    distinction before adding deferred read/directory payload delivery; current inline copying is
+    not proof of a retained payload on transient refusal. Also audit local synchronous File Busy
+    ownership across stalled delivery before enabling concurrent local dispatch/exclusion.
+    The native build identified exec_file_flush.rs as the last non-directory finish-helper caller;
+    its existing direct completion/signaling/release behavior remains explicitly local to that
+    adapter rather than retaining a generic destructive helper. Migrate flush separately using
+    NT5 misc.c:390 / ReactOS iofunc.c:1487 synchronous-API semantics: an asynchronous File uses an
+    internal completion event and kernel IOSB, not the ordinary no-user-event File signal policy.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

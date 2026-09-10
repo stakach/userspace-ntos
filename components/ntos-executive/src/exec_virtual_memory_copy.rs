@@ -94,6 +94,20 @@ impl VirtualMemoryCopy for ProcessMemoryCopy<'_> {
 }
 
 impl ExecNtHandler {
+    pub(crate) unsafe fn publish_file_io_status(
+        &mut self,
+        iosb: u64,
+        status: u32,
+        information: u64,
+    ) -> Result<(), u32> {
+        nt_address_space::native_output::publish_file_io_status(
+            &mut ProcessWriteProbe::current(self),
+            iosb,
+            status,
+            information,
+        )
+    }
+
     pub(super) unsafe fn capture_vm_range(
         &mut self,
         memory: SyscallUserMemory,

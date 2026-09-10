@@ -25723,9 +25723,9 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         }
 
         if pending.iosb_va != 0 && delivery_state & nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED == 0 {
-            if !nt_handler.xas_try_write_buf(pending.iosb_va, &terminal_status.to_le_bytes())
-                || !nt_handler
-                    .xas_try_write_buf(pending.iosb_va + 8, &terminal_information.to_le_bytes())
+            if nt_handler
+                .publish_file_io_status(pending.iosb_va, terminal_status, terminal_information)
+                .is_err()
             {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 restore_file_io_mirrors!();

@@ -10,6 +10,9 @@ use nt_io_abi::major;
 #[path = "exec_file_flush.rs"]
 mod file_flush;
 
+#[path = "exec_local_file_io.rs"]
+mod local_file_io;
+
 #[path = "exec_virtual_memory_copy.rs"]
 mod virtual_memory_copy;
 
@@ -29281,140 +29284,6 @@ impl ExecNtHandler {
         })
     }
 
-    unsafe fn reserved_local_file_io_id(&self) -> Result<u64, u32> {
-        let pending = &*core::ptr::addr_of!(PENDING_FILE_IO);
-        self.pending_file_io_reservation
-            .and_then(|reservation| pending.local_operation_id(reservation))
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)
-    }
-
-    unsafe fn begin_retained_local_file_io(&mut self, file_object: u64) -> Result<u64, u32> {
-        // Inline asynchronous operations also need a parked reply if delivery must retry.
-        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
-            || !wait_reply_pool_has_free()
-            || !self.reserve_pending_file_io_owner()
-        {
-            return Err(STATUS_INSUFFICIENT_RESOURCES);
-        }
-        let request_id = self.reserved_local_file_io_id()?;
-        self.begin_local_file_io(file_object)?;
-        Ok(request_id)
-    }
-
-    fn set_local_file_object_signaled(
-        &mut self,
-        file_object: u64,
-        signaled: bool,
-    ) -> Result<(), u32> {
-        let object_id = (file_object & LOCAL_ID_PAYLOAD_MASK) as u32;
-        match file_object & !LOCAL_ID_PAYLOAD_MASK {
-            LOCAL_FAT_FILE_OBJECT_TAG => self.readonly_file_opens.set_signaled(object_id, signaled),
-            LOCAL_FAT_DIRECTORY_OBJECT_TAG => {
-                self.directory_opens.set_signaled(object_id, signaled)
-            }
-            LOCAL_OVERLAY_FILE_OBJECT_TAG => unsafe {
-                crate::writable_fs::set_file_signaled(file_object & LOCAL_ID_PAYLOAD_MASK, signaled)
-            },
-            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
-        }
-    }
-
-    fn begin_local_file_io(&mut self, file_object: u64) -> Result<(), u32> {
-        let object_id = (file_object & LOCAL_ID_PAYLOAD_MASK) as u32;
-        match file_object & !LOCAL_ID_PAYLOAD_MASK {
-            LOCAL_FAT_FILE_OBJECT_TAG => self.readonly_file_opens.retain_io(object_id),
-            LOCAL_FAT_DIRECTORY_OBJECT_TAG => self.directory_opens.retain_io(object_id),
-            LOCAL_OVERLAY_FILE_OBJECT_TAG => unsafe {
-                return crate::writable_fs::begin_file_io(file_object & LOCAL_ID_PAYLOAD_MASK);
-            },
-            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
-        }?;
-        if let Err(status) = self.set_local_file_object_signaled(file_object, false) {
-            self.release_local_file_io_reference(file_object);
-            return Err(status);
-        }
-        Ok(())
-    }
-
-    fn finish_local_file_io(&mut self, file_object: u64, synchronous: bool, event_obj_idx: u64) {
-        if synchronous || event_obj_idx == u64::MAX {
-            let result = self.signal_local_file_completion(file_object);
-            assert_eq!(result, nt_fs::STATUS_SUCCESS);
-        }
-        self.release_local_file_io_reference(file_object);
-    }
-
-    pub(crate) fn release_local_file_io_reference(&mut self, file_object: u64) {
-        self.try_release_local_file_io_reference(file_object)
-            .expect("local pending I/O lost its FILE_OBJECT reference");
-    }
-
-    pub(crate) fn try_release_local_file_io_reference(&mut self, file_object: u64) -> Result<(), u32> {
-        let object_id = (file_object & LOCAL_ID_PAYLOAD_MASK) as u32;
-        match file_object & !LOCAL_ID_PAYLOAD_MASK {
-            LOCAL_FAT_FILE_OBJECT_TAG => self.readonly_file_opens.release_io(object_id),
-            LOCAL_FAT_DIRECTORY_OBJECT_TAG => self.directory_opens.release_io(object_id),
-            LOCAL_OVERLAY_FILE_OBJECT_TAG => unsafe {
-                crate::writable_fs::release_io_reference(file_object & LOCAL_ID_PAYLOAD_MASK)
-            },
-            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
-        }
-    }
-
-    pub(crate) fn signal_local_file_completion(&mut self, file_object: u64) -> u32 {
-        match self.set_local_file_object_signaled(file_object, true) {
-            Ok(()) => {
-                unsafe {
-                    let _ = wait_wake_dispatcher_set(self);
-                }
-                nt_fs::STATUS_SUCCESS
-            }
-            Err(status) => status,
-        }
-    }
-
-    fn stage_terminal_local_file_io(
-        &mut self,
-        request_id: u64,
-        major: u8,
-        file_object: u64,
-        synchronous: bool,
-        event_obj_idx: u64,
-        tid: u64,
-        apc_routine: u64,
-        apc_context: u64,
-        iosb: u64,
-        status: u32,
-        information: u64,
-        completion_port_suppressed: bool,
-    ) {
-        // Delivery may wait, but its original inline completion policy must not change.
-        let publish = nt_io_completion::file_io_status_publishes_completion(status, true);
-        assert!(self.pending_file_io_transfer.is_none());
-        assert!(self.pending_file_io_reservation.is_some());
-        self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-            file_id: file_object,
-            irp_id: request_id,
-            major,
-            operation: nt_io_manager::PendingFileIoOperation::LocalInline(
-                nt_io_manager::PendingLocalInline { status, information },
-            ),
-            pi: self.pi as u32,
-            tid,
-            badge: self.current_badge,
-            iosb_va: if publish { iosb } else { 0 },
-            apc_routine: if publish { apc_routine } else { 0 },
-            apc_context,
-            completion_port_suppressed,
-            signal_file: publish && (synchronous || event_obj_idx == u64::MAX),
-            event_obj_idx: if publish { event_obj_idx } else { u64::MAX },
-            ..nt_io_manager::PendingFileIo::default()
-        });
-        // Even an asynchronous FILE_OBJECT completed inline: return its real terminal status
-        // through this request's parked reply, not a fabricated asynchronous operation result.
-        self.pending_file_io_wait = true;
-    }
-
     unsafe fn local_directory_notify_route_for(
         &self,
         handle: u64,
@@ -41116,9 +40985,10 @@ impl ExecNtHandler {
                             != 0;
                         let file_object =
                             LOCAL_OVERLAY_FILE_OBJECT_TAG | (file_id & LOCAL_ID_PAYLOAD_MASK);
-                        if let Err(status) = self.begin_local_file_io(file_object) {
-                            return status;
-                        }
+                        let request_id = match self.begin_retained_local_file_io(file_object) {
+                            Ok(request_id) => request_id,
+                            Err(status) => return status,
+                        };
                         let scratch_len = length.min(DIR_QUERY_SCRATCH_CAP);
                         let encoded = core::slice::from_raw_parts_mut(
                             core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
@@ -41133,42 +41003,15 @@ impl ExecNtHandler {
                             restart_scan,
                             encoded,
                         );
-                        let mut iosb_bytes = [0u8; 16];
-                        iosb_bytes[..4].copy_from_slice(&result.status.to_le_bytes());
-                        iosb_bytes[8..].copy_from_slice(&(result.information as u64).to_le_bytes());
-                        if result.information > encoded.len()
-                            || !self.xas_try_write_buf(output, &encoded[..result.information])
-                            || !self.xas_try_write_buf(iosb, &iosb_bytes)
-                        {
-                            self.finish_local_file_io(
-                                file_object,
-                                synchronous,
-                                event_index.map_or(u64::MAX, |index| index as u64),
-                            );
-                            return STATUS_ACCESS_VIOLATION;
-                        }
-                        let apc_status =
-                            self.queue_file_user_apc(self.current_tid, args[2], args[3], iosb);
-                        let status = if apc_status == nt_fs::STATUS_SUCCESS {
-                            result.status
-                        } else {
-                            let mut apc_iosb = [0u8; 16];
-                            apc_iosb[..4].copy_from_slice(&apc_status.to_le_bytes());
-                            let _ = self.xas_try_write_buf(iosb, &apc_iosb);
-                            apc_status
-                        };
-                        if let Some(index) = event_index {
-                            if self.signal_event_index(index) != 0 {
-                                self.finish_local_file_io(file_object, synchronous, index as u64);
-                                return nt_fs::STATUS_INVALID_HANDLE;
-                            }
-                        }
-                        self.finish_local_file_io(
+                        return self.complete_local_directory_query(
+                            args,
+                            request_id,
                             file_object,
                             synchronous,
                             event_index.map_or(u64::MAX, |index| index as u64),
+                            result,
+                            encoded,
                         );
-                        return status;
                     }
                     Some(_) => {
                         crate::writable_fs::trace_dir_refusal(
@@ -41229,6 +41072,11 @@ impl ExecNtHandler {
                     & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                     != 0;
                 let file_object = LOCAL_FAT_DIRECTORY_OBJECT_TAG | object_id as u64;
+                // Reserve durable table capacity before entering the transient entry allocator.
+                let request_id = match self.reserve_local_file_io_delivery() {
+                    Ok(request_id) => request_id,
+                    Err(status) => return status,
+                };
                 let result = {
                     let _transient = allocator::enter_transient();
                     let mut entry_count = 0usize;
@@ -41247,17 +41095,8 @@ impl ExecNtHandler {
                     if let Err(status) = self.begin_local_file_io(file_object) {
                         return status;
                     }
-                    let directory = match self.directory_opens.get_mut(object_id) {
-                        Ok(directory) => directory,
-                        Err(status) => {
-                            self.finish_local_file_io(
-                                file_object,
-                                synchronous,
-                                event_index.map_or(u64::MAX, |index| index as u64),
-                            );
-                            return status;
-                        }
-                    };
+                    let directory = self.directory_opens.get_mut(object_id)
+                        .expect("retained FAT directory disappeared during query");
                     nt_fs::query_directory(
                         &mut directory.query,
                         &entries,
@@ -41268,44 +41107,15 @@ impl ExecNtHandler {
                         encoded,
                     )
                 };
-                let mut iosb_bytes = [0u8; 16];
-                iosb_bytes[..4].copy_from_slice(&result.status.to_le_bytes());
-                iosb_bytes[8..].copy_from_slice(&(result.information as u64).to_le_bytes());
-                if result.information > encoded.len()
-                    || !self.xas_try_write_buf(output, &encoded[..result.information])
-                    || !self.xas_try_write_buf(iosb, &iosb_bytes)
-                {
-                    if let Ok(directory) = self.directory_opens.get_mut(object_id) {
-                        directory.query = open.query;
-                    }
-                    self.finish_local_file_io(
-                        file_object,
-                        synchronous,
-                        event_index.map_or(u64::MAX, |index| index as u64),
-                    );
-                    return STATUS_ACCESS_VIOLATION;
-                }
-                let apc_status = self.queue_file_user_apc(self.current_tid, args[2], args[3], iosb);
-                let status = if apc_status == nt_fs::STATUS_SUCCESS {
-                    result.status
-                } else {
-                    let mut apc_iosb = [0u8; 16];
-                    apc_iosb[..4].copy_from_slice(&apc_status.to_le_bytes());
-                    let _ = self.xas_try_write_buf(iosb, &apc_iosb);
-                    apc_status
-                };
-                if let Some(index) = event_index {
-                    if self.signal_event_index(index) != 0 {
-                        self.finish_local_file_io(file_object, synchronous, index as u64);
-                        return nt_fs::STATUS_INVALID_HANDLE;
-                    }
-                }
-                self.finish_local_file_io(
+                self.complete_local_directory_query(
+                    args,
+                    request_id,
                     file_object,
                     synchronous,
                     event_index.map_or(u64::MAX, |index| index as u64),
-                );
-                status
+                    result,
+                    encoded,
+                )
             },
             // NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
             // FileInformationClass). Resolve process-local ownership here; nt-fs owns the ABI layout.

@@ -7,6 +7,24 @@ pub trait VmOutputMemory: WriteProbeMemory {
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), u32>;
 }
 
+/// Publish an x64 IO_STATUS_BLOCK with Status as the final completion indicator. Information
+/// precedes a release fence and the four-byte Status store; the union padding is untouched.
+/// Address-space admission belongs to the memory backend. Overflow is rejected before any store,
+/// and the first backend error stops publication without rolling back an accepted Information.
+/// A caller retaining the immutable terminal result may retry this sequence after a store failure.
+pub fn publish_file_io_status(
+    memory: &mut impl VmOutputMemory,
+    iosb: u64,
+    status: u32,
+    information: u64,
+) -> Result<(), u32> {
+    iosb.checked_add(15).ok_or(crate::STATUS_ACCESS_VIOLATION)?;
+    let information_address = iosb.checked_add(8).ok_or(crate::STATUS_ACCESS_VIOLATION)?;
+    memory.write_bytes(information_address, &information.to_le_bytes())?;
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+    memory.write_bytes(iosb, &status.to_le_bytes())
+}
+
 /// Admit file I/O before event reset or dispatch. The full (possibly unaligned) IOSB is captured
 /// before its self-write; a read destination is probed only after that scalar succeeds.
 pub fn probe_file_io_output(

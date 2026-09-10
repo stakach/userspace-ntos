@@ -36,7 +36,9 @@ impl ExecNtHandler {
             status = STATUS_ACCESS_VIOLATION;
         }
         // Flush has no event argument and completes synchronously even for an async open.
-        self.finish_local_file_io(file_object, false, u64::MAX);
+        let completion = self.signal_local_file_completion(file_object);
+        assert_eq!(completion, nt_fs::STATUS_SUCCESS);
+        self.release_local_file_io_reference(file_object);
         Some(status)
     }
 }

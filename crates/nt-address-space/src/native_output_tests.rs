@@ -20,6 +20,136 @@ const QUERY: VmBasicQueryOutput = VmBasicQueryOutput {
 };
 
 #[test]
+fn file_status_publication_stores_information_before_status_and_preserves_padding() {
+    for iosb in [0x1000, 0x1001] {
+        let mut memory = Memory::default();
+        memory.seed(iosb - 1, &[0xa5; 18]);
+        let status = 0x8000_0005;
+        let information = 0x1234_5678_9abc_def0;
+        assert_eq!(
+            publish_file_io_status(&mut memory, iosb, status, information),
+            Ok(())
+        );
+        assert_eq!(
+            memory.accesses,
+            vec![
+                Access::Store(iosb + 8, information.to_le_bytes().to_vec()),
+                Access::Store(iosb, status.to_le_bytes().to_vec()),
+            ]
+        );
+        for address in [iosb - 1, iosb + 4, iosb + 5, iosb + 6, iosb + 7, iosb + 16] {
+            assert_eq!(memory.bytes[&address], 0xa5);
+        }
+        for (offset, byte) in status.to_le_bytes().iter().enumerate() {
+            assert_eq!(memory.bytes[&(iosb + offset as u64)], *byte);
+        }
+        for (offset, byte) in information.to_le_bytes().iter().enumerate() {
+            assert_eq!(memory.bytes[&(iosb + 8 + offset as u64)], *byte);
+        }
+    }
+}
+
+#[test]
+fn failed_information_store_never_attempts_status_publication() {
+    let mut memory = Memory::default();
+    memory.seed(OLD, &[0xa5; 16]);
+    let before = memory.bytes.clone();
+    memory.fail_store = Some(1);
+    assert_eq!(
+        publish_file_io_status(&mut memory, OLD, 0, 42),
+        Err(STATUS_GUARD_PAGE_VIOLATION)
+    );
+    assert_eq!(
+        memory.accesses,
+        vec![Access::Store(OLD + 8, 42u64.to_le_bytes().to_vec())]
+    );
+    assert_eq!(memory.bytes, before);
+}
+
+#[test]
+fn failed_status_store_preserves_accepted_information_and_previous_status() {
+    let mut memory = Memory::default();
+    memory.seed(OLD, &[0xa5; 16]);
+    memory.seed(OLD, &0x103u32.to_le_bytes());
+    memory.fail_store = Some(2);
+    assert_eq!(
+        publish_file_io_status(&mut memory, OLD, 0, 42),
+        Err(STATUS_GUARD_PAGE_VIOLATION)
+    );
+    assert_eq!(
+        memory.accesses,
+        vec![
+            Access::Store(OLD + 8, 42u64.to_le_bytes().to_vec()),
+            Access::Store(OLD, 0u32.to_le_bytes().to_vec()),
+        ]
+    );
+    for (offset, byte) in 0x103u32.to_le_bytes().iter().enumerate() {
+        assert_eq!(memory.bytes[&(OLD + offset as u64)], *byte);
+    }
+    for address in OLD + 4..OLD + 8 {
+        assert_eq!(memory.bytes[&address], 0xa5);
+    }
+    for (offset, byte) in 42u64.to_le_bytes().iter().enumerate() {
+        assert_eq!(memory.bytes[&(OLD + 8 + offset as u64)], *byte);
+    }
+}
+
+#[test]
+fn file_status_address_overflow_fails_before_any_memory_access() {
+    for iosb in [u64::MAX, u64::MAX - 7, u64::MAX - 8, u64::MAX - 14] {
+        let mut memory = Memory::default();
+        assert_eq!(
+            publish_file_io_status(&mut memory, iosb, 0, 42),
+            Err(STATUS_ACCESS_VIOLATION)
+        );
+        assert!(memory.accesses.is_empty());
+        assert!(memory.bytes.is_empty());
+    }
+    // The backend decides whether a representable address range is actually accessible.
+    let mut memory = Memory::default();
+    assert_eq!(
+        publish_file_io_status(&mut memory, u64::MAX - 15, 0, 42),
+        Ok(())
+    );
+    assert_eq!(memory.stores, 2);
+}
+
+#[test]
+fn retrying_immutable_file_status_repeats_information_before_final_status() {
+    for failed_store in [1, 2] {
+        let mut memory = Memory::default();
+        memory.seed(OLD, &[0xa5; 16]);
+        memory.seed(OLD, &0x103u32.to_le_bytes());
+        memory.fail_store = Some(failed_store);
+        let status = 0x8000_0005;
+        let information = 0x1_0000_0001;
+        assert_eq!(
+            publish_file_io_status(&mut memory, OLD, status, information),
+            Err(STATUS_GUARD_PAGE_VIOLATION)
+        );
+        memory.fail_store = None;
+        memory.accesses.clear();
+        assert_eq!(
+            publish_file_io_status(&mut memory, OLD, status, information),
+            Ok(())
+        );
+        assert_eq!(
+            memory.accesses,
+            vec![
+                Access::Store(OLD + 8, information.to_le_bytes().to_vec()),
+                Access::Store(OLD, status.to_le_bytes().to_vec()),
+            ]
+        );
+        for (offset, byte) in status.to_le_bytes().iter().enumerate() {
+            assert_eq!(memory.bytes[&(OLD + offset as u64)], *byte);
+        }
+        for address in OLD + 4..OLD + 8 {
+            assert_eq!(memory.bytes[&address], 0xa5);
+        }
+    }
+}
+
+#[test]
 fn file_io_probes_unaligned_iosb_before_each_read_output_page_without_changing_bytes() {
     let mut memory = Memory::default();
     memory.seed(0xff9, &[0xa5; 16]);
