@@ -32324,6 +32324,54 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     lease is enabled, as do ordinary handle close and unpublished rollback. Native exclusion,
     exact CM storage binding and desktop acceptance remain open.
 
+    Retained inline local completion checkpoint (2026-09-10): migrate
+    the first complete native paths through the existing generation-exact pending-I/O owner.
+    - [x] Add immutable LocalInline terminal status/information, distinct from a provider IRP or
+      retained output payload. Enforce empty output geometry, reject pending/CREATE shapes, and
+      require the existing one-shot local reference-release acknowledgement before retirement.
+      Local correlations bypass provider matching, output copy, cancellation and backend ACK.
+    - [x] Migrate immediately granted/failed local byte-range locks and local directory-notify
+      registration failures. Both services reserve their owner and local request identity before
+      begin-I/O. Capture inline publication policy before parking; inline errors still suppress
+      IOSB/event/APC publication, while File signaling follows the original synchronous/event
+      policy. Park the caller even on asynchronous FILE_OBJECTs and return its real stored status,
+      never reissue the lock/registration or claim that an inline error became pending I/O.
+      Remove complete_terminal_local_file_io and its three destructive completion/release calls.
+    - [x] Retain the exact reply cap through rejected sends in shared pending-I/O redrive. A failed
+      send restores its claim without freeing the pool slot or reporting publication; an accepted
+      send commits publication before releasing the slot. A typed user-APC-staged acknowledgement
+      prevents context staging from repeating after a failed send. Teardown/extraction skips an
+      active claim until it settles. The native send is non-reentrant, and the audited rust-micro
+      decode_reply rejects an unbound reply before consuming it; no microkernel change was needed.
+    - [x] Complete serialized host and native validation. Twelve new core cases cover terminal
+      shape/reservation validation, provider/local separation, immutable results, every completion
+      and reference-release gate, abandonment, exact reply restoration, stale identities and
+      one-shot APC staging. Three real filesystem/lock/I/O Manager integration cases cover granted
+      locks, notification failures with inline-error surface suppression, original-event signal
+      policy, rejected reply sends, late reference retirement and consumer abandonment.
+
+    Validation: the corrected focused run passed 683 tests/doctests; the broader run passed 2,359,
+    including the additional all-local/provider separation case and nt-io-completion policy tests.
+    No tests were ignored. The final three integration tests were rerun successfully after making
+    lock release explicit before testing the retained FILE_OBJECT lifetime. Evidence:
+    .tmp/test-local-inline-focused-20260910.log, .tmp/test-local-inline-full-20260910.log and
+    .tmp/test-local-inline-integration-20260910.log. The initial new-test failure was an incorrect
+    empty-table assertion: a valid reservation deliberately keeps is_empty false even with zero
+    published records; the corrected test verifies both the empty record set and reusable claim.
+    The native executive release build passed in 37.06s with 294 warnings unchanged
+    (.tmp/build-local-inline-executive-20260910.log). Root serialized all runners. No VM run,
+    filesystem exclusion or desktop acceptance is claimed.
+
+    Review adjustment: reply-pool capacity is still preflighted, not separately reserved. This
+    slice extends preflight to all local lock/notify callers because an inline result owns a parked
+    reply even when the File is asynchronous. The existing post-preflight assertion remains; the
+    audited path does not dispatch another syscall or consume another reply slot before attachment.
+    The completed native paths retain signal, result, reply and final I/O reference across delivery
+    retries. READ/WRITE, directory-query and other inline File paths still need pre-dispatch owners
+    before their destructive completion/release calls can be removed. Ordinary handle close,
+    unpublished rollback, native filesystem exclusion and exact CM storage binding remain open.
+    No fresh desktop acceptance is implied by this host/native ownership checkpoint.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

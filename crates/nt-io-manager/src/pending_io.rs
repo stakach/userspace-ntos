@@ -20,6 +20,7 @@ pub const IO_DELIVERY_CREATE_COMMITTED: u16 = 1 << 9;
 pub const IO_DELIVERY_HANDLE_PUBLISHED: u16 = 1 << 10;
 pub const IO_DELIVERY_FILE_LOCK_RELEASED: u16 = 1 << 11;
 pub const IO_DELIVERY_LOCAL_REFERENCE_RELEASED: u16 = 1 << 12;
+pub const IO_DELIVERY_USER_APC_STAGED: u16 = 1 << 13;
 
 const IO_DELIVERY_PUBLIC_FLAGS: u16 = IO_DELIVERY_BUFFER_PUBLISHED
     | IO_DELIVERY_IOSB_PUBLISHED
@@ -79,6 +80,14 @@ pub struct PendingLocalDirectoryNotify {
     pub alertable: bool,
 }
 
+/// An already-terminal local operation whose output was handled inline. This owns completion
+/// delivery and the retained FILE_OBJECT reference, not a provider IRP or a replayable transfer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PendingLocalInline {
+    pub status: u32,
+    pub information: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PendingFileIoOperation {
     #[default]
@@ -87,6 +96,7 @@ pub enum PendingFileIoOperation {
     SetFileName(PendingSetFileNameOperation),
     LocalByteLock(PendingLocalByteLock),
     LocalDirectoryNotify(PendingLocalDirectoryNotify),
+    LocalInline(PendingLocalInline),
 }
 
 /// One pending File-bound operation and every completion surface owned by that exact IRP.
@@ -94,7 +104,8 @@ pub enum PendingFileIoOperation {
 pub struct PendingFileIo {
     /// Generation-protected I/O Manager File identity used for lifetime, cancellation, and signal.
     pub file_id: u64,
-    /// Generation-protected I/O Manager IRP identity used for terminal copy and acknowledgement.
+    /// Canonical provider IRP identity, or an exact local operation correlation for local variants.
+    /// Local correlations never authorize provider terminal copy, cancellation or acknowledgement.
     pub irp_id: u64,
     /// IRP major function used to reject a completion routed to the wrong syscall owner.
     pub major: u8,
@@ -147,6 +158,20 @@ pub struct PendingFileIo {
 }
 
 impl PendingFileIo {
+    fn reply_claim_in_flight(&self) -> bool {
+        self.delivery_state & (IO_DELIVERY_REPLY_CLAIMED | IO_DELIVERY_REPLY_PUBLISHED)
+            == IO_DELIVERY_REPLY_CLAIMED
+    }
+
+    pub const fn is_local(&self) -> bool {
+        matches!(
+            self.operation,
+            PendingFileIoOperation::LocalByteLock(_)
+                | PendingFileIoOperation::LocalDirectoryNotify(_)
+                | PendingFileIoOperation::LocalInline(_)
+        )
+    }
+
     /// The retained local result remains authoritative after filesystem bytes have been delivered
     /// or acknowledged. Provider-backed operations obtain terminal metadata from their own owner.
     pub fn local_terminal_result(&self) -> Option<(u32, u64)> {
@@ -154,6 +179,9 @@ impl PendingFileIo {
             PendingFileIoOperation::LocalByteLock(operation) => (operation.status, 0),
             PendingFileIoOperation::LocalDirectoryNotify(operation) => {
                 (operation.status, u64::from(operation.information))
+            }
+            PendingFileIoOperation::LocalInline(operation) => {
+                (operation.status, operation.information)
             }
             _ => return None,
         };
@@ -315,6 +343,14 @@ impl PendingFileIoTable {
                     && operation.information == 0
                     && pending.iosb_va != 0
                     && !pending.publish_iocp
+            }
+            PendingFileIoOperation::LocalInline(operation) => {
+                !crate::is_create_major(pending.major)
+                    && operation.status != nt_status::NtStatus::PENDING.raw() as u32
+                    && pending.output_va == 0
+                    && pending.output_len == 0
+                    && !pending.publish_iocp
+                    && pending.sync_lock_owner_tid == 0
             }
         };
         let control_valid = matches!(
@@ -537,7 +573,14 @@ impl PendingFileIoTable {
         irp_id: u64,
     ) -> Option<()> {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
-        if pending.irp_id != irp_id || !pending.user_apc_interrupt_requested {
+        if pending.irp_id != irp_id
+            || !pending.user_apc_interrupt_requested
+            || pending.delivery_state
+                & (IO_DELIVERY_USER_APC_STAGED
+                    | IO_DELIVERY_REPLY_CLAIMED
+                    | IO_DELIVERY_REPLY_PUBLISHED)
+                != 0
+        {
             return None;
         }
         pending.user_apc_interrupt_requested = false;
@@ -562,7 +605,8 @@ impl PendingFileIoTable {
                 }
                 _ => pending.file_id,
             };
-            pending.irp_id == irp_id
+            !pending.is_local()
+                && pending.irp_id == irp_id
                 && expected_file_id == file_id
                 && pending.tid == requestor_tid
                 && pending.major == major
@@ -801,11 +845,8 @@ impl PendingFileIoTable {
             pending.irp_id == irp_id
                 && pending.delivery_state & Self::required_delivery_state(pending)
                     == Self::required_delivery_state(pending)
-                && (!matches!(
-                    pending.operation,
-                    PendingFileIoOperation::LocalByteLock(_)
-                        | PendingFileIoOperation::LocalDirectoryNotify(_)
-                ) || pending.delivery_state & IO_DELIVERY_LOCAL_REFERENCE_RELEASED != 0)
+                && (!pending.is_local()
+                    || pending.delivery_state & IO_DELIVERY_LOCAL_REFERENCE_RELEASED != 0)
         }) {
             entry.take()
         } else {
@@ -839,6 +880,7 @@ impl PendingFileIoTable {
     ) -> Option<u32> {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id
+            || matches!(pending.operation, PendingFileIoOperation::LocalInline(_))
             || terminal_output_len > pending.output_len
             || pending.output_offset > terminal_output_len
         {
@@ -855,18 +897,61 @@ impl PendingFileIoTable {
         Some(next)
     }
 
-    /// Transfer synchronous reply ownership exactly once. `Some(None)` means it was already claimed.
+    /// Record the accepted user-APC redirect once before attempting its reply. A rejected reply
+    /// may restore its cap claim, but must not stage the user context a second time.
+    pub fn mark_user_apc_staged_exact(&mut self, slot: usize, irp_id: u64) -> Option<()> {
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        if pending.irp_id != irp_id
+            || !pending.user_apc_interrupt_requested
+            || !pending.reply_required
+            || pending.delivery_state
+                & (IO_DELIVERY_USER_APC_STAGED
+                    | IO_DELIVERY_REPLY_CLAIMED
+                    | IO_DELIVERY_REPLY_PUBLISHED)
+                != 0
+        {
+            return None;
+        }
+        pending.delivery_state |= IO_DELIVERY_USER_APC_STAGED;
+        Some(())
+    }
+
+    /// Claim synchronous reply execution exactly once. The stored cap retains exact identity
+    /// until publication; `Some(None)` means it was already claimed. Teardown skips active claims.
     pub fn claim_reply_cap_exact(&mut self, slot: usize, irp_id: u64) -> Option<Option<u64>> {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
-        if pending.irp_id != irp_id || !pending.reply_required {
+        if pending.irp_id != irp_id
+            || !pending.reply_required
+            || (pending.user_apc_interrupt_requested
+                && pending.delivery_state & IO_DELIVERY_USER_APC_STAGED == 0)
+        {
             return None;
         }
         if pending.delivery_state & IO_DELIVERY_REPLY_CLAIMED != 0 {
             return Some(None);
         }
-        let reply_cap = core::mem::replace(&mut pending.reply_cap, 0);
+        let reply_cap = pending.reply_cap;
+        if reply_cap == 0 {
+            return None;
+        }
         pending.delivery_state |= IO_DELIVERY_REPLY_CLAIMED;
         Some(Some(reply_cap))
+    }
+
+    /// Restore a claim only after a definitive rejected send. An uncertain send must remain
+    /// claimed: this method is not permission to replay a possibly accepted reply.
+    pub fn restore_reply_cap_exact(&mut self, slot: usize, irp_id: u64, cap: u64) -> Option<()> {
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        if pending.irp_id != irp_id
+            || !pending.reply_required
+            || cap == 0
+            || pending.reply_cap != cap
+            || !pending.reply_claim_in_flight()
+        {
+            return None;
+        }
+        pending.delivery_state &= !IO_DELIVERY_REPLY_CLAIMED;
+        Some(())
     }
 
     pub fn mark_reply_published_exact(&mut self, slot: usize, irp_id: u64) -> Option<u16> {
@@ -878,6 +963,7 @@ impl PendingFileIoTable {
             return None;
         }
         pending.delivery_state |= IO_DELIVERY_REPLY_PUBLISHED;
+        pending.reply_cap = 0;
         Some(pending.delivery_state)
     }
 
@@ -914,6 +1000,7 @@ impl PendingFileIoTable {
     /// Detach the dead thread's user-visible surfaces without retiring the exact IRP owner. The
     /// caller releases any transferred reply cap and requests cancellation; terminal redrive still
     /// owns backend ACK, Busy release, and the retained File reference.
+    /// An in-flight reply claim is retained untouched; teardown must retry after it is settled.
     pub fn abandon_thread_transfers_with<F>(&mut self, tid: u64, mut abandon: F) -> usize
     where
         F: FnMut(PendingFileIo),
@@ -922,6 +1009,7 @@ impl PendingFileIoTable {
         for pending in self.slots.iter_mut().flatten() {
             if pending.tid != tid
                 || pending.consumer_abandoned
+                || pending.reply_claim_in_flight()
                 || matches!(pending.operation, PendingFileIoOperation::Create(_))
             {
                 continue;
@@ -956,7 +1044,9 @@ impl PendingFileIoTable {
         let mut count = 0;
         for slot in self.slots.iter_mut() {
             if slot.is_some_and(|pending| {
-                pending.tid == tid && matches!(pending.operation, PendingFileIoOperation::Create(_))
+                pending.tid == tid
+                    && !pending.reply_claim_in_flight()
+                    && matches!(pending.operation, PendingFileIoOperation::Create(_))
             }) {
                 take(slot.take().unwrap());
                 count += 1;
@@ -967,13 +1057,14 @@ impl PendingFileIoTable {
 
     /// Remove every request owned by a terminating thread. The caller must release any reply cap,
     /// request cancellation/abandonment, and release the retained File reference.
+    /// Active reply claims are not transferred; the caller must retry their teardown later.
     pub fn take_thread_with<F>(&mut self, tid: u64, mut take: F) -> usize
     where
         F: FnMut(PendingFileIo),
     {
         let mut count = 0;
         for slot in self.slots.iter_mut() {
-            if slot.is_some_and(|pending| pending.tid == tid) {
+            if slot.is_some_and(|pending| pending.tid == tid && !pending.reply_claim_in_flight()) {
                 let pending = slot.take().unwrap();
                 take(pending);
                 count += 1;
@@ -986,6 +1077,10 @@ impl PendingFileIoTable {
 #[cfg(test)]
 #[path = "pending_io/local_delivery_tests.rs"]
 mod local_delivery_tests;
+
+#[cfg(test)]
+#[path = "pending_io/local_inline_tests.rs"]
+mod local_inline_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1476,7 +1571,7 @@ mod tests {
         let slot = table.park(pending(1, 2, 7)).unwrap();
         assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
         assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(None));
-        assert_eq!(table.get(slot).unwrap().reply_cap, 0);
+        assert_eq!(table.get(slot).unwrap().reply_cap, 0x50);
     }
 
     #[test]

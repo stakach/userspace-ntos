@@ -14147,6 +14147,7 @@ impl ExecNtHandler {
                     let _ =
                         self.cancel_local_directory_notify(pending.file_id, operation.notify_id);
                 }
+                nt_io_manager::PendingFileIoOperation::LocalInline(_) => {}
                 _ => {
                     let _ = driver_launch::cancel_irp_if_pending(pending.irp_id);
                 }
@@ -14460,7 +14461,7 @@ impl ExecNtHandler {
                     .unwrap_or(true)
             });
         if !self.reserve_pending_file_io_owner()
-            || (synchronous
+            || ((synchronous || local_route.is_some())
                 && (REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free()))
         {
             return STATUS_INSUFFICIENT_RESOURCES;
@@ -14498,7 +14499,9 @@ impl ExecNtHandler {
             let notify_id = match registration {
                 Ok(id) => id,
                 Err(status) => {
-                    self.complete_terminal_local_file_io(
+                    self.stage_terminal_local_file_io(
+                        request_id,
+                        major::IRP_MJ_DIRECTORY_CONTROL,
                         file_object,
                         synchronous,
                         event_obj_idx,
@@ -14508,10 +14511,9 @@ impl ExecNtHandler {
                         iosb,
                         status,
                         0,
-                        true,
                         completion_port_suppressed,
                     );
-                    return status;
+                    return STATUS_PENDING;
                 }
             };
             self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
@@ -14723,7 +14725,7 @@ impl ExecNtHandler {
                     .unwrap_or(true)
             });
         if !self.reserve_pending_file_io_owner()
-            || (synchronous
+            || ((synchronous || local_route.is_some())
                 && (REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free()))
         {
             return STATUS_INSUFFICIENT_RESOURCES;
@@ -14746,7 +14748,9 @@ impl ExecNtHandler {
                 .lock(request, fail_immediately, request_id)
             {
                 nt_fs::ByteRangeLockResult::Granted => {
-                    self.complete_terminal_local_file_io(
+                    self.stage_terminal_local_file_io(
+                        request_id,
+                        major::IRP_MJ_LOCK_CONTROL,
                         route.file_object,
                         synchronous,
                         event_obj_idx,
@@ -14756,13 +14760,14 @@ impl ExecNtHandler {
                         iosb,
                         nt_fs::STATUS_SUCCESS,
                         0,
-                        true,
                         completion_port_suppressed,
                     );
-                    nt_fs::STATUS_SUCCESS
+                    STATUS_PENDING
                 }
                 nt_fs::ByteRangeLockResult::Failed(status) => {
-                    self.complete_terminal_local_file_io(
+                    self.stage_terminal_local_file_io(
+                        request_id,
+                        major::IRP_MJ_LOCK_CONTROL,
                         route.file_object,
                         synchronous,
                         event_obj_idx,
@@ -14772,10 +14777,9 @@ impl ExecNtHandler {
                         iosb,
                         status,
                         0,
-                        true,
                         completion_port_suppressed,
                     );
-                    status
+                    STATUS_PENDING
                 }
                 nt_fs::ByteRangeLockResult::Pending(wait_id) => {
                     self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
@@ -29359,8 +29363,10 @@ impl ExecNtHandler {
         }
     }
 
-    fn complete_terminal_local_file_io(
+    fn stage_terminal_local_file_io(
         &mut self,
+        request_id: u64,
+        major: u8,
         file_object: u64,
         synchronous: bool,
         event_obj_idx: u64,
@@ -29370,22 +29376,33 @@ impl ExecNtHandler {
         iosb: u64,
         status: u32,
         information: u64,
-        completed_inline: bool,
         completion_port_suppressed: bool,
     ) {
-        self.complete_terminal_file_io(
-            0,
-            event_obj_idx,
+        // Delivery may wait, but its original inline completion policy must not change.
+        let publish = nt_io_completion::file_io_status_publishes_completion(status, true);
+        assert!(self.pending_file_io_transfer.is_none());
+        assert!(self.pending_file_io_reservation.is_some());
+        self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+            file_id: file_object,
+            irp_id: request_id,
+            major,
+            operation: nt_io_manager::PendingFileIoOperation::LocalInline(
+                nt_io_manager::PendingLocalInline { status, information },
+            ),
+            pi: self.pi as u32,
             tid,
-            apc_routine,
+            badge: self.current_badge,
+            iosb_va: if publish { iosb } else { 0 },
+            apc_routine: if publish { apc_routine } else { 0 },
             apc_context,
-            iosb,
-            status,
-            information,
-            completed_inline,
             completion_port_suppressed,
-        );
-        self.finish_local_file_io(file_object, synchronous, event_obj_idx);
+            signal_file: synchronous || event_obj_idx == u64::MAX,
+            event_obj_idx: if publish { event_obj_idx } else { u64::MAX },
+            ..nt_io_manager::PendingFileIo::default()
+        });
+        // Even an asynchronous FILE_OBJECT completed inline: return its real terminal status
+        // through this request's parked reply, not a fabricated asynchronous operation result.
+        self.pending_file_io_wait = true;
     }
 
     unsafe fn local_directory_notify_route_for(

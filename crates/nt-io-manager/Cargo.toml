@@ -24,6 +24,7 @@ bitflags = { workspace = true }
 
 [dev-dependencies]
 nt-fs = { workspace = true }
+nt-io-completion = { workspace = true }
 proptest = "1"
 
 [lints.clippy]

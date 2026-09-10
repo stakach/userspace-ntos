@@ -24302,6 +24302,7 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
         return false;
     };
     let alertable = match pending.operation {
+        nt_io_manager::PendingFileIoOperation::LocalInline(_) => false,
         nt_io_manager::PendingFileIoOperation::LocalByteLock(operation) => operation.alertable,
         nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
             operation.alertable
@@ -24331,6 +24332,7 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
         .expect("APC interruption candidate lost its exact pending File owner");
 
     let cancellation = match pending.operation {
+        nt_io_manager::PendingFileIoOperation::LocalInline(_) => Ok(false),
         nt_io_manager::PendingFileIoOperation::LocalByteLock(operation) => {
             let cancelled = nt_handler.cancel_local_byte_lock_wait(operation.wait_id);
             if cancelled {
@@ -25158,9 +25160,13 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         } else {
             None
         };
-        let mut completed = driver_launch::completed_irp_exact(pending.irp_id);
+        let mut completed = if pending.is_local() {
+            None
+        } else {
+            driver_launch::completed_irp_exact(pending.irp_id)
+        };
         if completed.is_none() && transaction_terminal.is_none() && local_terminal.is_none() {
-            if driver_launch::completed_irp_copy_requires_retry(pending.irp_id) {
+            if !pending.is_local() && driver_launch::completed_irp_copy_requires_retry(pending.irp_id) {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
             }
             continue;
@@ -25176,14 +25182,16 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 panic!("pending File completion identity mismatch");
             }
         }
-        let is_pipe_transceive = pending.major == nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
+        let is_pipe_transceive = !pending.is_local()
+            && pending.major == nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
             && pending.control_code == crate::exec_handler::FSCTL_PIPE_TRANSCEIVE;
-        let is_pipe_listen = pending.major == nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
+        let is_pipe_listen = !pending.is_local()
+            && pending.major == nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
             && pending.control_code == crate::exec_handler::FSCTL_PIPE_LISTEN;
         let pipe_listen_server_context = is_pipe_listen
             .then(|| driver_launch::hosted_file_route(pending.file_id).map(|(_, context)| context))
             .flatten();
-        if nt_handler.hosted_file_is_named_pipe(pending.file_id)
+        if !pending.is_local() && nt_handler.hosted_file_is_named_pipe(pending.file_id)
             && (matches!(
                 pending.major,
                 nt_io_abi::major::IRP_MJ_READ | nt_io_abi::major::IRP_MJ_WRITE
@@ -25650,6 +25658,9 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 let chunk = ((delivery_len - offset) as usize).min(4096);
                 let work = &mut *core::ptr::addr_of_mut!(FILE_IO_COPY_WORK);
                 let copy_result = match pending.operation {
+                    nt_io_manager::PendingFileIoOperation::LocalInline(_) => {
+                        Err(nt_fs::STATUS_INVALID_PARAMETER)
+                    }
                     nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
                         nt_handler.copy_local_directory_notify_completion(
                             pending.file_id, operation.notify_id, pending.irp_id,
@@ -25751,12 +25762,10 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 .expect("pending File event owner disappeared");
         }
         if pending.signal_file && delivery_state & nt_io_manager::IO_DELIVERY_FILE_PUBLISHED == 0 {
-            let status = match pending.operation {
-                nt_io_manager::PendingFileIoOperation::LocalByteLock(_)
-                | nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(_) => {
-                    nt_handler.signal_local_file_completion(pending.file_id)
-                }
-                _ => nt_handler.signal_file_completion(pending.file_id, terminal_status),
+            let status = if pending.is_local() {
+                nt_handler.signal_local_file_completion(pending.file_id)
+            } else {
+                nt_handler.signal_file_completion(pending.file_id, terminal_status)
             };
             if status != nt_fs::STATUS_SUCCESS {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
@@ -25843,26 +25852,39 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             && delivery_state & nt_io_manager::IO_DELIVERY_REPLY_PUBLISHED == 0
         {
             if pending.user_apc_interrupt_requested
-                && nt_handler.stage_current_user_apc(terminal_status) != Ok(true)
+                && delivery_state & nt_io_manager::IO_DELIVERY_USER_APC_STAGED == 0
             {
-                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                restore_file_io_mirrors!();
-                continue;
+                if nt_handler.stage_current_user_apc(terminal_status) != Ok(true) {
+                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                    restore_file_io_mirrors!();
+                    continue;
+                }
+                (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                    .mark_user_apc_staged_exact(slot, pending.irp_id)
+                    .expect("staged File user APC lost its reply owner");
             }
             let cap = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                 .claim_reply_cap_exact(slot, pending.irp_id)
                 .expect("pending File reply owner disappeared")
                 .expect("pending File reply cap was claimed without publication");
-            if pending.user_apc_interrupt_requested {
-                let _ = client_reply_on(cap, 0, 0, 0, 0, 0);
+            let replied = if pending.user_apc_interrupt_requested {
+                client_reply_on(cap, 0, 0, 0, 0, 0)
             } else {
-                let _ = reply_parked_syscall(cap, terminal_status as u64);
+                reply_parked_syscall(cap, terminal_status as u64)
+            };
+            if !replied {
+                (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                    .restore_reply_cap_exact(slot, pending.irp_id, cap)
+                    .expect("failed File reply lost its exact capability owner");
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
             }
-            release_reply_pool_cap(cap);
-            thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
             (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                 .mark_reply_published_exact(slot, pending.irp_id)
                 .expect("pending File reply publication owner disappeared");
+            release_reply_pool_cap(cap);
+            thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
         }
 
         if !(&*core::ptr::addr_of!(PENDING_FILE_IO))
@@ -25889,9 +25911,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 .mark_backend_acked_exact(slot, pending.irp_id)
                 .expect("ACKed pending File owner disappeared");
         }
-        if matches!(pending.operation,
-            nt_io_manager::PendingFileIoOperation::LocalByteLock(_)
-                | nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(_))
+        if pending.is_local()
             && delivery_state & nt_io_manager::IO_DELIVERY_LOCAL_REFERENCE_RELEASED == 0
         {
             if nt_handler.try_release_local_file_io_reference(pending.file_id).is_err() {
@@ -25932,7 +25952,8 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 nt_handler.release_file_reference(finished.file_id);
             }
             nt_io_manager::PendingFileIoOperation::LocalByteLock(_)
-            | nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(_) => {}
+            | nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(_)
+            | nt_io_manager::PendingFileIoOperation::LocalInline(_) => {}
         }
         delivered += 1;
         let trace_completion = FILE_IO_COMPLETION_TRACE.fetch_add(1, Ordering::Relaxed) < 32
