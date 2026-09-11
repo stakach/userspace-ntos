@@ -24214,7 +24214,7 @@ unsafe fn stage_parked_thread_user_apc(
 
 /// Interrupt one exact alertable dispatcher-object wait after an APC is queued to its owner.
 unsafe fn reconcile_user_apc_object_wait(nt_handler: &mut ExecNtHandler, tid: u64) -> bool {
-    let Some((slot, record)) = object_waiter_alertable_for_tid(tid) else {
+    let Some((identity, record)) = object_waiter_alertable_for_tid(tid) else {
         return false;
     };
     let Ok(target_tid) = nt_process::ThreadId::try_from(tid) else {
@@ -24234,7 +24234,7 @@ unsafe fn reconcile_user_apc_object_wait(nt_handler: &mut ExecNtHandler, tid: u6
         return false;
     }
 
-    let removed = object_waiter_take_exact(slot, record.tid, record.reply_cap)
+    let removed = object_waiter_take_exact(identity)
         .expect("staged object-wait APC lost its exact waiter");
     release_wait_object_references(nt_handler, removed);
     let _ = client_reply_on(removed.reply_cap, 0, 0, 0, 0, 0);

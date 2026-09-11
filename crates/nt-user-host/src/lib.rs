@@ -11,6 +11,7 @@
 extern crate alloc;
 
 pub mod commit_release;
+pub mod object_wait;
 
 mod mechanism;
 mod ntdll;

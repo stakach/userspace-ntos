@@ -33192,6 +33192,42 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Partial frame copy or changed register/FP state does not consume the queued APC or authorize
     register installation. The next checked attempt regenerates its frame from current state.
 
+    Ordinary object-wait ownership prerequisite (2026-09-11, implemented and host/build verified):
+    - [x] Replace the native slot-only table with host-testable nt-user-host object-wait storage.
+      Exact identities include a move-stable table identity, slot and never-reused generation.
+      Payload values, including a cleared Reply field, cannot make an owned row vacant. Failed
+      insertion returns the original payload; reset and initial reserve refuse outstanding owners.
+    - [x] Move native waiter records and accessors out of main.rs into object_wait.rs. Signal,
+      timeout, APC and teardown removal now carry the captured exact identity; no slot-only clear
+      or slot/TID/Reply reconstruction remains. Keep cross-source dispatcher FIFO sequence,
+      WaitAny result indices, WaitAll behavior, tagged deadlines and reference order unchanged.
+      Remove the exact completed row before releasing its reference set so cleanup reentry cannot
+      rediscover that row or clear a replacement inserted into its slot.
+    - [x] Complete serialized object-wait contract, focused/broad regressions and executive build.
+      All 11 new storage unit tests, 1,223 focused host/doc tests and 3,440 broad host/doc tests
+      passed, with no failures or ignored cases. Coverage includes stale/foreign identity
+      rejection, table moves/reset, zero-Reply payload ownership, checked identity exhaustion,
+      non-Copy payload preservation and a non-clone table compile-fail check. The executive
+      release build passed in 36.94s with the unchanged 294 warnings. Evidence:
+      `.tmp/test-object-wait-identity-contract-20260911.log`,
+      `.tmp/test-object-wait-identity-focused-20260911.log`,
+      `.tmp/test-object-wait-identity-full-20260911.log`, and
+      `.tmp/build-object-wait-identity-executive-20260911.log`. All runners were serialized.
+      Independent native review found no new issue in this scoped extraction. This is storage
+      and build evidence, not native Reply-failure injection or desktop acceptance.
+
+    Review adjustment: ordinary APC conversion cannot safely change reconcile_user_apc_object_wait
+    alone. Normal signal selection consumes dispatcher state before publication, the next scan
+    clears pending wake markers, timeout and teardown destructively retire rows, and reference
+    release can enter object/File/provider cleanup. Exact storage fixes stale-row aliasing but
+    deliberately does not claim those effects are retained or that an APC is already safely staged.
+    Next, add an exclusive same-row interruption state before frame copyout, refuse it after a
+    signal selection has committed, and exclude owned interruption rows from signal/deadline scans.
+    Retain per-reference release progress, original caller/APC claims, explicit native transport,
+    checked staging/send/cap-retirement receipts and teardown/runtime guards. Ordinary signal and
+    timeout send failures and teardown delete/retype failures also need retained effect ownership;
+    generation checks alone are not completion evidence.
+
     Ordinary object waits and general pending-IRP APC paths still use older staging/delivery
     adapters and need separate cutovers; inline terminal Busy/reference failure retention also
     remains open. No VM run or microkernel change occurred; the last measured 27 strict missing
