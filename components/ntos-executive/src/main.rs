@@ -46,6 +46,10 @@ mod thread_context;
 mod thread_suspend;
 mod object_wait;
 use object_wait::*;
+mod object_wait_apc;
+mod parked_reply;
+mod user_apc;
+mod ipc_message;
 mod executive_va;
 mod fs_loader;
 mod mounted_volume;
@@ -17440,11 +17444,13 @@ unsafe fn wait_park(
 }
 
 unsafe fn wait_cancel_thread(handler: &mut ExecNtHandler, tid: u64) {
+    object_wait_apc::request_thread(handler, tid);
+    object_wait_apc::redrive(handler);
     for slot in 0..object_waiter_len() {
         let Some((identity, record)) = object_waiter_record(slot) else {
             continue;
         };
-        if record.tid != tid {
+        if record.tid != tid || object_waiter_is_claimed(identity) {
             continue;
         }
         let cap = record.reply_cap;
@@ -18301,8 +18307,12 @@ unsafe fn terminate_hosted_thread_mechanism(
         Some(_) => return false,
     };
     crate::service_sec_image::synchronous_file_cancellation::request_thread(handler, tid);
+    object_wait_apc::request_thread(handler, tid);
     crate::service_sec_image::synchronous_file_cancellation::redrive(handler);
-    if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_runtime_dependency_for_thread(tid) {
+    object_wait_apc::redrive(handler);
+    if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_runtime_dependency_for_thread(tid)
+        || object_wait_apc::has_thread(tid)
+    {
         return false;
     }
     // A provider-side KeWait owns both the component rendezvous and this thread's native reply.
@@ -18339,6 +18349,7 @@ unsafe fn terminate_hosted_thread_mechanism(
     if handler.hosted_thread_tcb(tid) != Some(tcb)
         || handler.pm.has_thread_suspend_control(tid as nt_process::ThreadId)
         || (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_runtime_dependency_for_thread(tid)
+        || object_wait_apc::has_thread(tid)
     {
         return false;
     }
@@ -18412,14 +18423,17 @@ unsafe fn terminate_hosted_process_mechanisms(
         for tid in process.threads.iter().copied().map(u64::from) {
             if preserve_tid != Some(tid) {
                 crate::service_sec_image::synchronous_file_cancellation::request_thread(handler, tid);
+                object_wait_apc::request_thread(handler, tid);
             }
         }
     }
     crate::service_sec_image::synchronous_file_cancellation::redrive(handler);
+    object_wait_apc::redrive(handler);
     if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS))
         .has_runtime_dependency_matching(|waiter| {
             waiter.pi == u32::from(process_index) && preserve_tid != Some(waiter.tid)
         })
+        || object_wait_apc::has_process(process_index as usize, preserve_tid)
     {
         return 0;
     }
@@ -18559,6 +18573,7 @@ unsafe fn wait_park_multi(
         handler.current_resume_ip,
         handler.current_sp,
         handler.current_flags,
+        handler.current_native_call_transport,
         deadline,
     )) {
         for index in (0..objects.len()).rev() {
@@ -18738,7 +18753,8 @@ unsafe fn wait_wake_dispatcher(
     handler: &mut ExecNtHandler,
     pulse_event: Option<usize>,
 ) -> DispatcherWakeResult {
-    object_waiter_clear_pending_wakes();
+    // Selected results already consumed dispatcher state. Preserve them across cleanup reentry;
+    // only unselected records participate in another arbitration pass.
     let mut sequence = 0;
     while let Some((identity, record)) = object_waiter_next_after_sequence(sequence) {
         sequence = record.sequence;
@@ -18859,7 +18875,10 @@ unsafe fn wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
         let Some((identity, record)) = object_waiter_record(slot) else {
             continue;
         };
-        if !record.deadline.is_due(now) {
+        if object_waiter_is_claimed(identity)
+            || record.pending_wake_index != u64::MAX
+            || !record.deadline.is_due(now)
+        {
             continue;
         }
         let cap = record.reply_cap;

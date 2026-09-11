@@ -10556,9 +10556,9 @@ impl ExecNtHandler {
     ) -> Option<HostedThreadRuntime> {
         if unsafe {
             let waiters = &*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS);
-            // Cancellation retains captured File ownership and its pool slot independently of
-            // this runtime. Only active retry/ingress effects still require the target thread.
-            waiters.has_runtime_dependency_for_thread(tid)
+            // Converted teardown retains references and pool ownership independently. Active
+            // retry/ingress and APC context effects still require the original target thread.
+            waiters.has_runtime_dependency_for_thread(tid) || crate::object_wait_apc::has_thread(tid)
         }
         {
             return None;
@@ -14222,6 +14222,9 @@ impl ExecNtHandler {
     }
 
     pub(crate) unsafe fn cancel_file_io_for_thread_teardown(&mut self, tid: u64) -> usize {
+        // APC interruption may be inside a reference cleanup or checked context copyout. Publish
+        // teardown intent before any File abandonment can reenter, without stealing its owner.
+        crate::object_wait_apc::request_thread(self, tid);
         self.abandon_pending_file_io_for_thread(tid)
             + self.abandon_synchronous_file_waiters_for_thread(tid)
             + self.abandon_file_irp_drain_waiters_for_thread(tid)

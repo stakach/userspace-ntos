@@ -33228,10 +33228,61 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     timeout send failures and teardown delete/retype failures also need retained effect ownership;
     generation checks alone are not completion evidence.
 
-    Ordinary object waits and general pending-IRP APC paths still use older staging/delivery
-    adapters and need separate cutovers; inline terminal Busy/reference failure retention also
-    remains open. No VM run or microkernel change occurred; the last measured 27 strict missing
-    win32k imports and genuine desktop acceptance remain open.
+    Ordinary object-wait APC interruption (2026-09-11, implemented and host/build verified;
+    native runtime acceptance remains open):
+    - [x] Attach exclusive interruption control to the original generation-safe wait row before
+      any frame copyout or reference effect. Retain native caller/APC provenance separately, without
+      duplicating the row's object references or Reply ownership. Refuse takeover after dispatcher
+      wake selection and exclude claimed rows from signal arbitration, timeout, second APC and
+      legacy cancellation. Ordinary mutation/extraction remains forbidden through final retirement.
+      Preserve already-selected dispatcher results across nested scans instead of clearing them;
+      selection consumes state once and remains ineligible for APC takeover until exact removal.
+    - [x] Release retained wait references in reverse order with exact non-clone invocation tickets.
+      Give File-reference release and its checked IOCP followup separate receipts, so retrying a
+      followup never repeats the canonical decrement. Entered/uncertain effects cannot replay.
+    - [x] Capture native Call versus fault continuation at park. Share checked APC frame preparation
+      with File acquisition: original caller identity, real register/FP snapshot, explicit-process
+      copyout, post-copy state comparison and final queue-claim validation before checked register
+      installation and exact APC consumption. Remove the old object-wait mirror-swapping stage and
+      destructive immediate-return adapter. Retain Stage/Send/accepted-send pool-retirement effects.
+    - [x] Publish teardown intent before callouts; retain entered/uncertain Stage/Send runtime
+      dependencies. Once teardown is definitely selected, captured references/cap/queue cleanup can
+      outlive the target runtime. An acknowledged send still retires its pool slot without delete
+      or retype. Late teardown completion never marks a replacement thread Ready. Keep guards at
+      ingress, physical thread/process teardown and runtime release.
+    - [x] Redrive refused effects at the service-loop finalization boundary, including timer-only
+      activity. Preserve the complete 128-word root IPC buffer around each object/File cancellation
+      drive; checked context operations otherwise overwrite an incoming syscall's uncaptured MR
+      arguments. Nested snapshots restore in stack order. Share checked parked-Reply mechanisms
+      between File and object wait adapters and report the retained effect/index on failure.
+    - [x] Complete serialized contracts, composed host regressions and executive release build.
+      All 22 object-wait storage/protocol unit tests, 1,909 focused host/doc tests and 3,457 broad
+      host/doc tests passed, with no failures or ignored cases. Coverage adds 11 retained-protocol
+      unit tests, five composed File/IOCP/APC/context tests and a non-clone invocation compile-fail
+      check. The executive release build passed in 36.90s with the unchanged 294 warnings. Evidence:
+      `.tmp/test-object-wait-apc-contract-20260911.log`,
+      `.tmp/test-object-wait-apc-focused-20260911.log`,
+      `.tmp/test-object-wait-apc-full-20260911.log`, and
+      `.tmp/build-object-wait-apc-executive-20260911.log`. All runners were serialized. Composed
+      tests use real File/IOCP policy, PM APC claims and the context builder, but explicit host
+      fixtures for memory/TCB/Reply outcomes; they are not native capability or desktop proof.
+      Independent native reviews covered IPC preservation, late teardown, reference followups,
+      and persistent signal selection, including signal precedence over nested timeout delivery.
+
+    Review: unconditional runtime pinning would make a transient teardown retype/reference failure
+    block the one-shot physical teardown forever. Converted effects now retain their own captured
+    ownership independently; only work that still needs the original user execution context keeps
+    the runtime exclusion. Host tests must distinguish these cases, including an ACKed send racing
+    teardown. A failed send remains uncertain, never fabricated as success or automatically replayed.
+    The IPC snapshot protects active ingress even when deferred APC work runs before argument
+    normalization. No extra driver instance, thread serialization fallback or APC payload stub is
+    introduced.
+
+    General pending-IRP/current-thread APC paths still use older staging/delivery adapters and need
+    separate cutovers. Ordinary signal/timeout Reply failures, non-APC object-wait teardown and
+    inline terminal Busy/reference failure retention also remain open. No VM run or microkernel
+    change occurred; the last measured 27 strict missing win32k imports and genuine desktop
+    acceptance remain open.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

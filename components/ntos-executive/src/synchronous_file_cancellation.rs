@@ -76,37 +76,13 @@ unsafe fn cancel_policy(
     }
 }
 
-pub(super) unsafe fn saved_reply_pool_index(cap: u64) -> Result<usize, u32> {
-    if cap == 0 || cap == REPLY_MAIN_SLOT.load(Ordering::Relaxed) {
-        return Err(nt_fs::STATUS_INVALID_HANDLE);
-    }
-    wait_reply_pool_ref()
-        .iter()
-        .position(|record| record.cap == cap && record.used)
-        .ok_or(nt_fs::STATUS_INVALID_HANDLE)
-}
-
 unsafe fn revoke_reply(cap: u64) -> Result<Receipt, u32> {
-    saved_reply_pool_index(cap)?;
-    // Delete the final owned cap, not just its descendants. Reply deletion validates before
-    // mutation; a rejected invocation leaves the old binding and this effect owned for retry.
-    if cnode_delete_r(cap) != 0 {
-        return Err(nt_status::NtStatus::UNSUCCESSFUL.raw() as u32);
-    }
+    crate::parked_reply::revoke(cap)?;
     Ok(Receipt::ReplyRevoked)
 }
 
 unsafe fn retire_reply_cap(cap: u64) -> Result<Receipt, u32> {
-    let index = saved_reply_pool_index(cap)?;
-    // The slot stays pool-owned while empty. A failed retype must never repeat Reply deletion.
-    if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap) != 0 {
-        return Err(nt_fs::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    // No callback, allocation, or IPC separates successful retype, pool publication and receipt.
-    let record = &mut wait_reply_pool_mut()[index];
-    assert_eq!(record.cap, cap);
-    assert!(record.used);
-    record.used = false;
+    crate::parked_reply::retype(cap)?;
     Ok(Receipt::ReplyCapRetired)
 }
 
@@ -116,6 +92,7 @@ pub(crate) unsafe fn drive(
     nt_handler: &mut ExecNtHandler,
     identity: SynchronousFileCancelIdentity,
 ) -> bool {
+    let _message = crate::ipc_message::SavedMessageBuffer::capture();
     // Seven effects at most (including reference followup/APC return), then owner removal.
     for _ in 0..8 {
         let (waiter, phase) = {

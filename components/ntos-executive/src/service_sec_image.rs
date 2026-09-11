@@ -3391,9 +3391,10 @@ pub(crate) fn service_dll_pe_store_stats() -> DllPeStoreStats {
 
 /// Complete service-loop durability work before replying or receiving the next caller.
 ///
-/// The allocator retains live storage through ownership and `Drop`; this boundary exists only for
-/// state whose user-visible success requires publishing a writable-filesystem checkpoint.
+/// This boundary also progresses retained wait effects on timer-only activity, when no new user
+/// syscall can arrive to drive a failed context write or capability retirement.
 fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
+    unsafe { crate::object_wait_apc::redrive(nt_handler) };
     // Object Manager references can reach zero in handle, wait, debug, LPC, or teardown paths. The
     // serialized ownership barrier is the single convergence point for exact-generation final
     // process deletion; individual release sites may still make an eager attempt for low latency.
@@ -10799,6 +10800,7 @@ pub(crate) unsafe fn service_sec_image(
                 waiters.has_retry_delivery_for_thread(current_tid)
                     || waiters.has_cancellation_for_thread(current_tid)
                     || waiters.has_ingress_for_thread(current_tid)
+                    || crate::object_wait_apc::has_thread(current_tid)
             }
             {
                 // An uncertain earlier retry is not a fresh File acquisition. Reject only this
@@ -10809,6 +10811,7 @@ pub(crate) unsafe fn service_sec_image(
                 // Once this request has been refused, its IPC words are no longer needed.
                 // Progress retained cancellation even when rejected ingress is the only activity.
                 synchronous_file_cancellation::redrive(&mut nt_handler);
+                crate::object_wait_apc::redrive(&mut nt_handler);
                 let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
                 badge = nb;
@@ -24145,103 +24148,6 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     true
 }
 
-/// Temporarily select a parked hosted thread's address-space mirrors and stage one queued user APC
-/// in its saved user context. The service loop is serialized, so restoring this complete context
-/// before publishing the wake keeps the current caller isolated from the target.
-unsafe fn stage_parked_thread_user_apc(
-    nt_handler: &mut ExecNtHandler,
-    pi: usize,
-    badge: u64,
-    tid: u64,
-    resume_ip: u64,
-    resume_sp: u64,
-    resume_flags: u64,
-) -> bool {
-    const STATUS_USER_APC: u32 = 0x0000_00C0;
-    if pi >= MAX_PI {
-        return false;
-    }
-
-    let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
-    let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
-    let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
-    let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
-    let saved_w32_client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
-    let saved_pi = nt_handler.pi;
-    let saved_tid = nt_handler.current_tid;
-    let saved_badge = nt_handler.current_badge;
-    let saved_resume_ip = nt_handler.current_resume_ip;
-    let saved_sp = nt_handler.current_sp;
-    let saved_flags = nt_handler.current_flags;
-    let saved_ctx = nt_handler.loop_ctx;
-
-    let (sb, ss, smv, hmv, scratch_base) = mirror_ctx_for(badge, pi);
-    ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
-    ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
-    ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
-    ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
-    ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
-    W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
-    nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(pi));
-    nt_handler.pi = pi;
-    nt_handler.current_tid = tid;
-    nt_handler.current_badge = badge;
-    nt_handler.current_resume_ip = resume_ip;
-    nt_handler.current_sp = resume_sp;
-    nt_handler.current_flags = resume_flags;
-
-    let staged = nt_handler.stage_current_user_apc(STATUS_USER_APC) == Ok(true);
-
-    ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
-    ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
-    ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
-    ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
-    W32_CLIENT_PI.store(saved_w32_client_pi, Ordering::Relaxed);
-    nt_handler.pi = saved_pi;
-    nt_handler.current_tid = saved_tid;
-    nt_handler.current_badge = saved_badge;
-    nt_handler.current_resume_ip = saved_resume_ip;
-    nt_handler.current_sp = saved_sp;
-    nt_handler.current_flags = saved_flags;
-    nt_handler.loop_ctx = saved_ctx;
-    staged
-}
-
-/// Interrupt one exact alertable dispatcher-object wait after an APC is queued to its owner.
-unsafe fn reconcile_user_apc_object_wait(nt_handler: &mut ExecNtHandler, tid: u64) -> bool {
-    let Some((identity, record)) = object_waiter_alertable_for_tid(tid) else {
-        return false;
-    };
-    let Ok(target_tid) = nt_process::ThreadId::try_from(tid) else {
-        return false;
-    };
-    if nt_handler.pm.peek_user_apc(target_tid).is_none()
-        || !stage_parked_thread_user_apc(
-            nt_handler,
-            record.pi,
-            record.badge,
-            record.tid,
-            record.resume_ip,
-            record.resume_sp,
-            record.resume_flags,
-        )
-    {
-        return false;
-    }
-
-    let removed = object_waiter_take_exact(identity)
-        .expect("staged object-wait APC lost its exact waiter");
-    release_wait_object_references(nt_handler, removed);
-    let _ = client_reply_on(removed.reply_cap, 0, 0, 0, 0, 0);
-    release_reply_pool_cap(removed.reply_cap);
-    thread_wait_state_clear_badge_ready(nt_handler, removed.badge);
-    true
-}
 
 /// Redirect one alertable pre-dispatch File acquisition waiter when its target
 /// thread has a queued user APC.
@@ -24337,11 +24243,11 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
     }
 }
 
-/// Reconcile every alertable wait class that can own a hosted thread continuation. Object waits
-/// are removed immediately; in-flight File I/O first requests cancellation and stays owned until
-/// its real terminal completion wins the race.
+/// Reconcile every alertable wait class that can own a hosted thread continuation. Object/File
+/// acquisition interruptions retain their exact owners through APC effects; in-flight I/O first
+/// requests cancellation and stays owned until its real terminal completion wins the race.
 pub(crate) unsafe fn reconcile_user_apc_waits(nt_handler: &mut ExecNtHandler, tid: u64) -> bool {
-    reconcile_user_apc_object_wait(nt_handler, tid) || reconcile_user_apc_file_wait(nt_handler, tid)
+    crate::object_wait_apc::request(nt_handler, tid) || reconcile_user_apc_file_wait(nt_handler, tid)
 }
 
 /// Transfer one general File syscall into its exact pending-IRP delivery owner. Synchronous

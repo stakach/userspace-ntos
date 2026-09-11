@@ -8,6 +8,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TABLE_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
+mod apc;
+pub use apc::{
+    ObjectWaitApcAttempt, ObjectWaitApcDisposition, ObjectWaitApcEffect, ObjectWaitApcError,
+    ObjectWaitApcOutcome, ObjectWaitApcPhase, ObjectWaitApcView,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObjectWaiterIdentity {
     table: u64,
@@ -25,6 +31,7 @@ impl ObjectWaiterIdentity {
 struct Owned<T> {
     generation: u64,
     payload: T,
+    apc: Option<apc::Control>,
 }
 
 /// Move-stable ownership. Neither this table nor an owned payload needs to be clonable.
@@ -137,6 +144,7 @@ impl<T> ObjectWaiterTable<T> {
         self.entries[slot] = Some(Owned {
             generation,
             payload,
+            apc: None,
         });
         self.live += 1;
         Ok(ObjectWaiterIdentity {
@@ -159,11 +167,15 @@ impl<T> ObjectWaiterTable<T> {
     }
 
     pub fn get_exact(&self, identity: ObjectWaiterIdentity) -> Option<&T> {
+        self.owned_exact(identity).map(|entry| &entry.payload)
+    }
+
+    fn owned_exact(&self, identity: ObjectWaiterIdentity) -> Option<&Owned<T>> {
         if identity.table == 0 || identity.table != self.identity {
             return None;
         }
         let entry = self.entries.get(identity.slot)?.as_ref()?;
-        (entry.generation == identity.generation).then_some(&entry.payload)
+        (entry.generation == identity.generation).then_some(entry)
     }
 
     /// The closure may mutate payload fields, never storage identity or occupancy. It must not
@@ -173,7 +185,10 @@ impl<T> ObjectWaiterTable<T> {
         identity: ObjectWaiterIdentity,
         update: impl FnOnce(&mut T),
     ) -> bool {
-        if self.get_exact(identity).is_none() {
+        if self
+            .owned_exact(identity)
+            .is_none_or(|entry| entry.apc.is_some())
+        {
             return false;
         }
         update(&mut self.entries[identity.slot].as_mut().unwrap().payload);
@@ -181,10 +196,17 @@ impl<T> ObjectWaiterTable<T> {
     }
 
     pub fn take(&mut self, identity: ObjectWaiterIdentity) -> Option<T> {
-        self.get_exact(identity)?;
+        if self.owned_exact(identity)?.apc.is_some() {
+            return None;
+        }
+        self.take_owned(identity).map(|entry| entry.payload)
+    }
+
+    fn take_owned(&mut self, identity: ObjectWaiterIdentity) -> Option<Owned<T>> {
+        self.owned_exact(identity)?;
         let entry = self.entries[identity.slot].take()?;
         self.live -= 1;
-        Some(entry.payload)
+        Some(entry)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (ObjectWaiterIdentity, &T)> {

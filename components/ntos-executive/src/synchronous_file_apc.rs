@@ -110,16 +110,7 @@ unsafe fn stage_current(
         }
         (entry.caller, entry.apc.apc())
     };
-    let live = crate::thread_context::LegacyThreadContext::read(caller.tcb())
-        .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL.raw() as u32)?;
-    let rva = crate::img_spawn::OUR_KI_USER_APC_DISPATCHER_RVA.load(Ordering::Relaxed);
-    if rva == 0 {
-        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
-    }
-    let dispatcher = NTDLL_BASE
-        .checked_add(rva)
-        .ok_or(nt_fs::STATUS_INVALID_PARAMETER)?;
-    use nt_thread_start::amd64_context::{prepare_user_apc, UserApcContinuation, UserApcPayload};
+    use nt_thread_start::amd64_context::UserApcContinuation;
     let continuation = if waiter.native_call_transport {
         UserApcContinuation::NativeCall
     } else {
@@ -129,29 +120,7 @@ unsafe fn stage_current(
             resume_flags: waiter.resume_flags,
         }
     };
-    let prepared = prepare_user_apc(
-        &live.registers,
-        &live.floating_point,
-        continuation,
-        dispatcher,
-        UserApcPayload {
-            routine: apc.routine,
-            normal_context: apc.normal_context,
-            system_argument1: apc.system_argument1,
-            system_argument2: apc.system_argument2,
-        },
-        0xC0,
-        crate::exec_handler::HIGHEST_USER_ADDRESS,
-    )
-    .map_err(|_| nt_fs::STATUS_INVALID_PARAMETER)?;
-    nt_handler
-        .process_memory_write_checked(caller.pi(), prepared.frame_va, &prepared.frame)
-        .map_err(|failure| failure.status())?;
-    let current = crate::thread_context::LegacyThreadContext::read(caller.tcb())
-        .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL.raw() as u32)?;
-    if current.registers != live.registers || current.floating_point != live.floating_point {
-        return Err(nt_process::STATUS_DEVICE_BUSY);
-    }
+    let install = crate::user_apc::stage_frame(nt_handler, caller, apc, continuation, 0xC0)?;
     // Copyout may reenter. Revalidate the retained identities, not a new queue head or runtime,
     // immediately before the checked register commit. No user APC is consumed on refusal.
     {
@@ -165,7 +134,7 @@ unsafe fn stage_current(
             return Err(nt_fs::STATUS_INVALID_HANDLE);
         }
     }
-    crate::thread_context::write(caller.tcb(), &prepared.install, false)
+    crate::thread_context::write(caller.tcb(), &install, false)
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL.raw() as u32)?;
     let entry = (&mut *core::ptr::addr_of_mut!(INTERRUPTIONS))[slot]
         .as_mut()
@@ -207,7 +176,7 @@ pub(super) unsafe fn send(
     {
         return Outcome::NotEntered(nt_fs::STATUS_INVALID_HANDLE);
     }
-    if let Err(status) = synchronous_file_cancellation::saved_reply_pool_index(waiter.reply_cap) {
+    if let Err(status) = crate::parked_reply::validate_saved(waiter.reply_cap) {
         return Outcome::NotEntered(status);
     }
     // The staged context supplies the dispatcher entry. Empty Reply only releases its binding.
@@ -222,10 +191,8 @@ pub(super) unsafe fn send(
 }
 
 pub(super) unsafe fn retire_reply(cap: u64) -> Result<Receipt, u32> {
-    let slot = synchronous_file_cancellation::saved_reply_pool_index(cap)?;
     // Successful Reply already consumed the binding. There is no deletion or retyping here.
-    wait_reply_pool_mut()[slot].used = false;
-    Ok(Receipt::UserApcReplyCapRetired)
+    crate::parked_reply::retire_sent(cap).map(|()| Receipt::UserApcReplyCapRetired)
 }
 
 /// Native provenance and any unconsumed APC claim retire before the core owner is removed.

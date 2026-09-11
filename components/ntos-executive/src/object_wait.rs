@@ -29,6 +29,7 @@ pub(super) struct ObjectWaiterRecord {
     pub(super) resume_ip: u64,
     pub(super) resume_sp: u64,
     pub(super) resume_flags: u64,
+    pub(super) native_call_transport: bool,
     pub(super) deadline: nt_delay_execution::Deadline,
     pub(super) pending_wake_index: u64,
     pub(super) pending_wake_object: WaitObject,
@@ -51,6 +52,7 @@ impl ObjectWaiterRecord {
             resume_ip: 0,
             resume_sp: 0,
             resume_flags: 0,
+            native_call_transport: false,
             deadline: nt_delay_execution::Deadline::Infinite,
             pending_wake_index: u64::MAX,
             pending_wake_object: WaitObject::FREE,
@@ -79,6 +81,7 @@ impl ObjectWaiterRecord {
         resume_ip: u64,
         resume_sp: u64,
         resume_flags: u64,
+        native_call_transport: bool,
         deadline: nt_delay_execution::Deadline,
     ) -> Self {
         let mut record = Self::empty();
@@ -98,12 +101,14 @@ impl ObjectWaiterRecord {
         record.resume_ip = resume_ip;
         record.resume_sp = resume_sp;
         record.resume_flags = resume_flags;
+        record.native_call_transport = native_call_transport;
         record.deadline = deadline;
         record
     }
 }
 
-static mut OBJECT_WAITERS: ObjectWaiterTable<ObjectWaiterRecord> = ObjectWaiterTable::new();
+pub(super) static mut OBJECT_WAITERS: ObjectWaiterTable<ObjectWaiterRecord> =
+    ObjectWaiterTable::new();
 
 pub(super) fn object_waiter_table_reset() -> bool {
     unsafe { (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS)).reset(OBJECT_WAITER_INITIAL_RESERVE) }
@@ -141,7 +146,12 @@ pub(super) fn object_waiter_alertable_for_tid(
     unsafe {
         (&*core::ptr::addr_of!(OBJECT_WAITERS))
             .iter()
-            .find(|(_, record)| record.alertable && record.tid == tid)
+            .find(|(identity, record)| {
+                record.alertable
+                    && record.tid == tid
+                    && record.pending_wake_index == u64::MAX
+                    && !(&*core::ptr::addr_of!(OBJECT_WAITERS)).is_claimed(*identity)
+            })
             .map(|(identity, record)| (identity, *record))
     }
 }
@@ -156,6 +166,7 @@ pub(super) fn object_waiter_next_deadline(now: nt_delay_execution::TimeSnapshot)
     unsafe {
         (&*core::ptr::addr_of!(OBJECT_WAITERS))
             .iter()
+            .filter(|(identity, _)| !(&*core::ptr::addr_of!(OBJECT_WAITERS)).is_claimed(*identity))
             .filter_map(|(_, record)| record.deadline.monotonic_target(now))
             .min()
     }
@@ -169,20 +180,6 @@ pub(super) fn object_waiter_park(record: ObjectWaiterRecord) -> bool {
         (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS))
             .insert(record)
             .is_ok()
-    }
-}
-
-pub(super) fn object_waiter_clear_pending_wakes() {
-    unsafe {
-        let table = &mut *core::ptr::addr_of_mut!(OBJECT_WAITERS);
-        for slot in 0..table.slot_len() {
-            if let Some((identity, _)) = table.get(slot) {
-                table.update_exact(identity, |record| {
-                    record.pending_wake_index = u64::MAX;
-                    record.pending_wake_object = WaitObject::FREE;
-                });
-            }
-        }
     }
 }
 
@@ -203,6 +200,9 @@ pub(super) fn object_waiter_pending_wake(
     slot: usize,
 ) -> Option<(ObjectWaiterIdentity, ObjectWaiterRecord, u64, WaitObject)> {
     let (identity, record) = object_waiter_record(slot)?;
+    if object_waiter_is_claimed(identity) {
+        return None;
+    }
     (record.pending_wake_index != u64::MAX).then_some((
         identity,
         record,
@@ -217,10 +217,17 @@ pub(super) fn object_waiter_next_after_sequence(
     unsafe {
         (&*core::ptr::addr_of!(OBJECT_WAITERS))
             .iter()
-            .filter(|(_, record)| record.sequence > sequence)
+            .filter(|(identity, _)| !(&*core::ptr::addr_of!(OBJECT_WAITERS)).is_claimed(*identity))
+            .filter(|(_, record)| {
+                record.sequence > sequence && record.pending_wake_index == u64::MAX
+            })
             .min_by_key(|(_, record)| record.sequence)
             .map(|(identity, record)| (identity, *record))
     }
+}
+
+pub(super) fn object_waiter_is_claimed(identity: ObjectWaiterIdentity) -> bool {
+    unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).is_claimed(identity) }
 }
 
 pub(super) fn release_wait_object_references(

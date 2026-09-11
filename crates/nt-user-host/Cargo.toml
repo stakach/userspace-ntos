@@ -30,3 +30,5 @@ undocumented_unsafe_blocks = "deny"
 nt-config-manager = { workspace = true }
 nt-fs = { workspace = true }
 nt-syscall = { workspace = true }
+nt-thread-start = { workspace = true }
+nt-io-completion = { workspace = true }
