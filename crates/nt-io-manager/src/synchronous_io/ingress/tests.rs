@@ -61,10 +61,7 @@ fn claim_retains_route_and_blocks_duplicate_or_legacy_extraction() {
     );
     assert!(table.take_exact(slot, KEY, 20).is_none());
     assert!(table.adopt_promoted_fixture(2, 20, 120, 191).is_none());
-    assert_eq!(
-        table.take_thread_with(20, |_| panic!("claimed owner extracted")),
-        0
-    );
+    assert!(table.has_runtime_dependency_for_thread(20));
     drop(ingress);
     assert!(!table.reset());
     assert!(table.has_ingress_for_thread(20));
@@ -171,7 +168,9 @@ fn dropped_adoption_remains_invoking_and_blocks_teardown() {
     let mut ingress = claim(&mut table);
     let attempt = table.begin_adoption(&mut ingress).unwrap();
     drop(attempt);
+    assert!(table.has_runtime_dependency_for_thread(20));
     table.request_cancellation(ingress.identity()).unwrap();
+    assert!(table.has_runtime_dependency_for_thread(20));
     assert_eq!(
         table.cancellation(ingress.identity()).unwrap().phase,
         SynchronousFileCancelPhase::DeferredRetry

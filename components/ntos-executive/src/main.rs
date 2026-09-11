@@ -18609,14 +18609,16 @@ unsafe fn terminate_hosted_thread_mechanism(
     if handler.pm.has_thread_suspend_control(tid as nt_process::ThreadId) {
         return false;
     }
-    if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_retry_delivery_for_thread(tid) {
-        return false;
-    }
     let tcb = match handler.hosted_thread_tcb(tid) {
         Some(tcb) if tcb > 1 => tcb,
         None => return false,
         Some(_) => return false,
     };
+    crate::service_sec_image::synchronous_file_cancellation::request_thread(handler, tid);
+    crate::service_sec_image::synchronous_file_cancellation::redrive(handler);
+    if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_runtime_dependency_for_thread(tid) {
+        return false;
+    }
     // A provider-side KeWait owns both the component rendezvous and this thread's native reply.
     // Unwind it before win32k context or TCB retirement so neither side can retain a dead client.
     if !crate::service_sec_image::provider_wait_cancel_client_thread(handler, tid) {
@@ -18650,7 +18652,7 @@ unsafe fn terminate_hosted_thread_mechanism(
     }
     if handler.hosted_thread_tcb(tid) != Some(tcb)
         || handler.pm.has_thread_suspend_control(tid as nt_process::ThreadId)
-        || (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_retry_delivery_for_thread(tid)
+        || (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_runtime_dependency_for_thread(tid)
     {
         return false;
     }
@@ -18718,8 +18720,20 @@ unsafe fn terminate_hosted_process_mechanisms(
     if handler.pm.has_process_suspend_control(pid) {
         return 0;
     }
+    // Mark every target before any cancellation wake or provider callout can reenter. Preserved
+    // callers keep their own continuation and are cancelled by their separate thread teardown.
+    if let Some(process) = handler.pm.process(pid) {
+        for tid in process.threads.iter().copied().map(u64::from) {
+            if preserve_tid != Some(tid) {
+                crate::service_sec_image::synchronous_file_cancellation::request_thread(handler, tid);
+            }
+        }
+    }
+    crate::service_sec_image::synchronous_file_cancellation::redrive(handler);
     if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS))
-        .has_retry_delivery_for_pi(u32::from(process_index))
+        .has_runtime_dependency_matching(|waiter| {
+            waiter.pi == u32::from(process_index) && preserve_tid != Some(waiter.tid)
+        })
     {
         return 0;
     }

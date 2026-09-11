@@ -201,10 +201,10 @@ fn uncertain_retry_keeps_busy_and_cleanup_blocked_without_blocking_another_file(
         .oldest_waiting_for_file(FileIoWaitKey::Hosted(FILE))
         .is_none());
     assert!(waiters.begin_ingress(PI, 20, 120, SERVICE).is_err());
-    assert_eq!(
-        waiters.take_thread_with(20, |_| panic!("uncertain reply is still owned")),
-        0
-    );
+    assert_eq!(waiters.request_thread_cancellation(20), 1);
+    assert_eq!(waiters.request_thread_cancellation(20), 0);
+    assert!(waiters.has_cancellation_for_thread(20));
+    assert!(waiters.has_runtime_dependency_for_thread(20));
     assert_eq!(files.io_lock_owner(FILE), Ok(Some(20)));
     assert_eq!(files.io_waiter_count(FILE), Ok(1));
     assert_eq!(files.promote_cleanup_if_ready(FILE), Ok(false));

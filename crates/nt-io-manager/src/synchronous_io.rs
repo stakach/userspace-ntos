@@ -529,24 +529,6 @@ impl SynchronousFileWaitTable {
             .into_record()
             .map(|record| record.waiter)
     }
-
-    pub fn take_thread_with<F>(&mut self, tid: u64, mut take: F) -> usize
-    where
-        F: FnMut(SynchronousFileWaiter),
-    {
-        let mut count = 0;
-        for slot in self.slots.iter_mut() {
-            if slot
-                .as_ref()
-                .and_then(WaitSlot::record)
-                .is_some_and(|record| record.waiter.tid == tid && record.transferable())
-            {
-                take(slot.take().unwrap().into_record().unwrap().waiter);
-                count += 1;
-            }
-        }
-        count
-    }
 }
 
 #[cfg(test)]
@@ -695,18 +677,40 @@ mod tests {
     }
 
     #[test]
-    fn teardown_collects_waiting_and_promoted_owners() {
+    fn teardown_marks_waiting_and_promoted_owners_without_extracting_them() {
         let mut table = SynchronousFileWaitTable::new();
-        table.park(waiter(10, 1, 101)).unwrap();
+        let waiting_slot = table.park(waiter(10, 1, 101)).unwrap();
         let slot = table.park(waiter(20, 2, 102)).unwrap();
         table
             .promote_exact(slot, FileIoWaitKey::Hosted(20), 2)
             .unwrap();
         acknowledge_retry(&mut table, slot, 20, 2);
-        let mut taken = alloc::vec::Vec::new();
-        assert_eq!(table.take_thread_with(2, |waiter| taken.push(waiter)), 1);
-        assert_eq!(taken[0].state, SynchronousFileWaitState::Promoted);
-        assert_eq!(table.len(), 1);
+        assert_eq!(table.request_thread_cancellation(2), 1);
+        assert_eq!(table.request_thread_cancellation(2), 0);
+        let promoted = table
+            .cancellation_identity(slot, FileIoWaitKey::Hosted(20), 2)
+            .unwrap();
+        assert_eq!(
+            table.cancellation(promoted).unwrap().waiter.state,
+            SynchronousFileWaitState::Promoted
+        );
+        assert!(!table.has_cancellation_for_thread(1));
+        assert_eq!(table.request_thread_cancellation(1), 1);
+        let waiting = table
+            .cancellation_identity(waiting_slot, FileIoWaitKey::Hosted(10), 1)
+            .unwrap();
+        assert_eq!(
+            table.cancellation(waiting).unwrap().waiter.state,
+            SynchronousFileWaitState::Waiting
+        );
+        assert!(table
+            .take_exact(slot, FileIoWaitKey::Hosted(20), 2)
+            .is_none());
+        assert!(table
+            .take_exact(waiting_slot, FileIoWaitKey::Hosted(10), 1)
+            .is_none());
+        assert_eq!(table.len(), 2);
+        assert!(!table.reset());
     }
 
     #[test]

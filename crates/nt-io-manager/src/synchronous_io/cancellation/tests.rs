@@ -187,10 +187,8 @@ fn cancellation_owns_all_effects_and_legacy_paths_cannot_extract_it() {
     assert!(table.take_alertable_waiting_exact(slot, KEY, TID).is_none());
     assert!(table.promote_exact(slot, KEY, TID).is_none());
     assert!(table.take_exact(slot, KEY, TID).is_none());
-    assert_eq!(
-        table.take_thread_with(TID, |_| panic!("cancel owner escaped")),
-        0
-    );
+    assert_eq!(table.request_thread_cancellation(TID), 0);
+    assert!(table.has_cancellation_for_thread(TID));
     assert!(!table.reset());
     finish_hosted(&mut table, identity, true);
     assert!(!table.has_cancellation_for_thread(TID));
@@ -498,4 +496,131 @@ fn preflight_preserves_publication_budget_and_exhaustion_keeps_owned_work() {
     );
     assert!(table.finish_cancellation(id).is_none());
     assert!(!table.reset());
+}
+
+#[test]
+fn cancelled_ready_retry_keeps_cap_ownership_without_pinning_runtime() {
+    let mut table = SynchronousFileWaitTable::new();
+    let slot = table.park(waiter(TID, 50)).unwrap();
+    assert!(!table.has_runtime_dependency_for_thread(TID));
+    table.promote_exact(slot, KEY, TID).unwrap();
+    assert!(table.has_runtime_dependency_for_thread(TID));
+    assert!(table.has_runtime_dependency_for_pi(2));
+    let id = cancel(&mut table, slot, TID);
+    assert!(
+        table.has_retry_delivery_for_thread(TID),
+        "historical Ready remains diagnostic"
+    );
+    assert!(!table.has_runtime_dependency_for_thread(TID));
+    assert!(!table.has_runtime_dependency_for_pi(2));
+    complete(
+        &mut table,
+        id,
+        SynchronousFileCancelReceipt::HostedPolicy { waiters: 0 },
+    );
+    complete(&mut table, id, SynchronousFileCancelReceipt::Wake);
+    complete(
+        &mut table,
+        id,
+        SynchronousFileCancelReceipt::HostedReference(FileReferenceRelease {
+            device_id: DEVICE,
+            ..FileReferenceRelease::default()
+        }),
+    );
+    let mut revoke = table.begin_cancellation(id).unwrap();
+    assert_eq!(revoke.effect(), SynchronousFileCancelEffect::RevokeReply);
+    assert!(!table.has_runtime_dependency_for_thread(TID));
+    table
+        .record_cancellation(&mut revoke, SynchronousFileCancelOutcome::NotEntered(ERROR))
+        .unwrap();
+    assert!(!table.has_runtime_dependency_for_thread(TID));
+    complete(&mut table, id, SynchronousFileCancelReceipt::ReplyRevoked);
+    let mut retype = table.begin_cancellation(id).unwrap();
+    assert_eq!(retype.effect(), SynchronousFileCancelEffect::RetireReplyCap);
+    table
+        .record_cancellation(
+            &mut retype,
+            SynchronousFileCancelOutcome::Indeterminate(ERROR),
+        )
+        .unwrap();
+    assert!(!table.has_runtime_dependency_for_thread(TID));
+    assert!(table.has_cancellation_for_thread(TID));
+    assert!(table.has_waiter_for_pi(2));
+}
+
+#[test]
+fn deferred_retry_depends_on_runtime_until_exact_delivery_outcome_and_retirement() {
+    for outcome in [
+        SynchronousFileRetryOutcome::NotEntered(ERROR),
+        SynchronousFileRetryOutcome::Indeterminate(ERROR),
+        SynchronousFileRetryOutcome::Acknowledged,
+    ] {
+        let mut table = SynchronousFileWaitTable::new();
+        let slot = table.park(waiter(TID, 50)).unwrap();
+        table.promote_exact(slot, KEY, TID).unwrap();
+        let retry_id = table.retry_identity(slot, KEY, TID).unwrap();
+        let mut retry = table.begin_retry(retry_id).unwrap();
+        cancel(&mut table, slot, TID);
+        assert!(table.has_runtime_dependency_for_thread(TID));
+        table.record_retry(&mut retry, outcome).unwrap();
+        match outcome {
+            SynchronousFileRetryOutcome::NotEntered(_) => {
+                assert!(!table.has_runtime_dependency_for_thread(TID))
+            }
+            SynchronousFileRetryOutcome::Indeterminate(_) => {
+                assert!(table.has_runtime_dependency_for_thread(TID))
+            }
+            SynchronousFileRetryOutcome::Acknowledged => {
+                assert!(table.has_runtime_dependency_for_thread(TID));
+                assert!(!table.finish_retry(retry_id, Err(ERROR)).unwrap());
+                assert!(table.has_runtime_dependency_for_thread(TID));
+                assert!(table.finish_retry(retry_id, Ok(())).unwrap());
+                assert!(!table.has_runtime_dependency_for_thread(TID));
+            }
+        }
+    }
+}
+
+#[test]
+fn ingress_keeps_runtime_dependency_after_retry_cap_retirement() {
+    let mut table = SynchronousFileWaitTable::new();
+    let slot = table.park(waiter(TID, 50)).unwrap();
+    table.promote_exact(slot, KEY, TID).unwrap();
+    let retry_id = table.retry_identity(slot, KEY, TID).unwrap();
+    let mut retry = table.begin_retry(retry_id).unwrap();
+    table
+        .record_retry(&mut retry, SynchronousFileRetryOutcome::Acknowledged)
+        .unwrap();
+    table.finish_retry(retry_id, Ok(())).unwrap();
+    assert!(!table.has_runtime_dependency_for_thread(TID));
+    let mut ingress = table
+        .begin_ingress(2, TID, TID + 100, 191)
+        .unwrap()
+        .unwrap();
+    assert!(table.has_runtime_dependency_for_thread(TID));
+    let id = cancel(&mut table, slot, TID);
+    assert!(table.has_runtime_dependency_for_thread(TID));
+    assert_eq!(table.reject_ingress(&mut ingress, ERROR).unwrap(), id);
+    assert!(!table.has_runtime_dependency_for_thread(TID));
+}
+
+#[test]
+fn runtime_dependency_matching_respects_preserved_thread_and_process() {
+    let mut table = SynchronousFileWaitTable::new();
+    let first = table.park(waiter(TID, 50)).unwrap();
+    table.promote_exact(first, KEY, TID).unwrap();
+    let mut peer = waiter(TID + 1, 51);
+    peer.route = FileIoWaitRoute::Hosted {
+        file_id: FILE + 1,
+        device_id: DEVICE,
+        fs_context: 0,
+    };
+    peer.pi = 3;
+    let second = table.park(peer).unwrap();
+    table.promote_exact(second, peer.key(), peer.tid).unwrap();
+    assert!(!table.has_runtime_dependency_matching(|waiter| waiter.pi == 2 && waiter.tid != TID));
+    assert!(table.has_runtime_dependency_matching(|waiter| waiter.pi == 3 && waiter.tid != TID));
+    cancel(&mut table, first, TID);
+    assert!(!table.has_runtime_dependency_for_pi(2));
+    assert!(table.has_runtime_dependency_for_pi(3));
 }

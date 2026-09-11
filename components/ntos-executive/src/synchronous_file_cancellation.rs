@@ -1,4 +1,4 @@
-//! Retained cancellation for unpublished waits and rejected, reply-retired ingress.
+//! Retained cancellation for unpublished, published, and rejected-ingress File waits.
 
 use super::*;
 use nt_io_manager::{
@@ -73,13 +73,48 @@ unsafe fn cancel_policy(
     }
 }
 
+unsafe fn saved_reply_pool_index(cap: u64) -> Result<usize, u32> {
+    if cap == 0 || cap == REPLY_MAIN_SLOT.load(Ordering::Relaxed) {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
+    wait_reply_pool_ref()
+        .iter()
+        .position(|record| record.cap == cap && record.used)
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)
+}
+
+unsafe fn revoke_reply(cap: u64) -> Result<Receipt, u32> {
+    saved_reply_pool_index(cap)?;
+    // Delete the final owned cap, not just its descendants. Reply deletion validates before
+    // mutation; a rejected invocation leaves the old binding and this effect owned for retry.
+    if cnode_delete_r(cap) != 0 {
+        return Err(nt_status::NtStatus::UNSUCCESSFUL.raw() as u32);
+    }
+    Ok(Receipt::ReplyRevoked)
+}
+
+unsafe fn retire_reply_cap(cap: u64) -> Result<Receipt, u32> {
+    let index = saved_reply_pool_index(cap)?;
+    // The slot stays pool-owned while empty. A failed retype must never repeat Reply deletion.
+    if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap) != 0 {
+        return Err(nt_fs::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    // No callback, allocation, or IPC separates successful retype, pool publication and receipt.
+    let record = &mut wait_reply_pool_mut()[index];
+    assert_eq!(record.cap, cap);
+    assert!(record.used);
+    record.used = false;
+    Ok(Receipt::ReplyCapRetired)
+}
+
 /// Finish independent effects in one bounded visit. No global table borrow crosses wake/IPC.
 /// A retained failure retries only its current effect on a later service pass.
 pub(crate) unsafe fn drive(
     nt_handler: &mut ExecNtHandler,
     identity: SynchronousFileCancelIdentity,
 ) -> bool {
-    for _ in 0..5 {
+    // Six effects at most (including reference followup), then exact owner removal.
+    for _ in 0..7 {
         let (waiter, phase) = {
             let Ok(view) = (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).cancellation(identity)
             else {
@@ -87,11 +122,6 @@ pub(crate) unsafe fn drive(
             };
             (*view.waiter, view.phase)
         };
-        // Live Reply cancellation requires retained final-cap deletion and exact-slot retyping.
-        // No producer in this adapter transfers such an owner yet.
-        if waiter.reply_cap != 0 {
-            return false;
-        }
         if phase == Phase::Complete {
             (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
                 .finish_cancellation(identity)
@@ -141,9 +171,8 @@ pub(crate) unsafe fn drive(
                     Ok(Receipt::ReferenceFollowup)
                 }
             }
-            Effect::RevokeReply | Effect::RetireReplyCap => {
-                unreachable!("reply-free File cancellation requested a capability effect")
-            }
+            Effect::RevokeReply => revoke_reply(waiter.reply_cap),
+            Effect::RetireReplyCap => retire_reply_cap(waiter.reply_cap),
         };
         (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
             .record_cancellation(
@@ -174,7 +203,21 @@ pub(crate) unsafe fn cancel_unpublished(
     drive(nt_handler, identity)
 }
 
-pub(super) unsafe fn redrive(nt_handler: &mut ExecNtHandler) {
+/// Intent is published before any teardown callout; callers may mark an entire process before
+/// driving effects. Cancelled rows retain their own references/cap slots, not target VM lifetime.
+pub(crate) unsafe fn request_thread(nt_handler: &ExecNtHandler, tid: u64) -> usize {
+    let table = &mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS);
+    let marked = table.request_thread_cancellation(tid);
+    // This is a teardown request against the still-live runtime. Never defer badge cleanup to
+    // effect completion: the captured cancellation may survive TCB/runtime and PI retirement.
+    if table.has_cancellation_for_thread(tid) {
+        thread_wait_state_clear_tid(nt_handler, tid);
+        FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+    }
+    marked
+}
+
+pub(crate) unsafe fn redrive(nt_handler: &mut ExecNtHandler) {
     let mut after = None;
     while let Some(identity) =
         (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).next_cancellation_after(after)

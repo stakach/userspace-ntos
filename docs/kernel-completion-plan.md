@@ -33004,8 +33004,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
       rollback; do not allocate the cancellation owner after the File effect has occurred.
     - [x] Keep promoted ingress in its original row through adoption/rejection. Replace those
       destructive cancellation transfers with exact effect receipts, including hosted reference
-      followups, and guard thread/process retirement while cancellation still owns work.
-    - [ ] Convert published-waiter thread teardown, including live saved Replies, to retained
+      followups, and guard runtime retirement while retry/ingress still depends on the target.
+      Self-contained cancellation retains File/capability ownership independently, as refined below.
+    - [x] Convert published-waiter thread teardown, including live saved Replies, to retained
       cancellation. Delete the remaining remove-then-cancel teardown adapter after that cutover.
     - [x] Close the pre-existing acquired-Busy/pending-IRP post-action handoff: successful
       acquisition can precede a job-termination early exit before the normal service-tail
@@ -33028,7 +33029,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
       destructive take_promoted API and the replaced acquisition rollback paths.
     - [x] Drive reply-free cancellation through separate policy, wake, reference and checked
       reference-followup receipts. Share wake-handoff logic with pending Busy retirement and
-      retain thread/process lifetime while a cancellation or ingress claim still owns work.
+      retain required runtime lifetime for retry/ingress claims; the published teardown review
+      below separates independent cancellation ownership from that lifetime dependency.
     - [x] Validate exact claims, adoption, refused fresh admission and cancellation handoffs with
       real hosted policy composition, serialized host tests and an executive release build.
 
@@ -33062,7 +33064,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Final independent review found no remaining issue in this scoped native cutover. No VM run
     or microkernel change occurred; the 27 strict missing win32k imports and genuine desktop
     acceptance remain open. The accepted-Busy post-action handoff is addressed below;
-    published-waiter teardown and parked APC staging/Reply/capability settlement remain open.
+    published-waiter teardown is addressed next, while parked APC settlement remains open.
 
     Accepted File post-action handoff (2026-09-11, complete; runtime acceptance open):
     - [x] Publish the exact reserved pending owner before service post-actions or job teardown.
@@ -33103,14 +33105,63 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `.tmp/build-file-post-action-executive-20260911.log`. All runners were serialized; independent
     native review found no remaining issue in this scoped handoff.
 
-    Next boundary review: published acquisition-waiter teardown must request retained cancellation
-    before thread/process retry-delivery guards can return early, then defer physical teardown
-    while cancellation or retry delivery remains. Add checked final-cap Reply deletion and record
-    its receipt before exact-slot Reply retyping; keep the pool slot owned until retyping succeeds.
-    Reuse the checked GUI waiter teardown precedent, not CNode_Revoke or the generic slot-recycle
-    helper. Expand the bounded cancellation driver for the two additional effect stages. APC
-    staging/Reply settlement and inline terminal Busy/reference failure retention remain separate
-    follow-ons; do not widen this completed handoff into a claim that those adapters are fixed.
+    Published File acquisition-waiter teardown (2026-09-11, complete; runtime acceptance open):
+    - [x] Request cancellation in original waiter rows before thread/process retry guards and
+      provider/GUI/win32 callouts. Mark all non-preserved process targets before driving effects.
+      Remove the destructive thread teardown adapter and SynchronousFileWaitTable::take_thread_with.
+    - [x] Delete the exact saved Reply cap with checked CNode_Delete, record that effect, then
+      retype the same pool-owned slot. Retyping failure retains only that stage; neither failure
+      frees the pool bit or repeats an acknowledged policy/reference/deletion effect. Validate
+      that the cap is a used pool slot and is not the current main Reply before either invocation.
+    - [x] Expand bounded cancellation to six effects plus final owner removal. Keep APC's
+      context-staging/reply-send path separate from teardown's Reply-destruction disposition.
+    - [x] Separate runtime dependencies from captured cancellation ownership. Retain runtime
+      guards for ingress and deferred/entered/uncertain/acknowledged retry delivery, not a
+      historical Ready retry now owned by cancellation. Recheck before TCB deletion and runtime
+      release. Clear the live target's Waiting marker at teardown request, never at late effect
+      completion after its badge/PI may have been reused.
+    - [x] Complete serialized host regressions and executive release build, then record evidence.
+
+    Review adjustment: a blanket cancellation guard was unsafe with one-shot mechanism teardown:
+    TCB deletion could succeed and runtime release could then refuse, stranding the runtime. The
+    retained cancellation uses captured File route/grant/reference/port and an owned Reply slot,
+    with no target memory access or Reply send, so those effects may outlive the target runtime.
+    Only execution-dependent retry/ingress work still pins it. This does not make a still-owned
+    thread identity eligible for fresh ingress, or resolve uncertain sends by assuming failure.
+    The checked GUI waiter deletion/retype sequence and current rust-micro invocation validation
+    were used as references; no generic CNode_Revoke or slot-recycle shortcut is used.
+
+    Validation: all 46 synchronous File contract tests passed, including four new runtime-
+    dependency tests and an additional entered-adoption assertion. Three new integration tests
+    compose real File policy with exact retained cancellation and controlled Reply outcomes:
+    waiting/promoted deletion refusal, deletion followed by retype refusal, acknowledged retry
+    retirement before cancellation, and entered/uncertain/dropped send retention. Obsolete
+    thread-extraction fixtures now exercise retained teardown intent and exact extraction refusal.
+    All 1,499 focused and 2,759 broad host/doc tests passed. The executive release build passed in
+    37.87s with the unchanged 294 warnings. Evidence:
+    `.tmp/test-file-published-teardown-contract-20260911.log`,
+    `.tmp/test-file-published-teardown-focused-20260911.log`,
+    `.tmp/test-file-published-teardown-full-20260911.log`, and
+    `.tmp/build-file-published-teardown-executive-20260911.log`. All runners were serialized.
+    Independent native review found no remaining issue in this scoped teardown. Source inspection
+    confirmed rust-micro unlinks Reply bindings before TCB reuse; these host fixtures and the
+    release build are not native capability-failure or desktop acceptance evidence.
+
+    APC staging/Reply settlement and inline terminal Busy/reference failure retention remain the
+    next separate targets. The shared old cancellation helper remains solely for APC interruption
+    until that producer has retained staging/send/cap receipts. No VM run or microkernel change
+    occurred; the last measured 27 strict missing win32k imports and desktop acceptance remain open.
+
+    Next APC review: keep the acquisition waiter in its original row through exact interruption
+    claim, File cancellation/wake/reference settlement, checked APC context staging, Reply send,
+    and successful-send pool retirement. Staging currently uses an unchecked TCB read, writes the
+    user frame before fallible register installation, and ignores APC dequeue results. Retain
+    exact runtime/thread/APC identities and stage once; a failed or uncertain send must not pop
+    another APC, restage context, or automatically resend. Successful Reply consumes its binding
+    and requires pool retirement only, unlike teardown's deletion/retyping. Add stale-identity,
+    staging-refusal, send-uncertainty, cap-retirement-retry and teardown-race coverage. Ordinary
+    object waits and general pending-IRP APC adapters remain separate consumers to audit, not
+    evidence that the acquisition-waiter implementation has already been completed.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

@@ -10556,9 +10556,9 @@ impl ExecNtHandler {
     ) -> Option<HostedThreadRuntime> {
         if unsafe {
             let waiters = &*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS);
-            waiters.has_retry_delivery_for_thread(tid)
-                || waiters.has_cancellation_for_thread(tid)
-                || waiters.has_ingress_for_thread(tid)
+            // Cancellation retains captured File ownership and its pool slot independently of
+            // this runtime. Only active retry/ingress effects still require the target thread.
+            waiters.has_runtime_dependency_for_thread(tid)
         }
         {
             return None;
@@ -14193,17 +14193,11 @@ impl ExecNtHandler {
     }
 
     unsafe fn abandon_synchronous_file_waiters_for_thread(&mut self, tid: u64) -> usize {
-        let mut waiters = Vec::new();
-        (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-            .take_thread_with(tid, |waiter| waiters.push(waiter));
-        for waiter in waiters.iter().copied() {
-            if waiter.reply_cap != 0 {
-                release_reply_pool_cap(waiter.reply_cap);
-            }
-            thread_wait_state_clear_badge_ready(self, waiter.badge);
-            crate::service_sec_image::synchronous_file_cancel_waiter(self, waiter);
-        }
-        waiters.len()
+        let marked = crate::service_sec_image::synchronous_file_cancellation::request_thread(self, tid);
+        crate::service_sec_image::synchronous_file_cancellation::redrive(self);
+        // Native teardown clears its live runtime's Waiting marker. Late cancellation must not
+        // touch a badge or PI that physical teardown may already have made available for reuse.
+        marked
     }
 
     unsafe fn abandon_file_irp_drain_waiters_for_thread(&mut self, tid: u64) -> usize {

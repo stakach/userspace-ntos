@@ -65,10 +65,7 @@ fn assert_retained(table: &mut SynchronousFileWaitTable, identity: SynchronousFi
         .take_alertable_waiting_exact(identity.slot, original.key(), original.tid)
         .is_none());
     assert!(table.alertable_waiting_for_thread(original.tid).is_none());
-    assert_eq!(
-        table.take_thread_with(original.tid, |_| panic!("delivery cannot be discarded")),
-        0
-    );
+    assert!(table.has_runtime_dependency_for_thread(original.tid));
     assert!(table
         .adopt_promoted_fixture(
             original.pi,
@@ -339,8 +336,11 @@ fn scope_queries_cover_waiting_retired_grant_and_every_retained_delivery_phase()
     assert_retained(&mut table, identity);
     table.finish_retry(identity, Ok(())).unwrap();
     assert_eq!(
-        table.take_thread_with(1, |waiter| assert_eq!(waiter.reply_cap, 0)),
-        1
+        table
+            .take_exact(slot, FileIoWaitKey::Hosted(10), 1)
+            .unwrap()
+            .reply_cap,
+        0
     );
     assert!(!table.has_waiter_for_pi(2));
     assert!(table.reset());

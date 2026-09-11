@@ -150,6 +150,19 @@ impl SynchronousFileCancelAttempt {
 }
 
 impl WaitRecord {
+    fn has_runtime_dependency(&self) -> bool {
+        if self.ingress.is_some() {
+            return true;
+        }
+        match &self.cancellation {
+            Some(cancel) => {
+                cancel.phase == SynchronousFileCancelPhase::DeferredRetry
+                    || self.cancellation_must_defer()
+            }
+            None => self.delivery_retained(),
+        }
+    }
+
     fn cancellation_must_defer(&self) -> bool {
         matches!(
             self.ingress,
@@ -305,6 +318,25 @@ impl SynchronousFileWaitTable {
     pub fn has_cancellation_for_pi(&self, pi: u32) -> bool {
         self.records()
             .any(|(_, record)| record.waiter.pi == pi && record.cancellation.is_some())
+    }
+
+    /// Retained cancellation effects use only captured File and capability ownership. They may
+    /// outlive the target runtime after entered retry delivery and ingress claims have settled.
+    /// This does not authorize new admission under a still cancellation-owned thread identity.
+    pub fn has_runtime_dependency_matching(
+        &self,
+        mut matches: impl FnMut(&SynchronousFileWaiter) -> bool,
+    ) -> bool {
+        self.records()
+            .any(|(_, record)| record.has_runtime_dependency() && matches(&record.waiter))
+    }
+
+    pub fn has_runtime_dependency_for_thread(&self, tid: u64) -> bool {
+        self.has_runtime_dependency_matching(|waiter| waiter.tid == tid)
+    }
+
+    pub fn has_runtime_dependency_for_pi(&self, pi: u32) -> bool {
+        self.has_runtime_dependency_matching(|waiter| waiter.pi == pi)
     }
 
     pub fn cancellation(
