@@ -176,8 +176,9 @@ pub struct PendingFileIo {
     pub reply_cap: u64,
     /// Whether this record owns a parked synchronous syscall reply.
     pub reply_required: bool,
-    /// Whether the parked caller used the native seL4-Call transport. Native calls need only a
-    /// terminal MR0 reply; UnknownSyscall replies must restore the complete captured register frame.
+    /// Whether the parked caller used native seL4-Call rather than a fault continuation. APC
+    /// context preparation uses this captured transport; it cannot be inferred from zero resume IP.
+    pub native_call_transport: bool,
     /// Native-syscall resume context restored before replying to a synchronous request.
     pub resume_ip: u64,
     pub resume_sp: u64,
@@ -236,6 +237,31 @@ pub struct PendingFileIoReservation {
     generation: u64,
 }
 
+/// The delivery owner's lifetime identity, independent of its current provider IRP correlation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingFileIoIdentity {
+    table: u64,
+    slot: usize,
+    generation: u64,
+}
+
+impl PendingFileIoIdentity {
+    pub const fn slot(self) -> usize {
+        self.slot
+    }
+}
+
+impl PendingFileIoReservation {
+    /// The future published owner identity. It does not authorize access before publication.
+    pub const fn identity(self) -> PendingFileIoIdentity {
+        PendingFileIoIdentity {
+            table: self.table,
+            slot: self.slot,
+            generation: self.generation,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PendingFileIoParkError {
     StaleReservation,
@@ -249,6 +275,7 @@ pub enum PendingFileIoParkError {
 pub struct PendingFileIoTable {
     slots: Vec<Option<PendingFileIo>>,
     reservations: Vec<u64>,
+    owner_generations: Vec<u64>,
     local_outputs: Vec<Option<Vec<u8>>>,
     next_reservation_generation: u64,
     initial_reserve: usize,
@@ -281,6 +308,7 @@ impl PendingFileIoTable {
         Self {
             slots: Vec::new(),
             reservations: Vec::new(),
+            owner_generations: Vec::new(),
             local_outputs: Vec::new(),
             next_reservation_generation: 1,
             initial_reserve,
@@ -319,6 +347,16 @@ impl PendingFileIoTable {
                 return false;
             }
         }
+        if self.owner_generations.len() == self.owner_generations.capacity() {
+            let reserve = if self.owner_generations.capacity() == 0 {
+                self.initial_reserve.max(1)
+            } else {
+                1
+            };
+            if self.owner_generations.try_reserve(reserve).is_err() {
+                return false;
+            }
+        }
         true
     }
 
@@ -329,6 +367,7 @@ impl PendingFileIoTable {
         }
         self.slots.clear();
         self.reservations.clear();
+        self.owner_generations.clear();
         self.local_outputs.clear();
         if self.slots.capacity() < self.initial_reserve {
             let additional = self.initial_reserve - self.slots.capacity();
@@ -345,6 +384,12 @@ impl PendingFileIoTable {
         if self.local_outputs.capacity() < self.initial_reserve {
             let additional = self.initial_reserve - self.local_outputs.capacity();
             if self.local_outputs.try_reserve(additional).is_err() {
+                return false;
+            }
+        }
+        if self.owner_generations.capacity() < self.initial_reserve {
+            let additional = self.initial_reserve - self.owner_generations.capacity();
+            if self.owner_generations.try_reserve(additional).is_err() {
                 return false;
             }
         }
@@ -492,6 +537,7 @@ impl PendingFileIoTable {
                 self.grow_reservation().then(|| {
                     self.slots.push(None);
                     self.reservations.push(0);
+                    self.owner_generations.push(0);
                     self.local_outputs.push(None);
                     self.slots.len() - 1
                 })
@@ -596,6 +642,7 @@ impl PendingFileIoTable {
             busy.publish_reserved_identity(reservation);
         }
         self.slots[reservation.slot] = Some(pending);
+        self.owner_generations[reservation.slot] = reservation.generation;
         self.reservations[reservation.slot] = 0;
         Ok(reservation.slot)
     }
@@ -625,6 +672,7 @@ impl PendingFileIoTable {
     pub fn is_empty(&self) -> bool {
         self.slots.iter().all(Option::is_none)
             && self.reservations.iter().all(|generation| *generation == 0)
+            && self.owner_generations.iter().all(|generation| *generation == 0)
             && self.local_outputs.iter().all(Option::is_none)
     }
 
@@ -640,6 +688,10 @@ impl PendingFileIoTable {
         self.local_outputs.capacity()
     }
 
+    pub fn owner_generation_allocation_capacity(&self) -> usize {
+        self.owner_generations.capacity()
+    }
+
     pub fn has_capacity(&self) -> bool {
         self.slots
             .iter()
@@ -647,6 +699,7 @@ impl PendingFileIoTable {
             .any(|(slot, reservation)| slot.is_none() && *reservation == 0)
             || (self.slots.len() < self.slots.capacity()
                 && self.reservations.len() < self.reservations.capacity()
+                && self.owner_generations.len() < self.owner_generations.capacity()
                 && self.local_outputs.len() < self.local_outputs.capacity())
     }
 
@@ -665,6 +718,28 @@ impl PendingFileIoTable {
 
     pub fn get(&self, slot: usize) -> Option<PendingFileIo> {
         self.slots.get(slot).copied().flatten()
+    }
+
+    pub fn identity(&self, slot: usize) -> Option<PendingFileIoIdentity> {
+        self.get(slot)?;
+        let generation = *self.owner_generations.get(slot)?;
+        (self.identity != 0 && generation != 0).then_some(PendingFileIoIdentity {
+            table: self.identity,
+            slot,
+            generation,
+        })
+    }
+
+    pub fn get_exact(&self, identity: PendingFileIoIdentity) -> Option<PendingFileIo> {
+        (self.identity(identity.slot) == Some(identity))
+            .then(|| self.get(identity.slot))
+            .flatten()
+    }
+
+    pub fn drain_exact(&self) -> impl Iterator<Item = (PendingFileIoIdentity, PendingFileIo)> + '_ {
+        self.drain_all().filter_map(|(slot, pending)| {
+            self.identity(slot).map(|identity| (identity, pending))
+        })
     }
 
     /// Find one synchronous operation owner whose alertable wait can be
@@ -1046,6 +1121,7 @@ impl PendingFileIoTable {
         };
         if finished.is_some() {
             self.local_outputs[slot] = None;
+            self.owner_generations[slot] = 0;
         }
         finished
     }
@@ -1267,6 +1343,7 @@ impl PendingFileIoTable {
         pending.event_obj_idx = u64::MAX;
         pending.reply_cap = 0;
         pending.reply_required = false;
+        pending.native_call_transport = false;
         pending.resume_ip = 0;
         pending.resume_sp = 0;
         pending.resume_flags = 0;
@@ -1315,6 +1392,7 @@ impl PendingFileIoTable {
             return None;
         }
         self.local_outputs[slot] = None;
+        self.owner_generations[slot] = 0;
         self.slots[slot].take()
     }
 
@@ -1349,6 +1427,7 @@ impl PendingFileIoTable {
             }) {
                 let pending = slot.take().unwrap();
                 self.local_outputs[index] = None;
+                self.owner_generations[index] = 0;
                 take(pending);
                 count += 1;
             }
@@ -1359,6 +1438,9 @@ impl PendingFileIoTable {
 
 #[path = "pending_io/local_output.rs"]
 mod local_output;
+
+#[path = "pending_io/identity.rs"]
+mod identity;
 
 #[path = "pending_io/local_flush.rs"]
 mod local_flush;
@@ -1436,6 +1518,7 @@ mod tests {
             event_obj_idx: 7,
             reply_cap: 0x50,
             reply_required: true,
+            native_call_transport: false,
             resume_ip: 0x5000,
             resume_sp: 0x6000,
             resume_flags: 0x202,

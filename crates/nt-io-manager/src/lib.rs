@@ -142,7 +142,7 @@ pub use pending_io::{
     FileIoBusyOwner, PendingFileBusy, PendingFileBusyError, PendingFileBusyPhase,
     PendingFileBusyReleaseAttempt, PendingFileBusyWakeAttempt,
     PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoParkError,
-    LocalFlushMode, PendingFileIoReservation, PendingFileIoTable, PendingLocalBuffered,
+    LocalFlushMode, PendingFileIoIdentity, PendingFileIoReservation, PendingFileIoTable, PendingLocalBuffered,
     PendingLocalByteLock, PendingLocalDirectoryNotify, PendingLocalFlush, PendingLocalInline,
     PendingSetFileNameOperation,
     IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_BACKEND_ACKED, IO_DELIVERY_BUFFER_PUBLISHED,

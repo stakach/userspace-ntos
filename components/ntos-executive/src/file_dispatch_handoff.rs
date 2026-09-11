@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) struct PublishedFileIo {
-    slot: usize,
+    identity: nt_io_manager::PendingFileIoIdentity,
     irp_id: u64,
     badge: u64,
     pub tid: u64,
@@ -15,7 +15,7 @@ impl PublishedFileIo {
         self.wait_for_completion
             && thread_wait_state_badge_parked(self.badge)
             && (&*core::ptr::addr_of!(PENDING_FILE_IO))
-                .get(self.slot)
+                .get_exact(self.identity)
                 .is_some_and(|pending| {
                     pending.irp_id == self.irp_id
                         && pending.tid == self.tid
@@ -30,6 +30,7 @@ impl PublishedFileIo {
 pub(super) unsafe fn before_post_action(
     nt_handler: &mut ExecNtHandler,
     action: ExecPostAction,
+    native_call_transport: bool,
     resume_ip: u64,
     sp: u64,
     flags: u64,
@@ -72,10 +73,12 @@ pub(super) unsafe fn before_post_action(
         let wait_for_completion = nt_handler.pending_file_io_wait && !terminating;
         // The source remains in the handler until publication succeeds. Continuing synchronous
         // calls attach their reply in this same commit, never exposing an unarmed delivery row.
-        let slot = pending_file_io_transfer(
+        let identity = reservation.identity();
+        pending_file_io_transfer(
             pending,
             wait_for_completion,
             reservation,
+            native_call_transport,
             resume_ip,
             sp,
             flags,
@@ -88,7 +91,7 @@ pub(super) unsafe fn before_post_action(
             thread_wait_state_park_badge_waiting(nt_handler, pending.badge);
         }
         Some(PublishedFileIo {
-            slot,
+            identity,
             irp_id: pending.irp_id,
             badge: pending.badge,
             tid: pending.tid,
@@ -115,7 +118,7 @@ pub(super) unsafe fn before_post_action(
         // The current main Reply was never transferred. Post-action teardown deletes it; the
         // published File owner instead retains real cancellation/completion and Busy retirement.
         // CREATE deliberately continues through the existing specialized unpublished-handle path.
-        nt_handler.abandon_new_file_io_exact(owner.slot, owner.irp_id);
+        nt_handler.abandon_new_file_io_exact(owner.identity, owner.irp_id);
     }
     published
 }

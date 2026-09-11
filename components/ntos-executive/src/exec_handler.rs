@@ -14073,6 +14073,7 @@ impl ExecNtHandler {
                     event_obj_idx,
                     reply_cap: 0,
                     reply_required: false,
+                    native_call_transport: self.current_native_call_transport,
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -14144,18 +14145,22 @@ impl ExecNtHandler {
 
     /// Detach a just-published terminating caller before general teardown can refuse or reenter.
     /// Its main Reply remains with the post-action, not with this exact pending operation.
-    pub(crate) unsafe fn abandon_new_file_io_exact(&mut self, slot: usize, irp_id: u64) {
+    pub(crate) unsafe fn abandon_new_file_io_exact(
+        &mut self,
+        identity: nt_io_manager::PendingFileIoIdentity,
+        irp_id: u64,
+    ) {
         let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
-        let pending = table.get(slot).expect("new File owner disappeared before abandonment");
+        let pending = table.get_exact(identity).expect("new File owner disappeared before abandonment");
         assert_eq!(pending.irp_id, irp_id);
         assert_eq!(pending.reply_cap, 0);
         assert!(!pending.reply_required);
         if matches!(pending.operation, nt_io_manager::PendingFileIoOperation::Create(_)) {
-            let pending = table.take_create_exact(slot, irp_id)
+            let pending = table.take_create_owner_exact(identity, irp_id)
                 .expect("new CREATE refused its unpublished-handle rollback");
             self.abandon_file_create(pending);
         } else {
-            let pending = table.abandon_transfer_exact(slot, irp_id)
+            let pending = table.abandon_transfer_owner_exact(identity, irp_id)
                 .expect("new File transfer refused consumer abandonment");
             self.cancel_abandoned_file_transfer(pending);
             self.publish_local_byte_lock_completions();
@@ -14548,6 +14553,7 @@ impl ExecNtHandler {
                 event_obj_idx,
                 reply_cap: 0,
                 reply_required: false,
+                native_call_transport: self.current_native_call_transport,
                 resume_ip: 0,
                 resume_sp: 0,
                 resume_flags: 0,
@@ -14619,6 +14625,7 @@ impl ExecNtHandler {
                 event_obj_idx,
                 reply_cap: 0,
                 reply_required: false,
+                native_call_transport: self.current_native_call_transport,
                 resume_ip: 0,
                 resume_sp: 0,
                 resume_flags: 0,
@@ -14816,6 +14823,7 @@ impl ExecNtHandler {
                         event_obj_idx,
                         reply_cap: 0,
                         reply_required: false,
+                        native_call_transport: self.current_native_call_transport,
                         resume_ip: 0,
                         resume_sp: 0,
                         resume_flags: 0,
@@ -14890,6 +14898,7 @@ impl ExecNtHandler {
                     event_obj_idx,
                     reply_cap: 0,
                     reply_required: false,
+                    native_call_transport: self.current_native_call_transport,
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -15021,6 +15030,7 @@ impl ExecNtHandler {
                 event_obj_idx: u64::MAX,
                 reply_cap: 0,
                 reply_required: false,
+                native_call_transport: self.current_native_call_transport,
                 resume_ip: 0,
                 resume_sp: 0,
                 resume_flags: 0,
@@ -27723,6 +27733,7 @@ impl ExecNtHandler {
                 event_obj_idx: u64::MAX,
                 reply_cap: 0,
                 reply_required: false,
+                native_call_transport: self.current_native_call_transport,
                 resume_ip: 0,
                 resume_sp: 0,
                 resume_flags: 0,
@@ -28249,6 +28260,7 @@ impl ExecNtHandler {
                     event_obj_idx: u64::MAX,
                     reply_cap: 0,
                     reply_required: false,
+                    native_call_transport: self.current_native_call_transport,
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -28341,6 +28353,7 @@ impl ExecNtHandler {
                     event_obj_idx: u64::MAX,
                     reply_cap: 0,
                     reply_required: false,
+                    native_call_transport: self.current_native_call_transport,
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -28432,6 +28445,7 @@ impl ExecNtHandler {
                     event_obj_idx: u64::MAX,
                     reply_cap: 0,
                     reply_required: false,
+                    native_call_transport: self.current_native_call_transport,
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -28524,6 +28538,7 @@ impl ExecNtHandler {
                     event_obj_idx: u64::MAX,
                     reply_cap: 0,
                     reply_required: false,
+                    native_call_transport: self.current_native_call_transport,
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -28613,6 +28628,7 @@ impl ExecNtHandler {
                     event_obj_idx: u64::MAX,
                     reply_cap: 0,
                     reply_required: false,
+                    native_call_transport: self.current_native_call_transport,
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -28706,6 +28722,7 @@ impl ExecNtHandler {
                     event_obj_idx: u64::MAX,
                     reply_cap: 0,
                     reply_required: false,
+                    native_call_transport: self.current_native_call_transport,
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -28791,6 +28808,7 @@ impl ExecNtHandler {
                     event_obj_idx: u64::MAX,
                     reply_cap: 0,
                     reply_required: false,
+                    native_call_transport: self.current_native_call_transport,
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -29122,6 +29140,7 @@ impl ExecNtHandler {
             event_obj_idx: u64::MAX,
             reply_cap: 0,
             reply_required: false,
+            native_call_transport: self.current_native_call_transport,
             resume_ip: 0,
             resume_sp: 0,
             resume_flags: 0,
@@ -36181,6 +36200,7 @@ impl ExecNtHandler {
                             event_obj_idx,
                             reply_cap: 0,
                             reply_required: false,
+                            native_call_transport: self.current_native_call_transport,
                             resume_ip: 0,
                             resume_sp: 0,
                             resume_flags: 0,
@@ -41349,6 +41369,7 @@ impl ExecNtHandler {
                                 event_obj_idx: u64::MAX,
                                 reply_cap: 0,
                                 reply_required: false,
+                                native_call_transport: self.current_native_call_transport,
                                 resume_ip: 0,
                                 resume_sp: 0,
                                 resume_flags: 0,
@@ -43303,6 +43324,7 @@ impl ExecNtHandler {
                         event_obj_idx,
                         reply_cap: 0,
                         reply_required: false,
+                        native_call_transport: self.current_native_call_transport,
                         resume_ip: 0,
                         resume_sp: 0,
                         resume_flags: 0,
@@ -43839,6 +43861,7 @@ impl ExecNtHandler {
                         event_obj_idx,
                         reply_cap: 0,
                         reply_required: false,
+                        native_call_transport: self.current_native_call_transport,
                         resume_ip: 0,
                         resume_sp: 0,
                         resume_flags: 0,
@@ -44303,6 +44326,7 @@ impl ExecNtHandler {
                             event_obj_idx: u64::MAX,
                             reply_cap: 0,
                             reply_required: false,
+                            native_call_transport: self.current_native_call_transport,
                             resume_ip: 0,
                             resume_sp: 0,
                             resume_flags: 0,

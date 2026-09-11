@@ -33278,6 +33278,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     normalization. No extra driver instance, thread serialization fallback or APC payload stub is
     introduced.
 
+    Pending-IRP owner identity and transport prerequisite (2026-09-11, host/build verified):
+    - [x] Preserve the pre-dispatch reservation's table/slot/generation for every live pending File
+      row, including local non-Busy operations and zero-valued local File identities. Reserve the
+      parallel generation storage before dispatch; publication neither allocates nor mints another
+      identity. Clear live generations on each removal path and keep reset/reuse from aliasing an
+      old owner. Consumer abandonment retains the same IRP owner until real completion retirement.
+    - [x] Carry that exact identity through native publication, terminating-caller abandonment,
+      completion snapshots/live reads, rename/link IRP transitions and final retirement. Check the
+      expected current IRP separately so an earlier transaction phase cannot authorize a later one.
+      Reject stale snapshots after provider completion lookup and refresh the live row before
+      selecting process mirrors and continuation fields.
+    - [x] Capture native Call versus fault transport from the original ingress alongside the parked
+      continuation, for both local and provider operations. Restore it while redriving the exact
+      owner and restore the active handler's transport on exit. Do not infer transport from a zero
+      resume address or change the terminal Reply algorithm as part of this prerequisite.
+    - [x] Complete serialized contract, focused/broad host regression and executive release build.
+      All 540 I/O-manager unit tests, 1,917 focused host/doc tests and 3,465 broad host/doc tests
+      passed, with no failures or ignored cases. Eight new identity tests cover foreign tables,
+      identical numeric IRP/thread/Reply reuse, table moves/reset, local non-Busy namespaces,
+      retained abandonment and every extraction path. Rename/link transitions preserve both the
+      owner generation and captured transport/context while rejecting stale IRP phases. Reservation
+      tests also check the fourth storage array's capacity/pointer and publication after identity
+      budgets are exhausted. The executive release build passed in 38.18s with the unchanged 294
+      warnings. Evidence: `.tmp/test-pending-file-identity-contract-20260911.log`,
+      `.tmp/test-pending-file-identity-focused-20260911.log`,
+      `.tmp/test-pending-file-identity-full-20260911.log`, and
+      `.tmp/build-pending-file-identity-executive-20260911.log`. All runners were serialized.
+      Independent reviews covered storage invalidation, publication budget, native transport and
+      completion snapshot wiring. This is host/build evidence, not native APC/Reply injection or
+      desktop acceptance. No VM run or microkernel change occurred.
+
+    Review adjustment: reservation generations previously survived only inside Busy ownership;
+    local pending operations had no full live generation at all. This closes that prerequisite,
+    not the whole completion pipeline. Mid-pass output/event/APC/Reply mutations still include
+    slot-plus-IRP adapters across reentrant effects and need exact retained invocation ownership.
+    Next, reserve native provenance storage and capture the original logical caller before dispatch,
+    claim the queued APC when interruption is selected, and attach interruption control to the same
+    pending row. Distinguish cancellation selection from terminal IRP
+    completion. Cancellation acceptance is not proof of STATUS_CANCELLED: preserve a real success
+    that wins the race, and stage with the actual terminal status. Hold the exact PM APC claim
+    through checked frame preparation, register installation, send and acknowledged-send capability
+    retirement; uncertain effects must not replay. Teardown/extraction and runtime guards must
+    respect entered effects. Ordinary I/O completion APC publication remains a separate surface.
+
     General pending-IRP/current-thread APC paths still use older staging/delivery adapters and need
     separate cutovers. Ordinary signal/timeout Reply failures, non-APC object-wait teardown and
     inline terminal Busy/reference failure retention also remain open. No VM run or microkernel

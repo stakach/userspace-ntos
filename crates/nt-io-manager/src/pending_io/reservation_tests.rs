@@ -68,6 +68,7 @@ fn identity_exhaustion_refuses_before_creating_any_claim_or_storage() {
     assert_eq!(table.next_reservation_generation, 1);
     assert_eq!(table.allocation_capacity(), (0, 0));
     assert_eq!(table.local_output_allocation_capacity(), 0);
+    assert_eq!(table.owner_generation_allocation_capacity(), 0);
     assert!(table.is_empty());
 
     let source = AtomicU64::new(1);
@@ -89,18 +90,21 @@ fn reserved_last_generation_commits_busy_after_both_budgets_are_exhausted() {
     let capacity = (
         table.allocation_capacity(),
         table.local_output_allocation_capacity(),
+        table.owner_generation_allocation_capacity(),
     );
     let pointers = (
         table.slots.as_ptr(),
         table.reservations.as_ptr(),
         table.local_outputs.as_ptr(),
+        table.owner_generations.as_ptr(),
     );
     let slot = table.park_reserved(reservation, pending()).unwrap();
     assert_eq!(
         capacity,
         (
             table.allocation_capacity(),
-            table.local_output_allocation_capacity()
+            table.local_output_allocation_capacity(),
+            table.owner_generation_allocation_capacity(),
         )
     );
     assert_eq!(
@@ -108,11 +112,13 @@ fn reserved_last_generation_commits_busy_after_both_budgets_are_exhausted() {
         (
             table.slots.as_ptr(),
             table.reservations.as_ptr(),
-            table.local_outputs.as_ptr()
+            table.local_outputs.as_ptr(),
+            table.owner_generations.as_ptr(),
         )
     );
     assert_eq!(source.load(Ordering::Relaxed), u64::MAX);
     assert_eq!(table.next_reservation_generation, 0);
+    assert_eq!(table.identity(slot), Some(reservation.identity()));
     settle_test_busy(&mut table, slot, 12);
     table.mark_backend_acked_exact(slot, 12).unwrap();
     table.finish_exact(slot, 12).unwrap();

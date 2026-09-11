@@ -11540,7 +11540,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 published_file_io = file_dispatch_handoff::before_post_action(
-                    &mut nt_handler, post_action, resume_ip, sp, flags,
+                    &mut nt_handler, post_action, native_call_transport, resume_ip, sp, flags,
                 );
                 let post_action_process = match post_action {
                     ExecPostAction::TerminateProcess { process_index, .. } => Some(process_index),
@@ -24807,10 +24807,11 @@ unsafe fn pending_file_io_transfer(
     mut pending: nt_io_manager::PendingFileIo,
     wait_for_completion: bool,
     reservation: nt_io_manager::PendingFileIoReservation,
+    native_call_transport: bool,
     resume_ip: u64,
     sp: u64,
     flags: u64,
-) -> usize {
+) {
     fn commit_error_code(error: nt_io_manager::PendingFileIoParkError) -> u64 {
         match error {
             nt_io_manager::PendingFileIoParkError::StaleReservation => 1,
@@ -24825,9 +24826,9 @@ unsafe fn pending_file_io_transfer(
         reservation: nt_io_manager::PendingFileIoReservation,
         pending: nt_io_manager::PendingFileIo,
         synchronous: bool,
-    ) -> usize {
+    ) {
         let error = match table.park_reserved(reservation, pending) {
-            Ok(slot) => return slot,
+            Ok(_) => return,
             Err(error) => error,
         };
         print_str(b"[pending-file-owner] commit rejected error/file/irp/major/pi/tid/badge/sync/reply=");
@@ -24865,6 +24866,7 @@ unsafe fn pending_file_io_transfer(
         panic!("pre-dispatch pending File reservation rejected its exact IRP");
     }
 
+    pending.native_call_transport = native_call_transport;
     if !wait_for_completion {
         let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
         return commit_or_panic(table, reservation, pending, false);
@@ -24882,10 +24884,9 @@ unsafe fn pending_file_io_transfer(
     pending.resume_sp = sp;
     pending.resume_flags = flags;
     let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
-    let slot = commit_or_panic(table, reservation, pending, true);
+    commit_or_panic(table, reservation, pending, true);
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
-    slot
 }
 
 unsafe fn file_irp_drain_transfer(
@@ -24971,6 +24972,7 @@ unsafe fn pending_file_io_redrive_pass(
     let saved_resume_ip = nt_handler.current_resume_ip;
     let saved_sp = nt_handler.current_sp;
     let saved_flags = nt_handler.current_flags;
+    let saved_native_call_transport = nt_handler.current_native_call_transport;
     let saved_ctx = nt_handler.loop_ctx;
     macro_rules! restore_file_io_mirrors {
         () => {{
@@ -24986,12 +24988,13 @@ unsafe fn pending_file_io_redrive_pass(
             nt_handler.current_resume_ip = saved_resume_ip;
             nt_handler.current_sp = saved_sp;
             nt_handler.current_flags = saved_flags;
+            nt_handler.current_native_call_transport = saved_native_call_transport;
             nt_handler.loop_ctx = saved_ctx;
         }};
     }
 
     let mut snapshot: alloc::vec::Vec<_> = (&*core::ptr::addr_of!(PENDING_FILE_IO))
-        .drain_all()
+        .drain_exact()
         .filter(|(_, pending)| !finish_settled_busy_only
             || pending.busy.is_some_and(|busy| busy.is_settled()))
         .collect();
@@ -25005,9 +25008,10 @@ unsafe fn pending_file_io_redrive_pass(
         )
     });
     let mut delivered = 0u64;
-    for (slot, mut pending) in snapshot {
+    for (identity, mut pending) in snapshot {
+        let slot = identity.slot();
         let Some(live) = (&*core::ptr::addr_of!(PENDING_FILE_IO))
-            .get(slot).filter(|live| live.irp_id == pending.irp_id)
+            .get_exact(identity).filter(|live| live.irp_id == pending.irp_id)
         else { continue; };
         pending = live;
         let hosted_file_id = pending.route.hosted_file_id();
@@ -25053,6 +25057,12 @@ unsafe fn pending_file_io_redrive_pass(
         } else {
             driver_launch::completed_irp_exact(pending.irp_id)
         };
+        // Provider completion lookup may dispatch nested work and retire/reuse this slot.
+        if !(&*core::ptr::addr_of!(PENDING_FILE_IO))
+            .get_exact(identity).is_some_and(|live| live.irp_id == pending.irp_id)
+        {
+            continue;
+        }
         if completed.is_none() && transaction_terminal.is_none() && local_terminal.is_none() {
             if !pending.is_local() && driver_launch::completed_irp_copy_requires_retry(pending.irp_id) {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
@@ -25088,6 +25098,10 @@ unsafe fn pending_file_io_redrive_pass(
             nt_handler.pipe_endpoint_progress = true;
         }
 
+        let Some(live) = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+            .get_exact(identity).filter(|live| live.irp_id == pending.irp_id)
+        else { continue; };
+        pending = live;
         let (sb, ss, smv, hmv, scratch_base) =
             mirror_ctx_for(pending.badge, pending.pi as usize);
         ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
@@ -25103,14 +25117,8 @@ unsafe fn pending_file_io_redrive_pass(
         nt_handler.current_resume_ip = pending.resume_ip;
         nt_handler.current_sp = pending.resume_sp;
         nt_handler.current_flags = pending.resume_flags;
+        nt_handler.current_native_call_transport = pending.native_call_transport;
 
-        let Some(live) = (&*core::ptr::addr_of!(PENDING_FILE_IO))
-            .get(slot).filter(|live| live.irp_id == pending.irp_id)
-        else {
-            restore_file_io_mirrors!();
-            continue;
-        };
-        pending = live;
         let mut delivery_state = pending.delivery_state;
         let mut terminal_status = transaction_terminal
             .map(|result| result.0)
@@ -25238,8 +25246,8 @@ unsafe fn pending_file_io_redrive_pass(
                                             ))
                                                 .restore_update(transaction_id, transaction));
                                             (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-                                                .retarget_set_file_name_query_exact(
-                                                    slot,
+                                                .retarget_set_file_name_query_owner_exact(
+                                                    identity,
                                                     pending.irp_id,
                                                     create_irp.raw(),
                                                     nt_io_abi::major::IRP_MJ_CREATE,
@@ -25292,8 +25300,8 @@ unsafe fn pending_file_io_redrive_pass(
                                                 ))
                                                     .restore_update(transaction_id, transaction));
                                                 (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-                                                    .retarget_set_file_name_query_exact(
-                                                        slot,
+                                                    .retarget_set_file_name_query_owner_exact(
+                                                        identity,
                                                         pending.irp_id,
                                                         irp_id.raw(),
                                                         nt_io_abi::major::IRP_MJ_SET_INFORMATION,
@@ -25401,8 +25409,8 @@ unsafe fn pending_file_io_redrive_pass(
                                     ))
                                         .restore_update(transaction_id, transaction));
                                     (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-                                        .retarget_set_file_name_irp_exact(
-                                            slot,
+                                        .retarget_set_file_name_irp_owner_exact(
+                                            identity,
                                             pending.irp_id,
                                             irp_id.raw(),
                                         )
@@ -25498,12 +25506,12 @@ unsafe fn pending_file_io_redrive_pass(
                     nt_handler.pipe_endpoint_progress = true;
                 }
                 delivery_state = (&*core::ptr::addr_of!(PENDING_FILE_IO))
-                    .get(slot)
+                    .get_exact(identity)
                     .expect("committed pending CREATE owner disappeared")
                     .delivery_state;
             }
             let committed = (&*core::ptr::addr_of!(PENDING_FILE_IO))
-                .get(slot)
+                .get_exact(identity)
                 .expect("committed pending CREATE owner disappeared");
             let nt_io_manager::PendingFileIoOperation::Create(create) = committed.operation else {
                 panic!("pending CREATE changed operation kind");
@@ -25557,7 +25565,7 @@ unsafe fn pending_file_io_redrive_pass(
                     .expect("terminal File output exceeds delivery target")
             };
             let mut offset = (&*core::ptr::addr_of!(PENDING_FILE_IO))
-                .get(slot)
+                .get_exact(identity)
                 .expect("pending File output owner disappeared")
                 .output_offset;
             let mut copy_failed = false;
@@ -25618,7 +25626,7 @@ unsafe fn pending_file_io_redrive_pass(
                 continue;
             }
             delivery_state = (&*core::ptr::addr_of!(PENDING_FILE_IO))
-                .get(slot)
+                .get_exact(identity)
                 .expect("published File output owner disappeared")
                 .delivery_state;
         }
@@ -25662,7 +25670,7 @@ unsafe fn pending_file_io_redrive_pass(
                 }
             }
             .expect("pending File IOSB owner disappeared");
-            pending = table.get(slot).expect("settled File IOSB owner disappeared");
+            pending = table.get_exact(identity).expect("settled File IOSB owner disappeared");
         }
 
         if pending.event_obj_idx != u64::MAX
@@ -25843,7 +25851,7 @@ unsafe fn pending_file_io_redrive_pass(
         }
         let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
         let finished = table
-            .finish_exact(slot, pending.irp_id)
+            .finish_owner_exact(identity, pending.irp_id)
             .expect("completed pending File owner did not retire");
         match finished.operation {
             nt_io_manager::PendingFileIoOperation::Transfer => {
