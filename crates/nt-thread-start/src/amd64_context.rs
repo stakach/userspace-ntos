@@ -29,6 +29,10 @@ mod debug_context;
 mod floating_point;
 mod register_publication;
 mod native_continuation;
+mod user_apc;
+pub use user_apc::{
+    prepare_user_apc, PreparedUserApc, UserApcContinuation, UserApcPayload,
+};
 pub use continue_context::{
     LegacyContextRestore, NT_NATIVE_CODE_SELECTOR, PLATFORM_NATIVE_CODE_SELECTOR,
 };

@@ -184,7 +184,6 @@ fn cancellation_owns_all_effects_and_legacy_paths_cannot_extract_it() {
     assert!(!table.has_retry_delivery_for_thread(TID));
     assert!(table.oldest_waiting_for_file(KEY).is_none());
     assert!(table.alertable_waiting_for_thread(TID).is_none());
-    assert!(table.take_alertable_waiting_exact(slot, KEY, TID).is_none());
     assert!(table.promote_exact(slot, KEY, TID).is_none());
     assert!(table.take_exact(slot, KEY, TID).is_none());
     assert_eq!(table.request_thread_cancellation(TID), 0);

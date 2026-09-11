@@ -305,16 +305,14 @@ fn exact_route_cancellation_uses_each_domains_reference_contract() {
     let hosted_slot = queue.park(waiter(hosted(file), 40)).unwrap();
 
     assert!(queue
-        .take_alertable_waiting_exact(local_slot, FileIoWaitKey::Hosted(file), 20)
+        .wait_identity(local_slot, FileIoWaitKey::Hosted(file), 20)
         .is_none());
     assert!(queue
         .take_exact(hosted_slot, FileIoWaitKey::LocalOverlay(file), 40)
         .is_none());
     assert_eq!(fs.zw_file_io_state(file).unwrap().references, 3);
     assert_eq!(files.io_waiter_count(file), Ok(1));
-    let cancelled = queue
-        .take_alertable_waiting_exact(local_slot, local(file).key(), 20)
-        .unwrap();
+    let cancelled = queue.take_exact(local_slot, local(file).key(), 20).unwrap();
     assert_eq!(cancelled.route, local(file));
     assert_eq!(fs.zw_cancel_file_io_waiter(file), Ok(0));
     let after = fs.zw_file_io_state(file).unwrap();

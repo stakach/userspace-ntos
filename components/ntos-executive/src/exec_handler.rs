@@ -66,7 +66,7 @@ const STATUS_DEVICE_DATA_ERROR: u32 = 0xC000_009C;
 const STATUS_UNHANDLED_EXCEPTION: u32 = 0xC000_0144;
 const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
 const STATUS_IO_DEVICE_ERROR: u32 = 0xC000_0185;
-const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
+pub(crate) const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
 const NT_CREATE_THREAD_CLIENT_ID_ARG: usize = 4;
 const NT_CREATE_THREAD_CONTEXT_ARG: usize = 5;
 const NT_CREATE_THREAD_INITIAL_TEB_ARG: usize = 6;
@@ -13784,14 +13784,6 @@ impl ExecNtHandler {
         if let Ok(release) = self.file_completion.release_file(file_id) {
             self.complete_file_reference_release(file_id, release);
         }
-    }
-
-    /// A cancelled acquisition owns a separate reference, never the current syscall's deferred
-    /// Busy reference. Release it independently and report a failed ownership transition.
-    pub(crate) fn release_hosted_file_waiter_reference(&mut self, file_id: u64) -> Result<(), u32> {
-        let release = self.file_completion.release_file(file_id)?;
-        self.complete_file_reference_release(file_id, release);
-        Ok(())
     }
 
     fn release_file_handle_reference(&mut self, file_id: u64) {

@@ -61,9 +61,6 @@ fn assert_retained(table: &mut SynchronousFileWaitTable, identity: SynchronousFi
     assert!(table
         .take_exact(identity.slot, original.key(), original.tid)
         .is_none());
-    assert!(table
-        .take_alertable_waiting_exact(identity.slot, original.key(), original.tid)
-        .is_none());
     assert!(table.alertable_waiting_for_thread(original.tid).is_none());
     assert!(table.has_runtime_dependency_for_thread(original.tid));
     assert!(table

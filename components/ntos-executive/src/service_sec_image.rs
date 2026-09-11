@@ -14,13 +14,13 @@ mod synchronous_file_retry;
 mod synchronous_file_wait;
 #[path = "synchronous_file_cancellation.rs"]
 pub(crate) mod synchronous_file_cancellation;
+#[path = "synchronous_file_apc.rs"]
+mod synchronous_file_apc;
 #[path = "pending_file_busy.rs"]
 mod pending_file_busy;
 #[path = "file_dispatch_handoff.rs"]
 mod file_dispatch_handoff;
-pub(crate) use synchronous_file_wait::{
-    synchronous_file_cancel_waiter, synchronous_file_release_and_wake,
-};
+pub(crate) use synchronous_file_wait::synchronous_file_release_and_wake;
 
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -24249,37 +24249,7 @@ unsafe fn reconcile_user_apc_file_acquisition_wait(
     nt_handler: &mut ExecNtHandler,
     tid: u64,
 ) -> bool {
-    let Some((slot, waiter)) =
-        (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).alertable_waiting_for_thread(tid)
-    else {
-        return false;
-    };
-    let Ok(target_tid) = nt_process::ThreadId::try_from(tid) else {
-        return false;
-    };
-    if nt_handler.pm.peek_user_apc(target_tid).is_none() {
-        return false;
-    }
-    if !stage_parked_thread_user_apc(
-        nt_handler,
-        waiter.pi as usize,
-        waiter.badge,
-        waiter.tid,
-        waiter.resume_ip,
-        waiter.resume_sp,
-        waiter.resume_flags,
-    ) {
-        return false;
-    }
-
-    let removed = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-        .take_alertable_waiting_exact(slot, waiter.key(), waiter.tid)
-        .expect("staged File-wait APC lost its exact FIFO owner");
-    synchronous_file_cancel_waiter(nt_handler, removed);
-    let _ = client_reply_on(removed.reply_cap, 0, 0, 0, 0, 0);
-    release_reply_pool_cap(removed.reply_cap);
-    thread_wait_state_clear_badge_ready(nt_handler, removed.badge);
-    true
+    synchronous_file_apc::request(nt_handler, tid)
 }
 
 /// Reconcile a queued APC with either phase of an alertable synchronous File

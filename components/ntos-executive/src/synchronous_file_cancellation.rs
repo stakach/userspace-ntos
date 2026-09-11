@@ -20,6 +20,9 @@ fn report_failure(waiter: SynchronousFileWaiter, effect: Effect, status: u32) {
             Effect::ReferenceFollowup => b"reference-followup",
             Effect::RevokeReply => b"reply-revoke",
             Effect::RetireReplyCap => b"reply-retire",
+            Effect::StageUserApc => b"apc-stage",
+            Effect::SendUserApc => b"apc-send",
+            Effect::RetireApcReplyCap => b"apc-reply-retire",
         });
         print_str(b" file=");
         match waiter.key() {
@@ -73,7 +76,7 @@ unsafe fn cancel_policy(
     }
 }
 
-unsafe fn saved_reply_pool_index(cap: u64) -> Result<usize, u32> {
+pub(super) unsafe fn saved_reply_pool_index(cap: u64) -> Result<usize, u32> {
     if cap == 0 || cap == REPLY_MAIN_SLOT.load(Ordering::Relaxed) {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     }
@@ -113,8 +116,8 @@ pub(crate) unsafe fn drive(
     nt_handler: &mut ExecNtHandler,
     identity: SynchronousFileCancelIdentity,
 ) -> bool {
-    // Six effects at most (including reference followup), then exact owner removal.
-    for _ in 0..7 {
+    // Seven effects at most (including reference followup/APC return), then owner removal.
+    for _ in 0..8 {
         let (waiter, phase) = {
             let Ok(view) = (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).cancellation(identity)
             else {
@@ -123,6 +126,11 @@ pub(crate) unsafe fn drive(
             (*view.waiter, view.phase)
         };
         if phase == Phase::Complete {
+            if let Err(status) = synchronous_file_apc::finish(nt_handler, identity) {
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                report_failure(waiter, Effect::RetireApcReplyCap, status);
+                return false;
+            }
             (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
                 .finish_cancellation(identity)
                 .expect("settled File cancellation lost its exact owner");
@@ -135,55 +143,68 @@ pub(crate) unsafe fn drive(
         let mut attempt = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
             .begin_cancellation(identity)
             .expect("ready File cancellation lost its exact owner");
-        let result = match attempt.effect() {
-            Effect::Policy => cancel_policy(nt_handler, waiter),
-            Effect::Wake => {
-                // nt-fs may have retired its File in the preceding atomic cancellation.
-                if matches!(waiter.key(), FileIoWaitKey::LocalOverlay(_))
-                    && attempt.policy_waiters() == Some(0)
-                {
-                    Ok(Receipt::Wake)
-                } else {
-                    synchronous_file_wait::settle_synchronous_file_wake(nt_handler, waiter.key())
-                        .map(|()| Receipt::Wake)
-                }
-            }
-            Effect::HostedReference => match waiter.route {
-                FileIoWaitRoute::Hosted { file_id, .. } => nt_handler
-                    .file_completion
-                    .release_file(file_id)
-                    .map(Receipt::HostedReference),
-                FileIoWaitRoute::LocalOverlay { .. } => Err(nt_fs::STATUS_INVALID_PARAMETER),
-            },
-            Effect::ReferenceFollowup => {
-                let release = attempt
-                    .reference_release()
-                    .expect("File cancellation followup lost its reference receipt");
-                // Ordinary reference release cannot initiate CLEANUP. close_required describes
-                // policy-row retirement; it does not authorize a second driver CLOSE.
-                if release.cleanup_required {
-                    Err(nt_fs::STATUS_INVALID_PARAMETER)
-                } else if let Some(port_id) = release.port_id {
-                    nt_handler
-                        .try_release_io_completion_reference(port_id)
-                        .map(|()| Receipt::ReferenceFollowup)
-                } else {
-                    Ok(Receipt::ReferenceFollowup)
-                }
-            }
-            Effect::RevokeReply => revoke_reply(waiter.reply_cap),
-            Effect::RetireReplyCap => retire_reply_cap(waiter.reply_cap),
-        };
-        (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-            .record_cancellation(
-                &mut attempt,
+        let outcome = match attempt.effect() {
+            Effect::StageUserApc => synchronous_file_apc::stage(nt_handler, identity, waiter),
+            Effect::SendUserApc => synchronous_file_apc::send(nt_handler, identity, waiter),
+            effect => {
+                let result = match effect {
+                    Effect::Policy => cancel_policy(nt_handler, waiter),
+                    Effect::Wake => {
+                        // nt-fs may have retired its File in the preceding atomic cancellation.
+                        if matches!(waiter.key(), FileIoWaitKey::LocalOverlay(_))
+                            && attempt.policy_waiters() == Some(0)
+                        {
+                            Ok(Receipt::Wake)
+                        } else {
+                            synchronous_file_wait::settle_synchronous_file_wake(
+                                nt_handler,
+                                waiter.key(),
+                            )
+                            .map(|()| Receipt::Wake)
+                        }
+                    }
+                    Effect::HostedReference => match waiter.route {
+                        FileIoWaitRoute::Hosted { file_id, .. } => nt_handler
+                            .file_completion
+                            .release_file(file_id)
+                            .map(Receipt::HostedReference),
+                        FileIoWaitRoute::LocalOverlay { .. } => {
+                            Err(nt_fs::STATUS_INVALID_PARAMETER)
+                        }
+                    },
+                    Effect::ReferenceFollowup => {
+                        let release = attempt
+                            .reference_release()
+                            .expect("File cancellation followup lost its reference receipt");
+                        // Ordinary reference release cannot initiate CLEANUP. close_required describes
+                        // policy-row retirement; it does not authorize a second driver CLOSE.
+                        if release.cleanup_required {
+                            Err(nt_fs::STATUS_INVALID_PARAMETER)
+                        } else if let Some(port_id) = release.port_id {
+                            nt_handler
+                                .try_release_io_completion_reference(port_id)
+                                .map(|()| Receipt::ReferenceFollowup)
+                        } else {
+                            Ok(Receipt::ReferenceFollowup)
+                        }
+                    }
+                    Effect::RevokeReply => revoke_reply(waiter.reply_cap),
+                    Effect::RetireReplyCap => retire_reply_cap(waiter.reply_cap),
+                    Effect::RetireApcReplyCap => {
+                        synchronous_file_apc::retire_reply(waiter.reply_cap)
+                    }
+                    Effect::StageUserApc | Effect::SendUserApc => unreachable!(),
+                };
                 match result {
                     Ok(receipt) => Outcome::Completed(receipt),
                     Err(status) => Outcome::NotEntered(status),
-                },
-            )
+                }
+            }
+        };
+        (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
+            .record_cancellation(&mut attempt, outcome)
             .expect("File cancellation receipt lost its entered owner");
-        if let Err(status) = result {
+        if let Outcome::NotEntered(status) | Outcome::Indeterminate(status) = outcome {
             report_failure(waiter, attempt.effect(), status);
             return false;
         }

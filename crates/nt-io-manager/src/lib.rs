@@ -181,14 +181,14 @@ pub use retained_completion::{
 };
 pub use store::{GenStore, IoId};
 pub use synchronous_io::{
-    SynchronousFileAdoptedOwner, SynchronousFileAdoptionAttempt, SynchronousFileIngress,
-    SynchronousFileIngressError, SynchronousFileIngressPhase,
-    FileIoWaitKey, FileIoWaitRoute, SynchronousFileCancelAttempt, SynchronousFileCancelEffect,
+    FileIoWaitKey, FileIoWaitRoute, SynchronousFileAdoptedOwner, SynchronousFileAdoptionAttempt,
+    SynchronousFileCancelAttempt, SynchronousFileCancelDisposition, SynchronousFileCancelEffect,
     SynchronousFileCancelError, SynchronousFileCancelIdentity, SynchronousFileCancelOutcome,
     SynchronousFileCancelOwnership, SynchronousFileCancelPhase, SynchronousFileCancelReceipt,
-    SynchronousFileCancelView, SynchronousFileRetryAttempt, SynchronousFileRetryError,
-    SynchronousFileRetryIdentity,
-    SynchronousFileRetryOutcome, SynchronousFileRetryPhase, SynchronousFileRetryStats,
+    SynchronousFileCancelView, SynchronousFileIngress, SynchronousFileIngressError,
+    SynchronousFileIngressPhase, SynchronousFileRetryAttempt, SynchronousFileRetryError,
+    SynchronousFileRetryIdentity, SynchronousFileRetryOutcome, SynchronousFileRetryPhase,
+    SynchronousFileRetryStats,
     SynchronousFileRetryView, SynchronousFileWaitIdentity, SynchronousFileWaitReservation,
     SynchronousFileWaitState, SynchronousFileWaitTable, SynchronousFileWaiter,
 };

@@ -33018,6 +33018,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     - [ ] Retain parked APC staging, Reply and capability retirement independently before routing
       APC interruption through the cancellation contract. Remove the replaced adapters only when
       every producer transfers ownership through the retained path; no ignored-error fallback.
+      Acquisition-waiter interruption is implemented below; ordinary object-wait and general
+      pending-IRP APC consumers remain separate open cutovers.
 
     Native acquisition/ingress cutover (2026-09-11, complete; runtime acceptance open):
     - [x] Use exact pre-effect reservations and atomic hosted reference/Busy admission. Capture
@@ -33147,21 +33149,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     confirmed rust-micro unlinks Reply bindings before TCB reuse; these host fixtures and the
     release build are not native capability-failure or desktop acceptance evidence.
 
-    APC staging/Reply settlement and inline terminal Busy/reference failure retention remain the
-    next separate targets. The shared old cancellation helper remains solely for APC interruption
-    until that producer has retained staging/send/cap receipts. No VM run or microkernel change
-    occurred; the last measured 27 strict missing win32k imports and desktop acceptance remain open.
+    File acquisition APC interruption (2026-09-11, implemented and host/build verified;
+    native runtime acceptance remains open):
+    - [x] Keep the exact acquisition row through cancellation/wake/reference settlement, APC
+      staging, acknowledged send and pool retirement. Exclude ordinary FIFO/retry selection and
+      duplicate interruption. Entered or uncertain staging/send retains runtime ownership and is
+      never replayed automatically; teardown converts only after a definitive safe boundary.
+    - [x] Claim the exact queued APC before File effects using move-stable manager, thread-lifetime
+      and queue-entry identities. Legacy peek/take and timer-source removal cannot bypass the
+      claim. Commit that same entry after checked register installation; teardown releases an
+      unconsumed claim without unclaiming a replacement entry or another manager's ownership.
+    - [x] Reserve native provenance storage before claiming the File row. Retain the original
+      ProviderLogicalCaller and non-clone APC claim across failures. Use checked context reads,
+      explicit target-process frame writes, post-copy register/FP comparison and exact caller/APC
+      revalidation before checked installation; no global mirror swapping or unchecked dequeue.
+    - [x] Build the APC frame in nt-thread-start with real captured floating-point state and
+      transport-specific continuation semantics. Native Call restores the actual parked stub
+      RIP/RSP with RSI=one-word envelope and R10=STATUS_USER_APC, not the zero fault resume address
+      or reported Windows entry RSP. Place its frame below the live stub stack. Fault transport
+      preserves its captured syscall continuation and returns status in RAX.
+    - [x] Retire a successfully sent Reply's pool slot without deletion/retyping. Retain uncertain
+      sends and retry only failed local retirement after ACK. Remove the acquisition APC extraction
+      adapter, take_alertable_waiting_exact and the old shared fail-stop waiter-cancel/reference
+      helpers now that their last native producer has moved to retained effects.
+    - [x] Complete serialized contract, composed host regressions and executive release build.
+      All 912 contract unit tests, 1,896 focused host/doc tests and 3,156 broad host/doc tests
+      passed with no failures or ignored cases. Coverage adds 20 unit tests, four composed
+      File/APC/context regressions and a non-clone APC-claim compile-fail check. The executive
+      release build passed in 37.24s with the unchanged 294 warnings. Evidence:
+      `.tmp/test-file-wait-apc-contract-20260911.log`,
+      `.tmp/test-file-wait-apc-focused-20260911.log`,
+      `.tmp/test-file-wait-apc-full-20260911.log`, and
+      `.tmp/build-file-wait-apc-executive-20260911.log`. All runners were serialized.
+      Composed tests use controlled native-effect outcomes, not real Reply capabilities;
+      neither these tests nor the build substitute for native fault-injection or desktop proof.
 
-    Next APC review: keep the acquisition waiter in its original row through exact interruption
-    claim, File cancellation/wake/reference settlement, checked APC context staging, Reply send,
-    and successful-send pool retirement. Staging currently uses an unchecked TCB read, writes the
-    user frame before fallible register installation, and ignores APC dequeue results. Retain
-    exact runtime/thread/APC identities and stage once; a failed or uncertain send must not pop
-    another APC, restage context, or automatically resend. Successful Reply consumes its binding
-    and requires pool retirement only, unlike teardown's deletion/retyping. Add stale-identity,
-    staging-refusal, send-uncertainty, cap-retirement-retry and teardown-race coverage. Ordinary
-    object waits and general pending-IRP APC adapters remain separate consumers to audit, not
-    evidence that the acquisition-waiter implementation has already been completed.
+    Review: an empty Reply can overwrite transport return registers, but it preserves installed
+    dispatcher RIP/RSP. The APC dispatcher reloads its arguments from CONTEXT home slots, and
+    RtlRestoreContext later restores the real native stub continuation/reply envelope. Runtime
+    dependency stays held through APC completion until native provenance is retired. Converted
+    teardown retains independent cap/claim cleanup without touching reused runtime bookkeeping.
+    Partial frame copy or changed register/FP state does not consume the queued APC or authorize
+    register installation. The next checked attempt regenerates its frame from current state.
+
+    Ordinary object waits and general pending-IRP APC paths still use older staging/delivery
+    adapters and need separate cutovers; inline terminal Busy/reference failure retention also
+    remains open. No VM run or microkernel change occurred; the last measured 27 strict missing
+    win32k imports and genuine desktop acceptance remain open.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

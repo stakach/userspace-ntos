@@ -296,7 +296,12 @@ pub enum KernelUserApcSource {
 struct QueuedUserApc {
     apc: UserApc,
     source: Option<KernelUserApcSource>,
+    identity: u64,
+    claimed: bool,
 }
+
+mod user_apc;
+pub use user_apc::UserApcClaim;
 
 struct IdTable<T> {
     entries: Vec<(u32, T)>,
@@ -1092,6 +1097,8 @@ pub struct Win32Callouts {
 pub struct ProcessManager {
     /// Lazily assigned, move-stable identity for suspend-control plans.
     suspend_manager_identity: u64,
+    /// Move-stable owner identity for exact queued user-APC claims.
+    user_apc_manager_identity: u64,
     processes: IdTable<NtProcess>,
     threads: IdTable<NtThread>,
     /// Withdrawn Ps objects remain owned until their exact cleanup ticket is finished.
@@ -2851,14 +2858,7 @@ impl ProcessManager {
         {
             return Ok(false);
         }
-        thread
-            .user_apc_queue
-            .try_reserve(1)
-            .map_err(|_| STATUS_NO_MEMORY)?;
-        thread.user_apc_queue.push_back(QueuedUserApc {
-            apc,
-            source: Some(source),
-        });
+        self.queue_user_apc_to_thread(tid, apc, Some(source))?;
         Ok(true)
     }
 
@@ -2869,7 +2869,7 @@ impl ProcessManager {
         let Some(position) = thread
             .user_apc_queue
             .iter()
-            .position(|queued| queued.source == Some(source))
+            .position(|queued| queued.source == Some(source) && !queued.claimed)
         else {
             return false;
         };
@@ -2893,9 +2893,16 @@ impl ProcessManager {
             .user_apc_queue
             .try_reserve(1)
             .map_err(|_| STATUS_NO_MEMORY)?;
-        thread
-            .user_apc_queue
-            .push_back(QueuedUserApc { apc, source });
+        let identity = user_apc::allocate_identity()?;
+        if self.user_apc_manager_identity == 0 {
+            self.user_apc_manager_identity = user_apc::allocate_identity()?;
+        }
+        thread.user_apc_queue.push_back(QueuedUserApc {
+            apc,
+            source,
+            identity,
+            claimed: false,
+        });
         Ok(())
     }
 
@@ -2907,15 +2914,19 @@ impl ProcessManager {
 
     pub fn peek_user_apc(&self, tid: ThreadId) -> Option<UserApc> {
         let thread = self.threads.get(&tid)?;
-        thread.user_apc_queue.front().map(|queued| queued.apc)
+        thread
+            .user_apc_queue
+            .front()
+            .filter(|queued| !queued.claimed)
+            .map(|queued| queued.apc)
     }
 
     pub fn take_user_apc(&mut self, tid: ThreadId) -> Option<UserApc> {
-        self.threads
-            .get_mut(&tid)?
-            .user_apc_queue
-            .pop_front()
-            .map(|queued| queued.apc)
+        let thread = self.threads.get_mut(&tid)?;
+        if thread.user_apc_queue.front()?.claimed {
+            return None;
+        }
+        thread.user_apc_queue.pop_front().map(|queued| queued.apc)
     }
 
     pub fn clear_user_apcs(&mut self, tid: ThreadId) -> bool {

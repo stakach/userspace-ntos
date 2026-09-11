@@ -1,51 +1,7 @@
 //! Route retained File acquisition owners without crossing filesystem domains.
 
 use super::*;
-use nt_io_manager::{
-    FileIoWaitKey, FileIoWaitRoute, SynchronousFileWaitState, SynchronousFileWaiter,
-};
-
-/// The caller has removed the exact FIFO owner or still owns an unpublished waiter.
-/// Cancellation consumes the queued/granted reference according to its captured domain.
-pub(crate) unsafe fn synchronous_file_cancel_waiter(
-    nt_handler: &mut ExecNtHandler,
-    waiter: SynchronousFileWaiter,
-) {
-    let remaining = match waiter.route {
-        FileIoWaitRoute::Hosted { file_id, .. } => {
-            let remaining = match waiter.state {
-                SynchronousFileWaitState::Waiting => {
-                    nt_handler.file_completion.cancel_io_waiter(file_id)
-                }
-                SynchronousFileWaitState::Promoted => nt_handler
-                    .file_completion
-                    .cancel_promoted_io(file_id, waiter.tid)
-                    .map(|release| release.waiters),
-            }
-            .expect("File cancellation lost its hosted owner");
-            nt_handler
-                .release_hosted_file_waiter_reference(file_id)
-                .expect("File cancellation lost its hosted reference");
-            remaining
-        }
-        FileIoWaitRoute::LocalOverlay { file_object } => match waiter.state {
-            SynchronousFileWaitState::Waiting => {
-                crate::writable_fs::cancel_file_io_waiter(file_object)
-            }
-            SynchronousFileWaitState::Promoted => {
-                crate::writable_fs::cancel_promoted_file_io(file_object, waiter.tid)
-            }
-        }
-        .expect("File cancellation lost its local owner"),
-    };
-    if waiter.state == SynchronousFileWaitState::Promoted {
-        // Local cancellation may have finished cleanup and retired the row when no waiter remains.
-        // Hosted cleanup instead starts here after policy ownership becomes available.
-        if remaining != 0 || matches!(waiter.key(), FileIoWaitKey::Hosted(_)) {
-            let _ = synchronous_file_wake_next(nt_handler, waiter.key());
-        }
-    }
-}
+use nt_io_manager::{FileIoWaitKey, FileIoWaitRoute};
 
 pub(super) unsafe fn try_synchronous_file_wake_next(
     nt_handler: &mut ExecNtHandler,

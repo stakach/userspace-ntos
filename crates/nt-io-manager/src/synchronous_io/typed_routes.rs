@@ -58,9 +58,7 @@ fn equal_numeric_ids_have_independent_fifo_and_exact_ownership() {
     assert_eq!(table.oldest_waiting_for_file(local_key).unwrap().0, first);
     assert_eq!(table.oldest_waiting_for_file(hosted_key).unwrap().0, peer);
     assert!(table.take_exact(first, hosted_key, 1).is_none());
-    assert!(table
-        .take_alertable_waiting_exact(first, hosted_key, 1)
-        .is_none());
+    assert!(table.wait_identity(first, hosted_key, 1).is_none());
     assert!(table.promote_exact(first, hosted_key, 1).is_none());
     table.promote_exact(first, local_key, 1).unwrap();
     assert!(table.retry_identity(first, hosted_key, 1).is_none());

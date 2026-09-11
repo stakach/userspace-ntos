@@ -1,4 +1,4 @@
-//! Retained teardown and failed-publication rollback for counted File acquisition owners.
+//! Retained teardown, APC interruption, and rollback for counted File acquisition owners.
 
 use super::*;
 use nt_io_completion::FileReferenceRelease;
@@ -11,6 +11,15 @@ pub enum SynchronousFileCancelEffect {
     ReferenceFollowup,
     RevokeReply,
     RetireReplyCap,
+    StageUserApc,
+    SendUserApc,
+    RetireApcReplyCap,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SynchronousFileCancelDisposition {
+    Teardown,
+    UserApc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +54,9 @@ pub enum SynchronousFileCancelReceipt {
     ReferenceFollowup,
     ReplyRevoked,
     ReplyCapRetired,
+    UserApcStaged,
+    UserApcReplySent,
+    UserApcReplyCapRetired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +102,8 @@ pub(super) struct CancelState {
     pub(super) phase: SynchronousFileCancelPhase,
     policy_waiters: Option<u32>,
     reference_release: Option<FileReferenceRelease>,
+    disposition: SynchronousFileCancelDisposition,
+    teardown_requested: bool,
 }
 
 impl CancelState {
@@ -105,7 +119,54 @@ impl CancelState {
             },
             policy_waiters: None,
             reference_release: None,
+            disposition: SynchronousFileCancelDisposition::Teardown,
+            teardown_requested: true,
         }
+    }
+
+    fn request_teardown(&mut self) -> bool {
+        if self.teardown_requested {
+            return false;
+        }
+        self.teardown_requested = true;
+        use SynchronousFileCancelEffect as Effect;
+        use SynchronousFileCancelPhase as Phase;
+        // A definitely unentered user effect can be replaced. Entered staging or Reply must
+        // first provide its receipt, and an acknowledged Reply only owns local cap retirement.
+        match self.phase {
+            Phase::Ready {
+                effect: Effect::StageUserApc | Effect::SendUserApc,
+                ..
+            } => {
+                self.disposition = SynchronousFileCancelDisposition::Teardown;
+                self.phase = Phase::Ready {
+                    effect: Effect::RevokeReply,
+                    last_error: None,
+                };
+            }
+            Phase::Invoking {
+                effect: Effect::StageUserApc | Effect::SendUserApc,
+                ..
+            }
+            | Phase::Indeterminate {
+                effect: Effect::StageUserApc | Effect::SendUserApc,
+                ..
+            }
+            | Phase::Ready {
+                effect: Effect::RetireApcReplyCap,
+                ..
+            }
+            | Phase::Invoking {
+                effect: Effect::RetireApcReplyCap,
+                ..
+            }
+            | Phase::Indeterminate {
+                effect: Effect::RetireApcReplyCap,
+                ..
+            } => {}
+            _ => self.disposition = SynchronousFileCancelDisposition::Teardown,
+        }
+        true
     }
 }
 
@@ -115,6 +176,8 @@ pub struct SynchronousFileCancelView<'a> {
     pub phase: SynchronousFileCancelPhase,
     pub policy_waiters: Option<u32>,
     pub reference_release: Option<FileReferenceRelease>,
+    pub disposition: SynchronousFileCancelDisposition,
+    pub teardown_requested: bool,
 }
 
 /// Single-use authority over one effect. Dropping it retains Invoking without authorizing retry.
@@ -131,6 +194,8 @@ pub struct SynchronousFileCancelAttempt {
     waiter: SynchronousFileWaiter,
     policy_waiters: Option<u32>,
     reference_release: Option<FileReferenceRelease>,
+    disposition: SynchronousFileCancelDisposition,
+    teardown_requested: bool,
     consumed: bool,
 }
 
@@ -147,6 +212,15 @@ impl SynchronousFileCancelAttempt {
     pub const fn reference_release(&self) -> Option<FileReferenceRelease> {
         self.reference_release
     }
+    pub const fn identity(&self) -> SynchronousFileCancelIdentity {
+        self.identity
+    }
+    pub const fn disposition(&self) -> SynchronousFileCancelDisposition {
+        self.disposition
+    }
+    pub const fn teardown_requested(&self) -> bool {
+        self.teardown_requested
+    }
 }
 
 impl WaitRecord {
@@ -156,7 +230,8 @@ impl WaitRecord {
         }
         match &self.cancellation {
             Some(cancel) => {
-                cancel.phase == SynchronousFileCancelPhase::DeferredRetry
+                cancel.disposition == SynchronousFileCancelDisposition::UserApc
+                    || cancel.phase == SynchronousFileCancelPhase::DeferredRetry
                     || self.cancellation_must_defer()
             }
             None => self.delivery_retained(),
@@ -290,6 +365,8 @@ impl SynchronousFileWaitTable {
             .ok_or(SynchronousFileCancelError::WrongIdentity)?;
         if record.cancellation.is_none() {
             record.cancellation = Some(CancelState::new(record.cancellation_must_defer()));
+        } else {
+            record.cancellation.as_mut().unwrap().request_teardown();
         }
         Ok(identity)
     }
@@ -302,12 +379,55 @@ impl SynchronousFileWaitTable {
             .flatten()
             .filter_map(WaitSlot::record_mut)
         {
-            if record.waiter.tid == tid && record.cancellation.is_none() {
-                record.cancellation = Some(CancelState::new(record.cancellation_must_defer()));
-                marked += 1;
+            if record.waiter.tid == tid {
+                if let Some(cancel) = record.cancellation.as_mut() {
+                    marked += usize::from(cancel.request_teardown());
+                } else {
+                    record.cancellation = Some(CancelState::new(record.cancellation_must_defer()));
+                    marked += 1;
+                }
             }
         }
         marked
+    }
+
+    /// Claim an alertable pre-dispatch waiter before releasing File ownership or staging an APC.
+    /// The adapter reserves its APC payload/context owner first; this row remains the sole owner
+    /// of the counted wait, File reference, and reply throughout the interruption.
+    pub fn request_user_apc_interruption(
+        &mut self,
+        identity: SynchronousFileWaitIdentity,
+    ) -> Result<SynchronousFileCancelIdentity, SynchronousFileCancelError> {
+        if identity.table == 0 || identity.table != self.identity {
+            return Err(SynchronousFileCancelError::WrongIdentity);
+        }
+        let record = self
+            .record_mut(identity.slot)
+            .filter(|record| record.waiter.sequence == identity.sequence)
+            .ok_or(SynchronousFileCancelError::WrongIdentity)?;
+        if record.cancellation.is_some()
+            || record.ingress.is_some()
+            || record.retry.is_some()
+            || record.waiter.state != SynchronousFileWaitState::Waiting
+            || !record.waiter.is_alertable()
+            || record.waiter.reply_cap == 0
+        {
+            return Err(SynchronousFileCancelError::InvalidPhase);
+        }
+        let mut cancel = CancelState::new(false);
+        cancel.disposition = SynchronousFileCancelDisposition::UserApc;
+        cancel.teardown_requested = false;
+        record.cancellation = Some(cancel);
+        Ok(identity)
+    }
+
+    pub fn has_user_apc_interruption_for_thread(&self, tid: u64) -> bool {
+        self.records().any(|(_, record)| {
+            record.waiter.tid == tid
+                && record.cancellation.as_ref().is_some_and(|cancel| {
+                    cancel.disposition == SynchronousFileCancelDisposition::UserApc
+                })
+        })
     }
 
     pub fn has_cancellation_for_thread(&self, tid: u64) -> bool {
@@ -320,8 +440,9 @@ impl SynchronousFileWaitTable {
             .any(|(_, record)| record.waiter.pi == pi && record.cancellation.is_some())
     }
 
-    /// Retained cancellation effects use only captured File and capability ownership. They may
-    /// outlive the target runtime after entered retry delivery and ingress claims have settled.
+    /// Teardown effects use only captured File and capability ownership and may outlive the
+    /// runtime after entered retry delivery and ingress settle. APC disposition instead retains
+    /// the target through its complete stage/send/retirement sequence and final owner removal.
     /// This does not authorize new admission under a still cancellation-owned thread identity.
     pub fn has_runtime_dependency_matching(
         &self,
@@ -350,6 +471,8 @@ impl SynchronousFileWaitTable {
             phase: cancel.phase,
             policy_waiters: cancel.policy_waiters,
             reference_release: cancel.reference_release,
+            disposition: cancel.disposition,
+            teardown_requested: cancel.teardown_requested,
         })
     }
 
@@ -415,6 +538,8 @@ impl SynchronousFileWaitTable {
             waiter: record.waiter,
             policy_waiters: cancel.policy_waiters,
             reference_release: cancel.reference_release,
+            disposition: cancel.disposition,
+            teardown_requested: cancel.teardown_requested,
             consumed: false,
         };
         let record = self.record_mut(identity.slot).unwrap();
@@ -446,7 +571,15 @@ impl SynchronousFileWaitTable {
 
         use SynchronousFileCancelEffect as Effect;
         use SynchronousFileCancelReceipt as Receipt;
-        let reply_step = || (ticket.waiter.reply_cap != 0).then_some(Effect::RevokeReply);
+        let reply_step = || {
+            (ticket.waiter.reply_cap != 0).then_some(
+                if cancel.disposition == SynchronousFileCancelDisposition::UserApc {
+                    Effect::StageUserApc
+                } else {
+                    Effect::RevokeReply
+                },
+            )
+        };
         let next_effect = match outcome {
             SynchronousFileCancelOutcome::Completed(receipt) => match (ticket.effect, receipt) {
                 (Effect::Policy, Receipt::HostedPolicy { .. })
@@ -480,6 +613,15 @@ impl SynchronousFileWaitTable {
                 (Effect::ReferenceFollowup, Receipt::ReferenceFollowup) => reply_step(),
                 (Effect::RevokeReply, Receipt::ReplyRevoked) => Some(Effect::RetireReplyCap),
                 (Effect::RetireReplyCap, Receipt::ReplyCapRetired) => None,
+                (Effect::StageUserApc, Receipt::UserApcStaged) => {
+                    Some(if cancel.teardown_requested {
+                        Effect::RevokeReply
+                    } else {
+                        Effect::SendUserApc
+                    })
+                }
+                (Effect::SendUserApc, Receipt::UserApcReplySent) => Some(Effect::RetireApcReplyCap),
+                (Effect::RetireApcReplyCap, Receipt::UserApcReplyCapRetired) => None,
                 _ => return Err(SynchronousFileCancelError::WrongReceipt),
             },
             _ => None,
@@ -494,7 +636,9 @@ impl SynchronousFileWaitTable {
                         cancel.policy_waiters = Some(waiters)
                     }
                     Receipt::HostedReference(release) => cancel.reference_release = Some(release),
-                    Receipt::ReplyCapRetired => record.waiter.reply_cap = 0,
+                    Receipt::ReplyCapRetired | Receipt::UserApcReplyCapRetired => {
+                        record.waiter.reply_cap = 0
+                    }
                     _ => {}
                 }
                 match next_effect {
@@ -516,6 +660,23 @@ impl SynchronousFileWaitTable {
                 }
             }
         };
+        if cancel.teardown_requested
+            && matches!(ticket.effect, Effect::StageUserApc | Effect::SendUserApc)
+        {
+            match outcome {
+                SynchronousFileCancelOutcome::NotEntered(_) => {
+                    cancel.disposition = SynchronousFileCancelDisposition::Teardown;
+                    cancel.phase = SynchronousFileCancelPhase::Ready {
+                        effect: Effect::RevokeReply,
+                        last_error: None,
+                    };
+                }
+                SynchronousFileCancelOutcome::Completed(Receipt::UserApcStaged) => {
+                    cancel.disposition = SynchronousFileCancelDisposition::Teardown;
+                }
+                _ => {}
+            }
+        }
         ticket.consumed = true;
         Ok(cancel.phase)
     }
@@ -538,3 +699,7 @@ impl SynchronousFileWaitTable {
 #[cfg(test)]
 #[path = "cancellation/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "cancellation/apc_tests.rs"]
+mod apc_tests;

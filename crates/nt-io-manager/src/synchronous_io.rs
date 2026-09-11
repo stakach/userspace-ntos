@@ -12,10 +12,10 @@ mod cancellation;
 mod ingress;
 mod retry;
 pub use cancellation::{
-    SynchronousFileCancelAttempt, SynchronousFileCancelEffect, SynchronousFileCancelError,
-    SynchronousFileCancelIdentity, SynchronousFileCancelOutcome, SynchronousFileCancelOwnership,
-    SynchronousFileCancelPhase, SynchronousFileCancelReceipt, SynchronousFileCancelView,
-    SynchronousFileWaitIdentity,
+    SynchronousFileCancelAttempt, SynchronousFileCancelDisposition, SynchronousFileCancelEffect,
+    SynchronousFileCancelError, SynchronousFileCancelIdentity, SynchronousFileCancelOutcome,
+    SynchronousFileCancelOwnership, SynchronousFileCancelPhase, SynchronousFileCancelReceipt,
+    SynchronousFileCancelView, SynchronousFileWaitIdentity,
 };
 pub use ingress::{
     SynchronousFileAdoptedOwner, SynchronousFileAdoptionAttempt, SynchronousFileIngress,
@@ -444,29 +444,6 @@ impl SynchronousFileWaitTable {
         })
     }
 
-    pub fn take_alertable_waiting_exact(
-        &mut self,
-        slot: usize,
-        key: FileIoWaitKey,
-        tid: u64,
-    ) -> Option<SynchronousFileWaiter> {
-        let record = self.record(slot)?;
-        let waiter = &record.waiter;
-        if waiter.key() != key
-            || waiter.tid != tid
-            || !waiter.is_alertable()
-            || waiter.state != SynchronousFileWaitState::Waiting
-            || record.cancellation.is_some()
-        {
-            return None;
-        }
-        self.slots
-            .get_mut(slot)?
-            .take()?
-            .into_record()
-            .map(|record| record.waiter)
-    }
-
     /// Mark one exact FIFO waiter as the promoted Busy owner. Reply ownership remains on the
     /// record until the executive has made the retry visible.
     pub fn promote_exact(
@@ -733,15 +710,16 @@ mod tests {
         assert_eq!(slot, alertable_slot);
         assert_eq!(selected.resume_ip, 0x1002);
         assert!(table
-            .take_alertable_waiting_exact(slot, FileIoWaitKey::Hosted(11), selected.tid)
+            .wait_identity(slot, FileIoWaitKey::Hosted(11), selected.tid)
             .is_none());
-        assert_eq!(
-            table
-                .take_alertable_waiting_exact(slot, selected.key(), selected.tid)
-                .unwrap(),
-            selected
-        );
-        assert_eq!(table.len(), 2);
+        let identity = table
+            .wait_identity(slot, selected.key(), selected.tid)
+            .unwrap();
+        table.request_user_apc_interruption(identity).unwrap();
+        assert_eq!(*table.cancellation(identity).unwrap().waiter, selected);
+        assert!(table.alertable_waiting_for_thread(selected.tid).is_none());
+        assert!(table.has_runtime_dependency_for_thread(selected.tid));
+        assert_eq!(table.len(), 3);
         assert_eq!(
             table
                 .oldest_waiting_for_file(FileIoWaitKey::Hosted(20))
