@@ -249,25 +249,30 @@ fn retained_flush_requires_overlay_backing_and_keeps_zero_object_identity() {
 }
 
 #[test]
-fn apc_interruption_matches_the_full_route_not_only_its_object_number() {
+fn apc_interruption_uses_full_owner_identity_not_only_its_route_object_number() {
     let route = PendingFileRoute::Local(LocalFileObject::ReadonlyDirectory(7));
     let mut table = PendingFileIoTable::new();
     let slot = table
         .park(notification(LocalFileObject::ReadonlyDirectory(7)))
         .unwrap();
+    let identity = table.identity(slot).unwrap();
     for wrong in [
         PendingFileRoute::Hosted(7),
         PendingFileRoute::Local(LocalFileObject::ReadonlyFile(7)),
         PendingFileRoute::Local(LocalFileObject::Overlay(7)),
     ] {
-        assert!(table
-            .mark_user_apc_interrupt_requested_exact(slot, IRP, wrong, TID)
-            .is_none());
-        assert!(!table.get(slot).unwrap().user_apc_interrupt_requested);
+        let mut other = PendingFileIoTable::new();
+        let mut pending = if wrong.hosted_file_id().is_some() {
+            PendingFileIo { route: wrong, irp_id: IRP, major: nt_io_abi::major::IRP_MJ_READ,
+                event_obj_idx: u64::MAX, ..PendingFileIo::default() }
+        } else { inline(wrong.local_file_object().unwrap()) };
+        pending.irp_id = IRP;
+        let foreign_slot = other.park(pending).unwrap();
+        assert!(table.request_user_apc_interruption(other.identity(foreign_slot).unwrap(), IRP).is_err());
+        assert!(table.apc(identity).is_err());
     }
-    assert!(table
-        .mark_user_apc_interrupt_requested_exact(slot, IRP, route, TID)
-        .is_some());
+    table.request_user_apc_interruption(identity, IRP).unwrap();
+    assert_eq!(table.apc(identity).unwrap().pending.route, route);
 }
 
 #[test]

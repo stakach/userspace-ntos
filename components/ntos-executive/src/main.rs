@@ -49,6 +49,7 @@ use object_wait::*;
 mod object_wait_apc;
 mod parked_reply;
 mod pending_file_caller;
+mod pending_file_apc;
 mod user_apc;
 mod ipc_message;
 mod executive_va;
@@ -18310,10 +18311,13 @@ unsafe fn terminate_hosted_thread_mechanism(
     };
     crate::service_sec_image::synchronous_file_cancellation::request_thread(handler, tid);
     object_wait_apc::request_thread(handler, tid);
+    pending_file_apc::request_thread(handler, tid);
     crate::service_sec_image::synchronous_file_cancellation::redrive(handler);
     object_wait_apc::redrive(handler);
+    pending_file_apc::redrive(handler);
     if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_runtime_dependency_for_thread(tid)
         || object_wait_apc::has_thread(tid)
+        || pending_file_apc::has_thread(tid)
     {
         return false;
     }
@@ -18352,6 +18356,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         || handler.pm.has_thread_suspend_control(tid as nt_process::ThreadId)
         || (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_runtime_dependency_for_thread(tid)
         || object_wait_apc::has_thread(tid)
+        || pending_file_apc::has_thread(tid)
     {
         return false;
     }
@@ -18426,16 +18431,19 @@ unsafe fn terminate_hosted_process_mechanisms(
             if preserve_tid != Some(tid) {
                 crate::service_sec_image::synchronous_file_cancellation::request_thread(handler, tid);
                 object_wait_apc::request_thread(handler, tid);
+                pending_file_apc::request_thread(handler, tid);
             }
         }
     }
     crate::service_sec_image::synchronous_file_cancellation::redrive(handler);
     object_wait_apc::redrive(handler);
+    pending_file_apc::redrive(handler);
     if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS))
         .has_runtime_dependency_matching(|waiter| {
             waiter.pi == u32::from(process_index) && preserve_tid != Some(waiter.tid)
         })
         || object_wait_apc::has_process(process_index as usize, preserve_tid)
+        || pending_file_apc::has_process(process_index as usize, preserve_tid)
     {
         return 0;
     }

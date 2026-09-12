@@ -143,7 +143,6 @@ fn malformed_shapes_do_not_consume_the_exact_reservation() {
         |p| p.signal_file = true,
         |p| p.iosb_va = 0,
         |p| p.consumer_abandoned = true,
-        |p| p.user_apc_interrupt_requested = true,
         |p| p.control_code = 1,
         |p| p.delivery_state = IO_DELIVERY_IOSB_FAULTED,
         |p| {

@@ -391,16 +391,16 @@ fn apc_interruption_requires_captured_alertable_mode_and_unstarted_release() {
     let slot = table.park(pending).unwrap();
     assert!(table.user_apc_interrupt_candidate(TID).is_none());
     assert!(table
-        .mark_user_apc_interrupt_requested_exact(slot, IRP, PendingFileRoute::Hosted(FILE), TID)
-        .is_none());
+        .request_user_apc_interruption(table.identity(slot).unwrap(), IRP)
+        .is_err());
 
     let (mut alertable, slot) = parked();
     assert!(alertable.user_apc_interrupt_candidate(TID).is_some());
     let mut release = alertable.begin_busy_release_exact(slot, IRP).unwrap();
     assert!(alertable.user_apc_interrupt_candidate(TID).is_none());
     assert!(alertable
-        .mark_user_apc_interrupt_requested_exact(slot, IRP, PendingFileRoute::Hosted(FILE), TID)
-        .is_none());
+        .request_user_apc_interruption(alertable.identity(slot).unwrap(), IRP)
+        .is_err());
     alertable
         .record_busy_release(&mut release, Err(ERROR))
         .unwrap();

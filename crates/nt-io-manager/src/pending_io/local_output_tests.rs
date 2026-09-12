@@ -208,17 +208,9 @@ fn output_must_settle_before_other_surfaces_and_reply() {
         .is_none());
     assert!(table.claim_reply_cap_exact(slot, id).is_none());
     assert!(table
-        .mark_user_apc_interrupt_requested_exact(slot, id, pending.route, pending.tid)
-        .is_none());
-    table.slots[slot]
-        .as_mut()
-        .unwrap()
-        .user_apc_interrupt_requested = true;
-    assert!(table.mark_user_apc_staged_exact(slot, id).is_none());
-    table.slots[slot]
-        .as_mut()
-        .unwrap()
-        .user_apc_interrupt_requested = false;
+        .request_user_apc_interruption(table.identity(slot).unwrap(), id)
+        .is_err());
+    assert!(table.ready_apc_terminal(table.identity(slot).unwrap(), id, 0).is_err());
     assert!(!table.completion_surfaces_settled_exact(slot, id));
     assert!(table.mark_backend_acked_exact(slot, id).is_none());
     table.advance_output_exact(slot, id, 2, 2).unwrap();

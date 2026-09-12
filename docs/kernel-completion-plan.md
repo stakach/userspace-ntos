@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-09-11
+Last updated: 2026-09-13
 
 ## Objective
 
@@ -33367,9 +33367,59 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     final provenance/APC-claim cleanup as separately acknowledged obligations. Preserve attempt
     sequence uniqueness even if a declined APC request resets control on the same live I/O owner.
 
-    General pending-IRP/current-thread APC paths still use older staging/delivery adapters and need
-    separate cutovers. Ordinary signal/timeout Reply failures, non-APC object-wait teardown and
-    inline terminal Busy/reference failure retention also remain open. No VM run or microkernel
+    Pending-IRP retained APC delivery (2026-09-13, host/build verified):
+    - [x] Attach exclusive APC control and non-clone invocation tickets to the original pending
+      row. Claim the exact PM APC before cancellation lookup can reenter. Keep cancellation
+      selection separate from genuine terminal completion; release a declined claim before normal
+      completion resumes. Preserve successful I/O that races an accepted cancellation.
+    - [x] Lease the terminal prefix before provider lookup or user-buffer effects. Reject a new APC
+      claim and nested terminal prefix while an ordinary prefix is active; defer APC teardown until
+      its entered prefix returns. Preserve owner identity across rename/link IRP transitions.
+    - [x] Keep output, IOSB, event, File, completion APC/IOCP and Busy release/wake ordering. Only
+      then prepare the real APC frame with captured transport, original caller, register/FP state,
+      and exact queue claim. Retain Stage, Send, accepted-send pool retirement and claim cleanup
+      independently. An uncertain send never restages, resends or releases its cap; a definite
+      pre-entry refusal retains only the unperformed effect for retry.
+    - [x] Record teardown intent before callouts and retain entered context dependencies through
+      physical thread/process teardown and runtime release. Converted cleanup retains the original
+      IRP, Busy and references but can outlive the runtime; acknowledged sends never enter revoke
+      or retype. Block backend ACK/finish until protocol and native claim cleanup are complete.
+    - [x] Replace the native Boolean interruption/staging path. When an ordinary prefix declines
+      APC admission, rescan live exact candidates after its lease returns; retain the original
+      queued selection instead of requiring another syscall from the parked thread. Keep this
+      bounded admission scan separate from terminal-delivery retry scheduling.
+    - [x] Wire timer-only terminal convergence: provider-pump progress and retained effect retries
+      schedule the shared service-loop boundary's bounded pending-I/O prefix, cleanup and drain
+      pass. Preserve the full 128-word IPC buffer and retain any retry raised during that pass for
+      the next boundary; do not spin on nonterminal IRPs or wait for an unrelated user syscall.
+      The shared manager pump also schedules new progress discovered inside a nested completion
+      lookup or File cleanup, including a peer already visited by the outer snapshot. Keep the
+      existing syscall cleanup/second-pass handoff until its replacement is separately proven.
+    - [x] Complete serialized host regressions: 551 I/O-manager unit tests, eight composed
+      pending-I/O APC tests, 1,954 focused host/doc tests and 3,502 broad host/doc tests passed,
+      with no failures or ignored cases. Eleven new unit cases cover exact attempts and leases,
+      cancellation races, teardown during entered/uncertain effects, Busy wake ordering, and
+      distinct local File routes. Composed tests use real PM claims, File policy and AMD64 frame
+      preparation; provider, user-memory, TCB and Reply outcomes are explicit host fixtures.
+      The final composed rerun also checks actual SUCCESS/CANCELLED in saved-context RAX and
+      queue release/reclaim when an ordinary prefix delays admission.
+    - [x] Complete the executive release build after the final native convergence review: passed
+      in 36.27s with the unchanged 294 warnings. Evidence:
+      `.tmp/test-pending-file-apc-contract-20260913.log`,
+      `.tmp/test-pending-file-apc-composed-20260913.log`,
+      `.tmp/test-pending-file-apc-focused-20260913.log`,
+      `.tmp/test-pending-file-apc-full-20260913.log`, and
+      `.tmp/build-pending-file-apc-executive-20260913.log`. All runners were serialized.
+      Independent reviews covered entered-effect/lease invalidation, real terminal status,
+      runtime teardown barriers, original-caller transport and timer/nested-pump convergence.
+
+    Scope boundary: the all-row prefix marker prevents new APC takeover and duplicate prefix
+    entry, but does not claim retained effects for ordinary non-APC terminal teardown. A removed
+    ordinary row invalidates its old lease without touching a replacement. APC-owned rows instead
+    retain their exact owner until their protocol is complete. Current-thread APC entry still uses
+    the older staging adapter and requires its own cutover. Ordinary signal/timeout Reply failures,
+    non-APC object-wait teardown and inline terminal Busy/reference failure retention also remain
+    open. No VM run or microkernel
     change occurred; the last measured 27 strict missing win32k imports and genuine desktop
     acceptance remain open.
 

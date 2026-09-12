@@ -111,7 +111,6 @@ fn invalid_local_shapes_do_not_consume_the_reservation() {
         |request| request.busy = Some(test_busy(FILE, TID)),
         |request| request.control_code = 1,
         |request| request.delivery_state = IO_DELIVERY_BACKEND_ACKED,
-        |request| request.user_apc_interrupt_requested = true,
         |request| request.route = PendingFileRoute::Hosted(0),
         |request| request.irp_id = 0,
     ];
@@ -252,8 +251,8 @@ fn terminal_inline_cannot_be_replaced_or_treated_as_pending_provider_work() {
     assert!(!table.matches_completion_exact(slot, ID, FILE, TID, inline().major));
     assert!(table.user_apc_interrupt_candidate(TID).is_none());
     assert!(table
-        .mark_user_apc_interrupt_requested_exact(slot, ID, PendingFileRoute::Local(LocalFileObject::Overlay(FILE)), TID)
-        .is_none());
+        .request_user_apc_interruption(table.identity(slot).unwrap(), ID)
+        .is_err());
     assert!(table.advance_output_exact(slot, ID, 0, 0).is_none());
     assert!(!table.complete_local_byte_lock_exact(ID, 1, 0xc000_0120));
     assert!(!table.complete_local_directory_notify_exact(ID, 1, 0xc000_0120, 0, true));
@@ -415,18 +414,21 @@ fn user_apc_redirect_stages_once_across_definitively_rejected_reply() {
     request.major = nt_io_abi::major::IRP_MJ_READ;
     request.busy = Some(test_busy(FILE, TID));
     let slot = table.park(request).unwrap();
-    assert!(table.mark_user_apc_staged_exact(slot, ID).is_none());
+    let identity = table.identity(slot).unwrap();
+    assert!(table.ready_apc_terminal(identity, ID, 0).is_err());
     assert!(table
         .mark_delivery_exact(slot, ID, IO_DELIVERY_USER_APC_STAGED)
         .is_none());
     table
-        .mark_user_apc_interrupt_requested_exact(slot, ID, PendingFileRoute::Hosted(FILE), TID)
+        .request_user_apc_interruption(identity, ID)
         .unwrap();
     let unstaged = table.get(slot);
     assert!(table.claim_reply_cap_exact(slot, ID).is_none());
-    assert!(table.mark_user_apc_staged_exact(slot, ID + 1).is_none());
+    assert!(table.ready_apc_terminal(identity, ID + 1, 0).is_err());
     assert_eq!(table.get(slot), unstaged);
-    assert!(table.mark_user_apc_staged_exact(slot, ID).is_none());
+    assert!(table.ready_apc_terminal(identity, ID, 0).is_err());
+    test_apc_receipt(&mut table, identity, PendingFileApcReceipt::CancelSelected);
+    let mut lease = table.begin_apc_delivery(identity, ID).unwrap();
     for flag in [
         IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_APC_PUBLISHED,
         IO_DELIVERY_FILE_PUBLISHED, IO_DELIVERY_EVENT_PUBLISHED,
@@ -434,22 +436,23 @@ fn user_apc_redirect_stages_once_across_definitively_rejected_reply() {
         table.mark_delivery_exact(slot, ID, flag).unwrap();
     }
     settle_test_busy(&mut table, slot, ID);
-    table.mark_user_apc_staged_exact(slot, ID).unwrap();
-    assert!(table.mark_user_apc_staged_exact(slot, ID).is_none());
-    assert!(table
-        .rollback_user_apc_interrupt_requested_exact(slot, ID)
-        .is_none());
-    assert_eq!(table.claim_reply_cap_exact(slot, ID), Some(Some(76)));
-    assert!(table.mark_user_apc_staged_exact(slot, ID).is_none());
-    table.restore_reply_cap_exact(slot, ID, 76).unwrap();
+    table.finish_apc_delivery(&mut lease).unwrap();
+    table.ready_apc_terminal(identity, ID, 0).unwrap();
+    test_apc_receipt(&mut table, identity, PendingFileApcReceipt::Staged);
+    assert!(table.ready_apc_terminal(identity, ID, 0).is_err());
+    let mut send = table.begin_apc_step(identity).unwrap();
+    assert_eq!(send.effect(), PendingFileApcEffect::Send);
+    table.record_apc_step(&mut send, PendingFileApcOutcome::NotEntered(1)).unwrap();
     assert_ne!(
         table.get(slot).unwrap().delivery_state & IO_DELIVERY_USER_APC_STAGED,
         0
     );
-    assert!(table.mark_user_apc_staged_exact(slot, ID).is_none());
-    assert_eq!(table.claim_reply_cap_exact(slot, ID), Some(Some(76)));
-    table.mark_reply_published_exact(slot, ID).unwrap();
-    assert!(table.mark_user_apc_staged_exact(slot, ID).is_none());
+    assert!(table.claim_reply_cap_exact(slot, ID).is_none());
+    test_apc_receipt(&mut table, identity, PendingFileApcReceipt::Sent);
+    assert_eq!(table.get(slot).unwrap().reply_cap, 76);
+    test_apc_receipt(&mut table, identity, PendingFileApcReceipt::SentReplyRetired);
+    test_apc_receipt(&mut table, identity, PendingFileApcReceipt::ApcClaimReleased);
+    table.finish_apc(identity).unwrap();
     assert!(table.restore_reply_cap_exact(slot, ID, 76).is_none());
 }
 
@@ -457,11 +460,12 @@ fn user_apc_redirect_stages_once_across_definitively_rejected_reply() {
 fn ordinary_claim_and_abandoned_rows_cannot_manufacture_apc_staging() {
     let mut table = PendingFileIoTable::new();
     let slot = table.park(inline()).unwrap();
-    assert!(table.mark_user_apc_staged_exact(slot, ID).is_none());
+    let identity = table.identity(slot).unwrap();
+    assert!(table.ready_apc_terminal(identity, ID, 0).is_err());
     table.claim_reply_cap_exact(slot, ID).unwrap().unwrap();
-    assert!(table.mark_user_apc_staged_exact(slot, ID).is_none());
+    assert!(table.request_user_apc_interruption(identity, ID).is_err());
     table.restore_reply_cap_exact(slot, ID, 76).unwrap();
     table.abandon_thread_transfers_with(TID, |_| {});
-    assert!(table.mark_user_apc_staged_exact(slot, ID).is_none());
+    assert!(table.request_user_apc_interruption(identity, ID).is_err());
     assert!(table.claim_reply_cap_exact(slot, ID).is_none());
 }

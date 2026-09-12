@@ -168,6 +168,7 @@ fn retarget_preserves_owner_but_rejects_stale_irp_phase_and_foreign_identity() {
     let identity = table.identity(slot).unwrap();
     let other_slot = other.park(pending).unwrap();
     let foreign = other.identity(other_slot).unwrap();
+    let mut lease = table.begin_apc_delivery(identity, pending.irp_id).unwrap();
     assert_eq!(
         table.retarget_set_file_name_query_owner_exact(
             foreign,
@@ -213,6 +214,7 @@ fn retarget_preserves_owner_but_rejects_stale_irp_phase_and_foreign_identity() {
     assert_eq!(source_set.resume_ip, pending.resume_ip);
     assert_eq!(source_set.resume_sp, pending.resume_sp);
     assert_eq!(source_set.resume_flags, pending.resume_flags);
+    assert_eq!(table.finish_apc_delivery(&mut lease), Ok(None));
 }
 
 #[test]
@@ -251,7 +253,10 @@ fn every_specialized_or_legacy_removal_clears_owner_generation() {
     assert_eq!(table.park(create()), Some(slot));
     let second = table.identity(slot).unwrap();
     assert_eq!(table.take_create_owner_exact(first, 10), None);
-    assert_eq!(table.take_thread_creates_exact_with(13, |identity, _| assert_eq!(identity, second)), 1);
+    assert_eq!(
+        table.take_thread_creates_exact_with(13, |identity, _| assert_eq!(identity, second)),
+        1
+    );
     assert_eq!(table.owner_generations[slot], 0);
     assert_eq!(table.get_exact(second), None);
     assert_eq!(table.park(transfer()), Some(slot));

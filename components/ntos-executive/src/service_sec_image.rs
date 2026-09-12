@@ -18,6 +18,8 @@ pub(crate) mod synchronous_file_cancellation;
 mod synchronous_file_apc;
 #[path = "pending_file_busy.rs"]
 mod pending_file_busy;
+#[path = "pending_file_delivery.rs"]
+mod pending_file_delivery;
 #[path = "file_dispatch_handoff.rs"]
 mod file_dispatch_handoff;
 pub(crate) use synchronous_file_wait::synchronous_file_release_and_wake;
@@ -3395,6 +3397,17 @@ pub(crate) fn service_dll_pe_store_stats() -> DllPeStoreStats {
 /// syscall can arrive to drive a failed context write or capability retirement.
 fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
     unsafe { crate::object_wait_apc::redrive(nt_handler) };
+    unsafe { crate::pending_file_apc::redrive(nt_handler) };
+    if FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel) {
+        // This boundary can follow receive, before the new caller's arguments are captured.
+        // Retained cancellation must also converge when a timer delivers its only completion.
+        let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
+        unsafe {
+            let _ = pending_file_io_redrive_all(nt_handler);
+            let _ = file_cleanup_redrive_all(nt_handler);
+            let _ = file_irp_drain_redrive_all(nt_handler);
+        }
+    }
     // Object Manager references can reach zero in handle, wait, debug, LPC, or teardown paths. The
     // serialized ownership barrier is the single convergence point for exact-generation final
     // process deletion; individual release sites may still make an eager attempt for low latency.
@@ -10801,6 +10814,7 @@ pub(crate) unsafe fn service_sec_image(
                     || waiters.has_cancellation_for_thread(current_tid)
                     || waiters.has_ingress_for_thread(current_tid)
                     || crate::object_wait_apc::has_thread(current_tid)
+                    || crate::pending_file_apc::owns_thread(current_tid)
             }
             {
                 // An uncertain earlier retry is not a fresh File acquisition. Reject only this
@@ -10812,6 +10826,7 @@ pub(crate) unsafe fn service_sec_image(
                 // Progress retained cancellation even when rejected ingress is the only activity.
                 synchronous_file_cancellation::redrive(&mut nt_handler);
                 crate::object_wait_apc::redrive(&mut nt_handler);
+                crate::pending_file_apc::redrive(&mut nt_handler);
                 let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
                 badge = nb;
@@ -24168,98 +24183,7 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
     if reconcile_user_apc_file_acquisition_wait(nt_handler, tid) {
         return true;
     }
-    nt_handler.publish_local_byte_lock_completions();
-    let Some((slot, pending)) =
-        (&*core::ptr::addr_of!(PENDING_FILE_IO)).user_apc_interrupt_candidate(tid)
-    else {
-        return false;
-    };
-    let identity = (&*core::ptr::addr_of!(PENDING_FILE_IO))
-        .identity(slot).expect("APC candidate lost its pending File generation");
-    let Some(caller) = crate::pending_file_caller::caller(identity, pending) else {
-        return false;
-    };
-    if !nt_handler.validate_provider_logical_caller(caller) {
-        return false;
-    }
-    let Ok(target_tid) = nt_process::ThreadId::try_from(tid) else {
-        return false;
-    };
-    let alertable = match pending.operation {
-        nt_io_manager::PendingFileIoOperation::LocalInline(_)
-        | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
-        | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => false,
-        nt_io_manager::PendingFileIoOperation::LocalByteLock(operation) => operation.alertable,
-        nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
-            operation.alertable
-        }
-        _ => {
-            nt_handler.file_completion.io_mode(pending.route.hosted_file_id()
-                .expect("provider APC candidate lost its File route"))
-                == Ok(nt_io_completion::FileIoMode::SynchronousAlertable)
-        }
-    };
-    if nt_handler.pm.peek_user_apc(target_tid).is_none() || !alertable {
-        return false;
-    }
-
-    // A terminal manager result means the I/O completion won the alert race.
-    // Leave the APC queued for a later alertable wait and let normal redrive
-    // return this operation's real result.
-    if matches!(
-        pending.operation,
-        nt_io_manager::PendingFileIoOperation::Transfer
-    ) && driver_launch::completed_irp_exact(pending.irp_id).is_some()
-    {
-        FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-        return false;
-    }
-    // The provider lookup can reenter and retire this owner or replace its caller. Never
-    // recapture a new runtime to authorize the old request, even if every numeric ID matches.
-    if crate::pending_file_caller::caller(identity, pending) != Some(caller)
-        || !nt_handler.validate_provider_logical_caller(caller)
-    {
-        return false;
-    }
-    if (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-        .mark_user_apc_interrupt_requested_exact(slot, pending.irp_id, pending.route, pending.tid)
-        .is_none()
-    {
-        // Terminal delivery or another interruption may have won during the same lookup.
-        return false;
-    }
-
-    let cancellation = match pending.operation {
-        nt_io_manager::PendingFileIoOperation::LocalInline(_)
-        | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
-        | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => Ok(false),
-        nt_io_manager::PendingFileIoOperation::LocalByteLock(operation) => {
-            let cancelled = nt_handler.cancel_local_byte_lock_wait(operation.wait_id);
-            if cancelled {
-                nt_handler.publish_local_byte_lock_completions();
-            }
-            Ok(cancelled)
-        }
-        nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
-            nt_handler.cancel_local_directory_notify(
-                pending.route.local_file_object().expect("local notify lost its route"),
-                operation.notify_id,
-            )
-        }
-        _ => driver_launch::cancel_irp_if_pending(pending.irp_id),
-    };
-    match cancellation {
-        Ok(true) => {
-            FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-            true
-        }
-        Ok(false) | Err(_) => {
-            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-                .rollback_user_apc_interrupt_requested_exact(slot, pending.irp_id)
-                .expect("failed APC interruption lost its exact pending File owner");
-            false
-        }
-    }
+    crate::pending_file_apc::request(nt_handler, tid)
 }
 
 /// Reconcile every alertable wait class that can own a hosted thread continuation. Object/File
@@ -24667,10 +24591,14 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(nt_handler: &mut ExecNtHandle
     if crate::config_manager_take_device_action_wake() {
         nt_handler.pnp_signal_pending_action();
     }
-    activated
+    let progress = activated
         .saturating_add(pumped)
         .saturating_add(pending_driver_start_redrive_all(nt_handler))
-        .saturating_add(pending_pnp_operation_redrive_all(nt_handler))
+        .saturating_add(pending_pnp_operation_redrive_all(nt_handler));
+    if progress != 0 {
+        FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+    }
+    progress
 }
 
 fn pending_driver_start_redrive_needed(nt_handler: &ExecNtHandler) -> bool {
@@ -24980,6 +24908,7 @@ unsafe fn pending_file_io_redrive_pass(
     if !finish_settled_busy_only {
         synchronous_file_retry::redrive_retirement(nt_handler);
         synchronous_file_cancellation::redrive(nt_handler);
+        crate::pending_file_apc::redrive(nt_handler);
         nt_handler.publish_local_byte_lock_completions();
     }
     let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
@@ -25036,6 +24965,8 @@ unsafe fn pending_file_io_redrive_pass(
             .get_exact(identity).filter(|live| live.irp_id == pending.irp_id)
         else { continue; };
         pending = live;
+        let Ok(delivery) = pending_file_delivery::Delivery::begin(identity, pending.irp_id)
+        else { continue; };
         let hosted_file_id = pending.route.hosted_file_id();
         let local_file_object = pending.route.local_file_object();
         let set_file_name_id = match pending.operation {
@@ -25794,32 +25725,30 @@ unsafe fn pending_file_io_redrive_pass(
             continue;
         }
 
+        drop(delivery);
+        if let Ok(view) = (&*core::ptr::addr_of!(PENDING_FILE_IO)).apc(identity) {
+            if view.phase == nt_io_manager::PendingFileApcPhase::AwaitTerminal {
+                (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                    .ready_apc_terminal(identity, pending.irp_id, terminal_status)
+                    .expect("pending File APC reached staging before its terminal prefix settled");
+            }
+            crate::pending_file_apc::drive(nt_handler, identity);
+            // The protocol retires the claim and Reply before normal backend ACK can resume.
+            // Use a fresh row and delivery-state snapshot on the next completion visit.
+            restore_file_io_mirrors!();
+            continue;
+        }
+
         if pending.reply_required
             && delivery_state & nt_io_manager::IO_DELIVERY_REPLY_PUBLISHED == 0
         {
-            if pending.user_apc_interrupt_requested
-                && delivery_state & nt_io_manager::IO_DELIVERY_USER_APC_STAGED == 0
-            {
-                if nt_handler.stage_current_user_apc(terminal_status) != Ok(true) {
-                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                    restore_file_io_mirrors!();
-                    continue;
-                }
-                (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-                    .mark_user_apc_staged_exact(slot, pending.irp_id)
-                    .expect("staged File user APC lost its reply owner");
-            }
             let cap = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                 .claim_reply_cap_exact(slot, pending.irp_id)
                 .expect("pending File reply owner disappeared")
                 .expect("pending File reply cap was claimed without publication");
-            let replied = if pending.user_apc_interrupt_requested {
-                client_reply_on(cap, 0, 0, 0, 0, 0)
-            } else {
-                reply_parked_syscall(
-                    cap, pending.local_syscall_status().unwrap_or(terminal_status) as u64,
-                )
-            };
+            let replied = reply_parked_syscall(
+                cap, pending.local_syscall_status().unwrap_or(terminal_status) as u64,
+            );
             if !replied {
                 (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                     .restore_reply_cap_exact(slot, pending.irp_id, cap)

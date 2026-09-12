@@ -37628,7 +37628,12 @@ fn io_manager_mut() -> &'static mut ExecutiveIoManager {
 }
 
 fn pump_io_manager(io: &mut ExecutiveIoManager) -> usize {
-    io.pump_with_report().progress
+    let progress = io.pump_with_report().progress;
+    if progress != 0 {
+        // A nested lookup or File cleanup can complete a peer already visited by the outer pass.
+        crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+    }
+    progress
 }
 
 /// Consume the manager's complete durable-allocation signal. Unlike the pump

@@ -138,6 +138,9 @@ pub use local_set_information::{
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
 pub use pending_io::{
+    PendingFileApcAttempt, PendingFileApcDeliveryLease, PendingFileApcDisposition,
+    PendingFileApcEffect, PendingFileApcError, PendingFileApcOutcome, PendingFileApcPhase,
+    PendingFileApcReceipt, PendingFileApcView,
     LocalFileObject, PendingFileRoute,
     FileIoBusyOwner, PendingFileBusy, PendingFileBusyError, PendingFileBusyPhase,
     PendingFileBusyReleaseAttempt, PendingFileBusyWakeAttempt,

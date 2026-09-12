@@ -198,6 +198,9 @@ impl PendingFileIoTable {
         slot: usize,
         irp_id: u64,
     ) -> Result<PendingFileBusyReleaseAttempt, PendingFileBusyError> {
+        if !self.apc_prefix_allows_mutation(slot) {
+            return Err(PendingFileBusyError::InvalidPhase);
+        }
         let pending = self.get(slot).ok_or(PendingFileBusyError::WrongIdentity)?;
         let busy = pending.busy.ok_or(PendingFileBusyError::WrongIdentity)?;
         if pending.irp_id != irp_id || !busy.identity.is_published() {
