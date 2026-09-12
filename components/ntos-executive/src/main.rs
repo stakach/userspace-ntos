@@ -48,6 +48,7 @@ mod object_wait;
 use object_wait::*;
 mod object_wait_apc;
 mod parked_reply;
+mod pending_file_caller;
 mod user_apc;
 mod ipc_message;
 mod executive_va;
@@ -17185,7 +17186,8 @@ fn io_completion_waiter_table_stats() -> (usize, usize, usize, u64, u64) {
 
 fn hosted_io_owner_tables_reset() -> bool {
     unsafe {
-        (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).reset()
+        pending_file_caller::reset()
+            && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).reset()
             && (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES)).reset()
             && (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS)).reset()
             && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS)).reset()

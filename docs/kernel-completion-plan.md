@@ -33322,6 +33322,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     retirement; uncertain effects must not replay. Teardown/extraction and runtime guards must
     respect entered effects. Ordinary I/O completion APC publication remains a separate surface.
 
+    Pending-IRP original caller provenance (2026-09-13, host/build verified):
+    - [x] Add testable reserved/published caller metadata storage in nt-user-host, keyed by the
+      pending operation's complete owner identity. It stores the already-admitted original
+      process/thread lifetime, badge and TCB; it owns no thread references, APC claims or Reply
+      capabilities and does not pin runtime teardown.
+    - [x] Reserve metadata and capture the original caller before File dispatch. If either
+      reservation cannot be made, release the exact pre-dispatch claim before accepting any IRP.
+      Publication checks the original routing tuple and commits only its phase, without allocation
+      or recapturing a runtime that may have changed during dispatch.
+    - [x] Preserve metadata across rename/link IRP transitions and transfer abandonment. Remove it
+      on unused reservation cancellation, final completion and every native CREATE extraction,
+      before reference/provider cleanup can reenter. Keep batch CREATE extraction ahead of cleanup
+      callouts and retain full owner identities in that batch; remove the identity-discarding batch
+      API and migrate its tests. Refuse reset while metadata is live.
+    - [x] Validate the original caller when selecting an APC interruption and again after provider
+      completion lookup. A replaced runtime or retired/reused I/O row cannot authorize the old
+      request; a completion or competing interruption that wins lookup leaves the APC queued.
+    - [x] Complete serialized contracts, composed host regressions and executive release build.
+      All 10 focused caller-storage unit tests and six composed pending-I/O/caller tests passed.
+      The wider focused run passed 1,933 host/doc tests and the broad run passed 3,481, with no
+      failures or ignored cases. Coverage includes paired reservation rollback, allocation-free
+      publication, phase-specific retirement, same numeric IRP/thread/Reply reuse with a changed
+      real PM lifetime, rename/abandonment retention and whole-batch CREATE retirement before
+      cleanup reentry. Native runtime bindings in those tests are explicit host fixtures, not VM
+      execution. The executive release build passed in 38.30s with the unchanged 294 warnings.
+      Evidence: `.tmp/test-pending-file-caller-contract-20260913.log`,
+      `.tmp/test-pending-file-caller-composed-20260913.log`,
+      `.tmp/test-pending-file-caller-focused-20260913.log`,
+      `.tmp/test-pending-file-caller-full-20260913.log`, and
+      `.tmp/build-pending-file-caller-executive-20260913.log`. All runners were serialized.
+      Independent native review covered all 18 reservation call sites and found no legitimate
+      callerless boot path; publication/cancellation/retirement/reset paths were checked together.
+      No VM run or microkernel change occurred. Native APC failure injection and genuine desktop
+      acceptance remain open.
+
+    Review adjustment: the pending-I/O generation alone cannot authenticate a later PI/TID/badge/TCB
+    lookup. Capture original provenance before dispatch, not at APC staging, and do not recapture on
+    retry. This checkpoint supplies that boundary but deliberately does not claim cancellation
+    selection or terminal delivery is retained yet. The next attached APC controller also needs a
+    terminal-delivery lease: output/IOSB copyout can reenter before staging, so teardown must record
+    intent while that prefix is entered rather than detach its user surfaces underneath the active
+    walker. Keep cancellation invocation, actual terminal result, checked APC stage/send/retire and
+    final provenance/APC-claim cleanup as separately acknowledged obligations. Preserve attempt
+    sequence uniqueness even if a declined APC request resets control on the same live I/O owner.
+
     General pending-IRP/current-thread APC paths still use older staging/delivery adapters and need
     separate cutovers. Ordinary signal/timeout Reply failures, non-APC object-wait teardown and
     inline terminal Busy/reference failure retention also remain open. No VM run or microkernel

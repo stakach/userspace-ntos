@@ -29,6 +29,7 @@ nt-fs = { workspace = true }
 nt-memory-manager = { workspace = true }
 nt-process = { workspace = true }
 nt-thread-start = { workspace = true }
+nt-user-host = { workspace = true }
 proptest = "1"
 
 [lints.clippy]

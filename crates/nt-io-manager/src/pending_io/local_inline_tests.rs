@@ -397,13 +397,13 @@ fn teardown_defers_claimed_reply_until_rejection_or_publication_settles_it() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        table.take_thread_creates_with(TID, |_| panic!("claimed CREATE escaped")),
+        table.take_thread_creates_exact_with(TID, |_, _| panic!("claimed CREATE escaped")),
         0
     );
     table
         .restore_reply_cap_exact(create_slot, ID + 1, 76)
         .unwrap();
-    assert_eq!(table.take_thread_creates_with(TID, |_| {}), 1);
+    assert_eq!(table.take_thread_creates_exact_with(TID, |_, _| {}), 1);
 }
 
 #[test]

@@ -24174,6 +24174,14 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
     else {
         return false;
     };
+    let identity = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+        .identity(slot).expect("APC candidate lost its pending File generation");
+    let Some(caller) = crate::pending_file_caller::caller(identity, pending) else {
+        return false;
+    };
+    if !nt_handler.validate_provider_logical_caller(caller) {
+        return false;
+    }
     let Ok(target_tid) = nt_process::ThreadId::try_from(tid) else {
         return false;
     };
@@ -24206,9 +24214,20 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
         FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
         return false;
     }
-    (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+    // The provider lookup can reenter and retire this owner or replace its caller. Never
+    // recapture a new runtime to authorize the old request, even if every numeric ID matches.
+    if crate::pending_file_caller::caller(identity, pending) != Some(caller)
+        || !nt_handler.validate_provider_logical_caller(caller)
+    {
+        return false;
+    }
+    if (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
         .mark_user_apc_interrupt_requested_exact(slot, pending.irp_id, pending.route, pending.tid)
-        .expect("APC interruption candidate lost its exact pending File owner");
+        .is_none()
+    {
+        // Terminal delivery or another interruption may have won during the same lookup.
+        return false;
+    }
 
     let cancellation = match pending.operation {
         nt_io_manager::PendingFileIoOperation::LocalInline(_)
@@ -24821,14 +24840,17 @@ unsafe fn pending_file_io_transfer(
         }
     }
 
-    fn commit_or_panic(
+    unsafe fn commit_or_panic(
         table: &mut nt_io_manager::PendingFileIoTable,
         reservation: nt_io_manager::PendingFileIoReservation,
         pending: nt_io_manager::PendingFileIo,
         synchronous: bool,
     ) {
         let error = match table.park_reserved(reservation, pending) {
-            Ok(_) => return,
+            Ok(_) => {
+                crate::pending_file_caller::publish(reservation, pending);
+                return;
+            }
             Err(error) => error,
         };
         print_str(b"[pending-file-owner] commit rejected error/file/irp/major/pi/tid/badge/sync/reply=");
@@ -25853,6 +25875,7 @@ unsafe fn pending_file_io_redrive_pass(
         let finished = table
             .finish_owner_exact(identity, pending.irp_id)
             .expect("completed pending File owner did not retire");
+        crate::pending_file_caller::retire(identity);
         match finished.operation {
             nt_io_manager::PendingFileIoOperation::Transfer => {
                 nt_handler.release_file_reference(finished.route.hosted_file_id().expect("provider completion lost its File route"));

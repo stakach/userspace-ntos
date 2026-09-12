@@ -144,7 +144,7 @@ fn create_requires_specialized_exact_removal_with_reserved_handle_preserved() {
     assert_eq!(table.take_create_exact(slot, 12), None);
     assert_eq!(table.get(peer), Some(create(14)));
     assert_eq!(
-        table.take_thread_creates_with(13, |pending| assert_eq!(pending, create(14))),
+        table.take_thread_creates_exact_with(13, |_, pending| assert_eq!(pending, create(14))),
         1
     );
     assert!(table.is_empty());
@@ -172,7 +172,7 @@ fn exact_create_removal_refuses_transfer_and_claimed_create() {
     let claimed = table.get(create_slot).unwrap();
     assert_eq!(table.take_create_exact(create_slot, 14), None);
     assert_eq!(
-        table.take_thread_creates_with(13, |_| panic!("claimed CREATE extracted")),
+        table.take_thread_creates_exact_with(13, |_, _| panic!("claimed CREATE extracted")),
         0
     );
     assert_eq!(table.get(create_slot), Some(claimed));

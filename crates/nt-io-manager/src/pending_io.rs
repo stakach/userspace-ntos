@@ -1396,15 +1396,17 @@ impl PendingFileIoTable {
         self.slots[slot].take()
     }
 
-    pub fn take_thread_creates_with<F>(&mut self, tid: u64, mut take: F) -> usize
+    /// Yield complete owner identities so associated metadata can retire before CREATE cleanup.
+    pub fn take_thread_creates_exact_with<F>(&mut self, tid: u64, mut take: F) -> usize
     where
-        F: FnMut(PendingFileIo),
+        F: FnMut(PendingFileIoIdentity, PendingFileIo),
     {
         let mut count = 0;
         for index in 0..self.slots.len() {
             if let Some(pending) = self.slots[index].filter(|pending| pending.tid == tid) {
+                let identity = self.identity(index).expect("live CREATE lost its owner generation");
                 if let Some(pending) = self.take_create_exact(index, pending.irp_id) {
-                    take(pending);
+                    take(identity, pending);
                     count += 1;
                 }
             }

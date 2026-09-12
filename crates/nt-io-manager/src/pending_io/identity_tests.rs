@@ -251,7 +251,7 @@ fn every_specialized_or_legacy_removal_clears_owner_generation() {
     assert_eq!(table.park(create()), Some(slot));
     let second = table.identity(slot).unwrap();
     assert_eq!(table.take_create_owner_exact(first, 10), None);
-    assert_eq!(table.take_thread_creates_with(13, |_| {}), 1);
+    assert_eq!(table.take_thread_creates_exact_with(13, |identity, _| assert_eq!(identity, second)), 1);
     assert_eq!(table.owner_generations[slot], 0);
     assert_eq!(table.get_exact(second), None);
     assert_eq!(table.park(transfer()), Some(slot));

@@ -103,6 +103,7 @@ pub(super) unsafe fn before_post_action(
                 (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).cancel_reservation(reservation),
                 "unused File reservation became stale"
             );
+            crate::pending_file_caller::cancel_reserved(reservation);
         }
         None
     };

@@ -3882,9 +3882,25 @@ impl ExecNtHandler {
             self.pending_file_io_reservation.is_none(),
             "one syscall reserved more than one pending File owner"
         );
-        let pending = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
-        self.pending_file_io_reservation = pending.reserve();
-        self.pending_file_io_reservation.is_some()
+        let Some(tcb) = self.hosted_thread_tcb(self.current_tid) else {
+            return false;
+        };
+        let Some(caller) = self.capture_provider_logical_caller(
+            self.pi, self.current_tid, self.current_badge, tcb,
+        ) else {
+            return false;
+        };
+        let Some(reservation) = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).reserve()
+        else {
+            return false;
+        };
+        if !crate::pending_file_caller::reserve(reservation, caller) {
+            assert!((&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .cancel_reservation(reservation));
+            return false;
+        }
+        self.pending_file_io_reservation = Some(reservation);
+        true
     }
 
     unsafe fn reserve_pending_set_file_name_owner(
@@ -14158,6 +14174,7 @@ impl ExecNtHandler {
         if matches!(pending.operation, nt_io_manager::PendingFileIoOperation::Create(_)) {
             let pending = table.take_create_owner_exact(identity, irp_id)
                 .expect("new CREATE refused its unpublished-handle rollback");
+            crate::pending_file_caller::retire(identity);
             self.abandon_file_create(pending);
         } else {
             let pending = table.abandon_transfer_owner_exact(identity, irp_id)
@@ -14182,7 +14199,10 @@ impl ExecNtHandler {
 
         let mut creates = Vec::new();
         (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-            .take_thread_creates_with(tid, |pending| creates.push(pending));
+            .take_thread_creates_exact_with(tid, |identity, pending| {
+                crate::pending_file_caller::retire(identity);
+                creates.push(pending);
+            });
         for pending in creates.iter().copied() {
             self.abandon_file_create(pending);
         }
