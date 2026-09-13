@@ -471,6 +471,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let irp_id = self.allocate_irp(record)?;
         projection.irp_id = irp_id;
         let record = self.irp_mut(irp_id).expect("allocated detached IRP");
+        projection.create_case_sensitive = record.create_case_sensitive();
         assert!(record.transition(IrpState::Initialized));
         record.detached_file_owner = true;
         Ok(PreparedExternalFileIrp(Owner {

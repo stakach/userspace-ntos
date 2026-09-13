@@ -33972,6 +33972,10 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         || request.stack_location >= request.stack_count
         || request.stack_count > u8::MAX as u32
         || request.flags & !0xffff != 0
+        || !nt_io_abi::valid_create_case_sensitive(
+            request.major,
+            request.create_case_sensitive,
+        )
         || (request.major == major::IRP_MJ_QUERY_INFORMATION
             && request.buffer_len != request.output_len)
         || !nt_io_abi::valid_initial_information(
@@ -34164,6 +34168,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         if write_wdm_file_object(
             fo_bytes,
             WdmFileObjectInit {
+                opened_case_sensitive: request.create_case_sensitive != 0,
                 device_object: devobj,
                 fs_context: file_id,
                 related_file_object,
@@ -42447,6 +42452,7 @@ fn hosted_irp_dispatch_request(
             IoParameters::Create(parameters) => parameters.ea_length,
             _ => 0,
         },
+        create_case_sensitive: u32::from(irp.create_case_sensitive),
         parameter_offset,
         parameter_len,
         stack_location: u32::try_from(irp.stack_location)
@@ -58259,6 +58265,10 @@ unsafe fn dispatch_irp_for_instance_exact(
             || request.output_len as usize != out.len()
             || request.stack_count == 0
             || request.stack_location >= request.stack_count
+            || !nt_io_abi::valid_create_case_sensitive(
+                request.major,
+                request.create_case_sensitive,
+            )
             || (request.major == major::IRP_MJ_QUERY_INFORMATION
                 && request.buffer_len != request.output_len)
             || !nt_io_abi::valid_initial_information(
@@ -59187,6 +59197,7 @@ pub(crate) unsafe fn dispatch_hosted_file_create_irp_result_exact(
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
     require_hosted_device_ready_for_dispatch(device_id)?;
+    let stack_flags = parameters.case_sensitive_stack_flags(major);
     dispatch_external_irp_to_device_record_result_exact(
         device_id,
         Some(canonical_file_id),
@@ -59203,7 +59214,7 @@ pub(crate) unsafe fn dispatch_hosted_file_create_irp_result_exact(
         None,
         None,
         None,
-        StackFlags::empty(),
+        stack_flags,
         0,
     )
 }
@@ -59227,6 +59238,9 @@ pub(crate) unsafe fn dispatch_hosted_target_directory_create_irp_result_exact(
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
     require_hosted_device_ready_for_dispatch(device_id)?;
+    let stack_flags = parameters.case_sensitive_stack_flags(major::IRP_MJ_CREATE)
+        | StackFlags::FORCE_ACCESS_CHECK
+        | StackFlags::OPEN_TARGET_DIRECTORY;
     let mut output = [];
     dispatch_external_irp_to_device_record_result_exact(
         device_id,
@@ -59244,7 +59258,7 @@ pub(crate) unsafe fn dispatch_hosted_target_directory_create_irp_result_exact(
         None,
         None,
         None,
-        StackFlags::FORCE_ACCESS_CHECK | StackFlags::OPEN_TARGET_DIRECTORY,
+        stack_flags,
         0,
     )
 }

@@ -13,10 +13,10 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use nt_io_abi::{
-    ioctl, major, valid_directory_notify_parameters, valid_ea_parameters, valid_initial_information,
-    valid_lock_control_parameters, valid_quota_parameters, valid_read_write_parameters,
-    valid_set_information_control, valid_volume_information_parameters, IrpDispatchRequest,
-    IO_ABI_VERSION,
+    ioctl, major, valid_create_case_sensitive, valid_directory_notify_parameters,
+    valid_ea_parameters, valid_initial_information, valid_lock_control_parameters,
+    valid_quota_parameters, valid_read_write_parameters, valid_set_information_control,
+    valid_volume_information_parameters, IrpDispatchRequest, IO_ABI_VERSION,
 };
 use nt_status::NtStatus;
 
@@ -294,6 +294,10 @@ fn build_dispatch_request(
     if !valid_initial_information(irp.major, initial_information, input_len, output_len) {
         return Err(NtStatus::INVALID_PARAMETER);
     }
+    let create_case_sensitive = u32::from(irp.create_case_sensitive);
+    if !valid_create_case_sensitive(irp.major, create_case_sensitive) {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
     Ok(IrpDispatchRequest {
         abi_version: IO_ABI_VERSION as u16,
         abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
@@ -356,7 +360,7 @@ fn build_dispatch_request(
         _reserved1: 0,
         read_write_byte_offset,
         read_write_key,
-        _reserved2: 0,
+        create_case_sensitive,
         initial_information,
     })
 }
@@ -530,6 +534,10 @@ impl DriverPeerTransport for MockDriverPeer {
                 request.major,
                 request.ioctl_code,
                 request.set_information_control,
+            )
+            || !valid_create_case_sensitive(
+                request.major,
+                request.create_case_sensitive,
             )
             || !valid_quota_parameters(
                 request.major,
@@ -723,6 +731,7 @@ mod initial_information_tests {
 
     fn projection() -> IrpProjection {
         IrpProjection {
+            create_case_sensitive: false,
             irp_id: IrpId::new(1, 1),
             driver_id: DriverId::new(1, 2),
             device_id: DeviceId::new(1, 3),
@@ -817,6 +826,10 @@ mod initial_information_tests {
         let valid = request();
         let invalid = [
             IrpDispatchRequest {
+                abi_version: 13,
+                ..valid
+            },
+            IrpDispatchRequest {
                 abi_version: 12,
                 ..valid
             },
@@ -863,6 +876,299 @@ mod initial_information_tests {
                 }
             );
             assert_eq!(output, [0x5a; 104]);
+        }
+    }
+
+    #[test]
+    fn canonical_create_case_policy_roundtrips_to_wire_and_wdm_for_each_major() {
+        use crate::detached_file_irp::{ExternalFileIrpBuffers, ExternalFileIrpRequest};
+        use crate::{
+            write_wdm_file_object, CreateOptions, CreateParameters, DeviceCharacteristics,
+            DeviceFlags, DeviceType, DispatchTarget, IoManager, MajorFunctionTable,
+            MockDriverBackend, MockObjectPort, ShareAccess, WdmFileObjectInit,
+            WDM_X64_FILE_OBJECT_SIZE,
+        };
+        use alloc::{boxed::Box, vec};
+        use nt_types::{AccessMask, NtPath, UnicodeString};
+
+        for major in [
+            major::IRP_MJ_CREATE,
+            major::IRP_MJ_CREATE_NAMED_PIPE,
+            major::IRP_MJ_CREATE_MAILSLOT,
+        ] {
+            for sensitive in [false, true] {
+                let mut io = IoManager::new(MockObjectPort::new());
+                let client = io.register_client();
+                let mut majors = MajorFunctionTable::new();
+                majors.set_all(DispatchTarget::DriverPeer(crate::DriverPeerId(0)));
+                let driver = io
+                    .create_driver_peer_with_major_table(
+                        &NtPath::parse_str(r"\Driver\CaseProjection").unwrap(),
+                        Box::new(MockDriverBackend::new()),
+                        majors,
+                    )
+                    .unwrap();
+                let device = io
+                    .create_device(
+                        driver,
+                        None,
+                        DeviceType::UNKNOWN,
+                        DeviceCharacteristics::empty(),
+                        DeviceFlags::BUFFERED_IO,
+                        0,
+                    )
+                    .unwrap();
+                let file = io
+                    .allocate_external_file(
+                        client,
+                        device,
+                        AccessMask::GENERIC_READ,
+                        ShareAccess::READ,
+                        CreateOptions::empty(),
+                        UnicodeString::from_str("MixedCase"),
+                    )
+                    .unwrap();
+                let parameters = CreateParameters {
+                    opened_case_sensitive: sensitive,
+                    ..Default::default()
+                };
+                let prepared = io
+                    .prepare_external_file_irp_owned(
+                        ExternalFileIrpRequest {
+                            client,
+                            device_id: device,
+                            file_id: Some(file),
+                            user_data: 0,
+                            requestor_tid: 99,
+                            major,
+                            stack_flags: parameters.case_sensitive_stack_flags(major),
+                            parameters: IoParameters::Create(parameters),
+                            initial_information: 0,
+                        },
+                        ExternalFileIrpBuffers::new(vec![], vec![]),
+                    )
+                    .unwrap();
+                let mut bytes = [];
+                let context = DispatchContext::new(driver, client, &mut bytes);
+                let request =
+                    build_dispatch_request(prepared.projection(), &context, target(), None)
+                        .unwrap();
+                assert_eq!(request.create_case_sensitive, sensitive as u32);
+                assert_eq!(
+                    request.flags & 0x80 != 0,
+                    major == major::IRP_MJ_CREATE && sensitive
+                );
+                assert!(valid_create_case_sensitive(
+                    request.major,
+                    request.create_case_sensitive
+                ));
+                let mut peer = MockPeerControl::new().transport();
+                let expected = if major == major::IRP_MJ_CREATE {
+                    DispatchOutcome::Completed {
+                        status: NtStatus::SUCCESS,
+                        information: 0,
+                        file_context: None,
+                    }
+                } else {
+                    DispatchOutcome::Failed {
+                        status: NtStatus::INVALID_DEVICE_REQUEST,
+                    }
+                };
+                assert_eq!(
+                    peer.dispatch(&request, PeerTransferBuffers::new(&mut [])),
+                    expected
+                );
+                let mut wdm = [0xa5; WDM_X64_FILE_OBJECT_SIZE];
+                write_wdm_file_object(
+                    &mut wdm,
+                    WdmFileObjectInit {
+                        opened_case_sensitive: request.create_case_sensitive != 0,
+                        device_object: 0x1122,
+                        fs_context: 0x3344,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    u32::from_le_bytes(wdm[0x50..0x54].try_into().unwrap()),
+                    if sensitive { 0x0002_0000 } else { 0 }
+                );
+                assert_eq!(u64::from_le_bytes(wdm[8..16].try_into().unwrap()), 0x1122);
+                assert_eq!(io.file(file).unwrap().opened_case_sensitive(), sensitive);
+                for (flags, value) in [(request.flags, 2)] {
+                    let malformed = IrpDispatchRequest {
+                        flags,
+                        create_case_sensitive: value,
+                        ..request
+                    };
+                    assert_eq!(
+                        peer.dispatch(&malformed, PeerTransferBuffers::new(&mut [])),
+                        DispatchOutcome::Failed {
+                            status: NtStatus::INVALID_PARAMETER
+                        }
+                    );
+                }
+                io.discard_prepared_external_file_irp(prepared).unwrap();
+                io.release_external_file(client, file).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn forwarded_create_preserves_file_provenance_while_filter_changes_lower_stack() {
+        use crate::{
+            write_wdm_file_object, CreateOptions, CreateParameters, DeviceCharacteristics,
+            DeviceFlags, DeviceType, IoManager, IoStackLocation, MockDriverBackend, MockObjectPort,
+            ShareAccess, WdmFileObjectInit, WDM_X64_FILE_OBJECT_SIZE,
+        };
+        use alloc::boxed::Box;
+        use nt_types::{AccessMask, NtPath, UnicodeString};
+
+        for sensitive in [false, true] {
+            let mut io = IoManager::new(MockObjectPort::new());
+            let client = io.register_client();
+            let lower_driver = io
+                .create_driver(
+                    &NtPath::parse_str(r"\Driver\CaseLower").unwrap(),
+                    Box::new(MockDriverBackend::new()),
+                )
+                .unwrap();
+            let filter_driver = io
+                .create_driver(
+                    &NtPath::parse_str(r"\Driver\CaseFilter").unwrap(),
+                    Box::new(MockDriverBackend::new()),
+                )
+                .unwrap();
+            let lower = io
+                .create_device(
+                    lower_driver,
+                    None,
+                    DeviceType::UNKNOWN,
+                    DeviceCharacteristics::empty(),
+                    DeviceFlags::BUFFERED_IO,
+                    0,
+                )
+                .unwrap();
+            let filter = io
+                .create_device(
+                    filter_driver,
+                    None,
+                    DeviceType::UNKNOWN,
+                    DeviceCharacteristics::empty(),
+                    DeviceFlags::BUFFERED_IO,
+                    0,
+                )
+                .unwrap();
+            io.attach_device_to_stack(filter, lower).unwrap();
+            let file = io
+                .allocate_external_file(
+                    client,
+                    lower,
+                    AccessMask::GENERIC_READ,
+                    ShareAccess::READ,
+                    CreateOptions::empty(),
+                    UnicodeString::from_str("MixedCase"),
+                )
+                .unwrap();
+            let parameters = CreateParameters {
+                opened_case_sensitive: sensitive,
+                ..Default::default()
+            };
+            let mut rejected = io
+                .build_irp_record(
+                    client,
+                    lower_driver,
+                    lower,
+                    Some(file),
+                    major::IRP_MJ_CREATE,
+                    IoParameters::Create(parameters),
+                )
+                .unwrap();
+            rejected.stack[0].flags.toggle(StackFlags::CASE_SENSITIVE);
+            assert_eq!(io.allocate_irp(rejected), Err(NtStatus::INVALID_PARAMETER));
+            assert_eq!(io.file(file).unwrap().outstanding_irp_refs, 0);
+            assert!(!io.file(file).unwrap().opened_case_sensitive());
+            let record = io
+                .build_irp_record(
+                    client,
+                    lower_driver,
+                    lower,
+                    Some(file),
+                    major::IRP_MJ_CREATE,
+                    IoParameters::Create(parameters),
+                )
+                .unwrap();
+            let irp = io.allocate_irp(record).unwrap();
+            assert_eq!(io.irp(irp).unwrap().create_case_sensitive(), sensitive);
+            assert_eq!(io.file(file).unwrap().outstanding_irp_refs, 1);
+            let changed = CreateParameters {
+                opened_case_sensitive: !sensitive,
+                ..parameters
+            };
+            let mut next =
+                IoStackLocation::new(lower_driver, major::IRP_MJ_CREATE, lower, Some(file));
+            next.flags = changed.case_sensitive_stack_flags(major::IRP_MJ_CREATE);
+            next.parameters = IoParameters::Create(changed);
+            assert_eq!(
+                io.handoff_irp_to_next_stack(irp, lower_driver, next.clone()),
+                Err(NtStatus::INVALID_PARAMETER)
+            );
+            assert_eq!(io.irp(irp).unwrap().current_location, 0);
+            assert_eq!(
+                io.handoff_irp_to_next_stack(irp, filter_driver, next),
+                Ok((lower_driver, lower))
+            );
+            let projection = IrpProjection::from_record(io.irp(irp).unwrap()).unwrap();
+            assert_eq!(projection.create_case_sensitive, sensitive);
+            assert_eq!(
+                projection.flags.contains(StackFlags::CASE_SENSITIVE),
+                !sensitive
+            );
+            let IoParameters::Create(lower_parameters) = &projection.parameters else {
+                panic!("CREATE parameters lost");
+            };
+            assert_eq!(lower_parameters.opened_case_sensitive, !sensitive);
+            let mut bytes = [];
+            let context = DispatchContext::new(lower_driver, client, &mut bytes);
+            let request = build_dispatch_request(&projection, &context, target(), None).unwrap();
+            assert_eq!(request.create_case_sensitive, sensitive as u32);
+            assert_eq!(request.flags & 0x80 != 0, !sensitive);
+            let mut peer = MockPeerControl::new().transport();
+            assert!(matches!(
+                peer.dispatch(&request, PeerTransferBuffers::new(&mut [])),
+                DispatchOutcome::Completed {
+                    status: NtStatus::SUCCESS,
+                    ..
+                }
+            ));
+            let mut wdm = [0xa5; WDM_X64_FILE_OBJECT_SIZE];
+            write_wdm_file_object(
+                &mut wdm,
+                WdmFileObjectInit {
+                    opened_case_sensitive: request.create_case_sensitive != 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                u32::from_le_bytes(wdm[0x50..0x54].try_into().unwrap()),
+                if sensitive { 0x0002_0000 } else { 0 }
+            );
+            assert_eq!(io.file(file).unwrap().opened_case_sensitive(), sensitive);
+            assert_eq!(io.irp(irp).unwrap().create_case_sensitive(), sensitive);
+            let current = &mut io.irp_mut(irp).unwrap().stack[1];
+            current.major = major::IRP_MJ_READ;
+            current.parameters = IoParameters::Read(Default::default());
+            assert!(
+                !IrpProjection::from_record(io.irp(irp).unwrap())
+                    .unwrap()
+                    .create_case_sensitive
+            );
+            assert_eq!(io.irp(irp).unwrap().create_case_sensitive(), sensitive);
+            io.free_irp(irp).unwrap();
+            assert_eq!(io.file(file).unwrap().outstanding_irp_refs, 0);
+            io.release_external_file(client, file).unwrap();
+            assert!(io.file(file).is_none());
         }
     }
 }

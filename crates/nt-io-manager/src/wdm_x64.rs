@@ -49,6 +49,7 @@ pub struct WdmDeviceObjectInit {
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WdmFileObjectInit {
+    pub opened_case_sensitive: bool,
     pub device_object: u64,
     pub fs_context: u64,
     pub related_file_object: u64,
@@ -241,6 +242,15 @@ pub fn write_wdm_file_object(
     put_u64(bytes, 0x08, init.device_object);
     put_u64(bytes, 0x18, init.fs_context);
     put_u64(bytes, 0x40, init.related_file_object);
+    put_u32(
+        bytes,
+        0x50,
+        if init.opened_case_sensitive {
+            0x0002_0000
+        } else {
+            0
+        },
+    );
     put_u16(bytes, 0x58, init.file_name_len);
     put_u16(bytes, 0x5a, init.file_name_max_len);
     put_u64(bytes, 0x60, init.file_name_buffer);
@@ -278,6 +288,7 @@ pub fn write_wdm_open_device_projection(
     write_wdm_file_object(
         file_bytes,
         WdmFileObjectInit {
+            opened_case_sensitive: false,
             device_object: init.device_object,
             fs_context: init.file_object_context,
             related_file_object: 0,

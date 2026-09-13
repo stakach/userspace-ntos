@@ -30,7 +30,14 @@ pub use wire::{
 };
 
 /// ABI version of this wire contract; bumped on any incompatible change.
-pub const IO_ABI_VERSION: u32 = 13;
+pub const IO_ABI_VERSION: u32 = 14;
+
+/// Validate captured CREATE case provenance independently of mutable stack flags.
+/// A forwarding driver may change its next stack's `SL_CASE_SENSITIVE` without
+/// changing the File's original opened-case policy.
+pub const fn valid_create_case_sensitive(major: u8, value: u32) -> bool {
+    value <= 1 && (major::is_create_major(major) || value == 0)
+}
 
 /// Scalar initial `IoStatus.Information` is a bounded File-query byte count,
 /// never a transported PnP pointer.
@@ -538,7 +545,7 @@ mod tests {
 
     #[test]
     fn initial_information_wire_appends_scalar_without_moving_existing_fields() {
-        assert_eq!(IO_ABI_VERSION, 13);
+        assert_eq!(IO_ABI_VERSION, 14);
         assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 256);
         assert_eq!(
             core::mem::offset_of!(IrpDispatchRequest, target_domain_id),
@@ -563,6 +570,60 @@ mod tests {
             request
         );
         assert!(bytemuck::try_pod_read_unaligned::<IrpDispatchRequest>(&bytes[..248]).is_err());
+    }
+
+    #[test]
+    fn create_case_provenance_reuses_reserved_word_without_moving_query_information() {
+        assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 256);
+        assert_eq!(
+            core::mem::offset_of!(IrpDispatchRequest, create_case_sensitive),
+            244
+        );
+        assert_eq!(
+            core::mem::offset_of!(IrpDispatchRequest, initial_information),
+            248
+        );
+        let request = IrpDispatchRequest {
+            abi_version: IO_ABI_VERSION as u16,
+            abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
+            major: major::IRP_MJ_CREATE,
+            flags: 0x80,
+            create_case_sensitive: 1,
+            ..Default::default()
+        };
+        let bytes = bytemuck::bytes_of(&request);
+        assert_eq!(&bytes[244..248], &1u32.to_le_bytes());
+        assert_eq!(&bytes[..2], &14u16.to_le_bytes());
+        assert_eq!(
+            bytemuck::pod_read_unaligned::<IrpDispatchRequest>(bytes),
+            request
+        );
+        // ABI 13 has the same size but cannot identify explicit case provenance.
+        let old_request = IrpDispatchRequest {
+            abi_version: 13,
+            ..request
+        };
+        assert_ne!(old_request.abi_version, IO_ABI_VERSION as u16);
+    }
+
+    #[test]
+    fn create_case_provenance_validates_every_major_independently_of_stack_flags() {
+        for major in 0..=u8::MAX {
+            for value in [0, 1, 2, u32::MAX] {
+                let expected = value <= 1
+                    && match major {
+                        major::IRP_MJ_CREATE
+                        | major::IRP_MJ_CREATE_NAMED_PIPE
+                        | major::IRP_MJ_CREATE_MAILSLOT => true,
+                        _ => value == 0,
+                    };
+                assert_eq!(
+                    valid_create_case_sensitive(major, value),
+                    expected,
+                    "major={major:#x} value={value:#x}"
+                );
+            }
+        }
     }
 
     #[test]

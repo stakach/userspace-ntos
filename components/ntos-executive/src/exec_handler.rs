@@ -27488,6 +27488,7 @@ impl ExecNtHandler {
         major: u8,
         name16: &[u16],
         related_file_id: Option<u64>,
+        object_attributes: u32,
         provider_context: u64,
         desired_access: u32,
         share_access: u32,
@@ -27583,6 +27584,7 @@ impl ExecNtHandler {
             major,
             self.current_tid,
             nt_io_manager::CreateParameters {
+                opened_case_sensitive: object_attributes & 0x40 == 0, // OBJ_CASE_INSENSITIVE
                 desired_access: nt_types::AccessMask::from_bits_retain(desired_access),
                 share_access: nt_io_manager::ShareAccess::from_bits_retain(share_access),
                 create_options: nt_io_manager::CreateOptions::from_bits_retain(create_options),
@@ -32313,7 +32315,6 @@ impl ExecNtHandler {
             Ok(resolved) => resolved,
             Err(status) => return status,
         };
-        let _captured_attributes = captured.attributes;
         let mut nb = [0u8; 96];
         let nlen = {
             let mut n = 0;
@@ -32339,6 +32340,7 @@ impl ExecNtHandler {
                     major::IRP_MJ_CREATE,
                     name16,
                     Some(file_id),
+                    captured.attributes,
                     provider_context,
                     desired_access,
                     share_access,
@@ -32449,6 +32451,7 @@ impl ExecNtHandler {
                     major::IRP_MJ_CREATE,
                     leaf,
                     None,
+                    captured.attributes,
                     provider_context,
                     desired_access,
                     share_access,
@@ -35395,7 +35398,6 @@ impl ExecNtHandler {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
-                let _captured_attributes = captured.attributes;
                 let mut leaf_buf = [0u16; FILE_OBJECT_NAME_CAP + 1];
                 let (leaf, related_file_id) = match parse_root {
                     FileParseRoot::Absolute => {
@@ -35441,6 +35443,7 @@ impl ExecNtHandler {
                     major::IRP_MJ_CREATE_NAMED_PIPE,
                     leaf,
                     related_file_id,
+                    captured.attributes,
                     name_hash,
                     desired_access,
                     share_access,
@@ -41755,7 +41758,6 @@ impl ExecNtHandler {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
-                let _captured_attributes = captured.attributes;
                 let iosb = args[3];
                 if file_handle_out == 0
                     || iosb == 0
@@ -41849,6 +41851,7 @@ impl ExecNtHandler {
                             major::IRP_MJ_CREATE,
                             name16,
                             Some(file_id),
+                            captured.attributes,
                             provider_context,
                             desired_access,
                             share_access,
@@ -41950,6 +41953,7 @@ impl ExecNtHandler {
                             major::IRP_MJ_CREATE,
                             &root_name,
                             None,
+                            captured.attributes,
                             0,
                             desired_access,
                             share_access,
@@ -42001,6 +42005,7 @@ impl ExecNtHandler {
                             major::IRP_MJ_CREATE,
                             leaf,
                             None,
+                            captured.attributes,
                             pipe_hash,
                             desired_access,
                             share_access,

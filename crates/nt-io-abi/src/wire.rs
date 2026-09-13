@@ -146,7 +146,9 @@ pub struct IrpDispatchRequest {
     /// Typed `Parameters.Read/Write` values. Length remains the direction-specific transfer extent.
     pub read_write_byte_offset: u64,
     pub read_write_key: u32,
-    pub _reserved2: u32,
+    /// Captured CREATE case sensitivity as a Boolean, including named pipes and
+    /// mailslots where `SL_CASE_SENSITIVE` is not projected. Zero for other majors.
+    pub create_case_sensitive: u32,
     /// Initial scalar File-query byte count, bounded by `output_len`.
     /// PnP pointer-valued information stays in its separate typed transport.
     pub initial_information: u64,
@@ -186,6 +188,7 @@ const _: () = {
     assert!(size_of::<IoFileRequest>() == 16);
     assert!(size_of::<IoCancelRequest>() == 16);
     assert!(size_of::<IrpDispatchRequest>() == 256);
+    assert!(core::mem::offset_of!(IrpDispatchRequest, create_case_sensitive) == 244);
     assert!(core::mem::offset_of!(IrpDispatchRequest, initial_information) == 248);
     assert!(size_of::<IoReply>() == 32);
     assert!(align_of::<IoReadWriteRequest>() == 8);

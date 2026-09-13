@@ -420,6 +420,7 @@ unsafe fn rewrite_video_file_projection(file_id: u64) -> bool {
     write_wdm_file_object(
         core::slice::from_raw_parts_mut(objects.file as *mut u8, WDM_X64_FILE_OBJECT_SIZE),
         WdmFileObjectInit {
+            opened_case_sensitive: false,
             device_object: objects.device,
             fs_context: file_id,
             related_file_object: 0,

@@ -33914,12 +33914,48 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         `.tmp/build-relative-target-create-executive-20260913.log`. Independent ownership/NT5
         ordering review, focused formatting and git diff --check pass. Review keeps the remaining
         attributes, general absolute routing and native acceptance below explicitly open.
-      - [ ] Complete remaining target-open attributes and namespace routing semantics.
+      - [x] Preserve authoritative case-sensitive open provenance through target-parent CREATE
+        (2026-09-14; implementation, serialized host tests and native build complete).
+        Carry captured OBJ_CASE_INSENSITIVE from NtOpenFile, NtCreateFile and
+        NtCreateNamedPipeFile into typed CREATE parameters and immutable canonical File state.
+        NT5 parse.c:992-1003 publishes SL_CASE_SENSITIVE only for ordinary CREATE, while
+        parse.c:1172 sets FO_OPENED_CASE_SENSITIVE for every File create type. Keep these distinct:
+        ABI14 uses an explicit 0/1 create_case_sensitive word at offset 244 without growing the
+        256-byte request. Reject old ABI13, non-Boolean provenance and nonzero provenance on
+        non-CREATE requests. Initial canonical admission checks the typed input against the
+        manager-derived stack flag. Forwarded CREATE stack flags remain driver-controlled:
+        NT5 IopfCallDriver does not reconcile them with the immutable File flag. Retain original
+        provenance separately from mutable stack parameters through every lower-driver projection.
+        Initialize the provider FILE_OBJECT flag once at CREATE; reused objects retain their
+        provider-owned state. Rename/link target opening inherits the retained source's case
+        policy, never the RootDirectory's case policy. Absolute target Object Manager reparsing
+        now receives that policy instead of the old hardcoded case-insensitive setting, including
+        symbolic-link restart; the filesystem suffix keeps its original UTF-16 spelling.
+        No case state is inferred from names,
+        create options, executable identity or device identity. Internal callers without captured
+        object attributes explicitly select their case-insensitive policy; the generic open API
+        and local overlay/FAT namespace case behavior are not expanded by this checkpoint.
+        Six new manager tests cover all CREATE majors and both case policies, inconsistent initial
+        flags without ownership mutation, retained source cleanup and opposite-case root inheritance,
+        canonical-to-wire/WDM projection, and real canonical filter handoff with changed lower flags
+        and parameters. All 668 manager library tests pass, including forwarding and reference
+        retirement: `.tmp/test-create-case-manager-library-20260914.log`. Three Object Manager
+        regressions cover exact-case links, mismatched namespace components and symlink restart.
+        All 967 selected host/doc tests pass across 46 suites with no failures or ignored cases:
+        nt-io-manager, nt-io-abi, nt-driver-host, nt-driver-runtime, nt-object-manager,
+        nt-object-client and nt-object-server. Evidence: `.tmp/test-create-case-full-20260914.log`.
+        The final freestanding executive release build passes in 37.97s with the unchanged
+        294 warnings: `.tmp/build-create-case-executive-20260914.log`. Independent core/native
+        review, scoped formatting and git diff --check pass. No VM was run; provider IPC,
+        filesystem case behavior and desktop acceptance remain separate runtime validation work.
+      - [ ] Complete remaining direct-device and absolute namespace routing semantics.
         Canonical FO_DIRECT_DEVICE_OPEN is not represented: implement its actual open-state origin
-        and sole legitimate Basic-query exemption, not a create-option/name/device heuristic. Until
-        then the supported filesystem path always queries Basic. Preserve authoritative source
-        FO_OPENED_CASE_SENSITIVE when constructing target-open attributes; current transport does
-        not expose that state. Absolute targets still normalize against the source device prefix;
+        and sole legitimate Basic-query exemption, not a create-option/name/device heuristic.
+        NT5 parse.c:700-731 additionally requires no related File, empty remaining name, a limited
+        metadata/security access set and a real File, then changes mount routing. Relative roots
+        that were direct opens take the full mount path (parse.c:765). Model that parser/mount
+        decision before setting the flag. Until then the supported filesystem path always queries
+        Basic. Absolute targets still normalize against the source device prefix;
         replace this with general target namespace/device resolution so cross-device absolute
         CREATE parse/access errors also precede NOT_SAME_DEVICE. These are explicit remaining
         semantics, not fallback success paths or claims of full NT5 target-open equivalence.
@@ -33939,6 +33975,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         queries use canonical CurrentByteOffset before event clear (qsinfo.c:319), whereas inline
         Access/Mode/Alignment use normal event/completion semantics (qsinfo.c:603). Track missing
         canonical position state rather than supplying a fabricated offset.
+        The 2026-09-14 mode audit requires a coordinated change, not only a metadata setter:
+        FILE_VALID_SET_FLAGS is 0x36; async/sync identity is immutable, but synchronous alertability
+        can change. Unbuffered Files retain existing WRITE_THROUGH regardless of the requested bit.
+        Update canonical-owned WDM mode bits without replacing provider-owned Flags/FsContext,
+        and synchronize FileCompletionTable mode without allocation. pending_file_busy release
+        and prepare_hosted_file_io retry admission must compare immutable synchronicity rather
+        than reject owners after an alertability change. Already queued waits keep their captured
+        alertability; new waits read current mode. Access/Mode queries must not depend on live
+        attachment alignment. Cover these ownership and query rules before enabling native SET16.
       - [x] Preserve FileAll initial output and Information through provider transport (2026-09-13;
         host/composed/native-build verified below).
         NT5 qsinfo.c:688 initializes Information

@@ -363,6 +363,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             Some(file_id),
             major::IRP_MJ_CREATE,
             IoParameters::Create(CreateParameters {
+                opened_case_sensitive: false,
                 desired_access,
                 share_access,
                 create_options,

@@ -15126,12 +15126,13 @@ pub(crate) unsafe fn object_manager_delete_symbolic_link_path(
 
 pub(crate) unsafe fn object_manager_reparse_file_path(
     path: &[u16],
+    case_insensitive: bool,
     output: &mut [u16],
 ) -> Result<usize, nt_status::NtStatus> {
     let client = OBJECT_CLIENT_PTR
         .as_mut()
         .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
-    let reparsed = client.reparse_file_path(path, true)?;
+    let reparsed = client.reparse_file_path(path, case_insensitive)?;
     if reparsed.len() > output.len() {
         return Err(nt_status::NtStatus::OBJECT_NAME_INVALID);
     }
@@ -30924,6 +30925,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             1, /* IRP_MJ_CREATE_NAMED_PIPE */
                             0,
                             CreateParameters {
+                                opened_case_sensitive: false,
                                 desired_access: AccessMask::from_bits_retain(0x001f_01ff),
                                 share_access: ShareAccess::from_bits_retain(3),
                                 create_options: CreateOptions::empty(),
@@ -30980,6 +30982,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 0, /* IRP_MJ_CREATE */
                                 0,
                                 CreateParameters {
+                                    opened_case_sensitive: false,
                                     desired_access: AccessMask::from_bits_retain(0x001f_01ff),
                                     share_access: ShareAccess::from_bits_retain(3),
                                     create_options: CreateOptions::empty(),

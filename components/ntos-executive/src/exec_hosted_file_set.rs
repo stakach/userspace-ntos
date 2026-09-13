@@ -76,6 +76,9 @@ impl ExecNtHandler {
         if !self.set_file_name_caller_is_current(caller) {
             return Err(nt_status::NtStatus::CANCELLED.raw() as u32);
         }
+        let opened_case_sensitive =
+            driver_launch::owned_hosted_file_metadata(transaction.source_file_id)?
+                .opened_case_sensitive;
         let mut decoded = [0u16; FILE_OBJECT_NAME_CAP];
         let len = Self::decode_set_file_name_units(transaction.target_name(), &mut decoded)?;
         let name = &decoded[..len];
@@ -104,8 +107,12 @@ impl ExecNtHandler {
                 (Some(file_id), name)
             }
             FileParseRoot::Absolute => {
-                let len = crate::object_manager_reparse_file_path(name, &mut canonical)
-                    .map_err(|status| status.raw() as u32)?;
+                let len = crate::object_manager_reparse_file_path(
+                    name,
+                    !opened_case_sensitive,
+                    &mut canonical,
+                )
+                .map_err(|status| status.raw() as u32)?;
                 let len = driver_launch::hosted_file_device_relative_name(
                     transaction.source_file_id,
                     &canonical[..len],
@@ -134,6 +141,7 @@ impl ExecNtHandler {
             target,
             self.current_tid,
             nt_io_manager::CreateParameters {
+                opened_case_sensitive,
                 desired_access: nt_types::AccessMask::from_bits_retain(access),
                 share_access: nt_io_manager::ShareAccess::READ | nt_io_manager::ShareAccess::WRITE,
                 create_options: nt_io_manager::CreateOptions::OPEN_FOR_BACKUP_INTENT,

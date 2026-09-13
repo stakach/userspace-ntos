@@ -46,6 +46,8 @@ pub enum CancelState {
 /// `IRP_MJ_CREATE` parameters.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct CreateParameters {
+    /// Captured Object Attributes case policy; independent of the CREATE major's stack flags.
+    pub opened_case_sensitive: bool,
     pub desired_access: AccessMask,
     pub share_access: ShareAccess,
     pub create_options: CreateOptions,
@@ -56,6 +58,17 @@ pub struct CreateParameters {
     pub ea_length: u32,
     /// Canonical directory File retained by this File for a handle-relative CREATE.
     pub related_file: Option<FileId>,
+}
+
+impl CreateParameters {
+    /// NT only sets SL_CASE_SENSITIVE for ordinary CREATE, not pipe or mailslot CREATE.
+    pub fn case_sensitive_stack_flags(&self, major: u8) -> StackFlags {
+        if major == nt_io_abi::major::IRP_MJ_CREATE && self.opened_case_sensitive {
+            StackFlags::CASE_SENSITIVE
+        } else {
+            StackFlags::empty()
+        }
+    }
 }
 
 /// `IRP_MJ_READ` / `IRP_MJ_WRITE` parameters.
@@ -520,6 +533,8 @@ pub struct IrpRecord {
     pub origin_device_id: DeviceId,
     pub origin_major: u8,
     pub origin_minor: u8,
+    /// Original CREATE File-body provenance, committed only by canonical IRP admission.
+    pub(crate) create_case_sensitive: bool,
     pub state: IrpState,
     pub status: NtStatus,
     pub information: u64,
@@ -558,6 +573,7 @@ impl IrpRecord {
             origin_device_id: device_id,
             origin_major: major,
             origin_minor: 0,
+            create_case_sensitive: false,
             state: IrpState::Allocated,
             status: NtStatus::PENDING,
             information: 0,
@@ -574,6 +590,11 @@ impl IrpRecord {
             user_data: 0,
             requestor_tid: 0,
         }
+    }
+
+    /// File-body case policy committed by initial admission, not the driver's current stack flag.
+    pub(crate) fn create_case_sensitive(&self) -> bool {
+        self.create_case_sensitive
     }
 
     /// Return the identity captured before the request was visible to a driver.

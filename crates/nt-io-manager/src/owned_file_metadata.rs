@@ -10,6 +10,7 @@ use crate::{CreateOptions, FileState, IoManager};
 pub struct OwnedFileMetadata {
     pub device_id: DeviceId,
     pub create_options: CreateOptions,
+    pub opened_case_sensitive: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +72,7 @@ impl<P> IoManager<P> {
         Ok(OwnedFileMetadata {
             device_id: record.device_id,
             create_options: record.create_options,
+            opened_case_sensitive: record.opened_case_sensitive(),
         })
     }
 }
@@ -277,6 +279,7 @@ mod tests {
             Ok(OwnedFileMetadata {
                 device_id: f.device,
                 create_options: options,
+                opened_case_sensitive: false,
             })
         );
         assert_eq!(f.query(), Err(NtStatus::DELETE_PENDING));
@@ -357,6 +360,7 @@ mod tests {
             Ok(OwnedFileMetadata {
                 device_id: f.device,
                 create_options: options,
+                opened_case_sensitive: false,
             })
         );
         let absolute = nt_types::UnicodeString::from_str(r"\Device\OwnedMetadata\target\leaf");

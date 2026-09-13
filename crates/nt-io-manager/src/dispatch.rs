@@ -84,6 +84,8 @@ impl<'a> DispatchContext<'a> {
 /// ids + the current stack location's parameters — never a canonical pointer.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct IrpProjection {
+    /// Canonical File-body case provenance, independent of the current driver's CREATE flags.
+    pub create_case_sensitive: bool,
     pub irp_id: IrpId,
     pub driver_id: DriverId,
     pub device_id: DeviceId,
@@ -113,6 +115,7 @@ impl IrpProjection {
         let stack_count =
             u8::try_from(record.stack.len()).map_err(|_| NtStatus::INVALID_PARAMETER)?;
         Ok(Self {
+            create_case_sensitive: crate::is_create_major(stack.major) && record.create_case_sensitive(),
             irp_id: record.id,
             driver_id: stack.driver_id,
             device_id: stack.device_id,

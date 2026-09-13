@@ -668,6 +668,9 @@ impl<P> IoManager<P> {
             if stack.is_empty() {
                 location.parameters = parameters.clone();
                 match parameters {
+                    IoParameters::Create(parameters) => {
+                        location.flags = parameters.case_sensitive_stack_flags(major)
+                    }
                     IoParameters::Pnp(parameters) => location.minor = parameters.minor,
                     IoParameters::LockControl(parameters) => location.minor = parameters.minor,
                     IoParameters::NotifyDirectory(_) => {
@@ -705,6 +708,9 @@ impl<P> IoManager<P> {
         let stack = if device == DeviceId::NULL {
             let mut location = IoStackLocation::new(driver, major, DeviceId::NULL, file);
             match &parameters {
+                IoParameters::Create(parameters) => {
+                    location.flags = parameters.case_sensitive_stack_flags(major)
+                }
                 IoParameters::Pnp(parameters) => location.minor = parameters.minor,
                 IoParameters::LockControl(parameters) => location.minor = parameters.minor,
                 IoParameters::NotifyDirectory(_) => {
@@ -1089,6 +1095,14 @@ impl<P> IoManager<P> {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         if let Some(current) = record.current_stack() {
+            if let IoParameters::Create(parameters) = &current.parameters {
+                if !is_create_major(record.origin_major)
+                    || current.flags.intersection(StackFlags::CASE_SENSITIVE)
+                        != parameters.case_sensitive_stack_flags(record.origin_major)
+                {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+            }
             if current.file_id != record.file_id {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
@@ -1218,6 +1232,11 @@ impl<P> IoManager<P> {
                 .checked_add(1)
                 .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
             let file = self.files.get_mut(file_id).expect("validated file");
+            if let Some(IoParameters::Create(parameters)) =
+                record.current_stack().map(|stack| &stack.parameters)
+            {
+                file.opened_case_sensitive = parameters.opened_case_sensitive;
+            }
             file.outstanding_irp_refs += 1;
             if related_file.is_some() {
                 file.related_file = None;
@@ -1234,6 +1253,11 @@ impl<P> IoManager<P> {
                     .expect("validated set-information target File")
                     .outstanding_irp_refs += 1;
             }
+        }
+        if let Some(IoParameters::Create(parameters)) =
+            record.current_stack().map(|stack| &stack.parameters)
+        {
+            record.create_case_sensitive = parameters.opened_case_sensitive;
         }
         let id = self.irps.insert(record);
         self.irps.get_mut(id).expect("just inserted").id = id;
@@ -2167,6 +2191,7 @@ mod tests {
 
     fn projection(major: u8, parameters: IoParameters) -> IrpProjection {
         IrpProjection {
+            create_case_sensitive: false,
             irp_id: IrpId::new(1, 1),
             driver_id: DriverId::new(1, 1),
             device_id: DeviceId::new(1, 1),
@@ -6555,6 +6580,7 @@ mod tests {
                 17,
                 major::IRP_MJ_CREATE,
                 IoParameters::Create(CreateParameters {
+                    opened_case_sensitive: false,
                     desired_access: target_access,
                     share_access: ShareAccess::READ | ShareAccess::WRITE,
                     create_options: CreateOptions::OPEN_FOR_BACKUP_INTENT,
@@ -7464,6 +7490,7 @@ mod tests {
         write_wdm_file_object(
             &mut file,
             WdmFileObjectInit {
+                opened_case_sensitive: false,
                 device_object: 0x4444,
                 fs_context: 0x5555,
                 related_file_object: 0x5a5a,

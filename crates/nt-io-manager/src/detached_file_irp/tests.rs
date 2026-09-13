@@ -8,6 +8,7 @@ use alloc::{boxed::Box, rc::Rc, vec, vec::Vec};
 use core::cell::RefCell;
 use nt_types::{AccessMask, HandleValue, NtPath, UnicodeString};
 
+mod open_case_tests;
 mod operations_tests;
 mod relative_root_tests;
 

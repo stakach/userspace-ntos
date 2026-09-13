@@ -106,6 +106,8 @@ pub struct FileRecord {
     pub share_access: ShareAccess,
     pub create_options: CreateOptions,
     pub flags: FileFlags,
+    /// Object Attributes case policy captured by accepted CREATE, never a mutable driver flag.
+    pub(crate) opened_case_sensitive: bool,
     /// Parent captured for a handle-relative CREATE. `allocate_irp` transfers this identity into
     /// the CREATE stack and clears it here; the CREATE IRP, not the child File lifetime, retains
     /// the parent.
@@ -153,6 +155,7 @@ impl FileRecord {
             share_access,
             create_options,
             flags: FileFlags::empty(),
+            opened_case_sensitive: false,
             related_file: None,
             file_name,
             driver_context: None,
@@ -163,6 +166,10 @@ impl FileRecord {
             cleanup_dispatched: false,
             close_dispatched: false,
         }
+    }
+
+    pub fn opened_case_sensitive(&self) -> bool {
+        self.opened_case_sensitive
     }
 
     /// Advance the lifecycle state if the transition is allowed. Returns whether
