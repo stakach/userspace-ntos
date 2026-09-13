@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use nt_io_abi::{
-    ioctl, major, valid_directory_notify_parameters, valid_ea_parameters,
+    ioctl, major, valid_directory_notify_parameters, valid_ea_parameters, valid_initial_information,
     valid_lock_control_parameters, valid_quota_parameters, valid_read_write_parameters,
     valid_set_information_control, valid_volume_information_parameters, IrpDispatchRequest,
     IO_ABI_VERSION,
@@ -285,6 +285,15 @@ fn build_dispatch_request(
     {
         return Err(NtStatus::INVALID_PARAMETER);
     }
+    let initial_information = if irp.major == major::IRP_MJ_PNP {
+        // PnP information can be a peer-local pointer.
+        0
+    } else {
+        irp.information
+    };
+    if !valid_initial_information(irp.major, initial_information, input_len, output_len) {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
     Ok(IrpDispatchRequest {
         abi_version: IO_ABI_VERSION as u16,
         abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
@@ -348,6 +357,7 @@ fn build_dispatch_request(
         read_write_byte_offset,
         read_write_key,
         _reserved2: 0,
+        initial_information,
     })
 }
 
@@ -507,6 +517,15 @@ impl DriverPeerTransport for MockDriverPeer {
         if request.abi_version != IO_ABI_VERSION as u16
             || request.abi_size as usize != core::mem::size_of::<IrpDispatchRequest>()
             || !request.has_well_formed_domain_route()
+            || !valid_initial_information(
+                request.major,
+                request.initial_information,
+                request.input_len,
+                request.output_len,
+            )
+            || (request.major == major::IRP_MJ_QUERY_INFORMATION
+                && (request.output_len > request.buffer_len
+                    || request.buffer_len as usize > buffers.system.len()))
             || !valid_set_information_control(
                 request.major,
                 request.ioctl_code,
@@ -562,6 +581,7 @@ impl DriverPeerTransport for MockDriverPeer {
             request.major,
             major::IRP_MJ_READ
                 | major::IRP_MJ_WRITE
+                | major::IRP_MJ_QUERY_INFORMATION
                 | major::IRP_MJ_QUERY_EA
                 | major::IRP_MJ_SET_EA
                 | major::IRP_MJ_QUERY_QUOTA
@@ -644,8 +664,12 @@ impl DriverPeerTransport for MockDriverPeer {
                     file_context: None,
                 }
             }
-            major::IRP_MJ_QUERY_INFORMATION
-            | major::IRP_MJ_SET_INFORMATION
+            major::IRP_MJ_QUERY_INFORMATION => DispatchOutcome::Completed {
+                status: NtStatus::SUCCESS,
+                information: request.initial_information,
+                file_context: None,
+            },
+            major::IRP_MJ_SET_INFORMATION
             | major::IRP_MJ_QUERY_EA
             | major::IRP_MJ_SET_EA
             | major::IRP_MJ_QUERY_QUOTA
@@ -685,5 +709,160 @@ impl DriverPeerTransport for MockDriverPeer {
 
     fn is_faulted(&self) -> bool {
         self.state.borrow().faulted
+    }
+}
+
+#[cfg(test)]
+mod initial_information_tests {
+    use super::*;
+    use crate::{
+        DeviceId, DriverId, HostedDomainId, InformationParameters, IoParameters, PnpParameters,
+        StackControl, StackFlags,
+    };
+    use nt_types::ClientId;
+
+    fn projection() -> IrpProjection {
+        IrpProjection {
+            irp_id: IrpId::new(1, 1),
+            driver_id: DriverId::new(1, 2),
+            device_id: DeviceId::new(1, 3),
+            file_id: Some(FileId::new(1, 4)),
+            stack_location: 0,
+            stack_count: 1,
+            major: major::IRP_MJ_QUERY_INFORMATION,
+            minor: 0,
+            flags: StackFlags::empty(),
+            control: StackControl::empty(),
+            status: NtStatus::SUCCESS,
+            information: 88,
+            parameters: IoParameters::QueryInformation(InformationParameters {
+                info_class: 18,
+                length: 104,
+            }),
+            buffer: None,
+            user_data: 0,
+            requestor_tid: 20,
+        }
+    }
+
+    fn target() -> HostedDomainIdentity {
+        HostedDomainIdentity {
+            domain_id: HostedDomainId::new(1, 5),
+            cookie: 6,
+        }
+    }
+
+    fn request() -> IrpDispatchRequest {
+        let irp = projection();
+        let mut bytes = [0; 104];
+        let context = DispatchContext::new(irp.driver_id, ClientId(1), &mut bytes);
+        build_dispatch_request(&irp, &context, target(), None).unwrap()
+    }
+
+    #[test]
+    fn initial_information_projection_and_peer_keep_scalar_and_output_seed() {
+        let request = request();
+        assert_eq!(request.initial_information, 88);
+        assert_eq!(request.input_len, 0);
+        assert_eq!(request.output_len, 104);
+        assert_eq!(request.buffer_offset, 256);
+        let mut output = [0x5a; 104];
+        let before = output;
+        let control = MockPeerControl::new();
+        let mut peer = control.transport();
+        assert_eq!(
+            peer.dispatch(&request, PeerTransferBuffers::new(&mut output)),
+            DispatchOutcome::Completed {
+                status: NtStatus::SUCCESS,
+                information: 88,
+                file_context: None,
+            }
+        );
+        assert_eq!(output, before);
+        assert_eq!(control.last_request(), Some(request));
+    }
+
+    #[test]
+    fn initial_information_projection_refuses_oversized_query_and_never_exports_pnp_pointer() {
+        let mut irp = projection();
+        let mut output = [0; 104];
+        let context = DispatchContext::new(irp.driver_id, ClientId(1), &mut output);
+        irp.information = 105;
+        assert_eq!(
+            build_dispatch_request(&irp, &context, target(), None),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        irp.major = major::IRP_MJ_READ;
+        irp.parameters = IoParameters::Read(crate::ReadWriteParameters {
+            length: 104,
+            key: 0,
+            offset: 0,
+        });
+        irp.information = 1;
+        assert_eq!(
+            build_dispatch_request(&irp, &context, target(), None),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        irp.major = major::IRP_MJ_PNP;
+        let parameters = PnpParameters::query_device_relations(0);
+        irp.minor = parameters.minor;
+        irp.parameters = IoParameters::Pnp(parameters);
+        irp.information = 0xffff_9000_1234_5678;
+        let wire = build_dispatch_request(&irp, &context, target(), None).unwrap();
+        assert_eq!(wire.initial_information, 0);
+    }
+
+    #[test]
+    fn initial_information_peer_rejects_old_abi_and_malformed_scalar_before_touching_output() {
+        let valid = request();
+        let invalid = [
+            IrpDispatchRequest {
+                abi_version: 12,
+                ..valid
+            },
+            IrpDispatchRequest {
+                abi_size: 248,
+                ..valid
+            },
+            IrpDispatchRequest {
+                initial_information: 105,
+                ..valid
+            },
+            IrpDispatchRequest {
+                initial_information: u64::MAX,
+                ..valid
+            },
+            IrpDispatchRequest {
+                input_len: 1,
+                ..valid
+            },
+            IrpDispatchRequest {
+                buffer_len: 103,
+                ..valid
+            },
+            IrpDispatchRequest {
+                buffer_len: 105,
+                ..valid
+            },
+            IrpDispatchRequest {
+                major: major::IRP_MJ_READ,
+                ..valid
+            },
+            IrpDispatchRequest {
+                major: major::IRP_MJ_PNP,
+                ..valid
+            },
+        ];
+        let mut peer = MockPeerControl::new().transport();
+        for request in invalid {
+            let mut output = [0x5a; 104];
+            assert_eq!(
+                peer.dispatch(&request, PeerTransferBuffers::new(&mut output)),
+                DispatchOutcome::Failed {
+                    status: NtStatus::INVALID_PARAMETER,
+                }
+            );
+            assert_eq!(output, [0x5a; 104]);
+        }
     }
 }

@@ -125,10 +125,22 @@ fn read(f: &Fixture) -> ExternalFileIrpRequest {
             ..Default::default()
         }),
         stack_flags: StackFlags::empty(),
+        initial_information: 0,
     }
 }
 fn buffers() -> ExternalFileIrpBuffers {
     ExternalFileIrpBuffers::new(vec![], vec![7; 4])
+}
+fn seeded_query(f: &Fixture, initial_information: u64) -> ExternalFileIrpRequest {
+    ExternalFileIrpRequest {
+        major: major::IRP_MJ_QUERY_INFORMATION,
+        parameters: IoParameters::QueryInformation(crate::InformationParameters {
+            info_class: 18,
+            length: 128,
+        }),
+        initial_information,
+        ..read(f)
+    }
 }
 fn capture_and_ack(
     f: &mut Fixture,
@@ -183,6 +195,7 @@ fn create(f: &Fixture, file: FileId) -> ExternalFileIrpRequest {
         major: major::IRP_MJ_CREATE,
         parameters: IoParameters::Create(CreateParameters::default()),
         stack_flags: StackFlags::empty(),
+        initial_information: 0,
     }
 }
 fn returned(invocation: ExternalFileIrpInvocation) -> ExternalFileIrpReturn {
@@ -230,6 +243,120 @@ fn complete(f: &mut Fixture, id: IrpId) {
         file_context: None,
     });
     f.io.pump();
+}
+
+#[test]
+fn query_seed_preserves_output_and_scalar_information_through_projection() {
+    let mut f = fixture();
+    let mut output = vec![0; 128];
+    output[76..80].copy_from_slice(&0x0012_0089_u32.to_le_bytes());
+    output[88..92].copy_from_slice(&0x26_u32.to_le_bytes());
+    output[92..96].copy_from_slice(&0x1ff_u32.to_le_bytes());
+    let prepared =
+        f.io.prepare_external_file_irp_owned(
+            seeded_query(&f, 12),
+            ExternalFileIrpBuffers::new(vec![], output.clone()),
+        )
+        .unwrap();
+    let id = prepared.irp_id();
+    assert_eq!(prepared.projection().information, 12);
+    assert_eq!(f.io.irp(id).unwrap().information, 12);
+    assert_eq!(prepared.buffers().output(), output);
+    let invocation = f.io.begin_prepared_external_file_irp(prepared).unwrap();
+    assert_eq!(invocation.projection().information, 12);
+    assert_eq!(invocation.buffers().output(), output);
+    assert!(f.trace.borrow().calls.is_empty());
+    let ExternalFileIrpResult::NotEntered { prepared, .. } =
+        f.io.finish_external_file_irp(invocation.returned(ExternalFileIrpOutcome::NotEntered {
+            status: NtStatus::UNSUCCESSFUL,
+        }))
+        .unwrap()
+    else {
+        panic!("not-entered owner must be recoverable")
+    };
+    let buffers = f.io.discard_prepared_external_file_irp(prepared).unwrap();
+    assert_eq!(buffers.output(), output);
+    assert_eq!(f.io.irp_count(), 0);
+    assert_eq!(f.io.file(f.file).unwrap().outstanding_irp_refs, 0);
+}
+
+#[test]
+fn ordinary_read_starts_with_zero_information() {
+    let mut f = fixture();
+    let prepared =
+        f.io.prepare_external_file_irp_owned(read(&f), buffers())
+            .unwrap();
+    assert_eq!(prepared.projection().information, 0);
+    assert_eq!(f.io.irp(prepared.irp_id()).unwrap().information, 0);
+    f.io.discard_prepared_external_file_irp(prepared).unwrap();
+    assert_eq!(f.io.irp_count(), 0);
+}
+
+#[test]
+fn query_seed_refuses_oversized_information_before_retaining_any_owner() {
+    let mut f = fixture();
+    for information in [129, u64::MAX] {
+        let result = f.io.prepare_external_file_irp_owned(
+            seeded_query(&f, information),
+            ExternalFileIrpBuffers::new(vec![], vec![0; 128]),
+        );
+        assert_eq!(result.unwrap_err(), NtStatus::INVALID_PARAMETER);
+        assert_eq!(f.io.irp_count(), 0);
+        assert_eq!(f.io.file(f.file).unwrap().outstanding_irp_refs, 0);
+        assert_eq!(f.io.file_reference_count(f.file), 0);
+        assert!(f.trace.borrow().calls.is_empty());
+    }
+}
+
+#[test]
+fn nonquery_major_cannot_seed_information_even_with_sufficient_output() {
+    let mut f = fixture();
+    let mut request = read(&f);
+    request.initial_information = 1;
+    assert_eq!(
+        f.io.prepare_external_file_irp_owned(request, buffers())
+            .unwrap_err(),
+        NtStatus::INVALID_PARAMETER,
+    );
+    assert_eq!(f.io.irp_count(), 0);
+    assert_eq!(f.io.file(f.file).unwrap().outstanding_irp_refs, 0);
+    assert!(f.trace.borrow().calls.is_empty());
+}
+
+#[test]
+fn query_seed_remains_retained_while_pending_but_real_completion_replaces_it() {
+    let mut f = fixture();
+    let prepared =
+        f.io.prepare_external_file_irp_owned(
+            seeded_query(&f, 12),
+            ExternalFileIrpBuffers::new(vec![], vec![0xa5; 128]),
+        )
+        .unwrap();
+    let id = prepared.irp_id();
+    let invocation = f.io.begin_prepared_external_file_irp(prepared).unwrap();
+    let ExternalFileIrpResult::Pending(owner) =
+        f.io.finish_external_file_irp(invocation.returned(ExternalFileIrpOutcome::Pending))
+            .unwrap()
+    else {
+        panic!("pending query must retain its owner")
+    };
+    assert_eq!(owner.projection().information, 12);
+    assert_eq!(owner.buffers().output(), &[0xa5; 128]);
+    assert_eq!(f.io.irp(id).unwrap().information, 12);
+    assert_eq!(f.io.file(f.file).unwrap().outstanding_irp_refs, 1);
+    complete(&mut f, id);
+    let completion = f.io.prepare_external_file_irp_completion(owner).unwrap();
+    assert_eq!(completion.completion().information, 4);
+    assert_eq!(completion.capture_len(), 4);
+    let ack = capture_and_ack(&mut f, completion);
+    let report = ack.acknowledged(ExternalFileIrpAcknowledgement::Acknowledged);
+    let (receipt, buffers) = f.io.finish_external_file_irp_completion(report).unwrap();
+    assert!(receipt.backend_acknowledged());
+    assert_eq!(receipt.completion().information, 4);
+    assert_eq!(&buffers.output()[..4], &[5, 6, 7, 8]);
+    assert_eq!(&buffers.output()[4..], &[0xa5; 124]);
+    assert_eq!(f.io.irp_count(), 0);
+    assert_eq!(f.io.file(f.file).unwrap().outstanding_irp_refs, 0);
 }
 
 #[test]

@@ -33745,19 +33745,46 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         reintroducing fresh-open validation after capture. Synchronous FilePosition
         queries use canonical CurrentByteOffset before event clear (qsinfo.c:319), whereas inline
         Access/Mode/Alignment use normal event/completion semantics (qsinfo.c:603). Track missing
-        canonical position state rather than supplying a fabricated offset. FileAllInformation
-        also initializes the real IRP's IoStatus.Information to 12 for manager-owned fields
-        (qsinfo.c:688); preserving seeded output bytes alone does not provide that driver contract.
-        Native transport review (2026-09-13) also found that run_irp only pulls initial output
-        for METHOD_IN_DIRECT; ordinary QUERY_INFORMATION provider storage starts zeroed, so
-        executive-side FileAll fields do not yet reach the real driver's SystemBuffer. Carry
-        initial query output explicitly without overwriting buffered input for other operations.
-        For Information, extend ExternalFileIrpRequest and seed the canonical IrpRecord before
-        projection; IrpProjection already carries this state. Preserve the pointer-free seed
-        through hosted_irp_dispatch_request/IrpDispatchRequest and WdmIrpInit/write_wdm_irp.
-        Update ABI version 12's 248-byte wire layout and both Driver Host endpoints together.
-        Keep PnP Information-pointer relocation separate from scalar byte counts; no cross-domain
-        raw pointers. Require native provider-buffer/IRP readback, not only detached host fixtures.
+        canonical position state rather than supplying a fabricated offset.
+      - [x] Preserve FileAll initial output and Information through provider transport (2026-09-13;
+        host/composed/native-build verified below).
+        NT5 qsinfo.c:688 initializes Information
+        to 12 for three discontiguous manager-owned fields. The nt-fs encoder now returns that
+        byte count, and the producer carries it explicitly through ExternalFileIrpRequest,
+        canonical IrpRecord, IrpProjection, IrpDispatchRequest and WdmIrpInit. Nonzero scalar seeds
+        are limited to input-free QUERY_INFORMATION and bounded by output capacity; invalid
+        requests fail before ownership admission or provider buffer mutation. PnP pointer-valued
+        Information still uses separate provider-local relocation and is never put on this wire.
+        ABI version 13 appends the scalar at offset 248, increasing the wire request to 256 bytes
+        without moving earlier fields. Both native transport boundaries and generic DriverPeer
+        validation reject old versions/layouts. run_irp pulls the entire initial query output into
+        request-owned SystemBuffer before dispatch, using the same tested policy that preserves
+        METHOD_IN_DIRECT initialization but never overwrites buffered-control input. The 12-byte
+        seed is not a transfer prefix: FileAll fields live at offsets 76, 88 and 92.
+      - [x] Finish serialized FileAll seed/transport host tests, native build and independent review.
+        All 878 tests pass across the affected nt-fs, nt-io-abi and nt-io-manager libraries.
+        Seeded canonical output/projection and pending completion ownership, byte-exact ABI13
+        layout, old-wire/malformed-scalar rejection, query/control initial-output policy and
+        WDM Information serialization are covered. The executive release build passes in 38.07s
+        with the unchanged 294 warnings. Evidence: `.tmp/test-file-all-seed-libraries-20260913.log`
+        and `.tmp/build-file-all-seed-executive-20260913.log`. The composed provider-entry test
+        also passes: real nt-fs encoding, detached canonical ownership, DriverPeer wire
+        construction/receiver validation, full initial-output transfer policy and WDM serialization
+        preserve the fields and Information before mock driver completion, then retire the real
+        canonical IRP/File. This is a host fixture, not native IPC evidence. Evidence:
+        `.tmp/test-file-all-seed-provider-20260913.log`. All 3,679 broad host/doc tests pass across
+        78 suites, with no failures or ignored cases, including nt-io-abi, nt-driver-host and
+        nt-driver-runtime: `.tmp/test-file-all-seed-full-20260913.log`. Focused formatting and
+        git diff --check pass. No VM run or native provider readback was made in this checkpoint.
+        Independent native review found no blocking regressions: the active transfer publishes
+        the full initial-output cursor before the provider pump and keeps it separate from
+        completion-output progress. All ordinary producers explicitly seed zero; only FileAll's
+        encoder supplies 12. Ordinary queries now also pull their initialized output buffer;
+        measure that added bank IPC during native acceptance rather than dropping the copy based
+        on an inferred buffer value.
+      - [ ] Validate FileAll provider-buffer/IRP contents in native execution. Host fixtures do not
+        prove actual IPC, and a build does not close native readback or desktop acceptance.
+      - [ ] Extend canonical ownership to local File lifetime across user-memory callouts.
         Local disk/overlay File lifetime capture across probes remains a separate follow-on; the
         hosted reference adapter does not claim to protect those local File objects. Local
         lock/unlock still resolve their unretained route after user probes; do not move that

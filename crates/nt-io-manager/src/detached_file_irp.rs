@@ -24,6 +24,8 @@ pub struct ExternalFileIrpRequest {
     pub major: u8,
     pub parameters: IoParameters,
     pub stack_flags: StackFlags,
+    /// Scalar progress for I/O Manager-initialized query output. Other majors require zero.
+    pub initial_information: u64,
 }
 
 /// Separate owned buffers preserve both input and initial output bytes without aliasing slices.
@@ -318,6 +320,14 @@ fn validate_buffers(
 ) -> Result<(u32, u32, u32), NtStatus> {
     let input = u32::try_from(buffers.input.len()).map_err(|_| NtStatus::INVALID_PARAMETER)?;
     let output = u32::try_from(buffers.output.len()).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+    if !nt_io_abi::valid_initial_information(
+        request.major,
+        request.initial_information,
+        input,
+        output,
+    ) {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
     let valid = match &request.parameters {
         IoParameters::Create(p) => {
             crate::is_create_major(request.major) && output == 0 && input >= p.ea_length
@@ -431,6 +441,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         }
         record.requestor_tid = request.requestor_tid;
         record.user_data = request.user_data;
+        record.information = request.initial_information;
         record.buffer = Some(IoBufferRef {
             buffer_id: 0,
             offset: 0,

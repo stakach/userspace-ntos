@@ -104,17 +104,22 @@ impl ExecNtHandler {
             }
         };
         let output_capacity = routed_output.len();
-        if class == nt_fs::FILE_ALL_INFORMATION {
+        let initial_information = if class == nt_fs::FILE_ALL_INFORMATION {
             let result = self
                 .owned_hosted_query_metadata(capture)
                 .and_then(|metadata| {
                     nt_fs::encode_file_all_io_manager_information(metadata, &mut routed_output)
                 });
-            if let Err(status) = result {
-                self.release_file_reference(file_id);
-                return status;
+            match result {
+                Ok(information) => information as u64,
+                Err(status) => {
+                    self.release_file_reference(file_id);
+                    return status;
+                }
             }
-        }
+        } else {
+            0
+        };
 
         let mut information = 0u64;
         let mut pending_irp_id = 0u64;
@@ -124,6 +129,7 @@ impl ExecNtHandler {
             class as u64,
             &[],
             &mut routed_output,
+            initial_information,
         ) {
             Ok((driver_status, completed, irp_id)) => {
                 information = completed;

@@ -7499,6 +7499,28 @@ mod tests {
     }
 
     #[test]
+    fn wdm_x64_initial_information_preserves_full_width_without_changing_status() {
+        for initial_information in [0, 88, u64::MAX] {
+            let mut irp = [0xcc; WDM_X64_IRP_SIZE];
+            write_wdm_irp(
+                &mut irp,
+                WdmIrpInit {
+                    packet_size: (WDM_X64_IRP_SIZE + WDM_X64_IO_STACK_LOCATION_SIZE) as u16,
+                    stack_count: 1,
+                    current_location: 1,
+                    initial_information,
+                    ..Default::default()
+                },
+            ).unwrap();
+            assert_eq!(le_u32(&irp, 0x30), 0);
+            assert_eq!(le_u32(&irp, 0x34), 0);
+            assert_eq!(le_u64(&irp, 0x38), initial_information);
+            assert_eq!(irp[0x42], 1);
+            assert_eq!(irp[0x43], 1);
+        }
+    }
+
+    #[test]
     fn wdm_x64_irp_and_stack_layouts_are_stable() {
         let mut irp = [0xCC; WDM_X64_IRP_SIZE];
         write_wdm_irp(
@@ -7511,6 +7533,7 @@ mod tests {
                 user_buffer: 0x2222,
                 thread: 0x4444,
                 auxiliary_buffer: 0x5555,
+                initial_information: 0x1234_5678_9abc_def0,
                 stack_count: 1,
                 current_location: 1,
                 current_stack_location: 0x3333,
@@ -7525,6 +7548,8 @@ mod tests {
         assert_eq!(le_u64(&irp, 0x08), 0xAAAA);
         assert_eq!(le_u32(&irp, 0x10), 0x55AA);
         assert_eq!(le_u64(&irp, 0x18), 0x1111);
+        assert_eq!(le_u32(&irp, 0x30), 0);
+        assert_eq!(le_u64(&irp, 0x38), 0x1234_5678_9abc_def0);
         assert_eq!(irp[0x42], 1);
         assert_eq!(irp[0x43], 1);
         assert_eq!(le_u64(&irp, 0x70), 0x2222);

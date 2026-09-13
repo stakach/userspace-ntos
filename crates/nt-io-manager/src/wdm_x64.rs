@@ -78,6 +78,9 @@ pub struct WdmIrpInit {
     pub thread: u64,
     /// `IRP.Tail.Overlay.AuxiliaryBuffer`.
     pub auxiliary_buffer: u64,
+    /// Initial scalar `IRP.IoStatus.Information`; pointer-valued PnP overrides
+    /// are applied separately by the caller after projecting typed parameters.
+    pub initial_information: u64,
     pub stack_count: u8,
     pub current_location: u8,
     pub current_stack_location: u64,
@@ -307,6 +310,7 @@ pub fn write_wdm_irp(bytes: &mut [u8], init: WdmIrpInit) -> Result<(), WdmLayout
     put_u64(bytes, 0x08, init.mdl_address);
     put_u32(bytes, 0x10, init.flags);
     put_u64(bytes, 0x18, init.system_buffer);
+    put_u64(bytes, 0x38, init.initial_information);
     put_u8(bytes, 0x42, init.stack_count);
     put_u8(bytes, 0x43, init.current_location);
     put_u64(bytes, 0x70, init.user_buffer);

@@ -676,7 +676,7 @@ fn file_all_information_seeds_only_io_manager_owned_fields() {
     let mut output = [0xCC; FILE_ALL_INFORMATION_MINIMUM_LENGTH];
     assert_eq!(
         encode_file_all_io_manager_information(metadata, &mut output),
-        Ok(())
+        Ok(12)
     );
     assert!(output[..76].iter().all(|byte| *byte == 0xCC));
     assert_eq!(&output[76..80], &metadata.access_flags.to_le_bytes());

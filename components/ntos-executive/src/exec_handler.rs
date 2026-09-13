@@ -13936,6 +13936,7 @@ impl ExecNtHandler {
             ioctl as u64,
             &input,
             &mut output,
+            0,
         ) {
             Ok((driver_status, completed, irp_id)) => {
                 information = completed;
@@ -27921,6 +27922,7 @@ impl ExecNtHandler {
         fsctl: u64,
         input: &[u8],
         output: &mut [u8],
+        initial_information: u64,
     ) -> Result<(i32, u64, u64), u32> {
         let (status, information, pending_irp_id, _) =
             driver_launch::dispatch_hosted_file_irp_result_exact(
@@ -27930,6 +27932,7 @@ impl ExecNtHandler {
                 self.current_tid,
                 input,
                 output,
+                initial_information,
             )?;
         if driver_launch::device_id_by_name("\\Device\\NamedPipe") == Some(route.device_id) {
             NPFS_ROUTED_IRPS.fetch_add(1, Ordering::Relaxed);
@@ -28952,6 +28955,7 @@ impl ExecNtHandler {
                 self.current_tid,
                 &[],
                 &mut basic,
+                0,
             );
             let (status, information, irp_id) = match query {
                 Ok((status, information, irp_id, _)) => (
@@ -36076,6 +36080,7 @@ impl ExecNtHandler {
                                     fsctl,
                                     &input,
                                     &mut output,
+                                    0,
                                 ) {
                                     Ok((st, completed, pending_irp_id)) => {
                                         routed_hosted_fsctl = true;
@@ -44002,6 +44007,7 @@ impl ExecNtHandler {
                                         0,
                                         &[],
                                         &mut output,
+                                        0,
                                     ) {
                                         Ok((driver_status, completed, irp_id)) => {
                                             routed = true;

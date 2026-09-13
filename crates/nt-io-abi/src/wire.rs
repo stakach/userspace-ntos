@@ -147,6 +147,9 @@ pub struct IrpDispatchRequest {
     pub read_write_byte_offset: u64,
     pub read_write_key: u32,
     pub _reserved2: u32,
+    /// Initial scalar File-query byte count, bounded by `output_len`.
+    /// PnP pointer-valued information stays in its separate typed transport.
+    pub initial_information: u64,
 }
 
 impl IrpDispatchRequest {
@@ -182,7 +185,8 @@ const _: () = {
     assert!(size_of::<IoDeviceControlRequest>() == 56);
     assert!(size_of::<IoFileRequest>() == 16);
     assert!(size_of::<IoCancelRequest>() == 16);
-    assert!(size_of::<IrpDispatchRequest>() == 248);
+    assert!(size_of::<IrpDispatchRequest>() == 256);
+    assert!(core::mem::offset_of!(IrpDispatchRequest, initial_information) == 248);
     assert!(size_of::<IoReply>() == 32);
     assert!(align_of::<IoReadWriteRequest>() == 8);
     assert!(align_of::<IrpDispatchRequest>() == 8);

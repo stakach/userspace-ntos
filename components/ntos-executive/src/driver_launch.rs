@@ -33972,6 +33972,14 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         || request.stack_location >= request.stack_count
         || request.stack_count > u8::MAX as u32
         || request.flags & !0xffff != 0
+        || (request.major == major::IRP_MJ_QUERY_INFORMATION
+            && request.buffer_len != request.output_len)
+        || !nt_io_abi::valid_initial_information(
+            request.major,
+            request.initial_information,
+            request.input_len,
+            request.output_len,
+        )
     {
         return (STATUS_INVALID_PARAMETER, 0);
     }
@@ -34267,8 +34275,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         }
         write_unaligned((file_name + create_file_name_len) as *mut u16, 0);
     }
-    if control_method == Some(ioctl::METHOD_IN_DIRECT)
-        && outlen != 0
+    if nt_io_abi::initial_output_required(request.major, request.ioctl_code, request.output_len)
         && !pool_pull_request_bytes(
             FSD_SERVICE_PULL_IRP_OUTPUT_LABEL,
             canonical_irp_id,
@@ -34835,6 +34842,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             stack_count,
             current_location,
             current_stack_location: current_iosl,
+            initial_information: request.initial_information,
         },
     )
     .is_err()
@@ -42283,6 +42291,20 @@ fn hosted_irp_dispatch_request(
     input_len: usize,
     output_len: usize,
 ) -> Result<IrpDispatchRequest, nt_status::NtStatus> {
+    // PnP Information may be a domain-local pointer; its provider override is separate.
+    let initial_information = if irp.major == major::IRP_MJ_PNP {
+        0
+    } else {
+        irp.information
+    };
+    if !nt_io_abi::valid_initial_information(
+        irp.major,
+        initial_information,
+        u32::try_from(input_len).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
+        u32::try_from(output_len).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
+    ) {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
     let target = instance(instance_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     if target.hosted_domain_id == 0
         || target.hosted_domain_cookie == 0
@@ -42378,6 +42400,7 @@ fn hosted_irp_dispatch_request(
             IoParameters::Read(parameters) | IoParameters::Write(parameters) => parameters.key,
             _ => 0,
         },
+        initial_information,
         buffer_id: irp.buffer.map(|buffer| buffer.buffer_id).unwrap_or(0),
         buffer_len: u32::try_from(transfer_len)
             .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
@@ -42809,6 +42832,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
     lock_control: Option<LockControlParameters>,
     read_write: Option<ReadWriteParameters>,
     stack_flags: StackFlags,
+    initial_information: u64,
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
     let major = external_major(major).ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let (input_len, output_len, _) =
@@ -42837,6 +42861,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
             major,
             parameters: params,
             stack_flags,
+            initial_information,
         },
         in_data,
         out,
@@ -58220,6 +58245,14 @@ unsafe fn dispatch_irp_for_instance_exact(
             || request.output_len as usize != out.len()
             || request.stack_count == 0
             || request.stack_location >= request.stack_count
+            || (request.major == major::IRP_MJ_QUERY_INFORMATION
+                && request.buffer_len != request.output_len)
+            || !nt_io_abi::valid_initial_information(
+                request.major,
+                request.initial_information,
+                request.input_len,
+                request.output_len,
+            )
         {
             return Some(HostedIrpTransportResult::NotDispatched {
                 status: nt_status::NtStatus(STATUS_INVALID_PARAMETER),
@@ -58642,6 +58675,7 @@ pub(crate) unsafe fn dispatch_hosted_file_irp_result_exact(
     requestor_tid: u64,
     in_data: &[u8],
     out: &mut [u8],
+    initial_information: u64,
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
     let canonical_file_id = FileId(file_id);
     let device_id = io_manager_mut()
@@ -58667,6 +58701,7 @@ pub(crate) unsafe fn dispatch_hosted_file_irp_result_exact(
         None,
         None,
         StackFlags::empty(),
+        initial_information,
     )
 }
 
@@ -58711,6 +58746,7 @@ pub(crate) unsafe fn dispatch_hosted_file_read_write_irp_result_exact(
         None,
         Some(parameters),
         StackFlags::empty(),
+        0,
     )
 }
 
@@ -58750,6 +58786,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_information_irp_result_exact(
         None,
         None,
         StackFlags::empty(),
+        0,
     )
 }
 
@@ -58793,6 +58830,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_ea_irp_result_exact(
         None,
         None,
         stack_flags,
+        0,
     )
 }
 
@@ -58830,6 +58868,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_ea_irp_result_exact(
         None,
         None,
         StackFlags::empty(),
+        0,
     )
 }
 
@@ -58873,6 +58912,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_quota_irp_result_exact(
         None,
         None,
         stack_flags,
+        0,
     )
 }
 
@@ -58910,6 +58950,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_quota_irp_result_exact(
         None,
         None,
         StackFlags::empty(),
+        0,
     )
 }
 
@@ -58951,6 +58992,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_volume_information_irp_result_ex
         None,
         None,
         StackFlags::empty(),
+        0,
     )
 }
 
@@ -58992,6 +59034,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_volume_information_irp_result_exac
         None,
         None,
         StackFlags::empty(),
+        0,
     )
 }
 
@@ -59035,6 +59078,7 @@ pub(crate) unsafe fn dispatch_hosted_file_notify_directory_irp_result_exact(
         None,
         None,
         stack_flags,
+        0,
     )
 }
 
@@ -59081,6 +59125,7 @@ pub(crate) unsafe fn dispatch_hosted_file_lock_control_irp_result_exact(
         Some(parameters),
         None,
         stack_flags,
+        0,
     )
 }
 
@@ -59125,6 +59170,7 @@ pub(crate) unsafe fn dispatch_hosted_file_create_irp_result_exact(
         None,
         None,
         StackFlags::empty(),
+        0,
     )
 }
 
@@ -59165,6 +59211,7 @@ pub(crate) unsafe fn dispatch_hosted_target_directory_create_irp_result_exact(
         None,
         None,
         StackFlags::FORCE_ACCESS_CHECK | StackFlags::OPEN_TARGET_DIRECTORY,
+        0,
     )
 }
 
@@ -59246,7 +59293,7 @@ pub(crate) unsafe fn npfs_dispatch_irp(
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64)> {
-    dispatch_hosted_file_irp_result_exact(file_id, major, fsctl, 0, in_data, out)
+    dispatch_hosted_file_irp_result_exact(file_id, major, fsctl, 0, in_data, out, 0)
         .ok()
         .map(|(status, information, _, _)| (status, information))
 }
@@ -59258,7 +59305,7 @@ pub(crate) unsafe fn npfs_dispatch_irp_exact(
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64, u64)> {
-    dispatch_hosted_file_irp_result_exact(file_id, major, fsctl, 0, in_data, out)
+    dispatch_hosted_file_irp_result_exact(file_id, major, fsctl, 0, in_data, out, 0)
         .ok()
         .map(|(status, information, irp_id, _)| {
             (

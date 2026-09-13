@@ -316,18 +316,19 @@ pub fn encode_named_query_information(
 
 /// Seed the fields which the I/O Manager, rather than the filesystem provider, owns inside a
 /// caller's `FILE_ALL_INFORMATION` buffer. The provider fills every other field through its real
-/// `IRP_MJ_QUERY_INFORMATION` dispatch.
+/// `IRP_MJ_QUERY_INFORMATION` dispatch. Returns the initial IRP Information byte count; these
+/// fields are discontiguous, so this count is not an initial-output transfer extent.
 pub fn encode_file_all_io_manager_information(
     metadata: QueryMetadata,
     output: &mut [u8],
-) -> Result<(), u32> {
+) -> Result<usize, u32> {
     if output.len() < FILE_ALL_INFORMATION_MINIMUM_LENGTH {
         return Err(STATUS_INFO_LENGTH_MISMATCH);
     }
     encode_query_information(FILE_ACCESS_INFORMATION, metadata, &mut output[76..80])?;
     encode_query_information(FILE_MODE_INFORMATION, metadata, &mut output[88..92])?;
     encode_query_information(FILE_ALIGNMENT_INFORMATION, metadata, &mut output[92..96])?;
-    Ok(())
+    Ok(3 * core::mem::size_of::<u32>())
 }
 
 const fn normalized_file_attributes(metadata: QueryMetadata) -> u32 {

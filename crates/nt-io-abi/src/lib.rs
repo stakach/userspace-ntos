@@ -30,7 +30,35 @@ pub use wire::{
 };
 
 /// ABI version of this wire contract; bumped on any incompatible change.
-pub const IO_ABI_VERSION: u32 = 12;
+pub const IO_ABI_VERSION: u32 = 13;
+
+/// Scalar initial `IoStatus.Information` is a bounded File-query byte count,
+/// never a transported PnP pointer.
+pub const fn valid_initial_information(
+    major: u8,
+    initial_information: u64,
+    input_len: u32,
+    output_len: u32,
+) -> bool {
+    if major == major::IRP_MJ_QUERY_INFORMATION {
+        input_len == 0 && initial_information <= output_len as u64
+    } else {
+        initial_information == 0
+    }
+}
+
+/// Whether the driver consumes the caller's initial output bytes. Buffered
+/// control requests keep their input staging buffer rather than overwriting it.
+pub const fn initial_output_required(major: u8, control_code: u32, output_len: u32) -> bool {
+    output_len != 0
+        && (major == major::IRP_MJ_QUERY_INFORMATION
+            || (matches!(
+                major,
+                major::IRP_MJ_DEVICE_CONTROL
+                    | major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                    | major::IRP_MJ_FILE_SYSTEM_CONTROL
+            ) && ioctl::method(control_code) == ioctl::METHOD_IN_DIRECT))
+}
 
 /// Validate the major/minor/filter/flag shape of a directory notification IRP.
 pub const fn valid_directory_notify_parameters(
@@ -506,6 +534,122 @@ mod tests {
         let bytes = bytemuck::bytes_of(&irp);
         let back: IrpDispatchRequest = bytemuck::pod_read_unaligned(bytes);
         assert_eq!(irp, back);
+    }
+
+    #[test]
+    fn initial_information_wire_appends_scalar_without_moving_existing_fields() {
+        assert_eq!(IO_ABI_VERSION, 13);
+        assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 256);
+        assert_eq!(
+            core::mem::offset_of!(IrpDispatchRequest, target_domain_id),
+            16
+        );
+        assert_eq!(
+            core::mem::offset_of!(IrpDispatchRequest, read_write_byte_offset),
+            232
+        );
+        assert_eq!(
+            core::mem::offset_of!(IrpDispatchRequest, initial_information),
+            248
+        );
+        let request = IrpDispatchRequest {
+            initial_information: 0x1234_5678_9abc_def0,
+            ..Default::default()
+        };
+        let bytes = bytemuck::bytes_of(&request);
+        assert_eq!(&bytes[248..256], &request.initial_information.to_le_bytes());
+        assert_eq!(
+            bytemuck::pod_read_unaligned::<IrpDispatchRequest>(bytes),
+            request
+        );
+        assert!(bytemuck::try_pod_read_unaligned::<IrpDispatchRequest>(&bytes[..248]).is_err());
+    }
+
+    #[test]
+    fn initial_information_only_accepts_bounded_query_byte_counts() {
+        assert!(valid_initial_information(
+            major::IRP_MJ_QUERY_INFORMATION,
+            0,
+            0,
+            0
+        ));
+        assert!(valid_initial_information(
+            major::IRP_MJ_QUERY_INFORMATION,
+            88,
+            0,
+            104
+        ));
+        assert!(valid_initial_information(
+            major::IRP_MJ_QUERY_INFORMATION,
+            u32::MAX as u64,
+            0,
+            u32::MAX
+        ));
+        assert!(!valid_initial_information(
+            major::IRP_MJ_QUERY_INFORMATION,
+            105,
+            0,
+            104
+        ));
+        assert!(!valid_initial_information(
+            major::IRP_MJ_QUERY_INFORMATION,
+            u64::MAX,
+            0,
+            u32::MAX
+        ));
+        assert!(!valid_initial_information(
+            major::IRP_MJ_QUERY_INFORMATION,
+            0,
+            1,
+            104
+        ));
+        for major in [
+            major::IRP_MJ_PNP,
+            major::IRP_MJ_READ,
+            major::IRP_MJ_SET_INFORMATION,
+        ] {
+            assert!(valid_initial_information(major, 0, 0, 104));
+            assert!(!valid_initial_information(major, 1, 0, 104));
+        }
+    }
+
+    #[test]
+    fn initial_output_required_preserves_buffered_control_input() {
+        for control in 0..4 {
+            assert!(initial_output_required(
+                major::IRP_MJ_QUERY_INFORMATION,
+                control,
+                104
+            ));
+            assert!(!initial_output_required(
+                major::IRP_MJ_QUERY_INFORMATION,
+                control,
+                0
+            ));
+            for major in [
+                major::IRP_MJ_DEVICE_CONTROL,
+                major::IRP_MJ_INTERNAL_DEVICE_CONTROL,
+                major::IRP_MJ_FILE_SYSTEM_CONTROL,
+            ] {
+                assert_eq!(
+                    initial_output_required(major, control, 16),
+                    control == ioctl::METHOD_IN_DIRECT
+                );
+                assert!(!initial_output_required(major, control, 0));
+            }
+        }
+        for major in [
+            major::IRP_MJ_READ,
+            major::IRP_MJ_WRITE,
+            major::IRP_MJ_QUERY_VOLUME_INFORMATION,
+            major::IRP_MJ_PNP,
+        ] {
+            assert!(!initial_output_required(
+                major,
+                ioctl::METHOD_IN_DIRECT,
+                104
+            ));
+        }
     }
 
     #[test]
