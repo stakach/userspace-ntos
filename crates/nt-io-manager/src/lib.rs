@@ -1168,10 +1168,19 @@ impl<P> IoManager<P> {
                     .files
                     .get(related_file)
                     .ok_or(NtStatus::INVALID_HANDLE)?;
+                let valid_parent_state = !parent.close_dispatched
+                    && (parent.state == FileState::Open
+                        || (self.file_reference_count(related_file) != 0
+                            && matches!(
+                                parent.state,
+                                FileState::CleanupPending
+                                    | FileState::CleanupComplete
+                                    | FileState::ClosePending
+                            )));
                 if related_file == file_id
                     || parent.client_id != record.client_id
                     || parent.device_id != file.device_id
-                    || !parent.state.is_open()
+                    || !valid_parent_state
                     || file.related_file != Some(related_file)
                 {
                     return Err(NtStatus::INVALID_PARAMETER);
@@ -1188,8 +1197,12 @@ impl<P> IoManager<P> {
                     .ok_or(NtStatus::INVALID_HANDLE)?;
                 if target_file == file_id
                     || target.client_id != record.client_id
-                    || target.device_id != file.device_id
                     || !target.state.is_open()
+                {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+                if self.related_device_for_file(target_file)?
+                    != self.related_device_for_file(file_id)?
                 {
                     return Err(NtStatus::INVALID_PARAMETER);
                 }

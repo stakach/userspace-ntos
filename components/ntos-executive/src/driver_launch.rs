@@ -21,7 +21,7 @@
 //! already exist post effort-1); the named-pipe provider remains the deepest FSD data-plane proof.
 
 #[path = "hosted_irq_broker.rs"]
-#[allow(dead_code)] // Activated only by the atomic ISR/DPC/provider cutover tracked in the plan.
+#[allow(dead_code)]// Activated only by the atomic ISR/DPC/provider cutover tracked in the plan.
 mod hosted_irq_broker;
 
 #[path = "device_property.rs"]
@@ -58611,25 +58611,55 @@ pub(crate) fn related_io_device_identity_for_file(
 /// The caller owns the source through acquired or pending SET lifetime, including across CLEANUP.
 pub(crate) fn allocate_hosted_set_file_name_target(
     source_file_id: u64,
+    root_file_id: Option<u64>,
     source_is_directory: bool,
     target_name: &[u16],
 ) -> Result<(u64, u32), u32> {
     const FILE_WRITE_DATA: u32 = 0x0000_0002;
     const FILE_ADD_SUBDIRECTORY: u32 = 0x0000_0004;
-    let device_id = owned_hosted_file_metadata(source_file_id)?.device_id.raw();
     let target_access = if source_is_directory {
         FILE_ADD_SUBDIRECTORY
     } else {
         FILE_WRITE_DATA
     } | nt_types::AccessMask::SYNCHRONIZE.bits();
-    allocate_hosted_file(
-        device_id,
-        target_access,
-        (ShareAccess::READ | ShareAccess::WRITE).bits(),
-        CreateOptions::OPEN_FOR_BACKUP_INTENT.bits(),
-        target_name,
-    )
-    .map(|file_id| (file_id, target_access))
+    let file_id = if let Some(root_file_id) = root_file_id {
+        let device_id = owned_hosted_file_metadata(root_file_id)?.device_id.raw();
+        require_hosted_device_ready_for_dispatch(device_id)?;
+        io_manager_mut()
+            .allocate_owned_external_relative_file(
+                ClientId(IO_MANAGER_COMPONENT_ID),
+                FileId(root_file_id),
+                AccessMask::from_bits_retain(target_access),
+                ShareAccess::READ | ShareAccess::WRITE,
+                CreateOptions::OPEN_FOR_BACKUP_INTENT,
+                nt_types::UnicodeString::from_units(target_name),
+            )
+            .map(|file| file.raw())
+            .map_err(|status| status.raw() as u32)?
+    } else {
+        let device_id = owned_hosted_file_metadata(source_file_id)?.device_id.raw();
+        allocate_hosted_file(
+            device_id,
+            target_access,
+            (ShareAccess::READ | ShareAccess::WRITE).bits(),
+            CreateOptions::OPEN_FOR_BACKUP_INTENT.bits(),
+            target_name,
+        )?
+    };
+    Ok((file_id, target_access))
+}
+
+/// Compare live related devices only after the target's successful CREATE. Both Files are owned.
+pub(crate) fn owned_hosted_files_share_related_device(
+    source: u64,
+    target: u64,
+) -> Result<bool, nt_status::NtStatus> {
+    let manager = io_manager_mut();
+    for file in [source, target] {
+        manager.owned_file_metadata(ClientId(IO_MANAGER_COMPONENT_ID), FileId(file))?;
+    }
+    Ok(manager.related_device_for_file(FileId(source))?
+        == manager.related_device_for_file(FileId(target))?)
 }
 
 pub(crate) fn hosted_file_device_relative_name(

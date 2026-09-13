@@ -33868,27 +33868,67 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         every synchronous setter. The inspected Windows-facing test establishes nonzero rejection
         but not zero. Keep this narrow discrepancy explicit rather than treating Wine's internal
         implementation alone as proof. Native flag/event acceptance remains separate open work.
-      - [ ] Replace direct RootDirectory-as-target routing with the real relative target-parent
-        CREATE. NT5 qsinfo.c:1450 and internal.c:5398 open the complete relative name with its root,
-        IO_OPEN_TARGET_DIRECTORY and IO_FORCE_ACCESS_CHECK, write/add-subdirectory plus SYNCHRONIZE
-        access and READ/WRITE sharing. RootDirectory is not that newly opened target File, including
-        nested relative names. Preserve traversal/access checks and existing-target link collision
-        behavior. Independently authenticate/retain the root operand until canonical CREATE owns
-        related_file; the source retry grant cannot authenticate a different handle. Either give
-        a pending source-query transaction a consuming root owner or defer root resolution until
-        that query completes in the original caller context. Retain the kernel-only target through
-        SET and make failed unpublished-target retirement retryable instead of ignoring it.
-        Next-step review (2026-09-13): reuse the SourceQuery -> TargetCreate -> SourceSet owner
-        rather than creating another continuation path. NT5 resolves the root during target open,
-        after source-query success. Authenticate it freshly in that caller context, then retain
-        it across allocation/CREATE capture; source retry authority cannot supply this grant.
-        Existing allocate_external_relative_file, its native wrapper and related-parent IRP
-        admission require Open, so add an explicitly owned continuation path without relaxing
-        fresh-root admission. CREATE preparation already injects canonical child.related_file:
-        keep caller-supplied CreateParameters.related_file unset. Preserve the entire nested
-        relative name and compare the successfully opened target's related device with the source,
-        not just an early root/source device check. Cover real relative target CREATE, pending
-        source query and target open, root cleanup, target errors and link collisions.
+      - [x] Replace direct RootDirectory-as-target routing with real relative target-parent CREATE
+        (2026-09-13; implementation, serialized host tests and native build complete).
+        The Canonical(root_file_id) shortcut is removed. Inline and pending source-query completion
+        share open_set_file_name_target, which opens the entire captured relative name with a
+        separate kernel-only File, IO_OPEN_TARGET_DIRECTORY and IO_FORCE_ACCESS_CHECK,
+        FILE_WRITE_DATA/FILE_ADD_SUBDIRECTORY plus SYNCHRONIZE, READ/WRITE sharing, FILE_OPEN and
+        OPEN_FOR_BACKUP_INTENT. The canonical child supplies related_file to CREATE preparation;
+        no caller-provided native FILE_OBJECT pointer is accepted or fabricated.
+        PendingSetFileName retains the raw RootDirectory value, not a prematurely resolved FileId.
+        Source Basic query now runs before root/target resolution even when DIRECTORY_FILE or
+        NON_DIRECTORY_FILE was specified; remove those inferred-kind skips, which hid query errors.
+        Fresh root authentication reads the original caller's handle table without using a promoted
+        source retry grant or demanding additional root access. A scoped canonical root capture
+        bridges allocation to CREATE's related-File IRP reference, which survives pending completion
+        through ACK. Fresh relative allocation remains Open-only; the explicit owned API permits
+        retained roots after CLEANUP and rejects unowned roots, stale identity and entered CLOSE.
+        Original reserved/published caller provenance is checked before late handle lookup and
+        before each source SET, including after reentrant ACK. Abandoned or replaced callers cannot
+        initiate new target work or namespace mutation. Restored pi/tid scalars alone are not proof.
+        NT5 internal.c:5480-5530 checks a non-replacing hard-link collision before related-device
+        lookup. Shared postcondition policy preserves that ordering and topology errors. Native
+        and canonical SET admission compare live related devices, allowing distinct base Files in
+        the same attached stack while rejecting different stacks. Relative roots no longer get an
+        early source/root base-device rejection; real target parse/access failures take precedence.
+      - [x] Retain failed target retirement without synthetic IRPs or completion replay
+        (2026-09-13; included in the same checkpoint validation).
+        Inline paths transfer their pre-reserved transaction into a retirement-only row if canonical
+        abandonment refuses. Pending completion transfers its existing row only after real final
+        delivery/ACK. The source capture and exact target identity remain owned, with no new syscall
+        reply or fake IRP. A bounded, advancing retirement scan checks records out across callouts
+        and restores the same generation on refusal. Success transfers deferred CLEANUP/CLOSE to
+        the canonical manager before dropping the transaction. The old ignored target-abandonment
+        results in the replaced name-transaction paths are removed; unrelated unpublished CREATE
+        callers still require their own audit. Eight transaction tests cover raw root preservation,
+        collision/topology ordering and allocation-free retirement ownership transitions; five
+        detached tests cover real canonical root cleanup/CREATE/ACK, nested-name projection,
+        same-top/different-base SET lifetime and failed topology/identity admission. The 662 manager
+        library tests pass: `.tmp/test-relative-target-create-library-20260913.log`.
+        All 1,753 host/doc tests pass across 56 suites with no failures or ignored cases. Serialized
+        scope: nt-io-manager, nt-io-completion, nt-io-abi, nt-io-server, nt-io-client, nt-driver-host,
+        nt-driver-runtime, nt-fs and nt-user-host. Evidence:
+        `.tmp/test-relative-target-create-full-20260913.log`. The final freestanding executive
+        release build passes in 36.59s with the unchanged 294 warnings:
+        `.tmp/build-relative-target-create-executive-20260913.log`. Independent ownership/NT5
+        ordering review, focused formatting and git diff --check pass. Review keeps the remaining
+        attributes, general absolute routing and native acceptance below explicitly open.
+      - [ ] Complete remaining target-open attributes and namespace routing semantics.
+        Canonical FO_DIRECT_DEVICE_OPEN is not represented: implement its actual open-state origin
+        and sole legitimate Basic-query exemption, not a create-option/name/device heuristic. Until
+        then the supported filesystem path always queries Basic. Preserve authoritative source
+        FO_OPENED_CASE_SENSITIVE when constructing target-open attributes; current transport does
+        not expose that state. Absolute targets still normalize against the source device prefix;
+        replace this with general target namespace/device resolution so cross-device absolute
+        CREATE parse/access errors also precede NOT_SAME_DEVICE. These are explicit remaining
+        semantics, not fallback success paths or claims of full NT5 target-open equivalence.
+      - [ ] Validate relative target opening and retirement in native execution after import closure.
+        Host fixtures and an executive build do not prove actual provider IPC, filesystem access
+        checks or runtime race injection. Exercise pending source query/target CREATE, root closure,
+        caller teardown, cross-device errors, hard-link collisions and refused target retirement.
+        No VM or desktop proof is claimed by this checkpoint; the last measured 27 strict win32k
+        imports and desktop acceptance remain open.
       - [ ] Complete adjacent hosted File-query semantics beyond owned capture.
         Keep access immutable in the capture, but read mutable File mode/current position under
         admitted ownership: original create options are not current mode after FileModeInformation

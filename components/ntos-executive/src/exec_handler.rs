@@ -309,8 +309,10 @@ enum FileParseRoot {
 #[derive(Copy, Clone)]
 enum HostedSetFileNameTarget {
     SourceParent,
-    Canonical(u64),
-    OpenParent(usize),
+    OpenParent {
+        name_len: usize,
+        root_directory: u64,
+    },
 }
 
 fn try_zeroed_transfer_buffer(len: usize) -> Result<alloc::vec::Vec<u8>, u32> {
@@ -24662,7 +24664,6 @@ impl ExecNtHandler {
 
     fn resolve_hosted_set_file_name_target(
         &self,
-        source: HostedFileRoute,
         root_directory: u64,
         file_name: &[u8],
         open_name: &mut [u16],
@@ -24673,43 +24674,16 @@ impl ExecNtHandler {
         if root_directory == 0 && name.first() != Some(&(b'\\' as u16)) {
             return Ok(HostedSetFileNameTarget::SourceParent);
         }
-        let root = self.resolve_file_parse_root_for(root_directory, name)?;
-        let mut namespace_path = [0u8; NAMED_OBJECT_PATH_CAP];
-        let mut absolute_name = [0u16; FILE_OBJECT_NAME_CAP];
-        let (root, name) = self.normalize_object_directory_file_name(
-            root,
-            name,
-            &mut namespace_path,
-            &mut absolute_name,
-        )?;
-        match root {
-            FileParseRoot::HostedFile { file_id, device_id } => {
-                if name.first() == Some(&(b'\\' as u16)) {
-                    return Err(nt_fs::STATUS_INVALID_PARAMETER);
-                }
-                if device_id != source.device_id {
-                    return Err(nt_fs::STATUS_NOT_SAME_DEVICE);
-                }
-                Ok(HostedSetFileNameTarget::Canonical(file_id))
-            }
-            FileParseRoot::OverlayFile(_) | FileParseRoot::FatDirectory { .. } => {
-                Err(nt_fs::STATUS_NOT_SAME_DEVICE)
-            }
-            FileParseRoot::NonDirectoryFile => Err(nt_fs::STATUS_NOT_A_DIRECTORY),
-            FileParseRoot::Absolute => {
-                let mut canonical = [0u16; FILE_OBJECT_NAME_CAP];
-                let canonical_len =
-                    unsafe { crate::object_manager_reparse_file_path(name, &mut canonical) }
-                        .map_err(|status| status.raw() as u32)?;
-                driver_launch::hosted_file_device_relative_name(
-                    source.file_id,
-                    &canonical[..canonical_len],
-                    open_name,
-                )
-                .map(HostedSetFileNameTarget::OpenParent)
-            }
-            FileParseRoot::ObjectDirectory { .. } => Err(nt_fs::STATUS_INVALID_HANDLE),
+        // RootDirectory is a caller handle, not a target File. Resolve it only after the
+        // source query, including when that query parks and another thread changes handles.
+        if open_name.len() < name_len {
+            return Err(nt_fs::STATUS_OBJECT_NAME_INVALID);
         }
+        open_name[..name_len].copy_from_slice(name);
+        Ok(HostedSetFileNameTarget::OpenParent {
+            name_len,
+            root_directory,
+        })
     }
 
     unsafe fn query_local_file_relative(

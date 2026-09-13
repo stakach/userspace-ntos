@@ -25005,6 +25005,18 @@ unsafe fn file_cleanup_wait_transfer(
     true
 }
 
+unsafe fn pending_set_file_name_caller_is_live(
+    handler: &ExecNtHandler,
+    identity: nt_io_manager::PendingFileIoIdentity,
+    pending: nt_io_manager::PendingFileIo,
+) -> bool {
+    (&*core::ptr::addr_of!(PENDING_FILE_IO))
+        .get_exact(identity)
+        .is_some_and(|live| live.irp_id == pending.irp_id && !live.consumer_abandoned)
+        && crate::pending_file_caller::caller(identity, pending)
+            .is_some_and(|caller| handler.set_file_name_caller_is_current(caller))
+}
+
 /// Publish terminal results for general pending File IRPs in NT completion order. The backend
 /// completion remains retained until every required surface and synchronous reply is visible.
 unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
@@ -25022,6 +25034,7 @@ unsafe fn pending_file_io_redrive_pass(
     finish_settled_busy_only: bool,
 ) -> (u64, usize) {
     if !finish_settled_busy_only {
+        nt_handler.redrive_set_file_name_retirement();
         synchronous_file_retry::redrive_retirement(nt_handler);
         synchronous_file_cancellation::redrive(nt_handler);
         crate::pending_file_apc::redrive(nt_handler);
@@ -25207,6 +25220,13 @@ unsafe fn pending_file_io_redrive_pass(
                     .expect("set-file-name source query lost its transaction")
                     .phase();
                 assert_eq!(phase, nt_io_manager::PendingSetFileNamePhase::SourceQuery);
+                // A late RootDirectory lookup must not consult a reused process/thread slot.
+                if (terminal_status as i32) >= 0
+                    && !pending_set_file_name_caller_is_live(nt_handler, identity, pending)
+                {
+                    terminal_status = nt_status::NtStatus::CANCELLED.raw() as u32;
+                    terminal_information = 0;
+                }
                 if (terminal_status as i32) >= 0 {
                     const FILE_BASIC_INFORMATION_LEN: usize = 40;
                     let mut basic = [0u8; FILE_BASIC_INFORMATION_LEN];
@@ -25251,63 +25271,21 @@ unsafe fn pending_file_io_redrive_pass(
                                 (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
                                     .take_for_update(transaction_id)
                                     .expect("set-file-name query lost its captured buffers");
-                            let mut target_name = [0u16; crate::exec_handler::FILE_OBJECT_NAME_CAP];
-                            let decoded_name_len = transaction.target_name().len() / 2;
-                            let decoded_name = if decoded_name_len == 0
-                                || decoded_name_len > target_name.len()
-                                || transaction.target_name().len() & 1 != 0
-                            {
-                                None
-                            } else {
-                                for (word, bytes) in target_name[..decoded_name_len]
-                                    .iter_mut()
-                                    .zip(transaction.target_name().chunks_exact(2))
-                                {
-                                    *word = u16::from_le_bytes([bytes[0], bytes[1]]);
-                                }
-                                Some(&target_name[..decoded_name_len])
-                            };
-                            let target = decoded_name
-                                .ok_or(nt_fs::STATUS_OBJECT_NAME_INVALID)
-                                .and_then(|target_name| {
-                                    driver_launch::allocate_hosted_set_file_name_target(
-                                        transaction.source_file_id,
-                                        source_is_directory,
-                                        target_name,
-                                    )
-                                });
-                            match target {
+                            let create = pending_set_file_name_caller_is_live(nt_handler, identity, pending)
+                                .then(|| crate::pending_file_caller::caller(identity, pending)).flatten()
+                                .ok_or(nt_status::NtStatus::CANCELLED.raw() as u32)
+                                .and_then(|caller| nt_handler.open_set_file_name_target(
+                                    &mut transaction, source_is_directory, caller,
+                                ));
+                            let target_file_id = transaction.target_file_id;
+                            match create {
                                 Err(status) => {
                                     assert!(transaction.complete_inline(status, 0));
                                     terminal_status = status;
                                     terminal_information = 0;
                                 }
-                                Ok((target_file_id, target_access)) => {
-                                    assert!(transaction.advance_to_target_create(target_file_id));
-                                    let create = driver_launch::dispatch_hosted_target_directory_create_irp_result_exact(
-                                        target_file_id,
-                                        pending.tid,
-                                        nt_io_manager::CreateParameters {
-                                            desired_access: nt_types::AccessMask::from_bits_retain(
-                                                target_access,
-                                            ),
-                                            share_access: nt_io_manager::ShareAccess::READ
-                                                | nt_io_manager::ShareAccess::WRITE,
-                                            create_options: nt_io_manager::CreateOptions::OPEN_FOR_BACKUP_INTENT,
-                                            create_disposition: nt_fs::FILE_OPEN,
-                                            file_attributes: 0,
-                                            ea_length: 0,
-                                            related_file: None,
-                                        },
-                                        transaction.target_name(),
-                                    );
-                                    let (create_status, create_information, create_irp) =
-                                        match create {
-                                            Ok((status, information, irp_id, _)) => {
-                                                (status as u32, information, irp_id)
-                                            }
-                                            Err(status) => (status, 0, None),
-                                        };
+                                Ok((status, create_information, create_irp, _)) => {
+                                    let create_status = status as u32;
                                     if create_status == nt_status::NtStatus::PENDING.raw() as u32 {
                                         if let Some(create_irp) = create_irp {
                                             assert!((&mut *core::ptr::addr_of_mut!(
@@ -25333,17 +25311,17 @@ unsafe fn pending_file_io_redrive_pass(
                                     } else if (create_status as i32) < 0 {
                                         terminal_status = create_status;
                                         terminal_information = create_information;
-                                    } else if transaction.information_class
-                                        == nt_fs::FILE_LINK_INFORMATION
-                                        && !transaction.replace_if_exists()
-                                        && create_information == nt_fs::FILE_EXISTS as u64
-                                    {
-                                        terminal_status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
+                                    } else if let Err(status) = transaction.validate_target_open(create_information, || {
+                                        driver_launch::owned_hosted_files_share_related_device(transaction.source_file_id, target_file_id)
+                                    }) {
+                                        terminal_status = status.raw() as u32;
                                         terminal_information = 0;
                                     } else {
                                         let length =
                                             u32::try_from(transaction.set_information().len());
-                                        let dispatch = match length {
+                                        let dispatch = if !pending_set_file_name_caller_is_live(nt_handler, identity, pending) {
+                                            Err(nt_status::NtStatus::CANCELLED.raw() as u32)
+                                        } else { match length {
                                             Ok(length) => driver_launch::dispatch_hosted_file_set_information_irp_result_exact(
                                                 transaction.source_file_id,
                                                 pending.tid,
@@ -25358,7 +25336,7 @@ unsafe fn pending_file_io_redrive_pass(
                                                 transaction.set_information(),
                                             ),
                                             Err(_) => Err(nt_fs::STATUS_INVALID_PARAMETER),
-                                        };
+                                        }};
                                         match dispatch {
                                             Ok((status, _, Some(irp_id), _))
                                                 if status == nt_status::NtStatus::PENDING.raw() =>
@@ -25422,14 +25400,13 @@ unsafe fn pending_file_io_redrive_pass(
                     let mut transaction = (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
                         .take_for_update(transaction_id)
                         .expect("set-file-name target CREATE lost its captured owner");
-                    if transaction.information_class == nt_fs::FILE_LINK_INFORMATION
-                        && !transaction.replace_if_exists()
-                        && terminal_information == nt_fs::FILE_EXISTS as u64
-                    {
-                        assert!(transaction.complete_inline(nt_fs::STATUS_OBJECT_NAME_COLLISION, 0));
+                    if let Err(status) = transaction.validate_target_open(terminal_information, || {
+                        driver_launch::owned_hosted_files_share_related_device(transaction.source_file_id, transaction.target_file_id)
+                    }) {
+                        assert!(transaction.complete_inline(status.raw() as u32, 0));
                         assert!((&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
                             .restore_update(transaction_id, transaction));
-                        terminal_status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
+                        terminal_status = status.raw() as u32;
                         terminal_information = 0;
                     } else {
                         if driver_launch::acknowledge_completed_irp(pending.irp_id).is_err() {
@@ -25455,7 +25432,9 @@ unsafe fn pending_file_io_redrive_pass(
                         if transaction.phase()
                             == nt_io_manager::PendingSetFileNamePhase::TargetCreate
                         {
-                            let dispatch = driver_launch::dispatch_hosted_file_set_information_irp_result_exact(
+                            let dispatch = if !pending_set_file_name_caller_is_live(nt_handler, identity, pending) {
+                                Err(nt_status::NtStatus::CANCELLED.raw() as u32)
+                            } else { driver_launch::dispatch_hosted_file_set_information_irp_result_exact(
                                 transaction.source_file_id,
                                 pending.tid,
                                 nt_io_manager::SetInformationParameters {
@@ -25467,7 +25446,7 @@ unsafe fn pending_file_io_redrive_pass(
                                     control: transaction.control,
                                 },
                                 transaction.set_information(),
-                            );
+                            )};
                             match dispatch {
                                 Ok((status, _information, Some(irp_id), _))
                                     if status == nt_status::NtStatus::PENDING.raw() =>
@@ -25937,11 +25916,15 @@ unsafe fn pending_file_io_redrive_pass(
                 let transaction = (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
                     .take_for_update(transaction_id)
                     .expect("set-file-name completion lost its captured transaction");
-                assert!((&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
-                    .finish_update(transaction_id));
-                if transaction.target_file_id != 0 {
-                    let _ =
-                        driver_launch::abandon_unpublished_hosted_file(transaction.target_file_id);
+                if transaction.target_file_id != 0
+                    && driver_launch::abandon_unpublished_hosted_file(transaction.target_file_id).is_err()
+                {
+                    assert!((&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
+                        .restore_retirement(transaction_id, transaction));
+                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                } else {
+                    assert!((&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
+                        .finish_update(transaction_id));
                 }
                 nt_handler.release_file_reference(finished.route.hosted_file_id().expect("provider rename lost its File route"));
             }

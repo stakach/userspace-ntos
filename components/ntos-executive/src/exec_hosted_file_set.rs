@@ -2,7 +2,152 @@
 
 use super::*;
 
+static RETIRE_CURSOR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 impl ExecNtHandler {
+    pub(crate) fn set_file_name_caller_is_current(
+        &self,
+        caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+    ) -> bool {
+        self.validate_provider_logical_caller(caller)
+            && (self.pi, self.current_tid, self.current_badge)
+                == (
+                    caller.pi(),
+                    u64::from(caller.thread().thread_id()),
+                    caller.badge(),
+                )
+    }
+
+    pub(crate) unsafe fn redrive_set_file_name_retirement(&mut self) {
+        let mut cursor = RETIRE_CURSOR.load(Ordering::Relaxed);
+        for _ in 0..64 {
+            let Some((next, id)) =
+                (&*core::ptr::addr_of!(PENDING_SET_FILE_NAMES)).next_retirement_from(cursor)
+            else {
+                RETIRE_CURSOR.store(0, Ordering::Relaxed);
+                if cursor != 0 {
+                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                }
+                return;
+            };
+            cursor = next;
+            RETIRE_CURSOR.store(cursor, Ordering::Relaxed);
+            let transaction = (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
+                .take_for_update(id)
+                .expect("target retirement lost its selected owner");
+            if driver_launch::abandon_unpublished_hosted_file(transaction.target_file_id).is_ok() {
+                assert!((&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES)).finish_update(id));
+            } else {
+                assert!((&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
+                    .restore_update(id, transaction));
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+            }
+        }
+        FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+    }
+
+    unsafe fn retire_inline_set_file_name(
+        &mut self,
+        reservation: nt_io_manager::PendingSetFileNameReservation,
+        transaction: nt_io_manager::PendingSetFileName<driver_launch::hosted_file_capture::Capture>,
+    ) {
+        let target = transaction.target_file_id;
+        if target != 0 && driver_launch::abandon_unpublished_hosted_file(target).is_err() {
+            (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
+                .park_retirement(reservation, transaction)
+                .expect("target retirement lost its reserved transaction owner");
+            FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+        } else {
+            assert!((&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
+                .cancel_reservation(reservation));
+        }
+    }
+
+    /// Resolve the root in the original caller context only after source-query success. A scoped
+    /// root capture bridges allocation to CREATE's canonical related-File IRP reference.
+    pub(crate) unsafe fn open_set_file_name_target(
+        &mut self,
+        transaction: &mut nt_io_manager::PendingSetFileName<
+            driver_launch::hosted_file_capture::Capture,
+        >,
+        source_is_directory: bool,
+        caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+    ) -> Result<(i32, u64, Option<nt_io_manager::IrpId>, Option<u64>), u32> {
+        if !self.set_file_name_caller_is_current(caller) {
+            return Err(nt_status::NtStatus::CANCELLED.raw() as u32);
+        }
+        let mut decoded = [0u16; FILE_OBJECT_NAME_CAP];
+        let len = Self::decode_set_file_name_units(transaction.target_name(), &mut decoded)?;
+        let name = &decoded[..len];
+        let root_handle = transaction.root_directory();
+        let root = self.resolve_file_parse_root_for(root_handle, name)?;
+        let mut namespace = [0u8; NAMED_OBJECT_PATH_CAP];
+        let mut absolute = [0u16; FILE_OBJECT_NAME_CAP];
+        let (root, name) =
+            self.normalize_object_directory_file_name(root, name, &mut namespace, &mut absolute)?;
+        let mut root_owner = None;
+        let mut canonical = [0u16; FILE_OBJECT_NAME_CAP];
+        let mut relative = [0u16; FILE_OBJECT_NAME_CAP];
+        let (root_file_id, target_name) = match root {
+            FileParseRoot::HostedFile { file_id, device_id } => {
+                // This is a fresh root lookup, never the source's promoted retry grant.
+                let handle =
+                    nt_process::Handle::try_from(root_handle).map_err(|_| STATUS_INVALID_HANDLE)?;
+                let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+                let grant = self
+                    .pm
+                    .handle_access(pid, handle)
+                    .ok_or(STATUS_INVALID_HANDLE)?;
+                root_owner = Some(driver_launch::hosted_file_capture::capture(
+                    file_id, device_id, grant,
+                )?);
+                (Some(file_id), name)
+            }
+            FileParseRoot::Absolute => {
+                let len = crate::object_manager_reparse_file_path(name, &mut canonical)
+                    .map_err(|status| status.raw() as u32)?;
+                let len = driver_launch::hosted_file_device_relative_name(
+                    transaction.source_file_id,
+                    &canonical[..len],
+                    &mut relative,
+                )?;
+                (None, &relative[..len])
+            }
+            FileParseRoot::OverlayFile(_) | FileParseRoot::FatDirectory { .. } => {
+                return Err(nt_fs::STATUS_NOT_SAME_DEVICE)
+            }
+            FileParseRoot::NonDirectoryFile => return Err(nt_fs::STATUS_NOT_A_DIRECTORY),
+            FileParseRoot::ObjectDirectory { .. } => return Err(STATUS_INVALID_HANDLE),
+        };
+        let mut input = try_zeroed_transfer_buffer(target_name.len() * 2)?;
+        for (word, bytes) in target_name.iter().zip(input.chunks_exact_mut(2)) {
+            bytes.copy_from_slice(&word.to_le_bytes());
+        }
+        let (target, access) = driver_launch::allocate_hosted_set_file_name_target(
+            transaction.source_file_id,
+            root_file_id,
+            source_is_directory,
+            target_name,
+        )?;
+        assert!(transaction.advance_to_target_create(target));
+        let result = driver_launch::dispatch_hosted_target_directory_create_irp_result_exact(
+            target,
+            self.current_tid,
+            nt_io_manager::CreateParameters {
+                desired_access: nt_types::AccessMask::from_bits_retain(access),
+                share_access: nt_io_manager::ShareAccess::READ | nt_io_manager::ShareAccess::WRITE,
+                create_options: nt_io_manager::CreateOptions::OPEN_FOR_BACKUP_INTENT,
+                create_disposition: nt_fs::FILE_OPEN,
+                file_attributes: 0,
+                ea_length: 0,
+                related_file: None,
+            },
+            &input,
+        );
+        drop(root_owner);
+        result
+    }
+
     pub(super) fn trace_set_information_payload(
         &self,
         handle: u64,
@@ -203,7 +348,6 @@ impl ExecNtHandler {
                 }
             }
             _ => {
-                let route = capture.route;
                 let mut open_parent_name = [0u16; FILE_OBJECT_NAME_CAP];
                 let target = match information_class {
                     nt_fs::FILE_RENAME_INFORMATION | nt_fs::FILE_LINK_INFORMATION => {
@@ -211,7 +355,6 @@ impl ExecNtHandler {
                             Err(status) => Err(status),
                             Ok(set_name) => self
                                 .resolve_hosted_set_file_name_target(
-                                    route,
                                     set_name.root_directory,
                                     set_name.file_name,
                                     &mut open_parent_name,
@@ -231,7 +374,6 @@ impl ExecNtHandler {
                             Err(status) => Err(status),
                             Ok(move_cluster) => self
                                 .resolve_hosted_set_file_name_target(
-                                    route,
                                     move_cluster.root_directory,
                                     move_cluster.file_name,
                                     &mut open_parent_name,
@@ -262,13 +404,18 @@ impl ExecNtHandler {
                         ) {
                             payload[8..16].fill(0);
                         }
-                        if let HostedSetFileNameTarget::OpenParent(name_len) = target {
+                        if let HostedSetFileNameTarget::OpenParent {
+                            name_len,
+                            root_directory,
+                        } = target
+                        {
                             let (status, completed) = match self.dispatch_acquired_set_file_name(
                                 iosb,
                                 capture,
                                 synchronous_file,
                                 information_class,
                                 control,
+                                root_directory,
                                 &open_parent_name[..name_len],
                                 payload,
                             ) {
@@ -281,15 +428,10 @@ impl ExecNtHandler {
                             }
                             status
                         } else {
-                            let target_file = match target {
-                                HostedSetFileNameTarget::SourceParent => None,
-                                HostedSetFileNameTarget::Canonical(file_id) => Some(file_id),
-                                HostedSetFileNameTarget::OpenParent(_) => unreachable!(),
-                            };
                             let parameters = nt_io_manager::SetInformationParameters {
                                 info_class: information_class,
                                 length: length as u32,
-                                target_file: target_file.map(nt_io_abi::FileId),
+                                target_file: None,
                                 control,
                             };
                             let (status, completed) = match self.dispatch_acquired_set_information(
@@ -382,10 +524,15 @@ impl ExecNtHandler {
         synchronous_file: bool,
         information_class: u32,
         control: nt_io_manager::SetInformationControl,
+        root_directory: u64,
         target_name: &[u16],
         payload: Vec<u8>,
     ) -> Result<(u32, u64), u32> {
         let route = capture.route;
+        let caller = self
+            .pending_file_io_reservation
+            .and_then(|reservation| crate::pending_file_caller::reserved_caller(reservation))
+            .ok_or(nt_status::NtStatus::CANCELLED.raw() as u32)?;
         let Some(target_name_bytes_len) = target_name.len().checked_mul(2) else {
             return Err(nt_fs::STATUS_INVALID_PARAMETER);
         };
@@ -425,29 +572,15 @@ impl ExecNtHandler {
                 return Err(status);
             }
         };
-        let mut transaction = transaction.with_source_owner(source_owner);
+        let mut transaction = transaction
+            .with_root_directory(root_directory)
+            .with_source_owner(source_owner);
 
-        let source_create_options = match driver_launch::owned_hosted_file_metadata(route.file_id) {
-            Ok(metadata) if metadata.device_id.raw() == route.device_id => metadata.create_options,
-            result => {
-                let status = match result {
-                    Ok(_) => nt_fs::STATUS_INVALID_HANDLE,
-                    Err(status) => status,
-                };
-                (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
-                    .cancel_reservation(transaction_reservation);
-                return Err(status);
-            }
-        };
         let mut pending_irp = None;
         let mut pending_major = major::IRP_MJ_QUERY_INFORMATION;
-        let source_is_directory = if source_create_options
-            .contains(nt_io_manager::CreateOptions::DIRECTORY_FILE)
-        {
-            Some(true)
-        } else if source_create_options.contains(nt_io_manager::CreateOptions::NON_DIRECTORY_FILE) {
-            Some(false)
-        } else {
+        // Create options constrain opening, but cannot suppress this provider query or its error.
+        // The direct-device exception needs an authoritative FO_DIRECT_DEVICE_OPEN state.
+        let source_is_directory = {
             let mut basic = [0u8; FILE_BASIC_INFORMATION_LEN];
             let query = driver_launch::dispatch_hosted_file_irp_result_exact(
                 route.file_id,
@@ -496,36 +629,9 @@ impl ExecNtHandler {
 
         let mut target_file_id = 0;
         if let Some(source_is_directory) = source_is_directory {
-            let (allocated_target, target_access) =
-                match driver_launch::allocate_hosted_set_file_name_target(
-                    route.file_id,
-                    source_is_directory,
-                    target_name,
-                ) {
-                    Ok(target) => target,
-                    Err(status) => {
-                        (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
-                            .cancel_reservation(transaction_reservation);
-                        return Ok((status, 0));
-                    }
-                };
-            target_file_id = allocated_target;
-            assert!(transaction.advance_to_target_create(target_file_id));
-            let create = driver_launch::dispatch_hosted_target_directory_create_irp_result_exact(
-                target_file_id,
-                self.current_tid,
-                nt_io_manager::CreateParameters {
-                    desired_access: nt_types::AccessMask::from_bits_retain(target_access),
-                    share_access: nt_io_manager::ShareAccess::READ
-                        | nt_io_manager::ShareAccess::WRITE,
-                    create_options: nt_io_manager::CreateOptions::OPEN_FOR_BACKUP_INTENT,
-                    create_disposition: nt_fs::FILE_OPEN,
-                    file_attributes: 0,
-                    ea_length: 0,
-                    related_file: None,
-                },
-                transaction.target_name(),
-            );
+            let create =
+                self.open_set_file_name_target(&mut transaction, source_is_directory, caller);
+            target_file_id = transaction.target_file_id;
             let (create_status, create_information, create_irp) = match create {
                 Ok((status, information, pending, _)) => (
                     status as u32,
@@ -541,18 +647,22 @@ impl ExecNtHandler {
             if create_status != STATUS_PENDING {
                 if (create_status as i32) < 0 {
                     terminal = Some((create_status, create_information));
-                } else if information_class == nt_fs::FILE_LINK_INFORMATION
-                    && !control.replace_if_exists()
-                    && create_information == nt_fs::FILE_EXISTS as u64
+                } else if let Err(status) =
+                    transaction.validate_target_open(create_information, || {
+                        driver_launch::owned_hosted_files_share_related_device(
+                            route.file_id,
+                            target_file_id,
+                        )
+                    })
                 {
-                    terminal = Some((nt_fs::STATUS_OBJECT_NAME_COLLISION, 0));
+                    terminal = Some((status.raw() as u32, 0));
+                } else if !self.set_file_name_caller_is_current(caller) {
+                    terminal = Some((nt_status::NtStatus::CANCELLED.raw() as u32, 0));
                 } else {
                     let Some(set_information_len) =
                         u32::try_from(transaction.set_information().len()).ok()
                     else {
-                        (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
-                            .cancel_reservation(transaction_reservation);
-                        let _ = driver_launch::abandon_unpublished_hosted_file(target_file_id);
+                        self.retire_inline_set_file_name(transaction_reservation, transaction);
                         return Ok((nt_fs::STATUS_INVALID_PARAMETER, 0));
                     };
                     let parameters = nt_io_manager::SetInformationParameters {
@@ -584,19 +694,13 @@ impl ExecNtHandler {
             }
 
             if let Some((status, information)) = terminal {
-                (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
-                    .cancel_reservation(transaction_reservation);
-                let _ = driver_launch::abandon_unpublished_hosted_file(target_file_id);
+                self.retire_inline_set_file_name(transaction_reservation, transaction);
                 return Ok((status, information));
             }
         }
 
         let Some(pending_irp) = pending_irp else {
-            (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
-                .cancel_reservation(transaction_reservation);
-            if target_file_id != 0 {
-                let _ = driver_launch::abandon_unpublished_hosted_file(target_file_id);
-            }
+            self.retire_inline_set_file_name(transaction_reservation, transaction);
             return Ok((STATUS_INSUFFICIENT_RESOURCES, 0));
         };
         let transaction_id = (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))

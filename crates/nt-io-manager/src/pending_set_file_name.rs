@@ -27,6 +27,7 @@ pub struct PendingSetFileName<Owner = ()> {
     terminal_information: u64,
     target_name: Vec<u8>,
     set_information: Vec<u8>,
+    root_directory: u64,
     source_owner: Owner,
 }
 
@@ -75,6 +76,7 @@ impl PendingSetFileName<()> {
             terminal_information: 0,
             target_name,
             set_information,
+            root_directory: 0,
             source_owner: (),
         })
     }
@@ -104,8 +106,16 @@ impl PendingSetFileName<()> {
             terminal_information: 0,
             target_name,
             set_information,
+            root_directory: 0,
             source_owner: (),
         })
+    }
+
+    /// Preserve the raw caller handle for authentication in the original caller context after
+    /// SourceQuery completes. Capturing this value does not resolve or reference its object.
+    pub fn with_root_directory(mut self, root_directory: u64) -> Self {
+        self.root_directory = root_directory;
+        self
     }
 
     /// Attach the source lifetime exactly once before this transaction can be parked.
@@ -120,12 +130,17 @@ impl PendingSetFileName<()> {
             terminal_information: self.terminal_information,
             target_name: self.target_name,
             set_information: self.set_information,
+            root_directory: self.root_directory,
             source_owner: owner,
         }
     }
 }
 
 impl<Owner> PendingSetFileName<Owner> {
+    pub const fn root_directory(&self) -> u64 {
+        self.root_directory
+    }
+
     pub fn phase(&self) -> PendingSetFileNamePhase {
         self.phase
     }
@@ -140,6 +155,28 @@ impl<Owner> PendingSetFileName<Owner> {
 
     pub const fn replace_if_exists(&self) -> bool {
         self.control.replace_if_exists()
+    }
+
+    /// Validate postconditions only after a successful target CREATE. Provider failure statuses
+    /// remain the caller's responsibility. Hard-link collision precedes the fallible related-device
+    /// lookup, so a topology error cannot replace the earlier namespace result.
+    pub fn validate_target_open(
+        &self,
+        create_information: u64,
+        related_device: impl FnOnce() -> Result<bool, nt_status::NtStatus>,
+    ) -> Result<(), nt_status::NtStatus> {
+        const FILE_LINK_INFORMATION: u32 = 11;
+        const FILE_EXISTS: u64 = 4;
+        if self.information_class == FILE_LINK_INFORMATION
+            && !self.replace_if_exists()
+            && create_information == FILE_EXISTS
+        {
+            return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
+        }
+        if !related_device()? {
+            return Err(nt_status::NtStatus::NOT_SAME_DEVICE);
+        }
+        Ok(())
     }
 
     pub fn terminal_result(&self) -> Option<(u32, u64)> {
@@ -221,6 +258,7 @@ struct Slot<Owner> {
     generation: u32,
     record: Option<PendingSetFileName<Owner>>,
     updating: bool,
+    retirement_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -275,9 +313,9 @@ impl<Owner> PendingSetFileNameTable<Owner> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.slots
-            .iter()
-            .all(|slot| slot.generation == 0 && slot.record.is_none() && !slot.updating)
+        self.slots.iter().all(|slot| {
+            slot.generation == 0 && slot.record.is_none() && !slot.updating && !slot.retirement_only
+        })
     }
 
     pub fn reserve(&mut self) -> Option<PendingSetFileNameReservation> {
@@ -296,12 +334,14 @@ impl<Owner> PendingSetFileNameTable<Owner> {
                     generation: 0,
                     record: None,
                     updating: false,
+                    retirement_only: false,
                 });
                 Some(self.slots.len() - 1)
             })?;
         let generation = self.next_generation.max(1);
         self.next_generation = generation.wrapping_add(1).max(1);
         self.slots[slot].generation = generation;
+        self.slots[slot].retirement_only = false;
         Some(PendingSetFileNameReservation { slot, generation })
     }
 
@@ -313,6 +353,7 @@ impl<Owner> PendingSetFileNameTable<Owner> {
             return false;
         }
         slot.generation = 0;
+        slot.retirement_only = false;
         true
     }
 
@@ -326,7 +367,38 @@ impl<Owner> PendingSetFileNameTable<Owner> {
             return None;
         }
         slot.record = Some(record);
+        slot.retirement_only = false;
         PendingSetFileNameId::new(reservation.slot, reservation.generation)
+    }
+
+    /// Retain an inline transaction solely until target retirement succeeds. No IRP or reply
+    /// identity is manufactured, and the transaction keeps its existing source lifetime owner.
+    pub fn park_retirement(
+        &mut self,
+        reservation: PendingSetFileNameReservation,
+        record: PendingSetFileName<Owner>,
+    ) -> Option<PendingSetFileNameId> {
+        let id = self.park_reserved(reservation, record)?;
+        self.slots[reservation.slot].retirement_only = true;
+        Some(id)
+    }
+
+    /// Select the next idle retirement-only record, returning the next scan cursor and exact
+    /// generation identity. Checked-out records are invisible until restored after refusal.
+    pub fn next_retirement_from(&self, start: usize) -> Option<(usize, PendingSetFileNameId)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find_map(|(index, slot)| {
+                if !slot.retirement_only || slot.updating || slot.record.is_none() {
+                    return None;
+                }
+                Some((
+                    index + 1,
+                    PendingSetFileNameId::new(index, slot.generation)?,
+                ))
+            })
     }
 
     pub fn get(&self, id: PendingSetFileNameId) -> Option<&PendingSetFileName<Owner>> {
@@ -384,6 +456,24 @@ impl<Owner> PendingSetFileNameTable<Owner> {
         }
         slot.updating = false;
         slot.generation = 0;
+        slot.retirement_only = false;
+        true
+    }
+
+    /// After real completion delivery and ACK, hand a checked-out transaction to target-only
+    /// retirement without allocating or changing its generation identity.
+    pub fn restore_retirement(
+        &mut self,
+        id: PendingSetFileNameId,
+        record: PendingSetFileName<Owner>,
+    ) -> bool {
+        let Some((slot, _)) = id.parts() else {
+            return false;
+        };
+        if !self.restore_update(id, record) {
+            return false;
+        }
+        self.slots[slot].retirement_only = true;
         true
     }
 }
@@ -583,5 +673,229 @@ mod tests {
         assert!(query.advance_to_target_create(6));
         assert_eq!(query.phase(), PendingSetFileNamePhase::TargetCreate);
         assert_eq!(query.target_file_id, 6);
+    }
+
+    #[test]
+    fn root_directory_raw_handle_and_source_owner_survive_all_pending_phases() {
+        let drops = Rc::new(Cell::new(0));
+        let original_handle = 0xffff_ffff_1234_5678;
+        let mut caller_handle = original_handle;
+        let transaction = PendingSetFileName::awaiting_source_query(
+            1,
+            10,
+            SetInformationControl::ReplaceIfExists(false),
+            vec![b'x', 0],
+            vec![0; 24],
+        )
+        .unwrap()
+        .with_root_directory(caller_handle)
+        .with_source_owner(SourceOwner(drops.clone()));
+        // A changed caller variable or process handle table is not resolved by this container.
+        caller_handle = 0x80;
+        let mut table = PendingSetFileNameTable::new();
+        let reservation = table.reserve().unwrap();
+        let id = table.park_reserved(reservation, transaction).unwrap();
+        assert_eq!(table.get(id).unwrap().root_directory(), original_handle);
+        assert_ne!(table.get(id).unwrap().root_directory(), caller_handle);
+        let mut transaction = table.take_for_update(id).unwrap();
+        assert_eq!(transaction.root_directory(), original_handle);
+        assert!(transaction.advance_to_target_create(2));
+        assert!(table.restore_update(id, transaction));
+        assert_eq!(drops.get(), 0);
+        let mut transaction = table.take_for_update(id).unwrap();
+        assert_eq!(transaction.root_directory(), original_handle);
+        assert!(transaction.advance_to_source_set());
+        assert!(table.restore_update(id, transaction));
+        assert_eq!(drops.get(), 0);
+        let transaction = table.take_for_update(id).unwrap();
+        assert!(table.finish_update(id));
+        assert_eq!(transaction.root_directory(), original_handle);
+        drop(transaction);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn root_directory_defaults_to_zero_and_survives_inline_terminal() {
+        assert_eq!(record(1, 2).root_directory(), 0);
+        let query = PendingSetFileName::awaiting_source_query(
+            1,
+            10,
+            SetInformationControl::ReplaceIfExists(false),
+            vec![b'x', 0],
+            vec![0; 24],
+        )
+        .unwrap();
+        assert_eq!(query.root_directory(), 0);
+        let mut query = query.with_root_directory(0x100).with_source_owner(());
+        assert!(query.complete_inline(nt_status::NtStatus::INVALID_HANDLE.raw() as u32, 0));
+        assert_eq!(query.root_directory(), 0x100);
+    }
+
+    #[test]
+    fn target_open_nonreplacing_link_collision_skips_related_device_lookup() {
+        let link = PendingSetFileName::new(
+            1,
+            2,
+            11,
+            SetInformationControl::ReplaceIfExists(false),
+            vec![b'x', 0],
+            vec![0; 24],
+        )
+        .unwrap();
+        assert_eq!(
+            link.validate_target_open(4, || panic!("collision must precede topology lookup")),
+            Err(nt_status::NtStatus::OBJECT_NAME_COLLISION)
+        );
+        for information in [0, 1, 2, 3, 5, u64::MAX] {
+            assert_eq!(
+                link.validate_target_open(information, || Ok(false)),
+                Err(nt_status::NtStatus::NOT_SAME_DEVICE)
+            );
+            assert_eq!(link.validate_target_open(information, || Ok(true)), Ok(()));
+            assert_eq!(
+                link.validate_target_open(information, || Err(nt_status::NtStatus::INVALID_HANDLE)),
+                Err(nt_status::NtStatus::INVALID_HANDLE)
+            );
+        }
+    }
+
+    #[test]
+    fn target_open_existing_name_is_allowed_for_rename_replacing_link_and_move_cluster() {
+        for (class, control) in [
+            (10, SetInformationControl::ReplaceIfExists(false)),
+            (10, SetInformationControl::ReplaceIfExists(true)),
+            (11, SetInformationControl::ReplaceIfExists(true)),
+            (31, SetInformationControl::ClusterCount(7)),
+        ] {
+            let transaction =
+                PendingSetFileName::new(1, 2, class, control, vec![b'x', 0], vec![0; 24]).unwrap();
+            assert_eq!(transaction.validate_target_open(4, || Ok(true)), Ok(()));
+            assert_eq!(
+                transaction.validate_target_open(4, || Ok(false)),
+                Err(nt_status::NtStatus::NOT_SAME_DEVICE)
+            );
+            assert_eq!(
+                transaction
+                    .validate_target_open(4, || Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED)),
+                Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED)
+            );
+        }
+    }
+
+    #[test]
+    fn retirement_only_refusal_restore_retains_owner_until_successful_finish_and_drop() {
+        let drops = Rc::new(Cell::new(0));
+        let mut table = PendingSetFileNameTable::new();
+        let reservation = table.reserve().unwrap();
+        let mut transaction = record(1, 2)
+            .with_root_directory(0x80)
+            .with_source_owner(SourceOwner(drops.clone()));
+        assert!(transaction.complete_inline(nt_status::NtStatus::INVALID_PARAMETER.raw() as u32, 0));
+        let id = table.park_retirement(reservation, transaction).unwrap();
+        assert_eq!(table.next_retirement_from(0), Some((1, id)));
+        let transaction = table.take_for_update(id).unwrap();
+        assert!(table.next_retirement_from(0).is_none());
+        assert!(table.take_for_update(id).is_none());
+        assert_eq!(drops.get(), 0);
+        // A refused target-retirement call returns the same checked-out transaction for retry.
+        assert!(table.restore_update(id, transaction));
+        assert_eq!(table.next_retirement_from(0), Some((1, id)));
+        let transaction = table.take_for_update(id).unwrap();
+        assert_eq!(transaction.root_directory(), 0x80);
+        assert_eq!(transaction.target_file_id, 2);
+        assert_eq!(
+            transaction.terminal_result(),
+            Some((nt_status::NtStatus::INVALID_PARAMETER.raw() as u32, 0))
+        );
+        assert!(table.finish_update(id));
+        assert!(table.next_retirement_from(0).is_none());
+        assert!(table.is_empty());
+        assert_eq!(drops.get(), 0);
+        drop(transaction);
+        assert_eq!(drops.get(), 1);
+        drop(table);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn retirement_scan_skips_regular_pending_reserved_and_checked_out_rows() {
+        let mut table = PendingSetFileNameTable::new();
+        let ordinary = table.reserve().unwrap();
+        let ordinary_id = table.park_reserved(ordinary, record(1, 2)).unwrap();
+        let empty = table.reserve().unwrap();
+        let retirement = table.reserve().unwrap();
+        let retirement_id = table.park_retirement(retirement, record(3, 4)).unwrap();
+        assert_eq!(table.next_retirement_from(0), Some((3, retirement_id)));
+        assert!(table.next_retirement_from(3).is_none());
+        assert!(table.next_retirement_from(usize::MAX).is_none());
+        let transaction = table.take_for_update(retirement_id).unwrap();
+        assert!(table.next_retirement_from(0).is_none());
+        assert!(table.get(ordinary_id).is_some());
+        assert!(table.restore_update(retirement_id, transaction));
+        assert_eq!(table.next_retirement_from(1), Some((3, retirement_id)));
+        assert!(table.cancel_reservation(empty));
+    }
+
+    #[test]
+    fn retirement_slot_reuse_clears_tag_and_cannot_revalidate_stale_identity() {
+        let mut table = PendingSetFileNameTable::new();
+        let first = table.reserve().unwrap();
+        let stale = table.park_retirement(first, record(1, 2)).unwrap();
+        let second = table.reserve().unwrap();
+        let live = table.park_retirement(second, record(3, 4)).unwrap();
+        let retired = table.take_for_update(stale).unwrap();
+        assert!(table.finish_update(stale));
+        drop(retired);
+        let replacement = table.reserve().unwrap();
+        assert_eq!(replacement.slot, first.slot);
+        let ordinary = table.park_reserved(replacement, record(5, 6)).unwrap();
+        assert_ne!(ordinary, stale);
+        assert_eq!(table.next_retirement_from(0), Some((2, live)));
+        assert!(table.get(stale).is_none());
+        assert!(table.take_for_update(stale).is_none());
+        assert!(!table.finish_update(stale));
+        let record = table.take_for_update(ordinary).unwrap();
+        assert!(table.restore_update(ordinary, record));
+        assert_eq!(table.next_retirement_from(0), Some((2, live)));
+        let record = table.take_for_update(live).unwrap();
+        assert!(table.finish_update(live));
+        drop(record);
+        assert!(table.next_retirement_from(0).is_none());
+        assert!(table.get(ordinary).is_some());
+    }
+
+    #[test]
+    fn completed_pending_transaction_can_restore_as_retirement_without_replacing_owner_or_id() {
+        let drops = Rc::new(Cell::new(0));
+        let mut transaction = record(1, 2)
+            .with_root_directory(0x80)
+            .with_source_owner(SourceOwner(drops.clone()));
+        assert!(transaction.advance_to_source_set());
+        let mut table = PendingSetFileNameTable::new();
+        let reservation = table.reserve().unwrap();
+        let id = table.park_reserved(reservation, transaction).unwrap();
+        assert!(table.next_retirement_from(0).is_none());
+        let capacity = table.capacity();
+        let transaction = table.take_for_update(id).unwrap();
+        assert!(table.restore_retirement(id, transaction));
+        assert_eq!(table.capacity(), capacity);
+        assert_eq!(table.next_retirement_from(0), Some((1, id)));
+        assert_eq!(drops.get(), 0);
+        let transaction = table.take_for_update(id).unwrap();
+        assert_eq!(transaction.phase(), PendingSetFileNamePhase::SourceSet);
+        assert_eq!(transaction.source_file_id, 1);
+        assert_eq!(transaction.target_file_id, 2);
+        assert_eq!(transaction.root_directory(), 0x80);
+        assert!(table.next_retirement_from(0).is_none());
+        assert!(table.restore_update(id, transaction));
+        assert_eq!(table.next_retirement_from(0), Some((1, id)));
+        let transaction = table.take_for_update(id).unwrap();
+        assert!(table.finish_update(id));
+        assert!(table.is_empty());
+        assert_eq!(drops.get(), 0);
+        drop(transaction);
+        assert_eq!(drops.get(), 1);
+        drop(table);
+        assert_eq!(drops.get(), 1);
     }
 }

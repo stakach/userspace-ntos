@@ -807,6 +807,35 @@ impl<P> IoManager<P> {
         Ok(self.add_file(file))
     }
 
+    /// Allocate relative to an authenticated, pointer-owned parent, including after CLEANUP.
+    /// The caller must retain its canonical parent reference until CREATE preparation acquires
+    /// the IRP's related-file reference. Allocation alone does not transfer that ownership.
+    pub fn allocate_owned_external_relative_file(
+        &mut self,
+        client: ClientId,
+        related_file: FileId,
+        desired_access: AccessMask,
+        share_access: ShareAccess,
+        create_options: CreateOptions,
+        file_name: UnicodeString,
+    ) -> Result<FileId, NtStatus> {
+        let parent = self.owned_file_metadata(client, related_file)?;
+        if self.file_reference_count(related_file) == 0 {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        let mut file = FileRecord::new(
+            ObjectId::NULL,
+            client,
+            parent.device_id,
+            desired_access,
+            share_access,
+            create_options,
+            file_name,
+        );
+        file.related_file = Some(related_file);
+        Ok(self.add_file(file))
+    }
+
     /// Return the mutable driver-owned context attached to a live canonical
     /// File. A null context is valid and remains distinct from File identity.
     pub fn external_file_context(

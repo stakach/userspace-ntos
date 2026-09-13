@@ -69,6 +69,13 @@ pub(crate) unsafe fn caller(
     matches_caller(caller, live).then_some(caller)
 }
 
+pub(crate) unsafe fn reserved_caller(
+    reservation: PendingFileIoReservation,
+) -> Option<ProviderLogicalCaller> {
+    let identity = reservation.identity();
+    (&*core::ptr::addr_of!(CALLERS)).get_reserved(identity.slot(), identity)
+}
+
 pub(crate) unsafe fn reset() -> bool {
     (&mut *core::ptr::addr_of_mut!(CALLERS)).reset()
 }

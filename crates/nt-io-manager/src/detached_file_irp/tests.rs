@@ -9,6 +9,7 @@ use core::cell::RefCell;
 use nt_types::{AccessMask, HandleValue, NtPath, UnicodeString};
 
 mod operations_tests;
+mod relative_root_tests;
 
 #[derive(Default)]
 struct Trace {
@@ -198,6 +199,7 @@ fn create(f: &Fixture, file: FileId) -> ExternalFileIrpRequest {
         initial_information: 0,
     }
 }
+
 fn returned(invocation: ExternalFileIrpInvocation) -> ExternalFileIrpReturn {
     invocation.returned(ExternalFileIrpOutcome::Returned {
         status: NtStatus::SUCCESS,
