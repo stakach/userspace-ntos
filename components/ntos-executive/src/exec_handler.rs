@@ -14,6 +14,9 @@ mod file_flush;
 #[path = "exec_file_capture.rs"]
 mod file_capture;
 
+#[path = "exec_file_query.rs"]
+mod file_query;
+
 #[path = "exec_file_set_information.rs"]
 mod file_set_information;
 
@@ -41088,6 +41091,18 @@ impl ExecNtHandler {
                 if !self.probe_user_output(iosb, 16) || !self.probe_user_output(output, length) {
                     return nt_syscall::STATUS_ACCESS_VIOLATION;
                 }
+                let capture = match self.capture_hosted_file_unless_local_with_access(
+                    args[0],
+                    |access| contract.access_granted(access),
+                ) {
+                    Ok(capture) => capture,
+                    Err(status) => return status,
+                };
+                if let Some(capture) = capture {
+                    return self.query_hosted_file_information(
+                        args[0], iosb, output, length, class, &capture,
+                    );
+                }
                 let io_metadata = match self.io_manager_file_query_metadata(args[0]) {
                     Ok(metadata) => metadata,
                     Err(status) => return status,
@@ -41141,195 +41156,7 @@ impl ExecNtHandler {
                     return nt_fs::STATUS_SUCCESS;
                 }
                 if class == 41 {
-                    const FILE_IO_COMPLETION_NOTIFICATION_INFORMATION_LEN: usize = 4;
-                    let route = match self.hosted_file_route_for(args[0]) {
-                        Some(route) => route,
-                        None => return nt_fs::STATUS_INVALID_HANDLE,
-                    };
-                    let file_id = route.file_id;
-                    let granted_access = match self.hosted_file_access_for(args[0]) {
-                        Some(access) => access,
-                        None => return nt_fs::STATUS_INVALID_HANDLE,
-                    };
-                    match self.prepare_hosted_file_io(route, args[0], granted_access) {
-                        Ok(true) => {}
-                        Ok(false) => return STATUS_PENDING,
-                        Err(status) => return status,
-                    }
-                    if self.file_completion.set_signaled(file_id, false).is_err() {
-                        self.release_file_reference(file_id);
-                        return nt_fs::STATUS_INVALID_HANDLE;
-                    }
-                    let flags = match self.file_completion.notification_modes(file_id) {
-                        Ok(flags) => flags,
-                        Err(status) => {
-                            let _ = self.signal_file_completion(file_id, status);
-                            self.release_file_reference(file_id);
-                            return status;
-                        }
-                    };
-                    let mut status = nt_fs::STATUS_SUCCESS;
-                    let mut information = FILE_IO_COMPLETION_NOTIFICATION_INFORMATION_LEN as u64;
-                    if !self.xas_try_write_buf(output, &flags.to_le_bytes()) {
-                        status = nt_syscall::STATUS_ACCESS_VIOLATION;
-                        information = 0;
-                    }
-                    let mut iosb_bytes = [0u8; 16];
-                    iosb_bytes[..4].copy_from_slice(&status.to_le_bytes());
-                    iosb_bytes[8..16].copy_from_slice(&information.to_le_bytes());
-                    if !self.xas_try_write_buf(iosb, &iosb_bytes) {
-                        status = nt_syscall::STATUS_ACCESS_VIOLATION;
-                    }
-                    let _ = self.signal_file_completion(file_id, status);
-                    self.release_file_reference(file_id);
-                    return status;
-                }
-                if let Some(route) = self.hosted_file_route_for(args[0]) {
-                    let mut routed_output = match try_zeroed_transfer_buffer(length) {
-                        Ok(output) => output,
-                        Err(status) => return status,
-                    };
-                    let output_capacity = routed_output.len();
-                    if class == nt_fs::FILE_ALL_INFORMATION {
-                        if let Err(status) = nt_fs::encode_file_all_io_manager_information(
-                            io_metadata,
-                            &mut routed_output,
-                        ) {
-                            return status;
-                        }
-                    }
-
-                    let file_id = route.file_id;
-                    let synchronous_file = match self.file_completion.is_synchronous(file_id) {
-                        Ok(synchronous) => synchronous,
-                        Err(status) => return status,
-                    };
-                    if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
-                        || !wait_reply_pool_has_free()
-                        || !self.reserve_pending_file_io_owner()
-                    {
-                        return nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
-                    }
-                    let granted_access = match self.hosted_file_access_for(args[0]) {
-                        Some(access) => access,
-                        None => return nt_fs::STATUS_INVALID_HANDLE,
-                    };
-                    match self.prepare_hosted_file_io(route, args[0], granted_access) {
-                        Ok(true) => {}
-                        Ok(false) => return STATUS_PENDING,
-                        Err(status) => return status,
-                    }
-                    if self.file_completion.set_signaled(file_id, false).is_err() {
-                        self.release_file_reference(file_id);
-                        return nt_fs::STATUS_INVALID_HANDLE;
-                    }
-
-                    let mut information = 0u64;
-                    let mut pending_irp_id = 0u64;
-                    let mut status = match self.dispatch_hosted_file_irp_for(
-                        route,
-                        major::IRP_MJ_QUERY_INFORMATION as u64,
-                        class as u64,
-                        &[],
-                        &mut routed_output,
-                    ) {
-                        Ok((driver_status, completed, irp_id)) => {
-                            information = completed;
-                            pending_irp_id = irp_id;
-                            driver_status as u32
-                        }
-                        Err(route_status) => route_status,
-                    };
-
-                    if status == STATUS_PENDING {
-                        if pending_irp_id == 0 {
-                            status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
-                            information = 0;
-                            if synchronous_file {
-                                let _ = self.signal_file_completion(file_id, status);
-                            }
-                            self.release_file_reference(file_id);
-                            let mut iosb_bytes = [0u8; 16];
-                            iosb_bytes[..4].copy_from_slice(&status.to_le_bytes());
-                            if !self.xas_try_write_buf(iosb, &iosb_bytes) {
-                                status = nt_syscall::STATUS_ACCESS_VIOLATION;
-                            }
-                        } else {
-                            self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                                route: PendingFileRoute::Hosted(file_id),
-                                irp_id: pending_irp_id,
-                                major: major::IRP_MJ_QUERY_INFORMATION,
-                                control_code: 0,
-                                operation: nt_io_manager::PendingFileIoOperation::Transfer,
-                                delivery_state: 0,
-                                pi: self.pi as u32,
-                                tid: self.current_tid,
-                                busy: None,
-                                badge: self.current_badge,
-                                consumer_abandoned: false,
-                                output_va: output,
-                                output_len: output_capacity as u32,
-                                output_offset: 0,
-                                iosb_va: iosb,
-                                apc_routine: 0,
-                                apc_context: 0,
-                                completion_port_suppressed: true,
-                                signal_file: synchronous_file,
-                                publish_iocp: false,
-                                event_obj_idx: u64::MAX,
-                                reply_cap: 0,
-                                reply_required: false,
-                                native_call_transport: self.current_native_call_transport,
-                                resume_ip: 0,
-                                resume_sp: 0,
-                                resume_flags: 0,
-                            });
-                            self.pending_file_io_wait = true;
-                        }
-                    } else {
-                        let copy_len = information
-                            .min(length as u64)
-                            .min(routed_output.len() as u64)
-                            as usize;
-                        if copy_len != 0
-                            && !self.xas_try_write_buf(output, &routed_output[..copy_len])
-                        {
-                            status = nt_syscall::STATUS_ACCESS_VIOLATION;
-                            information = 0;
-                        }
-                        let mut iosb_bytes = [0u8; 16];
-                        iosb_bytes[..4].copy_from_slice(&status.to_le_bytes());
-                        iosb_bytes[8..16].copy_from_slice(&information.to_le_bytes());
-                        if !self.xas_try_write_buf(iosb, &iosb_bytes) {
-                            status = nt_syscall::STATUS_ACCESS_VIOLATION;
-                        }
-                        if synchronous_file {
-                            let _ = self.signal_file_completion(file_id, status);
-                        }
-                        self.release_file_reference(file_id);
-                    }
-                    if NT_QUERY_INFORMATION_FILE_NPFS_TRACE_N.fetch_add(1, Ordering::Relaxed) < 32 {
-                        print_str(b"[nt-query-info-file-npfs] pi=");
-                        print_u64(self.pi as u64);
-                        print_str(b" handle=0x");
-                        print_hex(args[0] as u32);
-                        print_str(b" fid=0x");
-                        print_hex(route.file_id as u32);
-                        print_str(b" dev=");
-                        print_u64(route.device_id);
-                        print_str(b" class=");
-                        print_u64(class as u64);
-                        print_str(b" length=");
-                        print_u64(length as u64);
-                        print_str(b" transport=");
-                        print_u64(output_capacity as u64);
-                        print_str(b" status=0x");
-                        print_hex(status);
-                        print_str(b" info=");
-                        print_u64(information);
-                        print_str(b"\n");
-                    }
-                    return status;
+                    return nt_fs::STATUS_INVALID_HANDLE;
                 }
                 if let Some(status) = nt_fs::absent_optional_query_facility_status(class) {
                     // Validate that this is one of the local filesystem File objects before

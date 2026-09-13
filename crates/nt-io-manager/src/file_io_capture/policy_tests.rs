@@ -7,7 +7,8 @@ use crate::inline_file_retirement::{
     InlineFileRetirementOutcome as Outcome, InlineFileRetirementTable as InlineTable,
 };
 use crate::*;
-use alloc::boxed::Box;
+use alloc::{boxed::Box, rc::Rc, vec::Vec};
+use core::cell::RefCell;
 use nt_io_completion::{FileCompletionTable, FileIoAcquireResult, FileIoMode};
 use nt_status::NtStatus;
 use nt_types::{AccessMask, ClientId, HandleValue, NtPath};
@@ -29,15 +30,23 @@ impl Fixture {
     }
 
     fn with_access(mode: FileIoMode, pending: bool, access: AccessMask) -> Self {
-        let mut io = IoManager::new(MockObjectPort::new());
-        let client = io.register_client();
         let mut backend = MockDriverBackend::new();
         backend.set_force_pending(pending);
         backend.set_pending_completion(NtStatus::SUCCESS, 0);
+        Self::with_backend(mode, access, Box::new(backend))
+    }
+
+    fn with_backend(
+        mode: FileIoMode,
+        access: AccessMask,
+        backend: Box<dyn DriverDispatchBackend>,
+    ) -> Self {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let client = io.register_client();
         let driver = io
             .create_driver(
                 &NtPath::parse_str(r"\Driver\CapturePolicy").unwrap(),
-                Box::new(backend),
+                backend,
             )
             .unwrap();
         let path = NtPath::parse_str(r"\Device\CapturePolicy").unwrap();
@@ -570,6 +579,338 @@ fn asynchronous_buffered_set_copy_failure_survives_immediate_cleanup_without_an_
         f.policy.release_file(f.file.raw()).unwrap();
         f.retire(capture);
         f.io.pump();
+        f.finish_policy_cleanup();
+    }
+}
+
+struct QueryRecordingDriver {
+    lifecycle: MockDriverBackend,
+    calls: Rc<RefCell<Vec<IrpProjection>>>,
+}
+
+impl DriverDispatchBackend for QueryRecordingDriver {
+    fn dispatch_irp(
+        &mut self,
+        context: DispatchContext<'_>,
+        irp: &IrpProjection,
+    ) -> Result<DispatchOutcome, NtStatus> {
+        self.calls.borrow_mut().push(irp.clone());
+        if irp.major == nt_io_abi::major::IRP_MJ_QUERY_INFORMATION {
+            context.system_buffer.fill(0x5a);
+            return Ok(DispatchOutcome::Completed {
+                status: NtStatus::SUCCESS,
+                information: context.system_buffer.len() as u64,
+                file_context: None,
+            });
+        }
+        self.lifecycle.dispatch_irp(context, irp)
+    }
+
+    fn cancel_irp(&mut self, irp: IrpId) -> Result<(), NtStatus> {
+        self.lifecycle.cancel_irp(irp)
+    }
+
+    fn poll_completion(&mut self) -> Option<DriverCompletion> {
+        self.lifecycle.poll_completion()
+    }
+}
+
+#[test]
+fn owned_file_query_dispatches_captured_route_and_grant_before_close_during_copyout() {
+    use nt_io_abi::major;
+    let access = AccessMask::from_bits_retain(0x80);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let mut f = Fixture::with_backend(
+        FileIoMode::SynchronousNonAlertable,
+        access,
+        Box::new(QueryRecordingDriver {
+            lifecycle: MockDriverBackend::new(),
+            calls: calls.clone(),
+        }),
+    );
+    let driver = f.io.device(f.device).unwrap().driver_id;
+    let dispatch =
+        f.io.driver(driver)
+            .unwrap()
+            .dispatch
+            .get(major::IRP_MJ_CREATE);
+    f.io.driver_mut(driver)
+        .unwrap()
+        .dispatch
+        .set(major::IRP_MJ_QUERY_INFORMATION, dispatch);
+    let capture = f
+        .captures
+        .capture(&mut f.io, f.file, f.device, access.bits())
+        .unwrap();
+    assert_eq!(capture.granted_access(), access.bits());
+    assert!(query_information_contract(4)
+        .unwrap()
+        .access_granted(AccessMask::from_bits_retain(capture.granted_access())));
+    assert_eq!(
+        f.policy.acquire_file_io(f.file.raw(), 20),
+        Ok(FileIoAcquireResult::Acquired)
+    );
+    let (mut owners, identity) = reserve_inline(&f, 20);
+    f.policy.set_signaled(f.file.raw(), false).unwrap();
+    let parameters = IoParameters::QueryInformation(InformationParameters {
+        info_class: 4,
+        length: 40,
+    });
+    let mut output = [0; 40];
+    assert_eq!(
+        f.io.build_and_dispatch_external_to_device_with_stack_flags(
+            f.client,
+            capture.device_id(),
+            Some(capture.file_id()),
+            0,
+            20,
+            major::IRP_MJ_QUERY_INFORMATION,
+            parameters.clone(),
+            StackFlags::empty(),
+            0,
+            40,
+            &mut output,
+        ),
+        Ok(ExternalDispatchResult::Completed {
+            status: NtStatus::SUCCESS,
+            information: 40,
+            file_context: None
+        })
+    );
+    let observed = calls.borrow().last().unwrap().clone();
+    assert_eq!(observed.parameters, parameters);
+    assert_eq!(observed.file_id, Some(capture.file_id()));
+    assert_eq!(observed.device_id, capture.device_id());
+    assert_eq!(observed.requestor_tid, 20);
+    assert_eq!(output, [0x5a; 40]);
+    // A reentrant copyout can close the public handle after the real IRP completed.
+    assert!(
+        f.policy
+            .release_handle(f.file.raw())
+            .unwrap()
+            .cleanup_required
+    );
+    assert_eq!(
+        f.policy.begin_cleanup(f.file.raw()),
+        Ok(FileIoAcquireResult::Contended { alertable: false })
+    );
+    assert_eq!(f.io.file(f.file).unwrap().outstanding_irp_refs, 0);
+    assert!(f.io.pending_irps().is_empty());
+    assert!(f
+        .io
+        .owned_file_query_metadata(f.client, capture.file_id(), capture.device_id())
+        .is_ok());
+    f.policy.set_signaled(f.file.raw(), true).unwrap();
+    assert!(!f.policy.promote_cleanup_if_ready(f.file.raw()).unwrap());
+    retire_inline(&mut f, &mut owners, identity);
+    assert!(f.io.file(f.file).is_some());
+    f.retire(capture);
+    f.io.pump();
+    f.finish_policy_cleanup();
+    assert_eq!(
+        calls
+            .borrow()
+            .iter()
+            .map(|irp| irp.major)
+            .collect::<Vec<_>>(),
+        alloc::vec![
+            major::IRP_MJ_CREATE,
+            major::IRP_MJ_QUERY_INFORMATION,
+            major::IRP_MJ_CLEANUP,
+            major::IRP_MJ_CLOSE,
+        ]
+    );
+}
+
+#[test]
+fn owned_file_query_inline_metadata_keeps_body_and_busy_through_reentrant_copyout() {
+    for mode in [
+        FileIoMode::SynchronousAlertable,
+        FileIoMode::SynchronousNonAlertable,
+    ] {
+        let access = AccessMask::from_bits_retain(0x80);
+        let mut f = Fixture::with_access(mode, false, access);
+        let capture = f
+            .captures
+            .capture(&mut f.io, f.file, f.device, access.bits())
+            .unwrap();
+        let options = CreateOptions::WRITE_THROUGH | CreateOptions::NO_INTERMEDIATE_BUFFERING;
+        f.io.file_mut(f.file).unwrap().create_options = options;
+        f.io.device_mut(f.device).unwrap().alignment_requirement = 0x1ff;
+        assert_eq!(
+            f.policy.acquire_file_io(f.file.raw(), 20),
+            Ok(FileIoAcquireResult::Acquired)
+        );
+        let (mut owners, identity) = reserve_inline(&f, 20);
+        f.policy.set_signaled(f.file.raw(), false).unwrap();
+        let metadata =
+            f.io.owned_file_query_metadata(f.client, capture.file_id(), capture.device_id())
+                .unwrap();
+        assert_eq!(metadata.create_options, options);
+        assert_eq!(metadata.alignment_requirement, 0x1ff);
+        for class in [8, 16, 17] {
+            assert!(query_information_contract(class)
+                .unwrap()
+                .access_granted(AccessMask::from_bits_retain(capture.granted_access())));
+        }
+        let mut copied = [[0; 4]; 3];
+        let mut copyout = |bytes: &mut [[u8; 4]; 3]| {
+            assert!(
+                f.policy
+                    .release_handle(f.file.raw())
+                    .unwrap()
+                    .cleanup_required
+            );
+            assert_eq!(
+                f.policy.begin_cleanup(f.file.raw()),
+                Ok(FileIoAcquireResult::Contended { alertable: false })
+            );
+            let still_live =
+                f.io.owned_file_query_metadata(f.client, capture.file_id(), capture.device_id())
+                    .unwrap();
+            assert_eq!(still_live, metadata);
+            assert_eq!(f.policy.is_signaled(f.file.raw()), Ok(false));
+            let query = nt_fs::QueryMetadata {
+                access_flags: capture.granted_access(),
+                mode: nt_fs::file_mode_from_create_options(still_live.create_options.bits()),
+                alignment_requirement: still_live.alignment_requirement,
+                ..Default::default()
+            };
+            for (class, output) in [8, 16, 17].into_iter().zip(bytes) {
+                assert_eq!(nt_fs::encode_query_information(class, query, output), Ok(4));
+            }
+        };
+        copyout(&mut copied);
+        assert_eq!(copied[0], access.bits().to_le_bytes());
+        assert_eq!(
+            copied[1],
+            nt_fs::file_mode_from_create_options(options.bits()).to_le_bytes()
+        );
+        assert_eq!(copied[2], 0x1ffu32.to_le_bytes());
+        f.policy.set_signaled(f.file.raw(), true).unwrap();
+        assert!(!f.policy.promote_cleanup_if_ready(f.file.raw()).unwrap());
+        assert_eq!(f.io.file(f.file).unwrap().outstanding_irp_refs, 0);
+        assert!(f.io.pending_irps().is_empty());
+        retire_inline(&mut f, &mut owners, identity);
+        f.retire(capture);
+        f.io.pump();
+        f.finish_policy_cleanup();
+    }
+}
+
+#[test]
+fn owned_file_query_queued_adoption_retains_grant_but_reads_live_metadata() {
+    for mode in [
+        FileIoMode::SynchronousAlertable,
+        FileIoMode::SynchronousNonAlertable,
+    ] {
+        let access = AccessMask::from_bits_retain(0x80);
+        let mut f = Fixture::with_access(mode, false, access);
+        assert_eq!(
+            f.policy.acquire_file_io(f.file.raw(), 20),
+            Ok(FileIoAcquireResult::Acquired)
+        );
+        let capture = f
+            .captures
+            .capture(&mut f.io, f.file, f.device, access.bits())
+            .unwrap();
+        let before =
+            f.io.owned_file_query_metadata(f.client, f.file, f.device)
+                .unwrap();
+        let key = FileIoWaitKey::Hosted(f.file.raw());
+        let mut waiters = SynchronousFileWaitTable::new();
+        let reserved = waiters.reserve().unwrap();
+        assert_eq!(
+            f.policy.acquire_file_io(f.file.raw(), 21),
+            Ok(FileIoAcquireResult::Contended {
+                alertable: mode == FileIoMode::SynchronousAlertable
+            })
+        );
+        let mut waiter = SynchronousFileWaiter::waiting(
+            FileIoWaitRoute::Hosted {
+                file_id: capture.file_id().raw(),
+                device_id: capture.device_id().raw(),
+                fs_context: capture.fs_context(),
+            },
+            0x40,
+            capture.granted_access(),
+            71,
+            2,
+            21,
+            121,
+            mode,
+            true,
+            0,
+            0x1002,
+            0x2000,
+            0x202,
+        );
+        waiter.reply_cap = 221;
+        waiters.park_reserved(reserved, waiter).unwrap();
+        assert!(
+            f.policy
+                .release_handle(f.file.raw())
+                .unwrap()
+                .cleanup_required
+        );
+        assert_eq!(
+            f.policy.begin_cleanup(f.file.raw()),
+            Ok(FileIoAcquireResult::Contended { alertable: false })
+        );
+        f.retire(capture);
+        assert_eq!(f.io.file_reference_count(f.file), 0);
+        let options = CreateOptions::SEQUENTIAL_ONLY | CreateOptions::WRITE_THROUGH;
+        // Host-model metadata mutation, not a native FileModeInformation set operation.
+        f.io.file_mut(f.file).unwrap().create_options = options;
+        f.io.device_mut(f.device).unwrap().alignment_requirement = 0xfff;
+        f.policy.release_io(f.file.raw(), 20).unwrap();
+        f.policy.release_file(f.file.raw()).unwrap();
+        assert!(!f.policy.promote_cleanup_if_ready(f.file.raw()).unwrap());
+        let (slot, _) = waiters.oldest_waiting_for_file(key).unwrap();
+        f.policy.promote_io_waiter(f.file.raw(), 21).unwrap();
+        waiters.promote_exact(slot, key, 21).unwrap();
+        let retry = waiters.retry_identity(slot, key, 21).unwrap();
+        let mut attempt = waiters.begin_retry(retry).unwrap();
+        waiters
+            .record_retry(&mut attempt, SynchronousFileRetryOutcome::Acknowledged)
+            .unwrap();
+        assert!(waiters.finish_retry(retry, Ok(())).unwrap());
+        let mut ingress = waiters.begin_ingress(2, 21, 121, 71).unwrap().unwrap();
+        let mut adoption = waiters.begin_adoption(&mut ingress).unwrap();
+        let result = f.policy.adopt_io_grant(f.file.raw(), 21);
+        let owner = waiters
+            .record_adoption(&mut adoption, result)
+            .unwrap()
+            .unwrap();
+        let adopted = owner.waiter();
+        assert_eq!(adopted.granted_access, access.bits());
+        assert_eq!(adopted.route, waiter.route);
+        assert!(query_information_contract(18)
+            .unwrap()
+            .access_granted(AccessMask::from_bits_retain(adopted.granted_access)));
+        let FileIoWaitRoute::Hosted {
+            file_id, device_id, ..
+        } = adopted.route
+        else {
+            panic!("hosted query must retain its original route");
+        };
+        let (mut owners, identity) = reserve_inline(&f, 21);
+        f.policy.set_signaled(f.file.raw(), false).unwrap();
+        let live =
+            f.io.owned_file_query_metadata(f.client, FileId(file_id), DeviceId(device_id))
+                .unwrap();
+        assert_ne!(live, before);
+        assert_eq!(live.create_options, options);
+        assert_eq!(live.alignment_requirement, 0xfff);
+        assert_eq!(
+            f.io.file_reference_count(f.file),
+            0,
+            "adoption does not recapture a handle"
+        );
+        assert_eq!(f.io.file(f.file).unwrap().outstanding_irp_refs, 0);
+        f.policy.set_signaled(f.file.raw(), true).unwrap();
+        assert!(!f.policy.promote_cleanup_if_ready(f.file.raw()).unwrap());
+        retire_inline(&mut f, &mut owners, identity);
         f.finish_policy_cleanup();
     }
 }

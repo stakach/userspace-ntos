@@ -33693,34 +33693,71 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
       - [ ] Audit EA/quota transfer-mode handling against canonical device flags. The buffered
         helper covers buffered marshalling; NT direct I/O pins an MDL and neither-I/O leaves the
         caller buffer to the driver. Do not claim those mechanisms from buffered host fixtures.
-      - [ ] Apply the same owned capture to File query and set, and rename/open-parent
-        paths. Capture route and access together before their first relevant callout; do not pair
-        a pinned original File with a reused handle's grant. io_manager_file_query_metadata still
-        consults the current handle before retained routing; derive hosted metadata from the
-        capture instead. Rename must retain both its source File and RootDirectory target through
+      - [x] Extend owned capture to hosted File queries (2026-09-13; host/native-build verified
+        below).
+        Move hosted query handling into exec_file_query.rs and remove the old borrowed-route
+        dispatch block. Initial user probes still precede File authentication; capture validates
+        File type/access and retains the exact route before acquisition. Promoted hosted requests
+        bypass fresh local classification and retain the original access grant. Hosted queries
+        no longer enter io_manager_file_query_metadata or re-read access through a live handle.
+        Canonical owned_file_query_metadata checks client/File/device identity, preserves complete
+        create options and resolves live attached-device alignment after acquisition, accepting
+        captured bodies through CLEANUP but rejecting pre-create/entered-CLOSE states. This API
+        requires a retained capture or adopted Busy/reference owner, not an unowned raw File ID.
+        Inline Access/Mode/Alignment and notification-mode queries now share acquisition/event
+        setup and retain ownership through output/IOSB publication. Routed buffer allocation and
+        FileAll staging occur after acquisition/event clear; failure retires the reference without
+        a new IOSB result or re-signaling the event. Existing driver dispatch, pending IRP ownership
+        and deferred completion remain in use. File query admission failures return directly and
+        cannot be overwritten by an ordinary completion IOSB store.
+      - [x] Finish serialized owned File-query host/native-build validation and independent review.
+        All nine focused tests pass: six canonical metadata cases and three composed query cases
+        cover full option bits, live attached-device alignment, wrong client/route/state errors,
+        pointer lifetime through real CLEANUP/CLOSE, canonical QUERY_INFORMATION dispatch, inline
+        ABI encoding through reentrant copyout, completion signaling that does not release Busy,
+        and exact queued-grant adoption before reading updated canonical metadata. The metadata
+        mutation is host-model setup, not evidence of native FileModeInformation SET support.
+        Executive release build passes in 37.95s with the unchanged 294 warnings. Independent
+        native/reference review found no blocking integration defects. Evidence:
+        `.tmp/test-owned-file-query-contract-20260913.log` and
+        `.tmp/build-owned-file-query-executive-20260913.log`. All 3,617 broad host/doc tests pass
+        across 66 suites, with no failures or ignored cases:
+        `.tmp/test-owned-file-query-full-20260913.log`. Focused metadata/capture/query/policy
+        formatting and git diff --check pass. No native fault injection or VM run was made;
+        host driver fixtures and a native build do not prove provider IPC or desktop acceptance.
+      - [ ] Apply the same owned capture to File set and rename/open-parent paths. Capture route
+        and access together before their first relevant callout; do not pair a pinned original
+        File with a reused handle's grant. Rename must retain both its source File and
+        RootDirectory target through
         acquisition/dispatch; an unretained canonical target ID is insufficient. Promoted hosted
         set-information must also bypass fresh local classification before consulting a reused
         handle.
         Remove borrowed route/access helpers once only genuinely callout-free inspection remains.
-        Continue with File query, then File set/name-target ownership.
-        Hosted File query currently allocates its routed output before Busy acquisition; move
-        that allocation and FileAllInformation staging after acquisition/event setup so queued
-        or interrupted requests do not perform pre-dispatch work outside the owned boundary.
-        Capture-derived metadata must preserve canonical create-option bits (including write-
-        through, sequential and no-buffering) and alignment, not reconstruct mode from only the
-        synchronous/alertable policy. File Access/Mode/Alignment immediate replies currently skip
-        synchronous Busy acquisition; bring them under the same acquisition/retirement boundary
-        (NT5 qsinfo.c:302,603). Include File set classes 30/41 in the capture audit rather than
-        treating only IRP-producing branches as requests, as with the completed driver-path query.
+        Continue with File set/name-target ownership. Include File set classes 30/41 in the
+        capture audit rather than treating only IRP-producing branches as requests, as with the
+        completed driver-path query.
+      - [ ] Complete adjacent hosted File-query semantics beyond owned capture.
         Keep access immutable in the capture, but read mutable File mode/current position under
         admitted ownership: original create options are not current mode after FileModeInformation
-        SET (NT5 qsinfo.c:1337). Existing hosted metadata accessors require state.is_open(); do not
-        reinstate fresh-open validation after a capture survives CLEANUP. Synchronous FilePosition
+        SET (NT5 qsinfo.c:1337). The new owned accessor preserves complete create options but does
+        not implement separate mutable NT mode state. Legacy metadata accessors still require
+        state.is_open(); keep migrating their remaining callers to real ownership instead of
+        reintroducing fresh-open validation after capture. Synchronous FilePosition
         queries use canonical CurrentByteOffset before event clear (qsinfo.c:319), whereas inline
         Access/Mode/Alignment use normal event/completion semantics (qsinfo.c:603). Track missing
         canonical position state rather than supplying a fabricated offset. FileAllInformation
         also initializes the real IRP's IoStatus.Information to 12 for manager-owned fields
         (qsinfo.c:688); preserving seeded output bytes alone does not provide that driver contract.
+        Native transport review (2026-09-13) also found that run_irp only pulls initial output
+        for METHOD_IN_DIRECT; ordinary QUERY_INFORMATION provider storage starts zeroed, so
+        executive-side FileAll fields do not yet reach the real driver's SystemBuffer. Carry
+        initial query output explicitly without overwriting buffered input for other operations.
+        For Information, extend ExternalFileIrpRequest and seed the canonical IrpRecord before
+        projection; IrpProjection already carries this state. Preserve the pointer-free seed
+        through hosted_irp_dispatch_request/IrpDispatchRequest and WdmIrpInit/write_wdm_irp.
+        Update ABI version 12's 248-byte wire layout and both Driver Host endpoints together.
+        Keep PnP Information-pointer relocation separate from scalar byte counts; no cross-domain
+        raw pointers. Require native provider-buffer/IRP readback, not only detached host fixtures.
         Local disk/overlay File lifetime capture across probes remains a separate follow-on; the
         hosted reference adapter does not claim to protect those local File objects. Local
         lock/unlock still resolve their unretained route after user probes; do not move that

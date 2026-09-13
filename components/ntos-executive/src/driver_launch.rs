@@ -58519,6 +58519,20 @@ pub(crate) fn hosted_file_exists(file_id: u64) -> bool {
     io_manager_mut().file(FileId(file_id)).is_some()
 }
 
+/// The caller retains an authenticated File capture or an adopted Busy/reference grant.
+pub(crate) fn owned_hosted_file_query_metadata(
+    file_id: u64,
+    device_id: u64,
+) -> Result<nt_io_manager::OwnedFileQueryMetadata, u32> {
+    io_manager_mut()
+        .owned_file_query_metadata(
+            ClientId(IO_MANAGER_COMPONENT_ID),
+            FileId(file_id),
+            nt_io_manager::DeviceId(device_id),
+        )
+        .map_err(|status| status.raw() as u32)
+}
+
 pub(crate) fn hosted_file_create_options(file_id: u64) -> Option<CreateOptions> {
     io_manager_mut()
         .file(FileId(file_id))

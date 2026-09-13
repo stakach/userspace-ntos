@@ -54,6 +54,7 @@ mod local_set_information;
 mod mock_driver;
 mod object_port;
 mod open;
+mod owned_file_query_metadata;
 mod pending_io;
 mod pending_set_file_name;
 mod pipe;
@@ -68,6 +69,7 @@ mod wdm_x64;
 
 pub use banked_transfer::{BankedTransferCursor, BankedTransferError};
 pub use bounded_file_read::{BoundedFileReadCompletion, BoundedFileReadPlan};
+pub use owned_file_query_metadata::OwnedFileQueryMetadata;
 pub use buffered_set_information::{
     capture_buffered_set_information, BufferedSetInformationError, BufferedSetInformationKind,
 };

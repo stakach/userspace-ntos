@@ -15,12 +15,21 @@ impl ExecNtHandler {
         &self,
         handle: u64,
     ) -> Result<Option<HostedFileCapture>, u32> {
+        self.capture_hosted_file_unless_local_with_access(handle, |_| true)
+    }
+
+    pub(super) fn capture_hosted_file_unless_local_with_access(
+        &self,
+        handle: u64,
+        access_granted: impl Fn(nt_types::AccessMask) -> bool,
+    ) -> Result<Option<HostedFileCapture>, u32> {
         if self.active_synchronous_file_retry.is_none()
             && self.local_file_object_for_handle(handle)?.is_some()
         {
             return Ok(None);
         }
-        self.capture_hosted_file(handle).map(Some)
+        self.capture_hosted_file_with_access(handle, access_granted)
+            .map(Some)
     }
 
     /// Read/write dispatch and pending publication share the original access and I/O mode.
@@ -53,7 +62,7 @@ impl ExecNtHandler {
     pub(super) fn capture_hosted_file_with_access(
         &self,
         handle: u64,
-        access_granted: fn(nt_types::AccessMask) -> bool,
+        access_granted: impl Fn(nt_types::AccessMask) -> bool,
     ) -> Result<HostedFileCapture, u32> {
         if self.active_synchronous_file_retry.is_some() {
             let retry = self
