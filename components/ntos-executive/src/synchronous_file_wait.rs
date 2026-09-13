@@ -96,26 +96,3 @@ pub(super) unsafe fn settle_synchronous_file_wake(
     }
     try_synchronous_file_wake_next(nt_handler, key).map(|_| ())
 }
-
-unsafe fn synchronous_file_wake_next(nt_handler: &mut ExecNtHandler, key: FileIoWaitKey) -> bool {
-    try_synchronous_file_wake_next(nt_handler, key)
-        .expect("synchronous File wake lost its policy owner")
-}
-
-/// Existing terminal/current-syscall ownership is still hosted-only. Local admission must not
-/// activate until retained local completion carries its domain through checked Busy retirement.
-pub(crate) unsafe fn synchronous_file_release_and_wake(
-    nt_handler: &mut ExecNtHandler,
-    file_id: u64,
-    owner_tid: u64,
-) -> bool {
-    let release = nt_handler
-        .file_completion
-        .release_io(file_id, owner_tid)
-        .expect("synchronous File lock released by a stale owner");
-    let woke = synchronous_file_wake_next(nt_handler, FileIoWaitKey::Hosted(file_id));
-    if release.waiters != 0 {
-        assert!(woke, "synchronous File waiter count has no FIFO owner");
-    }
-    woke
-}

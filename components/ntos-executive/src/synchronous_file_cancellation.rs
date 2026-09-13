@@ -153,17 +153,8 @@ pub(crate) unsafe fn drive(
                         let release = attempt
                             .reference_release()
                             .expect("File cancellation followup lost its reference receipt");
-                        // Ordinary reference release cannot initiate CLEANUP. close_required describes
-                        // policy-row retirement; it does not authorize a second driver CLOSE.
-                        if release.cleanup_required {
-                            Err(nt_fs::STATUS_INVALID_PARAMETER)
-                        } else if let Some(port_id) = release.port_id {
-                            nt_handler
-                                .try_release_io_completion_reference(port_id)
-                                .map(|()| Receipt::ReferenceFollowup)
-                        } else {
-                            Ok(Receipt::ReferenceFollowup)
-                        }
+                        crate::file_reference_retirement::followup(nt_handler, release)
+                            .map(|()| Receipt::ReferenceFollowup)
                     }
                     Effect::RevokeReply => revoke_reply(waiter.reply_cap),
                     Effect::RetireReplyCap => retire_reply_cap(waiter.reply_cap),

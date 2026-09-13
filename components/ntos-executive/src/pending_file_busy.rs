@@ -29,7 +29,7 @@ fn report_failure(stage: &[u8], owner: FileIoBusyOwner, status: u32) {
 }
 
 /// This transition neither invokes IPC nor releases the operation's independent File reference.
-unsafe fn release_policy(
+pub(super) unsafe fn release_policy(
     nt_handler: &mut ExecNtHandler,
     owner: FileIoBusyOwner,
 ) -> Result<u32, u32> {

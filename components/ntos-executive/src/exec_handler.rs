@@ -4145,7 +4145,7 @@ impl ExecNtHandler {
         write_field!(current_user_memory, SyscallUserMemory::CurrentProcess);
         write_field!(current_server_client_pid, 0);
         write_field!(active_synchronous_file_retry, None);
-        write_field!(current_synchronous_file_lock, 0);
+        write_field!(current_synchronous_file, None);
         write_field!(current_apc_handoff, None);
         write_field!(context_continue_redirected, false);
         write_field!(post_action, ExecPostAction::None);
@@ -13708,7 +13708,10 @@ impl ExecNtHandler {
     pub(crate) fn release_file_reference(&mut self, file_id: u64) {
         // A synchronous operation's reference protects the FILE_OBJECT while Busy is held. Inline
         // paths request their normal release here, but the service tail performs it after unlocking.
-        if self.current_synchronous_file_lock == file_id {
+        if self.current_synchronous_file.is_some_and(|identity| {
+            crate::service_sec_image::inline_file_retirement::active_owner(identity).key
+                == nt_io_manager::FileIoWaitKey::Hosted(file_id)
+        }) {
             return;
         }
         if let Ok(release) = self.file_completion.release_file(file_id) {
@@ -29681,6 +29684,16 @@ impl ExecNtHandler {
             return Ok(true);
         }
 
+        assert!(self.current_synchronous_file.is_none(),
+            "one syscall acquired more than one synchronous File");
+        let admission = crate::service_sec_image::inline_file_retirement::reserve(
+            nt_io_manager::FileIoBusyOwner {
+                key: nt_io_manager::FileIoWaitKey::Hosted(route.file_id),
+                tid: self.current_tid,
+                mode,
+            },
+        )?;
+
         if retry.is_some() {
             let mut ingress = self.active_synchronous_file_retry.take()
                 .expect("promoted File acquisition lost its ingress claim");
@@ -29710,8 +29723,7 @@ impl ExecNtHandler {
                 // The policy transition and transfer are memory-only. No callback can request
                 // cancellation between grant adoption and publication of current-syscall Busy.
                 assert!(!owner.cancellation_requested());
-                assert_eq!(self.current_synchronous_file_lock, 0);
-                self.current_synchronous_file_lock = route.file_id;
+                self.current_synchronous_file = Some(admission.activate());
                 return Ok(true);
             }
             crate::service_sec_image::synchronous_file_cancellation::drive(self, identity);
@@ -29754,11 +29766,7 @@ impl ExecNtHandler {
             Ok(nt_io_completion::FileIoAcquireResult::Acquired) => {
                 assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
                     .cancel_reservation(reservation));
-                assert_eq!(
-                    self.current_synchronous_file_lock, 0,
-                    "one syscall acquired more than one synchronous File"
-                );
-                self.current_synchronous_file_lock = route.file_id;
+                self.current_synchronous_file = Some(admission.activate());
                 Ok(true)
             }
             Ok(nt_io_completion::FileIoAcquireResult::Contended { alertable }) => {

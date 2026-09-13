@@ -33012,14 +33012,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
       acquisition can precede a job-termination early exit before the normal service-tail
       transfer/retirement. Retain the accepted operation before that exit; do not treat it as a
       still-promoted grant or release Busy before its accepted I/O has finished.
-    - [ ] Replace the inline terminal Busy/reference retirement's existing fail-stop adapter with
+    - [x] Replace the inline terminal Busy/reference retirement's existing fail-stop adapter with
       retained effect receipts. Inline operations may already have ACKed their real IRP; do not
       invent a pending IRP to represent this separate retirement obligation.
     - [ ] Retain parked APC staging, Reply and capability retirement independently before routing
       APC interruption through the cancellation contract. Remove the replaced adapters only when
       every producer transfers ownership through the retained path; no ignored-error fallback.
-      Acquisition-waiter interruption is implemented below; ordinary object-wait and general
-      pending-IRP APC consumers remain separate open cutovers.
+      Acquisition-waiter, object-wait, pending-IRP and current-thread ownership cutovers are
+      implemented below. Keep native failure-injection acceptance and remaining waiter-transport
+      APC coverage separate; these completed contracts are not proof that every NT wait is covered.
 
     Native acquisition/ingress cutover (2026-09-11, complete; runtime acceptance open):
     - [x] Use exact pre-effect reservations and atomic hosted reference/Busy admission. Capture
@@ -33493,10 +33494,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     after a prior entered Send delayed remote termination.
 
     This checkpoint covers dispatcher-object waits, not the distinct delay/keyed/LPC/IOCP waiter
-    transports. Inline terminal Busy/reference failure retention, per-mode Alerted/UserApcPending
-    behavior and native APC fault injection remain open. No new VM run or microkernel change occurred;
+    transports. Per-mode Alerted/UserApcPending behavior and native APC fault injection remain open.
+    No new VM run or microkernel change occurred;
     the last measured 27 strict missing win32k imports and genuine desktop acceptance remain open.
-    Next, close inline terminal Busy/reference failure retention before extending NT alert state.
+    Inline terminal Busy/reference failure retention is addressed by the following checkpoint.
+
+    Inline terminal synchronous File retirement (2026-09-13, host/build verified):
+    - [x] Reserve an independent exact Busy/reference owner before both fresh acquisition and
+      promoted-grant adoption. Replace the current-call scalar File ID with that typed identity;
+      refused/contended admission cancels only its still-empty pre-effect reservation.
+    - [x] Transfer the active owner only after publishing the real pending IRP. For already-terminal
+      inline work, start separate Busy-release, FIFO-wake, reference-release and reference-followup
+      effects before service post-actions. Do not create an IRP or retain the caller's Reply to
+      represent retirement; the obligation can outlive caller teardown and final File-row removal.
+    - [x] Remove the replaced release-and-wake fail-stop adapter. Share checked policy release with
+      pending IRPs and checked File-reference followups with object waits and File cancellation.
+      Drive retained failures from bounded common/finalizer and rejected-ingress service passes.
+    - [x] Complete independent native review, ten new core tests, seven composed policy tests and
+      two allocation-refusal tests. Reserve failure leaves no owner or acquisition; after successful
+      reserve, activation, all retirement effects and final removal allocate no storage even with
+      allocation forcibly disabled. Synchronous IOCP association is rejected by real policy;
+      caller-exit/final-reference tests preserve that rule rather than creating an invalid binding.
+    - [x] Finish serialized verification: all 3,559 broad host/doc tests passed, with no failures or
+      ignored cases. The executive release build passed in 36.70s with the unchanged 294 warnings.
+      Evidence: `.tmp/test-inline-file-retirement-contract-20260913.log`,
+      `.tmp/test-inline-file-retirement-composed-20260913.log`,
+      `.tmp/test-inline-file-retirement-allocation-20260913.log`,
+      `.tmp/test-inline-file-retirement-full-20260913.log`, and
+      `.tmp/build-inline-file-retirement-executive-20260913.log`. Independent reviews covered
+      both acquisition producers, publication-before-transfer, reference suppression and Wake
+      reentry; the deeper pre-existing lifetime/cleanup gaps are tracked separately below.
+    - [ ] Exercise native failure injection and fresh desktop acceptance; host fixtures are not
+      proof that kernel IPC, driver callouts or the desktop actually executed successfully.
+
+    Review adjustments and next work:
+    - [ ] Protect fresh handle capture through acquisition with an independent File reference.
+      hosted_file_route_for currently copies the handle/driver route without retaining a body
+      reference before user-memory callouts, including the retry-instruction copyin. Concurrent
+      final-handle close can begin CLEANUP before acquire_file_io. Generation-packed hosted File
+      IDs prevent ordinary slot reuse from aliasing a replacement; the immediate gap is lifetime
+      protection, not a need to infer identity from numeric handles. A retirement storage
+      reservation intentionally does not claim to be that missing File reference.
+    - [ ] Retain deeper canonical driver-cleanup lifecycle effects and their failures. The checked
+      FIFO Wake hands work to start_file_cleanup; existing lifecycle-start/release fail-stop paths
+      there are not removed by the inline Busy adapter cutover. Audit standalone asynchronous
+      File-reference release failures separately from this synchronous Busy/reference pair.
+    Resolve these reference/lifecycle ownership boundaries before expanding per-mode NT alert
+    state. The 27 last-measured strict win32k imports and genuine desktop acceptance remain open.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

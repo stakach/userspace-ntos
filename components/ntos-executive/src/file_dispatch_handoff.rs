@@ -39,7 +39,7 @@ pub(super) unsafe fn before_post_action(
     // unrelated staged File operation, even when the context application is later refused.
     if matches!(action, ExecPostAction::ContinueCurrentThread { .. }) {
         assert!(nt_handler.pending_file_io_transfer.is_none());
-        assert_eq!(nt_handler.current_synchronous_file_lock, 0);
+        assert!(nt_handler.current_synchronous_file.is_none());
     }
     let terminating = matches!(
         action,
@@ -51,21 +51,18 @@ pub(super) unsafe fn before_post_action(
             | ExecPostAction::CriticalTermination { .. }
     );
     let published = if let Some(mut pending) = nt_handler.pending_file_io_transfer {
-        let file_id = nt_handler.current_synchronous_file_lock;
-        if file_id != 0 {
-            assert_eq!(pending.route.hosted_file_id(), Some(file_id));
-            assert_eq!(pending.tid, nt_handler.current_tid);
+        if let Some(identity) = nt_handler.current_synchronous_file {
+            let owner = inline_file_retirement::active_owner(identity);
+            assert_eq!(
+                pending
+                    .route
+                    .hosted_file_id()
+                    .map(nt_io_manager::FileIoWaitKey::Hosted),
+                Some(owner.key)
+            );
+            assert_eq!(pending.tid, owner.tid);
             assert!(pending.busy.is_none());
-            pending.busy = Some(nt_io_manager::PendingFileBusy::new(
-                nt_io_manager::FileIoBusyOwner {
-                    key: nt_io_manager::FileIoWaitKey::Hosted(file_id),
-                    tid: pending.tid,
-                    mode: nt_handler
-                        .file_completion
-                        .io_mode(file_id)
-                        .expect("accepted File handoff lost its captured mode"),
-                },
-            ));
+            pending.busy = Some(nt_io_manager::PendingFileBusy::new(owner));
         }
         let reservation = nt_handler
             .pending_file_io_reservation
@@ -85,7 +82,9 @@ pub(super) unsafe fn before_post_action(
         );
         nt_handler.pending_file_io_transfer = None;
         nt_handler.pending_file_io_reservation = None;
-        nt_handler.current_synchronous_file_lock = 0;
+        if let Some(identity) = nt_handler.current_synchronous_file.take() {
+            inline_file_retirement::transfer_to_pending(identity);
+        }
         if wait_for_completion {
             // Publish Waiting before any reentrant completion can make this thread Ready.
             thread_wait_state_park_badge_waiting(nt_handler, pending.badge);
@@ -108,12 +107,11 @@ pub(super) unsafe fn before_post_action(
         None
     };
 
-    if nt_handler.current_synchronous_file_lock != 0 {
+    if let Some(identity) = nt_handler.current_synchronous_file.take() {
         // No accepted pending IRP exists: inline completion (including dispatch refusal) has
         // already settled the operation. Retire its existing Busy/reference before any exit.
-        let file_id = core::mem::replace(&mut nt_handler.current_synchronous_file_lock, 0);
-        synchronous_file_release_and_wake(nt_handler, file_id, nt_handler.current_tid);
-        nt_handler.release_file_reference(file_id);
+        inline_file_retirement::retire(identity);
+        inline_file_retirement::redrive(nt_handler);
     }
     if let Some(owner) = published.as_ref().filter(|_| terminating) {
         // The current main Reply was never transferred. Post-action teardown deletes it; the

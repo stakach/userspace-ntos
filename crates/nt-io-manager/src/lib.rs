@@ -45,6 +45,7 @@ mod file_reference;
 mod file_information;
 mod hosted_domain;
 mod hosted_device_pointer;
+pub mod inline_file_retirement;
 mod irp;
 mod lock_control;
 mod local_set_information;

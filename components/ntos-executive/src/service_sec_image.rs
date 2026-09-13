@@ -22,7 +22,8 @@ mod pending_file_busy;
 mod pending_file_delivery;
 #[path = "file_dispatch_handoff.rs"]
 mod file_dispatch_handoff;
-pub(crate) use synchronous_file_wait::synchronous_file_release_and_wake;
+#[path = "inline_file_retirement.rs"]
+pub(crate) mod inline_file_retirement;
 
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -3396,6 +3397,7 @@ pub(crate) fn service_dll_pe_store_stats() -> DllPeStoreStats {
 /// This boundary also progresses retained wait effects on timer-only activity, when no new user
 /// syscall can arrive to drive a failed context write or capability retirement.
 fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
+    unsafe { inline_file_retirement::redrive(nt_handler) };
     unsafe { crate::object_wait_apc::redrive(nt_handler) };
     unsafe { crate::object_wait_reply::redrive(nt_handler) };
     unsafe { crate::pending_file_apc::redrive(nt_handler) };
@@ -8428,6 +8430,7 @@ pub(crate) unsafe fn service_sec_image(
             crate::current_apc::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
             crate::object_wait_reply::redrive(&mut nt_handler);
             crate::object_wait_reply::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
+            inline_file_retirement::redrive(&mut nt_handler);
         }
         let ingress = if badge == DELAY_TIMER_BADGE || hosted_irq_lines_from_badge(badge) != 0 {
             None
@@ -10840,6 +10843,7 @@ pub(crate) unsafe fn service_sec_image(
                 crate::object_wait_reply::redrive(&mut nt_handler);
                 crate::pending_file_apc::redrive(&mut nt_handler);
                 crate::current_apc::redrive(&mut nt_handler);
+                inline_file_retirement::redrive(&mut nt_handler);
                 let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
                 badge = nb;
@@ -11278,7 +11282,7 @@ pub(crate) unsafe fn service_sec_image(
             nt_handler.current_user_memory = SyscallUserMemory::CurrentProcess;
             nt_handler.current_server_client_pid =
                 nt_handler.hosted_thread_lpc_client_process(badge);
-            assert_eq!(nt_handler.current_synchronous_file_lock, 0,
+            assert!(nt_handler.current_synchronous_file.is_none(),
                 "previous syscall retained acquired File Busy");
             assert!(nt_handler.active_synchronous_file_retry.is_none(),
                 "previous syscall retained an unconsumed File ingress claim");

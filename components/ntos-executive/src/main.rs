@@ -48,6 +48,7 @@ mod object_wait;
 use object_wait::*;
 mod object_wait_apc;
 mod object_wait_reply;
+mod file_reference_retirement;
 mod hosted_termination;
 mod parked_reply;
 mod pending_file_caller;
@@ -23256,8 +23257,8 @@ struct ExecNtHandler {
     current_server_client_pid: u32,
     /// Promoted acquisition whose retained route replaces process-handle lookup on retry.
     active_synchronous_file_retry: Option<nt_io_manager::SynchronousFileIngress>,
-    /// File lock acquired by this call; inline completion releases it at the dispatch boundary.
-    current_synchronous_file_lock: u64,
+    /// Exact pre-reserved Busy/reference owner, transferred or retired at the dispatch boundary.
+    current_synchronous_file: Option<nt_io_manager::inline_file_retirement::InlineFileRetirementIdentity>,
     current_apc_handoff: Option<nt_user_host::current_apc::CurrentApcIdentity>,
     context_continue_redirected: bool,
     post_action: ExecPostAction,
