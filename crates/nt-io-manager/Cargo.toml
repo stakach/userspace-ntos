@@ -19,13 +19,13 @@ nt-status = { workspace = true }
 nt-types = { workspace = true }
 nt-io-abi = { workspace = true }
 nt-io-completion = { workspace = true }
+nt-fs = { workspace = true }
 nt-pnp-abi = { workspace = true }
 nt-object-manager = { workspace = true, optional = true }
 bitflags = { workspace = true }
 
 [dev-dependencies]
 nt-address-space = { workspace = true }
-nt-fs = { workspace = true }
 nt-memory-manager = { workspace = true }
 nt-process = { workspace = true }
 nt-thread-start = { workspace = true }

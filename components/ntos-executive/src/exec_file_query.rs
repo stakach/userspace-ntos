@@ -3,22 +3,6 @@
 use super::*;
 
 impl ExecNtHandler {
-    unsafe fn owned_hosted_query_metadata(
-        &self,
-        capture: &file_capture::HostedFileCapture,
-    ) -> Result<nt_fs::QueryMetadata, u32> {
-        let metadata = driver_launch::owned_hosted_file_query_metadata(
-            capture.route.file_id,
-            capture.route.device_id,
-        )?;
-        Ok(nt_fs::QueryMetadata {
-            access_flags: capture.granted_access,
-            mode: nt_fs::file_mode_from_create_options(metadata.create_options.bits()),
-            alignment_requirement: metadata.alignment_requirement,
-            ..nt_fs::QueryMetadata::default()
-        })
-    }
-
     pub(super) unsafe fn query_hosted_file_information(
         &mut self,
         handle: u64,
@@ -68,10 +52,13 @@ impl ExecNtHandler {
                         4
                     })
             } else {
-                self.owned_hosted_query_metadata(capture)
-                    .and_then(|metadata| {
-                        nt_fs::encode_query_information(class, metadata, &mut encoded)
-                    })
+                driver_launch::encode_owned_hosted_file_query_information(
+                    file_id,
+                    route.device_id,
+                    capture.granted_access,
+                    class,
+                    &mut encoded,
+                )
             };
             let required = match result {
                 Ok(required) => required,
@@ -105,11 +92,13 @@ impl ExecNtHandler {
         };
         let output_capacity = routed_output.len();
         let initial_information = if class == nt_fs::FILE_ALL_INFORMATION {
-            let result = self
-                .owned_hosted_query_metadata(capture)
-                .and_then(|metadata| {
-                    nt_fs::encode_file_all_io_manager_information(metadata, &mut routed_output)
-                });
+            let result = driver_launch::encode_owned_hosted_file_query_information(
+                file_id,
+                route.device_id,
+                capture.granted_access,
+                class,
+                &mut routed_output,
+            );
             match result {
                 Ok(information) => information as u64,
                 Err(status) => {

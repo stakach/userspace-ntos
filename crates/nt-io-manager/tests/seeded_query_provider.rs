@@ -6,6 +6,7 @@ use nt_io_abi::{initial_output_required, major, IrpDispatchRequest, IO_ABI_VERSI
 use nt_io_manager::detached_file_irp::{
     ExternalFileIrpBuffers, ExternalFileIrpOutcome, ExternalFileIrpRequest, ExternalFileIrpResult,
 };
+use nt_io_manager::file_io_capture::FileIoCaptureTable;
 use nt_io_manager::{
     write_wdm_irp, CreateOptions, DeviceCharacteristics, DeviceFlags, DeviceType, DispatchContext,
     DispatchOutcome, DispatchTarget, DriverCompletion, DriverDispatchBackend, DriverPeerBackend,
@@ -148,31 +149,39 @@ fn file_all_seed_reaches_peer_and_wdm_before_driver_completion() {
             0,
         )
         .unwrap();
+    io.device_mut(device).unwrap().alignment_requirement = ALIGNMENT;
     let handle = io
         .open(
             client,
             &path,
-            AccessMask::GENERIC_READ,
+            AccessMask::from_bits_retain(ACCESS),
             ShareAccess::empty(),
-            CreateOptions::SYNCHRONOUS_IO_NONALERT,
+            CreateOptions::WRITE_THROUGH | CreateOptions::SYNCHRONOUS_IO_NONALERT,
             0,
         )
         .unwrap();
     let (file, _, _) = io
-        .reference_open_file_details(client, handle, AccessMask::empty())
+        .reference_open_file_details(client, handle, AccessMask::from_bits_retain(ACCESS))
         .unwrap();
+    let mut captures = FileIoCaptureTable::new();
+    let mut capture = captures.capture(&mut io, file, device, ACCESS).unwrap();
+    // The provider query owns a pointer, not a live handle; CLEANUP cannot consume it.
+    io.close(client, handle).unwrap();
+    io.pump();
+    assert_eq!(io.file_reference_count(file), 1);
+    assert!(!io.file(file).unwrap().close_dispatched);
 
     let mut output = vec![0x5a; OUTPUT_LENGTH];
-    let initial_information = nt_fs::encode_file_all_io_manager_information(
-        nt_fs::QueryMetadata {
-            access_flags: ACCESS,
-            mode: MODE,
-            alignment_requirement: ALIGNMENT,
-            ..Default::default()
-        },
-        &mut output,
-    )
-    .unwrap();
+    let initial_information = io
+        .encode_owned_file_query_information(
+            client,
+            capture.file_id(),
+            capture.device_id(),
+            capture.granted_access(),
+            nt_fs::FILE_ALL_INFORMATION,
+            &mut output,
+        )
+        .unwrap();
     assert_eq!(initial_information, 12);
     let prepared = io
         .prepare_external_file_irp_owned(
@@ -247,7 +256,10 @@ fn file_all_seed_reaches_peer_and_wdm_before_driver_completion() {
     assert_eq!(output.output()[OUTPUT_LENGTH - 1], 0x5a);
     assert_eq!(io.irp_count(), 0);
     assert_eq!(io.file(file).unwrap().outstanding_irp_refs, 0);
-    io.close(client, handle).unwrap();
+    captures.retire(&mut capture).unwrap();
+    captures
+        .release_retired(&mut io, capture.identity())
+        .unwrap();
     io.pump();
     assert!(io.file(file).is_none());
 }

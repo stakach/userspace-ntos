@@ -13,12 +13,6 @@ pub struct OwnedFileMetadata {
     pub opened_case_sensitive: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OwnedFileQueryMetadata {
-    pub create_options: CreateOptions,
-    pub alignment_requirement: u32,
-}
-
 impl<P> IoManager<P> {
     /// Read an already-owned File body without resolving device attachment topology.
     /// The caller holds a canonical reference, such as a capture or adopted Busy owner.
@@ -32,19 +26,46 @@ impl<P> IoManager<P> {
 
     /// The caller must hold a canonical capture reference or an adopted File Busy/reference
     /// owner. This reads the owned body, not a fresh handle, so CLEANUP does not invalidate it.
-    /// Metadata remains live: alignment follows current attachment topology and create options
-    /// are read from the canonical File rather than snapshotted into the capture token.
-    pub fn owned_file_query_metadata(
+    /// Access comes from the retained handle grant; mode reads the live File body. Only
+    /// Alignment and All queries resolve attachment topology. All seeds the I/O manager fields
+    /// for a subsequent provider dispatch; its byte count is not a contiguous transfer extent.
+    pub fn encode_owned_file_query_information(
         &self,
         client: ClientId,
         file: FileId,
         expected_device: DeviceId,
-    ) -> Result<OwnedFileQueryMetadata, NtStatus> {
+        granted_access: u32,
+        information_class: u32,
+        output: &mut [u8],
+    ) -> Result<usize, NtStatus> {
+        if !matches!(
+            information_class,
+            nt_fs::FILE_ACCESS_INFORMATION
+                | nt_fs::FILE_MODE_INFORMATION
+                | nt_fs::FILE_ALIGNMENT_INFORMATION
+                | nt_fs::FILE_ALL_INFORMATION
+        ) {
+            return Err(NtStatus(nt_fs::STATUS_INVALID_INFO_CLASS as i32));
+        }
         let metadata = self.owned_file_metadata_for(client, file, Some(expected_device))?;
-        Ok(OwnedFileQueryMetadata {
-            create_options: metadata.create_options,
-            alignment_requirement: self.file_alignment_requirement(file)?,
-        })
+        let mut query = nt_fs::QueryMetadata {
+            access_flags: granted_access,
+            // Authoritative mutable FO_* mode state remains a separate implementation gap.
+            mode: nt_fs::file_mode_from_create_options(metadata.create_options.bits()),
+            ..Default::default()
+        };
+        if matches!(
+            information_class,
+            nt_fs::FILE_ALIGNMENT_INFORMATION | nt_fs::FILE_ALL_INFORMATION
+        ) {
+            query.alignment_requirement = self.file_alignment_requirement(file)?;
+        }
+        if information_class == nt_fs::FILE_ALL_INFORMATION {
+            nt_fs::encode_file_all_io_manager_information(query, output)
+        } else {
+            nt_fs::encode_query_information(information_class, query, output)
+        }
+        .map_err(|status| NtStatus(status as i32))
     }
 
     fn owned_file_metadata_for(
@@ -79,6 +100,8 @@ impl<P> IoManager<P> {
 
 #[cfg(test)]
 mod tests {
+    mod query_encoding_tests;
+
     use super::*;
     use crate::file_io_capture::FileIoCaptureTable;
     use crate::{
@@ -140,9 +163,41 @@ mod tests {
             }
         }
 
-        fn query(&self) -> Result<OwnedFileQueryMetadata, NtStatus> {
-            self.io
-                .owned_file_query_metadata(self.client, self.file, self.device)
+        fn query(&self) -> Result<u32, NtStatus> {
+            self.query_for(
+                self.client,
+                self.file,
+                self.device,
+                nt_fs::FILE_ALIGNMENT_INFORMATION,
+            )
+        }
+
+        fn query_for(
+            &self,
+            client: ClientId,
+            file: FileId,
+            device: DeviceId,
+            class: u32,
+        ) -> Result<u32, NtStatus> {
+            let mut output = [0xa5; 4];
+            let result = self.io.encode_owned_file_query_information(
+                client,
+                file,
+                device,
+                0x81,
+                class,
+                &mut output,
+            );
+            match result {
+                Ok(length) => {
+                    assert_eq!(length, 4);
+                    Ok(u32::from_le_bytes(output))
+                }
+                Err(status) => {
+                    assert_eq!(output, [0xa5; 4]);
+                    Err(status)
+                }
+            }
         }
     }
 
@@ -156,10 +211,24 @@ mod tests {
             | CreateOptions::OPEN_FOR_BACKUP_INTENT;
         let mut f = Fixture::new(options);
         let mut owner = f.io.retain_file_reference(f.file).unwrap();
-        assert_eq!(f.query().unwrap().create_options, options);
+        assert_eq!(
+            f.io.owned_file_metadata(f.client, f.file)
+                .unwrap()
+                .create_options,
+            options
+        );
         let updated = CreateOptions::from_bits_retain(options.bits() | 0x8000_0000);
         f.io.file_mut(f.file).unwrap().create_options = updated;
-        assert_eq!(f.query().unwrap().create_options, updated);
+        assert_eq!(
+            f.io.owned_file_metadata(f.client, f.file)
+                .unwrap()
+                .create_options,
+            updated
+        );
+        assert_eq!(
+            f.query_for(f.client, f.file, f.device, nt_fs::FILE_MODE_INFORMATION),
+            Ok(nt_fs::file_mode_from_create_options(updated.bits()))
+        );
         f.io.release_file_reference(&mut owner).unwrap();
     }
 
@@ -168,7 +237,7 @@ mod tests {
         let mut f = Fixture::new(CreateOptions::empty());
         let mut owner = f.io.retain_file_reference(f.file).unwrap();
         f.io.device_mut(f.device).unwrap().alignment_requirement = 0x1ff;
-        assert_eq!(f.query().unwrap().alignment_requirement, 0x1ff);
+        assert_eq!(f.query(), Ok(0x1ff));
         let driver =
             f.io.create_driver(
                 &NtPath::parse_str(r"\Driver\OwnedMetadataFilter").unwrap(),
@@ -187,13 +256,13 @@ mod tests {
             .unwrap();
         f.io.device_mut(top).unwrap().alignment_requirement = 0xfff;
         f.io.attach_device_to_stack(top, f.device).unwrap();
-        assert_eq!(f.query().unwrap().alignment_requirement, 0xfff);
+        assert_eq!(f.query(), Ok(0xfff));
         assert_eq!(
-            f.io.owned_file_query_metadata(f.client, f.file, top),
+            f.query_for(f.client, f.file, top, nt_fs::FILE_ALIGNMENT_INFORMATION),
             Err(NtStatus::INVALID_HANDLE),
         );
         f.io.detach_device_from_stack(top).unwrap();
-        assert_eq!(f.query().unwrap().alignment_requirement, 0x1ff);
+        assert_eq!(f.query(), Ok(0x1ff));
         f.io.release_file_reference(&mut owner).unwrap();
     }
 
@@ -203,15 +272,30 @@ mod tests {
         let mut owner = f.io.retain_file_reference(f.file).unwrap();
         let other_client = f.io.register_client();
         assert_eq!(
-            f.io.owned_file_query_metadata(other_client, f.file, f.device),
+            f.query_for(
+                other_client,
+                f.file,
+                f.device,
+                nt_fs::FILE_ALIGNMENT_INFORMATION
+            ),
             Err(NtStatus::INVALID_HANDLE),
         );
         assert_eq!(
-            f.io.owned_file_query_metadata(f.client, f.file, DeviceId::NULL),
+            f.query_for(
+                f.client,
+                f.file,
+                DeviceId::NULL,
+                nt_fs::FILE_ALIGNMENT_INFORMATION
+            ),
             Err(NtStatus::INVALID_HANDLE),
         );
         assert_eq!(
-            f.io.owned_file_query_metadata(f.client, FileId::NULL, f.device),
+            f.query_for(
+                f.client,
+                FileId::NULL,
+                f.device,
+                nt_fs::FILE_ALIGNMENT_INFORMATION
+            ),
             Err(NtStatus::INVALID_HANDLE),
         );
         f.io.release_file_reference(&mut owner).unwrap();
@@ -244,9 +328,15 @@ mod tests {
         assert_eq!(f.io.file(f.file).unwrap().state, FileState::ClosePending);
         assert!(f.io.file(f.file).unwrap().cleanup_dispatched);
         assert_eq!(f.io.file_reference_count(f.file), 1);
-        assert_eq!(f.query().unwrap().create_options, options);
+        assert_eq!(
+            f.query_for(f.client, f.file, f.device, nt_fs::FILE_MODE_INFORMATION),
+            Ok(options.bits())
+        );
         f.io.pump();
-        assert_eq!(f.query().unwrap().create_options, options);
+        assert_eq!(
+            f.query_for(f.client, f.file, f.device, nt_fs::FILE_MODE_INFORMATION),
+            Ok(options.bits())
+        );
         captures.retire(&mut capture).unwrap();
         captures
             .release_retired(&mut f.io, capture.identity())
@@ -329,11 +419,21 @@ mod tests {
         let other_client = f.io.register_client();
         f.io.file_mut(f.file).unwrap().close_dispatched = true;
         assert_eq!(
-            f.io.owned_file_query_metadata(f.client, f.file, DeviceId::NULL),
+            f.query_for(
+                f.client,
+                f.file,
+                DeviceId::NULL,
+                nt_fs::FILE_ALIGNMENT_INFORMATION
+            ),
             Err(NtStatus::INVALID_HANDLE)
         );
         assert_eq!(
-            f.io.owned_file_query_metadata(f.client, f.file, DeviceId(f.device.raw() + 1),),
+            f.query_for(
+                f.client,
+                f.file,
+                DeviceId(f.device.raw() + 1),
+                nt_fs::FILE_ALIGNMENT_INFORMATION
+            ),
             Err(NtStatus::INVALID_HANDLE)
         );
         assert_eq!(

@@ -69,7 +69,7 @@ mod wdm_x64;
 
 pub use banked_transfer::{BankedTransferCursor, BankedTransferError};
 pub use bounded_file_read::{BoundedFileReadCompletion, BoundedFileReadPlan};
-pub use owned_file_metadata::{OwnedFileMetadata, OwnedFileQueryMetadata};
+pub use owned_file_metadata::OwnedFileMetadata;
 pub use buffered_set_information::{
     capture_buffered_set_information, BufferedSetInformationError, BufferedSetInformationKind,
 };

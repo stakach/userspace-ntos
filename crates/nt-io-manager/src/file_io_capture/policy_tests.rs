@@ -95,6 +95,22 @@ impl Fixture {
             .unwrap()
     }
 
+    fn query_fields(&self, file: FileId, device: DeviceId, grant: u32) -> [u8; 104] {
+        let mut output = [0xa5; 104];
+        assert_eq!(
+            self.io.encode_owned_file_query_information(
+                self.client,
+                file,
+                device,
+                grant,
+                nt_fs::FILE_ALL_INFORMATION,
+                &mut output,
+            ),
+            Ok(12)
+        );
+        output
+    }
+
     fn retire(&mut self, mut capture: FileIoCapture) {
         let identity = capture.identity();
         self.captures.retire(&mut capture).unwrap();
@@ -696,10 +712,11 @@ fn owned_file_query_dispatches_captured_route_and_grant_before_close_during_copy
     );
     assert_eq!(f.io.file(f.file).unwrap().outstanding_irp_refs, 0);
     assert!(f.io.pending_irps().is_empty());
-    assert!(f
-        .io
-        .owned_file_query_metadata(f.client, capture.file_id(), capture.device_id())
-        .is_ok());
+    f.query_fields(
+        capture.file_id(),
+        capture.device_id(),
+        capture.granted_access(),
+    );
     f.policy.set_signaled(f.file.raw(), true).unwrap();
     assert!(!f.policy.promote_cleanup_if_ready(f.file.raw()).unwrap());
     retire_inline(&mut f, &mut owners, identity);
@@ -743,11 +760,13 @@ fn owned_file_query_inline_metadata_keeps_body_and_busy_through_reentrant_copyou
         );
         let (mut owners, identity) = reserve_inline(&f, 20);
         f.policy.set_signaled(f.file.raw(), false).unwrap();
-        let metadata =
-            f.io.owned_file_query_metadata(f.client, capture.file_id(), capture.device_id())
-                .unwrap();
-        assert_eq!(metadata.create_options, options);
-        assert_eq!(metadata.alignment_requirement, 0x1ff);
+        let metadata = f.query_fields(
+            capture.file_id(),
+            capture.device_id(),
+            capture.granted_access(),
+        );
+        assert_eq!(&metadata[88..92], &options.bits().to_le_bytes());
+        assert_eq!(&metadata[92..96], &0x1ffu32.to_le_bytes());
         for class in [8, 16, 17] {
             assert!(query_information_contract(class)
                 .unwrap()
@@ -765,19 +784,25 @@ fn owned_file_query_inline_metadata_keeps_body_and_busy_through_reentrant_copyou
                 f.policy.begin_cleanup(f.file.raw()),
                 Ok(FileIoAcquireResult::Contended { alertable: false })
             );
-            let still_live =
-                f.io.owned_file_query_metadata(f.client, capture.file_id(), capture.device_id())
-                    .unwrap();
+            let still_live = f.query_fields(
+                capture.file_id(),
+                capture.device_id(),
+                capture.granted_access(),
+            );
             assert_eq!(still_live, metadata);
             assert_eq!(f.policy.is_signaled(f.file.raw()), Ok(false));
-            let query = nt_fs::QueryMetadata {
-                access_flags: capture.granted_access(),
-                mode: nt_fs::file_mode_from_create_options(still_live.create_options.bits()),
-                alignment_requirement: still_live.alignment_requirement,
-                ..Default::default()
-            };
             for (class, output) in [8, 16, 17].into_iter().zip(bytes) {
-                assert_eq!(nt_fs::encode_query_information(class, query, output), Ok(4));
+                assert_eq!(
+                    f.io.encode_owned_file_query_information(
+                        f.client,
+                        capture.file_id(),
+                        capture.device_id(),
+                        capture.granted_access(),
+                        class,
+                        output,
+                    ),
+                    Ok(4)
+                );
             }
         };
         copyout(&mut copied);
@@ -814,9 +839,7 @@ fn owned_file_query_queued_adoption_retains_grant_but_reads_live_metadata() {
             .captures
             .capture(&mut f.io, f.file, f.device, access.bits())
             .unwrap();
-        let before =
-            f.io.owned_file_query_metadata(f.client, f.file, f.device)
-                .unwrap();
+        let before = f.query_fields(f.file, f.device, capture.granted_access());
         let key = FileIoWaitKey::Hosted(f.file.raw());
         let mut waiters = SynchronousFileWaitTable::new();
         let reserved = waiters.reserve().unwrap();
@@ -896,12 +919,11 @@ fn owned_file_query_queued_adoption_retains_grant_but_reads_live_metadata() {
         };
         let (mut owners, identity) = reserve_inline(&f, 21);
         f.policy.set_signaled(f.file.raw(), false).unwrap();
-        let live =
-            f.io.owned_file_query_metadata(f.client, FileId(file_id), DeviceId(device_id))
-                .unwrap();
+        let live = f.query_fields(FileId(file_id), DeviceId(device_id), adopted.granted_access);
         assert_ne!(live, before);
-        assert_eq!(live.create_options, options);
-        assert_eq!(live.alignment_requirement, 0xfff);
+        assert_eq!(&live[76..80], &access.bits().to_le_bytes());
+        assert_eq!(&live[88..92], &options.bits().to_le_bytes());
+        assert_eq!(&live[92..96], &0xfffu32.to_le_bytes());
         assert_eq!(
             f.io.file_reference_count(f.file),
             0,

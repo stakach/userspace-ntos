@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-09-13
+Last updated: 2026-09-14
 
 ## Objective
 
@@ -33959,6 +33959,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         replace this with general target namespace/device resolution so cross-device absolute
         CREATE parse/access errors also precede NOT_SAME_DEVICE. These are explicit remaining
         semantics, not fallback success paths or claims of full NT5 target-open equivalence.
+        The 2026-09-14 routing review identifies the next bounded change: return the matched
+        Device ObjectId and unchanged UTF-16 filesystem suffix from the same Object Manager
+        traversal, then resolve that identity through IoManager::device_id_by_object_id.
+        Do not rescan textual source-device prefixes. Retain source case policy and the current
+        CREATE-before-same-device error ordering; reject stale or unregistered target identities
+        and snapshot current attachments at dispatch. Remove hosted_file_device_relative_name
+        and external_file_device_relative_name when their source-prefix shortcut is replaced.
+        Cover aliases, two independent devices, exact suffix preservation, cross-device CREATE
+        failure precedence, source-case traversal, attachment changes and failed-open retirement.
+        Mounted VPB routing is a separate prerequisite for full NT5 semantics: canonical Device
+        and File records currently have no VPB relationship. A base-to-top attachment walk is not
+        equivalent to IoGetRelatedDeviceObject's File/Device VPB selection or direct-open rules.
       - [ ] Validate relative target opening and retirement in native execution after import closure.
         Host fixtures and an executive build do not prove actual provider IPC, filesystem access
         checks or runtime race injection. Exercise pending source query/target CREATE, root closure,
@@ -33982,8 +33994,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         and synchronize FileCompletionTable mode without allocation. pending_file_busy release
         and prepare_hosted_file_io retry admission must compare immutable synchronicity rather
         than reject owners after an alertability change. Already queued waits keep their captured
-        alertability; new waits read current mode. Access/Mode queries must not depend on live
-        attachment alignment. Cover these ownership and query rules before enabling native SET16.
+        alertability; new waits read current mode. The Access/Mode alignment dependency is removed
+        by the checkpoint below. Cover the remaining ownership and mode rules before enabling
+        native SET16.
+      - [x] Encode owned File queries by information class without incidental alignment failures
+        (2026-09-14; validation evidence recorded below).
+        The canonical encode_owned_file_query_information replaces OwnedFileQueryMetadata and
+        the executive's duplicate metadata assembly. Access uses the retained handle grant;
+        Mode reads the existing File-body create-option projection. Both still authenticate the
+        client, File and stable base-device route and reject invalid body lifetime, but neither
+        resolves alignment topology. Alignment and FileAll resolve the current attached top;
+        missing or delete-pending topology remains an error, never a fabricated alignment.
+        FileAll retains the three discontiguous fields and initial Information=12. Failed
+        validation or encoding leaves output untouched. This removes an incidental dependency
+        in our representation, not a claim of identical NT5 lookup ordering: qsinfo.c selects
+        its related device before Busy acquisition. Mutable FO_* mode, canonical current
+        position and VPB/direct-device selection remain open above.
+        Six class-matrix regressions cover body/route error ordering, untouched failure buffers,
+        attachment changes, body-only queries with unavailable topology, immutable grants,
+        and retained post-CLEANUP lifetime. The composed provider test now derives its seed from
+        a real canonical File and retained capture after handle closure, instead of constructing
+        QueryMetadata directly. All 674 manager library tests pass:
+        .tmp/test-owned-query-lib-20260914.log. All 1,080 selected host/doc tests pass across
+        41 suites with no failures or ignored cases: nt-io-manager, nt-fs, nt-io-abi,
+        nt-driver-host and nt-driver-runtime, including the composed provider test.
+        Evidence: .tmp/test-owned-query-full-20260914.log. The broader compile caught nt-fs
+        being dev-only; it is now a normal no-std dependency so production reuses the same
+        tested encoders. The final freestanding executive release build passes in 38.79s
+        with the unchanged 294 warnings: .tmp/build-owned-query-encoding-executive-20260914.log.
+        Independent read-only review found no blocking regression; unrelated formatter churn
+        was removed and git diff --check passes. No native IPC, VM or desktop acceptance is
+        claimed by this checkpoint. Next: replace absolute target source-prefix routing using
+        Object Manager identity resolution, without folding in unimplemented VPB semantics.
       - [x] Preserve FileAll initial output and Information through provider transport (2026-09-13;
         host/composed/native-build verified below).
         NT5 qsinfo.c:688 initializes Information
