@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 
 mod file_io_serialization;
 pub use file_io_serialization::FileIoSerialization;
+mod file_mode;
 
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_TIMEOUT: u32 = 0x0000_0102;
@@ -474,16 +475,37 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         if tid == 0 || tid == u64::MAX {
             return Err(STATUS_INVALID_PARAMETER);
         }
+        let mode = self.io_mode(file_id)?;
+        self.acquire_file_io_with_mode(file_id, tid, mode)
+    }
+
+    /// Admit using the operation's captured wait policy. A concurrent FileModeInformation update
+    /// may change alertability, but cannot change whether this File uses synchronous Busy.
+    pub fn acquire_file_io_with_mode(
+        &mut self,
+        file_id: u64,
+        tid: u64,
+        captured_mode: FileIoMode,
+    ) -> Result<FileIoAcquireResult, u32> {
+        if tid == 0 || tid == u64::MAX {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if entry.handle_publication_reserved || entry.serialization.io_grant_owner() == Some(tid) {
+        if entry.io_mode.is_synchronous() != captured_mode.is_synchronous()
+            || entry.handle_publication_reserved
+            || entry.serialization.io_grant_owner() == Some(tid)
+        {
             return Err(STATUS_INVALID_PARAMETER);
         }
         if entry.cleanup_sent {
             return Err(STATUS_INVALID_HANDLE);
         }
-        let references = entry.references.checked_add(1).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let references = entry
+            .references
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         let mut serialization = entry.serialization;
-        let result = serialization.begin_io(entry.io_mode, tid, entry.cleanup_reference_held)?;
+        let result = serialization.begin_io(captured_mode, tid, entry.cleanup_reference_held)?;
         entry.references = references;
         entry.serialization = serialization;
         Ok(result)

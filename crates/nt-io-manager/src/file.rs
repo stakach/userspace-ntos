@@ -31,16 +31,6 @@ bitflags::bitflags! {
     }
 }
 
-bitflags::bitflags! {
-    /// Internal `FO_*`-style file-object flags.
-    #[repr(transparent)]
-    #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
-    pub struct FileFlags: u32 {
-        const SYNCHRONOUS_IO = 0x0000_0001;
-        const CLEANUP_COMPLETE = 0x0000_0002;
-    }
-}
-
 /// File lifecycle (spec §12.2). `IRP_MJ_CREATE` must succeed (→ `Open`) before a
 /// usable handle is returned; cleanup (handle release) and close (final deref)
 /// are kept distinct even where a simple device collapses them.
@@ -104,8 +94,9 @@ pub struct FileRecord {
     pub device_id: DeviceId,
     pub desired_access: AccessMask,
     pub share_access: ShareAccess,
+    /// Original CREATE options; mutable FileModeInformation lives in `mode_state`.
     pub create_options: CreateOptions,
-    pub flags: FileFlags,
+    mode_state: crate::FileModeState,
     /// Object Attributes case policy captured by accepted CREATE, never a mutable driver flag.
     pub(crate) opened_case_sensitive: bool,
     /// Parent captured for a handle-relative CREATE. `allocate_irp` transfers this identity into
@@ -154,7 +145,7 @@ impl FileRecord {
             desired_access,
             share_access,
             create_options,
-            flags: FileFlags::empty(),
+            mode_state: crate::FileModeState::from_create_options(create_options),
             opened_case_sensitive: false,
             related_file: None,
             file_name,
@@ -170,6 +161,14 @@ impl FileRecord {
 
     pub fn opened_case_sensitive(&self) -> bool {
         self.opened_case_sensitive
+    }
+
+    pub fn mode_state(&self) -> crate::FileModeState {
+        self.mode_state
+    }
+
+    pub(crate) fn set_mode_state(&mut self, mode: crate::FileModeState) {
+        self.mode_state = mode;
     }
 
     /// Advance the lifecycle state if the transition is allowed. Returns whether

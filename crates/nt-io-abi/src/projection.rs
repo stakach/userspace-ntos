@@ -47,6 +47,7 @@ pub struct DeviceObjectProjection {
 pub struct FileObjectProjection {
     pub file_id: u64,
     pub device_id: u64,
+    /// Canonical manager-owned FO_* mode/case bits, not the provider's complete Flags word.
     pub flags: u32,
     pub _reserved: u32,
 }

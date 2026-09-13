@@ -34004,11 +34004,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
       - [ ] Complete adjacent hosted File-query semantics beyond owned capture.
         Keep access immutable in the capture, but read mutable File mode/current position under
         admitted ownership: original create options are not current mode after FileModeInformation
-        SET (NT5 qsinfo.c:1337). The new owned accessor preserves complete create options but does
-        not implement separate mutable NT mode state. The obsolete fresh-open create-option and
-        alignment accessors are removed; audit any remaining route/body readers for actual
-        ownership instead of reintroducing fresh-open validation after capture. Synchronous FilePosition
-        queries use canonical CurrentByteOffset before event clear (qsinfo.c:319), whereas inline
+        SET (NT5 qsinfo.c:1337). Separate canonical mode state and policy preparation are tracked
+        below; native SET still needs exact provider projection publication. The obsolete
+        fresh-open create-option and alignment accessors are removed; audit remaining route/body
+        readers for actual ownership instead of reintroducing fresh-open validation after capture.
+        Synchronous FilePosition queries use canonical CurrentByteOffset before event clear
+        (qsinfo.c:319), whereas inline
         Access/Mode/Alignment use normal event/completion semantics (qsinfo.c:603). Track missing
         canonical position state rather than supplying a fabricated offset.
         The 2026-09-14 mode audit requires a coordinated change, not only a metadata setter:
@@ -34021,11 +34022,54 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         alertability; new waits read current mode. The Access/Mode alignment dependency is removed
         by the checkpoint below. Cover the remaining ownership and mode rules before enabling
         native SET16.
+      - [x] Establish canonical mutable File mode and captured-wait policy (2026-09-14;
+        host/composed/native-build validation recorded below).
+        Keep original CREATE options separate from private current mode. Validate the NT5 0x36
+        SET mask and immutable async/sync, unbuffered and delete-on-close properties before any
+        mutation; unbuffered Files retain their existing write-through state. Owned Mode/FileAll
+        queries read current canonical mode without adding topology dependence to Mode.
+        Preflight completion-policy identity, expected current mode and exact synchronous Busy
+        ownership before a memory-only canonical mutation, then commit live policy alertability
+        without allocation or reentry. A refused canonical update must not change policy.
+        Derive the next policy and canonical mutation from the same validated mode transition;
+        the memory-only commit closure must not independently choose a different mode.
+        Queued operations and Busy owners keep captured alertability. Native retry/release checks
+        compare immutable synchronicity, and acquisition after reentrant input copying uses the
+        captured mode instead of rereading alertability from the live File.
+        Remove the unused synthetic FileFlags field/type. The diagnostic FileObjectProjection
+        derives real NT FO_* mode/case bits from canonical state, rejecting invalid synchronous
+        combinations rather than inventing flags. This projection is not live WDM publication.
+        All 1,008 selected host tests pass across six suites without failures or ignored cases:
+        686 I/O Manager library, two composed mode-commit tests, one seeded provider test,
+        231 filesystem, 28 I/O ABI and 60 completion-policy tests. The composed fixture uses
+        a real canonical File and completes both canonical and policy cleanup/close retirement;
+        it proves failure atomicity and old/new wait policy, not native provider execution.
+        Evidence: .tmp/test-file-mode-manager-composed-20260914.log and
+        .tmp/test-file-mode-shared-20260914.log. Independent review found no blocking issue.
+        Serialized native release builds pass: executive in 35.61s with the unchanged 294
+        warnings, standalone I/O Manager in 3.66s without warnings. The executive wrapper now
+        forwards captured-mode acquisition; its obsolete live-mode method is removed.
+        Evidence: .tmp/build-file-mode-executive-20260914.log and
+        .tmp/build-file-mode-io-manager-20260914.log. Scoped formatting and diff checks pass.
+        No VM or native provider readback was run. The last measured 27 strict win32k imports
+        and desktop acceptance remain open; provider mode publication is the next step below.
+      - [ ] Publish canonical File mode to every exact provider FILE_OBJECT before native SET16.
+        The 2026-09-14 WDM audit found write_wdm_file_object currently initializes only case
+        policy at Flags+0x50; reuse intentionally leaves provider Flags untouched. Add complete
+        initial mode projection from original CREATE state, not filter-modified stack options.
+        Live updates must merge only FO_WRITE_THROUGH (0x10), FO_SEQUENTIAL_ONLY (0x20) and
+        FO_ALERTABLE_IO (0x4), preserving unrelated provider-owned flags and contexts. Synchronize
+        existing filter-domain projections and parked IRPs before acknowledging SET success;
+        refreshing only at the next IRP is insufficient. Own partial publication across transport
+        retries and caller teardown; do not return ordinary no-effect failure after partial writes.
+        Only then route hosted class 16 through the I/O Manager's real update/completion path.
+        Native SET16 is intentionally unchanged by the state/policy foundation, not reported complete.
       - [x] Encode owned File queries by information class without incidental alignment failures
         (2026-09-14; validation evidence recorded below).
         The canonical encode_owned_file_query_information replaces OwnedFileQueryMetadata and
         the executive's duplicate metadata assembly. Access uses the retained handle grant;
-        Mode reads the existing File-body create-option projection. Both still authenticate the
+        Mode initially read the File-body create-option projection; the mode-state checkpoint
+        above replaces that with private mutable canonical state. Both still authenticate the
         client, File and stable base-device route and reject invalid body lifetime, but neither
         resolves alignment topology. Alignment and FileAll resolve the current attached top;
         missing or delete-pending topology remains an error, never a fabricated alignment.

@@ -24193,13 +24193,14 @@ impl ExecFileCompletion {
         unsafe { (&*self.table).io_grant_owner(file_id) }
     }
 
-    fn acquire_file_io(
+    fn acquire_file_io_with_mode(
         &mut self,
         file_id: u64,
         tid: u64,
+        captured_mode: nt_io_completion::FileIoMode,
     ) -> Result<nt_io_completion::FileIoAcquireResult, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).acquire_file_io(file_id, tid) }
+        unsafe { (&mut *self.table).acquire_file_io_with_mode(file_id, tid, captured_mode) }
     }
 
     fn adopt_io_grant(&mut self, file_id: u64, tid: u64) -> Result<(), u32> {

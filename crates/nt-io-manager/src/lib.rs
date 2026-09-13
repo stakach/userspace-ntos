@@ -42,6 +42,7 @@ mod external_dispatch;
 pub mod detached_file_irp;
 mod fault;
 mod file;
+mod file_mode;
 mod file_reference;
 pub mod file_io_capture;
 mod file_information;
@@ -123,7 +124,8 @@ pub use external_dispatch::{
     ExternalDispatchResult, ExternalPnpDispatchResult, ExternalPnpTerminalReceipt,
     PreparedExternalPnpIrp, PreparedExternalPnpRejection,
 };
-pub use file::{CreateOptions, FileFlags, FileRecord, FileState, ShareAccess};
+pub use file::{CreateOptions, FileRecord, FileState, ShareAccess};
+pub use file_mode::FileModeState;
 pub use file_information::{
     query_information_contract, set_information_access_granted, set_information_contract,
     FileInformationContract,

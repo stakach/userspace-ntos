@@ -40,7 +40,12 @@ impl<P> IoManager<P> {
         Some(FileObjectProjection {
             file_id: file.0,
             device_id: f.device_id.0,
-            flags: f.flags.bits(),
+            flags: f.mode_state().wdm_mode_flags().ok()?
+                | if f.opened_case_sensitive() {
+                    0x0002_0000
+                } else {
+                    0
+                },
             _reserved: 0,
         })
     }

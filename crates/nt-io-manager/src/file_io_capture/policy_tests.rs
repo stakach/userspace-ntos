@@ -751,12 +751,17 @@ fn owned_file_query_inline_metadata_keeps_body_and_busy_through_reentrant_copyou
             .captures
             .capture(&mut f.io, f.file, f.device, access.bits())
             .unwrap();
-        let options = CreateOptions::WRITE_THROUGH | CreateOptions::NO_INTERMEDIATE_BUFFERING;
-        f.io.file_mut(f.file).unwrap().create_options = options;
+        let options = CreateOptions::WRITE_THROUGH | CreateOptions::SEQUENTIAL_ONLY;
         f.io.device_mut(f.device).unwrap().alignment_requirement = 0x1ff;
         assert_eq!(
             f.policy.acquire_file_io(f.file.raw(), 20),
             Ok(FileIoAcquireResult::Acquired)
+        );
+        f.io.set_owned_file_mode(f.client, f.file, f.device, options.bits())
+            .unwrap();
+        assert_eq!(
+            f.io.file(f.file).unwrap().create_options,
+            CreateOptions::empty()
         );
         let (mut owners, identity) = reserve_inline(&f, 20);
         f.policy.set_signaled(f.file.raw(), false).unwrap();
@@ -880,11 +885,17 @@ fn owned_file_query_queued_adoption_retains_grant_but_reads_live_metadata() {
             f.policy.begin_cleanup(f.file.raw()),
             Ok(FileIoAcquireResult::Contended { alertable: false })
         );
+        let options = CreateOptions::SEQUENTIAL_ONLY | CreateOptions::WRITE_THROUGH;
+        // Only the canonical async File's mutable flags change; the legacy policy fixture's
+        // independent synchronous mode still controls this queued-adoption exercise.
+        f.io.set_owned_file_mode(f.client, f.file, f.device, options.bits())
+            .unwrap();
+        assert_eq!(
+            f.io.file(f.file).unwrap().create_options,
+            CreateOptions::empty()
+        );
         f.retire(capture);
         assert_eq!(f.io.file_reference_count(f.file), 0);
-        let options = CreateOptions::SEQUENTIAL_ONLY | CreateOptions::WRITE_THROUGH;
-        // Host-model metadata mutation, not a native FileModeInformation set operation.
-        f.io.file_mut(f.file).unwrap().create_options = options;
         f.io.device_mut(f.device).unwrap().alignment_requirement = 0xfff;
         f.policy.release_io(f.file.raw(), 20).unwrap();
         f.policy.release_file(f.file.raw()).unwrap();
@@ -1172,7 +1183,12 @@ fn owned_file_set_source_access_denial_cannot_be_upgraded_after_capture() {
         .unwrap();
     // Host-model mutation cannot upgrade the grant already captured from the handle.
     f.io.file_mut(f.file).unwrap().desired_access = AccessMask::GENERIC_ALL;
-    f.io.file_mut(f.file).unwrap().create_options = CreateOptions::WRITE_THROUGH;
+    f.io.set_owned_file_mode(f.client, f.file, f.device, nt_fs::FILE_WRITE_THROUGH)
+        .unwrap();
+    assert_eq!(
+        f.io.file(f.file).unwrap().create_options,
+        CreateOptions::empty()
+    );
     let current = f.io.file(f.file).unwrap().desired_access;
     assert!(set_information_access_granted(current, 20));
     assert_eq!(capture.granted_access(), original.bits());

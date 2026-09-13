@@ -35,7 +35,7 @@ pub(super) unsafe fn release_policy(
 ) -> Result<u32, u32> {
     match owner.key {
         FileIoWaitKey::Hosted(file_id) => {
-            if nt_handler.file_completion.io_mode(file_id)? != owner.mode {
+            if nt_handler.file_completion.is_synchronous(file_id)? != owner.mode.is_synchronous() {
                 return Err(nt_fs::STATUS_INVALID_PARAMETER);
             }
             nt_handler

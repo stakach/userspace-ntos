@@ -29313,7 +29313,9 @@ impl ExecNtHandler {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let mode = if let Some(retry) = retry {
-            if retry.route != wait_route || retry.mode != live_mode {
+            if retry.route != wait_route
+                || retry.mode.is_synchronous() != live_mode.is_synchronous()
+            {
                 return Err(STATUS_INVALID_PARAMETER);
             }
             retry.mode
@@ -29398,12 +29400,12 @@ impl ExecNtHandler {
         } else {
             Err(STATUS_ACCESS_VIOLATION)
         };
-        if self.file_completion.io_mode(route.file_id) != Ok(mode) {
+        if self.file_completion.is_synchronous(route.file_id) != Ok(mode.is_synchronous()) {
             assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
                 .cancel_reservation(reservation));
             return Err(STATUS_INVALID_HANDLE);
         }
-        match self.file_completion.acquire_file_io(route.file_id, waiter.tid) {
+        match self.file_completion.acquire_file_io_with_mode(route.file_id, waiter.tid, mode) {
             Ok(nt_io_completion::FileIoAcquireResult::Acquired) => {
                 assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
                     .cancel_reservation(reservation));

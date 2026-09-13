@@ -47,11 +47,14 @@ impl<P> IoManager<P> {
         ) {
             return Err(NtStatus(nt_fs::STATUS_INVALID_INFO_CLASS as i32));
         }
-        let metadata = self.owned_file_metadata_for(client, file, Some(expected_device))?;
+        self.owned_file_metadata_for(client, file, Some(expected_device))?;
         let mut query = nt_fs::QueryMetadata {
             access_flags: granted_access,
-            // Authoritative mutable FO_* mode state remains a separate implementation gap.
-            mode: nt_fs::file_mode_from_create_options(metadata.create_options.bits()),
+            mode: self
+                .file(file)
+                .expect("validated owned File")
+                .mode_state()
+                .query_bits(),
             ..Default::default()
         };
         if matches!(
@@ -66,6 +69,22 @@ impl<P> IoManager<P> {
             nt_fs::encode_query_information(information_class, query, output)
         }
         .map_err(|status| NtStatus(status as i32))
+    }
+
+    /// Update canonical mode while the caller owns the File reference and its I/O serialization.
+    /// Provider mode publication is a separate obligation; this performs no IPC or topology lookup.
+    pub fn set_owned_file_mode(
+        &mut self,
+        client: ClientId,
+        file: FileId,
+        expected_device: DeviceId,
+        requested: u32,
+    ) -> Result<crate::FileModeState, NtStatus> {
+        self.owned_file_metadata_for(client, file, Some(expected_device))?;
+        let record = self.file_mut(file).expect("validated owned File");
+        let mode = record.mode_state().transition(requested)?;
+        record.set_mode_state(mode);
+        Ok(mode)
     }
 
     fn owned_file_metadata_for(
@@ -217,17 +236,24 @@ mod tests {
                 .create_options,
             options
         );
-        let updated = CreateOptions::from_bits_retain(options.bits() | 0x8000_0000);
-        f.io.file_mut(f.file).unwrap().create_options = updated;
+        let updated =
+            f.io.set_owned_file_mode(f.client, f.file, f.device, nt_fs::FILE_SYNCHRONOUS_IO_ALERT)
+                .unwrap();
         assert_eq!(
             f.io.owned_file_metadata(f.client, f.file)
                 .unwrap()
                 .create_options,
-            updated
+            options
         );
         assert_eq!(
             f.query_for(f.client, f.file, f.device, nt_fs::FILE_MODE_INFORMATION),
-            Ok(nt_fs::file_mode_from_create_options(updated.bits()))
+            Ok(updated.query_bits())
+        );
+        assert_eq!(
+            updated.query_bits(),
+            nt_fs::FILE_WRITE_THROUGH
+                | nt_fs::FILE_NO_INTERMEDIATE_BUFFERING
+                | nt_fs::FILE_SYNCHRONOUS_IO_ALERT
         );
         f.io.release_file_reference(&mut owner).unwrap();
     }
@@ -358,12 +384,16 @@ mod tests {
 
     #[test]
     fn owned_body_metadata_does_not_require_usable_alignment_topology() {
-        let options =
-            CreateOptions::from_bits_retain(0x8000_0000) | CreateOptions::NON_DIRECTORY_FILE;
-        let mut f = Fixture::new(CreateOptions::NON_DIRECTORY_FILE);
+        let options = CreateOptions::NON_DIRECTORY_FILE | CreateOptions::SEQUENTIAL_ONLY;
+        let mut f = Fixture::new(options);
         let mut owner = f.io.retain_file_reference(f.file).unwrap();
-        f.io.file_mut(f.file).unwrap().create_options = options;
         f.io.device_mut(f.device).unwrap().delete_pending = true;
+        assert_eq!(
+            f.io.set_owned_file_mode(f.client, f.file, f.device, nt_fs::FILE_WRITE_THROUGH)
+                .unwrap()
+                .query_bits(),
+            nt_fs::FILE_WRITE_THROUGH
+        );
         assert_eq!(
             f.io.owned_file_metadata(f.client, f.file),
             Ok(OwnedFileMetadata {
@@ -441,6 +471,165 @@ mod tests {
             Err(NtStatus::INVALID_HANDLE)
         );
         assert_eq!(f.query(), Err(NtStatus::FILE_CLOSED));
+        f.io.file_mut(f.file).unwrap().close_dispatched = false;
+        f.io.release_file_reference(&mut owner).unwrap();
+    }
+
+    #[test]
+    fn owned_mode_update_changes_class16_and_all_without_rewriting_create_options() {
+        let options = CreateOptions::SYNCHRONOUS_IO_NONALERT
+            | CreateOptions::WRITE_THROUGH
+            | CreateOptions::NON_DIRECTORY_FILE;
+        let mut f = Fixture::new(options);
+        let mut owner = f.io.retain_file_reference(f.file).unwrap();
+        f.io.device_mut(f.device).unwrap().alignment_requirement = 0x1ff;
+        let requested = nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SEQUENTIAL_ONLY;
+        assert_eq!(
+            f.io.set_owned_file_mode(f.client, f.file, f.device, requested)
+                .unwrap()
+                .query_bits(),
+            requested
+        );
+        assert_eq!(
+            f.query_for(f.client, f.file, f.device, nt_fs::FILE_MODE_INFORMATION),
+            Ok(requested)
+        );
+        let mut output = [0xa5; 104];
+        assert_eq!(
+            f.io.encode_owned_file_query_information(
+                f.client,
+                f.file,
+                f.device,
+                0x1234,
+                nt_fs::FILE_ALL_INFORMATION,
+                &mut output,
+            ),
+            Ok(12)
+        );
+        assert_eq!(&output[76..80], &0x1234u32.to_le_bytes());
+        assert_eq!(&output[88..92], &requested.to_le_bytes());
+        assert_eq!(&output[92..96], &0x1ffu32.to_le_bytes());
+        assert_eq!(&output[96..], &[0xa5; 8]);
+        assert_eq!(f.io.file(f.file).unwrap().create_options, options);
+        assert_eq!(f.io.irp_count(), 0);
+        f.io.release_file_reference(&mut owner).unwrap();
+    }
+
+    #[test]
+    fn owned_mode_update_survives_real_cleanup_and_missing_device_topology() {
+        let options = CreateOptions::WRITE_THROUGH | CreateOptions::DELETE_ON_CLOSE;
+        let mut f = Fixture::new(options);
+        let mut captures = FileIoCaptureTable::new();
+        let mut capture = captures.capture(&mut f.io, f.file, f.device, 1).unwrap();
+        f.io.close(f.client, f.handle).unwrap();
+        f.io.pump();
+        assert_eq!(f.io.file(f.file).unwrap().state, FileState::ClosePending);
+        f.io.device_mut(f.device).unwrap().top_of_stack = DeviceId::NULL;
+        let requested = nt_fs::FILE_SEQUENTIAL_ONLY;
+        let mode =
+            f.io.set_owned_file_mode(f.client, f.file, f.device, requested)
+                .unwrap();
+        assert_eq!(mode.query_bits(), requested | nt_fs::FILE_DELETE_ON_CLOSE);
+        assert_eq!(
+            f.query_for(f.client, f.file, f.device, nt_fs::FILE_MODE_INFORMATION),
+            Ok(mode.query_bits())
+        );
+        assert_eq!(f.io.file(f.file).unwrap().create_options, options);
+        assert_eq!(f.io.file_reference_count(f.file), 1);
+        f.io.device_mut(f.device).unwrap().top_of_stack = f.device;
+        captures.retire(&mut capture).unwrap();
+        captures
+            .release_retired(&mut f.io, capture.identity())
+            .unwrap();
+        f.io.pump();
+        assert!(f.io.file(f.file).is_none());
+        assert_eq!(
+            f.io.set_owned_file_mode(f.client, f.file, f.device, 0),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+    }
+
+    #[test]
+    fn owned_mode_update_errors_leave_mode_original_options_and_references_unchanged() {
+        let options = CreateOptions::SYNCHRONOUS_IO_NONALERT | CreateOptions::WRITE_THROUGH;
+        let mut f = Fixture::new(options);
+        let mut owner = f.io.retain_file_reference(f.file).unwrap();
+        let original = f.io.file(f.file).unwrap().mode_state();
+        let other_client = f.io.register_client();
+        for (client, file, device, requested, status) in [
+            (
+                other_client,
+                f.file,
+                f.device,
+                0x10,
+                NtStatus::INVALID_HANDLE,
+            ),
+            (
+                f.client,
+                FileId::NULL,
+                f.device,
+                0x10,
+                NtStatus::INVALID_HANDLE,
+            ),
+            (
+                f.client,
+                f.file,
+                DeviceId::NULL,
+                0x10,
+                NtStatus::INVALID_HANDLE,
+            ),
+            (
+                f.client,
+                f.file,
+                DeviceId(u64::MAX),
+                0x10,
+                NtStatus::INVALID_HANDLE,
+            ),
+            (f.client, f.file, f.device, 0, NtStatus::INVALID_PARAMETER),
+            (
+                f.client,
+                f.file,
+                f.device,
+                0x30,
+                NtStatus::INVALID_PARAMETER,
+            ),
+            (
+                f.client,
+                f.file,
+                f.device,
+                0x1020,
+                NtStatus::INVALID_PARAMETER,
+            ),
+        ] {
+            assert_eq!(
+                f.io.set_owned_file_mode(client, file, device, requested),
+                Err(status)
+            );
+            assert_eq!(f.io.file(f.file).unwrap().mode_state(), original);
+        }
+        for (state, status) in [
+            (FileState::Allocated, NtStatus::INVALID_HANDLE),
+            (FileState::CreateIrpDispatched, NtStatus::INVALID_HANDLE),
+            (FileState::Closed, NtStatus::FILE_CLOSED),
+        ] {
+            f.io.file_mut(f.file).unwrap().state = state;
+            assert_eq!(
+                f.io.set_owned_file_mode(f.client, f.file, f.device, 0x10),
+                Err(status)
+            );
+            assert_eq!(f.io.file(f.file).unwrap().mode_state(), original);
+        }
+        f.io.file_mut(f.file).unwrap().state = FileState::Open;
+        f.io.file_mut(f.file).unwrap().close_dispatched = true;
+        assert_eq!(
+            f.io.set_owned_file_mode(f.client, f.file, f.device, 0x10),
+            Err(NtStatus::FILE_CLOSED)
+        );
+        assert_eq!(f.io.file(f.file).unwrap().mode_state(), original);
+        assert_eq!(f.io.file(f.file).unwrap().create_options, options);
+        assert_eq!(f.io.file_reference_count(f.file), 1);
+        assert_eq!(f.io.file(f.file).unwrap().outstanding_irp_refs, 0);
+        assert_eq!(f.io.irp_count(), 0);
         f.io.file_mut(f.file).unwrap().close_dispatched = false;
         f.io.release_file_reference(&mut owner).unwrap();
     }
