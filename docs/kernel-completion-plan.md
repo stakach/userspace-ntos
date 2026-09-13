@@ -33725,17 +33725,57 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         `.tmp/test-owned-file-query-full-20260913.log`. Focused metadata/capture/query/policy
         formatting and git diff --check pass. No native fault injection or VM run was made;
         host driver fixtures and a native build do not prove provider IPC or desktop acceptance.
-      - [ ] Apply the same owned capture to File set and rename/open-parent paths. Capture route
-        and access together before their first relevant callout; do not pair a pinned original
-        File with a reused handle's grant. Rename must retain both its source File and
-        RootDirectory target through
-        acquisition/dispatch; an unretained canonical target ID is insufficient. Promoted hosted
-        set-information must also bypass fresh local classification before consulting a reused
-        handle.
-        Remove borrowed route/access helpers once only genuinely callout-free inspection remains.
-        Continue with File set/name-target ownership. Include File set classes 30/41 in the
-        capture audit rather than treating only IRP-producing branches as requests, as with the
-        completed driver-path query.
+      - [ ] Complete owned capture and NT ordering for File set and rename/open-parent paths.
+        The source-identity checkpoint below does not close acquisition ordering or the target
+        operand. Remove borrowed route/access helpers once only callout-free inspection remains.
+      - [x] Validate hosted SET source capture and admission separation (2026-09-13;
+        focused host/native-build verified; broad regression validation below).
+        Initial IOSB/input probes precede typed source capture and access validation; capture now
+        precedes payload allocation/copy and survives through final IOSB publication. Promoted
+        hosted retries bypass fresh local classification. Both SET dispatch helpers receive the
+        captured route and original grant instead of re-reading a possibly reused source handle;
+        inline classes 30/41 also use the captured File identity. Admission failures, including
+        USER_APC, return separately from completed I/O and leave IOSB untouched. The hosted helpers
+        move to exec_hosted_file_set.rs; their old exec_handler.rs implementations are removed.
+        All three composed source-only tests pass: capture survives close during payload-copy
+        reentry, a real canonical SET IRP takes over source lifetime through inline/pending ACK,
+        and later host-model metadata mutation cannot upgrade the captured access grant. The
+        positive dispatch fixture preserves canonical CREATE access for the manager's independent
+        access check. Executive release build passes in 35.80s with the unchanged 294 warnings.
+        Evidence: `.tmp/test-owned-file-set-contract-20260913.log` and
+        `.tmp/build-owned-file-set-executive-20260913.log`. Independent native review found no
+        introduced integration defects. These tests do not prove Busy-before-copy ordering,
+        target-directory semantics, native IPC or desktop acceptance; no VM was run.
+      - [x] Finish serialized hosted SET source broad regression validation and checkpoint.
+        All 3,682 host/doc tests pass across 78 suites with no failures or ignored cases:
+        `.tmp/test-owned-file-set-full-20260913.log`. Focused helper/policy formatting and
+        git diff --check pass. The remaining source acquisition, inline completion and rename
+        target semantics below are explicitly open; this checkpoint does not close the parent
+        File-set item or the last measured 27 strict win32k import blockers for native desktop.
+      - [ ] Move hosted SET payload allocation/copy under admitted ownership. NT5 qsinfo.c probes
+        before source authentication, acquires synchronous Busy (or async request resources), then
+        allocates/copies the payload after File event clear. Synchronous FilePosition is a special
+        fast path before event clear; add real canonical CurrentByteOffset rather than fabricating
+        an offset. Keep failures before dispatch distinct from completion publication. Source
+        create-option inspection in the name transaction must also accept an owned captured body
+        instead of requiring a fresh Open state after a reentrant callout.
+      - [ ] Correct inline SET completion semantics under acquisition. Class 30 association and
+        class 41 notification flags need the same ownership audit as IRP-producing operations.
+        NT5 internal.c IopCompleteRequest suppresses IOSB/event publication for immediate NT_ERROR
+        on the synchronous service tail; do not blanket-signal or publish every terminal status.
+        Wine ntdll/tests/file.c verifies the association error's unchanged IOSB sentinel and
+        successful association signaling. Class 41 is post-NT5; audit accepted/queryable flags
+        separately, including FILE_SKIP_SET_USER_EVENT_ON_FAST_IO.
+      - [ ] Replace direct RootDirectory-as-target routing with the real relative target-parent
+        CREATE. NT5 qsinfo.c:1450 and internal.c:5398 open the complete relative name with its root,
+        IO_OPEN_TARGET_DIRECTORY and IO_FORCE_ACCESS_CHECK, write/add-subdirectory plus SYNCHRONIZE
+        access and READ/WRITE sharing. RootDirectory is not that newly opened target File, including
+        nested relative names. Preserve traversal/access checks and existing-target link collision
+        behavior. Independently authenticate/retain the root operand until canonical CREATE owns
+        related_file; the source retry grant cannot authenticate a different handle. Either give
+        a pending source-query transaction a consuming root owner or defer root resolution until
+        that query completes in the original caller context. Retain the kernel-only target through
+        SET and make failed unpublished-target retirement retryable instead of ignoring it.
       - [ ] Complete adjacent hosted File-query semantics beyond owned capture.
         Keep access immutable in the capture, but read mutable File mode/current position under
         admitted ownership: original create options are not current mode after FileModeInformation

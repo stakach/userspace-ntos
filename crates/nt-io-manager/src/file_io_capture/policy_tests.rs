@@ -914,3 +914,268 @@ fn owned_file_query_queued_adoption_retains_grant_but_reads_live_metadata() {
         f.finish_policy_cleanup();
     }
 }
+
+struct SetRecordingDriver {
+    lifecycle: MockDriverBackend,
+    requests: Rc<RefCell<Vec<(IrpProjection, Vec<u8>)>>>,
+    pending: bool,
+    completion: Option<DriverCompletion>,
+}
+
+impl DriverDispatchBackend for SetRecordingDriver {
+    fn dispatch_irp(
+        &mut self,
+        context: DispatchContext<'_>,
+        irp: &IrpProjection,
+    ) -> Result<DispatchOutcome, NtStatus> {
+        self.requests
+            .borrow_mut()
+            .push((irp.clone(), context.system_buffer.to_vec()));
+        if irp.major == nt_io_abi::major::IRP_MJ_SET_INFORMATION {
+            if self.pending {
+                self.completion = Some(DriverCompletion {
+                    irp_id: irp.irp_id,
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                    file_context: None,
+                });
+                return Ok(DispatchOutcome::Pending);
+            }
+            return Ok(DispatchOutcome::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            });
+        }
+        self.lifecycle.dispatch_irp(context, irp)
+    }
+
+    fn cancel_irp(&mut self, irp: IrpId) -> Result<(), NtStatus> {
+        if let Some(completion) = self.completion.as_mut().filter(|item| item.irp_id == irp) {
+            completion.status = NtStatus::CANCELLED;
+            return Ok(());
+        }
+        self.lifecycle.cancel_irp(irp)
+    }
+
+    fn poll_completion(&mut self) -> Option<DriverCompletion> {
+        self.completion
+            .take()
+            .or_else(|| self.lifecycle.poll_completion())
+    }
+}
+
+type SetRequests = Rc<RefCell<Vec<(IrpProjection, Vec<u8>)>>>;
+
+fn source_set_fixture(pending: bool, access: AccessMask) -> (Fixture, SetRequests) {
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let mut f = Fixture::with_backend(
+        FileIoMode::Asynchronous,
+        access,
+        Box::new(SetRecordingDriver {
+            lifecycle: MockDriverBackend::new(),
+            requests: requests.clone(),
+            pending,
+            completion: None,
+        }),
+    );
+    let driver = f.io.device(f.device).unwrap().driver_id;
+    let dispatch =
+        f.io.driver(driver)
+            .unwrap()
+            .dispatch
+            .get(nt_io_abi::major::IRP_MJ_CREATE);
+    f.io.driver_mut(driver)
+        .unwrap()
+        .dispatch
+        .set(nt_io_abi::major::IRP_MJ_SET_INFORMATION, dispatch);
+    (f, requests)
+}
+
+#[test]
+fn owned_file_set_source_survives_close_during_input_copy_before_admission() {
+    let access = AccessMask::from_bits_retain(0x02);
+    let (mut f, requests) = source_set_fixture(false, access);
+    f.io.file_mut(f.file).unwrap().driver_context = Some(0x1234);
+    let capture = f
+        .captures
+        .capture(&mut f.io, f.file, f.device, access.bits())
+        .unwrap();
+    let mut input = [0; 8];
+    let mut copy_input = |destination: &mut [u8]| {
+        assert!(
+            f.policy
+                .release_handle(f.file.raw())
+                .unwrap()
+                .cleanup_required
+        );
+        assert_eq!(
+            f.policy.begin_cleanup(f.file.raw()),
+            Ok(FileIoAcquireResult::Bypassed)
+        );
+        f.start_canonical_cleanup();
+        assert!(f.io.file(capture.file_id()).is_some());
+        assert_eq!(f.io.file_reference_count(capture.file_id()), 1);
+        destination.copy_from_slice(&0x1234_5678u64.to_le_bytes());
+    };
+    copy_input(&mut input);
+    assert_eq!(input, 0x1234_5678u64.to_le_bytes());
+    assert_eq!(capture.file_id(), f.file);
+    assert_eq!(capture.device_id(), f.device);
+    assert_eq!(capture.fs_context(), 0x1234);
+    assert_eq!(capture.granted_access(), access.bits());
+    // This proves pre-admission body ownership, not a change to SET Busy ordering.
+    assert!(f.policy.acquire_file_io(f.file.raw(), 20).is_err());
+    assert!(!requests
+        .borrow()
+        .iter()
+        .any(|(irp, _)| irp.major == nt_io_abi::major::IRP_MJ_SET_INFORMATION));
+    assert_eq!(f.io.file(f.file).unwrap().outstanding_irp_refs, 0);
+    f.retire(capture);
+    f.io.pump();
+    f.finish_policy_cleanup();
+}
+
+#[test]
+fn owned_file_set_source_hands_canonical_reference_to_inline_or_pending_irp() {
+    use nt_io_abi::major;
+    for pending in [false, true] {
+        let access = AccessMask::from_bits_retain(0x02);
+        let (mut f, requests) = source_set_fixture(pending, access);
+        f.io.file_mut(f.file).unwrap().driver_context = Some(0x1234);
+        let capture = f
+            .captures
+            .capture(&mut f.io, f.file, f.device, access.bits())
+            .unwrap();
+        let mut input = 0x1234_5678_9abc_def0u64.to_le_bytes();
+        // A mutable driver context must not replace the source route or grant snapshot.
+        // Canonical CREATE access remains valid for the manager's independent dispatch check.
+        f.io.file_mut(f.file).unwrap().driver_context = Some(0x9876);
+        assert!(set_information_access_granted(
+            AccessMask::from_bits_retain(capture.granted_access()),
+            20
+        ));
+        assert_eq!(capture.fs_context(), 0x1234);
+        f.policy.retain_file(f.file.raw()).unwrap();
+        let parameters = IoParameters::SetInformation(SetInformationParameters {
+            info_class: 20,
+            length: input.len() as u32,
+            target_file: None,
+            control: SetInformationControl::None,
+        });
+        let result =
+            f.io.build_and_dispatch_external_to_device_with_stack_flags(
+                f.client,
+                capture.device_id(),
+                Some(capture.file_id()),
+                0,
+                20,
+                major::IRP_MJ_SET_INFORMATION,
+                parameters.clone(),
+                StackFlags::empty(),
+                8,
+                0,
+                &mut input,
+            )
+            .unwrap();
+        let (request, payload) = requests.borrow().last().unwrap().clone();
+        assert_eq!(request.parameters, parameters);
+        assert_eq!(request.file_id, Some(capture.file_id()));
+        assert_eq!(request.device_id, capture.device_id());
+        assert_eq!(request.requestor_tid, 20);
+        assert_eq!(payload, input);
+        f.retire(capture);
+        assert_eq!(f.io.file_reference_count(f.file), 0);
+        assert!(
+            f.policy
+                .release_handle(f.file.raw())
+                .unwrap()
+                .cleanup_required
+        );
+        assert_eq!(
+            f.policy.begin_cleanup(f.file.raw()),
+            Ok(FileIoAcquireResult::Bypassed)
+        );
+        f.start_canonical_cleanup();
+        if pending {
+            let ExternalDispatchResult::Pending { irp_id } = result else {
+                panic!("pending fixture must retain a canonical SET IRP");
+            };
+            assert_eq!(irp_id, request.irp_id);
+            assert_eq!(f.io.file(f.file).unwrap().outstanding_irp_refs, 1);
+            f.io.pump();
+            assert!(f.io.completed_irp(irp_id).is_some());
+            assert!(
+                f.io.file(f.file).is_some(),
+                "consumer ACK still owns the source File"
+            );
+            f.io.acknowledge_completed_irp(irp_id).unwrap();
+        } else {
+            assert_eq!(
+                result,
+                ExternalDispatchResult::Completed {
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                    file_context: None
+                }
+            );
+            assert!(f.io.pending_irps().is_empty());
+            assert!(f.io.file(f.file).is_none());
+        }
+        f.policy.release_file(f.file.raw()).unwrap();
+        f.finish_policy_cleanup();
+        assert_eq!(
+            requests
+                .borrow()
+                .iter()
+                .map(|(irp, _)| irp.major)
+                .collect::<Vec<_>>(),
+            alloc::vec![
+                major::IRP_MJ_CREATE,
+                major::IRP_MJ_SET_INFORMATION,
+                major::IRP_MJ_CLEANUP,
+                major::IRP_MJ_CLOSE,
+            ]
+        );
+    }
+}
+
+#[test]
+fn owned_file_set_source_access_denial_cannot_be_upgraded_after_capture() {
+    let original = AccessMask::from_bits_retain(0x80);
+    let (mut f, requests) = source_set_fixture(false, original);
+    let capture = f
+        .captures
+        .capture(&mut f.io, f.file, f.device, original.bits())
+        .unwrap();
+    // Host-model mutation cannot upgrade the grant already captured from the handle.
+    f.io.file_mut(f.file).unwrap().desired_access = AccessMask::GENERIC_ALL;
+    f.io.file_mut(f.file).unwrap().create_options = CreateOptions::WRITE_THROUGH;
+    let current = f.io.file(f.file).unwrap().desired_access;
+    assert!(set_information_access_granted(current, 20));
+    assert_eq!(capture.granted_access(), original.bits());
+    assert!(!set_information_access_granted(
+        AccessMask::from_bits_retain(capture.granted_access()),
+        20
+    ));
+    assert_eq!(f.io.file(f.file).unwrap().outstanding_irp_refs, 0);
+    assert!(f.io.pending_irps().is_empty());
+    assert_eq!(
+        requests.borrow().len(),
+        1,
+        "denied source must not dispatch an IRP"
+    );
+    f.retire(capture);
+    assert!(
+        f.policy
+            .release_handle(f.file.raw())
+            .unwrap()
+            .cleanup_required
+    );
+    assert_eq!(
+        f.policy.begin_cleanup(f.file.raw()),
+        Ok(FileIoAcquireResult::Bypassed)
+    );
+    f.start_canonical_cleanup();
+    f.finish_policy_cleanup();
+}
