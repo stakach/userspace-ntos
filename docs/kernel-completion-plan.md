@@ -33659,9 +33659,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         interrupted-wait/resource exits and internal.c synchronous-service admission.
       - [ ] Complete the admission/completion publication audit in the remaining File service
         helpers. Preserve pending-owner handoff and distinguish true dispatch results; a USER_APC
-        acquisition handoff must not be followed by a new IOSB copyout. Set EA/quota still copy
-        their payload before Busy acquisition; move that copy/validation under acquisition while
-        preserving the specific malformed-list IOSB error offsets (NT5 qsea.c:771,899).
+        acquisition handoff must not be followed by a new IOSB copyout.
+      - [x] Move buffered set EA/quota payload allocation/copy/validation under File acquisition
+        and event clear (2026-09-13; host/build verified below). Syscall entry retains the NT
+        initial probes and authenticated File capture, but no longer copies the payload before
+        the service's Busy acquisition. Failed or parked acquisition never invokes payload
+        capture; a promoted waiter copies the current buffer only after adopting its exact grant.
+        Reuse a focused nt-io-manager buffered-set helper with existing EA/quota validators and
+        fallible allocation. Allocation/copy errors leave IOSB untouched. Malformed lists publish
+        a four-byte Status followed by an eight-byte Information offset, preserving padding and
+        partial-write behavior. Either field fault returns ACCESS_VIOLATION; no normal completion
+        publication overwrites the failure. All failures retire the acquired reference without
+        re-signaling the cleared File event. Empty EA payloads bypass copy/validation; empty quota
+        payloads fail validation at offset zero. References: NT5 qsea.c:771,899 and
+        internal.c:6677,6716,6804 plus IopExceptionCleanup.
+        Quota-query list validation still updates only Information, but its previously unchecked
+        error-offset copyout now reports ACCESS_VIOLATION if the store fails; do not replicate the
+        missing fault boundary in NT5 qsquota.c:253.
+      - [x] Finish serialized core/composed and native-build validation of buffered set capture. Host
+        tests exercise actual File policy/capture ownership, deferred payload copying,
+        cleanup during a held request, allocator/copy failure and exact IOSB store ordering.
+        All 11 focused tests and all 3,608 broad host/doc tests pass across 66 suites, with no
+        failures or ignored cases. The broad suite now explicitly includes nt-status and its
+        ACCESS_VIOLATION value/name assertions. The executive release build passes in 39.31s
+        with the unchanged 294 warnings. Evidence:
+        `.tmp/test-buffered-set-capture-contract-20260913.log`,
+        `.tmp/test-buffered-set-capture-full-20260913.log`, and
+        `.tmp/build-buffered-set-capture-executive-20260913.log`. Focused helper/policy/status formatting
+        checks pass; pre-existing formatting drift in nt-io-manager/lib.rs remains untouched.
+        git diff --check passes. Independent reviews cover NT ordering, retained ownership,
+        partial IOSB stores and fault precedence. No native fault injection or VM run was made;
+        host fixtures and a native build do not prove IPC execution or desktop acceptance.
+      - [ ] Audit EA/quota transfer-mode handling against canonical device flags. The buffered
+        helper covers buffered marshalling; NT direct I/O pins an MDL and neither-I/O leaves the
+        caller buffer to the driver. Do not claim those mechanisms from buffered host fixtures.
       - [ ] Apply the same owned capture to File query and set, and rename/open-parent
         paths. Capture route and access together before their first relevant callout; do not pair
         a pinned original File with a reused handle's grant. io_manager_file_query_metadata still
@@ -33672,12 +33703,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         handle.
         Remove borrowed route/access helpers once only genuinely callout-free inspection remains.
         Continue with File query, then File set/name-target ownership.
+        Hosted File query currently allocates its routed output before Busy acquisition; move
+        that allocation and FileAllInformation staging after acquisition/event setup so queued
+        or interrupted requests do not perform pre-dispatch work outside the owned boundary.
         Capture-derived metadata must preserve canonical create-option bits (including write-
         through, sequential and no-buffering) and alignment, not reconstruct mode from only the
         synchronous/alertable policy. File Access/Mode/Alignment immediate replies currently skip
         synchronous Busy acquisition; bring them under the same acquisition/retirement boundary
         (NT5 qsinfo.c:302,603). Include File set classes 30/41 in the capture audit rather than
         treating only IRP-producing branches as requests, as with the completed driver-path query.
+        Keep access immutable in the capture, but read mutable File mode/current position under
+        admitted ownership: original create options are not current mode after FileModeInformation
+        SET (NT5 qsinfo.c:1337). Existing hosted metadata accessors require state.is_open(); do not
+        reinstate fresh-open validation after a capture survives CLEANUP. Synchronous FilePosition
+        queries use canonical CurrentByteOffset before event clear (qsinfo.c:319), whereas inline
+        Access/Mode/Alignment use normal event/completion semantics (qsinfo.c:603). Track missing
+        canonical position state rather than supplying a fabricated offset. FileAllInformation
+        also initializes the real IRP's IoStatus.Information to 12 for manager-owned fields
+        (qsinfo.c:688); preserving seeded output bytes alone does not provide that driver contract.
         Local disk/overlay File lifetime capture across probes remains a separate follow-on; the
         hosted reference adapter does not claim to protect those local File objects. Local
         lock/unlock still resolve their unretained route after user probes; do not move that

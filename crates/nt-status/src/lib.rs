@@ -101,6 +101,8 @@ statuses! {
     CONFLICTING_ADDRESSES = 0xC000_0018u32;
     /// Access was denied.
     ACCESS_DENIED = 0xC000_0022u32;
+    /// The caller's memory could not be read or written.
+    ACCESS_VIOLATION = 0xC000_0005u32;
     /// Insufficient resources (out of slots/memory).
     INSUFFICIENT_RESOURCES = 0xC000_009Au32;
     /// The object is not of the expected type.
@@ -176,6 +178,7 @@ mod tests {
         assert_eq!(NtStatus::OBJECT_NAME_INVALID.0 as u32, 0xC000_0033);
         assert_eq!(NtStatus::OBJECT_NAME_NOT_FOUND.0 as u32, 0xC000_0034);
         assert_eq!(NtStatus::INVALID_HANDLE.0 as u32, 0xC000_0008);
+        assert_eq!(NtStatus::ACCESS_VIOLATION.raw() as u32, 0xC000_0005);
         assert_eq!(NtStatus::OBJECT_TYPE_MISMATCH.0 as u32, 0xC000_0024);
         assert_eq!(NtStatus::NOT_SAME_DEVICE.0 as u32, 0xC000_00D4);
     }
@@ -186,6 +189,10 @@ mod tests {
         assert_eq!(
             format!("{:?}", NtStatus::ACCESS_DENIED),
             "NtStatus(ACCESS_DENIED)"
+        );
+        assert_eq!(
+            format!("{:?}", NtStatus::ACCESS_VIOLATION),
+            "NtStatus(ACCESS_VIOLATION)"
         );
         assert_eq!(format!("{:?}", NtStatus(0x1234)), "NtStatus(0x00001234)");
     }

@@ -28205,12 +28205,39 @@ impl ExecNtHandler {
         Ok((status, information))
     }
 
+    unsafe fn capture_buffered_set_information(
+        &mut self,
+        kind: nt_io_manager::BufferedSetInformationKind,
+        iosb: u64,
+        input: u64,
+        length: usize,
+    ) -> Result<alloc::vec::Vec<u8>, u32> {
+        nt_io_manager::capture_buffered_set_information(kind, length, |buffer| {
+            if self.xas_read(input, buffer) {
+                Ok(())
+            } else {
+                Err(nt_status::NtStatus::ACCESS_VIOLATION)
+            }
+        })
+        .map_err(|error| {
+            error
+                .publish(|offset, bytes| {
+                    let Some(address) = iosb.checked_add(offset as u64) else {
+                        return false;
+                    };
+                    self.xas_try_write_buf(address, bytes)
+                })
+                .raw() as u32
+        })
+    }
+
     unsafe fn service_hosted_set_ea(
         &mut self,
         handle: u64,
         iosb: u64,
         capture: &file_capture::HostedFileCapture,
-        input: &[u8],
+        input_va: u64,
+        length: usize,
     ) -> Result<(u32, u64), u32> {
         let route = capture.route;
         let file_id = route.file_id;
@@ -28230,9 +28257,21 @@ impl ExecNtHandler {
             self.release_file_reference(file_id);
             return Err(status);
         }
+        let input = match self.capture_buffered_set_information(
+            nt_io_manager::BufferedSetInformationKind::Ea,
+            iosb,
+            input_va,
+            length,
+        ) {
+            Ok(input) => input,
+            Err(status) => {
+                self.release_file_reference(file_id);
+                return Err(status);
+            }
+        };
 
         let (mut status, mut information, pending_irp_id) =
-            match self.dispatch_hosted_file_set_ea_for(route, input) {
+            match self.dispatch_hosted_file_set_ea_for(route, &input) {
                 Ok((driver_status, completed, irp_id)) => (driver_status as u32, completed, irp_id),
                 Err(route_status) => (route_status, 0, 0),
             };
@@ -28383,7 +28422,8 @@ impl ExecNtHandler {
         handle: u64,
         iosb: u64,
         capture: &file_capture::HostedFileCapture,
-        input: &[u8],
+        input_va: u64,
+        length: usize,
     ) -> Result<(u32, u64), u32> {
         let route = capture.route;
         let file_id = route.file_id;
@@ -28403,9 +28443,21 @@ impl ExecNtHandler {
             self.release_file_reference(file_id);
             return Err(status);
         }
+        let input = match self.capture_buffered_set_information(
+            nt_io_manager::BufferedSetInformationKind::Quota,
+            iosb,
+            input_va,
+            length,
+        ) {
+            Ok(input) => input,
+            Err(status) => {
+                self.release_file_reference(file_id);
+                return Err(status);
+            }
+        };
 
         let (mut status, mut information, pending_irp_id) =
-            match self.dispatch_hosted_file_set_quota_for(route, input) {
+            match self.dispatch_hosted_file_set_quota_for(route, &input) {
                 Ok((driver_status, completed, irp_id)) => (driver_status as u32, completed, irp_id),
                 Err(route_status) => (route_status, 0, 0),
             };
@@ -41565,23 +41617,8 @@ impl ExecNtHandler {
                     Ok(capture) => capture,
                     Err(status) => return status,
                 };
-                let mut captured = match try_zeroed_transfer_buffer(length) {
-                    Ok(bytes) => bytes,
-                    Err(status) => return status,
-                };
-                if length != 0 {
-                    if !self.xas_read(input, &mut captured) {
-                        return STATUS_ACCESS_VIOLATION;
-                    }
-                    if let Err(error) = nt_io_manager::validate_ea_buffer(&captured) {
-                        let status = nt_status::NtStatus::EA_LIST_INCONSISTENT.raw() as u32;
-                        let _ = self.write_current_iosb(iosb, status, error.offset as u64);
-                        return status;
-                    }
-                }
-
                 let (status, information) =
-                    match self.service_hosted_set_ea(args[0], iosb, &capture, &captured) {
+                    match self.service_hosted_set_ea(args[0], iosb, &capture, input, length) {
                         Ok(result) => result,
                         Err(status) => return status,
                     };
@@ -41662,7 +41699,9 @@ impl ExecNtHandler {
                     if let Err(error) =
                         nt_io_manager::validate_get_quota_buffer(&auxiliary[..sid_list_length])
                     {
-                        self.xas_write_buf(iosb + 8, &(error.offset as u64).to_le_bytes());
+                        if !self.xas_try_write_buf(iosb + 8, &(error.offset as u64).to_le_bytes()) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
                         return nt_status::NtStatus::QUOTA_LIST_INCONSISTENT.raw() as u32;
                     }
                 }
@@ -41748,25 +41787,8 @@ impl ExecNtHandler {
                     Ok(capture) => capture,
                     Err(status) => return status,
                 };
-                let mut captured = match try_zeroed_transfer_buffer(length) {
-                    Ok(bytes) => bytes,
-                    Err(status) => {
-                        let _ = self.write_current_iosb(iosb, status, 0);
-                        return status;
-                    }
-                };
-                if length != 0 && !self.xas_read(input, &mut captured) {
-                    let _ = self.write_current_iosb(iosb, STATUS_ACCESS_VIOLATION, 0);
-                    return STATUS_ACCESS_VIOLATION;
-                }
-                if let Err(error) = nt_io_manager::validate_set_quota_buffer(&captured) {
-                    let status = nt_status::NtStatus::QUOTA_LIST_INCONSISTENT.raw() as u32;
-                    let _ = self.write_current_iosb(iosb, status, error.offset as u64);
-                    return status;
-                }
-
                 let (status, information) =
-                    match self.service_hosted_set_quota(args[0], iosb, &capture, &captured) {
+                    match self.service_hosted_set_quota(args[0], iosb, &capture, input, length) {
                         Ok(result) => result,
                         Err(status) => return status,
                     };
