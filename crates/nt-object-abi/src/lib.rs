@@ -14,7 +14,7 @@
 #![no_std]
 
 /// ABI version. Bump on any incompatible wire change.
-pub const OB_ABI_VERSION: u32 = 1;
+pub const OB_ABI_VERSION: u32 = 2;
 
 /// The reserved SURT opcode range for the Object Manager protocol (spec §12).
 pub const OB_OPCODE_MIN: u16 = 0x2000;
@@ -47,7 +47,9 @@ pub mod opcode {
     pub const OB_OP_LOOKUP_PATH: u16 = 0x2030;
     pub const OB_OP_QUERY_OBJECT: u16 = 0x2031;
     pub const OB_OP_QUERY_DIRECTORY: u16 = 0x2032;
-    pub const OB_OP_REPARSE_FILE_PATH: u16 = 0x2033;
+    // 0x2033 was the retired path-string reparse operation. Do not reuse it.
+    /// Return the matched Device object identity and its untouched filesystem suffix.
+    pub const OB_OP_RESOLVE_FILE_TARGET: u16 = 0x2034;
 
     /// Deferred — see spec §12.1.
     pub const OB_OP_DUPLICATE_HANDLE: u16 = 0x2040;
@@ -223,7 +225,10 @@ pub struct ObDereferenceObjectRequest {
     pub reference_id: u64,
 }
 
-/// `OB_OP_LOOKUP_PATH` payload.
+/// `OB_OP_LOOKUP_PATH` and `OB_OP_RESOLVE_FILE_TARGET` payload.
+/// ResolveFileTarget accepts raw UTF-16: only its namespace prefix is parsed. On success,
+/// `detail0` is the nonzero Device ObjectId, `detail1` is zero, and `information` counts the
+/// untouched filesystem-suffix UTF-16 bytes in the output buffer (possibly zero).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ObLookupPathRequest {
@@ -312,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn version_is_one() {
-        assert_eq!(OB_ABI_VERSION, 1);
+    fn version_is_two() {
+        assert_eq!(OB_ABI_VERSION, 2);
     }
 }

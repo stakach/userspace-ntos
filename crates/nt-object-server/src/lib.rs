@@ -105,7 +105,7 @@ impl Server {
             opcode::OB_OP_DEREFERENCE_OBJECT => self.op_dereference_object(client, in_buf),
             opcode::OB_OP_DELETE_OBJECT => self.op_delete_object(in_buf),
             opcode::OB_OP_LOOKUP_PATH => self.op_lookup(in_buf),
-            opcode::OB_OP_REPARSE_FILE_PATH => self.op_reparse_file_path(in_buf, out_buf),
+            opcode::OB_OP_RESOLVE_FILE_TARGET => self.op_resolve_file_target(in_buf, out_buf),
             opcode::OB_OP_QUERY_OBJECT => self.op_query_object(in_buf, out_buf),
             opcode::OB_OP_CREATE_DIRECTORY => self.op_create_directory(in_buf),
             opcode::OB_OP_CREATE_DIRECTORY_HANDLE => self.op_directory_handle(client, in_buf, true),
@@ -390,26 +390,41 @@ impl Server {
         Ok(reply(NtStatus::SUCCESS, nbytes as u32, 0, 0))
     }
 
-    fn op_reparse_file_path(
+    fn op_resolve_file_target(
         &mut self,
         buf: &[u8],
         out_buf: &mut [u8],
     ) -> Result<ObReply, NtStatus> {
         let req: ObLookupPathRequest = read_req(buf)?;
-        let path = read_path(buf, req.path_offset, req.path_len_bytes)?;
-        let reparsed = self.om.reparse_file_path(&path, case_of(req.flags))?;
-        let units = reparsed.to_units();
+        check_size::<ObLookupPathRequest>(req.abi_size)?;
+        if req.flags as u32 & !ObjAttrFlags::CASE_INSENSITIVE.bits() != 0
+            || req.path_offset < size_of::<ObLookupPathRequest>() as u32
+            || req.path_offset & 1 != 0
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let path = read_unicode(buf, req.path_offset, req.path_len_bytes)?;
+        let target = self
+            .om
+            .resolve_file_target(path.as_units(), case_of(req.flags))?;
+        let units = target.remaining_name;
         let nbytes = units
             .len()
             .checked_mul(2)
             .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        let information = u32::try_from(nbytes).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
         let dst = out_buf
             .get_mut(..nbytes)
             .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
         for (index, unit) in units.iter().enumerate() {
             dst[index * 2..index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
         }
-        Ok(reply(NtStatus::SUCCESS, nbytes as u32, 0, 0))
+        Ok(reply(
+            NtStatus::SUCCESS,
+            information,
+            target.device_object.0,
+            0,
+        ))
     }
 
     /// Resolve the parent directory of `path` + return `(parent_ref, leaf_name)`.

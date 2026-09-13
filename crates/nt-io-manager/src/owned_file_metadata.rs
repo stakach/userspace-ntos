@@ -446,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_rename_source_metadata_and_name_survive_real_cleanup() {
+    fn retained_rename_source_metadata_survives_real_cleanup() {
         let options = CreateOptions::NON_DIRECTORY_FILE | CreateOptions::WRITE_THROUGH;
         let mut f = Fixture::new(options);
         let mut captures = FileIoCaptureTable::new();
@@ -463,14 +463,6 @@ mod tests {
                 opened_case_sensitive: false,
             })
         );
-        let absolute = nt_types::UnicodeString::from_str(r"\Device\OwnedMetadata\target\leaf");
-        let expected = nt_types::UnicodeString::from_str(r"\target\leaf");
-        let mut output = [0u16; 32];
-        let length = f
-            .io
-            .external_file_device_relative_name(f.client, f.file, absolute.as_units(), &mut output)
-            .unwrap();
-        assert_eq!(&output[..length], expected.as_units());
         captures.retire(&mut capture).unwrap();
         captures
             .release_retired(&mut f.io, capture.identity())
@@ -478,15 +470,6 @@ mod tests {
         f.io.pump();
         assert_eq!(
             f.io.owned_file_metadata(f.client, f.file),
-            Err(NtStatus::INVALID_HANDLE)
-        );
-        assert_eq!(
-            f.io.external_file_device_relative_name(
-                f.client,
-                f.file,
-                absolute.as_units(),
-                &mut output,
-            ),
             Err(NtStatus::INVALID_HANDLE)
         );
     }

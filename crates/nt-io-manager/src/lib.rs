@@ -6542,20 +6542,6 @@ mod tests {
         let (source, device, _) = om
             .reference_open_file_details(client, handle, AccessMask::GENERIC_READ)
             .unwrap();
-        let mut relative = [0u16; 32];
-        let absolute: Vec<u16> = "\\DEVICE\\peer0\\target\\leaf".encode_utf16().collect();
-        let relative_len = om
-            .external_file_device_relative_name(client, source, &absolute, &mut relative)
-            .unwrap();
-        assert_eq!(
-            &relative[..relative_len],
-            &"\\target\\leaf".encode_utf16().collect::<Vec<_>>()
-        );
-        let other: Vec<u16> = "\\Device\\Other\\target".encode_utf16().collect();
-        assert_eq!(
-            om.external_file_device_relative_name(client, source, &other, &mut relative),
-            Err(NtStatus::NOT_SAME_DEVICE)
-        );
         let target_access = AccessMask::from_bits_retain(0x0000_0002) | AccessMask::SYNCHRONIZE;
         let target = om
             .allocate_external_file(

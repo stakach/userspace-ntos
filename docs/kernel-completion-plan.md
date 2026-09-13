@@ -33948,29 +33948,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         294 warnings: `.tmp/build-create-case-executive-20260914.log`. Independent core/native
         review, scoped formatting and git diff --check pass. No VM was run; provider IPC,
         filesystem case behavior and desktop acceptance remain separate runtime validation work.
-      - [ ] Complete remaining direct-device and absolute namespace routing semantics.
+      - [ ] Complete remaining direct-device and mounted namespace routing semantics.
         Canonical FO_DIRECT_DEVICE_OPEN is not represented: implement its actual open-state origin
         and sole legitimate Basic-query exemption, not a create-option/name/device heuristic.
         NT5 parse.c:700-731 additionally requires no related File, empty remaining name, a limited
         metadata/security access set and a real File, then changes mount routing. Relative roots
         that were direct opens take the full mount path (parse.c:765). Model that parser/mount
         decision before setting the flag. Until then the supported filesystem path always queries
-        Basic. Absolute targets still normalize against the source device prefix;
-        replace this with general target namespace/device resolution so cross-device absolute
-        CREATE parse/access errors also precede NOT_SAME_DEVICE. These are explicit remaining
-        semantics, not fallback success paths or claims of full NT5 target-open equivalence.
-        The 2026-09-14 routing review identifies the next bounded change: return the matched
-        Device ObjectId and unchanged UTF-16 filesystem suffix from the same Object Manager
-        traversal, then resolve that identity through IoManager::device_id_by_object_id.
-        Do not rescan textual source-device prefixes. Retain source case policy and the current
-        CREATE-before-same-device error ordering; reject stale or unregistered target identities
-        and snapshot current attachments at dispatch. Remove hosted_file_device_relative_name
-        and external_file_device_relative_name when their source-prefix shortcut is replaced.
-        Cover aliases, two independent devices, exact suffix preservation, cross-device CREATE
-        failure precedence, source-case traversal, attachment changes and failed-open retirement.
+        Basic. The hosted Device identity path below replaces source-prefix routing, but does
+        not implement device security parsing or the local overlay/FAT target-open boundary.
+        Those local roots still reject a hosted target transaction before CREATE; integrate
+        their real parser/open lifetime before claiming general cross-filesystem error ordering.
         Mounted VPB routing is a separate prerequisite for full NT5 semantics: canonical Device
         and File records currently have no VPB relationship. A base-to-top attachment walk is not
         equivalent to IoGetRelatedDeviceObject's File/Device VPB selection or direct-open rules.
+      - [x] Resolve absolute hosted rename/link targets by Object Manager Device identity
+        (2026-09-14; host/protocol/native-build validation below).
+        Replaced the path-only reparse protocol and source-device prefix strip with one typed
+        Device ObjectId plus exact UTF-16 filesystem suffix from the same namespace traversal.
+        Namespace case policy follows the retained source; filesystem suffix parsing belongs to
+        the selected driver. The allocator resolves the identity through the canonical device store,
+        independently of the source, and preserves CREATE failure/collision-before-device-comparison
+        ordering. Relative roots retain their existing canonical capture through CREATE admission.
+        The caller is revalidated after namespace IPC before allocating or dispatching the target.
+        The old API, opcode and both native/canonical prefix helpers are removed. ABI version 2
+        reserves retired opcode 0x2033 and uses 0x2034 for the typed result, so old peers fail
+        explicitly instead of interpreting a changed response contract. Client/server validation
+        rejects malformed headers, lengths, identity and reserved fields without partial output.
+        Namespace parsing stops at Device; empty, trailing/repeated-separator and raw UTF-16
+        filesystem suffixes reach the selected parser unchanged. Symbolic-link expansion removes
+        exactly one duplicated join separator, including directory-target links, following NT5
+        oblink.c:831-846. Independent review caught and corrected the initial root-only join rule.
+        Ten new Object Manager/client/server tests cover these contracts and independent Device
+        aliases. Five canonical I/O tests cover named/unnamed Device identities, stale/deleted
+        target rejection without allocation leaks, current attachments at prepared CREATE,
+        deletion between allocation/admission and terminal target retirement. The cross-device
+        host fixture preserves injected CREATE errors and applies NOT_SAME_DEVICE only after
+        successful CREATE; it is not native provider execution or filesystem access-check proof.
+        All 679 I/O Manager library tests pass: .tmp/test-resolved-target-manager-20260914.log.
+        All 138 Object Manager stack host/doc tests pass: .tmp/test-resolved-target-object-stack-20260914.log.
+        Combined: 817 tests across 10 suites, no failures or ignored cases. The two native builds
+        were serialized: Object Manager passes in 1.33s without warnings, executive in 38.39s
+        with the unchanged 294 warnings. Evidence: .tmp/build-resolved-target-object-manager-20260914.log
+        and .tmp/build-resolved-target-executive-20260914.log. Scoped formatting and diff checks
+        pass. No VM was run; the last measured 27 strict win32k imports and desktop acceptance
+        remain open. Next bounded semantic work is canonical mutable File mode and its shared
+        completion/Busy policy, described below; mount/security/local-target integration remains
+        explicitly open above rather than being hidden behind this hosted Device implementation.
       - [ ] Validate relative target opening and retirement in native execution after import closure.
         Host fixtures and an executive build do not prove actual provider IPC, filesystem access
         checks or runtime race injection. Exercise pending source query/target CREATE, root closure,
@@ -34024,8 +34048,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         with the unchanged 294 warnings: .tmp/build-owned-query-encoding-executive-20260914.log.
         Independent read-only review found no blocking regression; unrelated formatter churn
         was removed and git diff --check passes. No native IPC, VM or desktop acceptance is
-        claimed by this checkpoint. Next: replace absolute target source-prefix routing using
-        Object Manager identity resolution, without folding in unimplemented VPB semantics.
+        claimed by this checkpoint. Absolute target identity routing is tracked separately above;
+        unimplemented VPB semantics remain open.
       - [x] Preserve FileAll initial output and Information through provider transport (2026-09-13;
         host/composed/native-build verified below).
         NT5 qsinfo.c:688 initializes Information

@@ -13,6 +13,8 @@ extern crate alloc;
 
 #[cfg(test)]
 mod directory_tests;
+#[cfg(test)]
+mod file_target_tests;
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -47,6 +49,12 @@ pub struct ObjectInfo {
     pub owner_local_id: u64,
     pub related_object_id: ObjectId,
     pub route_kind: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilePathTarget {
+    pub device_object: ObjectId,
+    pub remaining_name: Vec<u16>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -260,33 +268,46 @@ impl<B: Backend> ObjectClient<B> {
         Ok(ObjectId(r.detail0))
     }
 
-    /// Expand Object Manager links and return the canonical Device path plus untouched filesystem
-    /// suffix. Unlike object lookup, the suffix is not interpreted as namespace children.
-    pub fn reparse_file_path(
+    /// Resolve a Device identity and untouched filesystem suffix in one namespace traversal.
+    pub fn resolve_file_target(
         &mut self,
         path: &[u16],
         case_insensitive: bool,
-    ) -> Result<Vec<u16>, NtStatus> {
+    ) -> Result<FilePathTarget, NtStatus> {
+        let path_len_bytes = path
+            .len()
+            .checked_mul(2)
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
         let req = ObLookupPathRequest {
             abi_size: size_of::<ObLookupPathRequest>() as u16,
             flags: case_flag(case_insensitive),
             path_offset: size_of::<ObLookupPathRequest>() as u32,
-            path_len_bytes: byte_len(path),
+            path_len_bytes,
         };
         let buf = pack(&req, path);
         let mut out = vec![0u8; 4096];
         let reply = self
             .backend
-            .call(opcode::OB_OP_REPARSE_FILE_PATH, &buf, &mut out);
+            .call(opcode::OB_OP_RESOLVE_FILE_TARGET, &buf, &mut out);
         NtStatus(reply.status).to_result()?;
+        if reply.detail0 == 0 || reply.detail1 != 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let bytes = out
             .get(..reply.information as usize)
             .filter(|bytes| bytes.len() & 1 == 0)
             .ok_or(NtStatus::INVALID_PARAMETER)?;
-        Ok(bytes
-            .chunks_exact(2)
-            .map(|word| u16::from_le_bytes([word[0], word[1]]))
-            .collect())
+        if !bytes.is_empty() && bytes[..2] != (b'\\' as u16).to_le_bytes() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(FilePathTarget {
+            device_object: ObjectId(reply.detail0),
+            remaining_name: bytes
+                .chunks_exact(2)
+                .map(|word| u16::from_le_bytes([word[0], word[1]]))
+                .collect(),
+        })
     }
 
     /// Delete a named object from its parent directory. This unlinks the namespace route; outstanding

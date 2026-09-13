@@ -11,7 +11,9 @@ use alloc::vec::Vec;
 
 use nt_status::NtStatus;
 use nt_types::rights;
-use nt_types::{AccessMask, CaseSensitivity, GenericMapping, NtPath, ObjectTypeId, UnicodeString};
+use nt_types::{
+    AccessMask, CaseSensitivity, GenericMapping, NtPath, ObjectId, ObjectTypeId, UnicodeString,
+};
 
 use crate::store::ObjectRef;
 use crate::types::{DirectoryBody, ObjectBody, ObjectTypeDef, SymbolicLinkBody};
@@ -45,6 +47,12 @@ const SYMLINK_LIMIT: u32 = 32;
 pub(crate) enum ResolvedPath {
     Found(ObjectRef),
     Vacant { parent: ObjectRef, name: UnicodeString },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilePathTarget {
+    pub device_object: ObjectId,
+    pub remaining_name: Vec<u16>,
 }
 
 impl ObjectManager {
@@ -303,27 +311,38 @@ impl ObjectManager {
         self.lookup_path_ex(path, case, false)
     }
 
-    /// Expand Object Manager symbolic links in a file path and stop at the canonical Device
-    /// object. Components after that object belong to the filesystem parser and are preserved
-    /// exactly rather than looked up as Object Manager children.
-    pub fn reparse_file_path(
+    /// Resolve only the Object Manager prefix, returning the matched Device identity and exact
+    /// remaining UTF-16 suffix from that same traversal. Filesystem separators are not parsed.
+    pub fn resolve_file_target(
         &self,
-        path: &NtPath,
+        path: &[u16],
         case: CaseSensitivity,
-    ) -> Result<NtPath, NtStatus> {
+    ) -> Result<FilePathTarget, NtStatus> {
+        const SEPARATOR: u16 = b'\\' as u16;
+        if path.first() != Some(&SEPARATOR) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let root = self.root.clone().ok_or(NtStatus::OBJECT_PATH_NOT_FOUND)?;
-        let mut comps: Vec<UnicodeString> = path.components().to_vec();
+        let mut name = path.to_vec();
         let mut current = root;
-        let mut idx = 0usize;
+        let mut offset = 1usize;
         let mut hops = 0u32;
 
-        while idx < comps.len() {
+        while offset < name.len() {
+            let end = name[offset..]
+                .iter()
+                .position(|&unit| unit == SEPARATOR)
+                .map_or(name.len(), |length| offset + length);
+            if end == offset {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let component = UnicodeString::from_units(&name[offset..end]);
             let child = current.with_body(|body| match body {
-                ObjectBody::Directory(directory) => directory.lookup(&comps[idx], case),
+                ObjectBody::Directory(directory) => directory.lookup(&component, case),
                 _ => None,
             });
             let child = child.ok_or_else(|| {
-                if idx + 1 == comps.len() {
+                if end == name.len() {
                     NtStatus::OBJECT_NAME_NOT_FOUND
                 } else {
                     NtStatus::OBJECT_PATH_NOT_FOUND
@@ -338,25 +357,35 @@ impl ObjectManager {
                 if hops > SYMLINK_LIMIT {
                     return Err(NtStatus::OBJECT_PATH_NOT_FOUND);
                 }
-                let target = NtPath::parse(target.as_units())
-                    .map_err(|_| NtStatus::OBJECT_PATH_NOT_FOUND)?;
-                let mut rebuilt = target.components().to_vec();
-                rebuilt.extend_from_slice(&comps[idx + 1..]);
-                comps = rebuilt;
+                if target.as_units().first() != Some(&SEPARATOR) {
+                    return Err(NtStatus::OBJECT_PATH_NOT_FOUND);
+                }
+                let mut rebuilt = target.as_units().to_vec();
+                // NT link reparsing coalesces exactly one separator at the splice boundary.
+                let suffix = if rebuilt.last() == Some(&SEPARATOR) && end < name.len() {
+                    end + 1
+                } else {
+                    end
+                };
+                rebuilt.extend_from_slice(&name[suffix..]);
+                name = rebuilt;
                 current = self.root.clone().ok_or(NtStatus::OBJECT_PATH_NOT_FOUND)?;
-                idx = 0;
+                offset = 1;
                 continue;
             }
             if child.with_body(|body| matches!(body, ObjectBody::Device(_))) {
-                return Ok(NtPath::from_components(comps));
+                return Ok(FilePathTarget {
+                    device_object: child.id(),
+                    remaining_name: name[end..].to_vec(),
+                });
             }
-            if idx + 1 != comps.len()
+            if end != name.len()
                 && !child.with_body(|body| matches!(body, ObjectBody::Directory(_)))
             {
                 return Err(NtStatus::OBJECT_PATH_NOT_FOUND);
             }
             current = child;
-            idx += 1;
+            offset = end + 1;
         }
         Err(NtStatus::OBJECT_PATH_NOT_FOUND)
     }

@@ -17,6 +17,7 @@ mod access;
 mod handles;
 mod io;
 mod namespace;
+pub use namespace::FilePathTarget;
 pub mod directory;
 pub mod object_security;
 pub mod object_type;
@@ -177,6 +178,7 @@ impl ObjectManager {
 
 #[cfg(test)]
 mod tests {
+    mod file_target_tests;
     extern crate std;
 
     use super::*;
@@ -912,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn file_reparse_expands_dos_link_and_preserves_device_suffix() {
+    fn file_target_expands_dos_link_and_preserves_device_suffix() {
         let mut om = bootstrapped();
         let device = om.lookup_path(&path("\\Device"), CI).unwrap();
         let dosdev = om.lookup_path(&path("\\??"), CI).unwrap();
@@ -924,14 +926,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            om.reparse_file_path(&path("\\??\\c:\\Folder\\Leaf"), CI)
+            om.resolve_file_target(uni("\\??\\c:\\Folder\\Leaf").as_units(), CI)
                 .unwrap(),
-            path("\\Device\\Volume7\\Folder\\Leaf")
+            FilePathTarget {
+                device_object: volume.id(),
+                remaining_name: uni("\\Folder\\Leaf").as_units().to_vec()
+            }
         );
         assert_eq!(
-            om.reparse_file_path(&path("\\Device\\Volume7\\Direct"), CI)
+            om.resolve_file_target(uni("\\Device\\Volume7\\Direct").as_units(), CI)
                 .unwrap(),
-            path("\\Device\\Volume7\\Direct")
+            FilePathTarget {
+                device_object: volume.id(),
+                remaining_name: uni("\\Direct").as_units().to_vec()
+            }
         );
         assert_eq!(
             om.lookup_path(&path("\\Device\\Volume7"), CI).unwrap().id(),
@@ -940,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn file_reparse_rejects_missing_device_and_link_loops() {
+    fn file_target_rejects_missing_device_and_link_loops() {
         let mut om = bootstrapped();
         let dosdev = om.lookup_path(&path("\\??"), CI).unwrap();
         om.create_symbolic_link(&dosdev, &uni("Missing"), path("\\Device\\Absent"), true)
@@ -949,25 +957,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            om.reparse_file_path(&path("\\??\\Missing\\Leaf"), CI),
+            om.resolve_file_target(uni("\\??\\Missing\\Leaf").as_units(), CI),
             Err(NtStatus::OBJECT_PATH_NOT_FOUND)
         );
         assert_eq!(
-            om.reparse_file_path(&path("\\??\\Loop\\Leaf"), CI),
+            om.resolve_file_target(uni("\\??\\Loop\\Leaf").as_units(), CI),
             Err(NtStatus::OBJECT_PATH_NOT_FOUND)
         );
         assert_eq!(
-            om.reparse_file_path(&path("\\BaseNamedObjects"), CI),
+            om.resolve_file_target(uni("\\BaseNamedObjects").as_units(), CI),
             Err(NtStatus::OBJECT_PATH_NOT_FOUND)
         );
     }
 
     #[test]
-    fn file_reparse_sensitive_link_preserves_mixed_case_filesystem_suffix() {
+    fn file_target_sensitive_link_preserves_mixed_case_filesystem_suffix() {
         let mut om = bootstrapped();
         let device = om.lookup_path(&path("\\Device"), CI).unwrap();
         let dosdev = om.lookup_path(&path("\\??"), CI).unwrap();
-        om.create_device(&device, &uni("Volume7"), ComponentId(7), 70, true)
+        let volume = om
+            .create_device(&device, &uni("Volume7"), ComponentId(7), 70, true)
             .unwrap();
         om.create_symbolic_link(&dosdev, &uni("Drive"), path("\\Device\\Volume7"), true)
             .unwrap();
@@ -975,47 +984,58 @@ mod tests {
         for case in [CaseSensitivity::CaseSensitive, CI] {
             for suffix in ["MiXeD\\LeAf.TxT", "mixed\\leaf.txt"] {
                 assert_eq!(
-                    om.reparse_file_path(&path(&std::format!("\\??\\Drive\\{suffix}")), case),
-                    Ok(path(&std::format!("\\Device\\Volume7\\{suffix}")))
+                    om.resolve_file_target(
+                        uni(&std::format!("\\??\\Drive\\{suffix}")).as_units(),
+                        case,
+                    ),
+                    Ok(FilePathTarget {
+                        device_object: volume.id(),
+                        remaining_name: uni(&std::format!("\\{suffix}")).as_units().to_vec(),
+                    })
                 );
             }
         }
     }
 
     #[test]
-    fn file_reparse_case_policy_applies_to_each_caller_namespace_component() {
+    fn file_target_case_policy_applies_to_each_caller_namespace_component() {
         let mut om = bootstrapped();
         let device = om.lookup_path(&path("\\Device"), CI).unwrap();
         let dosdev = om.lookup_path(&path("\\??"), CI).unwrap();
-        om.create_device(&device, &uni("Volume7"), ComponentId(7), 70, true)
+        let volume = om
+            .create_device(&device, &uni("Volume7"), ComponentId(7), 70, true)
             .unwrap();
         om.create_symbolic_link(&dosdev, &uni("Drive"), path("\\Device\\Volume7"), true)
             .unwrap();
 
-        for (input, reparsed) in [
-            ("\\??\\drive\\MiXeD", "\\Device\\Volume7\\MiXeD"),
-            ("\\device\\Volume7\\MiXeD", "\\device\\Volume7\\MiXeD"),
-            ("\\Device\\volume7\\MiXeD", "\\Device\\volume7\\MiXeD"),
+        for input in [
+            "\\??\\drive\\MiXeD",
+            "\\device\\Volume7\\MiXeD",
+            "\\Device\\volume7\\MiXeD",
         ] {
             assert_eq!(
-                om.reparse_file_path(&path(input), CaseSensitivity::CaseSensitive),
+                om.resolve_file_target(uni(input).as_units(), CaseSensitivity::CaseSensitive),
                 Err(NtStatus::OBJECT_PATH_NOT_FOUND),
                 "{input}"
             );
             assert_eq!(
-                om.reparse_file_path(&path(input), CI),
-                Ok(path(reparsed)),
+                om.resolve_file_target(uni(input).as_units(), CI),
+                Ok(FilePathTarget {
+                    device_object: volume.id(),
+                    remaining_name: uni("\\MiXeD").as_units().to_vec(),
+                }),
                 "{input}"
             );
         }
     }
 
     #[test]
-    fn file_reparse_case_policy_survives_symbolic_link_restart() {
+    fn file_target_case_policy_survives_symbolic_link_restart() {
         let mut om = bootstrapped();
         let device = om.lookup_path(&path("\\Device"), CI).unwrap();
         let dosdev = om.lookup_path(&path("\\??"), CI).unwrap();
-        om.create_device(&device, &uni("Volume7"), ComponentId(7), 70, true)
+        let volume = om
+            .create_device(&device, &uni("Volume7"), ComponentId(7), 70, true)
             .unwrap();
 
         for (link, target) in [
@@ -1024,15 +1044,18 @@ mod tests {
         ] {
             om.create_symbolic_link(&dosdev, &uni(link), path(target), true)
                 .unwrap();
-            let input = path(&std::format!("\\??\\{link}\\MiXeD\\LeAf.TxT"));
+            let input = uni(&std::format!("\\??\\{link}\\MiXeD\\LeAf.TxT"));
             assert_eq!(
-                om.reparse_file_path(&input, CaseSensitivity::CaseSensitive),
+                om.resolve_file_target(input.as_units(), CaseSensitivity::CaseSensitive),
                 Err(NtStatus::OBJECT_PATH_NOT_FOUND),
                 "{target}"
             );
             assert_eq!(
-                om.reparse_file_path(&input, CI),
-                Ok(path(&std::format!("{target}\\MiXeD\\LeAf.TxT"))),
+                om.resolve_file_target(input.as_units(), CI),
+                Ok(FilePathTarget {
+                    device_object: volume.id(),
+                    remaining_name: uni("\\MiXeD\\LeAf.TxT").as_units().to_vec(),
+                }),
                 "{target}"
             );
         }

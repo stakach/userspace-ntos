@@ -58622,12 +58622,15 @@ pub(crate) fn related_io_device_identity_for_file(
         .map(|(device, object)| (device.raw(), object.0))
 }
 
-/// Allocate the kernel-only target-parent File after the source kind is known. Access is derived
-/// from provider attributes, while device ownership comes from the retained canonical source File.
-/// The caller owns the source through acquired or pending SET lifetime, including across CLEANUP.
+pub(crate) enum HostedFileNameTarget {
+    RelatedFile(u64),
+    DeviceObject(ObjectId),
+}
+
+/// Allocate the kernel-only target-parent File after the source kind is known. The target's
+/// retained root or resolved Device identity supplies its route, independently of the source.
 pub(crate) fn allocate_hosted_set_file_name_target(
-    source_file_id: u64,
-    root_file_id: Option<u64>,
+    target: HostedFileNameTarget,
     source_is_directory: bool,
     target_name: &[u16],
 ) -> Result<(u64, u32), u32> {
@@ -58638,29 +58641,39 @@ pub(crate) fn allocate_hosted_set_file_name_target(
     } else {
         FILE_WRITE_DATA
     } | nt_types::AccessMask::SYNCHRONIZE.bits();
-    let file_id = if let Some(root_file_id) = root_file_id {
-        let device_id = owned_hosted_file_metadata(root_file_id)?.device_id.raw();
-        require_hosted_device_ready_for_dispatch(device_id)?;
-        io_manager_mut()
-            .allocate_owned_external_relative_file(
-                ClientId(IO_MANAGER_COMPONENT_ID),
-                FileId(root_file_id),
-                AccessMask::from_bits_retain(target_access),
-                ShareAccess::READ | ShareAccess::WRITE,
-                CreateOptions::OPEN_FOR_BACKUP_INTENT,
-                nt_types::UnicodeString::from_units(target_name),
-            )
-            .map(|file| file.raw())
-            .map_err(|status| status.raw() as u32)?
-    } else {
-        let device_id = owned_hosted_file_metadata(source_file_id)?.device_id.raw();
-        allocate_hosted_file(
-            device_id,
-            target_access,
-            (ShareAccess::READ | ShareAccess::WRITE).bits(),
-            CreateOptions::OPEN_FOR_BACKUP_INTENT.bits(),
-            target_name,
-        )?
+    let file_id = match target {
+        HostedFileNameTarget::RelatedFile(root_file_id) => {
+            let device_id = owned_hosted_file_metadata(root_file_id)?.device_id.raw();
+            require_hosted_device_ready_for_dispatch(device_id)?;
+            io_manager_mut()
+                .allocate_owned_external_relative_file(
+                    ClientId(IO_MANAGER_COMPONENT_ID),
+                    FileId(root_file_id),
+                    AccessMask::from_bits_retain(target_access),
+                    ShareAccess::READ | ShareAccess::WRITE,
+                    CreateOptions::OPEN_FOR_BACKUP_INTENT,
+                    nt_types::UnicodeString::from_units(target_name),
+                )
+                .map(|file| file.raw())
+                .map_err(|status| status.raw() as u32)?
+        }
+        HostedFileNameTarget::DeviceObject(object_id) => {
+            let device_id = io_manager_mut()
+                .device_id_by_object_id(object_id)
+                .ok_or(nt_status::NtStatus::INVALID_PARAMETER.raw() as u32)?;
+            require_hosted_device_ready_for_dispatch(device_id.raw())?;
+            io_manager_mut()
+                .allocate_external_file_by_device_object(
+                    ClientId(IO_MANAGER_COMPONENT_ID),
+                    object_id,
+                    AccessMask::from_bits_retain(target_access),
+                    ShareAccess::READ | ShareAccess::WRITE,
+                    CreateOptions::OPEN_FOR_BACKUP_INTENT,
+                    nt_types::UnicodeString::from_units(target_name),
+                )
+                .map(|file| file.raw())
+                .map_err(|status| status.raw() as u32)?
+        }
     };
     Ok((file_id, target_access))
 }
@@ -58676,21 +58689,6 @@ pub(crate) fn owned_hosted_files_share_related_device(
     }
     Ok(manager.related_device_for_file(FileId(source))?
         == manager.related_device_for_file(FileId(target))?)
-}
-
-pub(crate) fn hosted_file_device_relative_name(
-    file_id: u64,
-    absolute_name: &[u16],
-    output: &mut [u16],
-) -> Result<usize, u32> {
-    io_manager_mut()
-        .external_file_device_relative_name(
-            ClientId(IO_MANAGER_COMPONENT_ID),
-            FileId(file_id),
-            absolute_name,
-            output,
-        )
-        .map_err(|status| status.raw() as u32)
 }
 
 pub(crate) fn hosted_driver_in_file_path(file_id: u64, driver_name: &[u16]) -> Result<bool, u32> {

@@ -89,9 +89,8 @@ impl ExecNtHandler {
         let (root, name) =
             self.normalize_object_directory_file_name(root, name, &mut namespace, &mut absolute)?;
         let mut root_owner = None;
-        let mut canonical = [0u16; FILE_OBJECT_NAME_CAP];
         let mut relative = [0u16; FILE_OBJECT_NAME_CAP];
-        let (root_file_id, target_name) = match root {
+        let (target, target_name) = match root {
             FileParseRoot::HostedFile { file_id, device_id } => {
                 // This is a fresh root lookup, never the source's promoted retry grant.
                 let handle =
@@ -104,21 +103,22 @@ impl ExecNtHandler {
                 root_owner = Some(driver_launch::hosted_file_capture::capture(
                     file_id, device_id, grant,
                 )?);
-                (Some(file_id), name)
+                (
+                    driver_launch::HostedFileNameTarget::RelatedFile(file_id),
+                    name,
+                )
             }
             FileParseRoot::Absolute => {
-                let len = crate::object_manager_reparse_file_path(
+                let (device_object, len) = crate::object_manager_resolve_file_target(
                     name,
                     !opened_case_sensitive,
-                    &mut canonical,
+                    &mut relative,
                 )
                 .map_err(|status| status.raw() as u32)?;
-                let len = driver_launch::hosted_file_device_relative_name(
-                    transaction.source_file_id,
-                    &canonical[..len],
-                    &mut relative,
-                )?;
-                (None, &relative[..len])
+                (
+                    driver_launch::HostedFileNameTarget::DeviceObject(device_object),
+                    &relative[..len],
+                )
             }
             FileParseRoot::OverlayFile(_) | FileParseRoot::FatDirectory { .. } => {
                 return Err(nt_fs::STATUS_NOT_SAME_DEVICE)
@@ -126,13 +126,15 @@ impl ExecNtHandler {
             FileParseRoot::NonDirectoryFile => return Err(nt_fs::STATUS_NOT_A_DIRECTORY),
             FileParseRoot::ObjectDirectory { .. } => return Err(STATUS_INVALID_HANDLE),
         };
+        if !self.set_file_name_caller_is_current(caller) {
+            return Err(nt_status::NtStatus::CANCELLED.raw() as u32);
+        }
         let mut input = try_zeroed_transfer_buffer(target_name.len() * 2)?;
         for (word, bytes) in target_name.iter().zip(input.chunks_exact_mut(2)) {
             bytes.copy_from_slice(&word.to_le_bytes());
         }
         let (target, access) = driver_launch::allocate_hosted_set_file_name_target(
-            transaction.source_file_id,
-            root_file_id,
+            target,
             source_is_directory,
             target_name,
         )?;

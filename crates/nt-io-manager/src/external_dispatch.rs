@@ -775,6 +775,37 @@ impl<P> IoManager<P> {
         )))
     }
 
+    /// Allocate from a Device object already resolved by the Object Manager. The name is the
+    /// exact unparsed suffix; source File identity and namespace spelling are not route inputs.
+    pub fn allocate_external_file_by_device_object(
+        &mut self,
+        client: ClientId,
+        device_object: ObjectId,
+        desired_access: AccessMask,
+        share_access: ShareAccess,
+        create_options: CreateOptions,
+        file_name: UnicodeString,
+    ) -> Result<FileId, NtStatus> {
+        if device_object == ObjectId::NULL {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let device_id = self
+            .device_id_by_object_id(device_object)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let device = self.device(device_id).ok_or(NtStatus::INVALID_PARAMETER)?;
+        if device.delete_pending {
+            return Err(NtStatus::DELETE_PENDING);
+        }
+        self.allocate_external_file(
+            client,
+            device_id,
+            desired_access,
+            share_access,
+            create_options,
+            file_name,
+        )
+    }
+
     /// Allocate a canonical File whose CREATE is parsed relative to an existing open File. The
     /// parent is the sole device-route authority, so a cross-device relationship cannot be
     /// constructed by the caller.
@@ -848,53 +879,6 @@ impl<P> IoManager<P> {
             return Err(NtStatus::INVALID_HANDLE);
         }
         Ok(file.driver_context)
-    }
-
-    /// Strip the canonical device prefix from an absolute Object Manager name for an operation
-    /// already rooted at `file_id`. This is the same-device authority check used before opening a
-    /// rename/link target parent; no namespace spelling is converted into a File identity here.
-    /// The caller retains the source File body across this lookup and the subsequent target open.
-    pub fn external_file_device_relative_name(
-        &self,
-        client: ClientId,
-        file_id: FileId,
-        absolute_name: &[u16],
-        output: &mut [u16],
-    ) -> Result<usize, NtStatus> {
-        let file = self.owned_file_metadata(client, file_id)?;
-        let device = self
-            .device(file.device_id)
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        let device_name = device
-            .name
-            .as_ref()
-            .ok_or(NtStatus::OBJECT_PATH_NOT_FOUND)?
-            .to_unicode_string();
-        let device_name = device_name.as_units();
-        if absolute_name.len() <= device_name.len()
-            || absolute_name.get(device_name.len()) != Some(&(b'\\' as u16))
-            || !absolute_name[..device_name.len()]
-                .iter()
-                .zip(device_name)
-                .all(|(&left, &right)| {
-                    let fold = |unit: u16| {
-                        if (b'A' as u16..=b'Z' as u16).contains(&unit) {
-                            unit + 32
-                        } else {
-                            unit
-                        }
-                    };
-                    fold(left) == fold(right)
-                })
-        {
-            return Err(NtStatus::NOT_SAME_DEVICE);
-        }
-        let relative = &absolute_name[device_name.len()..];
-        if relative.len() > output.len() {
-            return Err(NtStatus::OBJECT_NAME_INVALID);
-        }
-        output[..relative.len()].copy_from_slice(relative);
-        Ok(relative.len())
     }
 
     /// Build one IRP for `device_id`, route it through the owning driver's

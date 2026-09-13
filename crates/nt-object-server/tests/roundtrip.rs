@@ -9,6 +9,9 @@ use nt_object_server::Server;
 use nt_status::NtStatus;
 use nt_types::{AccessMask, AccessMode, ClientId};
 
+#[path = "roundtrip/file_target_tests.rs"]
+mod file_target_tests;
+
 /// An in-process backend: dispatch straight to the server for a fixed client.
 struct Direct<'a> {
     server: &'a mut Server,
@@ -59,13 +62,20 @@ fn full_service_roundtrip() {
     let expected: Vec<u16> = "C:\\Windows\\system32".encode_utf16().collect();
     assert_eq!(target, expected);
 
-    c.create_device("\\Device\\Volume0", 0x494f, 17, true)
+    let volume = c
+        .create_device("\\Device\\Volume0", 0x494f, 17, true)
         .unwrap();
     c.create_symbolic_link("\\??\\C:", "\\Device\\Volume0", true)
         .unwrap();
     let aliased: Vec<u16> = "\\??\\c:\\Folder\\Leaf".encode_utf16().collect();
-    let canonical: Vec<u16> = "\\Device\\Volume0\\Folder\\Leaf".encode_utf16().collect();
-    assert_eq!(c.reparse_file_path(&aliased, true).unwrap(), canonical);
+    let suffix: Vec<u16> = "\\Folder\\Leaf".encode_utf16().collect();
+    assert_eq!(
+        c.resolve_file_target(&aliased, true).unwrap(),
+        nt_object_client::FilePathTarget {
+            device_object: volume,
+            remaining_name: suffix,
+        }
+    );
 
     c.delete_object("\\??\\Link", true).unwrap();
     assert_eq!(

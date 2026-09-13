@@ -15124,20 +15124,20 @@ pub(crate) unsafe fn object_manager_delete_symbolic_link_path(
     object_manager_delete_path(link)
 }
 
-pub(crate) unsafe fn object_manager_reparse_file_path(
+pub(crate) unsafe fn object_manager_resolve_file_target(
     path: &[u16],
     case_insensitive: bool,
     output: &mut [u16],
-) -> Result<usize, nt_status::NtStatus> {
+) -> Result<(nt_types::ObjectId, usize), nt_status::NtStatus> {
     let client = OBJECT_CLIENT_PTR
         .as_mut()
         .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
-    let reparsed = client.reparse_file_path(path, case_insensitive)?;
-    if reparsed.len() > output.len() {
+    let target = client.resolve_file_target(path, case_insensitive)?;
+    if target.remaining_name.len() > output.len() {
         return Err(nt_status::NtStatus::OBJECT_NAME_INVALID);
     }
-    output[..reparsed.len()].copy_from_slice(&reparsed);
-    Ok(reparsed.len())
+    output[..target.remaining_name.len()].copy_from_slice(&target.remaining_name);
+    Ok((target.device_object, target.remaining_name.len()))
 }
 
 pub(crate) unsafe fn object_manager_create_file_handle(
