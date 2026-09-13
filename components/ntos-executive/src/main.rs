@@ -50,6 +50,7 @@ mod object_wait_apc;
 mod parked_reply;
 mod pending_file_caller;
 mod pending_file_apc;
+mod current_apc;
 mod user_apc;
 mod ipc_message;
 mod executive_va;
@@ -18312,12 +18313,15 @@ unsafe fn terminate_hosted_thread_mechanism(
     crate::service_sec_image::synchronous_file_cancellation::request_thread(handler, tid);
     object_wait_apc::request_thread(handler, tid);
     pending_file_apc::request_thread(handler, tid);
+    current_apc::request_thread(handler, tid);
     crate::service_sec_image::synchronous_file_cancellation::redrive(handler);
     object_wait_apc::redrive(handler);
     pending_file_apc::redrive(handler);
+    current_apc::redrive(handler);
     if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_runtime_dependency_for_thread(tid)
         || object_wait_apc::has_thread(tid)
         || pending_file_apc::has_thread(tid)
+        || current_apc::has_thread(tid)
     {
         return false;
     }
@@ -18357,6 +18361,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         || (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_runtime_dependency_for_thread(tid)
         || object_wait_apc::has_thread(tid)
         || pending_file_apc::has_thread(tid)
+        || current_apc::has_thread(tid)
     {
         return false;
     }
@@ -18432,18 +18437,21 @@ unsafe fn terminate_hosted_process_mechanisms(
                 crate::service_sec_image::synchronous_file_cancellation::request_thread(handler, tid);
                 object_wait_apc::request_thread(handler, tid);
                 pending_file_apc::request_thread(handler, tid);
+                current_apc::request_thread(handler, tid);
             }
         }
     }
     crate::service_sec_image::synchronous_file_cancellation::redrive(handler);
     object_wait_apc::redrive(handler);
     pending_file_apc::redrive(handler);
+    current_apc::redrive(handler);
     if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS))
         .has_runtime_dependency_matching(|waiter| {
             waiter.pi == u32::from(process_index) && preserve_tid != Some(waiter.tid)
         })
         || object_wait_apc::has_process(process_index as usize, preserve_tid)
         || pending_file_apc::has_process(process_index as usize, preserve_tid)
+        || current_apc::has_process(process_index as usize, preserve_tid)
     {
         return 0;
     }
@@ -23312,7 +23320,7 @@ struct ExecNtHandler {
     active_synchronous_file_retry: Option<nt_io_manager::SynchronousFileIngress>,
     /// File lock acquired by this call; inline completion releases it at the dispatch boundary.
     current_synchronous_file_lock: u64,
-    user_apc_redirected: bool,
+    current_apc_handoff: Option<nt_user_host::current_apc::CurrentApcIdentity>,
     context_continue_redirected: bool,
     post_action: ExecPostAction,
     /// Hosted processes whose Ps state was terminated by a job operation during this syscall.

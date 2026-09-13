@@ -475,7 +475,6 @@ const RPC_WORKER_SOURCE_SPECS: [RpcWorkerSourceSpec; 2] = [
     },
 ];
 
-static USER_APC_DELIVERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static FILE_USER_APC_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NT_CONTINUE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NT_RAISE_EXCEPTION_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -4147,7 +4146,7 @@ impl ExecNtHandler {
         write_field!(current_server_client_pid, 0);
         write_field!(active_synchronous_file_retry, None);
         write_field!(current_synchronous_file_lock, 0);
-        write_field!(user_apc_redirected, false);
+        write_field!(current_apc_handoff, None);
         write_field!(context_continue_redirected, false);
         write_field!(post_action, ExecPostAction::None);
         write_field!(pending_job_terminations, Vec::new());
@@ -9842,100 +9841,13 @@ impl ExecNtHandler {
             .filter(|&tcb| tcb > 1)
     }
 
-    pub(crate) unsafe fn stage_current_user_apc(
+    pub(crate) unsafe fn try_deliver_current_user_apc(
         &mut self,
         return_status: u32,
     ) -> Result<bool, u32> {
-        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
-
-        let current_tid = match u32::try_from(self.current_tid) {
-            Ok(tid) => tid,
-            Err(_) => return Err(nt_process::STATUS_INVALID_HANDLE),
-        };
-        let Some(apc) = self.pm.peek_user_apc(current_tid) else {
-            return Ok(false);
-        };
-        let dispatcher_rva =
-            crate::img_spawn::OUR_KI_USER_APC_DISPATCHER_RVA.load(Ordering::Relaxed);
-        if dispatcher_rva == 0 {
-            return Err(STATUS_UNSUCCESSFUL);
-        }
-        let Some(dispatcher) = NTDLL_BASE.checked_add(dispatcher_rva) else {
-            return Err(STATUS_UNSUCCESSFUL);
-        };
-        let Some(tcb) = self
-            .hosted_thread_tcb(self.current_tid)
-            .filter(|tcb| *tcb > 1)
-        else {
-            return Err(nt_process::STATUS_INVALID_HANDLE);
-        };
-        let Some(frame_base) = self
-            .current_sp
-            .checked_sub(nt_thread_start::AMD64_CONTEXT_SIZE as u64)
-        else {
-            return Err(STATUS_ACCESS_VIOLATION);
-        };
-        let frame_va = frame_base & !0xf;
-
-        let mut saved = [0u64; 20];
-        crate::win32k_glue::tcb_read_regs20(tcb, &mut saved);
-        let mut frame = [0u8; nt_thread_start::AMD64_CONTEXT_SIZE];
-        if !nt_thread_start::initialize_amd64_user_apc_context(
-            &mut frame,
-            &saved,
-            self.current_resume_ip,
-            self.current_sp,
-            self.current_flags,
-            return_status as u64,
-            apc.routine,
-            apc.normal_context,
-            apc.system_argument1,
-            apc.system_argument2,
-        ) {
-            return Err(STATUS_UNSUCCESSFUL);
-        }
-        if !self.xas_try_write_buf(frame_va, &frame) {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
-
-        saved[nt_user_callback::USER_CONTEXT_RIP] = dispatcher;
-        saved[nt_user_callback::USER_CONTEXT_RSP] = frame_va;
-        saved[nt_user_callback::USER_CONTEXT_RAX] = 0;
-        saved[nt_user_callback::USER_CONTEXT_RCX] = dispatcher;
-        saved[nt_user_callback::USER_CONTEXT_R10] = 0;
-        saved[nt_user_callback::USER_CONTEXT_R11] = saved[nt_user_callback::USER_CONTEXT_RFLAGS];
-        let write_error = crate::win32k_glue::tcb_write_regs20(tcb, &saved, false);
-        if write_error != 0 {
-            return Err(STATUS_UNSUCCESSFUL);
-        }
-        let _ = self.pm.take_user_apc(current_tid);
-
-        let trace = USER_APC_DELIVERY_TRACE_N.fetch_add(1, Ordering::Relaxed);
-        if trace < 16 {
-            print_str(b"[apc] deliver pi=");
-            print_u64(self.pi as u64);
-            print_str(b" tid=");
-            print_u64(self.current_tid);
-            print_str(b" dispatcher=0x");
-            print_hex_u64(dispatcher);
-            print_str(b" frame=0x");
-            print_hex_u64(frame_va);
-            print_str(b" routine=0x");
-            print_hex_u64(apc.routine);
-            print_str(b"\n");
-        }
-        Ok(true)
-    }
-
-    pub(crate) unsafe fn try_deliver_current_user_apc(&mut self) -> Result<bool, u32> {
-        const STATUS_USER_APC: u32 = 0x0000_00C0;
-
-        let delivered = self.stage_current_user_apc(STATUS_USER_APC)?;
-        if delivered {
-            self.user_apc_redirected = true;
-        }
-        Ok(delivered)
+        assert!(self.current_apc_handoff.is_none(), "current APC handoff already owned");
+        self.current_apc_handoff = crate::current_apc::request(self, return_status)?;
+        Ok(self.current_apc_handoff.is_some())
     }
 
     fn resolve_user_thread_for_context(
@@ -10576,6 +10488,7 @@ impl ExecNtHandler {
             // retry/ingress and APC context effects still require the original target thread.
             waiters.has_runtime_dependency_for_thread(tid) || crate::object_wait_apc::has_thread(tid)
                 || crate::pending_file_apc::has_thread(tid)
+                || crate::current_apc::has_thread(tid)
         }
         {
             return None;
@@ -12827,13 +12740,6 @@ impl ExecNtHandler {
         timeout_ptr: u64,
         timeout_interval: Option<i64>,
     ) -> u32 {
-        if alertable {
-            match unsafe { self.try_deliver_current_user_apc() } {
-                Ok(true) => return 0x0000_00C0,
-                Ok(false) => {}
-                Err(status) => return status,
-            }
-        }
         if self.wait_object_ready(object) {
             let status = match self.wait_object_consume(object) {
                 nt_kernel_exec::DispatcherConsumeResult::Consumed => 0,
@@ -12854,6 +12760,13 @@ impl ExecNtHandler {
             print_hex(status);
             print_str(b"\n");
             return status;
+        }
+        if alertable {
+            match unsafe { self.try_deliver_current_user_apc(0x0000_00C0) } {
+                Ok(true) => return 0x0000_00C0,
+                Ok(false) => {}
+                Err(status) => return status,
+            }
         }
         if let Some(timeout) = timeout_interval.map(PendingWaitTimeout::from_interval) {
             if timeout.is_due_now() == Some(true) {
@@ -12940,14 +12853,6 @@ impl ExecNtHandler {
                 }
             }
         }
-        if alertable {
-            match unsafe { self.try_deliver_current_user_apc() } {
-                Ok(true) => return 0x0000_00C0,
-                Ok(false) => {}
-                Err(status) => return status,
-            }
-        }
-
         if wait_all {
             let mut all_ready = true;
             for index in 0..count {
@@ -12986,6 +12891,13 @@ impl ExecNtHandler {
             }
         }
 
+        if alertable {
+            match unsafe { self.try_deliver_current_user_apc(0x0000_00C0) } {
+                Ok(true) => return 0x0000_00C0,
+                Ok(false) => {}
+                Err(status) => return status,
+            }
+        }
         if let Some(timeout) = timeout_interval.map(PendingWaitTimeout::from_interval) {
             if timeout.is_due_now() == Some(true) {
                 return 0x102;
@@ -14019,7 +13931,7 @@ impl ExecNtHandler {
             Ok(true) => {}
             Ok(false) => return STATUS_PENDING,
             Err(status) => {
-                if !self.user_apc_redirected {
+                if self.current_apc_handoff.is_none() {
                     self.write_current_iosb(iosb, status, 0);
                 }
                 return status;
@@ -14251,6 +14163,7 @@ impl ExecNtHandler {
         // teardown intent before any File abandonment can reenter, without stealing its owner.
         crate::object_wait_apc::request_thread(self, tid);
         crate::pending_file_apc::request_thread(self, tid);
+        crate::current_apc::request_thread(self, tid);
         self.abandon_pending_file_io_for_thread(tid)
             + self.abandon_synchronous_file_waiters_for_thread(tid)
             + self.abandon_file_irp_drain_waiters_for_thread(tid)
@@ -29859,7 +29772,7 @@ impl ExecNtHandler {
                     }
                     // No counted File acquisition remains when APC staging takes ownership of
                     // the current syscall's still-untransferred reply.
-                    return match self.try_deliver_current_user_apc() {
+                    return match self.try_deliver_current_user_apc(STATUS_USER_APC) {
                         Ok(true) => Err(STATUS_USER_APC),
                         Ok(false) => Err(STATUS_UNSUCCESSFUL),
                         Err(status) => Err(status),
@@ -36248,14 +36161,14 @@ impl ExecNtHandler {
                 if iosb != 0
                     && !generic_pending
                     && !routed_hosted_fsctl
-                    && !self.user_apc_redirected
+                    && self.current_apc_handoff.is_none()
                 {
                     self.xas_write_buf(iosb, &(status as u32).to_le_bytes());
                     self.xas_write_buf(iosb + 8, &information.to_le_bytes());
                 }
                 if routed_hosted_fsctl
                     && (status as u32) != STATUS_PENDING
-                    && !self.user_apc_redirected
+                    && self.current_apc_handoff.is_none()
                 {
                     self.complete_terminal_file_io(
                         fid,
@@ -39304,9 +39217,8 @@ impl ExecNtHandler {
                 }
                 STATUS_NOT_MAPPED_VIEW
             },
-            NativeService::NtTestAlert => match unsafe { self.try_deliver_current_user_apc() } {
-                Ok(true) => 0x0000_00C0,
-                Ok(false) => 0,
+            NativeService::NtTestAlert => match unsafe { self.try_deliver_current_user_apc(0) } {
+                Ok(_) => 0,
                 Err(status) => status,
             },
             NativeService::NtQuerySecurityObject => unsafe {
@@ -40638,7 +40550,7 @@ impl ExecNtHandler {
                 }
                 let interval = i64::from_le_bytes(bytes);
                 if alertable {
-                    match unsafe { self.try_deliver_current_user_apc() } {
+                    match unsafe { self.try_deliver_current_user_apc(0x0000_00C0) } {
                         Ok(true) => return 0x0000_00C0,
                         Ok(false) => {}
                         Err(status) => return status,
@@ -44336,7 +44248,7 @@ impl ExecNtHandler {
                         self.pending_file_io_wait = true;
                     }
                 }
-                if iosb_ok && status != STATUS_PENDING && !self.user_apc_redirected
+                if iosb_ok && status != STATUS_PENDING && self.current_apc_handoff.is_none()
                     && !self.write_current_iosb(iosb, status, information)
                 {
                     status = STATUS_ACCESS_VIOLATION;

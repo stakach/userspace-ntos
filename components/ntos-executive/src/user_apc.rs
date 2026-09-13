@@ -1,4 +1,4 @@
-//! Checked APC frame preparation shared by retained hosted wait continuations.
+//! Checked APC frame preparation shared by retained hosted syscall and wait returns.
 
 use crate::*;
 use nt_thread_start::amd64_context::{

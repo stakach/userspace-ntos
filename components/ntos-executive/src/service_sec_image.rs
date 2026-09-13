@@ -1413,7 +1413,7 @@ unsafe fn gui_message_wait_select_published(nt_handler: &mut ExecNtHandler, slot
 
 /// Steal the reply object bound to the caller currently being serviced and rotate a fresh pool
 /// object into `REPLY_MAIN_SLOT`, matching the common blocked-service continuation model.
-unsafe fn steal_main_reply() -> Option<u64> {
+pub(crate) unsafe fn steal_main_reply() -> Option<u64> {
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if stolen == 0 {
         return None;
@@ -3398,6 +3398,7 @@ pub(crate) fn service_dll_pe_store_stats() -> DllPeStoreStats {
 fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
     unsafe { crate::object_wait_apc::redrive(nt_handler) };
     unsafe { crate::pending_file_apc::redrive(nt_handler) };
+    unsafe { crate::current_apc::redrive(nt_handler) };
     if FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel) {
         // This boundary can follow receive, before the new caller's arguments are captured.
         // Retained cancellation must also converge when a timer delivers its only completion.
@@ -8420,6 +8421,11 @@ pub(crate) unsafe fn service_sec_image(
         driver_launch::retry_driver_registry_closes(monotonic_time_100ns());
         crate::cm_key_ownership::retry_cleanup(monotonic_time_100ns());
         crate::cm_snapshot_ownership::retry_cleanup(monotonic_time_100ns());
+        {
+            let _message = crate::ipc_message::SavedMessageBuffer::capture();
+            crate::current_apc::redrive(&mut nt_handler);
+            crate::current_apc::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
+        }
         let ingress = if badge == DELAY_TIMER_BADGE || hosted_irq_lines_from_badge(badge) != 0 {
             None
         } else {
@@ -10815,6 +10821,7 @@ pub(crate) unsafe fn service_sec_image(
                     || waiters.has_ingress_for_thread(current_tid)
                     || crate::object_wait_apc::has_thread(current_tid)
                     || crate::pending_file_apc::owns_thread(current_tid)
+                    || crate::current_apc::owns_thread(current_tid)
             }
             {
                 // An uncertain earlier retry is not a fresh File acquisition. Reject only this
@@ -10827,6 +10834,7 @@ pub(crate) unsafe fn service_sec_image(
                 synchronous_file_cancellation::redrive(&mut nt_handler);
                 crate::object_wait_apc::redrive(&mut nt_handler);
                 crate::pending_file_apc::redrive(&mut nt_handler);
+                crate::current_apc::redrive(&mut nt_handler);
                 let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
                 badge = nb;
@@ -11199,7 +11207,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut redirected_user_callback = false;
             let mut component_suspension_park_request = false;
             let mut component_suspension_admitted_dispatch_id = 0;
-            let mut redirected_user_apc = false;
+            let mut current_apc_handoff = None;
             let mut redirected_context_continue = false;
             let mut active_callback_bad_resume = false;
             // Checkpoint B: -1 = no wait-park; >=0 = NtWaitForSingleObject asked to park this caller on
@@ -11342,7 +11350,8 @@ pub(crate) unsafe fn service_sec_image(
                 // + out-write queue so a migrated handler can raise them (group A/B signals).
                 nt_handler.post_action = ExecPostAction::None;
                 nt_handler.stop = false;
-                nt_handler.user_apc_redirected = false;
+                assert!(nt_handler.current_apc_handoff.is_none(),
+                    "previous syscall leaked a current APC handoff");
                 nt_handler.context_continue_redirected = false;
                 nt_handler.user_timer_rearm_requested = false;
                 nt_handler.job_time_rearm_requested = false;
@@ -11434,6 +11443,7 @@ pub(crate) unsafe fn service_sec_image(
                     let dispatch_started = crate::disk_census_ticks();
                     let res =
                         nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
+                    current_apc_handoff = nt_handler.current_apc_handoff.take();
                     crate::record_native_dispatch_ticks(
                         m0,
                         crate::disk_census_ticks().wrapping_sub(dispatch_started),
@@ -11481,9 +11491,6 @@ pub(crate) unsafe fn service_sec_image(
                             print_str(b"\n");
                         }
                     }
-                    if nt_handler.user_apc_redirected {
-                        redirected_user_apc = true;
-                    }
                     if nt_handler.context_continue_redirected {
                         redirected_context_continue = true;
                     }
@@ -11507,6 +11514,17 @@ pub(crate) unsafe fn service_sec_image(
                         current_tid: nt_handler.current_tid,
                         drop_reply: true,
                     };
+                }
+                let apc_owned_terminating_reply = current_apc_handoff.is_some()
+                    && matches!(post_action,
+                        ExecPostAction::TerminateCurrentThread { .. }
+                        | ExecPostAction::TerminateProcess { drop_reply: true, .. }
+                        | ExecPostAction::CriticalTermination { .. });
+                if apc_owned_terminating_reply {
+                    crate::current_apc::cancel_tail(
+                        &mut nt_handler,
+                        current_apc_handoff.take().expect("terminating APC handoff missing"),
+                    );
                 }
                 if let Some(mut ingress) = nt_handler.active_synchronous_file_retry.take() {
                     let identity = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
@@ -11623,7 +11641,8 @@ pub(crate) unsafe fn service_sec_image(
                                 REPLY_MAIN_SLOT.load(Ordering::Relaxed),
                             );
                         }
-                        let reply_dropped = drop_current_hosted_reply();
+                        let reply_dropped = !apc_owned_terminating_reply
+                            && drop_current_hosted_reply();
                         let mechanism_deleted =
                             terminate_hosted_thread_mechanism(tid, delay_queue, &mut nt_handler);
                         if reply_dropped && mechanism_deleted {
@@ -11672,7 +11691,7 @@ pub(crate) unsafe fn service_sec_image(
                         } else {
                             None
                         };
-                        let reply_dropped = if drop_reply {
+                        let reply_dropped = if drop_reply && !apc_owned_terminating_reply {
                             drop_current_hosted_reply()
                         } else {
                             false
@@ -11740,7 +11759,8 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                     ExecPostAction::CriticalTermination { code, object } => {
-                        let reply_dropped = drop_current_hosted_reply();
+                        let reply_dropped = !apc_owned_terminating_reply
+                            && drop_current_hosted_reply();
                         // A critical process can bugcheck while it is running a win32k user-mode
                         // callback; unwind those continuations so win32k is idle (not stranded in its
                         // callback receive loop) for the gate. No-op when it held none.
@@ -17806,8 +17826,22 @@ pub(crate) unsafe fn service_sec_image(
             if tail_durable_status != nt_fs::STATUS_SUCCESS {
                 result = tail_durable_status as u64;
             }
+            if let Some(identity) = current_apc_handoff.take() {
+                crate::current_apc::release_tail(&mut nt_handler, identity);
+                crate::current_apc::redrive(&mut nt_handler);
+                let _ = finalize_service_loop_state(&mut nt_handler);
+                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                badge = nb;
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                m2 = nm2;
+                m3 = nm3;
+                continue;
+            }
             let redirected_user_control =
-                redirected_user_callback || redirected_user_apc || redirected_context_continue;
+                redirected_user_callback || redirected_context_continue;
             let native_load_reply_status =
                 (native_call_transport && m0 == SSN_NT_LOAD_DRIVER && !redirected_user_control)
                     .then_some(result as u32);
@@ -17834,7 +17868,7 @@ pub(crate) unsafe fn service_sec_image(
                     .requires_post_reply_inspection(nt_handler.lpc_reply_published);
             // Ordinary completion changes only RAX. Provider reentry can legitimately install
             // newer target registers while this syscall is serviced; never replay ingress state.
-            // A committed callback/APC redirect already owns the full canonical context and gets
+            // A committed callback redirect already owns the full canonical context and gets
             // an empty reply. Successful NtContinue has restarted atomically and bypassed this tail.
             let len = if redirected_user_control { 0 } else { 1 };
             let r0 = if redirected_user_control { 0 } else { result };
@@ -17843,9 +17877,8 @@ pub(crate) unsafe fn service_sec_image(
                 (reply_recv_badge(fault_ep, len, r0, 0, 0, 0), true)
             } else {
                 // A client redirected into a win32k user-mode callback resumes with the length-0
-                // fault reply the redirect staged, not with a syscall result. User APC delivery uses
-                // the same shape because the APC dispatcher frame already carries the eventual
-                // STATUS_USER_APC return in the restored context.
+                // fault reply the redirect staged, not with a syscall result. Current APC delivery
+                // owns its saved Reply independently and has already bypassed this tail.
                 if inspect_component_lpc_after_reply {
                     // The broker reply is visible, but its server must observe this native reply
                     // before the retained component client resumes. Calls made during the bounded

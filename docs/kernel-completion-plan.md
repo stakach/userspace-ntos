@@ -33416,12 +33416,55 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Scope boundary: the all-row prefix marker prevents new APC takeover and duplicate prefix
     entry, but does not claim retained effects for ordinary non-APC terminal teardown. A removed
     ordinary row invalidates its old lease without touching a replacement. APC-owned rows instead
-    retain their exact owner until their protocol is complete. Current-thread APC entry still uses
-    the older staging adapter and requires its own cutover. Ordinary signal/timeout Reply failures,
-    non-APC object-wait teardown and inline terminal Busy/reference failure retention also remain
-    open. No VM run or microkernel
-    change occurred; the last measured 27 strict missing win32k imports and genuine desktop
-    acceptance remain open.
+    retain their exact owner until their protocol is complete.
+
+    Current-thread APC return ownership (2026-09-13, host/build verified):
+    - [x] Reserve an exact current-syscall owner and original PM APC claim before transferring the
+      bound main Reply into the saved pool. Publish without allocation, retaining original caller,
+      native Call/fault continuation and the actual syscall return status.
+    - [x] Keep an AwaitTail gate while the original syscall unwinds post-actions and cleanup.
+      Teardown records intent without destroying that active caller context; early caller-exit
+      branches cancel/release the gate explicitly. Only the normal tail may admit Stage/Send.
+    - [x] Use checked register/FP frame preparation, exact PM claim commit and separate saved-Reply
+      send/retirement effects. Preserve definite retry and uncertain no-replay behavior, and let
+      detached capability/claim cleanup outlive the runtime once context effects have settled.
+    - [x] Replace the old staging helper and Boolean main-Reply redirect path. Drive retained work
+      from the common service boundary and protect ingress/runtime teardown with exact ownership.
+      Remove the now-unused legacy APC context builder and migrate its remaining useful tests to
+      the shared checked codec; do not keep an alternative builder with omitted FP state.
+    - [x] Correct current wait admission so ready objects win before queued APCs, and preserve
+      STATUS_SUCCESS in the saved return context for APC-only NtTestAlert delivery. Per-mode thread
+      Alerted/UserApcPending state is a separate remaining NT alert-semantics gap, not supplied by
+      checking whether the APC queue is nonempty.
+    - [x] Retain completed teardown ownership until the outer service loop reconciles physical
+      runtime termination. A remote terminate may have stopped at AwaitTail or an entered context
+      effect. Retry the original thread/process generation without another syscall; do not mistake
+      temporarily blocked ingress for retired identity, or act on a replacement runtime.
+    - [x] Complete serialized validation: ten new contract tests, seven composed APC tests, 1,972
+      focused host/doc tests and 3,520 broad host/doc tests passed, with no failures or ignored
+      cases. Composed tests use real PM claims and AMD64 context preparation, checking native
+      Call/fault status and FP preservation, tail gating, teardown and same-numeric-ID replacement.
+      Physical TCB, capability and user-memory outcomes remain explicit host fixtures, not VM
+      execution. The executive release build passed in 35.21s with the unchanged 294 warnings.
+      Evidence: `.tmp/test-current-apc-contract-20260913.log`,
+      `.tmp/test-current-apc-composed-20260913.log`,
+      `.tmp/test-current-apc-focused-20260913.log`,
+      `.tmp/test-current-apc-full-20260913.log`, and
+      `.tmp/build-current-apc-executive-20260913.log`. All runners were serialized. Independent
+      reviews covered the native reply-tail/early-exit paths, queue and caller identity, checked
+      context installation, and delayed physical teardown reconciliation.
+
+    Review adjustment: saving an APC Reply is not sufficient while the original syscall is still
+    executing post-actions. AwaitTail is a context-lifetime barrier, and releasing it must also
+    restart physical teardown that an earlier remote termination deferred. Completed teardown
+    records therefore retain their original provenance through reconciliation even after their
+    APC claim and Reply have settled. They never authorize a replacement process/thread.
+
+    Ordinary signal/timeout Reply failures, non-APC object-wait teardown and inline terminal
+    Busy/reference failure retention remain open. Next, close ordinary wait Reply ownership and
+    teardown before extending per-mode Alerted/UserApcPending behavior and native APC fault
+    injection. No VM run or microkernel change occurred; the last measured 27 strict missing
+    win32k imports and genuine desktop acceptance remain open.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
