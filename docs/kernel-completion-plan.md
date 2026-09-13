@@ -33752,20 +33752,79 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         git diff --check pass. The remaining source acquisition, inline completion and rename
         target semantics below are explicitly open; this checkpoint does not close the parent
         File-set item or the last measured 27 strict win32k import blockers for native desktop.
-      - [ ] Move hosted SET payload allocation/copy under admitted ownership. NT5 qsinfo.c probes
-        before source authentication, acquires synchronous Busy (or async request resources), then
-        allocates/copies the payload after File event clear. Synchronous FilePosition is a special
-        fast path before event clear; add real canonical CurrentByteOffset rather than fabricating
-        an offset. Keep failures before dispatch distinct from completion publication. Source
-        create-option inspection in the name transaction must also accept an owned captured body
-        instead of requiring a fresh Open state after a reentrant callout.
-      - [ ] Correct inline SET completion semantics under acquisition. Class 30 association and
-        class 41 notification flags need the same ownership audit as IRP-producing operations.
-        NT5 internal.c IopCompleteRequest suppresses IOSB/event publication for immediate NT_ERROR
-        on the synchronous service tail; do not blanket-signal or publish every terminal status.
-        Wine ntdll/tests/file.c verifies the association error's unchanged IOSB sentinel and
-        successful association signaling. Class 41 is post-NT5; audit accepted/queryable flags
-        separately, including FILE_SKIP_SET_USER_EVENT_ON_FAST_IO.
+      - [x] Centralize hosted SET admission, ordinary payload capture and immediate completion
+        (2026-09-13; native-build/review verified, host validation below). The hosted entry now
+        acquires Busy/reference exactly once before payload allocation/copy. Ordinary requests clear
+        the File event before capture, including inline classes 30/41 and rename target resolution.
+        Dispatch helpers are acquired-only: their duplicate acquisition, event signaling and source
+        releases are removed. One terminal exit retains ownership through IOSB publication; genuine
+        pending publication transfers the owner instead. Allocation/copy, privilege and negative
+        scalar failures leave IOSB untouched and do not restore the File event. The shared
+        SetInformationCompletionPolicy replaces the local-only name without compatibility aliases;
+        local behavior is unchanged. Immediate non-error driver completions publish Information
+        before Status with a release fence, ignore store faults and signal asynchronous as well as
+        synchronous Files. NT_ERROR and PENDING do not publish an immediate completion. Class 30
+        retains its association-specific event suppression; pending asynchronous I/O keeps its
+        existing private completion delivery instead of acquiring immediate File signaling.
+        Executive release build, including the pending-origin fix below, passes in 38.44s with
+        the unchanged 294 warnings:
+        `.tmp/build-set-admission-executive-20260913.log`. Independent native review found no
+        introduced ownership/cleanup defects. This is not native execution or desktop evidence.
+      - [x] Finish serialized SET admission/shared-policy/composed host tests and broad regressions.
+        All 637 I/O-manager library tests, including pending-origin preservation, pass:
+        `.tmp/test-set-admission-library-20260913.log`. Seven new shared-policy tests cover
+        fallible capture, exact owned bytes, ordinary/position policy separation, IOSB store
+        ordering and partial-store failures. Three composed tests cover Busy/event-clear before
+        capture, copy faults retaining ownership through retirement, status-dependent immediate
+        completion in all I/O modes, and real queued-grant adoption before copying changed input.
+        The composed completion statuses are host fixture inputs, not native driver execution.
+        Focused formatting and git diff --check pass. The first broad run was stopped (no observed
+        test failures) after final transport review found pending-origin collapse; the corrective
+        checkpoint below must be validated before restarting broad regressions. Interrupted evidence:
+        `.tmp/test-set-admission-full-interrupted-20260913.log`.
+        The corrected run passes all 3,695 host/doc tests across 78 suites with no failures or ignored
+        cases: `.tmp/test-set-admission-full-20260913.log`. Focused formatting and git diff --check
+        also pass on the final changes. No VM was run: native completion-race execution, desktop
+        acceptance and the last measured 27 strict win32k imports remain separate open work.
+      - [x] Preserve driver-pending origin when completion occurs before dispatch returns
+        (2026-09-13; host/native-build and corrected broad regressions verified).
+        run_irp previously consumed CompletedDispatch and returned terminal status even when the
+        driver's original return was STATUS_PENDING. That could misclassify SET as immediate and
+        apply the wrong asynchronous File-event/IOSB policy. Transfer CompletedDispatch to READY
+        for an original pending return and use existing poll/ACK ownership, retaining the terminal
+        graph without replay. True immediate consumption remains unchanged. Canonical detached
+        dispatch already preserves completions observed during dispatch as pending-owned. The
+        dispatch_return policy explicitly takes original pending status; three new tests cover the
+        retained terminal/error payload, duplicate-completion rejection and unrelated/immediate
+        owner phases, while existing stopped/in-flight tests cover both original return kinds.
+        The final library/native-build evidence above includes this fix; do not infer original
+        dispatch status from final status. Native race execution remains unproven by these host tests.
+        Independent native review verifies no graph reads after READY publication, exclusive
+        poll/ACK consumption, and preservation of completion arriving before canonical dispatch
+        returns. The existing dispatch-flight guard prevents premature copy/ACK; no IRP is replayed.
+      - [ ] Implement the real synchronous FilePosition fast path before event clear. Add authoritative
+        CurrentByteOffset and device sector-size validation instead of fabricating an offset. The
+        current hosted class 14 still dispatches a real driver request; it now acquires before
+        capture but deliberately retains capture-before-event-clear ordering. It is excluded from
+        the completed ordinary-SET ordering claim and still lacks NT5's scalar-only fast path.
+        Prerequisite audit: FileRecord has no offset, while the persistent provider WDM FILE_OBJECT
+        can hold driver-updated CurrentByteOffset with no state roundtrip (driver_launch.rs provider
+        File creation; wdm_x64.rs write_wdm_file_object). Establish one authoritative offset through
+        checked File/device scalar-state transport, or synchronize canonical state on dispatch and
+        genuine completion, including pending completion before Busy release. Do not add competing
+        unsynchronized offsets. DeviceRecord also lacks sector size; native driver alignment changes
+        are not currently published. Export live geometry through authenticated device ownership.
+        Explicitly translate File I/O flags: internal SYNCHRONOUS_IO is not raw FO_SYNCHRONOUS_IO.
+        Hosted null/sentinel read/write offsets must use the same authoritative state under Busy;
+        they currently pass captured offset_value directly, including null becoming zero. Keep
+        asynchronous position requests on the provider path and preserve the special synchronous
+        position event/IOSB behavior when the fast path is implemented.
+      - [ ] Replace fresh-open source create-option inspection in name transactions with an owned
+        body accessor. A retained File must not become unreadable merely because CLEANUP ran during
+        a reentrant callout. Do not add a device-alignment dependency just to read create options.
+      - [ ] Audit class 41 accepted/queryable notification flags separately against Windows tests,
+        including FILE_SKIP_SET_USER_EVENT_ON_FAST_IO. It is post-NT5; shared acquisition and
+        immediate completion do not close flag-value compatibility.
       - [ ] Replace direct RootDirectory-as-target routing with the real relative target-parent
         CREATE. NT5 qsinfo.c:1450 and internal.c:5398 open the complete relative name with its root,
         IO_OPEN_TARGET_DIRECTORY and IO_FORCE_ACCESS_CHECK, write/add-subdirectory plus SYNCHRONIZE

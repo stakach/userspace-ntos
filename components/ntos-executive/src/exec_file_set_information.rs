@@ -24,9 +24,11 @@ impl ExecNtHandler {
             Ok(None) => unreachable!("local SET File lost its typed route"),
             Err(status) => return Some(status),
         };
-        let policy =
-            nt_io_manager::LocalSetInformationPolicy::capture(information_class, route.synchronous);
-        let value = nt_io_manager::validate_local_set_information_value(information_class, payload);
+        let policy = nt_io_manager::SetInformationCompletionPolicy::capture(
+            information_class,
+            route.synchronous,
+        );
+        let value = nt_io_manager::validate_set_information_value(information_class, payload);
         if !policy.resets_file_signal() {
             if let Err(status) = value {
                 return Some(status.raw() as u32);

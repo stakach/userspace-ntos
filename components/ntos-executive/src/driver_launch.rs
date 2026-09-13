@@ -35052,7 +35052,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 // again before the originating dispatch returned. Transfer the graph to the
                 // asynchronous owner irrespective of the lower driver's immediate return status.
                 let pending_phase = nt_io_manager::CompletionOwnerPhase::StoppedDispatch
-                    .dispatch_handoff()
+                    .dispatch_return(ret as u32 == STATUS_PENDING)
                     .expect("stopped completion has no dispatch handoff");
                 let pending =
                     hosted_irp_state_with_kind(state, completion_owner_kind(pending_phase));
@@ -35069,6 +35069,20 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 return (STATUS_PENDING as i32, 0);
             }
             HOSTED_IRP_COMPLETED_DISPATCH => {
+                if let Some(phase) = nt_io_manager::CompletionOwnerPhase::CompletedDispatch
+                    .dispatch_return(ret as u32 == STATUS_PENDING)
+                {
+                    let ready = hosted_irp_state_with_kind(state, completion_owner_kind(phase));
+                    if pending_irp_owner_state(owner_node)
+                        .compare_exchange(state, ready, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    // Completion raced ahead of the driver's STATUS_PENDING return. Preserve
+                    // that origin and let the ordinary poll/ACK owner retire the terminal graph.
+                    return (STATUS_PENDING as i32, 0);
+                }
                 let consuming = hosted_irp_state_with_kind(state, HOSTED_IRP_CONSUMING);
                 if pending_irp_owner_state(owner_node)
                     .compare_exchange(state, consuming, Ordering::AcqRel, Ordering::Acquire)
@@ -35095,7 +35109,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 // this final return edge; the completer will publish READY and this actor will not
                 // touch the graph again.
                 let deferred_phase = nt_io_manager::CompletionOwnerPhase::CompletingDispatch
-                    .dispatch_handoff()
+                    .dispatch_return(ret as u32 == STATUS_PENDING)
                     .expect("in-flight completion has no dispatch handoff");
                 let deferred =
                     hosted_irp_state_with_kind(state, completion_owner_kind(deferred_phase));

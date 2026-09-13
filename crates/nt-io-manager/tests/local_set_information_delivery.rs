@@ -37,7 +37,12 @@ fn payload(class: u32) -> Vec<u8> {
     }
 }
 
-fn terminal(id: u64, file: LocalFileObject, policy: LocalSetInformationPolicy, status: u32) -> PendingFileIo {
+fn terminal(
+    id: u64,
+    file: LocalFileObject,
+    policy: SetInformationCompletionPolicy,
+    status: u32,
+) -> PendingFileIo {
     PendingFileIo {
         route: PendingFileRoute::Local(file),
         irp_id: id,
@@ -140,9 +145,9 @@ fn accepted_metadata_name_and_position_changes_survive_iosb_and_reply_retry() {
             for retry in [false, true] {
                 for store in [0, 1] {
                     let (mut fs, handle) = file(synchronous);
-                    let policy = LocalSetInformationPolicy::capture(class, synchronous);
+                    let policy = SetInformationCompletionPolicy::capture(class, synchronous);
                     let bytes = payload(class);
-                    validate_local_set_information_value(class, &bytes).unwrap();
+                    validate_set_information_value(class, &bytes).unwrap();
                     let mut table = PendingFileIoTable::new();
                     let reservation = table.reserve().unwrap();
                     let id = table.local_operation_id(reservation).unwrap();
@@ -254,7 +259,7 @@ fn negative_signed_scalar_uses_fast_or_dispatched_error_timing_without_mutation(
             for value in [-1i64, i64::MIN] {
                 let (mut fs, handle) = file(synchronous);
                 let before = fs.query_file_object_information(handle).unwrap();
-                let policy = LocalSetInformationPolicy::capture(class, synchronous);
+                let policy = SetInformationCompletionPolicy::capture(class, synchronous);
                 let mut table = PendingFileIoTable::new();
                 let reservation = if policy.resets_file_signal() {
                     let reservation = table.reserve().unwrap();
@@ -263,7 +268,7 @@ fn negative_signed_scalar_uses_fast_or_dispatched_error_timing_without_mutation(
                 } else {
                     None
                 };
-                let validation = validate_local_set_information_value(class, &value.to_le_bytes());
+                let validation = validate_set_information_value(class, &value.to_le_bytes());
                 assert_eq!(validation, Err(nt_status::NtStatus::INVALID_PARAMETER));
                 assert_eq!(fs.query_file_object_information(handle).unwrap(), before);
                 assert_eq!(
@@ -318,13 +323,13 @@ fn readonly_fast_position_retains_without_reset_or_signal_even_after_iosb_fault(
             )
             .unwrap();
         files.set_signaled(object, signaled).unwrap();
-        let policy = LocalSetInformationPolicy::capture(FILE_POSITION_INFORMATION, true);
+        let policy = SetInformationCompletionPolicy::capture(FILE_POSITION_INFORMATION, true);
         assert!(!policy.resets_file_signal());
         let mut table = PendingFileIoTable::new();
         let reservation = table.reserve().unwrap();
         let id = table.local_operation_id(reservation).unwrap();
         let bytes = 53i64.to_le_bytes();
-        validate_local_set_information_value(FILE_POSITION_INFORMATION, &bytes).unwrap();
+        validate_set_information_value(FILE_POSITION_INFORMATION, &bytes).unwrap();
         files.retain_io(object).unwrap();
         files.get_mut(object).unwrap().current_offset = u64::from_le_bytes(bytes);
         assert_eq!(files.is_signaled(object), Ok(signaled));
@@ -367,7 +372,7 @@ fn readonly_fast_position_retains_without_reset_or_signal_even_after_iosb_fault(
 #[test]
 fn abandoned_completed_rename_keeps_namespace_change_and_releases_exact_reference() {
     let (mut fs, handle) = file(false);
-    let policy = LocalSetInformationPolicy::capture(FILE_RENAME_INFORMATION, false);
+    let policy = SetInformationCompletionPolicy::capture(FILE_RENAME_INFORMATION, false);
     let mut table = PendingFileIoTable::new();
     let reservation = table.reserve().unwrap();
     let id = table.local_operation_id(reservation).unwrap();

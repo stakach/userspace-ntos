@@ -50,7 +50,7 @@ mod hosted_device_pointer;
 pub mod inline_file_retirement;
 mod irp;
 mod lock_control;
-mod local_set_information;
+mod set_information_completion;
 mod mock_driver;
 mod object_port;
 mod open;
@@ -140,8 +140,9 @@ pub use lock_control::{
     lock_control_access_granted, LockControlParameters, IRP_MN_LOCK, IRP_MN_UNLOCK_SINGLE,
     SL_EXCLUSIVE_LOCK, SL_FAIL_IMMEDIATELY,
 };
-pub use local_set_information::{
-    validate_local_set_information_value, LocalSetInformationPolicy,
+pub use set_information_completion::{
+    capture_set_information_payload, publish_immediate_set_iosb, validate_set_information_value,
+    SetInformationCompletionPolicy,
 };
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};

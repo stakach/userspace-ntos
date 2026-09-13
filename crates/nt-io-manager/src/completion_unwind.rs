@@ -138,11 +138,13 @@ impl CompletionOwnerClaim {
 }
 
 impl CompletionOwnerPhase {
-    /// Transfer a retained inline unwind when the originating dispatch returns.
-    pub const fn dispatch_handoff(self) -> Option<Self> {
+    /// Transfer retained completion ownership when the originating dispatch returns.
+    /// A terminal result stays asynchronous if its driver returned STATUS_PENDING.
+    pub const fn dispatch_return(self, returned_pending: bool) -> Option<Self> {
         match self {
             Self::StoppedDispatch => Some(Self::Pending),
             Self::CompletingDispatch => Some(Self::CompletingDeferred),
+            Self::CompletedDispatch if returned_pending => Some(Self::Ready),
             _ => None,
         }
     }
@@ -407,24 +409,28 @@ mod tests {
     fn stopped_dispatch_becomes_async_only_when_dispatch_returns() {
         let first = CompletionOwnerClaim::begin(CompletionOwnerPhase::Dispatching).unwrap();
         let stopped = first.release(CompletionClaimRelease::Stop, false);
-        let pending = stopped.dispatch_handoff().unwrap();
-        assert_eq!(pending, CompletionOwnerPhase::Pending);
+        for returned_pending in [false, true] {
+            let pending = stopped.dispatch_return(returned_pending).unwrap();
+            assert_eq!(pending, CompletionOwnerPhase::Pending);
 
-        let later = CompletionOwnerClaim::begin(pending).unwrap();
-        assert_eq!(later.claimed(), CompletionOwnerPhase::CompletingPending);
-        assert_eq!(
-            later.release(CompletionClaimRelease::Terminal, false),
-            CompletionOwnerPhase::Ready
-        );
+            let later = CompletionOwnerClaim::begin(pending).unwrap();
+            assert_eq!(later.claimed(), CompletionOwnerPhase::CompletingPending);
+            assert_eq!(
+                later.release(CompletionClaimRelease::Terminal, false),
+                CompletionOwnerPhase::Ready
+            );
+        }
     }
 
     #[test]
     fn caller_handoff_during_completion_resolves_without_origin_race() {
         let claim = CompletionOwnerClaim::begin(CompletionOwnerPhase::Dispatching).unwrap();
-        assert_eq!(
-            claim.claimed().dispatch_handoff(),
-            Some(CompletionOwnerPhase::CompletingDeferred)
-        );
+        for returned_pending in [false, true] {
+            assert_eq!(
+                claim.claimed().dispatch_return(returned_pending),
+                Some(CompletionOwnerPhase::CompletingDeferred)
+            );
+        }
         assert_eq!(
             claim.release(CompletionClaimRelease::Stop, true),
             CompletionOwnerPhase::Pending
@@ -437,6 +443,55 @@ mod tests {
             claim.release(CompletionClaimRelease::Terminal, true),
             CompletionOwnerPhase::Ready
         );
+    }
+
+    #[test]
+    fn completion_before_pending_return_preserves_terminal_payload_for_delivery() {
+        let claim = CompletionOwnerClaim::begin(CompletionOwnerPhase::Dispatching).unwrap();
+        let mut payload = crate::RetainedIrpCompletion::pending();
+        payload
+            .complete(7, 0xc000_0001, 16, 0x1000, 0x2000, 16, 0x70)
+            .unwrap();
+        let terminal = payload.completed().unwrap();
+        let completed = claim.release(CompletionClaimRelease::Terminal, false);
+        assert_eq!(completed, CompletionOwnerPhase::CompletedDispatch);
+        assert!(CompletionOwnerClaim::begin(completed).is_none());
+
+        let ready = completed.dispatch_return(true).unwrap();
+        assert_eq!(ready, CompletionOwnerPhase::Ready);
+        assert_eq!(payload.completed(), Some(terminal));
+        assert!(CompletionOwnerClaim::begin(ready).is_none());
+        assert_eq!(
+            payload.complete(8, 0, 0, 0, 0, 0, 0),
+            Err(crate::RetainedCompletionError::AlreadyCompleted)
+        );
+        assert_eq!(payload.completed(), Some(terminal));
+        assert_eq!(ready.dispatch_return(true), None);
+    }
+
+    #[test]
+    fn completed_nonpending_dispatch_remains_available_for_inline_consumption() {
+        let claim = CompletionOwnerClaim::begin(CompletionOwnerPhase::Dispatching).unwrap();
+        let completed = claim.release(CompletionClaimRelease::Terminal, false);
+        assert_eq!(completed.dispatch_return(false), None);
+        assert!(CompletionOwnerClaim::begin(completed).is_none());
+    }
+
+    #[test]
+    fn unrelated_owner_phases_do_not_accept_dispatch_return() {
+        for phase in [
+            CompletionOwnerPhase::Dispatching,
+            CompletionOwnerPhase::Pending,
+            CompletionOwnerPhase::CancelRoutine,
+            CompletionOwnerPhase::CompletingPending,
+            CompletionOwnerPhase::CompletingCancel,
+            CompletionOwnerPhase::Ready,
+            CompletionOwnerPhase::CompletedCancel,
+            CompletionOwnerPhase::CompletingDeferred,
+        ] {
+            assert_eq!(phase.dispatch_return(false), None);
+            assert_eq!(phase.dispatch_return(true), None);
+        }
     }
 
     #[test]

@@ -43304,6 +43304,11 @@ impl ExecNtHandler {
                     Ok(capture) => capture,
                     Err(status) => return status,
                 };
+                if let Some(capture) = capture.as_ref() {
+                    return self.set_hosted_file_information(
+                        args[0], iosb, args[2], length, information_class, capture,
+                    );
+                }
                 let mut payload = match try_zeroed_transfer_buffer(length) {
                     Ok(payload) => payload,
                     Err(status) => return status,
@@ -43311,34 +43316,9 @@ impl ExecNtHandler {
                 if length != 0 && (args[2] == 0 || !self.xas_read(args[2], &mut payload)) {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                if NT_SET_INFORMATION_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
-                    print_str(b"[nt-set-information-file] pi=");
-                    print_u64(self.pi as u64);
-                    print_str(b" handle=0x");
-                    print_hex(args[0] as u32);
-                    print_str(b" class=");
-                    print_u64(information_class as u64);
-                    print_str(b" length=");
-                    print_u64(length as u64);
-                    if information_class == 23 && payload.len() >= 8 {
-                        print_str(b" read_mode=");
-                        print_u64(u32::from_le_bytes(payload[0..4].try_into().unwrap()) as u64);
-                        print_str(b" completion_mode=");
-                        print_u64(u32::from_le_bytes(payload[4..8].try_into().unwrap()) as u64);
-                    }
-                    print_str(b" payload=");
-                    for &byte in payload.iter().take(64) {
-                        print_hex(byte as u32);
-                        debug_put_char(b' ');
-                    }
-                    print_str(b"\n");
-                }
-                let granted_access = match capture.as_ref() {
-                    Some(capture) => capture.granted_access,
-                    None => match self.hosted_file_access_for(args[0]) {
-                        Some(access) => access,
-                        None => return nt_fs::STATUS_INVALID_HANDLE,
-                    },
+                self.trace_set_information_payload(args[0], information_class, &payload);
+                let Some(granted_access) = self.hosted_file_access_for(args[0]) else {
+                    return nt_fs::STATUS_INVALID_HANDLE;
                 };
                 if !contract.access_granted(nt_types::AccessMask::from_bits_retain(granted_access))
                 {
@@ -43349,198 +43329,12 @@ impl ExecNtHandler {
                 {
                     return STATUS_PRIVILEGE_NOT_HELD;
                 }
-                if capture.is_none() {
-                    if let Some(status) = self.try_set_local_file_information(
-                        args[0], iosb, information_class, &payload,
-                    ) {
-                        return status;
-                    }
+                if let Some(status) = self.try_set_local_file_information(
+                    args[0], iosb, information_class, &payload,
+                ) {
+                    return status;
                 }
-                let Some(capture) = capture.as_ref() else {
-                    return nt_fs::STATUS_INVALID_HANDLE;
-                };
-                let mut information = 0u64;
-                let status = match information_class {
-                    23 if length < 8 => nt_fs::STATUS_INFO_LENGTH_MISMATCH,
-                    30 => {
-                        const IO_COMPLETION_MODIFY_STATE: u32 = 0x2;
-                        if length < 16 {
-                            0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
-                        } else {
-                            let file_id = capture.route.file_id;
-                            if file_id == 0 {
-                                0xC000_0008 // STATUS_INVALID_HANDLE
-                            } else if let Err(status) = self.file_completion.can_associate(file_id)
-                            {
-                                status
-                            } else {
-                                let port_handle =
-                                    u64::from_le_bytes(payload[0..8].try_into().unwrap());
-                                let key_context =
-                                    u64::from_le_bytes(payload[8..16].try_into().unwrap());
-                                match self
-                                    .io_completion_id_for(port_handle, IO_COMPLETION_MODIFY_STATE)
-                                {
-                                    Err(status) => status,
-                                    Ok(port_id) => match self.io_completion_ports.retain(port_id) {
-                                        Err(status) => status,
-                                        Ok(()) => {
-                                            let binding = nt_io_completion::FileCompletionBinding {
-                                                port_id,
-                                                key_context,
-                                            };
-                                            match self.file_completion.associate(file_id, binding) {
-                                                Ok(()) => {
-                                                    if self
-                                                        .file_completion
-                                                        .signal_on_completion_association(file_id)
-                                                        .unwrap_or(false)
-                                                    {
-                                                        let _ = wait_wake_dispatcher_set(self);
-                                                    }
-                                                    nt_io_completion::STATUS_SUCCESS
-                                                }
-                                                Err(status) => {
-                                                    self.release_io_completion_reference(port_id);
-                                                    status
-                                                }
-                                            }
-                                        }
-                                    },
-                                }
-                            }
-                        }
-                    }
-                    41 => {
-                        if length < 4 {
-                            0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
-                        } else {
-                            let file_id = capture.route.file_id;
-                            if file_id == 0 {
-                                0xC000_0008 // STATUS_INVALID_HANDLE
-                            } else {
-                                let flags = u32::from_le_bytes(payload[0..4].try_into().unwrap());
-                                match self.file_completion.set_notification_modes(file_id, flags) {
-                                    Ok(_) => nt_io_completion::STATUS_SUCCESS,
-                                    Err(status) => status,
-                                }
-                            }
-                        }
-                    }
-                    _ => {
-                        let route = capture.route;
-                        let mut open_parent_name = [0u16; FILE_OBJECT_NAME_CAP];
-                        let target = match information_class {
-                            nt_fs::FILE_RENAME_INFORMATION | nt_fs::FILE_LINK_INFORMATION => {
-                                match nt_fs::parse_set_file_name_information(&payload) {
-                                    Err(status) => Err(status),
-                                    Ok(set_name) => self
-                                        .resolve_hosted_set_file_name_target(
-                                            route,
-                                            set_name.root_directory,
-                                            set_name.file_name,
-                                            &mut open_parent_name,
-                                        )
-                                        .map(|target| {
-                                            (
-                                                target,
-                                                nt_io_manager::SetInformationControl::ReplaceIfExists(
-                                                    set_name.replace_if_exists,
-                                                ),
-                                            )
-                                        }),
-                                }
-                            }
-                            nt_fs::FILE_MOVE_CLUSTER_INFORMATION => {
-                                match nt_fs::parse_move_cluster_information(&payload) {
-                                    Err(status) => Err(status),
-                                    Ok(move_cluster) => self
-                                        .resolve_hosted_set_file_name_target(
-                                            route,
-                                            move_cluster.root_directory,
-                                            move_cluster.file_name,
-                                            &mut open_parent_name,
-                                        )
-                                        .map(|target| {
-                                            (
-                                                target,
-                                                nt_io_manager::SetInformationControl::ClusterCount(
-                                                    move_cluster.cluster_count,
-                                                ),
-                                            )
-                                        }),
-                                }
-                            }
-                            _ => Ok((
-                                HostedSetFileNameTarget::SourceParent,
-                                nt_io_manager::SetInformationControl::None,
-                            )),
-                        };
-                        match target {
-                            Err(status) => status,
-                            Ok((target, control)) => {
-                                if matches!(
-                                    information_class,
-                                    nt_fs::FILE_RENAME_INFORMATION
-                                        | nt_fs::FILE_LINK_INFORMATION
-                                        | nt_fs::FILE_MOVE_CLUSTER_INFORMATION
-                                ) {
-                                    payload[8..16].fill(0);
-                                }
-                                if let HostedSetFileNameTarget::OpenParent(name_len) = target {
-                                    let (status, completed) = match self
-                                        .service_hosted_set_file_name_with_open_parent(
-                                            args[0],
-                                            iosb,
-                                            capture,
-                                            information_class,
-                                            control,
-                                            &open_parent_name[..name_len],
-                                            payload,
-                                        ) {
-                                            Ok(result) => result,
-                                            Err(status) => return status,
-                                        };
-                                    information = completed;
-                                    if status == STATUS_PENDING {
-                                        return STATUS_PENDING;
-                                    }
-                                    status
-                                } else {
-                                    let target_file = match target {
-                                        HostedSetFileNameTarget::SourceParent => None,
-                                        HostedSetFileNameTarget::Canonical(file_id) => {
-                                            Some(file_id)
-                                        }
-                                        HostedSetFileNameTarget::OpenParent(_) => unreachable!(),
-                                    };
-                                    let parameters = nt_io_manager::SetInformationParameters {
-                                        info_class: information_class,
-                                        length: length as u32,
-                                        target_file: target_file.map(nt_io_abi::FileId),
-                                        control,
-                                    };
-                                    let (status, completed) = match self.service_hosted_set_information(
-                                        args[0], iosb, capture, parameters, &payload,
-                                    ) {
-                                        Ok(result) => result,
-                                        Err(status) => return status,
-                                    };
-                                    information = completed;
-                                    if status == STATUS_PENDING {
-                                        return STATUS_PENDING;
-                                    }
-                                    status
-                                }
-                            }
-                        }
-                    }
-                };
-                if iosb != 0 {
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &information.to_le_bytes());
-                }
-                status
+                nt_fs::STATUS_INVALID_HANDLE
             },
             // NtFlushBuffersFile flushes local mapped data and the filesystem checkpoint, or routes
             // a typed pipe handle through isolated npfs's real IRP_MJ_FLUSH_BUFFERS. NPFS may pend the
