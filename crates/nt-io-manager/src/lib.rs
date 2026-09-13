@@ -42,6 +42,7 @@ pub mod detached_file_irp;
 mod fault;
 mod file;
 mod file_reference;
+pub mod file_io_capture;
 mod file_information;
 mod hosted_domain;
 mod hosted_device_pointer;

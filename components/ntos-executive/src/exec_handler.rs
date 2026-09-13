@@ -11,6 +11,9 @@ use nt_io_manager::{LocalFileObject, PendingFileRoute};
 #[path = "exec_file_flush.rs"]
 mod file_flush;
 
+#[path = "exec_file_capture.rs"]
+mod file_capture;
+
 #[path = "exec_file_set_information.rs"]
 mod file_set_information;
 
@@ -13834,40 +13837,15 @@ impl ExecNtHandler {
             return STATUS_ACCESS_VIOLATION;
         }
 
-        if args[0] > u32::MAX as u64 {
-            self.write_current_iosb(iosb, STATUS_INVALID_HANDLE, 0);
-            return STATUS_INVALID_HANDLE;
-        }
-        let handle = args[0] as nt_process::Handle;
-        let access = match self.hosted_file_access_for(args[0]) {
-            Some(access) => access,
-            None => {
-                self.write_current_iosb(iosb, STATUS_INVALID_HANDLE, 0);
-                return STATUS_INVALID_HANDLE;
+        let capture = match self.capture_hosted_file(args[0]) {
+            Ok(capture) => capture,
+            Err(status) => {
+                self.write_current_iosb(iosb, status, 0);
+                return status;
             }
         };
-        let route = match self.hosted_file_route_for(args[0]) {
-            Some(route) => route,
-            None => match self
-                .pm_pid_for_pi(self.pi)
-                .and_then(|pid| self.pm.lookup_handle(pid, handle))
-            {
-                Some(nt_process::HandleObject::DiskFile { .. })
-                | Some(nt_process::HandleObject::Directory { .. })
-                | Some(nt_process::HandleObject::OverlayFile(_)) => {
-                    self.write_current_iosb(iosb, STATUS_INVALID_DEVICE_REQUEST, 0);
-                    return STATUS_INVALID_DEVICE_REQUEST;
-                }
-                Some(_) => {
-                    self.write_current_iosb(iosb, STATUS_OBJECT_TYPE_MISMATCH, 0);
-                    return STATUS_OBJECT_TYPE_MISMATCH;
-                }
-                None => {
-                    self.write_current_iosb(iosb, STATUS_INVALID_HANDLE, 0);
-                    return STATUS_INVALID_HANDLE;
-                }
-            },
-        };
+        let route = capture.route;
+        let access = capture.granted_access;
         let synchronous_file = match self.file_completion.is_synchronous(route.file_id) {
             Ok(synchronous) => synchronous,
             Err(status) => {
@@ -29805,67 +29783,6 @@ impl ExecNtHandler {
         }
     }
 
-    /// Resolve a typed pipe handle and enforce the write access granted at create/open time.
-    pub(crate) fn npfs_write_file_route_for(&self, handle: u64) -> Result<HostedFileRoute, u32> {
-        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
-        const FILE_WRITE_DATA: u32 = 0x0000_0002;
-        const FILE_APPEND_DATA: u32 = 0x0000_0004;
-        const GENERIC_WRITE: u32 = 0x4000_0000;
-        const GENERIC_ALL: u32 = 0x1000_0000;
-
-        let route = self
-            .hosted_file_route_for(handle)
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        let access = self
-            .hosted_file_access_for(handle)
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        if access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL) == 0 {
-            return Err(STATUS_ACCESS_DENIED);
-        }
-        Ok(route)
-    }
-
-    /// Resolve a typed named-pipe handle for `NtFlushBuffersFile`. ReactOS's I/O manager requires
-    /// write-data access for named pipes (append-data is deliberately excluded because that bit is
-    /// `FILE_CREATE_PIPE_INSTANCE` in the pipe namespace). Generic access is retained in our handle
-    /// table, so accept the generic write/all grants until object creation performs generic mapping.
-    pub(crate) fn npfs_flush_file_route_for(&self, handle: u64) -> Result<HostedFileRoute, u32> {
-        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
-
-        let route = self
-            .hosted_file_route_for(handle)
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        let access = self
-            .hosted_file_access_for(handle)
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        if !nt_fs::file_flush_access_allowed(access, true) {
-            return Err(STATUS_ACCESS_DENIED);
-        }
-        Ok(route)
-    }
-
-    /// Resolve a typed pipe handle and enforce read access granted at create/open time.
-    pub(crate) fn npfs_read_file_route_for(&self, handle: u64) -> Result<HostedFileRoute, u32> {
-        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
-        const FILE_READ_DATA: u32 = 0x0000_0001;
-        const GENERIC_READ: u32 = 0x8000_0000;
-        const GENERIC_ALL: u32 = 0x1000_0000;
-
-        let route = self
-            .hosted_file_route_for(handle)
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        let access = self
-            .hosted_file_access_for(handle)
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        if access & (FILE_READ_DATA | GENERIC_READ | GENERIC_ALL) == 0 {
-            return Err(STATUS_ACCESS_DENIED);
-        }
-        Ok(route)
-    }
-
     /// Reference an optional file-I/O event with EVENT_MODIFY_STATE and clear it before the IRP is
     /// issued. NT callers may set the low bit of `OVERLAPPED.hEvent` to suppress completion-port
     /// notification; the event object remains the untagged handle. Legacy opaque wait handles are
@@ -35946,29 +35863,18 @@ impl ExecNtHandler {
                 let is_pipe_listen = (fsctl as u32) == FSCTL_PIPE_LISTEN;
                 let raw_input_len = nt_ulong_arg(args[7]) as usize;
                 let raw_output_len = nt_ulong_arg(args[9]) as usize;
-                let file_route = self.hosted_file_route_for(args[0]);
-                let fid = file_route.map(|route| route.file_id).unwrap_or(0);
-                let fs_context = file_route.map(|route| route.fs_context).unwrap_or(0);
+                let capture = match self.capture_hosted_file(args[0]) {
+                    Ok(capture) => capture,
+                    Err(status) => return status,
+                };
+                let route = capture.route;
+                let fid = route.file_id;
+                let fs_context = route.fs_context;
                 let is_pipe_transceive = (fsctl as u32) == FSCTL_PIPE_TRANSCEIVE;
-                if file_route.is_none() {
-                    return STATUS_INVALID_HANDLE;
+                if !io_control_access_granted(capture.granted_access, fsctl as u32) {
+                    return STATUS_ACCESS_DENIED;
                 }
-                if let Some(route) = file_route {
-                    if args[0] > u32::MAX as u64 {
-                        return STATUS_INVALID_HANDLE;
-                    }
-                    let granted = match self.hosted_file_access_for(args[0]) {
-                        Some(granted) => granted,
-                        None => return STATUS_INVALID_HANDLE,
-                    };
-                    if !io_control_access_granted(granted, fsctl as u32) {
-                        return STATUS_ACCESS_DENIED;
-                    }
-                    debug_assert_eq!(route.file_id, fid);
-                }
-                if file_route.is_some_and(|route| {
-                    args[2] != 0 && self.file_completion.binding(route.file_id).is_some()
-                }) {
+                if args[2] != 0 && self.file_completion.binding(fid).is_some() {
                     return STATUS_INVALID_PARAMETER;
                 }
                 if is_pipe_listen {
@@ -35979,16 +35885,15 @@ impl ExecNtHandler {
                         return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
                     }
                 }
-                if file_route.is_some()
-                    && ((raw_input_len != 0 && args[6] == 0)
-                        || (raw_output_len != 0
-                            && !self.probe_user_output(args[8], raw_output_len)))
+                if (raw_input_len != 0 && args[6] == 0)
+                    || (raw_output_len != 0
+                        && !self.probe_user_output(args[8], raw_output_len))
                 {
                     return STATUS_ACCESS_VIOLATION;
                 }
                 let generic_synchronous_file = match self
                     .file_completion
-                    .is_synchronous(file_route.expect("validated File route").file_id)
+                    .is_synchronous(fid)
                 {
                     Ok(synchronous) => synchronous,
                     Err(status) => return status,
@@ -36013,7 +35918,7 @@ impl ExecNtHandler {
                 let mut generic_pending = false;
                 let mut pending_endpoint_irp_id = 0u64;
                 let mut routed_hosted_fsctl = false;
-                if let Some(route) = file_route {
+                {
                     let input_len = raw_input_len;
                     let output_len = raw_output_len;
                     let mut input = match try_zeroed_transfer_buffer(input_len) {
@@ -36037,12 +35942,9 @@ impl ExecNtHandler {
                     if !input_ok || !output_ok {
                         status = STATUS_ACCESS_VIOLATION as u64;
                     } else {
-                        let granted = self
-                            .hosted_file_access_for(args[0])
-                            .ok_or(STATUS_INVALID_HANDLE);
-                        let prepared = match granted.and_then(|granted| {
-                            self.prepare_hosted_file_io(route, args[0], granted)
-                        }) {
+                        let prepared = match self.prepare_hosted_file_io(
+                            route, args[0], capture.granted_access,
+                        ) {
                             Err(status) => Err(status),
                             Ok(false) => return STATUS_PENDING,
                             Ok(true) => {
@@ -36097,8 +35999,6 @@ impl ExecNtHandler {
                             }
                         }
                     }
-                } else {
-                    status = STATUS_INVALID_HANDLE as u64;
                 }
                 if generic_file_retained && (status as u32) == STATUS_PENDING {
                     if pending_endpoint_irp_id == 0 {
@@ -42981,6 +42881,18 @@ impl ExecNtHandler {
                 if let Err(status) = self.probe_file_io_output(iosb, None) {
                     return status;
                 }
+                // A promoted File grant is authoritative even if the process handle was reused.
+                // Capture fresh hosted identity/access before any offset, key or payload copyin.
+                let overlay_file = if self.active_synchronous_file_retry.is_none()
+                    && nt_process::Handle::try_from(fh).is_ok()
+                {
+                    self.overlay_file_id_for(fh)
+                } else {
+                    None
+                };
+                let overlay_access = overlay_file.and_then(|_| self.hosted_file_access_for(fh));
+                let hosted_write_capture = overlay_file.is_none()
+                    .then(|| self.capture_hosted_file_transfer(fh, true));
                 let trace = NT_WRITE_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8;
                 let mut offset_bytes = [0u8; 8];
                 let offset_ok = byte_offset == 0 || self.xas_read(byte_offset, &mut offset_bytes);
@@ -42991,18 +42903,16 @@ impl ExecNtHandler {
                 let mut key_bytes = [0u8; 4];
                 let key_ok = key == 0 || self.xas_read(key, &mut key_bytes);
                 let key_value = u32::from_le_bytes(key_bytes);
-                let apc_completion_conflict =
-                    self.npfs_write_file_route_for(fh)
-                        .ok()
-                        .is_some_and(|route| {
-                            apc_routine != 0
-                                && self.file_completion.binding(route.file_id).is_some()
-                        });
+                let apc_completion_conflict = hosted_write_capture
+                    .as_ref()
+                    .and_then(|capture| capture.as_ref().ok())
+                    .is_some_and(|(capture, _)| {
+                        apc_routine != 0
+                            && self.file_completion.binding(capture.route.file_id).is_some()
+                    });
                 // The writable overlay keeps its existing copy-loop staging bound. Hosted drivers
                 // stream arbitrary ULONG-sized requests through their per-instance transfer bank.
                 const OVERLAY_IO_CAP: usize = LOCAL_FILE_TRANSFER_CAP;
-                let overlay_file = self.overlay_file_id_for(fh);
-                let overlay_access = overlay_file.and_then(|_| self.hosted_file_access_for(fh));
                 let overlay_write_access = overlay_file.is_none()
                     || overlay_access.is_some_and(|access| {
                         access & (0x0000_0002 | 0x0000_0004 | 0x4000_0000 | 0x1000_0000) != 0
@@ -43131,16 +43041,17 @@ impl ExecNtHandler {
                                     _ => nt_fs::STATUS_INVALID_HANDLE,
                                 }
                             } else {
-                                match self.npfs_write_file_route_for(fh) {
-                                    Err(handle_status) => handle_status,
-                                    Ok(route) => {
+                                match hosted_write_capture
+                                    .as_ref()
+                                    .expect("nonlocal write retains its admitted capture")
+                                {
+                                    Err(handle_status) => *handle_status,
+                                    Ok((capture, mode)) => {
+                                        let route = capture.route;
                                         let file_id = route.file_id;
                                         completion_file_id = file_id;
                                         routed_fs_context = route.fs_context;
-                                        let synchronous = self
-                                            .file_completion
-                                            .is_synchronous(file_id)
-                                            .unwrap_or(true);
+                                        let synchronous = mode.is_synchronous();
                                         let sync_reply_capacity = if synchronous {
                                             REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
                                                 && wait_reply_pool_has_free()
@@ -43155,12 +43066,9 @@ impl ExecNtHandler {
                                         let prepared = if !owner_capacity || !sync_reply_capacity {
                                             Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
                                         } else {
-                                            let granted = self
-                                                .hosted_file_access_for(fh)
-                                                .ok_or(nt_fs::STATUS_INVALID_HANDLE);
-                                            match granted.and_then(|granted| {
-                                                self.prepare_hosted_file_io(route, fh, granted)
-                                            }) {
+                                            match self.prepare_hosted_file_io(
+                                                route, fh, capture.granted_access,
+                                            ) {
                                                 Err(status) => Err(status),
                                                 Ok(false) => return STATUS_PENDING,
                                                 Ok(true) => {
@@ -43220,10 +43128,12 @@ impl ExecNtHandler {
                     information = 0;
                 }
                 if routed && status == STATUS_PENDING {
-                    let synchronous = self
-                        .file_completion
-                        .is_synchronous(completion_file_id)
-                        .unwrap_or(true);
+                    let synchronous = hosted_write_capture
+                        .as_ref()
+                        .and_then(|capture| capture.as_ref().ok())
+                        .expect("pending hosted write lost its admitted mode")
+                        .1
+                        .is_synchronous();
                     let event_obj_idx =
                         completion_event_index.map_or(u64::MAX, |index| index as u64);
                     self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
@@ -43421,7 +43331,25 @@ impl ExecNtHandler {
                 if let Err(status) = self.probe_file_io_output(iosb, None) {
                     return status;
                 }
-                let disk_file = self.disk_file_for(fh);
+                // Hosted retry ownership precedes all fresh local-handle classification.
+                let fresh_handle = self.active_synchronous_file_retry.is_none()
+                    && nt_process::Handle::try_from(fh).is_ok();
+                let disk_file = if fresh_handle {
+                    self.disk_file_for(fh)
+                } else {
+                    Ok(None)
+                };
+                let overlay_file = if fresh_handle {
+                    self.overlay_file_id_for(fh)
+                } else {
+                    None
+                };
+                let overlay_read_access = overlay_file.is_none()
+                    || self.hosted_file_access_for(fh).is_some_and(|access| {
+                        access & (0x0000_0001 | 0x8000_0000 | 0x1000_0000) != 0
+                    });
+                let hosted_read_capture = (matches!(disk_file, Ok(None)) && overlay_file.is_none())
+                    .then(|| self.capture_hosted_file_transfer(fh, false));
                 let mut captured_offset_bytes = [0u8; 8];
                 let offset_ok =
                     byte_offset == 0 || self.xas_read(byte_offset, &mut captured_offset_bytes);
@@ -43433,19 +43361,15 @@ impl ExecNtHandler {
                 let mut key_bytes = [0u8; 4];
                 let key_ok = key == 0 || self.xas_read(key, &mut key_bytes);
                 let key_value = u32::from_le_bytes(key_bytes);
-                let apc_completion_conflict =
-                    self.npfs_read_file_route_for(fh).ok().is_some_and(|route| {
-                        apc_routine != 0 && self.file_completion.binding(route.file_id).is_some()
+                let apc_completion_conflict = hosted_read_capture
+                    .as_ref()
+                    .and_then(|capture| capture.as_ref().ok())
+                    .is_some_and(|(capture, _)| {
+                        apc_routine != 0
+                            && self.file_completion.binding(capture.route.file_id).is_some()
                     });
                 // Local reads reserve retained output before transfer; hosted drivers fill their
                 // destination through the banked transport.
-                let overlay_file = self.overlay_file_id_for(fh);
-                let overlay_read_access = overlay_file.is_none()
-                    || self.hosted_file_access_for(fh).is_some_and(|access| {
-                        access & (0x0000_0001 | 0x8000_0000 | 0x1000_0000) != 0
-                    });
-                let hosted_read_route = (matches!(disk_file, Ok(None)) && overlay_file.is_none())
-                    .then(|| self.npfs_read_file_route_for(fh));
                 const OVERLAY_IO_CAP: usize = LOCAL_FILE_TRANSFER_CAP;
                 let output_capacity = if matches!(disk_file, Ok(Some(_))) || overlay_file.is_some()
                 {
@@ -43480,7 +43404,7 @@ impl ExecNtHandler {
                     handle_status
                 } else if !overlay_read_access {
                     STATUS_ACCESS_DENIED
-                } else if let Some(Err(status)) = hosted_read_route.as_ref() {
+                } else if let Some(Err(status)) = hosted_read_capture.as_ref() {
                     *status
                 } else if apc_completion_conflict {
                     STATUS_INVALID_PARAMETER
@@ -43632,20 +43556,21 @@ impl ExecNtHandler {
                                     _ => nt_fs::STATUS_INVALID_HANDLE,
                                 }
                             } else {
-                                match hosted_read_route.expect("nonlocal read retains its admitted route") {
+                                match hosted_read_capture
+                                    .as_ref()
+                                    .expect("nonlocal read retains its admitted capture")
+                                {
                                     Err(handle_status) => {
-                                        npfs_route_status = handle_status;
-                                        handle_status
+                                        npfs_route_status = *handle_status;
+                                        *handle_status
                                     }
-                                    Ok(route) => {
+                                    Ok((capture, mode)) => {
+                                        let route = capture.route;
                                         npfs_route_status = nt_fs::STATUS_SUCCESS;
                                         let file_id = route.file_id;
                                         npfs_route_fid = route.fs_context;
                                         completion_file_id = file_id;
-                                        let synchronous = self
-                                            .file_completion
-                                            .is_synchronous(file_id)
-                                            .unwrap_or(true);
+                                        let synchronous = mode.is_synchronous();
                                         let sync_reply_capacity = if synchronous {
                                             REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
                                                 && wait_reply_pool_has_free()
@@ -43660,12 +43585,9 @@ impl ExecNtHandler {
                                         let prepared = if !owner_capacity || !sync_reply_capacity {
                                             Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
                                         } else {
-                                            let granted = self
-                                                .hosted_file_access_for(fh)
-                                                .ok_or(nt_fs::STATUS_INVALID_HANDLE);
-                                            match granted.and_then(|granted| {
-                                                self.prepare_hosted_file_io(route, fh, granted)
-                                            }) {
+                                            match self.prepare_hosted_file_io(
+                                                route, fh, capture.granted_access,
+                                            ) {
                                                 Err(status) => Err(status),
                                                 Ok(false) => return STATUS_PENDING,
                                                 Ok(true) => {
@@ -43756,10 +43678,12 @@ impl ExecNtHandler {
                     information = 0;
                 }
                 if routed && status == STATUS_PENDING {
-                    let synchronous = self
-                        .file_completion
-                        .is_synchronous(completion_file_id)
-                        .unwrap_or(true);
+                    let synchronous = hosted_read_capture
+                        .as_ref()
+                        .and_then(|capture| capture.as_ref().ok())
+                        .expect("pending hosted read lost its admitted mode")
+                        .1
+                        .is_synchronous();
                     let event_obj_idx =
                         completion_event_index.map_or(u64::MAX, |index| index as u64);
                     self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
@@ -44142,7 +44066,11 @@ impl ExecNtHandler {
                 let handle = args[0];
                 let iosb = args[1];
                 let iosb_ok = iosb != 0 && self.probe_user_output(iosb, 16);
-                if iosb_ok && handle <= u32::MAX as u64 {
+                // A promoted hosted grant remains authoritative even if its numeric handle
+                // was reused for an overlay File while this syscall was parked.
+                if iosb_ok && handle <= u32::MAX as u64
+                    && self.active_synchronous_file_retry.is_none()
+                {
                     if let Some(status) = self.try_flush_overlay_file(handle, iosb) {
                         return status;
                     }
@@ -44159,28 +44087,35 @@ impl ExecNtHandler {
                 } else if handle > u32::MAX as u64 {
                     STATUS_INVALID_HANDLE
                 } else {
-                    match self.npfs_flush_file_route_for(handle) {
+                    match self.capture_hosted_file(handle) {
                         Err(handle_status) => {
                             npfs_route_status = handle_status;
                             handle_status
                         }
-                        Ok(route) => {
+                        Ok(capture) => {
+                            if !nt_fs::file_flush_access_allowed(capture.granted_access, true) {
+                                self.write_current_iosb(iosb, STATUS_ACCESS_DENIED, 0);
+                                return STATUS_ACCESS_DENIED;
+                            }
+                            let route = capture.route;
                             npfs_route_status = nt_fs::STATUS_SUCCESS;
                             file_id = route.file_id;
-                            synchronous_file =
-                                self.file_completion.is_synchronous(file_id).unwrap_or(true);
+                            synchronous_file = match self.file_completion.is_synchronous(file_id) {
+                                Ok(synchronous) => synchronous,
+                                Err(status) => {
+                                    self.write_current_iosb(iosb, status, 0);
+                                    return status;
+                                }
+                            };
                             let prepared = if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
                                 || !wait_reply_pool_has_free()
                                 || !self.reserve_pending_file_io_owner()
                             {
                                 Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
                             } else {
-                                let granted = self
-                                    .hosted_file_access_for(handle)
-                                    .ok_or(nt_fs::STATUS_INVALID_HANDLE);
-                                match granted.and_then(|granted| {
-                                    self.prepare_hosted_file_io(route, handle, granted)
-                                }) {
+                                match self.prepare_hosted_file_io(
+                                    route, handle, capture.granted_access,
+                                ) {
                                     Err(status) => Err(status),
                                     Ok(false) => return STATUS_PENDING,
                                     Ok(true) => {
@@ -44192,7 +44127,11 @@ impl ExecNtHandler {
                             match prepared {
                                 Err(status) => status,
                                 Ok(()) => {
-                                    let _ = self.file_completion.set_signaled(file_id, false);
+                                    if let Err(status) = self.file_completion.set_signaled(file_id, false) {
+                                        self.release_file_reference(file_id);
+                                        self.write_current_iosb(iosb, status, 0);
+                                        return status;
+                                    }
                                     let mut output = [];
                                     match self.dispatch_hosted_file_irp_for(
                                         route,

@@ -33529,12 +33529,66 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
     Review adjustments and next work:
     - [ ] Protect fresh handle capture through acquisition with an independent File reference.
-      hosted_file_route_for currently copies the handle/driver route without retaining a body
-      reference before user-memory callouts, including the retry-instruction copyin. Concurrent
-      final-handle close can begin CLEANUP before acquire_file_io. Generation-packed hosted File
-      IDs prevent ordinary slot reuse from aliasing a replacement; the immediate gap is lifetime
-      protection, not a need to infer identity from numeric handles. A retirement storage
-      reservation intentionally does not claim to be that missing File reference.
+      The remaining hosted_file_route_for callers copy the handle/driver route without retaining
+      a body reference before later user-memory callouts, including the retry-instruction copyin.
+      Generation-packed hosted File IDs prevent ordinary slot reuse from aliasing a replacement;
+      the gap is object lifetime and preserving the original handle's access grant, not numeric
+      identity inference. A retirement storage reservation is not a File reference.
+
+      Fresh hosted File capture (2026-09-13, host/build verified):
+      - [x] Add a host-testable canonical capture owner in nt-io-manager/file_io_capture. Its
+        nonclone token names a generation-exact table row holding the actual manager FileReference
+        plus immutable device/context/access snapshots. Storage admission precedes the reference;
+        failed admission owns nothing, and failed release retains the owner and its error for
+        bounded retry. Retirement is allocation-free and backend-free; final release queues CLOSE
+        for the ordinary I/O pump. No synthetic IRP or extra handle reference is introduced.
+      - [x] Wire NtDeviceIoControlFile, NtFsControlFile and hosted NtFlushBuffersFile through a
+        focused exec_file_capture/hosted_file_capture adapter. Typed handle, access and canonical
+        route capture are memory-only before subsequent buffer probes/copyin and retry-instruction
+        capture. Their initial IOSB probe still precedes handle capture. Scope guards cover early
+        returns, synchronous contention, inline results and real pending-IRP publication. Promoted
+        retries borrow their existing exact grant instead of retaining or looking up the handle
+        again; hosted flush also bypasses fresh overlay classification on retry, so numeric handle
+        reuse cannot divert its parked request. Durable allocation scopes protect retained rows
+        from syscall scratch reclamation.
+        Remove the replaced npfs_flush_file_route_for helper, redundant FSCTL optional-route
+        branches, post-probe access relookup, and the flush mode's assumed-synchronous fallback.
+      - [x] Extend the same capture to hosted NtReadFile/NtWriteFile before offset/key/data
+        callouts and retain it through output/terminal completion copyout. APC/IOCP checks,
+        acquisition and pending publication use that same File/access/mode snapshot. Promoted
+        ingress takes precedence over fresh disk/overlay classification, and checked handle width
+        prevents high bits from aliasing a local handle. Remove the old NPFS read/write route
+        helpers and four assumed-synchronous mode fallbacks. Preserve local transfer/append/zero-
+        length behavior and deferred error evaluation; typed capture errors are no longer hidden
+        behind a generic invalid-handle translation.
+      - [x] Confirm the two lifetime layers: last-handle CLEANUP is independent of a pointer
+        reference, while final CLOSE/deletion waits for it (NT5 iomgr/read.c:129 and objsup.c:278,
+        ReactOS iomgr/file.c IopCloseFile/IopDeleteFile). The executive's transferred cleanup
+        reference keeps its policy row until canonical File removal, so a distinct capture policy
+        retain is unnecessary. Busy/count/grant ownership protects queued synchronous work after
+        capture retirement; a real pending asynchronous IRP retains the canonical File itself.
+      - [x] Serialized validation passes: 16 focused owner/policy tests, 2 allocation-refusal
+        tests and 3,578 broad host/doc tests (0 failures, 0 ignored), including the nonclone
+        ownership check. The native executive release build passes in 37.65s with the same 294
+        existing warnings. Focused formatting and git diff --check are clean. Evidence:
+        `.tmp/test-file-io-capture-contract-20260913.log`,
+        `.tmp/test-file-io-capture-allocation-20260913.log`,
+        `.tmp/test-file-io-capture-full-20260913.log`, and
+        `.tmp/build-file-io-capture-executive-20260913.log`. Independent reviews covered capture
+        scope, durable storage, canonical/policy lifetime, exact promoted routing, full-width
+        handle validation and mode ownership. This is not native fault-injection or desktop proof.
+      - [ ] Apply the same owned capture to notify, lock/unlock, volume/file query and
+        set, EA/quota and rename/open-parent paths. Capture route and access together before their
+        first relevant callout; do not pair a pinned original File with a reused handle's grant.
+        Remove borrowed route/access helpers once only genuinely callout-free inspection remains.
+        Local disk/overlay File lifetime capture across probes remains a separate follow-on; the
+        hosted reference adapter does not claim to protect those local File objects.
+      - [ ] Reconcile post-CLEANUP admission after a successful body capture: current fresh
+        synchronous acquisition rejects cleanup_sent. Preserve driver-owned post-cleanup behavior
+        when extending admission; do not wait for CLOSE while holding the reference needed by
+        CLOSE, and do not delay CLEANUP by pretending a capture reference is another handle.
+      - [ ] Exercise native failure injection and fresh desktop acceptance. Host fixtures do not
+        prove user-memory reentry, IPC or desktop execution on the native kernel.
     - [ ] Retain deeper canonical driver-cleanup lifecycle effects and their failures. The checked
       FIFO Wake hands work to start_file_cleanup; existing lifecycle-start/release fail-stop paths
       there are not removed by the inline Busy adapter cutover. Audit standalone asynchronous

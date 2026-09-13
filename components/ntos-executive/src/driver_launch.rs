@@ -39,6 +39,8 @@ pub(crate) mod hosted_add_device_rollback;
 mod hosted_file_dispatch;
 #[path = "hosted_file_owners.rs"]
 mod hosted_file_owners;
+#[path = "hosted_file_capture.rs"]
+pub(crate) mod hosted_file_capture;
 pub(crate) use hosted_file_owners::Stats as HostedFileOwnerStats;
 #[path = "hosted_video_dispatch.rs"]
 mod hosted_video_dispatch;
@@ -37628,6 +37630,7 @@ fn io_manager_mut() -> &'static mut ExecutiveIoManager {
 }
 
 fn pump_io_manager(io: &mut ExecutiveIoManager) -> usize {
+    hosted_file_capture::redrive(io);
     let progress = io.pump_with_report().progress;
     if progress != 0 {
         // A nested lookup or File cleanup can complete a peer already visited by the outer pass.
