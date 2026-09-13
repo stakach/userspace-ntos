@@ -58580,20 +58580,13 @@ pub(crate) fn owned_hosted_file_query_metadata(
         .map_err(|status| status.raw() as u32)
 }
 
-pub(crate) fn hosted_file_create_options(file_id: u64) -> Option<CreateOptions> {
+/// Read the retained source body without imposing fresh-handle or device-topology checks.
+pub(crate) fn owned_hosted_file_metadata(
+    file_id: u64,
+) -> Result<nt_io_manager::OwnedFileMetadata, u32> {
     io_manager_mut()
-        .file(FileId(file_id))
-        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID) && file.state.is_open())
-        .map(|file| file.create_options)
-}
-
-pub(crate) fn hosted_file_alignment_requirement(file_id: u64) -> Option<u32> {
-    let manager = io_manager_mut();
-    let file_id = FileId(file_id);
-    manager.file(file_id).filter(|file| {
-        file.client_id == ClientId(IO_MANAGER_COMPONENT_ID) && file.state.is_open()
-    })?;
-    manager.file_alignment_requirement(file_id).ok()
+        .owned_file_metadata(ClientId(IO_MANAGER_COMPONENT_ID), FileId(file_id))
+        .map_err(|status| status.raw() as u32)
 }
 
 /// Resolve the current top device for an executive-owned File through the canonical attachment
@@ -58614,7 +58607,8 @@ pub(crate) fn related_io_device_identity_for_file(
 }
 
 /// Allocate the kernel-only target-parent File after the source kind is known. Access is derived
-/// from provider attributes, while device ownership comes from the canonical source File.
+/// from provider attributes, while device ownership comes from the retained canonical source File.
+/// The caller owns the source through acquired or pending SET lifetime, including across CLEANUP.
 pub(crate) fn allocate_hosted_set_file_name_target(
     source_file_id: u64,
     source_is_directory: bool,
@@ -58622,11 +58616,7 @@ pub(crate) fn allocate_hosted_set_file_name_target(
 ) -> Result<(u64, u32), u32> {
     const FILE_WRITE_DATA: u32 = 0x0000_0002;
     const FILE_ADD_SUBDIRECTORY: u32 = 0x0000_0004;
-    let device_id = io_manager_mut()
-        .file(FileId(source_file_id))
-        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID) && file.state.is_open())
-        .map(|file| file.device_id.raw())
-        .ok_or(STATUS_INVALID_HANDLE as u32)?;
+    let device_id = owned_hosted_file_metadata(source_file_id)?.device_id.raw();
     let target_access = if source_is_directory {
         FILE_ADD_SUBDIRECTORY
     } else {

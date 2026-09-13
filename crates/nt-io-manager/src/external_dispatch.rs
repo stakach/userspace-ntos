@@ -824,6 +824,7 @@ impl<P> IoManager<P> {
     /// Strip the canonical device prefix from an absolute Object Manager name for an operation
     /// already rooted at `file_id`. This is the same-device authority check used before opening a
     /// rename/link target parent; no namespace spelling is converted into a File identity here.
+    /// The caller retains the source File body across this lookup and the subsequent target open.
     pub fn external_file_device_relative_name(
         &self,
         client: ClientId,
@@ -831,10 +832,7 @@ impl<P> IoManager<P> {
         absolute_name: &[u16],
         output: &mut [u16],
     ) -> Result<usize, NtStatus> {
-        let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
-        if file.client_id != client || !file.state.is_open() {
-            return Err(NtStatus::INVALID_HANDLE);
-        }
+        let file = self.owned_file_metadata(client, file_id)?;
         let device = self
             .device(file.device_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?;
@@ -878,6 +876,9 @@ impl<P> IoManager<P> {
     /// this crate but still need canonical driver/device/IRP dispatch. Warning
     /// and error statuses are returned as driver completions rather than being
     /// normalized into host errors.
+    /// An ordinary operation after CLEANUP must carry the caller's own retained
+    /// canonical File pointer until IRP admission. Another owner's reference is
+    /// not authority to resolve a fresh handle or initiate unrelated I/O.
     pub fn build_and_dispatch_external_to_device(
         &mut self,
         client: ClientId,
@@ -909,6 +910,8 @@ impl<P> IoManager<P> {
     /// Build one IRP with typed NT stack-location flags. Integration code uses
     /// this for I/O Manager operations such as opening a rename target parent;
     /// raw syscall flag values must not be forwarded here.
+    /// The same retained-File ownership contract as
+    /// `build_and_dispatch_external_to_device` applies.
     pub fn build_and_dispatch_external_to_device_with_stack_flags(
         &mut self,
         client: ClientId,

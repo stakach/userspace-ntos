@@ -2680,9 +2680,10 @@ static mut PENDING_FILE_IO: nt_io_manager::PendingFileIoTable =
     nt_io_manager::PendingFileIoTable::new();
 /// Captured provider rename/link buffers survive the internal target-parent CREATE and the source
 /// SET_INFORMATION without retaining caller memory. The generic pending File owner carries the
-/// syscall reply; this table carries the multi-IRP transaction state.
-static mut PENDING_SET_FILE_NAMES: nt_io_manager::PendingSetFileNameTable =
-    nt_io_manager::PendingSetFileNameTable::new();
+/// syscall reply; this table owns a canonical source reference across all intervening IRP ACKs.
+static mut PENDING_SET_FILE_NAMES:
+    nt_io_manager::PendingSetFileNameTable<driver_launch::hosted_file_capture::Capture> =
+        nt_io_manager::PendingSetFileNameTable::new();
 /// Syscalls that have referenced a synchronous File but are waiting for its Busy owner. The File
 /// table owns lock policy; this table owns FIFO continuation identity and the retained route.
 static mut SYNCHRONOUS_FILE_WAITERS: nt_io_manager::SynchronousFileWaitTable =

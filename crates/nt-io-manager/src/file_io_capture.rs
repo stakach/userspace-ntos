@@ -1,4 +1,4 @@
-//! A fresh authenticated handle capture owns a canonical File pointer before any callout.
+//! Authenticated handle and already-owned captures retain canonical File pointers across callouts.
 //! This is not a handle reference: last-handle CLEANUP remains legal, while CLOSE waits for
 //! retirement. Neither retirement nor its bounded retry invokes a driver backend.
 
@@ -135,6 +135,39 @@ impl FileIoCaptureTable {
             fs_context: record.driver_context.unwrap_or(0),
             granted_access,
         };
+        self.retain_snapshot(io, snapshot)
+    }
+
+    /// Extend a lifetime already held by a canonical pointer or IRP reference. Unlike a fresh
+    /// handle capture, CLEANUP is allowed; entered CLOSE is still a terminal barrier. The caller
+    /// supplies its retained grant, never a newly read desired-access mask. No device attachment
+    /// topology or alignment lookup is needed to retain the canonical File body.
+    pub fn capture_owned<P>(
+        &mut self,
+        io: &mut IoManager<P>,
+        file: FileId,
+        expected_device: DeviceId,
+        granted_access: u32,
+    ) -> Result<FileIoCapture, NtStatus> {
+        let record = io.file(file).ok_or(NtStatus::INVALID_HANDLE)?;
+        let metadata = io.owned_file_metadata(record.client_id, file)?;
+        if expected_device == DeviceId::NULL || metadata.device_id != expected_device {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        let snapshot = FileIoCaptureSnapshot {
+            file_id: file,
+            device_id: metadata.device_id,
+            fs_context: record.driver_context.unwrap_or(0),
+            granted_access,
+        };
+        self.retain_snapshot(io, snapshot)
+    }
+
+    fn retain_snapshot<P>(
+        &mut self,
+        io: &mut IoManager<P>,
+        snapshot: FileIoCaptureSnapshot,
+    ) -> Result<FileIoCapture, NtStatus> {
         let generation = self.next_generation;
         if generation == 0 {
             return Err(NtStatus::INSUFFICIENT_RESOURCES);
@@ -157,7 +190,7 @@ impl FileIoCaptureTable {
                 .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?
                 + 1;
         }
-        let reference = io.retain_file_reference(file)?;
+        let reference = io.retain_file_reference(snapshot.file_id)?;
         let identity = FileIoCaptureIdentity {
             table: self.identity,
             slot,
@@ -298,3 +331,7 @@ mod policy_tests;
 #[cfg(test)]
 #[path = "file_io_capture/request_tests.rs"]
 mod request_tests;
+
+#[cfg(test)]
+#[path = "file_io_capture/transaction_tests.rs"]
+mod transaction_tests;

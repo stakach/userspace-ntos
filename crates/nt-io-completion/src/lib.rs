@@ -1629,6 +1629,99 @@ mod tests {
     }
 
     #[test]
+    fn notification_bits_round_trip_independently_without_completion_port() {
+        for flag in [
+            FILE_SKIP_COMPLETION_PORT_ON_SUCCESS,
+            FILE_SKIP_SET_EVENT_ON_HANDLE,
+            FILE_SKIP_SET_USER_EVENT_ON_FAST_IO,
+        ] {
+            let mut files = FileCompletionTable::<1>::new();
+            files.insert_file(10, 77, false).unwrap();
+
+            assert_eq!(files.binding(10), None);
+            assert_eq!(files.notification_modes(10), Ok(0));
+            assert_eq!(files.set_notification_modes(10, flag), Ok(flag));
+            assert_eq!(files.notification_modes(10), Ok(flag));
+            assert_eq!(files.binding(10), None);
+        }
+    }
+
+    #[test]
+    fn notification_modes_mask_unknown_bits_and_zero_does_not_clear() {
+        let mut files = FileCompletionTable::<1>::new();
+        files.insert_file(10, 77, false).unwrap();
+
+        assert_eq!(files.set_notification_modes(10, 0x100), Ok(0));
+        assert_eq!(files.notification_modes(10), Ok(0));
+        assert_eq!(
+            files.set_notification_modes(10, FILE_SKIP_SET_USER_EVENT_ON_FAST_IO),
+            Ok(FILE_SKIP_SET_USER_EVENT_ON_FAST_IO)
+        );
+        assert_eq!(
+            files.set_notification_modes(10, 0x100),
+            Ok(FILE_SKIP_SET_USER_EVENT_ON_FAST_IO)
+        );
+        assert_eq!(
+            files.set_notification_modes(10, 0),
+            Ok(FILE_SKIP_SET_USER_EVENT_ON_FAST_IO)
+        );
+        assert_eq!(
+            files.notification_modes(10),
+            Ok(FILE_SKIP_SET_USER_EVENT_ON_FAST_IO)
+        );
+        assert_eq!(files.set_notification_modes(10, 0xdead_beef), Ok(7));
+        assert_eq!(files.notification_modes(10), Ok(7));
+        assert_eq!(files.set_notification_modes(10, 0), Ok(7));
+        assert_eq!(files.notification_modes(10), Ok(7));
+    }
+
+    #[test]
+    fn notification_modes_reject_nonzero_flags_for_both_synchronous_modes() {
+        for mode in [
+            FileIoMode::SynchronousAlertable,
+            FileIoMode::SynchronousNonAlertable,
+        ] {
+            let mut files = FileCompletionTable::<1>::new();
+            files.insert_file_with_mode(10, 77, mode).unwrap();
+            for flag in [
+                FILE_SKIP_COMPLETION_PORT_ON_SUCCESS,
+                FILE_SKIP_SET_EVENT_ON_HANDLE,
+                FILE_SKIP_SET_USER_EVENT_ON_FAST_IO,
+                FILE_IO_COMPLETION_NOTIFICATION_VALID_FLAGS,
+            ] {
+                assert_eq!(
+                    files.set_notification_modes(10, flag),
+                    Err(STATUS_INVALID_PARAMETER)
+                );
+                assert_eq!(files.notification_modes(10), Ok(0));
+                assert_eq!(files.io_mode(10), Ok(mode));
+                assert_eq!(files.binding(10), None);
+            }
+        }
+    }
+
+    #[test]
+    fn notification_modes_reject_invalid_file_identity_without_mutating_live_file() {
+        let mut files = FileCompletionTable::<2>::new();
+        files.insert_file(10, 77, false).unwrap();
+        files
+            .set_notification_modes(10, FILE_SKIP_SET_EVENT_ON_HANDLE)
+            .unwrap();
+
+        for file_id in [0, 20, u64::MAX] {
+            assert_eq!(files.notification_modes(file_id), Err(STATUS_INVALID_HANDLE));
+            assert_eq!(
+                files.set_notification_modes(file_id, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS),
+                Err(STATUS_INVALID_HANDLE)
+            );
+            assert_eq!(
+                files.notification_modes(10),
+                Ok(FILE_SKIP_SET_EVENT_ON_HANDLE)
+            );
+        }
+    }
+
+    #[test]
     fn file_completion_policy_controls_handle_signal_and_port_packets() {
         let mut files = FileCompletionTable::<1>::new();
         files.insert_file(10, 77, false).unwrap();

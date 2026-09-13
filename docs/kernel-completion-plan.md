@@ -33819,12 +33819,55 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         they currently pass captured offset_value directly, including null becoming zero. Keep
         asynchronous position requests on the provider path and preserve the special synchronous
         position event/IOSB behavior when the fast path is implemented.
-      - [ ] Replace fresh-open source create-option inspection in name transactions with an owned
-        body accessor. A retained File must not become unreadable merely because CLEANUP ran during
-        a reentrant callout. Do not add a device-alignment dependency just to read create options.
-      - [ ] Audit class 41 accepted/queryable notification flags separately against Windows tests,
-        including FILE_SKIP_SET_USER_EVENT_ON_FAST_IO. It is post-NT5; shared acquisition and
-        immediate completion do not close flag-value compatibility.
+      - [x] Replace fresh-open source metadata inspection and retain canonical transaction lifetime
+        (2026-09-13; serialized host validation complete, native build evidence below).
+        OwnedFileMetadata exposes device identity and complete create options without traversing
+        alignment topology. The acquired source-option check, inline/pending target allocator and
+        absolute device-relative name resolver now read the retained body after CLEANUP. Remove
+        the superseded fresh-open create-option/alignment getters and unreachable hosted branches
+        from the local-only metadata helper; fresh user-handle admission remains Open-only.
+        Review found that completion-policy references do not retain canonical File pointers:
+        source-query ACK can drop the last source IRP before target CREATE and source SET. The
+        consuming PendingSetFileName source owner now pins that body across all phases, ACKs and
+        terminal delivery. Retirement does not call a backend; refused releases remain retryable.
+        Ordinary canonical IRP admission after CLEANUP requires a positive pointer reference and
+        rejects entered CLOSE. This is a trusted integration boundary, not a fresh handle lookup:
+        raw FileId callers must hold their own reference, not borrow another owner's authority.
+        Shared identity/device/access checks remain in force. Composed coverage uses real canonical
+        IRPs/lifecycle with a fixture driver, not native IPC or a fabricated state reset.
+        Twelve added manager tests cover metadata without alignment dependencies, identity/state
+        rejection, real last-handle cleanup, consuming non-cloneable transaction ownership, query
+        ACK -> target CREATE -> source SET with no intervening source IRP, and terminal retirement.
+        The ordinary-IRP negative matrix rejects entered CLOSE even with a positive pointer,
+        pre-create/closed states and mismatched identities without invoking a backend. The zero-
+        owner rejection is checked while the source still exists and CLOSE has not entered.
+        All 1,109 host/doc tests across 48 suites pass with no failures or ignored tests, including
+        649 manager and 52 completion library tests. The serialized scope covers nt-io-manager,
+        nt-io-completion, nt-io-abi, nt-io-server, nt-io-client, nt-driver-host, nt-driver-runtime
+        and nt-fs. Evidence: `.tmp/test-owned-source-metadata-full-20260913.log` (the earlier
+        library-only pass is `.tmp/test-owned-source-metadata-libraries-20260913.log`).
+        The final freestanding executive release build passes in 37.96s with the unchanged
+        294 warnings: `.tmp/build-owned-source-metadata-executive-20260913.log`.
+        Independent native ownership/admission review and focused formatting/git diff --check
+        pass. No VM was run; native lifecycle execution, desktop acceptance and the last measured
+        27 strict win32k imports remain open. Relative-root CREATE and failed-target retirement
+        below are not closed by retaining the source body.
+      - [x] Audit class 41 known notification flags against the Windows-facing Wine tests
+        (2026-09-13; production flag policy unchanged, four new regression tests pass above).
+        references/wine/dlls/ntdll/tests/file.c:4415-4437 sets and queries each of 1, 2 and 4
+        independently, including FILE_SKIP_SET_USER_EVENT_ON_FAST_IO before port association.
+        All three bits must remain queryable. The earlier cases at 4256-4286 cover sticky flags,
+        zero preserving existing flags and acceptance of unknown bits. Four added policy tests
+        cover independent roundtrip, masked/sticky accumulation, synchronous nonzero rejection
+        and invalid identities without mutation. Do not remove bit 4 from the returned mask.
+        The Windows-facing query helper checks required-bit presence, not exact mask equality;
+        unknown-bit masking is supported by Wine's implementation, not proven by that helper.
+      - [ ] Resolve synchronous class 41 zero-flags behavior and exact unknown-bit query results
+        with direct Windows evidence.
+        Our setter accepts zero on a synchronous File, while Wine server/fd.c:3167-3183 rejects
+        every synchronous setter. The inspected Windows-facing test establishes nonzero rejection
+        but not zero. Keep this narrow discrepancy explicit rather than treating Wine's internal
+        implementation alone as proof. Native flag/event acceptance remains separate open work.
       - [ ] Replace direct RootDirectory-as-target routing with the real relative target-parent
         CREATE. NT5 qsinfo.c:1450 and internal.c:5398 open the complete relative name with its root,
         IO_OPEN_TARGET_DIRECTORY and IO_FORCE_ACCESS_CHECK, write/add-subdirectory plus SYNCHRONIZE
@@ -33835,13 +33878,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         a pending source-query transaction a consuming root owner or defer root resolution until
         that query completes in the original caller context. Retain the kernel-only target through
         SET and make failed unpublished-target retirement retryable instead of ignoring it.
+        Next-step review (2026-09-13): reuse the SourceQuery -> TargetCreate -> SourceSet owner
+        rather than creating another continuation path. NT5 resolves the root during target open,
+        after source-query success. Authenticate it freshly in that caller context, then retain
+        it across allocation/CREATE capture; source retry authority cannot supply this grant.
+        Existing allocate_external_relative_file, its native wrapper and related-parent IRP
+        admission require Open, so add an explicitly owned continuation path without relaxing
+        fresh-root admission. CREATE preparation already injects canonical child.related_file:
+        keep caller-supplied CreateParameters.related_file unset. Preserve the entire nested
+        relative name and compare the successfully opened target's related device with the source,
+        not just an early root/source device check. Cover real relative target CREATE, pending
+        source query and target open, root cleanup, target errors and link collisions.
       - [ ] Complete adjacent hosted File-query semantics beyond owned capture.
         Keep access immutable in the capture, but read mutable File mode/current position under
         admitted ownership: original create options are not current mode after FileModeInformation
         SET (NT5 qsinfo.c:1337). The new owned accessor preserves complete create options but does
-        not implement separate mutable NT mode state. Legacy metadata accessors still require
-        state.is_open(); keep migrating their remaining callers to real ownership instead of
-        reintroducing fresh-open validation after capture. Synchronous FilePosition
+        not implement separate mutable NT mode state. The obsolete fresh-open create-option and
+        alignment accessors are removed; audit any remaining route/body readers for actual
+        ownership instead of reintroducing fresh-open validation after capture. Synchronous FilePosition
         queries use canonical CurrentByteOffset before event clear (qsinfo.c:319), whereas inline
         Access/Mode/Alignment use normal event/completion semantics (qsinfo.c:603). Track missing
         canonical position state rather than supplying a fabricated offset.

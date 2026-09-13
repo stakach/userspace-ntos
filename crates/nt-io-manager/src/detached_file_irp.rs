@@ -403,6 +403,10 @@ fn validate_buffers(
 }
 
 impl<P: ObjectManagerPort> IoManager<P> {
+    /// Prepare an IRP from authenticated canonical identities and owned buffers. For an ordinary
+    /// operation continuing after CLEANUP, the caller must hold its own canonical File pointer
+    /// reference until this IRP takes ownership. Aggregate reference counts establish body
+    /// lifetime, not the caller's authority; fresh user handles must be resolved separately.
     pub fn prepare_external_file_irp_owned(
         &mut self,
         mut request: ExternalFileIrpRequest,

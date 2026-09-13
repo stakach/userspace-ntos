@@ -402,7 +402,7 @@ impl ExecNtHandler {
         let Some(transaction_reservation) = self.reserve_pending_set_file_name_owner() else {
             return Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES);
         };
-        let Some(mut transaction) = nt_io_manager::PendingSetFileName::awaiting_source_query(
+        let Some(transaction) = nt_io_manager::PendingSetFileName::awaiting_source_query(
             route.file_id,
             information_class,
             control,
@@ -413,13 +413,30 @@ impl ExecNtHandler {
                 .cancel_reservation(transaction_reservation);
             return Err(nt_fs::STATUS_INVALID_PARAMETER);
         };
-
-        let source_create_options = match driver_launch::hosted_file_create_options(route.file_id) {
-            Some(options) => options,
-            None => {
+        let source_owner = match driver_launch::hosted_file_capture::capture_owned(
+            route.file_id,
+            route.device_id,
+            capture.granted_access,
+        ) {
+            Ok(owner) => owner,
+            Err(status) => {
                 (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
                     .cancel_reservation(transaction_reservation);
-                return Err(nt_fs::STATUS_INVALID_HANDLE);
+                return Err(status);
+            }
+        };
+        let mut transaction = transaction.with_source_owner(source_owner);
+
+        let source_create_options = match driver_launch::owned_hosted_file_metadata(route.file_id) {
+            Ok(metadata) if metadata.device_id.raw() == route.device_id => metadata.create_options,
+            result => {
+                let status = match result {
+                    Ok(_) => nt_fs::STATUS_INVALID_HANDLE,
+                    Err(status) => status,
+                };
+                (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
+                    .cancel_reservation(transaction_reservation);
+                return Err(status);
             }
         };
         let mut pending_irp = None;

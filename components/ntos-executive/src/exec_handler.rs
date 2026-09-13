@@ -28866,7 +28866,7 @@ impl ExecNtHandler {
         self.pm.handle_access(pid, handle as nt_process::Handle)
     }
 
-    unsafe fn io_manager_file_query_metadata(
+    unsafe fn local_file_query_metadata(
         &self,
         handle: u64,
     ) -> Result<nt_fs::QueryMetadata, u32> {
@@ -28884,32 +28884,6 @@ impl ExecNtHandler {
             .handle_access(pid, process_handle)
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
         let (mode, alignment_requirement) = match object {
-            nt_process::HandleObject::RoutedFile { file_id, device_id } => {
-                let route = self
-                    .hosted_file_route_for(handle)
-                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-                if route.file_id != file_id || route.device_id != device_id {
-                    return Err(nt_fs::STATUS_INVALID_HANDLE);
-                }
-                let create_options = driver_launch::hosted_file_create_options(file_id)
-                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-                let alignment = driver_launch::hosted_file_alignment_requirement(file_id)
-                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-                (
-                    nt_fs::file_mode_from_create_options(create_options.bits()),
-                    alignment,
-                )
-            }
-            nt_process::HandleObject::File(file_id) => {
-                let create_options = driver_launch::hosted_file_create_options(file_id)
-                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-                let alignment = driver_launch::hosted_file_alignment_requirement(file_id)
-                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-                (
-                    nt_fs::file_mode_from_create_options(create_options.bits()),
-                    alignment,
-                )
-            }
             nt_process::HandleObject::DiskFile { object_id, .. } => {
                 let open = self.readonly_file_opens.get(object_id)?;
                 (nt_fs::file_mode_from_create_options(open.create_options), 0)
@@ -29266,7 +29240,7 @@ impl ExecNtHandler {
         handle: u64,
         include_opened_name: bool,
     ) -> Result<LocalFileQueryState, u32> {
-        let io_metadata = self.io_manager_file_query_metadata(handle)?;
+        let io_metadata = self.local_file_query_metadata(handle)?;
         let pid = self
             .pm_pid_for_pi(self.pi)
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
@@ -40254,7 +40228,7 @@ impl ExecNtHandler {
                 let access = if let Some(capture) = hosted_capture.as_ref() {
                     capture.granted_access
                 } else {
-                    match self.io_manager_file_query_metadata(args[0]) {
+                    match self.local_file_query_metadata(args[0]) {
                         Ok(metadata) => metadata.access_flags,
                         Err(status) => return status,
                     }
@@ -40360,7 +40334,7 @@ impl ExecNtHandler {
                 let access = if let Some(capture) = hosted_capture.as_ref() {
                     capture.granted_access
                 } else {
-                    match self.io_manager_file_query_metadata(args[0]) {
+                    match self.local_file_query_metadata(args[0]) {
                         Ok(metadata) => metadata.access_flags,
                         Err(status) => return status,
                     }
@@ -40702,7 +40676,7 @@ impl ExecNtHandler {
                         args[0], iosb, output, length, class, &capture,
                     );
                 }
-                let io_metadata = match self.io_manager_file_query_metadata(args[0]) {
+                let io_metadata = match self.local_file_query_metadata(args[0]) {
                     Ok(metadata) => metadata,
                     Err(status) => return status,
                 };

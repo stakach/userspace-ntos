@@ -1,4 +1,4 @@
-//! Canonical metadata for a File whose lifetime is already owned by the caller.
+//! Canonical body and query metadata for a File whose lifetime is already owned by the caller.
 
 use nt_io_abi::{DeviceId, FileId};
 use nt_status::NtStatus;
@@ -7,12 +7,28 @@ use nt_types::ClientId;
 use crate::{CreateOptions, FileState, IoManager};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedFileMetadata {
+    pub device_id: DeviceId,
+    pub create_options: CreateOptions,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnedFileQueryMetadata {
     pub create_options: CreateOptions,
     pub alignment_requirement: u32,
 }
 
 impl<P> IoManager<P> {
+    /// Read an already-owned File body without resolving device attachment topology.
+    /// The caller holds a canonical reference, such as a capture or adopted Busy owner.
+    pub fn owned_file_metadata(
+        &self,
+        client: ClientId,
+        file: FileId,
+    ) -> Result<OwnedFileMetadata, NtStatus> {
+        self.owned_file_metadata_for(client, file, None)
+    }
+
     /// The caller must hold a canonical capture reference or an adopted File Busy/reference
     /// owner. This reads the owned body, not a fresh handle, so CLEANUP does not invalidate it.
     /// Metadata remains live: alignment follows current attachment topology and create options
@@ -23,10 +39,23 @@ impl<P> IoManager<P> {
         file: FileId,
         expected_device: DeviceId,
     ) -> Result<OwnedFileQueryMetadata, NtStatus> {
+        let metadata = self.owned_file_metadata_for(client, file, Some(expected_device))?;
+        Ok(OwnedFileQueryMetadata {
+            create_options: metadata.create_options,
+            alignment_requirement: self.file_alignment_requirement(file)?,
+        })
+    }
+
+    fn owned_file_metadata_for(
+        &self,
+        client: ClientId,
+        file: FileId,
+        expected_device: Option<DeviceId>,
+    ) -> Result<OwnedFileMetadata, NtStatus> {
         let record = self.file(file).ok_or(NtStatus::INVALID_HANDLE)?;
-        if expected_device == DeviceId::NULL
-            || record.client_id != client
-            || record.device_id != expected_device
+        if record.client_id != client
+            || expected_device
+                .is_some_and(|device| device == DeviceId::NULL || record.device_id != device)
         {
             return Err(NtStatus::INVALID_HANDLE);
         }
@@ -39,9 +68,9 @@ impl<P> IoManager<P> {
         ) {
             return Err(NtStatus::INVALID_HANDLE);
         }
-        Ok(OwnedFileQueryMetadata {
+        Ok(OwnedFileMetadata {
+            device_id: record.device_id,
             create_options: record.create_options,
-            alignment_requirement: self.file_alignment_requirement(file)?,
         })
     }
 }
@@ -233,5 +262,128 @@ mod tests {
         assert_eq!(f.query(), Err(NtStatus::DELETE_PENDING));
         f.io.device_mut(f.device).unwrap().delete_pending = false;
         f.io.release_file_reference(&mut owner).unwrap();
+    }
+
+    #[test]
+    fn owned_body_metadata_does_not_require_usable_alignment_topology() {
+        let options =
+            CreateOptions::from_bits_retain(0x8000_0000) | CreateOptions::NON_DIRECTORY_FILE;
+        let mut f = Fixture::new(CreateOptions::NON_DIRECTORY_FILE);
+        let mut owner = f.io.retain_file_reference(f.file).unwrap();
+        f.io.file_mut(f.file).unwrap().create_options = options;
+        f.io.device_mut(f.device).unwrap().delete_pending = true;
+        assert_eq!(
+            f.io.owned_file_metadata(f.client, f.file),
+            Ok(OwnedFileMetadata {
+                device_id: f.device,
+                create_options: options,
+            })
+        );
+        assert_eq!(f.query(), Err(NtStatus::DELETE_PENDING));
+        f.io.device_mut(f.device).unwrap().delete_pending = false;
+        f.io.release_file_reference(&mut owner).unwrap();
+    }
+
+    #[test]
+    fn owned_body_rejects_wrong_identity_precreate_and_entered_close() {
+        let mut f = Fixture::new(CreateOptions::empty());
+        let mut owner = f.io.retain_file_reference(f.file).unwrap();
+        let other_client = f.io.register_client();
+        assert_eq!(
+            f.io.owned_file_metadata(other_client, f.file),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+        assert_eq!(
+            f.io.owned_file_metadata(f.client, FileId::NULL),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+        for state in [FileState::Allocated, FileState::CreateIrpDispatched] {
+            f.io.file_mut(f.file).unwrap().state = state;
+            assert_eq!(
+                f.io.owned_file_metadata(f.client, f.file),
+                Err(NtStatus::INVALID_HANDLE)
+            );
+        }
+        f.io.file_mut(f.file).unwrap().state = FileState::Closed;
+        assert_eq!(
+            f.io.owned_file_metadata(f.client, f.file),
+            Err(NtStatus::FILE_CLOSED)
+        );
+        f.io.file_mut(f.file).unwrap().state = FileState::Open;
+        f.io.file_mut(f.file).unwrap().close_dispatched = true;
+        assert_eq!(
+            f.io.owned_file_metadata(f.client, f.file),
+            Err(NtStatus::FILE_CLOSED)
+        );
+        f.io.file_mut(f.file).unwrap().close_dispatched = false;
+        f.io.release_file_reference(&mut owner).unwrap();
+    }
+
+    #[test]
+    fn query_route_identity_failure_precedes_owned_body_state_failure() {
+        let mut f = Fixture::new(CreateOptions::empty());
+        let mut owner = f.io.retain_file_reference(f.file).unwrap();
+        let other_client = f.io.register_client();
+        f.io.file_mut(f.file).unwrap().close_dispatched = true;
+        assert_eq!(
+            f.io.owned_file_query_metadata(f.client, f.file, DeviceId::NULL),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+        assert_eq!(
+            f.io.owned_file_query_metadata(f.client, f.file, DeviceId(f.device.raw() + 1),),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+        assert_eq!(
+            f.io.owned_file_metadata(other_client, f.file),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+        assert_eq!(f.query(), Err(NtStatus::FILE_CLOSED));
+        f.io.file_mut(f.file).unwrap().close_dispatched = false;
+        f.io.release_file_reference(&mut owner).unwrap();
+    }
+
+    #[test]
+    fn retained_rename_source_metadata_and_name_survive_real_cleanup() {
+        let options = CreateOptions::NON_DIRECTORY_FILE | CreateOptions::WRITE_THROUGH;
+        let mut f = Fixture::new(options);
+        let mut captures = FileIoCaptureTable::new();
+        let mut capture = captures.capture(&mut f.io, f.file, f.device, 1).unwrap();
+        f.io.close(f.client, f.handle).unwrap();
+        f.io.pump();
+        assert!(f.io.file(f.file).unwrap().cleanup_dispatched);
+        assert_eq!(f.io.file(f.file).unwrap().state, FileState::ClosePending);
+        assert_eq!(
+            f.io.owned_file_metadata(f.client, f.file),
+            Ok(OwnedFileMetadata {
+                device_id: f.device,
+                create_options: options,
+            })
+        );
+        let absolute = nt_types::UnicodeString::from_str(r"\Device\OwnedMetadata\target\leaf");
+        let expected = nt_types::UnicodeString::from_str(r"\target\leaf");
+        let mut output = [0u16; 32];
+        let length = f
+            .io
+            .external_file_device_relative_name(f.client, f.file, absolute.as_units(), &mut output)
+            .unwrap();
+        assert_eq!(&output[..length], expected.as_units());
+        captures.retire(&mut capture).unwrap();
+        captures
+            .release_retired(&mut f.io, capture.identity())
+            .unwrap();
+        f.io.pump();
+        assert_eq!(
+            f.io.owned_file_metadata(f.client, f.file),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+        assert_eq!(
+            f.io.external_file_device_relative_name(
+                f.client,
+                f.file,
+                absolute.as_units(),
+                &mut output,
+            ),
+            Err(NtStatus::INVALID_HANDLE)
+        );
     }
 }

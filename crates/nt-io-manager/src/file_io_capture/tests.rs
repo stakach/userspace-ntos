@@ -358,3 +358,192 @@ fn canonical_capture_keeps_policy_cleanup_owner_until_real_close() {
     );
     assert!(policy.active_cleanup_from(0).is_none());
 }
+
+#[test]
+fn capture_owned_extends_existing_pointer_after_cleanup_without_reopening_handle() {
+    let (mut io, client, handle, file, device, calls) = opened();
+    let mut captures = FileIoCaptureTable::new();
+    let mut first = captures.capture(&mut io, file, device, 0x80).unwrap();
+    io.close(client, handle).unwrap();
+    assert_eq!(count(&calls, major::IRP_MJ_CLEANUP), 1);
+    assert_eq!(
+        captures.capture(&mut io, file, device, 0x80).unwrap_err(),
+        NtStatus::INVALID_HANDLE
+    );
+    let mut retained = captures
+        .capture_owned(&mut io, file, device, first.granted_access())
+        .unwrap();
+    assert_eq!(retained.snapshot(), first.snapshot());
+    assert_eq!(io.file_reference_count(file), 2);
+    captures.retire(&mut first).unwrap();
+    captures.release_retired(&mut io, first.identity()).unwrap();
+    io.pump();
+    assert!(io.file(file).is_some());
+    assert_eq!(io.file_reference_count(file), 1);
+    assert_eq!(count(&calls, major::IRP_MJ_CLOSE), 0);
+    captures.retire(&mut retained).unwrap();
+    captures
+        .release_retired(&mut io, retained.identity())
+        .unwrap();
+    assert!(captures.is_empty());
+    assert_eq!(io.file_reference_count(file), 0);
+    assert!(
+        io.file(file).is_some(),
+        "pointer retirement queues rather than enters CLOSE"
+    );
+    assert_eq!(
+        captures
+            .capture_owned(&mut io, file, device, 0x80)
+            .unwrap_err(),
+        NtStatus::FILE_CLOSED
+    );
+    io.pump();
+    assert!(io.file(file).is_none());
+    assert_eq!(count(&calls, major::IRP_MJ_CLOSE), 1);
+}
+
+#[test]
+fn retained_pointer_does_not_bypass_irp_state_or_identity_barriers() {
+    use crate::{FileState, InformationParameters, IoParameters};
+
+    let (mut io, client, handle, file, device, calls) = opened();
+    let driver = io.device(device).unwrap().driver_id;
+    let dispatch = io
+        .driver(driver)
+        .unwrap()
+        .dispatch
+        .get(major::IRP_MJ_CREATE);
+    io.driver_mut(driver)
+        .unwrap()
+        .dispatch
+        .set(major::IRP_MJ_QUERY_INFORMATION, dispatch);
+    let other_device = io
+        .create_device(
+            driver,
+            None,
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+    let other_client = io.register_client();
+    let mut captures = FileIoCaptureTable::new();
+    let mut capture = captures.capture(&mut io, file, device, 0x80).unwrap();
+    io.close(client, handle).unwrap();
+    assert_eq!(io.file(file).unwrap().state, FileState::ClosePending);
+    let before = calls.borrow().len();
+
+    // Exercise admission barriers independently; the composed transaction test uses real
+    // lifecycle transitions for the valid post-CLEANUP path.
+    for (state, entered_close, request_client, request_device, request_file) in [
+        (FileState::Open, true, client, device, file),
+        (FileState::ClosePending, true, client, device, file),
+        (FileState::Allocated, false, client, device, file),
+        (FileState::CreateIrpDispatched, false, client, device, file),
+        (FileState::Closed, false, client, device, file),
+        (FileState::ClosePending, false, other_client, device, file),
+        (FileState::ClosePending, false, client, other_device, file),
+        (
+            FileState::ClosePending,
+            false,
+            client,
+            device,
+            FileId(u64::MAX),
+        ),
+    ] {
+        let body = io.file_mut(file).unwrap();
+        body.state = state;
+        body.close_dispatched = entered_close;
+        let mut output = [0; 40];
+        assert!(
+            io.build_and_dispatch_external_to_device(
+                request_client,
+                request_device,
+                Some(request_file),
+                0,
+                20,
+                major::IRP_MJ_QUERY_INFORMATION,
+                IoParameters::QueryInformation(InformationParameters {
+                    info_class: 4,
+                    length: 40
+                }),
+                0,
+                40,
+                &mut output,
+            )
+            .is_err(),
+            "state={state:?} entered_close={entered_close}"
+        );
+        assert_eq!(calls.borrow().len(), before);
+        assert_eq!(io.file_reference_count(file), 1);
+        assert_eq!(io.file(file).unwrap().outstanding_irp_refs, 0);
+        assert_eq!(output, [0; 40]);
+    }
+    let body = io.file_mut(file).unwrap();
+    body.state = FileState::ClosePending;
+    body.close_dispatched = false;
+    captures.retire(&mut capture).unwrap();
+    assert_eq!(captures.redrive(&mut io, usize::MAX).released, 1);
+    io.pump();
+    assert!(io.file(file).is_none());
+    assert!(captures.is_empty());
+    assert_eq!(count(&calls, major::IRP_MJ_CLOSE), 1);
+}
+
+#[test]
+fn capture_owned_refuses_entered_close_even_while_body_is_addressable() {
+    let (mut io, client, handle, file, device, calls) = opened();
+    let mut captures = FileIoCaptureTable::new();
+    let mut retained = captures.capture(&mut io, file, device, 0x80).unwrap();
+    // Model the terminal entry barrier independently of ordinary lifecycle scheduling.
+    io.file_mut(file).unwrap().close_dispatched = true;
+    assert_eq!(
+        captures
+            .capture_owned(&mut io, file, device, 0x80)
+            .unwrap_err(),
+        NtStatus::FILE_CLOSED
+    );
+    assert_eq!(io.file_reference_count(file), 1);
+    assert_eq!(count(&calls, major::IRP_MJ_CLOSE), 0);
+    io.file_mut(file).unwrap().close_dispatched = false;
+    captures.retire(&mut retained).unwrap();
+    captures
+        .release_retired(&mut io, retained.identity())
+        .unwrap();
+    io.close(client, handle).unwrap();
+    assert!(io.file(file).is_none());
+}
+
+#[test]
+fn capture_owned_wrong_route_and_exhaustion_do_not_consume_existing_owner() {
+    let (mut io, _, _, file, device, _) = opened();
+    let mut captures = FileIoCaptureTable::new();
+    let mut retained = captures.capture(&mut io, file, device, 0x80).unwrap();
+    for wrong_device in [
+        DeviceId::NULL,
+        DeviceId::new(device.generation(), device.slot() + 1),
+    ] {
+        assert_eq!(
+            captures
+                .capture_owned(&mut io, file, wrong_device, 0x80)
+                .unwrap_err(),
+            NtStatus::INVALID_HANDLE
+        );
+        assert_eq!(io.file_reference_count(file), 1);
+    }
+    captures.next_generation = 0;
+    assert_eq!(
+        captures
+            .capture_owned(&mut io, file, device, 0x80)
+            .unwrap_err(),
+        NtStatus::INSUFFICIENT_RESOURCES
+    );
+    assert_eq!(io.file_reference_count(file), 1);
+    assert!(retained.is_held());
+    captures.retire(&mut retained).unwrap();
+    captures
+        .release_retired(&mut io, retained.identity())
+        .unwrap();
+    assert!(captures.is_empty());
+}

@@ -25094,7 +25094,7 @@ unsafe fn pending_file_io_redrive_pass(
         let transaction_terminal = set_file_name_id.and_then(|id| {
             (&*core::ptr::addr_of!(PENDING_SET_FILE_NAMES))
                 .get(id)
-                .and_then(nt_io_manager::PendingSetFileName::terminal_result)
+                .and_then(|transaction| transaction.terminal_result())
         });
         // Once local output is committed, the I/O owner retains the terminal result even after
         // the FSD acknowledges its bytes. Later surface/reference retries must not re-query it.

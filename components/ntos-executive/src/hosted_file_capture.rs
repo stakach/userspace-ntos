@@ -50,6 +50,33 @@ pub(crate) fn capture(file_id: u64, device_id: u64, granted_access: u32) -> Resu
     }
 }
 
+/// Extend an existing canonical pointer/IRP lifetime across a transaction continuation.
+pub(crate) fn capture_owned(
+    file_id: u64,
+    device_id: u64,
+    granted_access: u32,
+) -> Result<Capture, u32> {
+    let _durable = crate::allocator::enter_durable();
+    let io = io_manager_mut();
+    let file = io
+        .file(FileId(file_id))
+        .ok_or(STATUS_INVALID_HANDLE as u32)?;
+    if file.client_id != ClientId(IO_MANAGER_COMPONENT_ID) {
+        return Err(STATUS_INVALID_HANDLE as u32);
+    }
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(CAPTURES))
+            .capture_owned(
+                io,
+                FileId(file_id),
+                nt_io_manager::DeviceId(device_id),
+                granted_access,
+            )
+            .map(Capture)
+            .map_err(|status| status.raw() as u32)
+    }
+}
+
 fn report(file: u64, status: u32) {
     if FAILURES.fetch_add(1, Ordering::Relaxed) < 16 {
         print_str(b"[file-capture] reference retirement retained file=0x");

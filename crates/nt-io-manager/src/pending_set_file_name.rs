@@ -17,7 +17,7 @@ pub enum PendingSetFileNamePhase {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingSetFileName {
+pub struct PendingSetFileName<Owner = ()> {
     pub source_file_id: u64,
     pub target_file_id: u64,
     pub information_class: u32,
@@ -27,9 +27,10 @@ pub struct PendingSetFileName {
     terminal_information: u64,
     target_name: Vec<u8>,
     set_information: Vec<u8>,
+    source_owner: Owner,
 }
 
-impl PendingSetFileName {
+impl PendingSetFileName<()> {
     fn validate(
         source_file_id: u64,
         target_file_id: u64,
@@ -74,6 +75,7 @@ impl PendingSetFileName {
             terminal_information: 0,
             target_name,
             set_information,
+            source_owner: (),
         })
     }
 
@@ -102,9 +104,28 @@ impl PendingSetFileName {
             terminal_information: 0,
             target_name,
             set_information,
+            source_owner: (),
         })
     }
 
+    /// Attach the source lifetime exactly once before this transaction can be parked.
+    pub fn with_source_owner<Owner>(self, owner: Owner) -> PendingSetFileName<Owner> {
+        PendingSetFileName {
+            source_file_id: self.source_file_id,
+            target_file_id: self.target_file_id,
+            information_class: self.information_class,
+            control: self.control,
+            phase: self.phase,
+            terminal_status: self.terminal_status,
+            terminal_information: self.terminal_information,
+            target_name: self.target_name,
+            set_information: self.set_information,
+            source_owner: owner,
+        }
+    }
+}
+
+impl<Owner> PendingSetFileName<Owner> {
     pub fn phase(&self) -> PendingSetFileNamePhase {
         self.phase
     }
@@ -196,26 +217,26 @@ pub struct PendingSetFileNameReservation {
 }
 
 #[derive(Clone, Debug)]
-struct Slot {
+struct Slot<Owner> {
     generation: u32,
-    record: Option<PendingSetFileName>,
+    record: Option<PendingSetFileName<Owner>>,
     updating: bool,
 }
 
 #[derive(Clone, Debug)]
-pub struct PendingSetFileNameTable {
-    slots: Vec<Slot>,
+pub struct PendingSetFileNameTable<Owner = ()> {
+    slots: Vec<Slot<Owner>>,
     next_generation: u32,
     initial_reserve: usize,
 }
 
-impl Default for PendingSetFileNameTable {
+impl<Owner> Default for PendingSetFileNameTable<Owner> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl PendingSetFileNameTable {
+impl<Owner> PendingSetFileNameTable<Owner> {
     const DEFAULT_INITIAL_RESERVE: usize = 4;
 
     pub const fn new() -> Self {
@@ -298,7 +319,7 @@ impl PendingSetFileNameTable {
     pub fn park_reserved(
         &mut self,
         reservation: PendingSetFileNameReservation,
-        record: PendingSetFileName,
+        record: PendingSetFileName<Owner>,
     ) -> Option<PendingSetFileNameId> {
         let slot = self.slots.get_mut(reservation.slot)?;
         if slot.generation != reservation.generation || slot.record.is_some() || slot.updating {
@@ -308,7 +329,7 @@ impl PendingSetFileNameTable {
         PendingSetFileNameId::new(reservation.slot, reservation.generation)
     }
 
-    pub fn get(&self, id: PendingSetFileNameId) -> Option<&PendingSetFileName> {
+    pub fn get(&self, id: PendingSetFileNameId) -> Option<&PendingSetFileName<Owner>> {
         let (slot, generation) = id.parts()?;
         let slot = self.slots.get(slot)?;
         (slot.generation == generation && !slot.updating)
@@ -318,7 +339,10 @@ impl PendingSetFileNameTable {
 
     /// Temporarily remove a record while provider dispatch may re-enter the executive. The slot
     /// remains generation-reserved and cannot be observed or reused until restore/finish.
-    pub fn take_for_update(&mut self, id: PendingSetFileNameId) -> Option<PendingSetFileName> {
+    pub fn take_for_update(
+        &mut self,
+        id: PendingSetFileNameId,
+    ) -> Option<PendingSetFileName<Owner>> {
         let (slot, generation) = id.parts()?;
         let slot = self.slots.get_mut(slot)?;
         if slot.generation != generation || slot.updating {
@@ -329,7 +353,11 @@ impl PendingSetFileNameTable {
         Some(record)
     }
 
-    pub fn restore_update(&mut self, id: PendingSetFileNameId, record: PendingSetFileName) -> bool {
+    pub fn restore_update(
+        &mut self,
+        id: PendingSetFileNameId,
+        record: PendingSetFileName<Owner>,
+    ) -> bool {
         let Some((slot, generation)) = id.parts() else {
             return false;
         };
@@ -362,7 +390,9 @@ impl PendingSetFileNameTable {
 
 #[cfg(test)]
 mod tests {
+    use alloc::rc::Rc;
     use alloc::vec;
+    use core::cell::Cell;
 
     use super::*;
 
@@ -376,6 +406,89 @@ mod tests {
             vec![0; 24],
         )
         .unwrap()
+    }
+
+    struct SourceOwner(Rc<Cell<usize>>);
+
+    impl Drop for SourceOwner {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn nonclone_source_owner_survives_all_transaction_phases_and_slot_retirement() {
+        let drops = Rc::new(Cell::new(0));
+        let transaction = PendingSetFileName::awaiting_source_query(
+            1,
+            10,
+            SetInformationControl::ReplaceIfExists(true),
+            vec![b'x', 0],
+            vec![0; 24],
+        )
+        .unwrap()
+        .with_source_owner(SourceOwner(Rc::clone(&drops)));
+        let mut table = PendingSetFileNameTable::new();
+        let reservation = table.reserve().unwrap();
+        let id = table.park_reserved(reservation, transaction).unwrap();
+
+        let mut transaction = table.take_for_update(id).unwrap();
+        assert!(table.take_for_update(id).is_none());
+        assert!(table.get(id).is_none());
+        assert_eq!(drops.get(), 0);
+        assert!(transaction.advance_to_target_create(2));
+        assert!(table.restore_update(id, transaction));
+        assert_eq!(drops.get(), 0);
+
+        let mut transaction = table.take_for_update(id).unwrap();
+        assert!(transaction.advance_to_source_set());
+        assert!(table.restore_update(id, transaction));
+        assert_eq!(drops.get(), 0);
+        let transaction = table.take_for_update(id).unwrap();
+        assert!(table.finish_update(id));
+        assert!(table.get(id).is_none());
+        drop(table);
+        assert_eq!(drops.get(), 0);
+        assert_eq!(transaction.target_name(), [b'x', 0]);
+        assert_eq!(transaction.set_information(), &[0; 24]);
+        drop(transaction);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn inline_terminal_record_retains_source_until_transaction_drop() {
+        let drops = Rc::new(Cell::new(0));
+        let mut transaction = record(1, 2).with_source_owner(SourceOwner(Rc::clone(&drops)));
+        assert!(transaction.complete_inline(0xc000_0001, 0));
+        let mut table = PendingSetFileNameTable::new();
+        let reservation = table.reserve().unwrap();
+        let id = table.park_reserved(reservation, transaction).unwrap();
+        let transaction = table.take_for_update(id).unwrap();
+        assert_eq!(transaction.terminal_result(), Some((0xc000_0001, 0)));
+        assert!(table.finish_update(id));
+        assert_eq!(drops.get(), 0);
+        drop(transaction);
+        assert_eq!(drops.get(), 1);
+        drop(table);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn dropping_table_releases_only_records_it_still_owns() {
+        let drops = Rc::new(Cell::new(0));
+        let mut table = PendingSetFileNameTable::new();
+        for source in [1, 3] {
+            let reservation = table.reserve().unwrap();
+            table
+                .park_reserved(
+                    reservation,
+                    record(source, source + 1).with_source_owner(SourceOwner(Rc::clone(&drops))),
+                )
+                .unwrap();
+        }
+        assert_eq!(drops.get(), 0);
+        drop(table);
+        assert_eq!(drops.get(), 2);
     }
 
     #[test]

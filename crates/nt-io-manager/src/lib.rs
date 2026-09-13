@@ -54,7 +54,7 @@ mod set_information_completion;
 mod mock_driver;
 mod object_port;
 mod open;
-mod owned_file_query_metadata;
+mod owned_file_metadata;
 mod pending_io;
 mod pending_set_file_name;
 mod pipe;
@@ -69,7 +69,7 @@ mod wdm_x64;
 
 pub use banked_transfer::{BankedTransferCursor, BankedTransferError};
 pub use bounded_file_read::{BoundedFileReadCompletion, BoundedFileReadPlan};
-pub use owned_file_query_metadata::OwnedFileQueryMetadata;
+pub use owned_file_metadata::{OwnedFileMetadata, OwnedFileQueryMetadata};
 pub use buffered_set_information::{
     capture_buffered_set_information, BufferedSetInformationError, BufferedSetInformationKind,
 };
@@ -1113,7 +1113,17 @@ impl<P> IoManager<P> {
                 major if is_create_major(major) => file.state == FileState::Allocated,
                 nt_io_abi::major::IRP_MJ_CLEANUP => file.state == FileState::CleanupPending,
                 nt_io_abi::major::IRP_MJ_CLOSE => file.state == FileState::ClosePending,
-                _ => file.state == FileState::Open,
+                // A pointer-owned operation may continue after last-handle CLEANUP, but cannot
+                // resurrect an unowned body or enter after CLOSE. Fresh handles validate Open.
+                _ => !file.close_dispatched
+                    && (file.state == FileState::Open
+                        || (self.file_reference_count(file_id) != 0
+                            && matches!(
+                                file.state,
+                                FileState::CleanupPending
+                                    | FileState::CleanupComplete
+                                    | FileState::ClosePending
+                            ))),
             };
             if file.client_id != record.client_id
                 || file_driver != record.origin_driver_id
