@@ -131,8 +131,8 @@ pub use irp::{
     StackControl, StackFlags,
 };
 pub use lock_control::{
-    LockControlParameters, IRP_MN_LOCK, IRP_MN_UNLOCK_SINGLE, SL_EXCLUSIVE_LOCK,
-    SL_FAIL_IMMEDIATELY,
+    lock_control_access_granted, LockControlParameters, IRP_MN_LOCK, IRP_MN_UNLOCK_SINGLE,
+    SL_EXCLUSIVE_LOCK, SL_FAIL_IMMEDIATELY,
 };
 pub use local_set_information::{
     validate_local_set_information_value, LocalSetInformationPolicy,

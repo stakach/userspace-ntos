@@ -14336,33 +14336,37 @@ impl ExecNtHandler {
             return STATUS_INVALID_PARAMETER;
         }
 
-        let local_route = match self.local_directory_notify_route_for(handle) {
-            Ok(route) => route,
+        let hosted_capture = match self.capture_hosted_file_unless_local(handle) {
+            Ok(capture) => capture,
             Err(status) => return status,
         };
-        let hosted_route = if local_route.is_none() {
-            match self.hosted_file_route_for(handle) {
-                Some(route) => Some(route),
-                None => return STATUS_INVALID_HANDLE,
+        let local_route = if hosted_capture.is_none() {
+            match self.local_directory_notify_route_for(handle) {
+                Ok(Some(route)) => Some(route),
+                Err(status) => return status,
+                Ok(None) => return STATUS_INVALID_HANDLE,
             }
         } else {
             None
         };
-        let hosted_access = if let Some(route) = hosted_route {
-            let Some(access) = self.hosted_file_access_for(handle) else {
-                return STATUS_INVALID_HANDLE;
-            };
+        let synchronous = if let Some(capture) = hosted_capture.as_ref() {
             if !nt_io_manager::directory_notify_access_granted(
-                nt_types::AccessMask::from_bits_retain(access),
+                nt_types::AccessMask::from_bits_retain(capture.granted_access),
             ) {
                 return STATUS_ACCESS_DENIED;
             }
-            if apc_routine != 0 && self.file_completion.binding(route.file_id).is_some() {
+            if apc_routine != 0 && self.file_completion.binding(capture.route.file_id).is_some() {
                 return STATUS_INVALID_PARAMETER;
             }
-            access
+            match self.file_completion.io_mode(capture.route.file_id) {
+                Ok(mode) => mode.is_synchronous(),
+                Err(status) => return status,
+            }
         } else {
-            0
+            local_route
+                .as_ref()
+                .expect("local notify lost its route")
+                .synchronous()
         };
         let event_obj_idx = match self.prepare_io_event_for_request(event) {
             Ok(index) => index.map_or(u64::MAX, |index| index as u64),
@@ -14370,14 +14374,6 @@ impl ExecNtHandler {
         };
         let completion_port_suppressed =
             nt_io_completion::io_event_suppresses_completion_port(event);
-        let synchronous = local_route
-            .as_ref()
-            .map(LocalDirectoryNotifyRoute::synchronous)
-            .unwrap_or_else(|| {
-                self.file_completion
-                    .is_synchronous(hosted_route.unwrap().file_id)
-                    .unwrap_or(true)
-            });
         if !self.reserve_pending_file_io_owner()
             || ((synchronous || local_route.is_some())
                 && (REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free()))
@@ -14478,12 +14474,15 @@ impl ExecNtHandler {
             return STATUS_PENDING;
         }
 
-        let route = hosted_route.unwrap();
+        let capture = hosted_capture
+            .as_ref()
+            .expect("hosted notify lost its capture");
+        let route = capture.route;
         let mut output = match try_zeroed_transfer_buffer(buffer_length as usize) {
             Ok(output) => output,
             Err(status) => return status,
         };
-        match self.prepare_hosted_file_io(route, handle, hosted_access) {
+        match self.prepare_hosted_file_io(route, handle, capture.granted_access) {
             Ok(true) => {}
             Ok(false) => return STATUS_PENDING,
             Err(status) => return status,
@@ -14581,6 +14580,23 @@ impl ExecNtHandler {
         let apc_routine = args[2];
         let apc_context = args[3];
         let iosb = args[4];
+        let hosted_capture = match self.capture_hosted_file_unless_local(handle) {
+            Ok(capture) => capture,
+            Err(status) => return status,
+        };
+        let hosted_mode = if let Some(capture) = hosted_capture.as_ref() {
+            if !nt_io_manager::lock_control_access_granted(
+                nt_types::AccessMask::from_bits_retain(capture.granted_access),
+            ) {
+                return STATUS_ACCESS_DENIED;
+            }
+            match self.file_completion.io_mode(capture.route.file_id) {
+                Ok(mode) => Some(mode),
+                Err(status) => return status,
+            }
+        } else {
+            None
+        };
         let mut offset_bytes = [0u8; 8];
         let mut length_bytes = [0u8; 8];
         if iosb == 0
@@ -14601,51 +14617,34 @@ impl ExecNtHandler {
             Some(pid) => pid,
             None => return nt_fs::STATUS_INVALID_HANDLE,
         };
-        let local_route = match self.local_byte_lock_route_for(handle) {
-            Ok(route) => route,
-            Err(status) => return status,
-        };
-        let hosted_route = if local_route.is_none() {
-            match self.hosted_file_route_for(handle) {
-                Some(route) => Some(route),
-                None => return nt_fs::STATUS_INVALID_HANDLE,
+        let local_route = if hosted_capture.is_none() {
+            match self.local_byte_lock_route_for(handle) {
+                Ok(Some(route)) => Some(route),
+                Err(status) => return status,
+                Ok(None) => return STATUS_INVALID_HANDLE,
             }
         } else {
             None
         };
-        if hosted_route.is_some_and(|route| {
-            apc_routine != 0 && self.file_completion.binding(route.file_id).is_some()
+        if hosted_capture.as_ref().is_some_and(|capture| {
+            apc_routine != 0 && self.file_completion.binding(capture.route.file_id).is_some()
         }) {
             return STATUS_INVALID_PARAMETER;
         }
-        let hosted_access = if hosted_route.is_some() {
-            match self.hosted_file_access_for(handle) {
-                Some(access)
-                    if access
-                        & (0x0000_0001 | 0x0000_0002 | 0x8000_0000 | 0x4000_0000 | 0x1000_0000)
-                        != 0 =>
-                {
-                    access
-                }
-                Some(_) => return STATUS_ACCESS_DENIED,
-                None => return nt_fs::STATUS_INVALID_HANDLE,
-            }
-        } else {
-            0
-        };
         let event_obj_idx = match self.prepare_lock_event_for_request(event) {
             Ok(index) => index.map_or(u64::MAX, |index| index as u64),
             Err(status) => return status,
         };
         let completion_port_suppressed =
             nt_io_completion::io_event_suppresses_completion_port(event);
-        let synchronous = local_route
-            .map(|route| route.synchronous)
-            .unwrap_or_else(|| {
-                self.file_completion
-                    .is_synchronous(hosted_route.unwrap().file_id)
-                    .unwrap_or(true)
-            });
+        let synchronous = if let Some(mode) = hosted_mode {
+            mode.is_synchronous()
+        } else {
+            local_route
+                .as_ref()
+                .expect("local lock lost its route")
+                .synchronous
+        };
         if !self.reserve_pending_file_io_owner()
             || ((synchronous || local_route.is_some())
                 && (REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free()))
@@ -14747,8 +14746,11 @@ impl ExecNtHandler {
                 }
             }
         } else {
-            let route = hosted_route.unwrap();
-            match self.prepare_hosted_file_io(route, handle, hosted_access) {
+            let capture = hosted_capture
+                .as_ref()
+                .expect("hosted lock lost its capture");
+            let route = capture.route;
+            match self.prepare_hosted_file_io(route, handle, capture.granted_access) {
                 Ok(true) => {}
                 Ok(false) => return STATUS_PENDING,
                 Err(status) => return status,
@@ -14840,6 +14842,17 @@ impl ExecNtHandler {
         const STATUS_PENDING: u32 = 0x0000_0103;
         let handle = args[0];
         let iosb = args[1];
+        let hosted_capture = match self.capture_hosted_file_unless_local(handle) {
+            Ok(capture) => capture,
+            Err(status) => return status,
+        };
+        if let Some(capture) = hosted_capture.as_ref() {
+            if !nt_io_manager::lock_control_access_granted(
+                nt_types::AccessMask::from_bits_retain(capture.granted_access),
+            ) {
+                return STATUS_ACCESS_DENIED;
+            }
+        }
         let mut offset_bytes = [0u8; 8];
         let mut length_bytes = [0u8; 8];
         if iosb == 0
@@ -14858,9 +14871,14 @@ impl ExecNtHandler {
             Some(pid) => pid,
             None => return nt_fs::STATUS_INVALID_HANDLE,
         };
-        let local_route = match self.local_byte_lock_route_for(handle) {
-            Ok(route) => route,
-            Err(status) => return status,
+        let local_route = if hosted_capture.is_none() {
+            match self.local_byte_lock_route_for(handle) {
+                Ok(Some(route)) => Some(route),
+                Err(status) => return status,
+                Ok(None) => return STATUS_INVALID_HANDLE,
+            }
+        } else {
+            None
         };
         if let Some(route) = local_route {
             let status = self
@@ -14877,18 +14895,17 @@ impl ExecNtHandler {
             return status;
         }
 
-        let route = match self.hosted_file_route_for(handle) {
-            Some(route) => route,
-            None => return nt_fs::STATUS_INVALID_HANDLE,
-        };
+        let capture = hosted_capture
+            .as_ref()
+            .expect("hosted unlock lost its capture");
+        let route = capture.route;
         if !self.reserve_pending_file_io_owner()
             || REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
             || !wait_reply_pool_has_free()
         {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        let access = self.hosted_file_access_for(handle).unwrap();
-        match self.prepare_hosted_file_io(route, handle, access) {
+        match self.prepare_hosted_file_io(route, handle, capture.granted_access) {
             Ok(true) => {}
             Ok(false) => return STATUS_PENDING,
             Err(status) => return status,
@@ -28100,12 +28117,13 @@ impl ExecNtHandler {
         handle: u64,
         iosb: u64,
         output_va: u64,
-        route: HostedFileRoute,
+        capture: &file_capture::HostedFileCapture,
         parameters: nt_io_manager::QueryEaParameters,
         stack_flags: nt_io_manager::StackFlags,
         ea_list: &[u8],
         output: &mut [u8],
     ) -> (u32, u64) {
+        let route = capture.route;
         let file_id = route.file_id;
         let synchronous_file = match self.file_completion.is_synchronous(file_id) {
             Ok(synchronous) => synchronous,
@@ -28117,10 +28135,7 @@ impl ExecNtHandler {
         {
             return (nt_io_completion::STATUS_INSUFFICIENT_RESOURCES, 0);
         }
-        let Some(granted_access) = self.hosted_file_access_for(handle) else {
-            return (nt_fs::STATUS_INVALID_HANDLE, 0);
-        };
-        match self.prepare_hosted_file_io(route, handle, granted_access) {
+        match self.prepare_hosted_file_io(route, handle, capture.granted_access) {
             Ok(true) => {}
             Ok(false) => return (STATUS_PENDING, 0),
             Err(status) => return (status, 0),
@@ -28197,9 +28212,10 @@ impl ExecNtHandler {
         &mut self,
         handle: u64,
         iosb: u64,
-        route: HostedFileRoute,
+        capture: &file_capture::HostedFileCapture,
         input: &[u8],
     ) -> (u32, u64) {
+        let route = capture.route;
         let file_id = route.file_id;
         let synchronous_file = match self.file_completion.is_synchronous(file_id) {
             Ok(synchronous) => synchronous,
@@ -28211,10 +28227,7 @@ impl ExecNtHandler {
         {
             return (nt_io_completion::STATUS_INSUFFICIENT_RESOURCES, 0);
         }
-        let Some(granted_access) = self.hosted_file_access_for(handle) else {
-            return (nt_fs::STATUS_INVALID_HANDLE, 0);
-        };
-        match self.prepare_hosted_file_io(route, handle, granted_access) {
+        match self.prepare_hosted_file_io(route, handle, capture.granted_access) {
             Ok(true) => {}
             Ok(false) => return (STATUS_PENDING, 0),
             Err(status) => return (status, 0),
@@ -28283,12 +28296,13 @@ impl ExecNtHandler {
         handle: u64,
         iosb: u64,
         output_va: u64,
-        route: HostedFileRoute,
+        capture: &file_capture::HostedFileCapture,
         parameters: nt_io_manager::QueryQuotaParameters,
         stack_flags: nt_io_manager::StackFlags,
         auxiliary: &[u8],
         output: &mut [u8],
     ) -> (u32, u64) {
+        let route = capture.route;
         let file_id = route.file_id;
         let synchronous_file = match self.file_completion.is_synchronous(file_id) {
             Ok(synchronous) => synchronous,
@@ -28300,10 +28314,7 @@ impl ExecNtHandler {
         {
             return (nt_io_completion::STATUS_INSUFFICIENT_RESOURCES, 0);
         }
-        let Some(granted_access) = self.hosted_file_access_for(handle) else {
-            return (nt_fs::STATUS_INVALID_HANDLE, 0);
-        };
-        match self.prepare_hosted_file_io(route, handle, granted_access) {
+        match self.prepare_hosted_file_io(route, handle, capture.granted_access) {
             Ok(true) => {}
             Ok(false) => return (STATUS_PENDING, 0),
             Err(status) => return (status, 0),
@@ -28380,9 +28391,10 @@ impl ExecNtHandler {
         &mut self,
         handle: u64,
         iosb: u64,
-        route: HostedFileRoute,
+        capture: &file_capture::HostedFileCapture,
         input: &[u8],
     ) -> (u32, u64) {
+        let route = capture.route;
         let file_id = route.file_id;
         let synchronous_file = match self.file_completion.is_synchronous(file_id) {
             Ok(synchronous) => synchronous,
@@ -28394,10 +28406,7 @@ impl ExecNtHandler {
         {
             return (nt_io_completion::STATUS_INSUFFICIENT_RESOURCES, 0);
         }
-        let Some(granted_access) = self.hosted_file_access_for(handle) else {
-            return (nt_fs::STATUS_INVALID_HANDLE, 0);
-        };
-        match self.prepare_hosted_file_io(route, handle, granted_access) {
+        match self.prepare_hosted_file_io(route, handle, capture.granted_access) {
             Ok(true) => {}
             Ok(false) => return (STATUS_PENDING, 0),
             Err(status) => return (status, 0),
@@ -29388,11 +29397,6 @@ impl ExecNtHandler {
         &self,
         handle: u64,
     ) -> Result<Option<LocalByteLockRoute>, u32> {
-        const FILE_READ_DATA: u32 = 0x0000_0001;
-        const FILE_WRITE_DATA: u32 = 0x0000_0002;
-        const GENERIC_READ: u32 = 0x8000_0000;
-        const GENERIC_WRITE: u32 = 0x4000_0000;
-        const GENERIC_ALL: u32 = 0x1000_0000;
         let pid = self
             .pm_pid_for_pi(self.pi)
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
@@ -29402,9 +29406,9 @@ impl ExecNtHandler {
             .pm
             .handle_access(pid, process_handle)
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-        if access & (FILE_READ_DATA | FILE_WRITE_DATA | GENERIC_READ | GENERIC_WRITE | GENERIC_ALL)
-            == 0
-        {
+        if !nt_io_manager::lock_control_access_granted(
+            nt_types::AccessMask::from_bits_retain(access),
+        ) {
             return Err(STATUS_ACCESS_DENIED);
         }
         self.local_file_io_route_for(handle)
@@ -41460,19 +41464,12 @@ impl ExecNtHandler {
                     }
                 }
 
-                let io_metadata = match self.io_manager_file_query_metadata(args[0]) {
-                    Ok(metadata) => metadata,
+                let capture = match self.capture_hosted_file_with_access(
+                    args[0],
+                    nt_io_manager::query_ea_access_granted,
+                ) {
+                    Ok(capture) => capture,
                     Err(status) => return status,
-                };
-                if !nt_io_manager::query_ea_access_granted(nt_types::AccessMask::from_bits_retain(
-                    io_metadata.access_flags,
-                )) {
-                    return STATUS_ACCESS_DENIED;
-                }
-                let Some(route) = self.hosted_file_route_for(args[0]) else {
-                    let status = STATUS_INVALID_DEVICE_REQUEST;
-                    let _ = self.write_current_iosb(iosb, status, 0);
-                    return status;
                 };
 
                 let mut routed_output = match try_zeroed_transfer_buffer(length) {
@@ -41498,7 +41495,7 @@ impl ExecNtHandler {
                     args[0],
                     iosb,
                     output,
-                    route,
+                    &capture,
                     parameters,
                     stack_flags,
                     &ea_list,
@@ -41528,9 +41525,16 @@ impl ExecNtHandler {
                         STATUS_DATATYPE_MISALIGNMENT
                     };
                 }
-                if !self.probe_user_output(iosb, 16) {
+                if !self.probe_user_output(iosb, 16) || !self.probe_user_input(input, length) {
                     return STATUS_ACCESS_VIOLATION;
                 }
+                let capture = match self.capture_hosted_file_with_access(
+                    args[0],
+                    nt_io_manager::set_ea_access_granted,
+                ) {
+                    Ok(capture) => capture,
+                    Err(status) => return status,
+                };
                 let mut captured = match try_zeroed_transfer_buffer(length) {
                     Ok(bytes) => bytes,
                     Err(status) => return status,
@@ -41546,22 +41550,8 @@ impl ExecNtHandler {
                     }
                 }
 
-                let io_metadata = match self.io_manager_file_query_metadata(args[0]) {
-                    Ok(metadata) => metadata,
-                    Err(status) => return status,
-                };
-                if !nt_io_manager::set_ea_access_granted(nt_types::AccessMask::from_bits_retain(
-                    io_metadata.access_flags,
-                )) {
-                    return STATUS_ACCESS_DENIED;
-                }
-                let Some(route) = self.hosted_file_route_for(args[0]) else {
-                    let status = STATUS_INVALID_DEVICE_REQUEST;
-                    let _ = self.write_current_iosb(iosb, status, 0);
-                    return status;
-                };
                 let (status, information) =
-                    self.service_hosted_set_ea(args[0], iosb, route, &captured);
+                    self.service_hosted_set_ea(args[0], iosb, &capture, &captured);
                 if status != STATUS_PENDING && !self.write_current_iosb(iosb, status, information) {
                     return STATUS_ACCESS_VIOLATION;
                 }
@@ -41654,13 +41644,9 @@ impl ExecNtHandler {
                     }
                 }
 
-                if let Err(status) = self.io_manager_file_query_metadata(args[0]) {
-                    return status;
-                }
-                let Some(route) = self.hosted_file_route_for(args[0]) else {
-                    let status = STATUS_INVALID_DEVICE_REQUEST;
-                    let _ = self.write_current_iosb(iosb, status, 0);
-                    return status;
+                let capture = match self.capture_hosted_file(args[0]) {
+                    Ok(capture) => capture,
+                    Err(status) => return status,
                 };
 
                 let mut routed_output = match try_zeroed_transfer_buffer(length) {
@@ -41686,7 +41672,7 @@ impl ExecNtHandler {
                     args[0],
                     iosb,
                     output,
-                    route,
+                    &capture,
                     parameters,
                     stack_flags,
                     &auxiliary,
@@ -41716,9 +41702,16 @@ impl ExecNtHandler {
                         STATUS_DATATYPE_MISALIGNMENT
                     };
                 }
-                if !self.probe_user_output(iosb, 16) {
+                if !self.probe_user_output(iosb, 16) || !self.probe_user_input(input, length) {
                     return STATUS_ACCESS_VIOLATION;
                 }
+                let capture = match self.capture_hosted_file_with_access(
+                    args[0],
+                    nt_io_manager::set_quota_access_granted,
+                ) {
+                    Ok(capture) => capture,
+                    Err(status) => return status,
+                };
                 let mut captured = match try_zeroed_transfer_buffer(length) {
                     Ok(bytes) => bytes,
                     Err(status) => {
@@ -41736,26 +41729,8 @@ impl ExecNtHandler {
                     return status;
                 }
 
-                let io_metadata = match self.io_manager_file_query_metadata(args[0]) {
-                    Ok(metadata) => metadata,
-                    Err(status) => {
-                        let _ = self.write_current_iosb(iosb, status, 0);
-                        return status;
-                    }
-                };
-                if !nt_io_manager::set_quota_access_granted(nt_types::AccessMask::from_bits_retain(
-                    io_metadata.access_flags,
-                )) {
-                    let _ = self.write_current_iosb(iosb, STATUS_ACCESS_DENIED, 0);
-                    return STATUS_ACCESS_DENIED;
-                }
-                let Some(route) = self.hosted_file_route_for(args[0]) else {
-                    let status = STATUS_INVALID_DEVICE_REQUEST;
-                    let _ = self.write_current_iosb(iosb, status, 0);
-                    return status;
-                };
                 let (status, information) =
-                    self.service_hosted_set_quota(args[0], iosb, route, &captured);
+                    self.service_hosted_set_quota(args[0], iosb, &capture, &captured);
                 if status != STATUS_PENDING && !self.write_current_iosb(iosb, status, information) {
                     return STATUS_ACCESS_VIOLATION;
                 }

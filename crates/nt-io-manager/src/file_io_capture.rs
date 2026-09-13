@@ -294,3 +294,7 @@ mod tests;
 #[cfg(test)]
 #[path = "file_io_capture/policy_tests.rs"]
 mod policy_tests;
+
+#[cfg(test)]
+#[path = "file_io_capture/request_tests.rs"]
+mod request_tests;

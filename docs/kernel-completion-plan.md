@@ -33577,12 +33577,62 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         `.tmp/build-file-io-capture-executive-20260913.log`. Independent reviews covered capture
         scope, durable storage, canonical/policy lifetime, exact promoted routing, full-width
         handle validation and mode ownership. This is not native fault-injection or desktop proof.
-      - [ ] Apply the same owned capture to notify, lock/unlock, volume/file query and
-        set, EA/quota and rename/open-parent paths. Capture route and access together before their
-        first relevant callout; do not pair a pinned original File with a reused handle's grant.
+      - [x] Extend owned hosted capture to directory notify, byte-range lock/unlock and
+        query/set EA/quota (2026-09-13; host/build verified below). Their dispatch,
+        synchronous admission and terminal copyout retain the same canonical File and original
+        access. Promoted hosted retries bypass fresh local classification and access lookup.
+        Remove notify/lock's assumed-synchronous defaults, unlock's unchecked access unwrap and
+        EA/quota's repeated live-handle metadata/access resolution. The common byte-lock access
+        predicate accepts read or write data access, not append-only access; exclusive locking
+        does not itself require write access. Unlock remains a synchronous API even on an
+        asynchronous File.
+        Preserve NT5 capture ordering: notify probes/filter validation precede File capture;
+        hosted lock/unlock capture and access checks precede range/IOSB probes. EA/quota queries
+        capture optional lists/index/SID before the File. Set EA/quota probe first, then capture
+        the File before allocating/copying/validating the payload. A readable malformed set
+        payload must not mask an invalid or denied File handle. References: NT5 iomgr/dir.c,
+        lock.c, qsea.c, qsquota.c and internal.c.
+        Shared access-aware capture checks the original grant before rejecting an unsupported
+        local File route. Handle-reference/access failures return without changing the IOSB;
+        legacy unrouted File handles remain File-typed but are explicitly unsupported, never
+        assigned an inferred driver route.
+      - [ ] Resolve the lock Event-handle failure contract explicitly against NT5 lock.c and
+        ReactOS iofunc.c before changing current rejection behavior. The capture migration leaves
+        this policy unchanged; differing reference behavior is not permission for a fallback.
+      - [x] Finish serialized host/native validation of the notify/lock/EA/quota checkpoint.
+        Canonical IRP lifecycle fixtures cover inline completion and pending consumer ACK,
+        original context/access/typed parameters, last-handle CLEANUP and deferred final CLOSE.
+        All 23 focused capture tests and 3 lock-control tests pass; the broad host/doc run passes
+        3,587 tests across 64 suites, with no failures or ignored cases. The executive release
+        build passes in 38.26s with the unchanged 294 warnings. Focused formatting and
+        git diff --check pass. Evidence:
+        `.tmp/test-file-lock-notify-capture-contract-20260913.log`,
+        `.tmp/test-file-lock-notify-access-20260913.log`,
+        `.tmp/test-file-lock-notify-capture-full-20260913.log`, and
+        `.tmp/build-file-lock-notify-capture-executive-20260913.log`.
+        Independent reviews covered NT5 capture/probe ordering, original access, local unsupported
+        route error precedence, IOSB nonmutation on reference failure and exact retry routing.
+        Driver execution is a host fixture, not a claim of native execution or desktop paint.
+      - [ ] Apply the same owned capture to volume/file query and set, and rename/open-parent
+        paths. Capture route and access together before their first relevant callout; do not pair
+        a pinned original File with a reused handle's grant. io_manager_file_query_metadata still
+        consults the current handle before retained routing; derive hosted metadata from the
+        capture instead. Rename must retain both its source File and RootDirectory target through
+        acquisition/dispatch; an unretained canonical target ID is insufficient. Promoted hosted
+        set-information must also bypass fresh local classification before consulting a reused
+        handle.
         Remove borrowed route/access helpers once only genuinely callout-free inspection remains.
+        Implement volume query/set first, then File query, then File set/name-target ownership.
+        Capture-derived metadata must preserve canonical create-option bits (including write-
+        through, sequential and no-buffering) and alignment, not reconstruct mode from only the
+        synchronous/alertable policy. File Access/Mode/Alignment immediate replies currently skip
+        synchronous Busy acquisition; bring them under the same acquisition/retirement boundary
+        (NT5 qsinfo.c:302,603). Include the volume driver-path inline query and File set classes
+        30/41 in the capture audit rather than treating only IRP-producing branches as requests.
         Local disk/overlay File lifetime capture across probes remains a separate follow-on; the
-        hosted reference adapter does not claim to protect those local File objects.
+        hosted reference adapter does not claim to protect those local File objects. Local
+        lock/unlock still resolve their unretained route after user probes; do not move that
+        lookup earlier without first adding a real local File reference.
       - [ ] Reconcile post-CLEANUP admission after a successful body capture: current fresh
         synchronous acquisition rejects cleanup_sent. Preserve driver-owned post-cleanup behavior
         when extending admission; do not wait for CLOSE while holding the reference needed by
