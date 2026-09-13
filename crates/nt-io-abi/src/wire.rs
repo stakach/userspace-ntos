@@ -122,6 +122,7 @@ pub struct IrpDispatchRequest {
     pub create_desired_access: u32,
     pub create_share_access: u32,
     pub create_disposition: u32,
+    /// Current CREATE stack options, which a forwarding driver may change.
     pub create_options: u32,
     pub create_file_attributes: u32,
     pub create_ea_length: u32,
@@ -142,7 +143,9 @@ pub struct IrpDispatchRequest {
     pub lock_byte_offset: u64,
     pub lock_length: u64,
     pub lock_key: u32,
-    pub _reserved1: u32,
+    /// Original canonical File CREATE options, independent of a forwarding driver's mutable
+    /// stack `create_options`. Low 24 bits only; zero for non-CREATE majors.
+    pub file_create_options: u32,
     /// Typed `Parameters.Read/Write` values. Length remains the direction-specific transfer extent.
     pub read_write_byte_offset: u64,
     pub read_write_key: u32,
@@ -188,6 +191,7 @@ const _: () = {
     assert!(size_of::<IoFileRequest>() == 16);
     assert!(size_of::<IoCancelRequest>() == 16);
     assert!(size_of::<IrpDispatchRequest>() == 256);
+    assert!(core::mem::offset_of!(IrpDispatchRequest, file_create_options) == 228);
     assert!(core::mem::offset_of!(IrpDispatchRequest, create_case_sensitive) == 244);
     assert!(core::mem::offset_of!(IrpDispatchRequest, initial_information) == 248);
     assert!(size_of::<IoReply>() == 32);

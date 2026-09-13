@@ -30,7 +30,19 @@ pub use wire::{
 };
 
 /// ABI version of this wire contract; bumped on any incompatible change.
-pub const IO_ABI_VERSION: u32 = 14;
+pub const IO_ABI_VERSION: u32 = 15;
+
+/// Validate original canonical File CREATE options separately from mutable stack options.
+/// CREATE, named-pipe CREATE, and mailslot CREATE carry only the low 24 option bits and cannot
+/// select both synchronous modes. This checks wire provenance, not full CREATE admission.
+/// Other major functions must not carry initial File options.
+pub const fn valid_file_create_options(major: u8, options: u32) -> bool {
+    if major::is_create_major(major) {
+        options & 0xff00_0000 == 0 && options & 0x30 != 0x30
+    } else {
+        options == 0
+    }
+}
 
 /// Validate captured CREATE case provenance independently of mutable stack flags.
 /// A forwarding driver may change its next stack's `SL_CASE_SENSITIVE` without
@@ -545,7 +557,7 @@ mod tests {
 
     #[test]
     fn initial_information_wire_appends_scalar_without_moving_existing_fields() {
-        assert_eq!(IO_ABI_VERSION, 14);
+        assert_eq!(IO_ABI_VERSION, 15);
         assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 256);
         assert_eq!(
             core::mem::offset_of!(IrpDispatchRequest, target_domain_id),
@@ -593,7 +605,7 @@ mod tests {
         };
         let bytes = bytemuck::bytes_of(&request);
         assert_eq!(&bytes[244..248], &1u32.to_le_bytes());
-        assert_eq!(&bytes[..2], &14u16.to_le_bytes());
+        assert_eq!(&bytes[..2], &15u16.to_le_bytes());
         assert_eq!(
             bytemuck::pod_read_unaligned::<IrpDispatchRequest>(bytes),
             request
@@ -604,6 +616,85 @@ mod tests {
             ..request
         };
         assert_ne!(old_request.abi_version, IO_ABI_VERSION as u16);
+    }
+
+    #[test]
+    fn file_create_options_reuses_reserved_word_without_moving_other_fields() {
+        assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 256);
+        assert_eq!(
+            core::mem::offset_of!(IrpDispatchRequest, file_create_options),
+            228
+        );
+        assert_eq!(core::mem::offset_of!(IrpDispatchRequest, lock_key), 224);
+        assert_eq!(
+            core::mem::offset_of!(IrpDispatchRequest, read_write_byte_offset),
+            232
+        );
+        assert_eq!(
+            core::mem::offset_of!(IrpDispatchRequest, create_case_sensitive),
+            244
+        );
+        assert_eq!(
+            core::mem::offset_of!(IrpDispatchRequest, initial_information),
+            248
+        );
+        let request = IrpDispatchRequest {
+            abi_version: IO_ABI_VERSION as u16,
+            abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
+            major: major::IRP_MJ_CREATE,
+            create_options: 0x40,
+            file_create_options: 0x0020_0026,
+            ..Default::default()
+        };
+        assert!(valid_file_create_options(
+            request.major,
+            request.file_create_options
+        ));
+        let bytes = bytemuck::bytes_of(&request);
+        assert_eq!(&bytes[228..232], &request.file_create_options.to_le_bytes());
+        assert_eq!(&bytes[..2], &15u16.to_le_bytes());
+        let decoded: IrpDispatchRequest = bytemuck::pod_read_unaligned(bytes);
+        assert_eq!(decoded, request);
+        assert_ne!(decoded.create_options, decoded.file_create_options);
+
+        // ABI 14 has identical size but its reserved word cannot attest original File options.
+        let old_request = IrpDispatchRequest {
+            abi_version: 14,
+            ..request
+        };
+        let old_decoded: IrpDispatchRequest =
+            bytemuck::pod_read_unaligned(bytemuck::bytes_of(&old_request));
+        assert_eq!(old_decoded.abi_size, request.abi_size);
+        assert_ne!(old_decoded.abi_version, IO_ABI_VERSION as u16);
+    }
+
+    #[test]
+    fn file_create_options_validates_every_bit_and_major_independently_of_stack_options() {
+        for major in 0..=u8::MAX {
+            let is_create = matches!(
+                major,
+                major::IRP_MJ_CREATE
+                    | major::IRP_MJ_CREATE_NAMED_PIPE
+                    | major::IRP_MJ_CREATE_MAILSLOT
+            );
+            assert!(valid_file_create_options(major, 0));
+            for bit in 0..32 {
+                for sync in [0, 0x10, 0x20, 0x30] {
+                    let options = (1u32 << bit) | sync;
+                    let expected = is_create && bit < 24 && options & 0x30 != 0x30;
+                    assert_eq!(
+                        valid_file_create_options(major, options),
+                        expected,
+                        "major={major:#x} options={options:#x}"
+                    );
+                }
+            }
+            for options in [0x00ff_ffcf, 0x00ff_ffdf, 0x00ff_ffef] {
+                assert_eq!(valid_file_create_options(major, options), is_create);
+            }
+            assert!(!valid_file_create_options(major, 0x00ff_ffff));
+            assert!(!valid_file_create_options(major, u32::MAX));
+        }
     }
 
     #[test]

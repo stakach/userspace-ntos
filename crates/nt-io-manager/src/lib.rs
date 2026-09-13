@@ -1149,6 +1149,13 @@ impl<P> IoManager<P> {
             {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
+            if is_create_major(record.origin_major) {
+                let options = file.create_options.bits();
+                if !nt_io_abi::valid_file_create_options(record.origin_major, options) {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+                record.file_create_options = options;
+            }
             if let Some(IoParameters::SetInformation(parameters)) =
                 record.current_stack().map(|stack| &stack.parameters)
             {
@@ -2194,6 +2201,7 @@ mod tests {
     fn projection(major: u8, parameters: IoParameters) -> IrpProjection {
         IrpProjection {
             create_case_sensitive: false,
+            file_create_options: 0,
             irp_id: IrpId::new(1, 1),
             driver_id: DriverId::new(1, 1),
             device_id: DeviceId::new(1, 1),
@@ -7478,7 +7486,9 @@ mod tests {
         write_wdm_file_object(
             &mut file,
             WdmFileObjectInit {
+                file_object_address: 0x3000,
                 opened_case_sensitive: false,
+                create_options: 0,
                 device_object: 0x4444,
                 fs_context: 0x5555,
                 related_file_object: 0x5a5a,
@@ -7509,6 +7519,7 @@ mod tests {
             &mut device,
             &mut file,
             WdmOpenDeviceProjectionInit {
+                file_object_address: 0x3000,
                 driver_object: 0x1000,
                 driver_extension: 0x1150,
                 device_object: 0x2000,

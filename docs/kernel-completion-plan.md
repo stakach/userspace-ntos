@@ -34053,15 +34053,58 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/build-file-mode-io-manager-20260914.log. Scoped formatting and diff checks pass.
         No VM or native provider readback was run. The last measured 27 strict win32k imports
         and desktop acceptance remain open; provider mode publication is the next step below.
+      - [x] Initialize provider FILE_OBJECT flags from canonical CREATE provenance (2026-09-14;
+        host/composed/native-build validation recorded below).
+        Carry original File CREATE options independently of a filter's mutable stack parameters
+        through canonical admission, detached/forwarded projection and ABI15. The wire reuses
+        offset 228 without changing the 256-byte request size; ABI14 peers fail explicitly.
+        Validate options before ownership side effects and before provider object mutation.
+        NT5 parse.c:1103-1173 sets sync/alert, unbuffered, write-through, sequential and random
+        access hints plus independent case policy. It does not pre-set the filesystem-owned
+        FO_DELETE_ON_CLOSE bit. Existing provider objects must never be rebuilt on reuse.
+        Initialize synchronous Lock at +0x80 and every File's Event at +0x98, following
+        parse.c:1136/1307: synchronization/notification respectively, both initially unsignaled.
+        KEVENT size and empty wait-list links use the explicitly supplied final provider address,
+        not a staging slice pointer. Invalid options/addresses fail before File buffer mutation.
+        The video bridge reads its successful canonical open's options/case policy as well.
+        Host validation passes: 692 I/O Manager library tests, 30 ABI, nine driver-runtime and
+        11 composed tests (mode commit, seeded FileAll provider, synchronous ingress/routes),
+        totaling 742 without failures or ignored cases. Driver-host and I/O client/server
+        library test targets also compile but contain zero unit tests. Six new WDM tests cover
+        exact flags/events, remote-address self-links and failure nonmutation; composed CREATE
+        coverage includes all three majors, filter-altered options, invalid admission with no
+        ownership effects, old-ABI rejection and zero provenance on non-CREATE projections.
+        Evidence: .tmp/test-initial-file-projection-libraries-20260914.log,
+        .tmp/test-initial-file-projection-composed-20260914.log and
+        .tmp/test-initial-file-projection-transport-20260914.log. Independent review found no
+        blocking issue, including the added event-header initialization.
+        Serialized native release builds pass: executive in 38.16s with the unchanged 294
+        warnings and standalone I/O Manager in 2.54s without warnings. Evidence:
+        .tmp/build-initial-file-projection-executive-20260914.log and
+        .tmp/build-initial-file-projection-io-manager-20260914.log. Scoped formatting and
+        git diff --check pass. No VM or native provider readback is claimed; the last measured
+        27 strict win32k imports and desktop acceptance remain open. Next is exact native File
+        projection registration, followed by runtime synchronization and mode publication below.
+      - [ ] Register every native File projection with exact hosted-domain ownership.
+        The 2026-09-14 audit found hosted_domain's typed File bind/unbind APIs have no native
+        driver_launch callers. Component-local FILE_OBJECTS is not an authoritative cross-domain
+        registry. Bind before driver entry; unbind exact identity on final CLOSE/failed-CREATE
+        retirement, including retained-completion ACK, not CLEANUP. Add per-File enumeration
+        and binding leases with domain generation/cookie, FileId, address and binding generation.
+        Current device attachments cannot identify detached filters or retained older projections.
+        Audit/reconcile canonical and provider-realized File body state using those bindings:
+        initial headers do not prove ongoing Event/Busy/current-position synchronization, and
+        CREATE's delete-on-close option is not proof that the filesystem set FO_DELETE_ON_CLOSE.
       - [ ] Publish canonical File mode to every exact provider FILE_OBJECT before native SET16.
-        The 2026-09-14 WDM audit found write_wdm_file_object currently initializes only case
-        policy at Flags+0x50; reuse intentionally leaves provider Flags untouched. Add complete
-        initial mode projection from original CREATE state, not filter-modified stack options.
+        Build on initial projection and exact native binding registration above. Use a dedicated
+        authenticated host-control operation, not a synthetic SET IRP or direct remote writes.
         Live updates must merge only FO_WRITE_THROUGH (0x10), FO_SEQUENTIAL_ONLY (0x20) and
         FO_ALERTABLE_IO (0x4), preserving unrelated provider-owned flags and contexts. Synchronize
         existing filter-domain projections and parked IRPs before acknowledging SET success;
         refreshing only at the next IRP is insufficient. Own partial publication across transport
         retries and caller teardown; do not return ordinary no-effect failure after partial writes.
+        Use versioned idempotent receipts, retain the canonical File and exact projection leases,
+        and make new binding admission version-aware so it cannot miss an in-progress update.
         Only then route hosted class 16 through the I/O Manager's real update/completion path.
         Native SET16 is intentionally unchanged by the state/policy foundation, not reported complete.
       - [x] Encode owned File queries by information class without incidental alignment failures

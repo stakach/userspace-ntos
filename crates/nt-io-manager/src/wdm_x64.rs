@@ -49,6 +49,10 @@ pub struct WdmDeviceObjectInit {
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WdmFileObjectInit {
+    /// Final WDM virtual address, which may differ from this writer's output slice address.
+    pub file_object_address: u64,
+    /// Original canonical CREATE options, excluding the disposition byte.
+    pub create_options: u32,
     pub opened_case_sensitive: bool,
     pub device_object: u64,
     pub fs_context: u64,
@@ -60,6 +64,7 @@ pub struct WdmFileObjectInit {
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WdmOpenDeviceProjectionInit {
+    pub file_object_address: u64,
     pub driver_object: u64,
     pub driver_extension: u64,
     pub device_object: u64,
@@ -236,25 +241,60 @@ pub fn write_wdm_file_object(
     init: WdmFileObjectInit,
 ) -> Result<(), WdmLayoutError> {
     require(bytes, WDM_X64_FILE_OBJECT_SIZE)?;
+    validate_file_object_address(init.file_object_address)?;
+    if init.create_options & 0xff00_0000 != 0 {
+        return Err(WdmLayoutError::InvalidField);
+    }
+    let mode = crate::FileModeState::from_create_options(crate::CreateOptions::from_bits_retain(
+        init.create_options,
+    ));
+    // NT initializes these flags before CREATE; the filesystem owns FO_DELETE_ON_CLOSE.
+    let mut flags = mode
+        .wdm_mode_flags()
+        .map_err(|_| WdmLayoutError::InvalidField)?
+        & !0x0001_0000;
+    if init.create_options & 0x0000_0800 != 0 {
+        flags |= 0x0010_0000; // FO_RANDOM_ACCESS
+    }
+    if init.opened_case_sensitive {
+        flags |= 0x0002_0000;
+    }
     zero(bytes);
     put_i16(bytes, 0x00, WDM_X64_IO_TYPE_FILE);
     put_u16(bytes, 0x02, WDM_X64_FILE_OBJECT_SIZE as u16);
     put_u64(bytes, 0x08, init.device_object);
     put_u64(bytes, 0x18, init.fs_context);
     put_u64(bytes, 0x40, init.related_file_object);
-    put_u32(
-        bytes,
-        0x50,
-        if init.opened_case_sensitive {
-            0x0002_0000
-        } else {
-            0
-        },
-    );
+    put_u32(bytes, 0x50, flags);
     put_u16(bytes, 0x58, init.file_name_len);
     put_u16(bytes, 0x5a, init.file_name_max_len);
     put_u64(bytes, 0x60, init.file_name_buffer);
+    if flags & 0x0000_0002 != 0 {
+        write_file_event(bytes, 0x80, init.file_object_address, 1);
+    }
+    write_file_event(bytes, 0x98, init.file_object_address, 0);
     Ok(())
+}
+
+fn validate_file_object_address(address: u64) -> Result<(), WdmLayoutError> {
+    if address == 0
+        || address & 7 != 0
+        || address
+            .checked_add(WDM_X64_FILE_OBJECT_SIZE as u64)
+            .is_none()
+    {
+        return Err(WdmLayoutError::InvalidField);
+    }
+    Ok(())
+}
+
+fn write_file_event(bytes: &mut [u8], offset: usize, file_address: u64, kind: u8) {
+    put_u8(bytes, offset, kind);
+    put_u8(bytes, offset + 2, 6);
+    put_u32(bytes, offset + 4, 0);
+    let head = file_address + offset as u64 + 8;
+    put_u64(bytes, offset + 8, head);
+    put_u64(bytes, offset + 0x10, head);
 }
 
 pub fn write_wdm_open_device_projection(
@@ -263,6 +303,7 @@ pub fn write_wdm_open_device_projection(
     file_bytes: &mut [u8],
     init: WdmOpenDeviceProjectionInit,
 ) -> Result<(), WdmLayoutError> {
+    validate_file_object_address(init.file_object_address)?;
     write_wdm_driver_object(
         driver_bytes,
         WdmDriverObjectInit {
@@ -288,6 +329,8 @@ pub fn write_wdm_open_device_projection(
     write_wdm_file_object(
         file_bytes,
         WdmFileObjectInit {
+            file_object_address: init.file_object_address,
+            create_options: 0,
             opened_case_sensitive: false,
             device_object: init.device_object,
             fs_context: init.file_object_context,
@@ -516,3 +559,6 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
 fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
+
+#[cfg(test)]
+mod file_object_tests;

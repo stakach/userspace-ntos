@@ -33976,6 +33976,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             request.major,
             request.create_case_sensitive,
         )
+        || !nt_io_abi::valid_file_create_options(request.major, request.file_create_options)
         || (request.major == major::IRP_MJ_QUERY_INFORMATION
             && request.buffer_len != request.output_len)
         || !nt_io_abi::valid_initial_information(
@@ -34168,7 +34169,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         if write_wdm_file_object(
             fo_bytes,
             WdmFileObjectInit {
+                file_object_address: fo,
                 opened_case_sensitive: request.create_case_sensitive != 0,
+                create_options: request.file_create_options,
                 device_object: devobj,
                 fs_context: file_id,
                 related_file_object,
@@ -42310,6 +42313,9 @@ fn hosted_irp_dispatch_request(
     input_len: usize,
     output_len: usize,
 ) -> Result<IrpDispatchRequest, nt_status::NtStatus> {
+    if !nt_io_abi::valid_file_create_options(irp.major, irp.file_create_options) {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
     // PnP Information may be a domain-local pointer; its provider override is separate.
     let initial_information = if irp.major == major::IRP_MJ_PNP {
         0
@@ -42453,6 +42459,7 @@ fn hosted_irp_dispatch_request(
             _ => 0,
         },
         create_case_sensitive: u32::from(irp.create_case_sensitive),
+        file_create_options: irp.file_create_options,
         parameter_offset,
         parameter_len,
         stack_location: u32::try_from(irp.stack_location)
@@ -58269,6 +58276,7 @@ unsafe fn dispatch_irp_for_instance_exact(
                 request.major,
                 request.create_case_sensitive,
             )
+            || !nt_io_abi::valid_file_create_options(request.major, request.file_create_options)
             || (request.major == major::IRP_MJ_QUERY_INFORMATION
                 && request.buffer_len != request.output_len)
             || !nt_io_abi::valid_initial_information(

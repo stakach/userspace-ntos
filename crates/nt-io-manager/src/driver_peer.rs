@@ -298,6 +298,9 @@ fn build_dispatch_request(
     if !valid_create_case_sensitive(irp.major, create_case_sensitive) {
         return Err(NtStatus::INVALID_PARAMETER);
     }
+    if !nt_io_abi::valid_file_create_options(irp.major, irp.file_create_options) {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
     Ok(IrpDispatchRequest {
         abi_version: IO_ABI_VERSION as u16,
         abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
@@ -357,7 +360,7 @@ fn build_dispatch_request(
         lock_byte_offset,
         lock_length,
         lock_key,
-        _reserved1: 0,
+        file_create_options: irp.file_create_options,
         read_write_byte_offset,
         read_write_key,
         create_case_sensitive,
@@ -539,6 +542,7 @@ impl DriverPeerTransport for MockDriverPeer {
                 request.major,
                 request.create_case_sensitive,
             )
+            || !nt_io_abi::valid_file_create_options(request.major, request.file_create_options)
             || !valid_quota_parameters(
                 request.major,
                 request.quota_sid_list_length,
@@ -732,6 +736,7 @@ mod initial_information_tests {
     fn projection() -> IrpProjection {
         IrpProjection {
             create_case_sensitive: false,
+            file_create_options: 0,
             irp_id: IrpId::new(1, 1),
             driver_id: DriverId::new(1, 2),
             device_id: DeviceId::new(1, 3),
@@ -880,7 +885,7 @@ mod initial_information_tests {
     }
 
     #[test]
-    fn canonical_create_case_policy_roundtrips_to_wire_and_wdm_for_each_major() {
+    fn canonical_create_provenance_roundtrips_to_wire_and_wdm_for_each_major() {
         use crate::detached_file_irp::{ExternalFileIrpBuffers, ExternalFileIrpRequest};
         use crate::{
             write_wdm_file_object, CreateOptions, CreateParameters, DeviceCharacteristics,
@@ -891,6 +896,7 @@ mod initial_information_tests {
         use alloc::{boxed::Box, vec};
         use nt_types::{AccessMask, NtPath, UnicodeString};
 
+        let original = CreateOptions::WRITE_THROUGH | CreateOptions::SYNCHRONOUS_IO_NONALERT;
         for major in [
             major::IRP_MJ_CREATE,
             major::IRP_MJ_CREATE_NAMED_PIPE,
@@ -924,12 +930,13 @@ mod initial_information_tests {
                         device,
                         AccessMask::GENERIC_READ,
                         ShareAccess::READ,
-                        CreateOptions::empty(),
+                        original,
                         UnicodeString::from_str("MixedCase"),
                     )
                     .unwrap();
                 let parameters = CreateParameters {
                     opened_case_sensitive: sensitive,
+                    create_options: original,
                     ..Default::default()
                 };
                 let prepared = io
@@ -954,6 +961,15 @@ mod initial_information_tests {
                     build_dispatch_request(prepared.projection(), &context, target(), None)
                         .unwrap();
                 assert_eq!(request.create_case_sensitive, sensitive as u32);
+                assert_eq!(request.file_create_options, original.bits());
+                for options in [0x30, 0x0100_0000] {
+                    let mut malformed = prepared.projection().clone();
+                    malformed.file_create_options = options;
+                    assert_eq!(
+                        build_dispatch_request(&malformed, &context, target(), None),
+                        Err(NtStatus::INVALID_PARAMETER)
+                    );
+                }
                 assert_eq!(
                     request.flags & 0x80 != 0,
                     major == major::IRP_MJ_CREATE && sensitive
@@ -982,7 +998,9 @@ mod initial_information_tests {
                 write_wdm_file_object(
                     &mut wdm,
                     WdmFileObjectInit {
+                        file_object_address: 0x4000,
                         opened_case_sensitive: request.create_case_sensitive != 0,
+                        create_options: request.file_create_options,
                         device_object: 0x1122,
                         fs_context: 0x3344,
                         ..Default::default()
@@ -991,7 +1009,7 @@ mod initial_information_tests {
                 .unwrap();
                 assert_eq!(
                     u32::from_le_bytes(wdm[0x50..0x54].try_into().unwrap()),
-                    if sensitive { 0x0002_0000 } else { 0 }
+                    0x12 | if sensitive { 0x0002_0000 } else { 0 }
                 );
                 assert_eq!(u64::from_le_bytes(wdm[8..16].try_into().unwrap()), 0x1122);
                 assert_eq!(io.file(file).unwrap().opened_case_sensitive(), sensitive);
@@ -1001,6 +1019,32 @@ mod initial_information_tests {
                         create_case_sensitive: value,
                         ..request
                     };
+                    assert_eq!(
+                        peer.dispatch(&malformed, PeerTransferBuffers::new(&mut [])),
+                        DispatchOutcome::Failed {
+                            status: NtStatus::INVALID_PARAMETER
+                        }
+                    );
+                }
+                for malformed in [
+                    IrpDispatchRequest {
+                        abi_version: 14,
+                        ..request
+                    },
+                    IrpDispatchRequest {
+                        file_create_options: 0x30,
+                        ..request
+                    },
+                    IrpDispatchRequest {
+                        file_create_options: 0x0100_0000,
+                        ..request
+                    },
+                    IrpDispatchRequest {
+                        major: major::IRP_MJ_READ,
+                        create_case_sensitive: 0,
+                        ..request
+                    },
+                ] {
                     assert_eq!(
                         peer.dispatch(&malformed, PeerTransferBuffers::new(&mut [])),
                         DispatchOutcome::Failed {
@@ -1024,6 +1068,8 @@ mod initial_information_tests {
         use alloc::boxed::Box;
         use nt_types::{AccessMask, NtPath, UnicodeString};
 
+        let original = CreateOptions::from_bits_retain(0x181a);
+        let lower_options = CreateOptions::SYNCHRONOUS_IO_NONALERT | CreateOptions::SEQUENTIAL_ONLY;
         for sensitive in [false, true] {
             let mut io = IoManager::new(MockObjectPort::new());
             let client = io.register_client();
@@ -1066,12 +1112,13 @@ mod initial_information_tests {
                     lower,
                     AccessMask::GENERIC_READ,
                     ShareAccess::READ,
-                    CreateOptions::empty(),
+                    original,
                     UnicodeString::from_str("MixedCase"),
                 )
                 .unwrap();
             let parameters = CreateParameters {
                 opened_case_sensitive: sensitive,
+                create_options: original,
                 ..Default::default()
             };
             let mut rejected = io
@@ -1088,6 +1135,24 @@ mod initial_information_tests {
             assert_eq!(io.allocate_irp(rejected), Err(NtStatus::INVALID_PARAMETER));
             assert_eq!(io.file(file).unwrap().outstanding_irp_refs, 0);
             assert!(!io.file(file).unwrap().opened_case_sensitive());
+            for options in [0x30, 0x0100_0000] {
+                io.file_mut(file).unwrap().create_options = CreateOptions::from_bits_retain(options);
+                let rejected = io
+                    .build_irp_record(
+                        client,
+                        lower_driver,
+                        lower,
+                        Some(file),
+                        major::IRP_MJ_CREATE,
+                        IoParameters::Create(parameters),
+                    )
+                    .unwrap();
+                assert_eq!(io.allocate_irp(rejected), Err(NtStatus::INVALID_PARAMETER));
+                assert_eq!(io.file(file).unwrap().outstanding_irp_refs, 0);
+                assert!(!io.file(file).unwrap().opened_case_sensitive());
+                assert_eq!(io.irp_count(), 0);
+            }
+            io.file_mut(file).unwrap().create_options = original;
             let record = io
                 .build_irp_record(
                     client,
@@ -1103,6 +1168,7 @@ mod initial_information_tests {
             assert_eq!(io.file(file).unwrap().outstanding_irp_refs, 1);
             let changed = CreateParameters {
                 opened_case_sensitive: !sensitive,
+                create_options: lower_options,
                 ..parameters
             };
             let mut next =
@@ -1120,6 +1186,7 @@ mod initial_information_tests {
             );
             let projection = IrpProjection::from_record(io.irp(irp).unwrap()).unwrap();
             assert_eq!(projection.create_case_sensitive, sensitive);
+            assert_eq!(projection.file_create_options, original.bits());
             assert_eq!(
                 projection.flags.contains(StackFlags::CASE_SENSITIVE),
                 !sensitive
@@ -1128,10 +1195,13 @@ mod initial_information_tests {
                 panic!("CREATE parameters lost");
             };
             assert_eq!(lower_parameters.opened_case_sensitive, !sensitive);
+            assert_eq!(lower_parameters.create_options, lower_options);
             let mut bytes = [];
             let context = DispatchContext::new(lower_driver, client, &mut bytes);
             let request = build_dispatch_request(&projection, &context, target(), None).unwrap();
             assert_eq!(request.create_case_sensitive, sensitive as u32);
+            assert_eq!(request.file_create_options, original.bits());
+            assert_eq!(request.create_options, lower_options.bits());
             assert_eq!(request.flags & 0x80 != 0, !sensitive);
             let mut peer = MockPeerControl::new().transport();
             assert!(matches!(
@@ -1145,17 +1215,20 @@ mod initial_information_tests {
             write_wdm_file_object(
                 &mut wdm,
                 WdmFileObjectInit {
+                    file_object_address: 0x4000,
                     opened_case_sensitive: request.create_case_sensitive != 0,
+                    create_options: request.file_create_options,
                     ..Default::default()
                 },
             )
             .unwrap();
             assert_eq!(
                 u32::from_le_bytes(wdm[0x50..0x54].try_into().unwrap()),
-                if sensitive { 0x0002_0000 } else { 0 }
+                0x0010_001e | if sensitive { 0x0002_0000 } else { 0 }
             );
             assert_eq!(io.file(file).unwrap().opened_case_sensitive(), sensitive);
             assert_eq!(io.irp(irp).unwrap().create_case_sensitive(), sensitive);
+            assert_eq!(io.file(file).unwrap().create_options, original);
             let current = &mut io.irp_mut(irp).unwrap().stack[1];
             current.major = major::IRP_MJ_READ;
             current.parameters = IoParameters::Read(Default::default());
@@ -1165,6 +1238,13 @@ mod initial_information_tests {
                     .create_case_sensitive
             );
             assert_eq!(io.irp(irp).unwrap().create_case_sensitive(), sensitive);
+            assert_eq!(
+                IrpProjection::from_record(io.irp(irp).unwrap())
+                    .unwrap()
+                    .file_create_options,
+                0
+            );
+            assert_eq!(io.irp(irp).unwrap().file_create_options(), original.bits());
             io.free_irp(irp).unwrap();
             assert_eq!(io.file(file).unwrap().outstanding_irp_refs, 0);
             io.release_external_file(client, file).unwrap();

@@ -535,6 +535,8 @@ pub struct IrpRecord {
     pub origin_minor: u8,
     /// Original CREATE File-body provenance, committed only by canonical IRP admission.
     pub(crate) create_case_sensitive: bool,
+    /// Original canonical File options, independent of a filter's current CREATE stack.
+    pub(crate) file_create_options: u32,
     pub state: IrpState,
     pub status: NtStatus,
     pub information: u64,
@@ -574,6 +576,7 @@ impl IrpRecord {
             origin_major: major,
             origin_minor: 0,
             create_case_sensitive: false,
+            file_create_options: 0,
             state: IrpState::Allocated,
             status: NtStatus::PENDING,
             information: 0,
@@ -595,6 +598,10 @@ impl IrpRecord {
     /// File-body case policy committed by initial admission, not the driver's current stack flag.
     pub(crate) fn create_case_sensitive(&self) -> bool {
         self.create_case_sensitive
+    }
+
+    pub(crate) fn file_create_options(&self) -> u32 {
+        self.file_create_options
     }
 
     /// Return the identity captured before the request was visible to a driver.

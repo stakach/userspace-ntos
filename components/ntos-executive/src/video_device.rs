@@ -392,6 +392,7 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> u64) -> bo
         core::slice::from_raw_parts_mut(device as *mut u8, WDM_X64_DEVICE_OBJECT_SIZE),
         core::slice::from_raw_parts_mut(file as *mut u8, WDM_X64_FILE_OBJECT_SIZE),
         WdmOpenDeviceProjectionInit {
+            file_object_address: file,
             driver_object: driver,
             driver_extension: driver + WDM_X64_DRIVER_OBJECT_SIZE as u64,
             device_object: device,
@@ -417,10 +418,15 @@ unsafe fn rewrite_video_file_projection(file_id: u64) -> bool {
     if !objects.ready() {
         return false;
     }
+    let Ok(metadata) = crate::driver_launch::owned_hosted_file_metadata(file_id) else {
+        return false;
+    };
     write_wdm_file_object(
         core::slice::from_raw_parts_mut(objects.file as *mut u8, WDM_X64_FILE_OBJECT_SIZE),
         WdmFileObjectInit {
-            opened_case_sensitive: false,
+            file_object_address: objects.file,
+            opened_case_sensitive: metadata.opened_case_sensitive,
+            create_options: metadata.create_options.bits(),
             device_object: objects.device,
             fs_context: file_id,
             related_file_object: 0,
