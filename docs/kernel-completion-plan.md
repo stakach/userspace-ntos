@@ -33613,7 +33613,56 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Independent reviews covered NT5 capture/probe ordering, original access, local unsupported
         route error precedence, IOSB nonmutation on reference failure and exact retry routing.
         Driver execution is a host fixture, not a claim of native execution or desktop paint.
-      - [ ] Apply the same owned capture to volume/file query and set, and rename/open-parent
+      - [x] Extend owned hosted capture to volume query/set (2026-09-13; host/build verified
+        below). Both paths retain the original File/access through helper dispatch, pending
+        publication and final copyout. Only fresh local requests enter local metadata handling;
+        hosted volume requests need the saved access grant and checked canonical I/O mode, not
+        an otherwise unused lookup of full File metadata through a potentially reused handle.
+        Remove both volume helpers' repeated access lookup and the driver-path branch's borrowed
+        route lookup. Set-volume now probes first, then captures/access-checks the File, acquires
+        Busy, and copies/validates the payload. Post-acquisition capture errors retire the held
+        reference without publishing an IOSB result. Both query/set helpers distinguish admission
+        failure from dispatch completion: interrupted acquisition (including USER_APC), resource
+        refusal and setup errors return without IOSB stores. The existing pending IRP and
+        synchronous API completion paths remain in use.
+        Driver-path inline queries acquire Busy before allocation/name copy, retain capture
+        through output/IOSB publication, and retire on every return. They neither clear nor
+        signal the File event; lookup/copy errors leave IOSB unchanged. Move bounded driver-name
+        extraction into a tested nt-io-manager volume contract, including zero, odd, oversized
+        and truncated lengths. References: NT5 qsfs.c:189,222,322,688,730,843 and
+        internal.c IopExceptionCleanup; ReactOS iofunc.c query/set volume entry points.
+      - [x] Finish serialized host/native validation of volume capture. Focused volume tests
+        cover canonical QUERY/SET_VOLUME_INFORMATION IRPs, exact class/access/input, inline and
+        pending ACK lifetime, CLEANUP/CLOSE order and bounded driver-name parsing. All 11 focused
+        volume tests pass; all 3,593 broad host/doc tests pass across 64 suites, with no failures
+        or ignored cases. The executive release build passes in 38.44s with the unchanged 294
+        warnings, including the four EA/quota admission-result conversions below. Focused
+        formatting and git diff --check pass. Evidence:
+        `.tmp/test-volume-file-capture-contract-20260913.log`,
+        `.tmp/test-volume-file-capture-full-20260913.log`, and
+        `.tmp/build-volume-file-capture-executive-20260913.log`.
+        Independent reviews covered capture/probe/acquisition ordering, unchanged inline File
+        event state, centralized reference retirement, exact setup errors and pre-dispatch IOSB
+        nonpublication. These host fixtures are not native user-memory reentry or desktop proof.
+      - [ ] Complete adjacent volume semantics against canonical File/device state: direct-device
+        opens reject classes other than FileFsDeviceInformation; device information normally
+        comes inline from real device characteristics/mount state, with network filesystem
+        routing preserved. Local driver-path queries still lack a canonical device-stack model;
+        do not infer a route or confuse a known driver outside the stack with a missing driver.
+        Keep local set-volume denial a filesystem policy, not a universal NT restriction: NTFS
+        quota-index control-information opens differ from ordinary Fastfat file opens.
+      - [x] Extend the volume admission/completion result distinction to all four EA/quota
+        service helpers and syscall callers. Canonical mode, resource, acquisition and event-
+        setup failures return directly without IOSB stores; setup failure retains its exact
+        status and retires the acquired reference. Queued acquisition and dispatched IRP
+        completion retain their existing ownership/publication paths. References: NT5 qsea.c
+        interrupted-wait/resource exits and internal.c synchronous-service admission.
+      - [ ] Complete the admission/completion publication audit in the remaining File service
+        helpers. Preserve pending-owner handoff and distinguish true dispatch results; a USER_APC
+        acquisition handoff must not be followed by a new IOSB copyout. Set EA/quota still copy
+        their payload before Busy acquisition; move that copy/validation under acquisition while
+        preserving the specific malformed-list IOSB error offsets (NT5 qsea.c:771,899).
+      - [ ] Apply the same owned capture to File query and set, and rename/open-parent
         paths. Capture route and access together before their first relevant callout; do not pair
         a pinned original File with a reused handle's grant. io_manager_file_query_metadata still
         consults the current handle before retained routing; derive hosted metadata from the
@@ -33622,13 +33671,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         set-information must also bypass fresh local classification before consulting a reused
         handle.
         Remove borrowed route/access helpers once only genuinely callout-free inspection remains.
-        Implement volume query/set first, then File query, then File set/name-target ownership.
+        Continue with File query, then File set/name-target ownership.
         Capture-derived metadata must preserve canonical create-option bits (including write-
         through, sequential and no-buffering) and alignment, not reconstruct mode from only the
         synchronous/alertable policy. File Access/Mode/Alignment immediate replies currently skip
         synchronous Busy acquisition; bring them under the same acquisition/retirement boundary
-        (NT5 qsinfo.c:302,603). Include the volume driver-path inline query and File set classes
-        30/41 in the capture audit rather than treating only IRP-producing branches as requests.
+        (NT5 qsinfo.c:302,603). Include File set classes 30/41 in the capture audit rather than
+        treating only IRP-producing branches as requests, as with the completed driver-path query.
         Local disk/overlay File lifetime capture across probes remains a separate follow-on; the
         hosted reference adapter does not claim to protect those local File objects. Local
         lock/unlock still resolve their unretained route after user probes; do not move that

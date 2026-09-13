@@ -28122,27 +28122,24 @@ impl ExecNtHandler {
         stack_flags: nt_io_manager::StackFlags,
         ea_list: &[u8],
         output: &mut [u8],
-    ) -> (u32, u64) {
+    ) -> Result<(u32, u64), u32> {
         let route = capture.route;
         let file_id = route.file_id;
-        let synchronous_file = match self.file_completion.is_synchronous(file_id) {
-            Ok(synchronous) => synchronous,
-            Err(status) => return (status, 0),
-        };
+        let synchronous_file = self.file_completion.is_synchronous(file_id)?;
         if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
             || !wait_reply_pool_has_free()
             || !self.reserve_pending_file_io_owner()
         {
-            return (nt_io_completion::STATUS_INSUFFICIENT_RESOURCES, 0);
+            return Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES);
         }
         match self.prepare_hosted_file_io(route, handle, capture.granted_access) {
             Ok(true) => {}
-            Ok(false) => return (STATUS_PENDING, 0),
-            Err(status) => return (status, 0),
+            Ok(false) => return Ok((STATUS_PENDING, 0)),
+            Err(status) => return Err(status),
         }
-        if self.file_completion.set_signaled(file_id, false).is_err() {
+        if let Err(status) = self.file_completion.set_signaled(file_id, false) {
             self.release_file_reference(file_id);
-            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+            return Err(status);
         }
 
         let output_capacity = output.len();
@@ -28205,7 +28202,7 @@ impl ExecNtHandler {
             }
             self.release_file_reference(file_id);
         }
-        (status, information)
+        Ok((status, information))
     }
 
     unsafe fn service_hosted_set_ea(
@@ -28214,27 +28211,24 @@ impl ExecNtHandler {
         iosb: u64,
         capture: &file_capture::HostedFileCapture,
         input: &[u8],
-    ) -> (u32, u64) {
+    ) -> Result<(u32, u64), u32> {
         let route = capture.route;
         let file_id = route.file_id;
-        let synchronous_file = match self.file_completion.is_synchronous(file_id) {
-            Ok(synchronous) => synchronous,
-            Err(status) => return (status, 0),
-        };
+        let synchronous_file = self.file_completion.is_synchronous(file_id)?;
         if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
             || !wait_reply_pool_has_free()
             || !self.reserve_pending_file_io_owner()
         {
-            return (nt_io_completion::STATUS_INSUFFICIENT_RESOURCES, 0);
+            return Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES);
         }
         match self.prepare_hosted_file_io(route, handle, capture.granted_access) {
             Ok(true) => {}
-            Ok(false) => return (STATUS_PENDING, 0),
-            Err(status) => return (status, 0),
+            Ok(false) => return Ok((STATUS_PENDING, 0)),
+            Err(status) => return Err(status),
         }
-        if self.file_completion.set_signaled(file_id, false).is_err() {
+        if let Err(status) = self.file_completion.set_signaled(file_id, false) {
             self.release_file_reference(file_id);
-            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+            return Err(status);
         }
 
         let (mut status, mut information, pending_irp_id) =
@@ -28288,7 +28282,7 @@ impl ExecNtHandler {
             }
             self.release_file_reference(file_id);
         }
-        (status, information)
+        Ok((status, information))
     }
 
     unsafe fn service_hosted_query_quota(
@@ -28301,27 +28295,24 @@ impl ExecNtHandler {
         stack_flags: nt_io_manager::StackFlags,
         auxiliary: &[u8],
         output: &mut [u8],
-    ) -> (u32, u64) {
+    ) -> Result<(u32, u64), u32> {
         let route = capture.route;
         let file_id = route.file_id;
-        let synchronous_file = match self.file_completion.is_synchronous(file_id) {
-            Ok(synchronous) => synchronous,
-            Err(status) => return (status, 0),
-        };
+        let synchronous_file = self.file_completion.is_synchronous(file_id)?;
         if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
             || !wait_reply_pool_has_free()
             || !self.reserve_pending_file_io_owner()
         {
-            return (nt_io_completion::STATUS_INSUFFICIENT_RESOURCES, 0);
+            return Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES);
         }
         match self.prepare_hosted_file_io(route, handle, capture.granted_access) {
             Ok(true) => {}
-            Ok(false) => return (STATUS_PENDING, 0),
-            Err(status) => return (status, 0),
+            Ok(false) => return Ok((STATUS_PENDING, 0)),
+            Err(status) => return Err(status),
         }
-        if self.file_completion.set_signaled(file_id, false).is_err() {
+        if let Err(status) = self.file_completion.set_signaled(file_id, false) {
             self.release_file_reference(file_id);
-            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+            return Err(status);
         }
 
         let output_capacity = output.len();
@@ -28384,7 +28375,7 @@ impl ExecNtHandler {
             }
             self.release_file_reference(file_id);
         }
-        (status, information)
+        Ok((status, information))
     }
 
     unsafe fn service_hosted_set_quota(
@@ -28393,27 +28384,24 @@ impl ExecNtHandler {
         iosb: u64,
         capture: &file_capture::HostedFileCapture,
         input: &[u8],
-    ) -> (u32, u64) {
+    ) -> Result<(u32, u64), u32> {
         let route = capture.route;
         let file_id = route.file_id;
-        let synchronous_file = match self.file_completion.is_synchronous(file_id) {
-            Ok(synchronous) => synchronous,
-            Err(status) => return (status, 0),
-        };
+        let synchronous_file = self.file_completion.is_synchronous(file_id)?;
         if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
             || !wait_reply_pool_has_free()
             || !self.reserve_pending_file_io_owner()
         {
-            return (nt_io_completion::STATUS_INSUFFICIENT_RESOURCES, 0);
+            return Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES);
         }
         match self.prepare_hosted_file_io(route, handle, capture.granted_access) {
             Ok(true) => {}
-            Ok(false) => return (STATUS_PENDING, 0),
-            Err(status) => return (status, 0),
+            Ok(false) => return Ok((STATUS_PENDING, 0)),
+            Err(status) => return Err(status),
         }
-        if self.file_completion.set_signaled(file_id, false).is_err() {
+        if let Err(status) = self.file_completion.set_signaled(file_id, false) {
             self.release_file_reference(file_id);
-            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+            return Err(status);
         }
 
         let (mut status, mut information, pending_irp_id) =
@@ -28467,7 +28455,73 @@ impl ExecNtHandler {
             }
             self.release_file_reference(file_id);
         }
-        (status, information)
+        Ok((status, information))
+    }
+
+    unsafe fn capture_set_volume_information(
+        &self,
+        input: u64,
+        length: usize,
+        information_class: u32,
+    ) -> Result<alloc::vec::Vec<u8>, u32> {
+        let mut captured = try_zeroed_transfer_buffer(length)?;
+        if !self.xas_read(input, &mut captured) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        if !nt_io_manager::validate_set_volume_information(information_class, &captured) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(captured)
+    }
+
+    unsafe fn capture_volume_driver_name(
+        &self,
+        input: u64,
+        length: usize,
+    ) -> Result<alloc::vec::Vec<u16>, u32> {
+        let mut captured = try_zeroed_transfer_buffer(length)?;
+        if !self.xas_read(input, &mut captured) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let name = nt_io_manager::volume_driver_path_name(&captured)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let mut driver_name = alloc::vec::Vec::new();
+        driver_name
+            .try_reserve_exact(name.len() / 2)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        for word in name.chunks_exact(2) {
+            driver_name.push(u16::from_le_bytes([word[0], word[1]]));
+        }
+        Ok(driver_name)
+    }
+
+    unsafe fn service_hosted_query_volume_driver_path(
+        &mut self,
+        handle: u64,
+        iosb: u64,
+        output: u64,
+        length: usize,
+        capture: &file_capture::HostedFileCapture,
+    ) -> u32 {
+        let route = capture.route;
+        match self.prepare_hosted_file_io(route, handle, capture.granted_access) {
+            Ok(true) => {}
+            Ok(false) => return STATUS_PENDING,
+            Err(status) => return status,
+        }
+        // Inline queries own Busy/reference retirement, but never change the File event.
+        let result = (|| -> Result<(), u32> {
+            let name = self.capture_volume_driver_name(output, length)?;
+            let in_path = driver_launch::hosted_driver_in_file_path(route.file_id, &name)?;
+            if !self.xas_try_write_buf(output, &[in_path as u8])
+                || !self.write_current_iosb(iosb, nt_fs::STATUS_SUCCESS, 12)
+            {
+                return Err(STATUS_ACCESS_VIOLATION);
+            }
+            Ok(())
+        })();
+        self.release_file_reference(route.file_id);
+        result.map_or_else(|status| status, |()| nt_fs::STATUS_SUCCESS)
     }
 
     unsafe fn service_hosted_query_volume_information(
@@ -28475,32 +28529,27 @@ impl ExecNtHandler {
         handle: u64,
         iosb: u64,
         output_va: u64,
-        route: HostedFileRoute,
+        capture: &file_capture::HostedFileCapture,
         parameters: nt_io_manager::QueryVolumeInformationParameters,
         output: &mut [u8],
-    ) -> (u32, u64) {
+    ) -> Result<(u32, u64), u32> {
+        let route = capture.route;
         let file_id = route.file_id;
-        let synchronous_file = match self.file_completion.is_synchronous(file_id) {
-            Ok(synchronous) => synchronous,
-            Err(status) => return (status, 0),
-        };
+        let synchronous_file = self.file_completion.is_synchronous(file_id)?;
         if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
             || !wait_reply_pool_has_free()
             || !self.reserve_pending_file_io_owner()
         {
-            return (nt_io_completion::STATUS_INSUFFICIENT_RESOURCES, 0);
+            return Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES);
         }
-        let Some(granted_access) = self.hosted_file_access_for(handle) else {
-            return (nt_fs::STATUS_INVALID_HANDLE, 0);
-        };
-        match self.prepare_hosted_file_io(route, handle, granted_access) {
+        match self.prepare_hosted_file_io(route, handle, capture.granted_access) {
             Ok(true) => {}
-            Ok(false) => return (STATUS_PENDING, 0),
-            Err(status) => return (status, 0),
+            Ok(false) => return Ok((STATUS_PENDING, 0)),
+            Err(status) => return Err(status),
         }
-        if self.file_completion.set_signaled(file_id, false).is_err() {
+        if let Err(status) = self.file_completion.set_signaled(file_id, false) {
             self.release_file_reference(file_id);
-            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+            return Err(status);
         }
 
         let output_capacity = output.len();
@@ -28563,43 +28612,50 @@ impl ExecNtHandler {
             }
             self.release_file_reference(file_id);
         }
-        (status, information)
+        Ok((status, information))
     }
 
+    /// Pre-dispatch capture/admission failures return without publishing an IOSB result.
     unsafe fn service_hosted_set_volume_information(
         &mut self,
         handle: u64,
         iosb: u64,
-        route: HostedFileRoute,
+        capture: &file_capture::HostedFileCapture,
         parameters: nt_io_manager::SetVolumeInformationParameters,
-        input: &[u8],
-    ) -> (u32, u64) {
+        input_va: u64,
+    ) -> Result<(u32, u64), u32> {
+        let route = capture.route;
         let file_id = route.file_id;
-        let synchronous_file = match self.file_completion.is_synchronous(file_id) {
-            Ok(synchronous) => synchronous,
-            Err(status) => return (status, 0),
-        };
+        let synchronous_file = self.file_completion.is_synchronous(file_id)?;
         if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
             || !wait_reply_pool_has_free()
             || !self.reserve_pending_file_io_owner()
         {
-            return (nt_io_completion::STATUS_INSUFFICIENT_RESOURCES, 0);
+            return Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES);
         }
-        let Some(granted_access) = self.hosted_file_access_for(handle) else {
-            return (nt_fs::STATUS_INVALID_HANDLE, 0);
-        };
-        match self.prepare_hosted_file_io(route, handle, granted_access) {
+        match self.prepare_hosted_file_io(route, handle, capture.granted_access) {
             Ok(true) => {}
-            Ok(false) => return (STATUS_PENDING, 0),
-            Err(status) => return (status, 0),
+            Ok(false) => return Ok((STATUS_PENDING, 0)),
+            Err(status) => return Err(status),
         }
-        if self.file_completion.set_signaled(file_id, false).is_err() {
+        if let Err(status) = self.file_completion.set_signaled(file_id, false) {
             self.release_file_reference(file_id);
-            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+            return Err(status);
         }
+        let input = match self.capture_set_volume_information(
+            input_va,
+            parameters.length as usize,
+            parameters.information_class,
+        ) {
+            Ok(input) => input,
+            Err(status) => {
+                self.release_file_reference(file_id);
+                return Err(status);
+            }
+        };
 
         let (mut status, mut information, pending_irp_id) =
-            match self.dispatch_hosted_file_set_volume_information_for(route, parameters, input) {
+            match self.dispatch_hosted_file_set_volume_information_for(route, parameters, &input) {
                 Ok((driver_status, completed, irp_id)) => (driver_status as u32, completed, irp_id),
                 Err(route_status) => (route_status, 0, 0),
             };
@@ -28649,7 +28705,7 @@ impl ExecNtHandler {
             }
             self.release_file_reference(file_id);
         }
-        (status, information)
+        Ok((status, information))
     }
 
     unsafe fn service_hosted_set_information(
@@ -40537,74 +40593,37 @@ impl ExecNtHandler {
                     return STATUS_ACCESS_VIOLATION;
                 }
 
-                let io_metadata = match self.io_manager_file_query_metadata(args[0]) {
-                    Ok(metadata) => metadata,
+                let hosted_capture = match self.capture_hosted_file_unless_local(args[0]) {
+                    Ok(capture) => capture,
                     Err(status) => return status,
                 };
+                let access = if let Some(capture) = hosted_capture.as_ref() {
+                    capture.granted_access
+                } else {
+                    match self.io_manager_file_query_metadata(args[0]) {
+                        Ok(metadata) => metadata.access_flags,
+                        Err(status) => return status,
+                    }
+                };
                 if !contract.access_granted(nt_types::AccessMask::from_bits_retain(
-                    io_metadata.access_flags,
+                    access,
                 )) {
                     return STATUS_ACCESS_DENIED;
                 }
 
                 if information_class == nt_fs::FILE_FS_DRIVER_PATH_INFORMATION {
-                    let mut captured = match try_zeroed_transfer_buffer(length) {
-                        Ok(bytes) => bytes,
-                        Err(status) => return status,
-                    };
-                    if !self.xas_read(output, &mut captured) {
-                        return STATUS_ACCESS_VIOLATION;
+                    if let Some(capture) = hosted_capture.as_ref() {
+                        return self.service_hosted_query_volume_driver_path(
+                            args[0], iosb, output, length, capture,
+                        );
                     }
-                    let driver_name_length =
-                        u32::from_le_bytes(captured[4..8].try_into().unwrap()) as usize;
-                    if driver_name_length & 1 != 0
-                        || driver_name_length > u16::MAX as usize
-                        || driver_name_length > length.saturating_sub(8)
-                    {
-                        return STATUS_INVALID_PARAMETER;
+                    if let Err(status) = self.capture_volume_driver_name(output, length) {
+                        return status;
                     }
-                    let mut driver_name = alloc::vec::Vec::new();
-                    if driver_name
-                        .try_reserve_exact(driver_name_length / 2)
-                        .is_err()
-                    {
-                        return STATUS_INSUFFICIENT_RESOURCES;
-                    }
-                    for word in captured[8..8 + driver_name_length].chunks_exact(2) {
-                        driver_name.push(u16::from_le_bytes([word[0], word[1]]));
-                    }
-                    let Some(route) = self.hosted_file_route_for(args[0]) else {
-                        return nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw() as u32;
-                    };
-                    let Some(granted_access) = self.hosted_file_access_for(args[0]) else {
-                        return nt_fs::STATUS_INVALID_HANDLE;
-                    };
-                    match self.prepare_hosted_file_io(route, args[0], granted_access) {
-                        Ok(true) => {}
-                        Ok(false) => return STATUS_PENDING,
-                        Err(status) => return status,
-                    }
-                    let result =
-                        driver_launch::hosted_driver_in_file_path(route.file_id, &driver_name);
-                    let (status, information) = match result {
-                        Ok(in_path) => {
-                            if !self.xas_try_write_buf(output, &[in_path as u8]) {
-                                (STATUS_ACCESS_VIOLATION, 0)
-                            } else {
-                                (nt_fs::STATUS_SUCCESS, 12)
-                            }
-                        }
-                        Err(status) => (status, 0),
-                    };
-                    let _ = self.signal_file_completion(route.file_id, status);
-                    self.release_file_reference(route.file_id);
-                    if !self.write_current_iosb(iosb, status, information) {
-                        return STATUS_ACCESS_VIOLATION;
-                    }
-                    return status;
+                    return nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw() as u32;
                 }
 
-                if let Some(route) = self.hosted_file_route_for(args[0]) {
+                if let Some(capture) = hosted_capture.as_ref() {
                     let mut routed_output = match try_zeroed_transfer_buffer(length) {
                         Ok(bytes) => bytes,
                         Err(status) => return status,
@@ -40613,14 +40632,17 @@ impl ExecNtHandler {
                         information_class,
                         length: length as u32,
                     };
-                    let (status, information) = self.service_hosted_query_volume_information(
+                    let (status, information) = match self.service_hosted_query_volume_information(
                         args[0],
                         iosb,
                         output,
-                        route,
+                        capture,
                         parameters,
                         &mut routed_output,
-                    );
+                    ) {
+                        Ok(result) => result,
+                        Err(status) => return status,
+                    };
                     if status != STATUS_PENDING
                         && !self.write_current_iosb(iosb, status, information)
                     {
@@ -40653,8 +40675,8 @@ impl ExecNtHandler {
                 result.status
             },
             // NtSetVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation, Length,
-            // FsInformationClass). Local file handles do not represent a direct volume open, so
-            // their filesystem rejects updates; provider volume handles receive a real SET IRP.
+            // FsInformationClass). The local filesystem currently rejects updates; hosted
+            // Files receive a real SET IRP so their filesystem decides which opens may update.
             NativeService::NtSetVolumeInformationFile => unsafe {
                 let iosb = args[1];
                 let input = args[2];
@@ -40674,30 +40696,32 @@ impl ExecNtHandler {
                 if iosb & 7 != 0 || input & (contract.alignment() as u64 - 1) != 0 {
                     return STATUS_DATATYPE_MISALIGNMENT;
                 }
-                if !self.probe_user_output(iosb, 16) {
+                if !self.probe_user_output(iosb, 16) || !self.probe_user_input(input, length) {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                let mut captured = match try_zeroed_transfer_buffer(length) {
-                    Ok(bytes) => bytes,
+                let hosted_capture = match self.capture_hosted_file_unless_local(args[0]) {
+                    Ok(capture) => capture,
                     Err(status) => return status,
                 };
-                if !self.xas_read(input, &mut captured) {
-                    return STATUS_ACCESS_VIOLATION;
-                }
-                if !nt_io_manager::validate_set_volume_information(information_class, &captured) {
-                    return STATUS_INVALID_PARAMETER;
-                }
-
-                let io_metadata = match self.io_manager_file_query_metadata(args[0]) {
-                    Ok(metadata) => metadata,
-                    Err(status) => return status,
+                let access = if let Some(capture) = hosted_capture.as_ref() {
+                    capture.granted_access
+                } else {
+                    match self.io_manager_file_query_metadata(args[0]) {
+                        Ok(metadata) => metadata.access_flags,
+                        Err(status) => return status,
+                    }
                 };
                 if !contract.access_granted(nt_types::AccessMask::from_bits_retain(
-                    io_metadata.access_flags,
+                    access,
                 )) {
                     return STATUS_ACCESS_DENIED;
                 }
-                let Some(route) = self.hosted_file_route_for(args[0]) else {
+                let Some(capture) = hosted_capture.as_ref() else {
+                    if let Err(status) =
+                        self.capture_set_volume_information(input, length, information_class)
+                    {
+                        return status;
+                    }
                     if let Err(status) = self.local_file_query_state(args[0], false) {
                         return status;
                     }
@@ -40709,9 +40733,12 @@ impl ExecNtHandler {
                     information_class,
                     length: length as u32,
                 };
-                let (status, information) = self.service_hosted_set_volume_information(
-                    args[0], iosb, route, parameters, &captured,
-                );
+                let (status, information) = match self.service_hosted_set_volume_information(
+                    args[0], iosb, capture, parameters, input,
+                ) {
+                    Ok(result) => result,
+                    Err(status) => return status,
+                };
                 if status != STATUS_PENDING && !self.write_current_iosb(iosb, status, information) {
                     return STATUS_ACCESS_VIOLATION;
                 }
@@ -41491,7 +41518,7 @@ impl ExecNtHandler {
                 if index_specified {
                     stack_flags |= nt_io_manager::StackFlags::INDEX_SPECIFIED;
                 }
-                let (status, information) = self.service_hosted_query_ea(
+                let (status, information) = match self.service_hosted_query_ea(
                     args[0],
                     iosb,
                     output,
@@ -41500,7 +41527,10 @@ impl ExecNtHandler {
                     stack_flags,
                     &ea_list,
                     &mut routed_output,
-                );
+                ) {
+                    Ok(result) => result,
+                    Err(status) => return status,
+                };
                 if status != STATUS_PENDING && !self.write_current_iosb(iosb, status, information) {
                     return STATUS_ACCESS_VIOLATION;
                 }
@@ -41551,7 +41581,10 @@ impl ExecNtHandler {
                 }
 
                 let (status, information) =
-                    self.service_hosted_set_ea(args[0], iosb, &capture, &captured);
+                    match self.service_hosted_set_ea(args[0], iosb, &capture, &captured) {
+                        Ok(result) => result,
+                        Err(status) => return status,
+                    };
                 if status != STATUS_PENDING && !self.write_current_iosb(iosb, status, information) {
                     return STATUS_ACCESS_VIOLATION;
                 }
@@ -41668,7 +41701,7 @@ impl ExecNtHandler {
                 if start_sid_length != 0 {
                     stack_flags |= nt_io_manager::StackFlags::INDEX_SPECIFIED;
                 }
-                let (status, information) = self.service_hosted_query_quota(
+                let (status, information) = match self.service_hosted_query_quota(
                     args[0],
                     iosb,
                     output,
@@ -41677,7 +41710,10 @@ impl ExecNtHandler {
                     stack_flags,
                     &auxiliary,
                     &mut routed_output,
-                );
+                ) {
+                    Ok(result) => result,
+                    Err(status) => return status,
+                };
                 if status != STATUS_PENDING && !self.write_current_iosb(iosb, status, information) {
                     return STATUS_ACCESS_VIOLATION;
                 }
@@ -41730,7 +41766,10 @@ impl ExecNtHandler {
                 }
 
                 let (status, information) =
-                    self.service_hosted_set_quota(args[0], iosb, &capture, &captured);
+                    match self.service_hosted_set_quota(args[0], iosb, &capture, &captured) {
+                        Ok(result) => result,
+                        Err(status) => return status,
+                    };
                 if status != STATUS_PENDING && !self.write_current_iosb(iosb, status, information) {
                     return STATUS_ACCESS_VIOLATION;
                 }

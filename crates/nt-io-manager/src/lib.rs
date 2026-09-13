@@ -199,7 +199,7 @@ pub use synchronous_io::{
 };
 pub use volume_information::{
     query_volume_information_contract, set_volume_information_contract,
-    validate_set_volume_information, QueryVolumeInformationParameters,
+    validate_set_volume_information, volume_driver_path_name, QueryVolumeInformationParameters,
     SetVolumeInformationParameters, VolumeInformationContract,
 };
 pub use wdm_x64::{

@@ -31,6 +31,8 @@ impl DriverDispatchBackend for RecordingDriver {
                 | major::IRP_MJ_SET_EA
                 | major::IRP_MJ_QUERY_QUOTA
                 | major::IRP_MJ_SET_QUOTA
+                | major::IRP_MJ_QUERY_VOLUME_INFORMATION
+                | major::IRP_MJ_SET_VOLUME_INFORMATION
         ) {
             assert_eq!(
                 &context.system_buffer[..self.expected_input.len()],
@@ -143,6 +145,26 @@ fn captured_request_lifecycle(
             major::IRP_MJ_SET_EA => set_ea_access_granted(captured_access),
             major::IRP_MJ_QUERY_QUOTA => captured_access.is_empty(),
             major::IRP_MJ_SET_QUOTA => set_quota_access_granted(captured_access),
+            major::IRP_MJ_QUERY_VOLUME_INFORMATION => {
+                let IoParameters::QueryVolumeInformation(volume) = &parameters else {
+                    panic!("query-volume fixture requires typed parameters");
+                };
+                let contract = query_volume_information_contract(volume.information_class).unwrap();
+                assert!(output_length >= contract.minimum_length());
+                contract.access_granted(captured_access)
+            }
+            major::IRP_MJ_SET_VOLUME_INFORMATION => {
+                let IoParameters::SetVolumeInformation(volume) = &parameters else {
+                    panic!("set-volume fixture requires typed parameters");
+                };
+                assert!(validate_set_volume_information(
+                    volume.information_class,
+                    input
+                ));
+                set_volume_information_contract(volume.information_class)
+                    .unwrap()
+                    .access_granted(captured_access)
+            }
             _ => panic!("unregistered capture fixture operation"),
         });
 
@@ -351,6 +373,45 @@ fn set_quota_capture_preserves_update_and_access_through_real_irp_lifetime() {
         major::IRP_MJ_SET_QUOTA,
         0,
         IoParameters::SetQuota(SetQuotaParameters {
+            length: input.len() as u32,
+        }),
+        StackFlags::empty(),
+        AccessMask::from_bits_retain(0x02),
+        &input,
+        0,
+    );
+}
+
+#[test]
+fn query_volume_capture_preserves_class_and_access_through_real_irp_lifetime() {
+    for (class, length, access) in [
+        (4, 8, AccessMask::empty()),
+        (6, 48, AccessMask::from_bits_retain(0x01)),
+    ] {
+        captured_request_lifecycle(
+            major::IRP_MJ_QUERY_VOLUME_INFORMATION,
+            0,
+            IoParameters::QueryVolumeInformation(QueryVolumeInformationParameters {
+                information_class: class,
+                length,
+            }),
+            StackFlags::empty(),
+            access,
+            &[],
+            length as usize,
+        );
+    }
+}
+
+#[test]
+fn set_volume_capture_preserves_label_and_access_through_real_irp_lifetime() {
+    let input = [4, 0, 0, 0, b'N', 0, b'T', 0];
+    assert!(validate_set_volume_information(2, &input));
+    captured_request_lifecycle(
+        major::IRP_MJ_SET_VOLUME_INFORMATION,
+        0,
+        IoParameters::SetVolumeInformation(SetVolumeInformationParameters {
+            information_class: 2,
             length: input.len() as u32,
         }),
         StackFlags::empty(),

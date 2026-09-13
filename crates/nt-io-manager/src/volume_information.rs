@@ -136,6 +136,18 @@ pub struct SetVolumeInformationParameters {
     pub length: u32,
 }
 
+/// Borrow the bounded UTF-16 driver name from `FILE_FS_DRIVER_PATH_INFORMATION`.
+pub fn volume_driver_path_name(input: &[u8]) -> Option<&[u8]> {
+    if input.len() < 12 {
+        return None;
+    }
+    let length = u32::from_le_bytes(input.get(4..8)?.try_into().ok()?);
+    if length > u16::MAX as u32 || length & 1 != 0 {
+        return None;
+    }
+    input.get(8..8 + length as usize)
+}
+
 /// Validate class-specific fields in captured set-volume input.
 pub fn validate_set_volume_information(class: u32, input: &[u8]) -> bool {
     let Some(contract) = set_volume_information_contract(class) else {
@@ -220,5 +232,46 @@ mod tests {
         assert!(!validate_set_volume_information(2, &[0; 7]));
         assert!(validate_set_volume_information(6, &[0; 48]));
         assert!(!validate_set_volume_information(5, &[0; 48]));
+    }
+
+    #[test]
+    fn driver_path_name_requires_native_structure_minimum_and_complete_name() {
+        for length in 0..12 {
+            assert_eq!(volume_driver_path_name(&[0; 12][..length]), None);
+        }
+        let mut input = [0; 12];
+        input[4..8].copy_from_slice(&6u32.to_le_bytes());
+        assert_eq!(volume_driver_path_name(&input), None);
+        input[4..8].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(volume_driver_path_name(&input), Some(&input[8..12]));
+    }
+
+    #[test]
+    fn driver_path_name_rejects_odd_and_unrepresentable_unicode_lengths() {
+        let mut input = alloc::vec![0; 8 + 65_536];
+        for length in [1u32, 3, 65_535, 65_536, u32::MAX] {
+            input[4..8].copy_from_slice(&length.to_le_bytes());
+            assert_eq!(volume_driver_path_name(&input), None);
+        }
+        input[4..8].copy_from_slice(&65_534u32.to_le_bytes());
+        assert_eq!(volume_driver_path_name(&input), Some(&input[8..65_542]));
+    }
+
+    #[test]
+    fn driver_path_name_accepts_zero_length_without_consuming_tail() {
+        let input = [1, 0xaa, 0xbb, 0xcc, 0, 0, 0, 0, 0xdd, 0xee, 0xff, 0x11];
+        assert_eq!(volume_driver_path_name(&input), Some(&input[8..8]));
+    }
+
+    #[test]
+    fn driver_path_name_borrows_exact_name_and_leaves_header_and_tail_untouched() {
+        let input = [
+            1, 0xaa, 0xbb, 0xcc, 4, 0, 0, 0, b'N', 0, b'T', 0, 0xdd, 0xee,
+        ];
+        let before = input;
+        let name = volume_driver_path_name(&input).unwrap();
+        assert_eq!(name, &[b'N', 0, b'T', 0]);
+        assert_eq!(name.as_ptr(), input[8..].as_ptr());
+        assert_eq!(input, before);
     }
 }
