@@ -47,6 +47,8 @@ mod thread_suspend;
 mod object_wait;
 use object_wait::*;
 mod object_wait_apc;
+mod object_wait_reply;
+mod hosted_termination;
 mod parked_reply;
 mod pending_file_caller;
 mod pending_file_apc;
@@ -17449,30 +17451,9 @@ unsafe fn wait_park(
 
 unsafe fn wait_cancel_thread(handler: &mut ExecNtHandler, tid: u64) {
     object_wait_apc::request_thread(handler, tid);
+    object_wait_reply::request_thread(handler, tid);
     object_wait_apc::redrive(handler);
-    for slot in 0..object_waiter_len() {
-        let Some((identity, record)) = object_waiter_record(slot) else {
-            continue;
-        };
-        if record.tid != tid || object_waiter_is_claimed(identity) {
-            continue;
-        }
-        let cap = record.reply_cap;
-        if cap != 0 {
-            let deleted = cnode_delete_r(cap);
-            let retyped = if deleted == 0 {
-                untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
-            } else {
-                u64::MAX
-            };
-            if deleted == 0 && retyped == 0 {
-                release_reply_pool_cap(cap);
-            }
-        }
-        if let Some(removed) = object_waiter_take_exact(identity) {
-            release_wait_object_references(handler, removed);
-        }
-    }
+    object_wait_reply::redrive(handler);
     thread_wait_state_clear_tid(handler, tid);
 }
 
@@ -18312,14 +18293,17 @@ unsafe fn terminate_hosted_thread_mechanism(
     };
     crate::service_sec_image::synchronous_file_cancellation::request_thread(handler, tid);
     object_wait_apc::request_thread(handler, tid);
+    object_wait_reply::request_thread(handler, tid);
     pending_file_apc::request_thread(handler, tid);
     current_apc::request_thread(handler, tid);
     crate::service_sec_image::synchronous_file_cancellation::redrive(handler);
     object_wait_apc::redrive(handler);
+    object_wait_reply::redrive(handler);
     pending_file_apc::redrive(handler);
     current_apc::redrive(handler);
     if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_runtime_dependency_for_thread(tid)
         || object_wait_apc::has_thread(tid)
+        || object_wait_reply::has_thread(tid)
         || pending_file_apc::has_thread(tid)
         || current_apc::has_thread(tid)
     {
@@ -18360,6 +18344,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         || handler.pm.has_thread_suspend_control(tid as nt_process::ThreadId)
         || (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_runtime_dependency_for_thread(tid)
         || object_wait_apc::has_thread(tid)
+        || object_wait_reply::has_thread(tid)
         || pending_file_apc::has_thread(tid)
         || current_apc::has_thread(tid)
     {
@@ -18436,6 +18421,7 @@ unsafe fn terminate_hosted_process_mechanisms(
             if preserve_tid != Some(tid) {
                 crate::service_sec_image::synchronous_file_cancellation::request_thread(handler, tid);
                 object_wait_apc::request_thread(handler, tid);
+                object_wait_reply::request_thread(handler, tid);
                 pending_file_apc::request_thread(handler, tid);
                 current_apc::request_thread(handler, tid);
             }
@@ -18443,6 +18429,7 @@ unsafe fn terminate_hosted_process_mechanisms(
     }
     crate::service_sec_image::synchronous_file_cancellation::redrive(handler);
     object_wait_apc::redrive(handler);
+    object_wait_reply::redrive(handler);
     pending_file_apc::redrive(handler);
     current_apc::redrive(handler);
     if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS))
@@ -18450,6 +18437,7 @@ unsafe fn terminate_hosted_process_mechanisms(
             waiter.pi == u32::from(process_index) && preserve_tid != Some(waiter.tid)
         })
         || object_wait_apc::has_process(process_index as usize, preserve_tid)
+        || object_wait_reply::has_process(process_index as usize, preserve_tid)
         || pending_file_apc::has_process(process_index as usize, preserve_tid)
         || current_apc::has_process(process_index as usize, preserve_tid)
     {
@@ -18542,6 +18530,12 @@ unsafe fn wait_park_multi(
         WAIT_PARK_INVALID_SET.fetch_add(1, Ordering::Relaxed);
         return false;
     }
+    let Some(caller) = handler.hosted_thread_tcb(tid).and_then(|tcb| {
+        handler.capture_provider_logical_caller(handler.pi, tid, handler.current_badge, tcb)
+    }) else {
+        WAIT_PARK_INVALID_SET.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
     // The reply object bound to this caller is the active REPLY_MAIN.
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if stolen == 0 {
@@ -18578,6 +18572,7 @@ unsafe fn wait_park_multi(
     // Commit: record the waiter's object set + its syscall resume context, install the fresh object as
     // the active recv reply cap.
     if !object_waiter_park(ObjectWaiterRecord::new(
+        caller,
         next_dispatcher_wait_sequence(),
         objects,
         &event_leases[..objects.len()],
@@ -18585,9 +18580,6 @@ unsafe fn wait_park_multi(
         wait_all,
         alertable,
         stolen,
-        tid,
-        handler.pi,
-        handler.current_badge,
         handler.current_resume_ip,
         handler.current_sp,
         handler.current_flags,
@@ -18791,7 +18783,6 @@ unsafe fn wait_wake_dispatcher(
             handler.wait_object_mutant_limit_for(record.objects[selected_slot], record.tid)
         };
         // Consume the selected dispatcher transaction only after the condition is known to hold.
-        let mut wake_object = record.objects[selected_slot.min(count.saturating_sub(1))];
         if mutant_limit {
             wake_index = 0xC000_0191; // STATUS_MUTANT_LIMIT_EXCEEDED
         } else if record.wait_all {
@@ -18804,7 +18795,6 @@ unsafe fn wait_wake_dispatcher(
                 abandoned |= handler.wait_object_consume_for(object, record.tid)
                     == nt_kernel_exec::DispatcherConsumeResult::Abandoned;
             }
-            wake_object = record.objects[0];
             if abandoned {
                 wake_index = 0x80;
             }
@@ -18823,7 +18813,7 @@ unsafe fn wait_wake_dispatcher(
                 }
             }
         }
-        let _ = object_waiter_mark_pending_wake(identity, wake_index, wake_object);
+        object_wait_reply::select(identity, wake_index);
     }
 
     let pulse_event_consumed = pulse_event.is_some_and(|index| {
@@ -18838,48 +18828,7 @@ unsafe fn wait_wake_dispatcher(
         let _ = handler.events.reset_existing(index as u64);
     }
 
-    let mut woken = 0u64;
-    let waiter_count = object_waiter_len();
-    for i in 0..waiter_count {
-        let Some((identity, record, wake_index, wake_object)) = object_waiter_pending_wake(i) else {
-            continue;
-        };
-        let cap = record.reply_cap;
-        if cap != 0 {
-            // Complete the wait without replacing the canonical thread continuation.
-            reply_parked_syscall(cap, wake_index);
-            // Return this reply object to the pool (clear its used bit).
-            release_reply_pool_cap(cap);
-            let trace = WAIT_WAKE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if trace < 96 {
-                print_str(b"[wait-wake] #");
-                print_u64(trace);
-                print_str(b" tid=");
-                print_u64(record.tid);
-                if let Some(badge) = handler.hosted_thread_badge_for_tid(record.tid) {
-                    print_str(b" badge=");
-                    print_u64(badge);
-                }
-                print_str(b" object=");
-                print_str(wake_object.describe());
-                print_str(b"/");
-                print_u64(wake_object.id());
-                print_str(b" result=");
-                print_u64(wake_index);
-                print_str(b" count=");
-                print_u64(record.count as u64);
-                print_str(b" wait_all=");
-                print_u64(record.wait_all as u64);
-                print_str(b"\n");
-            }
-            thread_wait_state_clear_tid_ready(handler, record.tid);
-            woken += 1;
-            WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
-        }
-        if let Some(removed) = object_waiter_take_exact(identity) {
-            release_wait_object_references(handler, removed);
-        }
-    }
+    let woken = object_wait_reply::redrive(handler);
     DispatcherWakeResult {
         woken,
         pulse_event_consumed,
@@ -18887,30 +18836,19 @@ unsafe fn wait_wake_dispatcher(
 }
 
 unsafe fn wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
-    let mut woken = 0;
     let now = nt_time_snapshot_at(now);
     for slot in 0..object_waiter_len() {
         let Some((identity, record)) = object_waiter_record(slot) else {
             continue;
         };
         if object_waiter_is_claimed(identity)
-            || record.pending_wake_index != u64::MAX
             || !record.deadline.is_due(now)
         {
             continue;
         }
-        let cap = record.reply_cap;
-        if cap != 0 {
-            reply_parked_syscall(cap, 0x102);
-            release_reply_pool_cap(cap);
-            thread_wait_state_clear_tid_ready(handler, record.tid);
-            woken += 1;
-        }
-        if let Some(removed) = object_waiter_take_exact(identity) {
-            release_wait_object_references(handler, removed);
-        }
+        object_wait_reply::select(identity, 0x102);
     }
-    woken
+    object_wait_reply::redrive(handler)
 }
 
 unsafe fn set_reply_mr(i: usize, v: u64) {

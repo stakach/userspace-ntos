@@ -15,6 +15,9 @@ pub(super) const WAITER_MAX_EVENTS: usize = 64;
 
 #[derive(Clone, Copy)]
 pub(super) struct ObjectWaiterRecord {
+    pub(super) caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+    pub(super) reply_sent: bool,
+    pub(super) reference_followup: Option<(usize, Option<nt_io_completion::FileReferenceRelease>)>,
     pub(super) sequence: u64,
     pub(super) objects: [WaitObject; WAITER_MAX_EVENTS],
     pub(super) event_leases: [nt_kernel_exec::EventLeaseId; WAITER_MAX_EVENTS],
@@ -31,13 +34,14 @@ pub(super) struct ObjectWaiterRecord {
     pub(super) resume_flags: u64,
     pub(super) native_call_transport: bool,
     pub(super) deadline: nt_delay_execution::Deadline,
-    pub(super) pending_wake_index: u64,
-    pub(super) pending_wake_object: WaitObject,
 }
 
 impl ObjectWaiterRecord {
-    const fn empty() -> Self {
+    const fn empty(caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller) -> Self {
         Self {
+            caller,
+            reply_sent: false,
+            reference_followup: None,
             sequence: 0,
             objects: [WaitObject::FREE; WAITER_MAX_EVENTS],
             event_leases: [nt_kernel_exec::EventLeaseId::NULL; WAITER_MAX_EVENTS],
@@ -54,8 +58,6 @@ impl ObjectWaiterRecord {
             resume_flags: 0,
             native_call_transport: false,
             deadline: nt_delay_execution::Deadline::Infinite,
-            pending_wake_index: u64::MAX,
-            pending_wake_object: WaitObject::FREE,
         }
     }
 
@@ -68,6 +70,7 @@ impl ObjectWaiterRecord {
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
+        caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
         sequence: u64,
         objects: &[WaitObject],
         event_leases: &[nt_kernel_exec::EventLeaseId],
@@ -75,16 +78,13 @@ impl ObjectWaiterRecord {
         wait_all: bool,
         alertable: bool,
         reply_cap: u64,
-        tid: u64,
-        pi: usize,
-        badge: u64,
         resume_ip: u64,
         resume_sp: u64,
         resume_flags: u64,
         native_call_transport: bool,
         deadline: nt_delay_execution::Deadline,
     ) -> Self {
-        let mut record = Self::empty();
+        let mut record = Self::empty(caller);
         record.sequence = sequence;
         for (index, object) in objects.iter().copied().enumerate() {
             record.objects[index] = object;
@@ -95,9 +95,9 @@ impl ObjectWaiterRecord {
         record.wait_all = wait_all;
         record.alertable = alertable;
         record.reply_cap = reply_cap;
-        record.tid = tid;
-        record.pi = pi;
-        record.badge = badge;
+        record.tid = u64::from(caller.thread().thread_id());
+        record.pi = caller.pi();
+        record.badge = caller.badge();
         record.resume_ip = resume_ip;
         record.resume_sp = resume_sp;
         record.resume_flags = resume_flags;
@@ -149,17 +149,10 @@ pub(super) fn object_waiter_alertable_for_tid(
             .find(|(identity, record)| {
                 record.alertable
                     && record.tid == tid
-                    && record.pending_wake_index == u64::MAX
                     && !(&*core::ptr::addr_of!(OBJECT_WAITERS)).is_claimed(*identity)
             })
             .map(|(identity, record)| (identity, *record))
     }
-}
-
-pub(super) fn object_waiter_take_exact(
-    identity: ObjectWaiterIdentity,
-) -> Option<ObjectWaiterRecord> {
-    unsafe { (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS)).take(identity) }
 }
 
 pub(super) fn object_waiter_next_deadline(now: nt_delay_execution::TimeSnapshot) -> Option<u64> {
@@ -183,34 +176,6 @@ pub(super) fn object_waiter_park(record: ObjectWaiterRecord) -> bool {
     }
 }
 
-pub(super) fn object_waiter_mark_pending_wake(
-    identity: ObjectWaiterIdentity,
-    wake_index: u64,
-    wake_object: WaitObject,
-) -> bool {
-    unsafe {
-        (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS)).update_exact(identity, |record| {
-            record.pending_wake_index = wake_index;
-            record.pending_wake_object = wake_object;
-        })
-    }
-}
-
-pub(super) fn object_waiter_pending_wake(
-    slot: usize,
-) -> Option<(ObjectWaiterIdentity, ObjectWaiterRecord, u64, WaitObject)> {
-    let (identity, record) = object_waiter_record(slot)?;
-    if object_waiter_is_claimed(identity) {
-        return None;
-    }
-    (record.pending_wake_index != u64::MAX).then_some((
-        identity,
-        record,
-        record.pending_wake_index,
-        record.pending_wake_object,
-    ))
-}
-
 pub(super) fn object_waiter_next_after_sequence(
     sequence: u64,
 ) -> Option<(ObjectWaiterIdentity, ObjectWaiterRecord)> {
@@ -218,9 +183,7 @@ pub(super) fn object_waiter_next_after_sequence(
         (&*core::ptr::addr_of!(OBJECT_WAITERS))
             .iter()
             .filter(|(identity, _)| !(&*core::ptr::addr_of!(OBJECT_WAITERS)).is_claimed(*identity))
-            .filter(|(_, record)| {
-                record.sequence > sequence && record.pending_wake_index == u64::MAX
-            })
+            .filter(|(_, record)| record.sequence > sequence)
             .min_by_key(|(_, record)| record.sequence)
             .map(|(identity, record)| (identity, *record))
     }
@@ -230,13 +193,35 @@ pub(super) fn object_waiter_is_claimed(identity: ObjectWaiterIdentity) -> bool {
     unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).is_claimed(identity) }
 }
 
-pub(super) fn release_wait_object_references(
+pub(super) fn release_wait_reference_step(
     handler: &mut ExecNtHandler,
     record: ObjectWaiterRecord,
-) {
-    for index in (0..record.count as usize).rev() {
-        handler
-            .release_wait_object_reference(record.objects[index], record.event_leases[index])
-            .expect("parked wait lost its retained object reference");
+    index: usize,
+) -> Result<Option<nt_io_completion::FileReferenceRelease>, u32> {
+    if index >= record.count as usize {
+        return Err(nt_fs::STATUS_INVALID_PARAMETER);
     }
+    let object = record.objects[index];
+    if object.kind() == WaitObject::KIND_FILE {
+        handler.file_completion.release_file(object.id()).map(Some)
+    } else {
+        handler.release_wait_object_reference(object, record.event_leases[index])?;
+        Ok(None)
+    }
+}
+
+pub(super) fn finish_wait_reference_step(
+    handler: &mut ExecNtHandler,
+    release: Option<nt_io_completion::FileReferenceRelease>,
+) -> Result<(), u32> {
+    if let Some(release) = release {
+        // A wait reference cannot authorize another driver's CLEANUP/CLOSE transaction.
+        if release.cleanup_required {
+            return Err(nt_fs::STATUS_INVALID_PARAMETER);
+        }
+        if let Some(port) = release.port_id {
+            handler.try_release_io_completion_reference(port)?;
+        }
+    }
+    Ok(())
 }

@@ -53,13 +53,10 @@ pub(crate) unsafe fn request(handler: &mut ExecNtHandler, tid: u64) -> bool {
     let Some((identity, record)) = object_waiter_alertable_for_tid(tid) else {
         return false;
     };
-    let Some(tcb) = handler.hosted_thread_tcb(tid) else {
+    let caller = record.caller;
+    if !handler.validate_provider_logical_caller(caller) {
         return false;
-    };
-    let Some(caller) = handler.capture_provider_logical_caller(record.pi, tid, record.badge, tcb)
-    else {
-        return false;
-    };
+    }
     let records = &mut *core::ptr::addr_of_mut!(INTERRUPTIONS);
     let vacant = records.iter().position(Option::is_none);
     if vacant.is_none() && records.try_reserve(1).is_err() {
@@ -106,7 +103,7 @@ pub(crate) unsafe fn request_thread(handler: &ExecNtHandler, tid: u64) -> usize 
         let Some((identity, record)) = table.get(slot) else {
             continue;
         };
-        if record.tid != tid || !table.is_claimed(identity) {
+        if record.tid != tid || table.apc(identity).is_err() {
             continue;
         }
         table
@@ -137,15 +134,7 @@ unsafe fn release_reference(
     {
         return Err(nt_fs::STATUS_INVALID_PARAMETER);
     }
-    let object = record.objects[reference];
-    let release = if object.kind() == WaitObject::KIND_FILE {
-        Some(handler.file_completion.release_file(object.id())?)
-    } else {
-        // These adapters only return Err before canonical decrement. Reentrant object/job cleanup
-        // remains within this Invoking effect, so no second pass can release the reference again.
-        handler.release_wait_object_reference(object, record.event_leases[reference])?;
-        None
-    };
+    let release = release_wait_reference_step(handler, record, reference)?;
     (&mut *core::ptr::addr_of_mut!(INTERRUPTIONS))[slot]
         .as_mut()
         .unwrap()
@@ -167,15 +156,7 @@ unsafe fn reference_followup(
     if index != reference {
         return Err(nt_fs::STATUS_INVALID_PARAMETER);
     }
-    if let Some(release) = release {
-        // Ordinary wait-reference retirement cannot authorize another driver CLEANUP/CLOSE.
-        if release.cleanup_required {
-            return Err(nt_fs::STATUS_INVALID_PARAMETER);
-        }
-        if let Some(port) = release.port_id {
-            handler.try_release_io_completion_reference(port)?;
-        }
-    }
+    finish_wait_reference_step(handler, release)?;
     (&mut *core::ptr::addr_of_mut!(INTERRUPTIONS))[slot]
         .as_mut()
         .unwrap()
@@ -407,7 +388,12 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         return;
     }
     let mut after = None;
+    let limit = object_waiter_len();
     while let Some(identity) = (&*core::ptr::addr_of!(OBJECT_WAITERS)).next_apc_after(after) {
+        if identity.slot() >= limit {
+            RETRY_PENDING.store(true, Ordering::Release);
+            break;
+        }
         after = Some(identity.slot());
         drive(handler, identity);
     }

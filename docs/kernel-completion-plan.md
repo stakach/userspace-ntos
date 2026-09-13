@@ -33460,11 +33460,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     records therefore retain their original provenance through reconciliation even after their
     APC claim and Reply have settled. They never authorize a replacement process/thread.
 
-    Ordinary signal/timeout Reply failures, non-APC object-wait teardown and inline terminal
-    Busy/reference failure retention remain open. Next, close ordinary wait Reply ownership and
-    teardown before extending per-mode Alerted/UserApcPending behavior and native APC fault
-    injection. No VM run or microkernel change occurred; the last measured 27 strict missing
-    win32k imports and genuine desktop acceptance remain open.
+    Ordinary object-wait Reply ownership (2026-09-13, host/build verified):
+    - [x] Add an allocation-free terminal claim on the exact object-wait row, mutually exclusive
+      with APC interruption. Preserve selected signal/timeout status through retries, per-reference
+      release/followup, accepted Send retirement and teardown Revoke/Retype.
+    - [x] Capture original PM/runtime caller identity at park; route signal, timeout and cancellation
+      through retained effects. Remove unchecked wake removal and the old pending-wake fields.
+      Share reference cleanup with APC waits and delayed physical termination with current APCs.
+    - [x] Rework the debugger blocking probe to use a real PM/runtime thread and private badged
+      endpoint. Remove the fabricated TID and shared-endpoint receive/discard loop; preserve the
+      actual blocked-marker and resumed-client acceptance bit. Keep private capabilities when
+      teardown is unsettled rather than destroying an entered or uncertain Reply owner.
+    - [x] Complete independent native review and six composed failure/lifetime tests. Bound each
+      ordinary/object-APC retry scans to their initial slot range, and current-APC retries to the
+      initially allocated slot capacity, so cleanup reentry cannot indefinitely extend a pass.
+      Tests cover synchronization-event and WaitAll abandoned results, timeout/APC separation,
+      File/IOCP reference followup retries, uncertain Send and real PM lifetime reactivation.
+    - [x] Complete serialized verification: twelve new contract tests, six composed tests,
+      1,985 focused host/doc tests (before adding the composed target) and 3,539 broad host/doc tests
+      passed, with no failures or ignored cases. Final executive release build: 34.06s, unchanged
+      294 warnings. Evidence: `.tmp/test-object-wait-reply-contract-20260913.log`,
+      `.tmp/test-object-wait-reply-composed-20260913.log`,
+      `.tmp/test-object-wait-reply-focused-20260913.log`,
+      `.tmp/test-object-wait-reply-full-20260913.log`, and
+      `.tmp/build-object-wait-reply-executive-20260913.log`. Physical Reply/capability/runtime
+      outcomes in composed tests are explicit host fixtures, not native fault injection.
+    - [ ] Validate these native paths and the corrected debugger probe in a fresh boot.
+
+    Review adjustment: mandatory caller provenance exposed historical debugger-probe machinery
+    which bypassed runtime registration. Fix the probe rather than adding optional identities to
+    production waits. Retained teardown completion must also revisit physical runtime cleanup
+    after a prior entered Send delayed remote termination.
+
+    This checkpoint covers dispatcher-object waits, not the distinct delay/keyed/LPC/IOCP waiter
+    transports. Inline terminal Busy/reference failure retention, per-mode Alerted/UserApcPending
+    behavior and native APC fault injection remain open. No new VM run or microkernel change occurred;
+    the last measured 27 strict missing win32k imports and genuine desktop acceptance remain open.
+    Next, close inline terminal Busy/reference failure retention before extending NT alert state.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

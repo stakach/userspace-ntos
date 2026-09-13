@@ -422,50 +422,7 @@ pub(crate) unsafe fn redrive_terminated_runtimes(
             continue;
         }
         let caller = view.payload.logical;
-        let tid = caller.thread().thread_id();
-        let same_process = handler.capture_process_identity(caller.pi()) == Some(caller.process());
-        let retired = if !same_process {
-            // No authority over a replacement process, even if its numeric PI/TID/TCB matches.
-            true
-        } else if handler
-            .pm
-            .process(caller.process().pid)
-            .is_some_and(|process| process.state == nt_process::ProcessState::Terminated)
-        {
-            // Process teardown may have stopped before visiting any peers while AwaitTail pinned
-            // this thread. Retry the original process generation, not only this thread.
-            if let Ok(pi) = u8::try_from(caller.pi()) {
-                let _ = terminate_hosted_process_mechanisms(pi, None, queue, handler);
-            }
-            !handler.thread_runtime.has_process(caller.pi())
-        } else {
-            let runtime = handler.thread_runtime.get_by_tid(u64::from(tid));
-            let lifetime = handler.pm.thread_lifetime(tid);
-            if caller
-                .validate(runtime.map(|runtime| runtime.binding()), lifetime)
-                .is_err()
-            {
-                // Compare published ownership directly: a blocked ingress is not identity loss.
-                true
-            } else if handler
-                .pm
-                .thread(tid)
-                .is_some_and(|thread| thread.state == nt_process::ThreadState::Terminated)
-            {
-                let _ = terminate_hosted_thread_mechanism(u64::from(tid), queue, handler);
-                caller
-                    .validate(
-                        handler
-                            .thread_runtime
-                            .get_by_tid(u64::from(tid))
-                            .map(|runtime| runtime.binding()),
-                        handler.pm.thread_lifetime(tid),
-                    )
-                    .is_err()
-            } else {
-                false
-            }
-        };
+        let retired = hosted_termination::reconcile(handler, queue, caller);
         if retired {
             finish(handler, identity);
         } else {
@@ -479,7 +436,12 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         return;
     }
     let mut after = None;
+    let limit = (&*core::ptr::addr_of!(OWNERS)).capacity();
     while let Some(identity) = (&*core::ptr::addr_of!(OWNERS)).next_ready_after(after) {
+        if identity.slot() >= limit {
+            RETRY_PENDING.store(true, Ordering::Release);
+            break;
+        }
         after = Some(identity.slot());
         drive(handler, identity);
     }

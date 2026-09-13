@@ -10487,6 +10487,7 @@ impl ExecNtHandler {
             // Converted teardown retains references and pool ownership independently. Active
             // retry/ingress and APC context effects still require the original target thread.
             waiters.has_runtime_dependency_for_thread(tid) || crate::object_wait_apc::has_thread(tid)
+                || crate::object_wait_reply::has_thread(tid)
                 || crate::pending_file_apc::has_thread(tid)
                 || crate::current_apc::has_thread(tid)
         }
@@ -14162,6 +14163,7 @@ impl ExecNtHandler {
         // APC interruption may be inside a reference cleanup or checked context copyout. Publish
         // teardown intent before any File abandonment can reenter, without stealing its owner.
         crate::object_wait_apc::request_thread(self, tid);
+        crate::object_wait_reply::request_thread(self, tid);
         crate::pending_file_apc::request_thread(self, tid);
         crate::current_apc::request_thread(self, tid);
         self.abandon_pending_file_io_for_thread(tid)

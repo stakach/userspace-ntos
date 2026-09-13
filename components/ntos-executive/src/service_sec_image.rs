@@ -3397,6 +3397,7 @@ pub(crate) fn service_dll_pe_store_stats() -> DllPeStoreStats {
 /// syscall can arrive to drive a failed context write or capability retirement.
 fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
     unsafe { crate::object_wait_apc::redrive(nt_handler) };
+    unsafe { crate::object_wait_reply::redrive(nt_handler) };
     unsafe { crate::pending_file_apc::redrive(nt_handler) };
     unsafe { crate::current_apc::redrive(nt_handler) };
     if FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel) {
@@ -8425,6 +8426,8 @@ pub(crate) unsafe fn service_sec_image(
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             crate::current_apc::redrive(&mut nt_handler);
             crate::current_apc::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
+            crate::object_wait_reply::redrive(&mut nt_handler);
+            crate::object_wait_reply::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
         }
         let ingress = if badge == DELAY_TIMER_BADGE || hosted_irq_lines_from_badge(badge) != 0 {
             None
@@ -10820,6 +10823,7 @@ pub(crate) unsafe fn service_sec_image(
                     || waiters.has_cancellation_for_thread(current_tid)
                     || waiters.has_ingress_for_thread(current_tid)
                     || crate::object_wait_apc::has_thread(current_tid)
+                    || crate::object_wait_reply::owns_thread(current_tid)
                     || crate::pending_file_apc::owns_thread(current_tid)
                     || crate::current_apc::owns_thread(current_tid)
             }
@@ -10833,6 +10837,7 @@ pub(crate) unsafe fn service_sec_image(
                 // Progress retained cancellation even when rejected ingress is the only activity.
                 synchronous_file_cancellation::redrive(&mut nt_handler);
                 crate::object_wait_apc::redrive(&mut nt_handler);
+                crate::object_wait_reply::redrive(&mut nt_handler);
                 crate::pending_file_apc::redrive(&mut nt_handler);
                 crate::current_apc::redrive(&mut nt_handler);
                 let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -19883,6 +19888,7 @@ pub(crate) unsafe fn service_sec_image(
             const CONTEXT_AMD64_DEBUG_REGISTERS: u32 = 0x0010_0000 | 0x0000_0010;
             const EFLAGS_TF: u32 = 0x0000_0100;
             const BLK_TEST_RUNTIME_BADGE: u64 = 0xDB6B_0001;
+            const BLK_DEBUGGER_RUNTIME_BADGE: u64 = 0xDB6B_0002;
             // Executive scratch VAs inside the SAME proven-resident 2 MiB page table the ALPC
             // cross-VSpace self-test uses (see its comment): base + 3000*0x1000, PT index 5.
             let write_scratch_t = SMSS_SCRATCH_BASE + 3010 * 0x1000;
@@ -19964,6 +19970,7 @@ pub(crate) unsafe fn service_sec_image(
             let reply_c = make(OBJ_REPLY, 0);
             let reply_d = make(OBJ_REPLY, 0);
             let reply_spare = make(OBJ_REPLY, 0);
+            let reply_debugger_done = make(OBJ_REPLY, 0);
             // NOTE the ORDER below: each marker frame is mapped into its CLIENT'S VSpace FIRST (by
             // `dbgk_client_spawn`) and only then windowed into the executive through a `copy_cap`.
             // A frame capability carries its own mapping, and mapping a COPY first leaves the
@@ -20771,24 +20778,51 @@ pub(crate) unsafe fn service_sec_image(
 
                     // ═══ 0x0100 — ★ THE DEBUGGER-SIDE BLOCKING WAIT, with a LIVE CLIENT ═══════
                     // A second real client thread issues a syscall the test services as
-                    // `NtWaitForDebugEvent` with an EMPTY queue. Its fault is received on the
-                    // executive's REAL fault endpoint bound to REPLY_MAIN, so the PRODUCTION
+                    // `NtWaitForDebugEvent` with an EMPTY queue. Its private fault endpoint is
+                    // received with REPLY_MAIN, so the PRODUCTION
                     // `wait_park` steals its reply capability exactly as the service loop does. The
                     // client cannot progress until a queue-side post runs `wait_wake_dispatcher_set`.
                     let dphase_ready = target_registered && attached && keepalive.is_some();
-                    let (dbg_pml4, dbg_tcb, _dbg_ep) = if dphase_ready {
+                    let debugger_wait_tid = dphase_ready
+                        .then(|| nt_handler.pm.create_thread(debugger_pid, selftests::DBGK_CLIENT_CODE, 0, false).ok())
+                        .flatten();
+                    let debugger_ep = alloc_slot();
+                    slots[nslots] = debugger_ep;
+                    nslots += 1;
+                    let debugger_fault = alloc_slot();
+                    slots[nslots] = debugger_fault;
+                    nslots += 1;
+                    let debugger_endpoint_ready = debugger_wait_tid.is_some()
+                        && untyped_retype_r(CAP_INIT_UNTYPED, OBJ_ENDPOINT, 0, 1, debugger_ep) == 0
+                        && cnode_mint_r(
+                            CAP_INIT_THREAD_CNODE,
+                            debugger_fault,
+                            debugger_ep,
+                            BLK_DEBUGGER_RUNTIME_BADGE,
+                        ) == 0;
+                    let (dbg_pml4, dbg_tcb, _dbg_ep) = if debugger_endpoint_ready {
                         let dcode = selftests::dbgk_debugger_client_code();
                         selftests::dbgk_client_spawn(
                             &dcode,
                             shared_d,
                             write_scratch_d,
-                            fault_ep,
+                            debugger_fault,
                             &mut slots,
                             &mut nslots,
                         )
                     } else {
                         (0, 0, 0)
                     };
+                    let debugger_runtime_registered = debugger_wait_tid.is_some_and(|tid| {
+                        dbg_tcb != 0
+                            && nt_handler.register_hosted_thread_tcb(
+                                0,
+                                u64::from(tid),
+                                dbg_tcb,
+                                BLK_DEBUGGER_RUNTIME_BADGE,
+                                HostedThreadRole::DbgkSelftestTarget,
+                            )
+                    });
                     let win_d = if dphase_ready {
                         let s = copy_cap(shared_d);
                         slots[nslots] = s;
@@ -20832,34 +20866,40 @@ pub(crate) unsafe fn service_sec_image(
                             break;
                         }
                     }
-                    // ★ SELECT this test's client, don't just take whatever arrives. `fault_ep` is
-                    // the executive's SHARED endpoint: a hosted thread that was still runnable when
-                    // the loop quiesced can land here first, and a bare `recv` would then read ITS
-                    // message as the client's (observed: a win32k `m0 = 0x101b` from a still-live
-                    // winlogon worker, which made this step read a foreign syscall and silently skip
-                    // the whole assertion). Any foreign message is simply LEFT UNANSWERED — the boot
-                    // has already quiesced, so an un-replied caller is exactly as parked as every
-                    // other thread on the `[parked]` list. The selection is on the client's own
-                    // distinctive SSN, so the assertion below is unchanged in strength.
-                    let mut w_mi = 0u64;
-                    let mut w_m0 = 0u64;
-                    let mut select_guard = 0;
-                    while dphase_ready && select_guard < 8 {
-                        select_guard += 1;
-                        let (_wb, mi_r, m0_r, _m1_r, _m2_r, _m3_r) =
-                            recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
-                        w_mi = mi_r;
-                        w_m0 = m0_r;
-                        if (mi_r >> 12) == 2 && m0_r == 0xD1 {
-                            break;
-                        }
-                        dbgk_blk_trace(b"dw1-foreign", mi_r, m0_r, 0, marker_d());
+                    // The private endpoint has exactly one registered sender. A mismatched fault
+                    // fails this proof; no shared-endpoint caller is discarded or rebound.
+                    let (w_badge, w_mi, w_m0, _, w_ip, _) = if debugger_runtime_registered {
+                        recv_full_r12(debugger_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed))
+                    } else {
+                        (0, 0, 0, 0, 0, 0)
+                    };
+                    let w_sp = get_recv_mr(16);
+                    let w_flags = get_recv_mr(17);
+                    let saved_wait_caller = (
+                        nt_handler.current_tid,
+                        nt_handler.current_badge,
+                        nt_handler.current_resume_ip,
+                        nt_handler.current_sp,
+                        nt_handler.current_flags,
+                        nt_handler.current_native_call_transport,
+                    );
+                    let debugger_wait_received = debugger_runtime_registered
+                        && w_badge == BLK_DEBUGGER_RUNTIME_BADGE
+                        && (w_mi >> 12) == 2
+                        && w_m0 == 0xD1;
+                    if debugger_wait_received {
+                        nt_handler.current_tid = u64::from(debugger_wait_tid.unwrap());
+                        nt_handler.current_badge = w_badge;
+                        nt_handler.current_resume_ip = w_ip;
+                        nt_handler.current_sp = w_sp;
+                        nt_handler.current_flags = w_flags;
+                        nt_handler.current_native_call_transport = false;
                     }
                     dbgk_blk_trace(b"dw1", w_mi, w_m0, 0, marker_d());
                     // The handler's own park REQUEST (NULL *Timeout, empty queue) — the exact arm a
                     // hosted debugger would take.
                     nt_handler.wait_park_event = -1;
-                    let wait_status = if dphase_ready {
+                    let wait_status = if debugger_wait_received {
                         sysc!(SSN_NT_WAIT_FOR_DEBUG_EVENT, &[dbg_handle, 0, 0, A_STATE])
                     } else {
                         nt_process::STATUS_INSUFFICIENT_RESOURCES
@@ -20868,15 +20908,14 @@ pub(crate) unsafe fn service_sec_image(
                     let live_parked = target_registered
                         && attached
                         && dbg_pml4 != 0
-                        && (w_mi >> 12) == 2
-                        && w_m0 == 0xD1
+                        && debugger_wait_received
                         && wait_status == 0x102
                         && park_index >= 0
                         && wait_park(
                             &mut nt_handler,
                             WaitObject::dispatcher(park_index as usize),
                             false,
-                            0xD1D1_0001,
+                            u64::from(debugger_wait_tid.unwrap()),
                             nt_delay_execution::Deadline::Infinite,
                         )
                         && marker_d() == 0;
@@ -20889,18 +20928,35 @@ pub(crate) unsafe fn service_sec_image(
                             dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, 0x9999),
                             true,
                         );
-                    // GUARD: only recv again when the client was really parked (else nothing
-                    // could ever resume it and the recv would block forever).
-                    if live_parked && wake_posted {
-                        let (_wb2, w2_mi, w2_m0, _x1, _x2, _x3) =
-                            recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    // Only an acknowledged terminal delivery permits another blocking receive.
+                    // A queued event alone cannot prove a failed Reply actually resumed the TCB.
+                    if live_parked
+                        && wake_posted
+                        && !object_waiter_contains_tid(u64::from(debugger_wait_tid.unwrap()))
+                    {
+                        let (wb2, w2_mi, w2_m0, _x1, _x2, _x3) =
+                            recv_full_r12(debugger_ep, reply_debugger_done);
                         dbgk_blk_trace(b"dw2", w2_mi, w2_m0, 0, marker_d());
-                        if (w2_mi >> 12) == 2 && w2_m0 == 0xD2 && marker_d() == 1 {
+                        if wb2 == BLK_DEBUGGER_RUNTIME_BADGE
+                            && (w2_mi >> 12) == 2
+                            && w2_m0 == 0xD2
+                            && marker_d() == 1
+                        {
                             bk_ok |= 0x0100;
                         }
                     } else if live_parked {
-                        wait_cancel_thread(&mut nt_handler, 0xD1D1_0001);
+                        wait_cancel_thread(&mut nt_handler, u64::from(debugger_wait_tid.unwrap()));
+                    } else if debugger_runtime_registered && w_mi >> 12 != 0 {
+                        assert!(drop_current_hosted_reply(), "debugger proof failed to retire its received fault");
                     }
+                    (
+                        nt_handler.current_tid,
+                        nt_handler.current_badge,
+                        nt_handler.current_resume_ip,
+                        nt_handler.current_sp,
+                        nt_handler.current_flags,
+                        nt_handler.current_native_call_transport,
+                    ) = saved_wait_caller;
 
                     // 0x0080 — ★ THE ESCAPE HATCH. Leave the live keepalive reporter blocked on
                     // the breakpoint event posted above, then destroy the debug object (`NtClose`
@@ -20931,40 +20987,63 @@ pub(crate) unsafe fn service_sec_image(
                         bk_ok |= 0x0080;
                     }
 
-                    // Reclaim: suspend both throwaway client threads, then delete every cap this
-                    // test made (child-first), leaving the TCBs + PML4s last. The executive's own
-                    // `fault_ep` is NOT in `slots` (it was passed in, not minted). These caps are
-                    // selftest-private, so their root slots can be returned to the allocator before
-                    // the next post-loop selftest starts.
+                    // Reclaim private capabilities only after retained wait effects settle.
+                    // An uncertain Send still owns the debugger TCB and all its runtime resources.
                     let _ = tcb_suspend_r(client_tcb);
-                    if dbg_tcb != 0 {
-                        let _ = tcb_suspend_r(dbg_tcb);
-                    }
                     if client_runtime_registered {
                         let _ = nt_handler.release_hosted_thread_runtime(main_tid as u64);
                     }
-                    for index in (0..nslots).rev() {
-                        let s = slots[index];
-                        if s == 0
-                            || s == client_tcb
-                            || s == dbg_tcb
-                            || s == client_pml4
-                            || s == dbg_pml4
+                    let mut debugger_resources_settled = true;
+                    let mut debugger_tcb_owned = dbg_tcb != 0;
+                    if let Some(tid) = debugger_wait_tid {
+                        wait_cancel_thread(&mut nt_handler, u64::from(tid));
+                        let _ = nt_handler.pm.terminate_thread(tid, 0);
+                        crate::object_wait_reply::redrive(&mut nt_handler);
+                        crate::object_wait_reply::redrive_terminated_runtimes(
+                            &mut nt_handler,
+                            delay_queue,
+                        );
+                        debugger_resources_settled = !object_waiter_contains_tid(u64::from(tid));
+                        if debugger_runtime_registered
+                            && nt_handler.thread_runtime.get_by_tid(u64::from(tid)).is_none()
                         {
-                            continue;
+                            // Retained termination reconciliation already deleted this TCB.
+                            debugger_tcb_owned = false;
                         }
-                        let _ = cnode_delete_recycle_r(s);
+                        if debugger_resources_settled && debugger_runtime_registered {
+                            let _ = nt_handler.release_hosted_thread_runtime(u64::from(tid));
+                        }
                     }
-                    let _ = cnode_delete_recycle_r(client_tcb);
-                    if dbg_tcb != 0 {
-                        let _ = cnode_delete_recycle_r(dbg_tcb);
-                    }
-                    let _ = cnode_delete_recycle_r(client_pml4);
-                    if dbg_pml4 != 0 {
-                        let _ = cnode_delete_recycle_r(dbg_pml4);
-                    }
-                    if let Some(claim) = target_claim {
-                        let _ = nt_handler.release_temporary_process_slot(claim);
+                    if debugger_resources_settled {
+                        if debugger_tcb_owned {
+                            let _ = tcb_suspend_r(dbg_tcb);
+                        }
+                        for index in (0..nslots).rev() {
+                            let s = slots[index];
+                            if s == 0
+                                || s == client_tcb
+                                || s == dbg_tcb
+                                || s == client_pml4
+                                || s == dbg_pml4
+                            {
+                                continue;
+                            }
+                            let _ = cnode_delete_recycle_r(s);
+                        }
+                        let _ = cnode_delete_recycle_r(client_tcb);
+                        if debugger_tcb_owned {
+                            let _ = cnode_delete_recycle_r(dbg_tcb);
+                        }
+                        let _ = cnode_delete_recycle_r(client_pml4);
+                        if dbg_pml4 != 0 {
+                            let _ = cnode_delete_recycle_r(dbg_pml4);
+                        }
+                        if let Some(claim) = target_claim {
+                            let _ = nt_handler.release_temporary_process_slot(claim);
+                        }
+                    } else {
+                        bk_ok &= !0x0100;
+                        print_str(b"[dbgk-blk] debugger teardown unsettled; private capabilities retained\n");
                     }
                 }
             }

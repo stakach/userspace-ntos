@@ -9,9 +9,14 @@ use core::sync::atomic::{AtomicU64, Ordering};
 static NEXT_TABLE_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 mod apc;
+mod reply;
 pub use apc::{
     ObjectWaitApcAttempt, ObjectWaitApcDisposition, ObjectWaitApcEffect, ObjectWaitApcError,
     ObjectWaitApcOutcome, ObjectWaitApcPhase, ObjectWaitApcView,
+};
+pub use reply::{
+    ObjectWaitReplyAttempt, ObjectWaitReplyDisposition, ObjectWaitReplyEffect, ObjectWaitReplyError,
+    ObjectWaitReplyOutcome, ObjectWaitReplyPhase, ObjectWaitReplyView,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +37,7 @@ struct Owned<T> {
     generation: u64,
     payload: T,
     apc: Option<apc::Control>,
+    reply: Option<reply::Control>,
 }
 
 /// Move-stable ownership. Neither this table nor an owned payload needs to be clonable.
@@ -145,6 +151,7 @@ impl<T> ObjectWaiterTable<T> {
             generation,
             payload,
             apc: None,
+            reply: None,
         });
         self.live += 1;
         Ok(ObjectWaiterIdentity {
@@ -170,6 +177,11 @@ impl<T> ObjectWaiterTable<T> {
         self.owned_exact(identity).map(|entry| &entry.payload)
     }
 
+    pub fn is_claimed(&self, identity: ObjectWaiterIdentity) -> bool {
+        self.owned_exact(identity)
+            .is_some_and(|entry| entry.apc.is_some() || entry.reply.is_some())
+    }
+
     fn owned_exact(&self, identity: ObjectWaiterIdentity) -> Option<&Owned<T>> {
         if identity.table == 0 || identity.table != self.identity {
             return None;
@@ -187,7 +199,7 @@ impl<T> ObjectWaiterTable<T> {
     ) -> bool {
         if self
             .owned_exact(identity)
-            .is_none_or(|entry| entry.apc.is_some())
+            .is_none_or(|entry| entry.apc.is_some() || entry.reply.is_some())
         {
             return false;
         }
@@ -196,7 +208,8 @@ impl<T> ObjectWaiterTable<T> {
     }
 
     pub fn take(&mut self, identity: ObjectWaiterIdentity) -> Option<T> {
-        if self.owned_exact(identity)?.apc.is_some() {
+        let entry = self.owned_exact(identity)?;
+        if entry.apc.is_some() || entry.reply.is_some() {
             return None;
         }
         self.take_owned(identity).map(|entry| entry.payload)

@@ -130,7 +130,7 @@ impl<T> ObjectWaiterTable<T> {
         let entry = self
             .owned_exact(identity)
             .ok_or(ObjectWaitApcError::WrongIdentity)?;
-        if entry.apc.is_some() {
+        if entry.apc.is_some() || entry.reply.is_some() {
             return Err(ObjectWaitApcError::InvalidPhase);
         }
         let effect = if reference_count == 0 {
@@ -151,11 +151,6 @@ impl<T> ObjectWaiterTable<T> {
             next_attempt: 1,
         });
         Ok(())
-    }
-
-    pub fn is_claimed(&self, identity: ObjectWaiterIdentity) -> bool {
-        self.owned_exact(identity)
-            .is_some_and(|entry| entry.apc.is_some())
     }
 
     pub fn apc(
