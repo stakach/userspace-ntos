@@ -258,6 +258,51 @@ pub(super) unsafe fn service_event_poll(
     result.unwrap_or_else(|status| status as i32)
 }
 
+/// Readiness scheduling must supply a real selected kernel frame. This memory-only claim does
+/// not enable blocking admission or issue a Reply; the owned ticket must cross the mechanism
+/// boundary exactly once, with no activation/PM/dispatcher borrow held.
+pub(super) unsafe fn claim_driver_entry_wait_resume(
+    caller: KernelProviderCaller,
+    capture: nt_user_host::provider_kernel_activation::KernelProviderWaitCapture,
+) -> Result<
+    (
+        spawn_hosts::PumpChannel,
+        nt_user_host::provider_kernel_wait::KernelProviderWaitResume<ComponentSuspensionCompletion>,
+    ),
+    u32,
+> {
+    let _durable = allocator::enter_durable();
+    let channel = (&*core::ptr::addr_of!(ACTIVATIONS))
+        .recipient(caller)?.execution_channel(caller);
+    if authenticated_channel_caller(&channel)? != caller {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    let ticket = with_provider_process_manager(|pm| {
+        (&mut *core::ptr::addr_of_mut!(ACTIVATIONS)).begin_wait_resume(
+            caller,
+            pm,
+            &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+            &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS),
+            capture,
+        ).map_err(|error| {
+            use nt_user_host::provider_kernel_activation::KernelProviderResumeError;
+            match error {
+                KernelProviderResumeError::Authority(status) => status,
+                KernelProviderResumeError::Pump(
+                    nt_user_host::provider_kernel_pump::PumpProgressError::IdentityExhausted,
+                ) | KernelProviderResumeError::Lane(nt_component_suspension::LaneError::NoCapacity) => {
+                    nt_process::STATUS_INSUFFICIENT_RESOURCES
+                }
+                KernelProviderResumeError::Lane(nt_component_suspension::LaneError::Busy) => {
+                    nt_status::NtStatus::DEVICE_BUSY.raw() as u32
+                }
+                _ => nt_process::STATUS_INVALID_PARAMETER,
+            }
+        })
+    })?;
+    Ok((channel, ticket))
+}
+
 /// Capture the real initialization return before the shared page or physical lane is reused.
 /// A wall, scheduler yield or parked wait is not completion and retains the activation unchanged.
 unsafe fn record_driver_entry_pump(

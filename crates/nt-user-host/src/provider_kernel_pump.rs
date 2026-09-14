@@ -82,7 +82,19 @@ pub enum PumpProgressError {
     WrongAttempt,
 }
 
-/// One claimed pump entry. Dropping it leaves the canonical progress Invoking.
+/// The exact suspended pump entry, not authority to resume its activation.
+///
+/// ```compile_fail
+/// use nt_user_host::provider_kernel_pump::KernelProviderPumpObservation;
+/// let forged = KernelProviderPumpObservation { reply_cap: 42, nonce: 1 };
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelProviderPumpObservation {
+    reply_cap: u64,
+    nonce: u64,
+}
+
+/// One pump entry ticket. Once committed, dropping it leaves canonical progress Invoking.
 ///
 /// ```compile_fail
 /// use nt_user_host::provider_kernel_pump::KernelProviderPumpAttempt;
@@ -94,13 +106,17 @@ pub struct KernelProviderPumpAttempt {
     reply_cap: u64,
     nonce: u64,
     consumed: bool,
+    resume_from: Option<KernelProviderPumpObservation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Progress {
     Ready,
     Invoking(u64),
-    Observed(KernelProviderPumpDisposition),
+    Observed {
+        nonce: u64,
+        disposition: KernelProviderPumpDisposition,
+    },
 }
 
 /// Owned by the activation recipient; dropping a ticket never grants a replacement entry.
@@ -133,10 +149,10 @@ impl KernelProviderPumpProgress {
     pub fn begin_receive_after_yield(
         &mut self,
     ) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
-        self.begin_entry(
-            Progress::Observed(KernelProviderPumpDisposition::SchedulerYielded),
-            &NEXT_ATTEMPT,
-        )
+        if self.disposition() != Some(KernelProviderPumpDisposition::SchedulerYielded) {
+            return Err(PumpProgressError::NotReady);
+        }
+        self.begin_entry(self.progress, &NEXT_ATTEMPT)
     }
 
     fn begin_entry(
@@ -147,6 +163,16 @@ impl KernelProviderPumpProgress {
         if self.progress != expected {
             return Err(PumpProgressError::NotReady);
         }
+        let attempt = self.allocate_attempt(counter, None)?;
+        self.progress = Progress::Invoking(attempt.nonce);
+        Ok(attempt)
+    }
+
+    fn allocate_attempt(
+        &self,
+        counter: &AtomicU64,
+        resume_from: Option<KernelProviderPumpObservation>,
+    ) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
         let nonce = counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 if value == 0 {
@@ -156,12 +182,48 @@ impl KernelProviderPumpProgress {
                 }
             })
             .map_err(|_| PumpProgressError::IdentityExhausted)?;
-        self.progress = Progress::Invoking(nonce);
         Ok(KernelProviderPumpAttempt {
             reply_cap: self.reply_cap,
             nonce,
             consumed: false,
+            resume_from,
         })
+    }
+
+    /// Reserve the next identity before the activation owner changes canonical wait lanes.
+    /// Rejection by those lanes can drop this reservation without changing pump progress.
+    pub(crate) fn prepare_provider_wait_resume(
+        &self,
+        observation: KernelProviderPumpObservation,
+    ) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
+        self.prepare_provider_wait_resume_with_counter(observation, &NEXT_ATTEMPT)
+    }
+
+    fn prepare_provider_wait_resume_with_counter(
+        &self,
+        observation: KernelProviderPumpObservation,
+        counter: &AtomicU64,
+    ) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
+        if self.provider_wait_observation(observation.reply_cap) != Some(observation) {
+            return Err(PumpProgressError::NotReady);
+        }
+        self.allocate_attempt(counter, Some(observation))
+    }
+
+    /// Called only after canonical lane admission, under the same exclusive progress borrow.
+    pub(crate) fn commit_provider_wait_resume(
+        &mut self,
+        observation: KernelProviderPumpObservation,
+        attempt: &KernelProviderPumpAttempt,
+    ) {
+        assert_eq!(
+            self.provider_wait_observation(observation.reply_cap),
+            Some(observation)
+        );
+        assert_eq!(attempt.resume_from, Some(observation));
+        assert_eq!(attempt.reply_cap, self.reply_cap);
+        assert!(!attempt.consumed);
+        self.progress = Progress::Invoking(attempt.nonce);
     }
 
     /// Seal every exact entered observation, including malformed outcomes. A wrong ticket
@@ -179,21 +241,39 @@ impl KernelProviderPumpProgress {
             return Err(PumpProgressError::WrongAttempt);
         }
         let disposition = facts.classify(self.reply_cap, returned_status);
-        self.progress = Progress::Observed(disposition);
+        self.progress = Progress::Observed {
+            nonce: attempt.nonce,
+            disposition,
+        };
         attempt.consumed = true;
         Ok(disposition)
     }
 
     pub const fn disposition(&self) -> Option<KernelProviderPumpDisposition> {
         match self.progress {
-            Progress::Observed(disposition) => Some(disposition),
+            Progress::Observed { disposition, .. } => Some(disposition),
             _ => None,
         }
     }
 
     pub fn observed_provider_wait(&self, reply_cap: u64) -> bool {
-        self.reply_cap == reply_cap
-            && self.disposition() == Some(KernelProviderPumpDisposition::ProviderWaitSuspended)
+        self.provider_wait_observation(reply_cap).is_some()
+    }
+
+    pub fn provider_wait_observation(
+        &self,
+        reply_cap: u64,
+    ) -> Option<KernelProviderPumpObservation> {
+        if reply_cap != self.reply_cap {
+            return None;
+        }
+        match self.progress {
+            Progress::Observed {
+                nonce,
+                disposition: KernelProviderPumpDisposition::ProviderWaitSuspended,
+            } => Some(KernelProviderPumpObservation { reply_cap, nonce }),
+            _ => None,
+        }
     }
 }
 

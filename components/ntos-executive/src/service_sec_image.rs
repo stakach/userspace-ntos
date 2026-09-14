@@ -232,6 +232,15 @@ enum ComponentNativeContinuation {
     Kernel(nt_user_host::provider_kernel_activation::KernelProviderWaitCapture),
 }
 
+impl nt_user_host::provider_kernel_wait::KernelProviderWaitContinuation for ComponentNativeContinuation {
+    fn kernel_wait_capture(&self) -> Option<nt_user_host::provider_kernel_activation::KernelProviderWaitCapture> {
+        match self {
+            Self::Kernel(capture) => Some(*capture),
+            Self::Hosted(_) => None,
+        }
+    }
+}
+
 impl ComponentNativeContinuation {
     fn hosted(&self) -> Option<&HostedNativeContinuation> {
         match self {

@@ -1,6 +1,10 @@
 //! Root-owned kernel provider activations, independent of hosted callback headers.
 
 use crate::provider_kernel_pump::KernelProviderPumpProgress;
+use crate::provider_kernel_pump::{KernelProviderPumpObservation, PumpProgressError};
+use crate::provider_kernel_wait::{
+    KernelProviderWaitContinuation, KernelProviderWaitRecipient, KernelProviderWaitResume,
+};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use nt_component_suspension::{
@@ -70,6 +74,7 @@ impl KernelProviderCaller {
 pub struct KernelProviderWaitCapture {
     caller: KernelProviderCaller,
     request: ProviderWaitRequest,
+    observation: KernelProviderPumpObservation,
 }
 
 /// Transport observations supplied by the native receiver, not values asserted by a provider.
@@ -82,6 +87,10 @@ pub struct KernelProviderServiceEnvelope {
 }
 
 impl KernelProviderWaitCapture {
+    pub(crate) const fn observation(self) -> KernelProviderPumpObservation {
+        self.observation
+    }
+
     pub const fn caller(self) -> KernelProviderCaller {
         self.caller
     }
@@ -136,6 +145,7 @@ pub struct KernelProviderCompletionCursor {
 pub enum KernelProviderResumeError {
     Authority(u32),
     Lane(LaneError),
+    Pump(PumpProgressError),
 }
 
 impl KernelProviderCompletionReceipt {
@@ -314,7 +324,14 @@ impl<D> KernelProviderActivations<D> {
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        Ok(KernelProviderWaitCapture { caller, request })
+        let observation = progress
+            .provider_wait_observation(bound_reply)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        Ok(KernelProviderWaitCapture {
+            caller,
+            request,
+            observation,
+        })
     }
 
     /// Authenticate a scalar service request before acquiring any service-state borrow. The
@@ -422,6 +439,52 @@ impl<D> KernelProviderActivations<D> {
         lanes
             .begin_resume(caller.dispatch.lane(), caller.binding.reply_object, key)
             .map_err(KernelProviderResumeError::Lane)
+    }
+
+    /// Couple the exact selected wait with the recipient's stopped pump observation. Reserve
+    /// the nonce before the fallible lane transition; no progress or capture is lost on refusal.
+    /// No scheduler effect or IPC may occur until the returned ticket has left these borrows.
+    pub fn begin_wait_resume<C, R: Clone, T>(
+        &mut self,
+        caller: KernelProviderCaller,
+        pm: &ProcessManager,
+        catalog: &ProviderDomainCatalog,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        capture: KernelProviderWaitCapture,
+    ) -> Result<KernelProviderWaitResume<R>, KernelProviderResumeError>
+    where
+        C: KernelProviderWaitContinuation,
+        D: KernelProviderWaitRecipient,
+    {
+        if capture.caller() != caller {
+            return Err(KernelProviderResumeError::Authority(STATUS_INVALID_HANDLE));
+        }
+        self.validate_resume(caller, pm, catalog, lanes, capture.key())
+            .map_err(KernelProviderResumeError::Authority)?;
+        if lanes
+            .top(caller.dispatch.lane())
+            .map_err(KernelProviderResumeError::Lane)?
+            .and_then(|frame| frame.continuation.kernel_wait_capture())
+            != Some(capture)
+        {
+            return Err(KernelProviderResumeError::Authority(STATUS_INVALID_HANDLE));
+        }
+        let state = self
+            .recipient_mut(caller)
+            .map_err(KernelProviderResumeError::Authority)?
+            .kernel_wait_state();
+        let attempt = state
+            .prepare_resume(capture)
+            .map_err(KernelProviderResumeError::Pump)?;
+        let selection = lanes
+            .begin_resume(caller.dispatch.lane(), caller.binding.reply_object, capture.key())
+            .map_err(KernelProviderResumeError::Lane)?;
+        state.commit_resume(capture, &attempt);
+        Ok(KernelProviderWaitResume {
+            capture,
+            attempt,
+            selection,
+        })
     }
 
     /// Record only a genuine provider return observed by the authenticated native adapter.

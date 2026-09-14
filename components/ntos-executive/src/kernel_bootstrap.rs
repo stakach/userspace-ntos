@@ -5,20 +5,18 @@ use nt_user_host::provider_kernel_pump::{
     KernelProviderPumpAttempt, KernelProviderPumpDisposition, KernelProviderPumpFacts,
     KernelProviderPumpProgress, PumpProgressError,
 };
-
-enum DriverEntryWaitObservation {
-    Captured(nt_user_host::provider_kernel_activation::KernelProviderWaitCapture),
-    Rejected {
-        request: nt_provider_wait::ProviderWaitRequest,
-        status: u32,
-    },
-}
+use nt_user_host::provider_kernel_wait::{KernelProviderWaitRecipient, KernelProviderWaitState};
 
 pub(super) struct DriverEntryRecipient {
     channel: spawn_hosts::PumpChannel,
-    progress: KernelProviderPumpProgress,
+    wait: KernelProviderWaitState,
     observation: Option<spawn_hosts::PumpResult>,
-    wait_capture: Option<DriverEntryWaitObservation>,
+}
+
+impl KernelProviderWaitRecipient for DriverEntryRecipient {
+    fn kernel_wait_state(&mut self) -> &mut KernelProviderWaitState {
+        &mut self.wait
+    }
 }
 
 fn pump_error(error: PumpProgressError) -> u32 {
@@ -31,10 +29,9 @@ fn pump_error(error: PumpProgressError) -> u32 {
 impl DriverEntryRecipient {
     pub(super) fn new(channel: spawn_hosts::PumpChannel) -> Result<Self, u32> {
         Ok(Self {
-            progress: KernelProviderPumpProgress::new(channel.reply_cap).map_err(pump_error)?,
+            wait: KernelProviderWaitState::new(channel.reply_cap).map_err(pump_error)?,
             channel,
             observation: None,
-            wait_capture: None,
         })
     }
 
@@ -49,11 +46,15 @@ impl DriverEntryRecipient {
         &mut self,
         caller: KernelProviderCaller,
     ) -> Result<(spawn_hosts::PumpChannel, KernelProviderPumpAttempt), u32> {
-        let attempt = self.progress.begin_initial().map_err(pump_error)?;
+        let attempt = self.wait.begin_initial().map_err(pump_error)?;
+        Ok((self.execution_channel(caller), attempt))
+    }
+
+    pub(super) fn execution_channel(&self, caller: KernelProviderCaller) -> spawn_hosts::PumpChannel {
         let mut channel = self.channel;
         channel.kernel_caller = Some(caller);
         channel.caps.kernel_irq_yield = true;
-        Ok((channel, attempt))
+        channel
     }
 
     pub(super) fn begin_receive_after_yield(
@@ -71,13 +72,10 @@ impl DriverEntryRecipient {
             .observation
             .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
         let attempt = self
-            .progress
+            .wait
             .begin_receive_after_yield()
             .map_err(pump_error)?;
-        let mut channel = self.channel;
-        channel.kernel_caller = Some(caller);
-        channel.caps.kernel_irq_yield = true;
-        Ok((channel, attempt, previous))
+        Ok((self.execution_channel(caller), attempt, previous))
     }
 
     pub(super) fn observe(
@@ -88,7 +86,7 @@ impl DriverEntryRecipient {
         returned_status: Option<u32>,
     ) -> Result<(), u32> {
         let disposition = self
-            .progress
+            .wait
             .observe(attempt, facts, returned_status)
             .map_err(pump_error)?;
         self.observation = Some(pump);
@@ -99,14 +97,14 @@ impl DriverEntryRecipient {
     }
 
     pub(super) fn observed_return(&self) -> Option<u32> {
-        match self.progress.disposition() {
+        match self.wait.progress().disposition() {
             Some(KernelProviderPumpDisposition::Returned(status)) => Some(status),
             _ => None,
         }
     }
 
     pub(super) fn progress(&self) -> &KernelProviderPumpProgress {
-        &self.progress
+        self.wait.progress()
     }
 
     pub(super) fn retain_provider_wait(
@@ -114,21 +112,7 @@ impl DriverEntryRecipient {
         request: nt_provider_wait::ProviderWaitRequest,
         capture: Result<nt_user_host::provider_kernel_activation::KernelProviderWaitCapture, u32>,
     ) -> Result<(), u32> {
-        if self.wait_capture.is_some()
-            || !self.progress.observed_provider_wait(self.channel.reply_cap)
-        {
-            return Err(nt_process::STATUS_INVALID_PARAMETER);
-        }
-        match capture {
-            Ok(capture) => {
-                self.wait_capture = Some(DriverEntryWaitObservation::Captured(capture));
-                Ok(())
-            }
-            Err(status) => {
-                self.wait_capture = Some(DriverEntryWaitObservation::Rejected { request, status });
-                Err(status)
-            }
-        }
+        self.wait.retain_provider_wait(request, capture)
     }
 
     pub(super) unsafe fn can_initialize(&self, caller: KernelProviderCaller) -> bool {

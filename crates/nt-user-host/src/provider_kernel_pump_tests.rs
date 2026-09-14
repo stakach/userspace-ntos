@@ -332,10 +332,10 @@ fn receive_tickets_cannot_cross_same_cap_recipients_or_replay_into_later_receive
 
 #[test]
 fn receive_nonce_exhaustion_preserves_exact_observed_yield() {
-    let expected = Progress::Observed(KernelProviderPumpDisposition::SchedulerYielded);
     for initial in [0, u64::MAX] {
         let counter = AtomicU64::new(initial);
         let (mut progress, _) = yielded_progress();
+        let expected = progress.progress;
         assert_eq!(
             progress.begin_entry(expected, &counter).unwrap_err(),
             PumpProgressError::IdentityExhausted
@@ -345,12 +345,229 @@ fn receive_nonce_exhaustion_preserves_exact_observed_yield() {
     }
     let counter = AtomicU64::new(u64::MAX - 1);
     let (mut progress, _) = yielded_progress();
+    let expected = progress.progress;
     let mut last = progress.begin_entry(expected, &counter).unwrap();
     progress.observe(&mut last, facts(16), None).unwrap();
+    let expected = progress.progress;
     assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     assert_eq!(
         progress.begin_entry(expected, &counter).unwrap_err(),
         PumpProgressError::IdentityExhausted
     );
     assert_eq!(progress.progress, expected);
+}
+
+fn provider_wait_progress() -> (KernelProviderPumpProgress, KernelProviderPumpObservation) {
+    let mut progress = KernelProviderPumpProgress::new(CAP).unwrap();
+    let mut first = progress.begin_initial().unwrap();
+    progress.observe(&mut first, facts(4), None).unwrap();
+    let observation = progress.provider_wait_observation(CAP).unwrap();
+    (progress, observation)
+}
+
+#[test]
+fn only_exact_provider_wait_has_an_observation_epoch() {
+    let mut progress = KernelProviderPumpProgress::new(CAP).unwrap();
+    assert_eq!(progress.provider_wait_observation(CAP), None);
+    let mut initial = progress.begin_initial().unwrap();
+    assert_eq!(progress.provider_wait_observation(CAP), None);
+    progress.observe(&mut initial, facts(4), None).unwrap();
+    assert!(progress.observed_provider_wait(CAP));
+    assert_eq!(progress.provider_wait_observation(0), None);
+    assert_eq!(progress.provider_wait_observation(CAP + 1), None);
+    for mask in 0..32 {
+        if mask == 4 {
+            continue;
+        }
+        let mut progress = KernelProviderPumpProgress::new(CAP).unwrap();
+        let mut initial = progress.begin_initial().unwrap();
+        progress
+            .observe(
+                &mut initial,
+                facts(mask),
+                if mask == 1 { Some(0) } else { None },
+            )
+            .unwrap();
+        assert_eq!(progress.provider_wait_observation(CAP), None);
+        assert!(!progress.observed_provider_wait(CAP));
+    }
+}
+
+#[test]
+fn prepare_is_not_entry_and_dropped_reservation_preserves_observation() {
+    let (mut progress, observation) = provider_wait_progress();
+    let expected = progress.progress;
+    let mut prepared = progress.prepare_provider_wait_resume(observation).unwrap();
+    assert_eq!(progress.progress, expected);
+    assert_eq!(
+        progress.observe(&mut prepared, facts(1), Some(0)),
+        Err(PumpProgressError::WrongAttempt)
+    );
+    assert!(!prepared.consumed);
+    let discarded_nonce = prepared.nonce;
+    drop(prepared);
+    assert_eq!(progress.progress, expected);
+    let mut entered = progress.prepare_provider_wait_resume(observation).unwrap();
+    assert_ne!(entered.nonce, discarded_nonce);
+    progress.commit_provider_wait_resume(observation, &entered);
+    assert_eq!(progress.provider_wait_observation(CAP), None);
+    assert_eq!(
+        progress
+            .prepare_provider_wait_resume(observation)
+            .unwrap_err(),
+        PumpProgressError::NotReady
+    );
+    assert_eq!(
+        progress.observe(&mut entered, facts(1), Some(0)),
+        Ok(KernelProviderPumpDisposition::Returned(0))
+    );
+}
+
+#[test]
+fn repark_and_same_cap_replacement_reject_stale_observation() {
+    let (mut progress, first) = provider_wait_progress();
+    let mut resume = progress.prepare_provider_wait_resume(first).unwrap();
+    progress.commit_provider_wait_resume(first, &resume);
+    progress.observe(&mut resume, facts(4), None).unwrap();
+    let second = progress.provider_wait_observation(CAP).unwrap();
+    assert_ne!(first, second);
+    let expected = progress.progress;
+    assert_eq!(
+        progress.prepare_provider_wait_resume(first).unwrap_err(),
+        PumpProgressError::NotReady
+    );
+    assert_eq!(progress.progress, expected);
+    let (replacement, replacement_observation) = provider_wait_progress();
+    assert_ne!(replacement_observation, second);
+    assert_eq!(
+        replacement
+            .prepare_provider_wait_resume(second)
+            .unwrap_err(),
+        PumpProgressError::NotReady
+    );
+    assert_eq!(
+        replacement.provider_wait_observation(CAP),
+        Some(replacement_observation)
+    );
+}
+
+#[test]
+fn wrong_observation_cap_or_nonce_does_not_change_progress_or_allocate() {
+    let (progress, observation) = provider_wait_progress();
+    let expected = progress.progress;
+    let counter = AtomicU64::new(80);
+    for wrong in [
+        KernelProviderPumpObservation {
+            reply_cap: 0,
+            ..observation
+        },
+        KernelProviderPumpObservation {
+            reply_cap: CAP + 1,
+            ..observation
+        },
+        KernelProviderPumpObservation {
+            nonce: observation.nonce + 1,
+            ..observation
+        },
+    ] {
+        assert_eq!(
+            progress
+                .prepare_provider_wait_resume_with_counter(wrong, &counter)
+                .unwrap_err(),
+            PumpProgressError::NotReady
+        );
+        assert_eq!(progress.progress, expected);
+        assert_eq!(counter.load(Ordering::Relaxed), 80);
+    }
+}
+
+#[test]
+fn dropped_entered_wait_resume_never_permits_replay() {
+    let (mut progress, observation) = provider_wait_progress();
+    let attempt = progress.prepare_provider_wait_resume(observation).unwrap();
+    progress.commit_provider_wait_resume(observation, &attempt);
+    let entered = progress.progress;
+    drop(attempt);
+    assert_eq!(progress.provider_wait_observation(CAP), None);
+    assert_eq!(
+        progress.begin_initial().unwrap_err(),
+        PumpProgressError::NotReady
+    );
+    assert_eq!(
+        progress.begin_receive_after_yield().unwrap_err(),
+        PumpProgressError::NotReady
+    );
+    assert_eq!(
+        progress
+            .prepare_provider_wait_resume(observation)
+            .unwrap_err(),
+        PumpProgressError::NotReady
+    );
+    assert_eq!(progress.progress, entered);
+}
+
+#[test]
+fn wait_resume_identity_exhaustion_preserves_exact_observation() {
+    for initial in [0, u64::MAX] {
+        let (progress, observation) = provider_wait_progress();
+        let expected = progress.progress;
+        let counter = AtomicU64::new(initial);
+        assert_eq!(
+            progress
+                .prepare_provider_wait_resume_with_counter(observation, &counter)
+                .unwrap_err(),
+            PumpProgressError::IdentityExhausted
+        );
+        assert_eq!(progress.progress, expected);
+        assert_eq!(counter.load(Ordering::Relaxed), initial);
+    }
+    let (mut progress, observation) = provider_wait_progress();
+    let counter = AtomicU64::new(u64::MAX - 1);
+    let mut last = progress
+        .prepare_provider_wait_resume_with_counter(observation, &counter)
+        .unwrap();
+    progress.commit_provider_wait_resume(observation, &last);
+    progress.observe(&mut last, facts(4), None).unwrap();
+    let observation = progress.provider_wait_observation(CAP).unwrap();
+    let expected = progress.progress;
+    assert_eq!(
+        progress
+            .prepare_provider_wait_resume_with_counter(observation, &counter)
+            .unwrap_err(),
+        PumpProgressError::IdentityExhausted
+    );
+    assert_eq!(progress.progress, expected);
+    assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+}
+
+#[test]
+#[should_panic]
+fn duplicate_commit_cannot_reenter_a_claimed_wait() {
+    let (mut progress, observation) = provider_wait_progress();
+    let attempt = progress.prepare_provider_wait_resume(observation).unwrap();
+    progress.commit_provider_wait_resume(observation, &attempt);
+    progress.commit_provider_wait_resume(observation, &attempt);
+}
+
+#[test]
+#[should_panic]
+fn same_cap_foreign_reservation_cannot_commit() {
+    let (first, first_observation) = provider_wait_progress();
+    let (mut second, second_observation) = provider_wait_progress();
+    let attempt = first
+        .prepare_provider_wait_resume(first_observation)
+        .unwrap();
+    second.commit_provider_wait_resume(second_observation, &attempt);
+}
+
+#[test]
+#[should_panic]
+fn stale_prepared_reservation_cannot_commit_after_repark() {
+    let (mut progress, observation) = provider_wait_progress();
+    let stale = progress.prepare_provider_wait_resume(observation).unwrap();
+    let mut attempt = progress.prepare_provider_wait_resume(observation).unwrap();
+    progress.commit_provider_wait_resume(observation, &attempt);
+    progress.observe(&mut attempt, facts(4), None).unwrap();
+    let current = progress.provider_wait_observation(CAP).unwrap();
+    progress.commit_provider_wait_resume(current, &stale);
 }

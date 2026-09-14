@@ -35097,14 +35097,46 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         barrier within BOOT_TIMEOUT_SECONDS=300; the runner exits failure without a successful
         guest completion or Explorer verdict. No QEMU remains. This verifies unchanged early
         boot progress, not native kernel poll execution, DriverEntry completion or desktop rendering.
-      - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
-        Next whole ownership slice: extend the existing KernelProviderPumpProgress and
-        DriverEntryRecipient beyond initial entry/IRQ receive continuation to a single-use resume
-        ticket for an exact selected or cancelled ProviderWaitSuspended observation. Couple
-        canonical begin_resume with that ticket, retain Reply/shared-bank ownership through
-        repeated waits, and deliver eventual return to the retained kernel recipient. The current
-        wait_capture slot is observation-only, not such a resume path. Exercise stale/wrong
-        selection, exited callers, repark, uncertain execution without replay and terminal delivery.
+      - [x] Couple exact captured kernel waits to single-use pump resume ownership (2026-09-15).
+        Pump observations now retain their globally unique attempt nonce as well as their exact
+        Reply identity. KernelProviderWaitCapture includes that opaque observation, preventing
+        an older request from matching a later stop even when owner, wait ID and Reply are reused.
+        KernelProviderWaitState replaces the native recipient's one-shot wait_capture machinery;
+        it retains successful or rejected observations and clears only the capture committed to
+        a resume ticket. Initial/yield entry and actual observations use the same shared state.
+        begin_wait_resume validates the retained live caller, selected/cancelled canonical top,
+        exact typed kernel continuation and recipient capture before preparing a fresh nonce.
+        It then performs the fallible lane transition and infallibly commits pump Invoking state
+        under the same exclusive borrows. Authority, busy/capacity and preparation failures keep
+        the selected frame, observation and capture intact; a burned nonce is not execution.
+        The nonclone ticket carries the capture, selection and unique pump attempt together.
+        Dropping an entered ticket or observing malformed results never reopens the claim.
+        Native DriverEntry uses the shared state and provides a canonical memory-only claim
+        adapter; its durable allocation scope retains any callback-token capacity grown during
+        lane resume. No PM/activation/lane borrow may cross subsequent mechanism effects.
+        Nine pump tests exercise exact observation epochs, two-phase claims, stale same-cap
+        attempts, drop behavior and exhaustion. Nine integration tests use real canonical
+        activation/lane state for selection/cancellation, refusal nonmutation, replaced/exited
+        callers, reused wait IDs, rejected requests, repeated repark and terminal retirement/ACK
+        with the original recipient bank and Ps references. Two compile-fail cases prevent
+        forging observation fields or cloning the owned resume ticket. Final serialized validation
+        passes 1,210 tests across 17 suites with no failures or ignored cases:
+        .tmp/test-kernel-wait-resume-final-20260915.log. Executive release passes in 38.11s with
+        296 warnings; two obsolete capture-field warnings were removed and the preparatory claim
+        adapter now has an unused-function warning. Standalone I/O Manager passes without warnings.
+        Evidence: .tmp/build-kernel-wait-resume-executive-20260915.log and
+        .tmp/build-kernel-wait-resume-io-manager-20260915.log. Independent transaction/native review,
+        scoped formatting and git diff --check pass. No boot was rerun: the latest measured boot
+        remains the 27-import rejection above, before DriverEntry or this resume path can execute.
+        The native claim adapter is preparatory: no production blocking admission or resume pump
+        caller exists yet. Host terminal tests do not establish native repark or terminal delivery.
+      - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
+        Next whole native execution slice: consume the owned resume ticket through the real
+        selected-kernel pump, revalidate after scheduling before effects, preserve the Reply/shared
+        bank across IRQ yields, and repark a repeated request through rearm_running_owned rather
+        than stacking another frame over the old Resuming wait. Preserve both continuations on
+        failed repark. A genuine resumed return must use retained active-frame terminal completion
+        and the original kernel recipient, never frame-free record_completion or a hosted reply.
         Keep blocking admission disabled until real readiness scheduling and this ownership
         contract are both wired; Timer expiration and receive-endpoint fan-in remain necessary
         for asynchronous boot rather than being implied by successful synchronous Event polls.

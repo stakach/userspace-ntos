@@ -1,0 +1,182 @@
+//! Recipient-owned pump progress and its exact stopped provider-wait observation.
+
+use crate::provider_kernel_activation::{KernelProviderCaller, KernelProviderWaitCapture};
+use crate::provider_kernel_pump::{
+    KernelProviderPumpAttempt, KernelProviderPumpDisposition, KernelProviderPumpFacts,
+    KernelProviderPumpProgress, PumpProgressError,
+};
+use nt_component_suspension::SuspensionResume;
+use nt_process::STATUS_INVALID_PARAMETER;
+use nt_provider_wait::ProviderWaitRequest;
+
+#[derive(Debug)]
+enum WaitObservation {
+    Captured(KernelProviderWaitCapture),
+    Rejected {
+        request: ProviderWaitRequest,
+        status: u32,
+    },
+}
+
+/// The native recipient retains this state alongside its physical channel and pump result.
+#[derive(Debug)]
+pub struct KernelProviderWaitState {
+    progress: KernelProviderPumpProgress,
+    wait: Option<WaitObservation>,
+}
+
+pub trait KernelProviderWaitRecipient {
+    fn kernel_wait_state(&mut self) -> &mut KernelProviderWaitState;
+}
+
+/// A selected kernel frame must retain the same validated capture as its pump recipient.
+pub trait KernelProviderWaitContinuation {
+    fn kernel_wait_capture(&self) -> Option<KernelProviderWaitCapture>;
+}
+
+impl KernelProviderWaitContinuation for KernelProviderWaitCapture {
+    fn kernel_wait_capture(&self) -> Option<KernelProviderWaitCapture> {
+        Some(*self)
+    }
+}
+
+impl KernelProviderWaitRecipient for KernelProviderWaitState {
+    fn kernel_wait_state(&mut self) -> &mut KernelProviderWaitState {
+        self
+    }
+}
+
+impl KernelProviderWaitState {
+    pub fn new(reply_cap: u64) -> Result<Self, PumpProgressError> {
+        Ok(Self {
+            progress: KernelProviderPumpProgress::new(reply_cap)?,
+            wait: None,
+        })
+    }
+
+    pub fn progress(&self) -> &KernelProviderPumpProgress {
+        &self.progress
+    }
+
+    pub fn begin_initial(&mut self) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
+        self.progress.begin_initial()
+    }
+
+    pub fn begin_receive_after_yield(
+        &mut self,
+    ) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
+        self.progress.begin_receive_after_yield()
+    }
+
+    pub fn observe(
+        &mut self,
+        attempt: &mut KernelProviderPumpAttempt,
+        facts: KernelProviderPumpFacts,
+        returned_status: Option<u32>,
+    ) -> Result<KernelProviderPumpDisposition, PumpProgressError> {
+        self.progress.observe(attempt, facts, returned_status)
+    }
+
+    /// Preserve rejected requests too; a validation failure is not permission to reply or retry.
+    pub fn retain_provider_wait(
+        &mut self,
+        request: ProviderWaitRequest,
+        capture: Result<KernelProviderWaitCapture, u32>,
+    ) -> Result<(), u32> {
+        if self.wait.is_some()
+            || self.progress.disposition()
+                != Some(KernelProviderPumpDisposition::ProviderWaitSuspended)
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        match capture {
+            Ok(capture) => {
+                if capture.request() != &request
+                    || self
+                        .progress
+                        .provider_wait_observation(capture.caller().binding().reply_object)
+                        != Some(capture.observation())
+                {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                self.wait = Some(WaitObservation::Captured(capture));
+                Ok(())
+            }
+            Err(status) => {
+                self.wait = Some(WaitObservation::Rejected { request, status });
+                Err(status)
+            }
+        }
+    }
+
+    pub fn captured_wait(&self) -> Option<KernelProviderWaitCapture> {
+        match self.wait {
+            Some(WaitObservation::Captured(capture)) => Some(capture),
+            _ => None,
+        }
+    }
+
+    pub fn rejected_wait(&self) -> Option<(&ProviderWaitRequest, u32)> {
+        match &self.wait {
+            Some(WaitObservation::Rejected { request, status }) => Some((request, *status)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn prepare_resume(
+        &self,
+        capture: KernelProviderWaitCapture,
+    ) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
+        if self.captured_wait() != Some(capture) {
+            return Err(PumpProgressError::NotReady);
+        }
+        self.progress
+            .prepare_provider_wait_resume(capture.observation())
+    }
+
+    pub(crate) fn commit_resume(
+        &mut self,
+        capture: KernelProviderWaitCapture,
+        attempt: &KernelProviderPumpAttempt,
+    ) {
+        assert_eq!(self.captured_wait(), Some(capture));
+        self.progress
+            .commit_provider_wait_resume(capture.observation(), attempt);
+        self.wait = None;
+    }
+}
+
+/// An authenticated lane transition and its unique pump attempt travel together.
+/// Dropping this value does not reopen either the selected wait or the pump entry.
+///
+/// ```compile_fail
+/// use nt_user_host::provider_kernel_wait::KernelProviderWaitResume;
+/// fn duplicate(ticket: KernelProviderWaitResume<i32>) { let _ = ticket.clone(); }
+/// ```
+#[must_use = "execute and observe the claimed pump exactly once; dropping it does not permit retry"]
+#[derive(Debug)]
+pub struct KernelProviderWaitResume<R> {
+    pub(crate) capture: KernelProviderWaitCapture,
+    pub(crate) attempt: KernelProviderPumpAttempt,
+    pub(crate) selection: SuspensionResume<R>,
+}
+
+impl<R> KernelProviderWaitResume<R> {
+    pub fn caller(&self) -> KernelProviderCaller {
+        self.capture.caller()
+    }
+
+    pub fn selection(&self) -> &SuspensionResume<R> {
+        &self.selection
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        KernelProviderWaitCapture,
+        KernelProviderPumpAttempt,
+        SuspensionResume<R>,
+    ) {
+        (self.capture, self.attempt, self.selection)
+    }
+}
