@@ -34212,17 +34212,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         pass. No VM, native pending-video execution or desktop acceptance is claimed; the last
         measured 27 strict win32k imports remain open. Review refined the native conversion below
         around real IRP/status lifetime, not a new VideoPort completion API.
+      - [x] Move native VideoPort dispatch onto ordinary retained IRPs
+        (2026-09-14; host/composed/native-build verified below).
+        VideoPortInitialize validates its Driver object and registers CREATE, CLEANUP, CLOSE and
+        DEVICE_CONTROL handlers. Remove the separate initialization/StartIO transport and its
+        zero transfer identity. CREATE now publishes the ordinary provider File binding before
+        HwInitialize; lifecycle and buffered controls complete through IoCompleteRequest with
+        the normal PendingIrp graph. Each Device owns its hardware extension, zeroed once at
+        Device creation; FindAdapter and dispatch select the exact Device rather than a singleton.
+        The transient VRP points at persistent IRP.IoStatus and SystemBuffer. A host-testable
+        classifier preserves success/MORE_DATA Information, clears known-error Information and
+        rejects invalid miniport pending/unknown status as a guarded provider protocol violation.
+        Snapshot the legacy initialization registry log before Config Manager calls; failure
+        after successful native CREATE is indeterminate, not a fabricated no-effect failure.
+        This does not close the win32k caller/reply conversion or per-Device serialization below.
+        Review found and removed the remaining lifecycle interception because it bypassed native
+        File registration and would have prevented the new control handler from being reached.
+        Review also required consuming the captured registry batch before Config Manager entry,
+        so a subsequent CREATE cannot replay stale ARG records and nested staging is not erased.
+        All 762 selected tests pass without failures or ignored cases: 27 video library tests,
+        two composed WDM/VRP tests, 717 I/O Manager library tests and 16 exact-control/native-File
+        protocol/video-projection regressions. Composition checks persistent IoStatus pointers,
+        descriptor lifetime, shared buffered storage, all known VP status mappings and 64-bit
+        Information; it does not execute the native adapter or prove hardware-extension lifetime.
+        Evidence: .tmp/test-native-video-port-control-20260914.log and
+        .tmp/test-native-video-port-control-io-regression-20260914.log. Serialized release builds
+        pass: executive in 35.22s with the unchanged 294 warnings and standalone I/O Manager with
+        no warnings. Evidence: .tmp/build-native-video-port-control-executive-20260914.log and
+        .tmp/build-native-video-port-control-io-manager-20260914.log. Scoped formatting and diff
+        checks pass; source search confirms both replaced selectors, the singleton hardware
+        extension pointer, old status mapper and hosted_video_dispatch module are removed.
+        No VM, native pending-video execution or desktop acceptance is claimed. The last measured
+        27 strict win32k imports remain open; review expanded the remaining lifecycle/registry
+        prerequisites below rather than marking the whole bridge complete.
       - [ ] Replace the native video IOCTL bridge with authenticated, owned File-less requests.
         Retain the physical win32k caller, exact Device authority, input/output buffers and reply
         continuation before dispatch. Use detached exact-device preparation rather than holding
         a mutable I/O Manager borrow across hosted driver execution. Preserve the canonical IRP
-        identity through the video intercept, replacing its current zero transfer id. Retain the
-        native IRP/status/output owner: NT5 drivers/video/ms/port/videoprt.c:1769 uses a transient
-        VRP wrapper pointing to the real IRP's persistent IoStatus; it does not justify our current
-        stack-local status and unconditional buffer free. hosted_video_dispatch currently rejects
-        pending requests as indeterminate because that owner is absent. Reuse PendingIrp and
-        detached completion ownership, and establish a genuine completion source for each async
-        port operation; do not invent a SCSI-style VideoPortNotification/RequestComplete API.
+        identity through the ordinary native IRP dispatch established above. NT5
+        drivers/video/ms/port/videoprt.c:1769 uses a transient VRP wrapper pointing to the real
+        IRP's persistent IoStatus. Its status mapper at 6006 rejects ERROR_IO_PENDING from
+        HwStartIO; do not copy the release-build success fallback or invent asynchronous VRP
+        retention. Genuine port-owned asynchronous operations, such as monitor power requests
+        at 903/919 and pVideoPortPowerCompletionIoctl at 6724, retain and complete the real IRP.
+        Reuse PendingIrp and detached completion ownership for those operations; do not invent
+        a SCSI-style VideoPortNotification/RequestComplete API.
         Copy the singleton win32k scratch window before entry and restore only the authenticated
         lane/dispatch's owned output. Serialize HwStartIO per Device (NT5 videoprt.c:503), not
         globally across independent adapters. Preserve pending IRP/caller state
@@ -34231,6 +34265,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Information through Eng's Win32 error translation (including BUFFER_OVERFLOW/MORE_DATA).
         Direct/neither capture must preserve caller writeback and pointer contracts; host vector
         tests do not prove native MDL permissions, original addresses, mapping or copyback.
+        Replace the legacy staged VideoPort registry log with real per-call completion and exact
+        Device registry identity: snapshotting on inline CREATE return does not protect staged
+        records from other ARG-using imports during HwInitialize, deferred completion or future
+        concurrent lanes, and driver-wide starting-device metadata is not per-adapter identity.
+        Complete per-Device VideoPort lifecycle policy alongside that state: NT5 CREATE at 564
+        distinguishes user/attribute-only opens, checks FindAdapter success and retains HwInitStatus
+        so repeated opens cannot reinitialize hardware. The ordinary-IRP conversion above preserves
+        existing initialization behavior; it does not yet supply those port-owned lifecycle fields
+        or the requestor-mode/session control access checks at 749.
       - [ ] Replace legacy video pointer acquisition with authenticated per-call File ownership.
         NT5 base/ntos/io/iomgr/iosubs.c:7393 and ReactOS ntoskrnl/io/iomgr/device.c:264 open a NEW
         File for each IoGetDeviceObjectPointer call with caller DesiredAccess, no sharing,

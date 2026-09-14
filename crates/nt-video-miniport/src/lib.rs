@@ -7,6 +7,9 @@
 
 #![no_std]
 
+mod control;
+pub use control::{classify_start_io_status, VideoControlCompletion, VideoControlProtocolError};
+
 pub const FILE_DEVICE_VIDEO: u32 = 0x23;
 
 pub const VIDEO_DRIVER_OBJECT_PATH_PREFIX: &str = "\\Driver\\";

@@ -273,26 +273,7 @@ pub(super) fn execute(
             status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         };
     };
-    if let Some(binding) = hosted_device_binding_by_device_id(projection.device_id.raw())
-        .filter(|binding| binding.instance == route_instance)
-    {
-        if let Some(result) = unsafe {
-            dispatch_video_irp_for_binding_exact(
-                route_instance,
-                route_inst,
-                binding,
-                projection.major as u64,
-                projection.minor as u64,
-                projection_fsctl(projection),
-                projection.user_data,
-                input,
-                output,
-            )
-        } {
-            return result;
-        }
-    }
-    unsafe {
+    let result = unsafe {
         dispatch_irp_for_instance_exact(
             route_instance,
             projection.major as u64,
@@ -310,5 +291,24 @@ pub(super) fn execute(
     }
     .unwrap_or(HostedIrpTransportResult::NotDispatched {
         status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
-    })
+    });
+    if projection.major == major::IRP_MJ_CREATE
+        && matches!(
+            result,
+            HostedIrpTransportResult::Returned {
+                status: nt_status::NtStatus::SUCCESS,
+                ..
+            }
+        )
+        && unsafe { hosted_instance_video_port_initialized(route_inst) }
+    {
+        if let Err(transport_status) =
+            unsafe { commit_video_registry_parameters_for_instance(route_inst) }
+        {
+            // Native CREATE already published its File. A later registry failure cannot undo it.
+            register_instance_ready(route_instance, false);
+            return HostedIrpTransportResult::Indeterminate { transport_status };
+        }
+    }
+    result
 }
