@@ -127,20 +127,15 @@ pub(crate) unsafe fn hosted_main_client_id(pi: usize) -> Option<nt_process::Clie
     (client_id.unique_process == pid).then_some(client_id)
 }
 
-pub(crate) unsafe fn service_initial_system_request(
-    caller: nt_process::InitialSystemIdentity,
-    op: u64,
-    object: u64,
-    value: u64,
-) -> (i32, u64, u64, u64) {
+/// Memory-only operation; the callback must not enter provider IPC or retain a manager borrow.
+pub(crate) unsafe fn with_process_manager<R>(
+    operation: impl FnOnce(&mut nt_process::ProcessManager) -> Result<R, u32>,
+) -> Result<R, u32> {
     let BootstrapPhase::Owned(seed) = &mut *core::ptr::addr_of_mut!(BOOTSTRAP) else {
-        return (0xc000_00a3u32 as i32, 0, 0, 0);
+        return Err(0xc000_00a3);
     };
     let (pm, _) = seed.ps.managers_mut();
-    if !pm.validate_initial_system_caller(caller) {
-        return (0xc000_00a3u32 as i32, 0, 0, 0);
-    }
-    provider_ps::dispatch(pm, op, object, value)
+    operation(pm)
 }
 
 #[inline(never)]

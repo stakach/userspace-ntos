@@ -69,6 +69,12 @@ impl IrqlState {
         self.level <= APC_LEVEL
     }
 
+    /// True if a nonblocking dispatcher poll is permitted. A zero-timeout poll
+    /// may run at `DISPATCH_LEVEL`; this does not authorize parking a thread.
+    pub fn can_poll(&self) -> bool {
+        self.level <= DISPATCH_LEVEL
+    }
+
     /// Count of rejected (invalid) IRQL transitions — a debug/test signal.
     pub fn invalid_transitions(&self) -> u32 {
         self.invalid_transitions
@@ -113,6 +119,18 @@ mod tests {
         assert!(irql.can_wait()); // APC ok
         irql.raise(DISPATCH_LEVEL);
         assert!(!irql.can_wait()); // DISPATCH: no waiting
+    }
+
+    #[test]
+    fn polling_and_blocking_have_distinct_irql_limits() {
+        for level in 0..=u8::MAX {
+            let mut irql = IrqlState::new();
+            irql.raise(level);
+            assert_eq!(irql.can_poll(), level <= DISPATCH_LEVEL);
+            assert_eq!(irql.can_wait(), level <= APC_LEVEL);
+            assert_eq!(irql.current(), level);
+            assert_eq!(irql.invalid_transitions(), 0);
+        }
     }
 
     #[test]

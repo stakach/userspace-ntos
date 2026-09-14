@@ -23,6 +23,7 @@ pub mod provider_alias_bank;
 pub mod provider_finalization;
 pub mod native_call_owner;
 pub mod gui_exit;
+pub mod provider_kernel_activation;
 pub mod provider_logical_caller;
 pub mod provider_irp_requestor;
 pub mod provider_subject;

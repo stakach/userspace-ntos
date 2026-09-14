@@ -8,6 +8,8 @@ use crate::*;
 mod component_terminal;
 #[path = "component_callback_transfer.rs"]
 mod component_callback_transfer;
+#[path = "kernel_provider_activation.rs"]
+pub(crate) mod kernel_provider_activation;
 #[path = "synchronous_file_retry.rs"]
 mod synchronous_file_retry;
 #[path = "synchronous_file_wait.rs"]
@@ -4462,10 +4464,7 @@ pub(crate) unsafe fn validate_provider_logical_caller(
 /// Service Ps queries issued by the win32k component against the canonical Process Manager.
 /// Stable EPROCESS/ETHREAD projections cross this boundary; mutable Ps state does not.
 pub(crate) unsafe fn service_win32k_ps_request(
-    client_pi: u64,
-    client_generation: u64,
-    logical_caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
-    kernel_caller: Option<nt_process::InitialSystemIdentity>,
+    channel: &spawn_hosts::PumpChannel,
     op: u64,
     object: u64,
     value: u64,
@@ -4473,24 +4472,20 @@ pub(crate) unsafe fn service_win32k_ps_request(
     const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
     const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 
-    if logical_caller.is_some() && kernel_caller.is_some() {
+    let client_pi = channel.client_pi;
+    let client_generation = channel.client_generation;
+    let logical_caller = channel.logical_caller;
+    if logical_caller.is_some() && channel.kernel_caller.is_some() {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+    }
+    if let Some(caller) = channel.kernel_caller {
+        return kernel_provider_activation::service_ps(channel, caller, op, object, value);
     }
     let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if handler_ptr.is_null() {
-        return match kernel_caller {
-            Some(caller) => ps_bootstrap::service_initial_system_request(caller, op, object, value),
-            None => (STATUS_DEVICE_NOT_READY, 0, 0, 0),
-        };
+        return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     }
     let handler = &mut *handler_ptr;
-    if let Some(caller) = kernel_caller {
-        return if handler.pm.validate_initial_system_caller(caller) {
-            provider_ps::dispatch(&mut handler.pm, op, object, value)
-        } else {
-            (STATUS_DEVICE_NOT_READY, 0, 0, 0)
-        };
-    }
     let Ok(pi) = usize::try_from(client_pi) else {
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     };
@@ -4506,6 +4501,19 @@ pub(crate) unsafe fn service_win32k_ps_request(
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     }
     provider_ps::dispatch(&mut handler.pm, op, object, value)
+}
+
+/// Serialized memory-only ownership operation, across the bootstrap-to-live Ps store transfer.
+/// No manager borrow may escape the callback or span IPC/reentrant dispatch.
+unsafe fn with_provider_process_manager<R>(
+    operation: impl FnOnce(&mut nt_process::ProcessManager) -> Result<R, u32>,
+) -> Result<R, u32> {
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if handler.is_null() {
+        ps_bootstrap::with_process_manager(operation)
+    } else {
+        operation(&mut (*handler).pm)
+    }
 }
 
 /// Service `MmSecureVirtualMemory` for the authenticated hosted process generation. The returned

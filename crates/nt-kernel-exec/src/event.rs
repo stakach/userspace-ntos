@@ -46,7 +46,7 @@ pub enum WaitResult {
     Signaled,
     /// Not signaled within the timeout.
     TimedOut,
-    /// Waiting is not permitted at the current IRQL (spec §6.1).
+    /// Polling is not permitted above `DISPATCH_LEVEL`.
     BadIrql,
 }
 
@@ -60,7 +60,7 @@ pub enum WaitManyResult {
     TimedOut,
     /// At least one supplied event identity does not exist.
     InvalidEvent,
-    /// Waiting is not permitted at the current IRQL.
+    /// Polling is not permitted above `DISPATCH_LEVEL`.
     BadIrql,
 }
 
@@ -192,9 +192,10 @@ impl EventStore {
     }
 
     /// Poll `WaitAny`/`WaitAll` over existing event identities and apply NT
-    /// synchronization-event consumption on success.
+    /// synchronization-event consumption on success. This never blocks and is
+    /// permitted through `DISPATCH_LEVEL`.
     pub fn poll_many(&mut self, ptrs: &[u64], wait_all: bool, irql: &IrqlState) -> WaitManyResult {
-        if !irql.can_wait() {
+        if !irql.can_poll() {
             return WaitManyResult::BadIrql;
         }
         if ptrs.is_empty()
@@ -247,11 +248,11 @@ impl EventStore {
     }
 
     /// Attempt a non-blocking wait / poll on the event: if signaled, succeed
-    /// (consuming a Synchronization event); otherwise time out. Waiting above
-    /// `APC_LEVEL` fails (spec §6.1). Blocking waits are the runtime's job — it
-    /// advances the clock / drains work and re-polls.
+    /// (consuming a Synchronization event); otherwise time out. Polling above
+    /// `DISPATCH_LEVEL` fails. A runtime that parks a thread must independently
+    /// check [`IrqlState::can_wait`] before admitting a blocking wait.
     pub fn poll(&mut self, ptr: u64, irql: &IrqlState) -> WaitResult {
-        if !irql.can_wait() {
+        if !irql.can_poll() {
             return WaitResult::BadIrql;
         }
         let e = self.slot(ptr);
@@ -318,12 +319,89 @@ mod tests {
     }
 
     #[test]
-    fn waits_above_apc_rejected() {
-        let mut irql = IrqlState::new();
-        irql.raise(DISPATCH_LEVEL);
-        let mut ev = EventStore::new();
-        ev.initialize(0xE3, EventKind::Notification, true);
-        assert_eq!(ev.poll(0xE3, &irql), WaitResult::BadIrql);
+    fn single_poll_irql_limit_preserves_signal_and_identity_on_rejection() {
+        for level in 0..=u8::MAX {
+            let mut irql = IrqlState::new();
+            irql.raise(level);
+            let mut events = EventStore::new();
+            events.initialize(1, EventKind::Synchronization, true);
+            events.initialize(2, EventKind::Notification, true);
+            if level <= DISPATCH_LEVEL {
+                assert_eq!(events.poll(1, &irql), WaitResult::Signaled);
+                assert_eq!(events.poll(1, &irql), WaitResult::TimedOut);
+                assert_eq!(events.poll(2, &irql), WaitResult::Signaled);
+                assert_eq!(events.poll(2, &irql), WaitResult::Signaled);
+                assert!(!events.read_state(1));
+            } else {
+                assert_eq!(events.poll(1, &irql), WaitResult::BadIrql);
+                assert_eq!(events.poll(2, &irql), WaitResult::BadIrql);
+                assert_eq!(events.poll(99, &irql), WaitResult::BadIrql);
+                assert!(!events.contains(99));
+                assert!(events.read_state(1));
+            }
+            assert!(events.read_state(2));
+            assert_eq!(irql.current(), level);
+        }
+    }
+
+    #[test]
+    fn multi_poll_irql_limit_preserves_wait_any_and_wait_all_atomicity() {
+        for level in 0..=u8::MAX {
+            let mut irql = IrqlState::new();
+            irql.raise(level);
+            let mut events = EventStore::new();
+            events.initialize(1, EventKind::Synchronization, true);
+            events.initialize(2, EventKind::Synchronization, false);
+            events.initialize(3, EventKind::Notification, true);
+            let allowed = level <= DISPATCH_LEVEL;
+            assert_eq!(
+                events.poll_many(&[1, 2, 3], true, &irql),
+                if allowed {
+                    WaitManyResult::TimedOut
+                } else {
+                    WaitManyResult::BadIrql
+                }
+            );
+            assert!(events.read_state(1));
+            assert!(!events.read_state(2));
+            assert!(events.read_state(3));
+            assert_eq!(
+                events.poll_many(&[1, 99], false, &irql),
+                if allowed {
+                    WaitManyResult::InvalidEvent
+                } else {
+                    WaitManyResult::BadIrql
+                }
+            );
+            assert!(events.read_state(1));
+            assert!(!events.contains(99));
+
+            events.set_existing(2);
+            assert_eq!(
+                events.poll_many(&[2, 1, 3], false, &irql),
+                if allowed {
+                    WaitManyResult::Signaled(0)
+                } else {
+                    WaitManyResult::BadIrql
+                }
+            );
+            assert_eq!(events.read_state(2), !allowed);
+            assert!(events.read_state(1));
+            assert!(events.read_state(3));
+            events.set_existing(2);
+            assert_eq!(
+                events.poll_many(&[1, 2, 3], true, &irql),
+                if allowed {
+                    WaitManyResult::Signaled(0)
+                } else {
+                    WaitManyResult::BadIrql
+                }
+            );
+            assert_eq!(events.read_state(1), !allowed);
+            assert_eq!(events.read_state(2), !allowed);
+            assert!(events.read_state(3));
+            assert_eq!(irql.current(), level);
+        }
     }
 
     #[test]

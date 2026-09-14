@@ -34369,6 +34369,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         separate teardown/phase/resume types are gone. No VM, native kernel wait, pending Eng
         execution or desktop acceptance is claimed; the last measured 27 strict win32k imports
         remain open. Review refined the native activation, thread-lifetime and IRQL work below.
+      - [x] Retain canonical kernel provider activations and separate poll IRQL policy
+        (2026-09-14; host/composed/native-build verified below).
+        New focused nt-user-host provider_kernel_activation owns the existing indivisible
+        NativeThreadProcessReference pair, not copied initial-System metadata. Admission binds
+        the original manager-authenticated NativeHandleCaller to the real provider catalog and
+        generation, physical lane binding and shared LaneDispatchIdentity. Checked unique
+        activation IDs fence cross-table and same-epoch release/recapture aliasing. Reserve
+        row storage before acquiring references; failed release retains the exact row and pair.
+        Execution validation rejects parked/completed/replaced jobs and exited callers; cleanup
+        deliberately remains possible after exit, provider retirement or moving the canonical PM.
+        Native DriverEntry now captures this owner after beginning its physical dispatch, before
+        pumping imports. PumpChannel carries typed activation metadata instead of InitialSystemIdentity.
+        Every kernel-originated Ps request checks its exact channel/epoch/provider and retained
+        caller. The completion sentinel finishes the lane and explicitly releases both references;
+        a wall or uncertain completion retains them. Remove the old bootstrap System-only Ps
+        service branch; both bootstrap and live stores use the same validation and decoder without
+        a PM borrow crossing IPC. Keep native ownership code in focused kernel_provider_activation.rs.
+        EventStore polls now permit DISPATCH_LEVEL while blocking can_wait remains limited to
+        APC_LEVEL. Tests cover all byte-valued levels and single/multiple-event consumption,
+        invalid-object atomicity and above-DISPATCH rejection without mutation. Native lane-local
+        IRQL and blocking admission remain separate prerequisites, not proved by these poll tests.
+        Serialized full host run passed 1,292 tests across 17 suites, with no failures or ignored
+        cases, covering nt-user-host, nt-process, nt-kernel-exec, nt-component-suspension and
+        nt-provider-wait. Evidence: .tmp/test-kernel-provider-activation-20260914.log. After review
+        added the activation nonce, all 556 nt-user-host unit tests passed, including the eight
+        new activation cases: .tmp/test-kernel-provider-activation-final-20260914.log. These use
+        production lane, catalog and PM APIs to exercise exact admission, independent lanes,
+        suspend/resume/repark, stale next-job and catalog identities, caller exit, wrong-manager
+        release retry, PM move, cross-table and same-epoch nonce fencing, and counter exhaustion.
+        Together the runs cover 1,295 distinct host tests; no native IPC/parking proof is implied.
+        Both independent reviews found no remaining blocker within this scope. Serialized native
+        release builds pass: executive in 37.20s with the unchanged 294 warnings and standalone
+        I/O Manager in 0.05s without warnings. Evidence:
+        .tmp/build-kernel-provider-activation-executive-20260914.log and
+        .tmp/build-kernel-provider-activation-io-manager-20260914.log. Scoped formatting and diff
+        checks pass; the obsolete InitialSystemIdentity channel field and bootstrap-only Ps
+        service branch are gone. No VM, native kernel wait or desktop acceptance is claimed;
+        the last measured 27 strict win32k imports remain open. Review refined the component
+        activation publication, terminal retirement and durable-allocation prerequisites below.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -34383,15 +34422,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         kind must not authorize blocking from ISR/DPC execution. Do not add a video-only
         suspension variant, infer a caller kind from failed lookup, or manufacture a hosted
         client for a kernel caller.
-        Native audit found DriverEntry already starts a physical lane with PumpChannel.kernel_caller
-        carrying InitialSystemIdentity, but that value owns no canonical thread reference. Acquire
-        the real thread lifetime before parking, publish/capture its activation independently of
+        DriverEntry now retains canonical process/thread references and a root-side lane activation
+        as described above. Publish/capture that exact activation in the component independently of
         callback headers, and preserve a typed kernel return continuation across repark/teardown.
+        Component stack-activation ordinals and DriverEntry's existing u64::MAX local sentinel are
+        not the executive LaneDispatchIdentity; publish an explicit authenticated mapping, never
+        reinterpret one as the other. Native kernel wait admission remains disabled. Complete
+        terminal/cancellation cleanup for retained activation rows after walls/uncertain replies;
+        when provider/catalog retirement is wired, its quiescence checks must include these rows
+        even if the physical lane is idle. There is currently no native catalog retirement caller;
+        do not add an unused alternate teardown path just to invoke the new count observer.
+        Future runtime activation capture must allocate its retained rows in durable storage,
+        outside any rewindable per-turn scratch scope; current DriverEntry capture precedes it.
         Do not relax the current hosted-only event authorization to manufacture process ownership.
         KeGetCurrentIrql is currently patched to constant PASSIVE_LEVEL in win32k_subsystem; replace
-        that with real lane-local IRQL before enabling kernel waits. Existing EventTable polling
-        rejects all IRQL above APC_LEVEL; separately implement the correct DISPATCH_LEVEL zero-time
-        poll versus blocking-wait distinction rather than relying on the constant patch.
+        that with real lane-local IRQL before enabling kernel waits. EventStore now distinguishes
+        DISPATCH_LEVEL zero-time polling from blocking wait policy; wire the native wait adapter
+        to actual activation IRQL rather than relying on the constant patch. Shared driver-host
+        IRQL bytes and win32k's shared KPCR cannot represent multiple independently parked lanes.
       - [ ] Replace the native video IOCTL bridge with authenticated, owned File-less requests.
         Retain the physical win32k caller, exact Device authority, input/output buffers and reply
         continuation before dispatch. Use detached exact-device preparation rather than holding

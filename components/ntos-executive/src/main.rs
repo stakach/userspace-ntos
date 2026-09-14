@@ -30255,7 +30255,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // `RecvFirst`: the component is mid-DriverEntry — a blocked SENDER (fault Call) or about
             // to issue its ready Call — so the pump starts by RECEIVING, exactly as the old loop did.
             let code_va = win32k_subsystem::WIN32K_CODE_VA;
-            let init_ch = spawn_hosts::PumpChannel {
+            let mut init_ch = spawn_hosts::PumpChannel {
                 fault_ep: w_fault,
                 pml4: host_pml4,
                 code_va,
@@ -30273,8 +30273,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 client_pi: 0,
                 client_generation: 0,
                 logical_caller: None,
-                kernel_caller: Some(ps_bootstrap::initial_system_projection()
-                    .expect("DriverEntry requires the canonical initial System objects").identity),
+                kernel_caller: None,
                 // DriverEntry runs before any client exists: no client_attach (its faults are its
                 // OWN pages, zero-filled), no usermode callbacks, no assert-skip — the same set the
                 // bespoke loop implemented inline.
@@ -30317,6 +30316,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 service_sec_image::begin_component_execution_lane(init_lane),
                 "primary win32k initialization dispatch admission failed"
             );
+            let init_caller = service_sec_image::kernel_provider_activation::capture_win32k_initial_system(
+                &init_ch,
+                init_lane,
+                ps_bootstrap::initial_system_projection()
+                    .expect("DriverEntry requires the canonical initial System objects").identity,
+            ).expect("DriverEntry must retain its canonical caller before pumping requests");
+            init_ch.kernel_caller = Some(init_caller);
             let init_pr = spawn_hosts::component_pump(&init_ch);
             let faults = init_pr.faults;
             let demand = init_pr.demand;
@@ -30332,6 +30338,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     service_sec_image::finish_component_execution_lane(init_lane),
                     "primary win32k initialization dispatch completion failed"
                 );
+                service_sec_image::kernel_provider_activation::release_completed(init_caller)
+                    .expect("completed DriverEntry caller references must retire together");
                 WIN32K_FAULT_EP.store(w_fault, Ordering::Relaxed);
                 WIN32K_HOST_PML4.store(host_pml4, Ordering::Relaxed);
                 if !win32k_glue::initialize_win32k_physical_lane(host_pml4) {
