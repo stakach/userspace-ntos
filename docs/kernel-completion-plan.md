@@ -34986,6 +34986,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         that barrier, within BOOT_TIMEOUT_SECONDS=300. The runner exits failure without a guest
         success/Explorer verdict; no QEMU remains. This confirms unchanged early boot progress,
         not execution of the new signaling path, DriverEntry completion or desktop rendering.
+      - [x] Implement bootstrap SET/PULSE only for canonically unobserved Events (2026-09-15).
+        The shared signal_unobserved_provider_event helper reads the retained registry record
+        itself rather than trusting a caller-built diagnostic snapshot. Require the exact live
+        Provider owner/local identity, no projection or deletion, and zero handle/pointer,
+        native/GUI/provider wait, signal, operation and legacy namespace wait references. Refuse
+        existing observers with NOT_SUPPORTED and invalid identity/backing with INVALID_PARAMETER,
+        without changing dispatcher state, references or pending effects. Mutate only an existing
+        EventStore record; do not manufacture missing backing. With no observers and no callout,
+        SET leaves the state true and PULSE leaves it false, returning the real previous state
+        for both Event kinds without publishing a queued pulse or retaining artificial leases.
+        The native facade first validates the live namespace Event and uses its actual legacy
+        wait-reference count. Kernel activation/channel validation still precedes dispatcher
+        access. The bootstrap adapter must be in BootstrapPhase::Owned; a null live-handler
+        pointer alone cannot authorize access after transfer or reconstruct any state. The
+        complete borrow remains memory-only, including during IRQ-yield bootstrap scheduling.
+        Successful transitions use the existing provider/domain/local-identity trace mechanism.
+        Live-handler SET/PULSE continue through full arbitration and operation ownership, never
+        through this no-observer path. Remove the obsolete requires_dispatcher classifier and
+        unconditional bootstrap signaling refusal. Kernel wait admission, timer expiration and
+        observed bootstrap signaling remain disabled until real readiness ownership exists.
+        Nine guard/transition tests cover both kinds and prior states, every reachable observer,
+        queued/delivering/retriggered signals, stale/deleted/foreign identities and missing backing.
+        Two handoff tests preserve exact namespace/Event identities, state and unrelated Timer
+        deadlines/leases through the ownership move; adding a real provider wait then refuses
+        unobserved signaling without losing the wait or ordinary dispatcher consume behavior.
+        Serialized validation passes 1,166 tests across 17 suites with no failures or ignored
+        cases: .tmp/test-bootstrap-event-signal-20260915.log. Executive release passes in 37.96s
+        with unchanged 297 warnings; standalone I/O Manager passes without warnings. Evidence:
+        .tmp/build-bootstrap-event-signal-executive-20260915.log and
+        .tmp/build-bootstrap-event-signal-io-manager-20260915.log. Independent native/phase
+        reviews, scoped formatting and git diff --check pass. The live-handler signal path is
+        unchanged, and no requires_dispatcher consumers remain. Real DriverEntry transport
+        execution is still a proof obligation beyond the strict-import barrier; host transition
+        and handoff tests do not establish native execution or desktop acceptance.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -35017,17 +35051,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         a hosted client and the live ExecNtHandler; DriverEntry precedes that handler. The intact
         bootstrap dispatcher state checkpoint above replaces reconstruction, but early provider
         memory-local Event operations now use the authenticated route above. Live-handler SET/PULSE
-        use the shared exact-one arbitration checkpoint above; early signaling and timers still
-        need pre-loop readiness/deadline ownership. Process handles/projected pointers must keep
-        their distinct authority. Bootstrap has no native waiter scheduler: keep signaling refused
-        until its genuine no-waiter invariant or complete early wake ownership is established.
-        Review identifies a bounded next slice: kernel rendezvous currently rejects a kernel
-        owner before publishing a wait request, while native/GUI wait publication requires the
-        live handler. Validate bootstrap signaling against the exact Provider-local Event,
-        live namespace backing, no deletion and zero wait/signal/operation/handle/pointer
-        references, including legacy namespace wait_references. Only then can an exclusive
-        bootstrap-state borrow perform real no-waiter SET or PULSE; reject mismatches before
-        mutation. A null live-handler pointer alone is not evidence of absent observers.
+        use shared exact-one arbitration; bootstrap SET/PULSE now validate the canonical
+        no-observer invariant as above. Observed early signaling and timers still need pre-loop
+        readiness/deadline ownership. Process handles/projected pointers keep distinct authority.
+        Kernel rendezvous still rejects a kernel owner before publishing a wait request, while
+        native/GUI wait publication requires the live handler. Preserve those admission guards
+        until the complete ownership and wake/resume mechanisms below are implemented.
         Subsequent real kernel waits must use the existing ProviderDispatcherWaitArbiter over
         the same bootstrap stores, publish the typed kernel continuation and exact dispatcher
         leases, and retain Reply/shared-bank authority before queue progress. Do not simply

@@ -2,8 +2,8 @@ use super::*;
 use alloc::vec::Vec;
 use nt_component_suspension::{LaneHandle, SuspensionCaller, SuspensionOwner};
 use nt_kernel_exec::{
-    EventKind, EventLeaseKind, EventObjectError, EventObjectId, EventObjectOwner,
-    SignalQueueResult, TimeSnapshot,
+    signal_unobserved_provider_event, EventKind, EventLeaseKind, EventObjectError, EventObjectId,
+    EventObjectOwner, EventSignalMode, SignalQueueResult, TimeSnapshot, UnobservedEventSignalError,
 };
 use nt_provider_wait::{ProviderDomainIdentity, ProviderTimerError, ProviderTimerKind};
 
@@ -465,4 +465,169 @@ fn provider_timer_delete_and_retirement_tickets_survive_move_without_early_reuse
         timers.ack_retirement(retirement),
         Err(ProviderTimerError::StaleIdentity)
     );
+}
+
+#[test]
+fn unobserved_event_signals_move_with_namespace_and_leave_timer_ownership_intact() {
+    for kind in [EventKind::Notification, EventKind::Synchronization] {
+        for mode in [EventSignalMode::Set, EventSignalMode::Pulse] {
+            for previous in [false, true] {
+                let mut source = OwnedDispatcher::new();
+                let native = source.backing("bootstrap-event", kind, previous);
+                let id = source
+                    .state
+                    .event_objects
+                    .create_provider_local(PROVIDER, 41, native)
+                    .unwrap();
+                let snapshot = source.state.event_objects.snapshot(id).unwrap();
+                let mut timers = ProviderTimerTable::new(ProviderDomainIdentity {
+                    domain: 7,
+                    generation: 3,
+                })
+                .unwrap();
+                let timer = timers
+                    .publish(51, ProviderTimerKind::Synchronization)
+                    .unwrap();
+                let timer_lease = timers
+                    .acquire_wait(timer_owner(), timer.wait_object())
+                    .unwrap();
+                timers.set_local(51, -100, 0, now(10)).unwrap();
+                source.state.provider_timers = Some(timers);
+                let next_native = source.next_native;
+                let current = mode == EventSignalMode::Set;
+
+                assert_eq!(
+                    signal_unobserved_provider_event(
+                        &source.state.event_objects,
+                        &mut source.state.events,
+                        id,
+                        PROVIDER,
+                        41,
+                        0,
+                        mode,
+                    ),
+                    Ok((previous, current))
+                );
+                assert_eq!(source.state.event_objects.snapshot(id), Ok(snapshot));
+                assert_eq!(source.state.event_objects.live_lease_count(), 0);
+                assert_eq!(source.state.event_objects.queued_signal_count(), 0);
+                assert_eq!(
+                    source.state.events.query_existing(native),
+                    Some((kind, current))
+                );
+
+                let mut live = handoff(source);
+                assert_eq!(live.namespace.as_slice(), &[(native, "bootstrap-event")]);
+                assert_eq!(live.next_native, next_native);
+                assert_eq!(live.state.event_objects.id_for_native(native), Some(id));
+                assert_eq!(
+                    live.state.event_objects.id_for_provider_local(PROVIDER, 41),
+                    Some(id)
+                );
+                assert_eq!(live.state.event_objects.snapshot(id), Ok(snapshot));
+                assert_eq!(live.state.event_objects.live_lease_count(), 0);
+                assert_eq!(live.state.event_objects.queued_signal_count(), 0);
+                assert_eq!(
+                    live.state.events.query_existing(native),
+                    Some((kind, current))
+                );
+                let timers = live.state.provider_timers.as_mut().unwrap();
+                assert_eq!(timers.id_for_local(51), Some(timer));
+                assert_eq!(timers.next_deadline(now(10)), Some(110));
+                assert!(!timers.is_ready(timer_lease).unwrap());
+                assert_eq!(timers.expire_next_due(now(109)), None);
+                assert_eq!(timers.expire_next_due(now(110)).unwrap().id, timer);
+                assert!(timers.is_ready(timer_lease).unwrap());
+                assert_eq!(timers.release_wait(timer_lease), Ok(None));
+                assert_eq!(live.backing("after-handoff", kind, false), next_native);
+            }
+        }
+    }
+}
+
+#[test]
+fn moved_event_with_real_provider_wait_refuses_unobserved_signal_without_losing_state() {
+    for kind in [EventKind::Notification, EventKind::Synchronization] {
+        for bootstrap_mode in [EventSignalMode::Set, EventSignalMode::Pulse] {
+            let mut source = OwnedDispatcher::new();
+            let native = source.backing("bootstrap-event", kind, false);
+            let id = source
+                .state
+                .event_objects
+                .create_provider_local(PROVIDER, 41, native)
+                .unwrap();
+            let current = bootstrap_mode == EventSignalMode::Set;
+            assert_eq!(
+                signal_unobserved_provider_event(
+                    &source.state.event_objects,
+                    &mut source.state.events,
+                    id,
+                    PROVIDER,
+                    41,
+                    0,
+                    bootstrap_mode,
+                ),
+                Ok((false, current))
+            );
+            let mut live = handoff(source);
+            let lease = live
+                .state
+                .event_objects
+                .acquire_provider_local_wait(id, PROVIDER)
+                .unwrap();
+            let snapshot = live.state.event_objects.snapshot(id).unwrap();
+
+            for mode in [EventSignalMode::Set, EventSignalMode::Pulse] {
+                assert_eq!(
+                    signal_unobserved_provider_event(
+                        &live.state.event_objects,
+                        &mut live.state.events,
+                        id,
+                        PROVIDER,
+                        41,
+                        0,
+                        mode,
+                    ),
+                    Err(UnobservedEventSignalError::Observed)
+                );
+                assert_eq!(live.state.event_objects.snapshot(id), Ok(snapshot));
+                assert_eq!(live.state.event_objects.live_lease_count(), 1);
+                assert_eq!(live.state.event_objects.queued_signal_count(), 0);
+                assert_eq!(
+                    live.state
+                        .event_objects
+                        .event_for_lease(lease, EventLeaseKind::ProviderWait),
+                    Ok(id)
+                );
+                assert_eq!(
+                    live.state.events.query_existing(native),
+                    Some((kind, current))
+                );
+                assert_eq!(live.namespace.as_slice(), &[(native, "bootstrap-event")]);
+                assert!(live.state.provider_timers.is_none());
+            }
+
+            assert_eq!(live.state.events.set_existing(native), Some(current));
+            assert!(live.state.events.consume_existing(native));
+            assert_eq!(
+                live.state.events.query_existing(native),
+                Some((kind, kind == EventKind::Notification))
+            );
+            assert_eq!(
+                live.state
+                    .event_objects
+                    .release_wait(lease, EventLeaseKind::ProviderWait),
+                Ok(None)
+            );
+            assert_eq!(live.state.event_objects.live_lease_count(), 0);
+            assert_eq!(
+                live.state
+                    .event_objects
+                    .snapshot(id)
+                    .unwrap()
+                    .native_identity,
+                native
+            );
+        }
+    }
 }

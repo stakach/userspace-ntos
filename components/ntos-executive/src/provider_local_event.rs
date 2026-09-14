@@ -117,6 +117,42 @@ impl<'a> LocalEventState<'a> {
             .ok_or(INVALID_PARAMETER)
     }
 
+    /// Bootstrap owns this borrow exclusively; no callout may admit observers before mutation.
+    pub(crate) fn signal_unobserved(
+        &mut self,
+        provider: ProviderDomainIdentity,
+        local: u64,
+        mode: nt_kernel_exec::EventSignalMode,
+    ) -> Result<(bool, bool), u32> {
+        let owner = Self::owner(provider, local)?;
+        let (id, index, _, _) = self.identity(provider, local)?;
+        let result = nt_kernel_exec::signal_unobserved_provider_event(
+            self.event_objects,
+            self.events,
+            id,
+            owner,
+            local,
+            self.obj_ns[index].wait_references,
+            mode,
+        )
+        .map_err(|error| match error {
+            nt_kernel_exec::UnobservedEventSignalError::Observed => 0xC000_00BB,
+            nt_kernel_exec::UnobservedEventSignalError::InvalidIdentity
+            | nt_kernel_exec::UnobservedEventSignalError::InvalidBacking => INVALID_PARAMETER,
+        })?;
+        trace(
+            match mode {
+                nt_kernel_exec::EventSignalMode::Set => b"set-unobserved",
+                nt_kernel_exec::EventSignalMode::Pulse => b"pulse-unobserved",
+            },
+            provider,
+            local,
+            Some(id),
+            index as u64,
+        );
+        Ok(result)
+    }
+
     pub(crate) fn clear(
         &mut self,
         provider: ProviderDomainIdentity,

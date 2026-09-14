@@ -60,7 +60,10 @@ pub use dispatcher_wait::{
     DispatcherWaitResult, DispatcherWaitSource, DispatcherWaitTimeout,
 };
 pub use dpc::{DpcImportance, DpcQueue};
-pub use event_signal::{select_event_signal, EventSignalMode, EventSignalSelector};
+pub use event_signal::{
+    select_event_signal, signal_unobserved_provider_event, EventSignalMode, EventSignalSelector,
+    UnobservedEventSignalError,
+};
 pub use driver_thread::{
     HostedDispatcherCompletion, HostedDispatcherWaitAdmission, HostedDispatcherWaitError,
     HostedDispatcherWaitQueue, HostedDispatcherWaiter, HostedDispatcherWake, HostedDriverThread,

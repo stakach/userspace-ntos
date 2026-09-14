@@ -38,7 +38,15 @@ fn execute(
             state.ack(provider, local, id)?;
             (0, 0, 0, 0)
         }
-        LocalEventRequest::Set { .. } | LocalEventRequest::Pulse { .. } => return Err(0xC000_00BB),
+        LocalEventRequest::Set { local } | LocalEventRequest::Pulse { local } => {
+            let mode = if matches!(request, LocalEventRequest::Set { .. }) {
+                nt_kernel_exec::EventSignalMode::Set
+            } else {
+                nt_kernel_exec::EventSignalMode::Pulse
+            };
+            let (previous, current) = state.signal_unobserved(provider, local, mode)?;
+            (0, u64::from(previous), u64::from(current), 0)
+        }
     })
 }
 
@@ -76,9 +84,6 @@ pub(super) unsafe fn dispatch(
         );
         execute(&mut state, provider, request)
     } else {
-        if request.requires_dispatcher() {
-            return Err(0xC000_00BB);
-        }
         dispatcher_bootstrap::with_local_events(|state| execute(state, provider, request))
     }
 }

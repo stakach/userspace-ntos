@@ -46,11 +46,6 @@ pub enum LocalEventRequest {
 }
 
 impl LocalEventRequest {
-    /// Wake operations require the live dispatcher, not merely bootstrap object storage.
-    pub const fn requires_dispatcher(self) -> bool {
-        matches!(self, Self::Set { .. } | Self::Pulse { .. })
-    }
-
     /// Timers require deadline ownership; process handles require other authority. Refuse those
     /// operations rather than routing them through a fabricated hosted client.
     pub fn decode(op: u64, local: u64, arg2: u64, arg3: u64) -> Result<Self, u32> {

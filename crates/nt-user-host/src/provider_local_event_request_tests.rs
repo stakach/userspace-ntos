@@ -136,21 +136,3 @@ fn process_handle_timer_and_unknown_operations_have_no_fake_local_semantics() {
         );
     }
 }
-
-#[test]
-fn signaling_requires_live_dispatcher_but_memory_local_operations_do_not() {
-    for op in [
-        PUBLISH,
-        RETIRE,
-        ACK_RETIREMENT,
-        SET,
-        RESET,
-        CLEAR,
-        PULSE,
-        READ,
-    ] {
-        let (a, b) = if op == ACK_RETIREMENT { (1, 1) } else { (0, 0) };
-        let request = LocalEventRequest::decode(op, 41, a, b).unwrap();
-        assert_eq!(request.requires_dispatcher(), matches!(op, SET | PULSE));
-    }
-}
