@@ -20,6 +20,8 @@ pub struct ExternalFileIrpIntent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExternalFileIrpOutputCapture {
     Information,
+    /// Ordinary IOCTL completion: status-gated buffered output or full direct/neither writeback.
+    DeviceControl,
     BufferedDeviceControlCapacity,
 }
 impl ExternalFileIrpOutputCapture {
@@ -34,6 +36,26 @@ impl ExternalFileIrpOutputCapture {
                 completion.information,
                 capacity as u64,
             ) as usize),
+            Self::DeviceControl => {
+                if !matches!(
+                    owner.projection.major,
+                    major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                ) {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+                let code = match &owner.projection.parameters {
+                    IoParameters::DeviceControl(p) | IoParameters::InternalDeviceControl(p) => {
+                        p.ioctl_code
+                    }
+                    _ => return Err(NtStatus::INVALID_PARAMETER),
+                };
+                Ok(crate::device_control::device_control_output_len(
+                    nt_io_abi::ioctl::method(code),
+                    completion.status,
+                    completion.information,
+                    capacity as u64,
+                ) as usize)
+            }
             Self::BufferedDeviceControlCapacity => {
                 if !matches!(
                     owner.projection.major,

@@ -427,6 +427,52 @@ impl<P: ObjectManagerPort> IoManager<P> {
             output_capacity as u64,
         ))
         .map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        self.copy_completed_output_range(irp_id, driver_id, transfer_len, offset, output)
+    }
+
+    /// Copy terminal IOCTL output using its transfer method and status, without acknowledging it.
+    /// Buffered errors (and VERIFY_REQUIRED) do not copy; warnings may carry Information bytes.
+    /// Direct/neither writes cover the retained caller buffer independently of Information. The
+    /// backend must retain that complete buffer, including unchanged bytes, until acknowledgement.
+    pub fn copy_completed_device_control_output(
+        &mut self,
+        irp_id: IrpId,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<usize, NtStatus> {
+        let irp = self.irp(irp_id).ok_or(NtStatus::INVALID_PARAMETER)?;
+        if irp.detached_file_owner {
+            return Err(NtStatus::DELETE_PENDING);
+        }
+        if irp.state != IrpState::Completed
+            || !matches!(
+                irp.origin_major,
+                major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+            )
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let stack = irp.current_stack().ok_or(NtStatus::INVALID_PARAMETER)?;
+        let method = irp.device_control_method.ok_or(NtStatus::INVALID_PARAMETER)?;
+        let length = crate::device_control::device_control_output_len(
+            method,
+            irp.status,
+            irp.information,
+            irp.buffer.map_or(0, |buffer| u64::from(buffer.output_len)),
+        );
+        let driver_id = stack.driver_id;
+        let length = usize::try_from(length).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        self.copy_completed_output_range(irp_id, driver_id, length, offset, output)
+    }
+
+    fn copy_completed_output_range(
+        &mut self,
+        irp_id: IrpId,
+        driver_id: DriverId,
+        transfer_len: usize,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<usize, NtStatus> {
         let offset = usize::try_from(offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
         if offset > transfer_len {
             return Err(NtStatus::INVALID_PARAMETER);
@@ -477,13 +523,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
             let stack = irp.current_stack().ok_or(NtStatus::INVALID_PARAMETER)?;
-            let method = match &stack.parameters {
-                crate::irp::IoParameters::DeviceControl(parameters)
-                | crate::irp::IoParameters::InternalDeviceControl(parameters) => {
-                    nt_io_abi::ioctl::method(parameters.ioctl_code)
-                }
-                _ => return Err(NtStatus::INVALID_PARAMETER),
-            };
+            let method = irp.device_control_method.ok_or(NtStatus::INVALID_PARAMETER)?;
             if method != nt_io_abi::ioctl::METHOD_BUFFERED {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
@@ -494,28 +534,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                     .unwrap_or(0),
             )
         };
-        let offset = usize::try_from(offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
-        if offset > output_capacity {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-        let copy_capacity = output.len().min(output_capacity - offset);
-        if copy_capacity == 0 {
-            return Ok(0);
-        }
-        let backend_index = self
-            .driver(driver_id)
-            .map(|driver| driver.backend.0 as usize)
-            .filter(|index| *index < self.backends.len())
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        let copied = self.backends[backend_index].copy_completion_output(
-            irp_id,
-            offset as u64,
-            &mut output[..copy_capacity],
-        )?;
-        if copied > copy_capacity {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-        Ok(copied)
+        self.copy_completed_output_range(irp_id, driver_id, output_capacity, offset, output)
     }
 
     /// Copy the retained request-owned payload of a completed in/out PnP request. Unlike ordinary

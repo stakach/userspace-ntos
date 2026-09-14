@@ -29,6 +29,27 @@ fn ioctl_required_access(code: u32) -> AccessMask {
     req
 }
 
+/// Buffered completion follows NT_ERROR, not NT_SUCCESS: warnings can carry output. Direct and
+/// neither buffers model caller memory, whose writes are independent of IoStatus.Information.
+pub(crate) fn device_control_output_len(
+    method: u32,
+    status: NtStatus,
+    information: u64,
+    capacity: u64,
+) -> u64 {
+    if method == ioctl::METHOD_BUFFERED {
+        const STATUS_VERIFY_REQUIRED: u32 = 0x8000_0016;
+        let raw = status.raw() as u32;
+        if raw >> 30 == 3 || raw == STATUS_VERIFY_REQUIRED {
+            0
+        } else {
+            information.min(capacity)
+        }
+    } else {
+        capacity
+    }
+}
+
 impl<P: ObjectManagerPort> IoManager<P> {
     /// Buffered device control (`IRP_MJ_DEVICE_CONTROL`, spec §17.4). Returns the
     /// number of output bytes produced.
@@ -83,6 +104,44 @@ impl<P: ObjectManagerPort> IoManager<P> {
         output: &mut [u8],
     ) -> Result<ExternalDispatchResult, NtStatus> {
         self.ioctl_device(client, device_id, ioctl_code, input, output, true)
+    }
+
+    /// Build a File-less control for the exact supplied Device object, without entering devices
+    /// attached above it. This models `IoBuildDeviceIoControlRequest` followed by
+    /// `IoCallDriver(DeviceObject, Irp)` when the caller already holds Device-object authority.
+    ///
+    /// Buffered completion copies at most `min(Information, output.len())` bytes for non-error
+    /// statuses other than VERIFY_REQUIRED. Direct/neither buffer writes are preserved regardless
+    /// of status or Information. The raw status and Information are returned unchanged.
+    /// Pending requests retain an IRP id; the caller must wait for terminal completion, copy with
+    /// [`IoManager::copy_completed_device_control_output`], and acknowledge only after consuming
+    /// the result. Captured direct/neither buffers do not expose original caller addresses.
+    pub fn device_control_exact_device(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        ioctl_code: u32,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<ExternalDispatchResult, NtStatus> {
+        self.ioctl_target(
+            client, device_id, None, ioctl_code, input, output, false, false, true,
+        )
+    }
+
+    /// File-less internal control for the exact supplied Device object. See
+    /// [`IoManager::device_control_exact_device`] for target and completion ownership semantics.
+    pub fn internal_device_control_exact_device(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        ioctl_code: u32,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<ExternalDispatchResult, NtStatus> {
+        self.ioctl_target(
+            client, device_id, None, ioctl_code, input, output, true, false, true,
+        )
     }
 
     fn ioctl(
@@ -211,11 +270,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
             }
             ioctl::METHOD_OUT_DIRECT => {
                 sysbuf.extend_from_slice(input);
-                direct.resize(output.len(), 0);
+                direct.extend_from_slice(output);
             }
             ioctl::METHOD_NEITHER => {
                 type3.extend_from_slice(input);
-                user.resize(output.len(), 0);
+                user.extend_from_slice(output);
             }
             _ => unreachable!("CTL_CODE method is two bits"),
         }
@@ -270,12 +329,17 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 user_buffer,
             )?
         };
-        if let ExternalDispatchResult::Completed { information, .. } = completion {
+        if let ExternalDispatchResult::Completed {
+            status,
+            information,
+            ..
+        } = completion
+        {
             let n = if copy_full_buffered_output {
                 debug_assert_eq!(method, ioctl::METHOD_BUFFERED);
                 output.len()
             } else {
-                (information as usize).min(output.len())
+                device_control_output_len(method, status, information, output.len() as u64) as usize
             };
             match method {
                 ioctl::METHOD_BUFFERED => output[..n].copy_from_slice(&sysbuf[..n]),

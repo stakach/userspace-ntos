@@ -9,6 +9,7 @@ use core::cell::RefCell;
 use nt_types::{AccessMask, HandleValue, NtPath, UnicodeString};
 
 mod device_object_target_tests;
+mod exact_device_control_tests;
 mod open_case_tests;
 mod operations_tests;
 mod relative_root_tests;

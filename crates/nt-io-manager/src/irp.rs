@@ -537,6 +537,8 @@ pub struct IrpRecord {
     pub(crate) create_case_sensitive: bool,
     /// Original canonical File options, independent of a filter's current CREATE stack.
     pub(crate) file_create_options: u32,
+    /// Transfer method captured at admission, independent of a lower driver's stack parameters.
+    pub(crate) device_control_method: Option<u32>,
     pub state: IrpState,
     pub status: NtStatus,
     pub information: u64,
@@ -577,6 +579,7 @@ impl IrpRecord {
             origin_minor: 0,
             create_case_sensitive: false,
             file_create_options: 0,
+            device_control_method: None,
             state: IrpState::Allocated,
             status: NtStatus::PENDING,
             information: 0,

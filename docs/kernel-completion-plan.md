@@ -34179,6 +34179,58 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Scoped formatting and diff checks pass. No VM, native registration execution or desktop
         acceptance is claimed; the last measured 27 strict win32k imports remain open. Review
         split per-call pointer ownership and native body synchronization into the next two items.
+      - [x] Provide exact-device, File-less IOCTL preparation and completion capture
+        (2026-09-14; host/composed/native-build verified below).
+        EngDeviceIoControl calls the supplied Device object, not a newly resolved stack top.
+        Add exact-device ordinary/internal control entry points and an owned detached preparation
+        entry point that admits only File-less controls. Preserve the existing top-of-stack APIs
+        for callers that require them. Reuse canonical IRP, Device topology, separate buffers,
+        pending completion, immutable copy and strict ACK ownership; do not introduce another
+        request registry. Normal buffered completion uses NT_ERROR severity, allowing warnings
+        but excluding VERIFY_REQUIRED; direct/neither captured writes cover the whole seeded
+        buffer independently of Information. Keep explicit full-buffer structured-payload APIs
+        separate. This core prerequisite does not claim native buffer mapping or video execution.
+        Review found that completion must not derive its transfer method from a lower driver's
+        mutable stack parameters. Capture the original method at canonical IRP admission and use
+        it for both ordinary pending output and the explicit buffered-payload helper; the current
+        driver remains the authenticated retained-output source. Forwarding regressions exercise
+        genuine canonical handoff with changed lower control codes. The owned capture policy uses
+        the immutable original projection and retains the existing copy/ACK state machine.
+        All 855 tests in the full I/O Manager suite pass across 32 suites without failures or
+        ignored cases: 717 library, 123 integration and 15 documentation tests, with object-manager
+        enabled. Three new owned-request tests and seven integration tests exercise all four
+        transfer methods, external/internal control majors, exact lower/middle routing versus
+        ordinary top routing, no File/open/access side effects, warnings/errors/VERIFY_REQUIRED,
+        zero and oversized Information, seeded untouched tails, pending copy/ACK retries,
+        forwarding method changes and retained Device topology. Evidence:
+        .tmp/test-exact-device-control-full-20260914.log. Independent final review confirms the
+        original-method capture resolves the forwarding issue and found no further production
+        blocker in this bounded core scope. Serialized native release builds pass: executive in
+        37.77s with the unchanged 294 warnings, and standalone I/O Manager in 2.46s without warnings.
+        Evidence: .tmp/build-exact-device-control-executive-20260914.log and
+        .tmp/build-exact-device-control-io-manager-20260914.log. Scoped formatting and diff checks
+        pass. No VM, native pending-video execution or desktop acceptance is claimed; the last
+        measured 27 strict win32k imports remain open. Review refined the native conversion below
+        around real IRP/status lifetime, not a new VideoPort completion API.
+      - [ ] Replace the native video IOCTL bridge with authenticated, owned File-less requests.
+        Retain the physical win32k caller, exact Device authority, input/output buffers and reply
+        continuation before dispatch. Use detached exact-device preparation rather than holding
+        a mutable I/O Manager borrow across hosted driver execution. Preserve the canonical IRP
+        identity through the video intercept, replacing its current zero transfer id. Retain the
+        native IRP/status/output owner: NT5 drivers/video/ms/port/videoprt.c:1769 uses a transient
+        VRP wrapper pointing to the real IRP's persistent IoStatus; it does not justify our current
+        stack-local status and unconditional buffer free. hosted_video_dispatch currently rejects
+        pending requests as indeterminate because that owner is absent. Reuse PendingIrp and
+        detached completion ownership, and establish a genuine completion source for each async
+        port operation; do not invent a SCSI-style VideoPortNotification/RequestComplete API.
+        Copy the singleton win32k scratch window before entry and restore only the authenticated
+        lane/dispatch's owned output. Serialize HwStartIO per Device (NT5 videoprt.c:503), not
+        globally across independent adapters. Preserve pending IRP/caller state
+        through actual completion and strict ACK, including uncertainty, cancellation and caller
+        exit. Remove the route-File control wrapper after conversion, and retain raw status and
+        Information through Eng's Win32 error translation (including BUFFER_OVERFLOW/MORE_DATA).
+        Direct/neither capture must preserve caller writeback and pointer contracts; host vector
+        tests do not prove native MDL permissions, original addresses, mapping or copyback.
       - [ ] Replace legacy video pointer acquisition with authenticated per-call File ownership.
         NT5 base/ntos/io/iomgr/iosubs.c:7393 and ReactOS ntoskrnl/io/iomgr/device.c:264 open a NEW
         File for each IoGetDeviceObjectPointer call with caller DesiredAccess, no sharing,
@@ -34188,7 +34240,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         still does not implement that contract. Replace it, including IoFileObjectType validation,
         with an authenticated physical-channel broker, per-open consumer bodies, and queued
         concurrent reference operations rather than treating the legacy guard as completion.
-        First separate EngDeviceIoControl from the permanent File handle: ReactOS
+        After the native IOCTL conversion above, remove the permanent route File handle: ReactOS
         win32ss/gdi/eng/device.c:994 builds a Device-targeted, file-less request. Route publication
         should own Device/Driver projections and metadata, not a shared open. Retain pending CREATE
         continuations and exact namespace-case semantics; IoManager::open currently supports only

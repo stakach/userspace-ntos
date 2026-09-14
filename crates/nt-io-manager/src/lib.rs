@@ -1274,6 +1274,13 @@ impl<P> IoManager<P> {
         {
             record.create_case_sensitive = parameters.opened_case_sensitive;
         }
+        record.device_control_method = match record.current_stack().map(|stack| &stack.parameters) {
+            Some(IoParameters::DeviceControl(parameters))
+            | Some(IoParameters::InternalDeviceControl(parameters)) => {
+                Some(nt_io_abi::ioctl::method(parameters.ioctl_code))
+            }
+            _ => None,
+        };
         let id = self.irps.insert(record);
         self.irps.get_mut(id).expect("just inserted").id = id;
         Ok(id)

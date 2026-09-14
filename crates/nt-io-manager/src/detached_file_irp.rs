@@ -409,8 +409,41 @@ impl<P: ObjectManagerPort> IoManager<P> {
     /// lifetime, not the caller's authority; fresh user handles must be resolved separately.
     pub fn prepare_external_file_irp_owned(
         &mut self,
+        request: ExternalFileIrpRequest,
+        buffers: ExternalFileIrpBuffers,
+    ) -> Result<PreparedExternalFileIrp, NtStatus> {
+        self.prepare_external_file_irp_owned_with_start(request, buffers, false)
+    }
+
+    /// Prepare a File-less kernel IOCTL starting at the exact authenticated Device object,
+    /// matching `IoCallDriver(DeviceObject, Irp)` rather than entering attached devices above it.
+    /// The caller owns Device authority; dispatch, copy, and ACK retain the ordinary detached
+    /// manager-bound owners and must execute outside a manager borrow.
+    pub fn prepare_external_device_control_irp_owned_at_device(
+        &mut self,
+        request: ExternalFileIrpRequest,
+        buffers: ExternalFileIrpBuffers,
+    ) -> Result<PreparedExternalFileIrp, NtStatus> {
+        if request.file_id.is_some()
+            || !matches!(
+                (&request.parameters, request.major),
+                (IoParameters::DeviceControl(_), major::IRP_MJ_DEVICE_CONTROL)
+                    | (
+                        IoParameters::InternalDeviceControl(_),
+                        major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                    )
+            )
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.prepare_external_file_irp_owned_with_start(request, buffers, true)
+    }
+
+    fn prepare_external_file_irp_owned_with_start(
+        &mut self,
         mut request: ExternalFileIrpRequest,
         buffers: ExternalFileIrpBuffers,
+        exact_device: bool,
     ) -> Result<PreparedExternalFileIrp, NtStatus> {
         let (input, output, total) = validate_buffers(&request, &buffers)?;
         let device = self
@@ -432,14 +465,24 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 request.user_data = file.driver_context.unwrap_or(0);
             }
         }
-        let mut record = self.build_irp_record(
-            request.client,
-            origin_driver,
-            request.device_id,
-            request.file_id,
-            request.major,
-            request.parameters,
-        )?;
+        let mut record = if exact_device {
+            self.build_irp_record_at_device(
+                request.client,
+                request.device_id,
+                request.file_id,
+                request.major,
+                request.parameters,
+            )?
+        } else {
+            self.build_irp_record(
+                request.client,
+                origin_driver,
+                request.device_id,
+                request.file_id,
+                request.major,
+                request.parameters,
+            )?
+        };
         for stack in &mut record.stack {
             stack.flags = request.stack_flags;
         }
