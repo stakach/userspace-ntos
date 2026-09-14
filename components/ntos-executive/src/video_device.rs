@@ -10,9 +10,8 @@ use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut, read_unaligned, write_unaligned};
 
 use nt_io_manager::{
-    write_wdm_file_object, write_wdm_open_device_projection, WdmFileObjectInit,
-    WdmOpenDeviceProjectionInit, WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_SIZE,
-    WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE,
+    write_wdm_device_object, write_wdm_driver_object, WdmDeviceObjectInit, WdmDriverObjectInit,
+    WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE,
 };
 use nt_status::NtStatus;
 use nt_video_miniport::{
@@ -26,6 +25,15 @@ const STATUS_ACCESS_VIOLATION: i32 = 0xC000_0005u32 as i32;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const REG_SZ: u32 = 1;
 const REG_DWORD: u32 = 4;
+
+#[path = "video_projection_owners.rs"]
+mod video_projection_owners;
+#[path = "video_projection_retirements.rs"]
+mod video_projection_retirements;
+pub(crate) use video_projection_retirements::{
+    deadline as video_file_retirement_deadline, drain as drain_video_file_retirements,
+    wake_due as video_file_retirement_wake_due,
+};
 
 pub(crate) struct HostedVideoDeviceRegistration<'a> {
     pub(crate) device_id: u64,
@@ -72,7 +80,7 @@ impl VideoRegistrationMetadata {
 struct VideoProjectionObjects {
     driver: u64,
     device: u64,
-    file: u64,
+    initialized: bool,
 }
 
 impl VideoProjectionObjects {
@@ -80,17 +88,19 @@ impl VideoProjectionObjects {
         Self {
             driver: 0,
             device: 0,
-            file: 0,
+            initialized: false,
         }
     }
 
     fn ready(&self) -> bool {
-        self.driver != 0 && self.device != 0 && self.file != 0
+        self.initialized && self.driver != 0 && self.device != 0
     }
 }
 
 #[derive(Clone, Copy)]
 struct VideoIoRoute {
+    owner_id: u64,
+    file_projection: u64,
     driver_id: u64,
     device_id: u64,
     device_object_id: u64,
@@ -103,6 +113,8 @@ struct VideoIoRoute {
 impl VideoIoRoute {
     const fn empty() -> Self {
         Self {
+            owner_id: 0,
+            file_projection: 0,
             driver_id: 0,
             device_id: 0,
             device_object_id: 0,
@@ -114,7 +126,9 @@ impl VideoIoRoute {
     }
 
     fn ready(&self) -> bool {
-        self.driver_id != 0
+        self.owner_id != 0
+            && self.file_projection != 0
+            && self.driver_id != 0
             && self.device_id != 0
             && self.device_object_id != 0
             && self.file_handle != 0
@@ -180,14 +194,50 @@ impl VideoBridgeState {
 }
 
 static mut VIDEO_STATE: VideoBridgeState = VideoBridgeState::empty();
-static mut VIDEO_FILE_REFERENCES:
-    nt_object_manager::win32k_ob::ExternalReferenceTokenLedger =
+static VIDEO_PUBLICATION_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static mut VIDEO_FILE_REFERENCES: nt_object_manager::win32k_ob::ExternalReferenceTokenLedger =
     nt_object_manager::win32k_ob::ExternalReferenceTokenLedger::new();
+
+struct PublicationGuard;
+
+impl PublicationGuard {
+    fn enter() -> Option<Self> {
+        VIDEO_PUBLICATION_ACTIVE
+            .compare_exchange(
+                false,
+                true,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for PublicationGuard {
+    fn drop(&mut self) {
+        VIDEO_PUBLICATION_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+pub(crate) unsafe fn video_file_owners_quiesced() -> bool {
+    !VIDEO_PUBLICATION_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
+        && !video_projection_owners::has_owners()
+}
+
+pub(crate) unsafe fn video_file_retirement_pending() -> u64 {
+    video_projection_owners::pending_count()
+}
 
 #[inline(never)]
 pub(crate) unsafe fn publish_hosted_video_device_route(
     reg: &HostedVideoDeviceRegistration<'_>,
 ) -> bool {
+    let Some(_publication) = PublicationGuard::enter() else {
+        print_hosted_video_publish_failure(b"publication-busy", None);
+        return false;
+    };
     if !(*addr_of!(VIDEO_FILE_REFERENCES)).is_empty() {
         print_hosted_video_publish_failure(b"route-busy", None);
         return false;
@@ -217,26 +267,54 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         print_hosted_video_publish_failure(b"metadata", None);
         return false;
     };
-    let (file_handle, file_id, file_object_id) =
-        match open_video_device_route(route_info.device_id, metadata) {
+    let owner_id = match video_projection_owners::reserve() {
+        Ok(owner) => owner,
+        Err(status) => {
+            print_hosted_video_publish_failure(b"file-owner", Some(status));
+            return false;
+        }
+    };
+    let (file_handle, file_id, opened_device, file_object_id) =
+        match open_video_device_route(metadata) {
             Ok(route) => route,
             Err(status) => {
+                video_projection_owners::retire(owner_id);
                 print_hosted_video_publish_failure(b"open", Some(status));
                 return false;
             }
         };
-    if !rewrite_video_file_projection(file_id) {
-        let _ = crate::driver_launch::close_io_handle(file_handle);
-        print_hosted_video_publish_failure(b"file-projection", None);
+    video_projection_owners::attach_open(owner_id, file_handle, file_id)
+        .expect("reserved video File owner disappeared during open");
+    if opened_device != route_info.device_id {
+        video_projection_owners::retire(owner_id);
+        print_hosted_video_publish_failure(
+            b"opened-device",
+            Some(NtStatus::INVALID_DEVICE_REQUEST),
+        );
         return false;
     }
+    let file_projection = match video_projection_owners::prepare(
+        owner_id,
+        route_info.device_id,
+        video_state_snapshot().objects.device,
+        reg.allocate_projection,
+    ) {
+        Ok(address) => address,
+        Err(status) => {
+            video_projection_owners::retire(owner_id);
+            print_hosted_video_publish_failure(b"file-projection", Some(status));
+            return false;
+        }
+    };
     if !teardown_video_io_route() {
-        let _ = crate::driver_launch::close_io_handle(file_handle);
+        video_projection_owners::retire(owner_id);
         print_hosted_video_publish_failure(b"teardown", None);
         return false;
     }
     (*addr_of_mut!(VIDEO_STATE)).metadata = Some(metadata);
     commit_video_io_route(
+        owner_id,
+        file_projection,
         route_info.driver_id,
         route_info.device_id,
         route_info.device_object_id,
@@ -368,7 +446,7 @@ pub(crate) fn video_device_projection_proofs() -> (u64, u64, u64, u64) {
             video_device_map_ready() as u64,
             state.objects.driver,
             state.objects.device,
-            state.objects.file,
+            state.route.file_projection,
         )
     }
 }
@@ -379,63 +457,47 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> u64) -> bo
         return true;
     }
     let driver_len = WDM_X64_DRIVER_OBJECT_SIZE + WDM_X64_DRIVER_EXTENSION_SIZE;
-    let driver = allocate_projection(driver_len as u64);
-    let device = allocate_projection(WDM_X64_DEVICE_OBJECT_SIZE as u64);
-    let file = allocate_projection(WDM_X64_FILE_OBJECT_SIZE as u64);
-    if driver == 0 || device == 0 || file == 0 {
+    if video_state_snapshot().objects.driver == 0 {
+        (*addr_of_mut!(VIDEO_STATE)).objects.driver = allocate_projection(driver_len as u64);
+    }
+    if video_state_snapshot().objects.device == 0 {
+        (*addr_of_mut!(VIDEO_STATE)).objects.device =
+            allocate_projection(WDM_X64_DEVICE_OBJECT_SIZE as u64);
+    }
+    let objects = video_state_snapshot().objects;
+    let driver = objects.driver;
+    let device = objects.device;
+    if driver == 0 || device == 0 {
         return false;
     }
 
     // win32k needs projected, dereferenceable WDM bodies for the I/O Manager route identities.
-    if write_wdm_open_device_projection(
+    if write_wdm_driver_object(
         core::slice::from_raw_parts_mut(driver as *mut u8, driver_len),
-        core::slice::from_raw_parts_mut(device as *mut u8, WDM_X64_DEVICE_OBJECT_SIZE),
-        core::slice::from_raw_parts_mut(file as *mut u8, WDM_X64_FILE_OBJECT_SIZE),
-        WdmOpenDeviceProjectionInit {
-            file_object_address: file,
-            driver_object: driver,
-            driver_extension: driver + WDM_X64_DRIVER_OBJECT_SIZE as u64,
+        WdmDriverObjectInit {
+            size_field: WDM_X64_DRIVER_OBJECT_SIZE as u16,
             device_object: device,
-            file_object_context: 0,
-            device_type: nt_video_miniport::FILE_DEVICE_VIDEO,
+            driver_extension: driver + WDM_X64_DRIVER_OBJECT_SIZE as u64,
+            driver_unload: 0,
         },
     )
     .is_err()
     {
         return false;
     }
-    (*addr_of_mut!(VIDEO_STATE)).objects = VideoProjectionObjects {
-        driver,
-        device,
-        file,
-    };
-    true
-}
-
-#[inline(never)]
-unsafe fn rewrite_video_file_projection(file_id: u64) -> bool {
-    let objects = video_state_snapshot().objects;
-    if !objects.ready() {
-        return false;
-    }
-    let Ok(metadata) = crate::driver_launch::owned_hosted_file_metadata(file_id) else {
-        return false;
-    };
-    write_wdm_file_object(
-        core::slice::from_raw_parts_mut(objects.file as *mut u8, WDM_X64_FILE_OBJECT_SIZE),
-        WdmFileObjectInit {
-            file_object_address: objects.file,
-            opened_case_sensitive: metadata.opened_case_sensitive,
-            create_options: metadata.create_options.bits(),
-            device_object: objects.device,
-            fs_context: file_id,
-            related_file_object: 0,
-            file_name_len: 0,
-            file_name_max_len: 0,
-            file_name_buffer: 0,
+    let initialized = write_wdm_device_object(
+        core::slice::from_raw_parts_mut(device as *mut u8, WDM_X64_DEVICE_OBJECT_SIZE),
+        WdmDeviceObjectInit {
+            size_field: WDM_X64_DEVICE_OBJECT_SIZE as u16,
+            driver_object: driver,
+            device_type: nt_video_miniport::FILE_DEVICE_VIDEO,
+            stack_size: 1,
+            ..WdmDeviceObjectInit::default()
         },
     )
-    .is_ok()
+    .is_ok();
+    (*addr_of_mut!(VIDEO_STATE)).objects.initialized = initialized;
+    initialized
 }
 
 #[inline(never)]
@@ -453,25 +515,20 @@ unsafe fn video_io_route_ids_present(metadata: VideoRegistrationMetadata) -> boo
 
 #[inline(never)]
 unsafe fn open_video_device_route(
-    device_id: u64,
     metadata: VideoRegistrationMetadata,
-) -> Result<(u64, u64, u64), NtStatus> {
+) -> Result<(u64, u64, u64, u64), NtStatus> {
     let device_path =
         core::str::from_utf8(metadata.device_path()).map_err(|_| NtStatus::INVALID_PARAMETER)?;
-    let (file_handle, file_id, opened_device_id, file_object_id) =
-        crate::driver_launch::open_io_device(
-            device_path,
-            nt_types::AccessMask::GENERIC_READ | nt_types::AccessMask::GENERIC_WRITE,
-        )?;
-    if opened_device_id != device_id {
-        let _ = crate::driver_launch::close_io_handle(file_handle);
-        return Err(NtStatus::INVALID_DEVICE_REQUEST);
-    }
-    Ok((file_handle, file_id, file_object_id))
+    crate::driver_launch::open_io_device(
+        device_path,
+        nt_types::AccessMask::GENERIC_READ | nt_types::AccessMask::GENERIC_WRITE,
+    )
 }
 
 #[inline(never)]
 unsafe fn commit_video_io_route(
+    owner_id: u64,
+    file_projection: u64,
     driver_id: u64,
     device_id: u64,
     device_object_id: u64,
@@ -481,6 +538,8 @@ unsafe fn commit_video_io_route(
     backend: VideoRouteBackend,
 ) {
     (*addr_of_mut!(VIDEO_STATE)).route = VideoIoRoute {
+        owner_id,
+        file_projection,
         driver_id,
         device_id,
         device_object_id,
@@ -508,8 +567,9 @@ unsafe fn teardown_video_io_route() -> bool {
         return false;
     }
     let route = video_state_snapshot().route;
-    if route.file_handle != 0 {
-        if crate::driver_launch::close_io_handle(route.file_handle).is_err() {
+    (*addr_of_mut!(VIDEO_STATE)).ready = false;
+    if route.owner_id != 0 {
+        if !video_projection_owners::retire(route.owner_id) {
             return false;
         }
     }
@@ -618,12 +678,12 @@ pub(crate) unsafe fn video_get_device_object_pointer(
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     if let Err(status) = retain_video_file_projection(
-        objects.file,
+        state.route.file_projection,
         nt_types::AccessMask::from_bits_retain(desired_access as u32),
     ) {
         return status;
     }
-    write_unaligned(fileobj_out, objects.file);
+    write_unaligned(fileobj_out, state.route.file_projection);
     write_unaligned(devobj_out, objects.device);
     0
 }
@@ -638,7 +698,7 @@ pub(crate) unsafe fn video_related_device_object(file_object: u64) -> Result<u64
         return Err(NtStatus::DEVICE_NOT_READY);
     }
     let state = video_state_snapshot();
-    if file_object == 0 || file_object != state.objects.file {
+    if file_object == 0 || file_object != state.route.file_projection {
         return Err(NtStatus::INVALID_HANDLE);
     }
     let (device_id, device_object_id) =
@@ -650,32 +710,31 @@ pub(crate) unsafe fn video_related_device_object(file_object: u64) -> Result<u64
 }
 
 pub(crate) unsafe fn video_file_projection_contains(object: u64) -> bool {
-    let objects = video_state_snapshot().objects;
-    objects.ready() && object == objects.file
+    let state = video_state_snapshot();
+    state.ready && object != 0 && object == state.route.file_projection
 }
 
 pub(crate) unsafe fn retain_video_file_projection(
     object: u64,
     desired_access: nt_types::AccessMask,
 ) -> Result<u64, i32> {
+    let _operation = PublicationGuard::enter().ok_or(NtStatus::DEVICE_BUSY.raw())?;
     if !projected_video_route_ready() || !video_file_projection_contains(object) {
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     }
     let state = video_state_snapshot();
-    let ledger = &mut *addr_of_mut!(VIDEO_FILE_REFERENCES);
-    if !ledger.reserve() {
+    if !(&mut *addr_of_mut!(VIDEO_FILE_REFERENCES)).reserve() {
         return Err(STATUS_NO_MEMORY);
     }
-    let (canonical_object, token) = crate::driver_launch::retain_io_handle_reference(
-        state.route.file_handle,
-        desired_access,
-    )
-    .map_err(|status| status.raw())?;
+    let (canonical_object, token) =
+        crate::driver_launch::retain_io_handle_reference(state.route.file_handle, desired_access)
+            .map_err(|status| status.raw())?;
     if canonical_object != state.route.file_object_id {
         let _ = crate::driver_launch::release_io_object_reference(token);
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let Some(count) = ledger.insert_reserved(object, token) else {
+    let Some(count) = (&mut *addr_of_mut!(VIDEO_FILE_REFERENCES)).insert_reserved(object, token)
+    else {
         let _ = crate::driver_launch::release_io_object_reference(token);
         return Err(STATUS_NO_MEMORY);
     };
@@ -683,24 +742,24 @@ pub(crate) unsafe fn retain_video_file_projection(
 }
 
 pub(crate) unsafe fn release_video_file_projection(object: u64) -> Result<u64, i32> {
+    let _operation = PublicationGuard::enter().ok_or(NtStatus::DEVICE_BUSY.raw())?;
     if !video_file_projection_contains(object) {
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     }
-    let ledger = &mut *addr_of_mut!(VIDEO_FILE_REFERENCES);
-    let Some(token) = ledger.release_token(object) else {
+    let Some(token) = (&*addr_of!(VIDEO_FILE_REFERENCES)).release_token(object) else {
         return Err(STATUS_INVALID_PARAMETER);
     };
     crate::driver_launch::release_io_object_reference(token).map_err(|status| status.raw())?;
-    let remaining = ledger
+    let remaining = (&mut *addr_of_mut!(VIDEO_FILE_REFERENCES))
         .complete_release(object, token)
         .expect("video File reference disappeared after canonical release");
     Ok(u64::from(remaining) + 1)
 }
 
 pub(crate) unsafe fn video_file_projection_reference_count() -> u64 {
-    let objects = video_state_snapshot().objects;
+    let route = video_state_snapshot().route;
     let ledger = &*addr_of!(VIDEO_FILE_REFERENCES);
-    u64::from(ledger.count(objects.file))
+    u64::from(ledger.count(route.file_projection))
 }
 
 pub(crate) unsafe fn video_device_io_control(

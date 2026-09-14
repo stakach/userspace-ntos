@@ -24704,12 +24704,14 @@ unsafe fn pending_pnp_operation_redrive_all(nt_handler: &mut ExecNtHandler) -> u
 unsafe fn pump_hosted_io_and_redrive_driver_starts(nt_handler: &mut ExecNtHandler) -> u64 {
     let activated = driver_launch::drain_hosted_driver_dpcs();
     let retired = driver_launch::drain_hosted_file_retirements();
+    let video_retired = crate::video_device::drain_video_file_retirements();
     let pumped = driver_launch::pump_hosted_io_completions() as u64;
     if crate::config_manager_take_device_action_wake() {
         nt_handler.pnp_signal_pending_action();
     }
     let progress = activated
         .saturating_add(retired)
+        .saturating_add(video_retired)
         .saturating_add(pumped)
         .saturating_add(pending_driver_start_redrive_all(nt_handler))
         .saturating_add(pending_pnp_operation_redrive_all(nt_handler));

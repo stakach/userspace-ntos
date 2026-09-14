@@ -17161,6 +17161,10 @@ const HOSTED_WORK_QUEUE_WALL_TRACE_CAP: u64 = 8;
 static HOSTED_WORK_QUEUE_CAPACITY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_WORK_QUEUE_CAPACITY_TRACE_CAP: u64 = 8;
 static HOSTED_COMPONENT_PUMP_DEPTH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn hosted_component_dispatch_active() -> bool {
+    HOSTED_COMPONENT_PUMP_DEPTH.load(Ordering::Acquire) != 0
+}
 /// Request banks currently owned by live hosted-component pumps. This is a call-stack ledger, not a
 /// driver identity table: nested dispatch may use any idle bank, while IRQ/DPC work targeting an
 /// occupied bank remains queued until its owner returns.
@@ -41652,6 +41656,7 @@ pub(crate) fn hosted_file_retry_deadline() -> Option<u64> {
     hosted_file_owners::retry_deadline()
         .into_iter()
         .chain(hosted_file_retirements::retry_deadline())
+        .chain(crate::video_device::video_file_retirement_deadline())
         .min()
 }
 
@@ -41666,6 +41671,7 @@ pub(crate) fn hosted_file_owner_stats() -> HostedFileOwnerStats {
 pub(crate) fn hosted_file_retry_wake_due(now_100ns: u64) -> u64 {
     hosted_file_owners::retry_wake_due(now_100ns)
         .saturating_add(hosted_file_retirements::retry_wake_due(now_100ns))
+        .saturating_add(crate::video_device::video_file_retirement_wake_due(now_100ns))
 }
 
 pub(crate) fn hosted_bus_reported_device_id(instance_id: &str) -> Option<u64> {

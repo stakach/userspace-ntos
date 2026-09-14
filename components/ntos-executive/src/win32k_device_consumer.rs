@@ -175,6 +175,63 @@ pub(crate) unsafe fn bind_projection(
     Ok(())
 }
 
+/// Root-only publication after a genuine open. The consumer's physical domain owns the File
+/// address, independently of the hosted driver that completed CREATE.
+pub(crate) unsafe fn bind_file_projection(
+    address: u64,
+    file: nt_io_manager::FileId,
+    device: nt_io_manager::DeviceId,
+) -> Result<nt_io_manager::HostedFileIdentity, i32> {
+    let _durable = crate::allocator::enter_durable();
+    if address == 0
+        || address & 7 != 0
+        || address
+            .checked_add(nt_io_manager::WDM_X64_FILE_OBJECT_SIZE as u64)
+            .is_none()
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let consumer = live_consumer()?;
+    let projection = consumer
+        .projections
+        .iter()
+        .find(|projection| projection.device == device && projection.bound)
+        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    let registration = projection
+        .registration
+        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    let io = io_manager_mut();
+    if io.hosted_device_by_identity(consumer.domain, projection.address) != Some(device) {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    io.hosted_device_pointer_count(registration)
+        .map_err(|status| status.raw())?;
+    let record = io.file(file).ok_or(nt_status::NtStatus::INVALID_HANDLE.raw())?;
+    if record.device_id != device {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    if record.state != nt_io_manager::FileState::Open {
+        return Err(nt_status::NtStatus::FILE_CLOSED.raw());
+    }
+    io.bind_hosted_file_identity(consumer.domain, address, file)
+        .map_err(|status| status.raw())
+}
+
+/// Exact receipt retirement remains available after consumer admission has closed. Unbind does
+/// not free the native allocation; the owner must retain it until this call succeeds.
+pub(crate) unsafe fn retire_file_projection(
+    identity: nt_io_manager::HostedFileIdentity,
+) -> Result<(), i32> {
+    let consumer = consumer_mut()?;
+    if identity.domain() != consumer.domain {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    io_manager_mut()
+        .unbind_hosted_file_identity(identity)
+        .map(|_| ())
+        .map_err(|status| status.raw())
+}
+
 /// A revalidatable observation, not a new device reference or permission to outlive a dispatch.
 /// Ownership stays with the consumer projection; asynchronous I/O must acquire its own references.
 #[derive(Clone, Copy)]
@@ -298,6 +355,9 @@ pub(crate) unsafe fn authenticate(
 /// every physical lane first. Failed retirement denies new admission and retains unfinished owners.
 #[allow(dead_code)]
 pub(crate) unsafe fn retire_quiescent_projections() -> Result<(), i32> {
+    if !crate::video_device::video_file_owners_quiesced() {
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
     let consumer = consumer_mut()?;
     consumer.retiring = true;
     if !crate::win32k_glue::win32k_physical_lanes_quiescent() {

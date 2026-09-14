@@ -34149,10 +34149,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         checks pass. No native IPC execution, provider readback, or VM run is claimed; the last
         measured 27 strict win32k imports and desktop acceptance remain open. Review split the
         remaining non-IRP projection and runtime acceptance work into the next item below.
-      - [ ] Complete non-IRP File projection ownership and native registration acceptance.
-        The video_device FILE_OBJECT singleton remains outside the generic run_irp registration
-        path. Replace its overwrite/reuse lifetime with exact canonical per-open binding and
-        retirement ownership before claiming every native projection is covered. Validate generic
+      - [x] Stage video-route File projections with exact consumer-domain retirement ownership
+        (2026-09-14; host/composed/native-build verified below).
+        Route replacement previously rewrote the old singleton File body before closing the old
+        handle. Reserve a durable owner before opening, allocate/initialize a fresh File body for
+        that open, and bind its exact File identity in the registered win32k consumer domain.
+        Preserve the old body during candidate preparation. Failed candidate publication retires
+        only that candidate; old-route teardown denies new admission before close/unbind/free.
+        Each retirement stage retains its handle, receipt or allocation until acknowledged, with
+        bounded idle/timer redrive and a consumer-domain teardown barrier. Diagnostic output now
+        includes pending File retirements. Device/Driver projection allocation is retained across
+        partial initialization instead of forgetting a successful first allocation.
+        Review found in-flight pointer acquisition was invisible to the old reference ledger.
+        A shared publication/reference-operation guard now spans Object Manager IPC and ledger
+        commit, preventing reentrant body reclamation and double token release. This legacy guard
+        rejects overlapping operations; it is not the final queued/concurrent NT pointer broker.
+        All 756 selected host tests pass without failures or ignored cases: 714 I/O Manager
+        library tests, five projection-protocol tests, four new composed video replacement tests,
+        and 33 Object Manager win32k reference-ledger tests. Replacement coverage verifies distinct
+        WDM bodies, lease-blocked old-route retirement, independently retired candidates, retained
+        canonical File references and identity mismatch rejection. These exercise the canonical
+        ownership primitives, not the native IPC or atomic publication sequence. Evidence:
+        .tmp/test-video-file-projection-regression-20260914.log,
+        .tmp/test-video-file-projection-replacement-20260914.log and
+        .tmp/test-video-reference-ledger-20260914.log. The serialized executive release build
+        passes in 35.63s with the unchanged 294 warnings:
+        .tmp/build-video-file-projection-executive-20260914.log. Independent final review confirms
+        the guard resolves the reported reentrancy blocker within this bounded legacy scope.
+        Scoped formatting and diff checks pass. No VM, native registration execution or desktop
+        acceptance is claimed; the last measured 27 strict win32k imports remain open. Review
+        split per-call pointer ownership and native body synchronization into the next two items.
+      - [ ] Replace legacy video pointer acquisition with authenticated per-call File ownership.
+        NT5 base/ntos/io/iomgr/iosubs.c:7393 and ReactOS ntoskrnl/io/iomgr/device.c:264 open a NEW
+        File for each IoGetDeviceObjectPointer call with caller DesiredAccess, no sharing,
+        NON_DIRECTORY_FILE and OBJ_KERNEL_HANDLE (not CASE_INSENSITIVE). Retain a canonical
+        FileReference before closing the temporary handle: CLEANUP happens before return and
+        final pointer dereference permits CLOSE. The current route-open/OM-token implementation
+        still does not implement that contract. Replace it, including IoFileObjectType validation,
+        with an authenticated physical-channel broker, per-open consumer bodies, and queued
+        concurrent reference operations rather than treating the legacy guard as completion.
+        First separate EngDeviceIoControl from the permanent File handle: ReactOS
+        win32ss/gdi/eng/device.c:994 builds a Device-targeted, file-less request. Route publication
+        should own Device/Driver projections and metadata, not a shared open. Retain pending CREATE
+        continuations and exact namespace-case semantics; IoManager::open currently supports only
+        synchronous return and hardcodes case-insensitive CREATE provenance. Track metadata and
+        base projection retirement and partial DeviceMap publication as explicit remaining owners.
+      - [ ] Complete native File registration acceptance and runtime body synchronization.
+        Validate generic and consumer
         registration/retirement in the VM, including failed CREATE, retained ACK, provider domains,
         idle retry and unload barriers. Host tests and release builds do not prove those paths ran.
         Audit/reconcile canonical and provider-realized File body state using those bindings:

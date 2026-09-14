@@ -1507,6 +1507,11 @@ pub(crate) unsafe fn property_pool_free(p: u64) {
     }
 }
 
+/// Executive-owned video projection release; failure retains the allocation for retirement retry.
+pub(crate) unsafe fn release_video_projection(address: u64, size: u64) -> bool {
+    size != 0 && provider_pool_release_owned(&[(address, size)])
+}
+
 unsafe fn provider_pool_note_invalid_free() {
     if let Some(_guard) = provider_pool_lock() {
         let _ = shared_pool::note_invalid_free(&mut ProviderPoolMemory);

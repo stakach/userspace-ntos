@@ -33062,6 +33062,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_hex((video_file >> 32) as u32);
         print_hex(video_file as u32);
         let video_file_references = video_device::video_file_projection_reference_count();
+        print_str(b" retiring-files=");
+        print_u64(video_device::video_file_retirement_pending());
         print_str(b" refs=");
         print_u64(video_file_references);
         print_str(b"/");
