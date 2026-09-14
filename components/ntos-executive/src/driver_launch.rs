@@ -39,6 +39,13 @@ pub(crate) mod hosted_add_device_rollback;
 mod hosted_file_dispatch;
 #[path = "hosted_file_owners.rs"]
 mod hosted_file_owners;
+#[path = "hosted_file_retirements.rs"]
+mod hosted_file_retirements;
+#[path = "hosted_file_objects.rs"]
+mod hosted_file_objects;
+use hosted_file_objects::{
+    fo_bind, fo_is_registered, fo_lookup, fo_register, fo_release, fo_reserve_new_slot,
+};
 #[path = "hosted_file_capture.rs"]
 pub(crate) mod hosted_file_capture;
 pub(crate) use hosted_file_owners::Stats as HostedFileOwnerStats;
@@ -413,6 +420,7 @@ pub const SH_SYMLINK_LINK_BUF: u64 = 0x190; // out: UTF-16LE path capture
 pub const SH_SYMLINK_TARGET_BUF: u64 = 0x290; // out: UTF-16LE path capture
 pub const SH_CAPTURED_PATH_BYTES: usize = 0x100;
 pub const SH_REQ_CONTROL_ID: u64 = 0x390; // in: exact IrpId for cancel/copy/ack control selectors
+pub const SH_FILE_RETIREMENTS: u64 = 0x398; // out: independently owned FILE_OBJECT retirements
 pub const SH_RESOURCE_INTERRUPT_VECTOR: u64 = 0x3B8; // in: granted interrupt vector/level (u32)
 pub const SH_RESOURCE_INTERRUPT_LINE: u64 = 0x3BC; // in: raw bus interrupt line (u32)
 pub const SH_RESOURCE_INTERRUPT_AFFINITY: u64 = 0x3C0; // in: granted interrupt affinity
@@ -723,6 +731,7 @@ pub const FSD_SERVICE_QUEUE_DPC_LABEL: u64 = 0x789;
 pub const FSD_SERVICE_FLUSH_DPCS_LABEL: u64 = 0x78A;
 pub const FSD_SERVICE_DMA_ADAPTER_LABEL: u64 = 0x78B;
 pub const FSD_SERVICE_MDL_LABEL: u64 = 0x78C;
+pub const FSD_SERVICE_FILE_LABEL: u64 = 0x78D;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
@@ -736,6 +745,7 @@ pub const FSD_DISPATCH_COPY_COMPLETION: u64 = u64::MAX - 0x77C;
 pub const FSD_DISPATCH_ACK_COMPLETION: u64 = u64::MAX - 0x77D;
 pub const FSD_DISPATCH_CREATE_PDO_PROJECTION: u64 = u64::MAX - 0x77F;
 pub const FSD_DISPATCH_ROLLBACK_ADD_DEVICE: u64 = u64::MAX - 0x780;
+pub const FSD_DISPATCH_DRAIN_FILE_RETIREMENTS: u64 = u64::MAX - 0x781;
 
 pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
     matches!(
@@ -765,6 +775,7 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
             | FSD_SERVICE_FLUSH_DPCS_LABEL
             | FSD_SERVICE_DMA_ADAPTER_LABEL
             | FSD_SERVICE_MDL_LABEL
+            | FSD_SERVICE_FILE_LABEL
     )
 }
 
@@ -2332,17 +2343,9 @@ unsafe fn pool_free(p: u64) {
 //
 // The fix is the NT lifetime: ONE FILE_OBJECT per OPEN, reused by every IRP on that open (which is
 // also what makes two concurrent IRPs on one handle — a pending read plus a write, the ordinary
-// rpcrt4 server shape — structurally correct rather than merely lucky), freed on CLEANUP/CLOSE.
-
-#[derive(Clone, Copy)]
-struct FileObjectSlot {
-    /// Generation-protected I/O Manager identity for this open.
-    canonical_file_id: u64,
-    /// The FILE_OBJECT block in the FSD pool.
-    fo: u64,
-}
-
-static mut FILE_OBJECTS: Option<Vec<FileObjectSlot>> = None;
+// rpcrt4 server shape — structurally correct rather than merely lucky). CLOSE or failed CREATE
+// retires the projection; CLEANUP does not. hosted_file_objects retains storage until exact
+// canonical unbind is acknowledged, independently of the completed IRP graph.
 
 /// FILE_OBJECTs created for an open (one per open, not per IRP).
 pub(crate) static FSD_FO_OPENS: AtomicU64 = AtomicU64::new(0);
@@ -2357,110 +2360,6 @@ pub(crate) static FSD_FO_DANGLING: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FSD_FO_CORRUPTED: AtomicU64 = AtomicU64::new(0);
 /// Opens rejected because the per-open FILE_OBJECT registry could not grow.
 pub(crate) static FSD_FO_TABLE_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
-
-unsafe fn file_objects_mut() -> &'static mut Vec<FileObjectSlot> {
-    let slot = &mut *core::ptr::addr_of_mut!(FILE_OBJECTS);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    slot.as_mut().unwrap()
-}
-
-unsafe fn file_objects() -> Option<&'static Vec<FileObjectSlot>> {
-    (*core::ptr::addr_of!(FILE_OBJECTS)).as_ref()
-}
-
-/// The per-open FILE_OBJECT for one canonical FileId, or 0.
-unsafe fn fo_lookup(canonical_file_id: u64) -> u64 {
-    if canonical_file_id == 0 {
-        return 0;
-    }
-    let Some(table) = file_objects() else {
-        return 0;
-    };
-    for slot in table.iter() {
-        if slot.canonical_file_id == canonical_file_id {
-            return slot.fo;
-        }
-    }
-    0
-}
-
-unsafe fn fo_reserve_new_slot() -> bool {
-    let table = file_objects_mut();
-    if table.iter().any(|slot| slot.canonical_file_id == 0) || table.len() < table.capacity() {
-        return true;
-    }
-    if table.try_reserve(1).is_ok() {
-        true
-    } else {
-        FSD_FO_TABLE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-        false
-    }
-}
-
-/// Is `fo` one of the live per-open FILE_OBJECTs?
-unsafe fn fo_is_registered(fo: u64) -> bool {
-    let Some(table) = file_objects() else {
-        return false;
-    };
-    table
-        .iter()
-        .any(|slot| slot.canonical_file_id != 0 && slot.fo == fo)
-}
-
-/// Register `fo` as the per-open FILE_OBJECT for a canonical FileId. A live
-/// generation can name only one component-local object.
-unsafe fn fo_register(canonical_file_id: u64, fo: u64) -> bool {
-    if canonical_file_id == 0 || fo == 0 {
-        return false;
-    }
-    let table = file_objects_mut();
-    for slot in table.iter_mut() {
-        if slot.canonical_file_id == canonical_file_id {
-            return slot.fo == fo;
-        }
-    }
-    for slot in table.iter_mut() {
-        if slot.canonical_file_id == 0 {
-            *slot = FileObjectSlot {
-                canonical_file_id,
-                fo,
-            };
-            FSD_FO_OPENS.fetch_add(1, Ordering::Relaxed);
-            return true;
-        }
-    }
-    if table.len() == table.capacity() && table.try_reserve(1).is_err() {
-        FSD_FO_TABLE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    table.push(FileObjectSlot {
-        canonical_file_id,
-        fo,
-    });
-    FSD_FO_OPENS.fetch_add(1, Ordering::Relaxed);
-    true
-}
-
-/// Release the per-open FILE_OBJECT for one canonical FileId. CLOSE is the only
-/// normal place this component-local object dies.
-unsafe fn fo_release(canonical_file_id: u64) {
-    if canonical_file_id == 0 {
-        return;
-    }
-    let table = file_objects_mut();
-    for slot in table.iter_mut() {
-        if slot.canonical_file_id == canonical_file_id {
-            pool_free(slot.fo);
-            *slot = FileObjectSlot {
-                canonical_file_id: 0,
-                fo: 0,
-            };
-            return;
-        }
-    }
-}
 
 // --- npfs DATA-QUEUE CONSISTENCY AUDIT (the hang guard + the lifetime proof) -------------------
 //
@@ -33343,6 +33242,9 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
 
 unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
     let major = req.sel;
+    if major == FSD_DISPATCH_DRAIN_FILE_RETIREMENTS {
+        return (STATUS_SUCCESS, hosted_file_objects::drain());
+    }
     let request_drv = match read_volatile((FSD_SHARED_VADDR + SH_DRVOBJ) as *const u64) {
         0 => req.drv,
         drv => drv,
@@ -34130,7 +34032,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         None
     };
 
-    // FILE_OBJECT — ONE per OPEN, reused by every IRP on that open, freed at CLEANUP/CLOSE.
+    // FILE_OBJECT: one per open, reused until CLOSE and exact canonical unbind acknowledgement.
     // A FILE_OBJECT outlives the IRP that introduced it (npfs stores it in `Ccb->FileObject[end]`
     // and writes through that pointer on disconnect), so it must NOT be rebuilt/freed per request.
     let existing = if uses_file_object {
@@ -34937,6 +34839,17 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 + core::mem::offset_of!(PendingIrp, owns_fo) as u64) as *mut bool,
             false,
         );
+        if let Err(status) = fo_bind(canonical_file_id, canonical_irp_id) {
+            let state = pending_irp_owner_state(owner_node).load(Ordering::Acquire);
+            let consuming = hosted_irp_state_with_kind(state, HOSTED_IRP_CONSUMING);
+            pending_irp_owner_state(owner_node).store(consuming, Ordering::Release);
+            // The File slot owns even an uncertain registration independently of this IRP.
+            fo_release(canonical_file_id);
+            let entry = read_volatile(pending_irp_entry_address(owner_node) as *const PendingIrp);
+            release_pending_irp_graph_component(entry);
+            tombstone_pending_irp_owner(owner_node, consuming);
+            return (status, 0);
+        }
     }
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IRP) as *mut u64, irp);
     write_volatile(
@@ -35221,10 +35134,10 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 info = 0;
             }
         }
-        release_pending_irp_graph_component(completed);
         if uses_file_object && (major == IRP_MJ_CLOSE || is_create && st < 0) {
             fo_release(canonical_file_id);
         }
+        release_pending_irp_graph_component(completed);
         tombstone_pending_irp_owner(owner_node, consuming_state);
     }
     (st, info)
@@ -41737,6 +41650,13 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
 
 pub(crate) fn hosted_file_retry_deadline() -> Option<u64> {
     hosted_file_owners::retry_deadline()
+        .into_iter()
+        .chain(hosted_file_retirements::retry_deadline())
+        .min()
+}
+
+pub(crate) unsafe fn drain_hosted_file_retirements() -> u64 {
+    hosted_file_retirements::drain()
 }
 
 pub(crate) fn hosted_file_owner_stats() -> HostedFileOwnerStats {
@@ -41745,6 +41665,7 @@ pub(crate) fn hosted_file_owner_stats() -> HostedFileOwnerStats {
 
 pub(crate) fn hosted_file_retry_wake_due(now_100ns: u64) -> u64 {
     hosted_file_owners::retry_wake_due(now_100ns)
+        .saturating_add(hosted_file_retirements::retry_wake_due(now_100ns))
 }
 
 pub(crate) fn hosted_bus_reported_device_id(instance_id: &str) -> Option<u64> {
@@ -51189,6 +51110,8 @@ static mut DRIVER_INSTANCE_THUNK_SLOTS: Option<
 struct ActiveHostedIrpTransfer {
     shared_va: u64,
     transfer_id: u64,
+    /// Executive-validated CREATE File and physical provider address space.
+    file_create: Option<(FileId, HostedDomainIdentity)>,
     input: u64,
     output: u64,
     input_cursor: BankedTransferCursor,
@@ -51231,6 +51154,7 @@ impl Drop for ActiveHostedIrpTransferGuard {
 unsafe fn enter_active_hosted_irp_transfer(
     shared_va: u64,
     transfer_id: u64,
+    file_create: Option<(FileId, HostedDomainIdentity)>,
     input: &[u8],
     output: &mut [u8],
 ) -> Option<ActiveHostedIrpTransferGuard> {
@@ -51246,6 +51170,7 @@ unsafe fn enter_active_hosted_irp_transfer(
     transfers.push(ActiveHostedIrpTransfer {
         shared_va,
         transfer_id,
+        file_create,
         input: input.as_ptr() as u64,
         output: output.as_mut_ptr() as u64,
         input_cursor: BankedTransferCursor::new(input.len() as u64),
@@ -52229,7 +52154,8 @@ pub(crate) struct HostedVideoRouteInfo {
 }
 
 fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
-    if !hosted_file_owners::instance_quiesced(i)
+    if !hosted_file_retirements::instance_quiesced(i)
+        || !hosted_file_owners::instance_quiesced(i)
         || !unsafe { hosted_add_device_rollback::instance_quiesced(i) }
         || instance(i).is_some_and(|inst| ps_object_backing::references_provider_vspace(inst.pml4))
     {
@@ -52698,6 +52624,81 @@ fn instance_for_pump_channel(
         return None;
     }
     Some((instance, inst))
+}
+
+/// File projection services authenticate the physical address space, not a dependent driver's
+/// completion-attribution domain. Only BIND requires the original, still-active CREATE authority.
+pub(crate) fn service_hosted_file(
+    ch: &crate::spawn_hosts::PumpChannel,
+    operation: u64,
+    request_id: u64,
+    file_id: u64,
+    address: u64,
+    active_reply_cap: u64,
+) -> (i32, u64) {
+    let _durable = crate::allocator::enter_durable();
+    if !matches!(operation, 1..=3)
+        || file_id == 0
+        || address == 0
+        || address & 7 != 0
+        || address
+            .checked_add(WDM_X64_FILE_OBJECT_SIZE as u64)
+            .is_none()
+        || (operation == 3 && request_id != 0)
+        || (operation != 3 && request_id == 0)
+    {
+        return (STATUS_INVALID_PARAMETER, 0);
+    }
+    let Some((_, instance)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return (STATUS_ACCESS_DENIED, 0);
+    };
+    let Some(domain) = instance_domain_identity(instance) else {
+        return (STATUS_ACCESS_DENIED, 0);
+    };
+    let file = FileId(file_id);
+    let result = match operation {
+        1 => {
+            let authorized = unsafe {
+                active_hosted_irp_transfer_mut(ch.shared_va, request_id)
+                    .is_some_and(|active| active.file_create == Some((file, domain)))
+            };
+            if !authorized {
+                return (STATUS_ACCESS_DENIED, 0);
+            }
+            // CREATE authority identifies the File, not arbitrary component memory. Prove the
+            // submitted projection occupies a live provider-pool allocation before publishing it.
+            let Some(file_object) = (unsafe {
+                hosted_instance_pool_allocation_exec_if_live(
+                    instance,
+                    address,
+                    WDM_X64_FILE_OBJECT_SIZE as u64,
+                )
+            }) else {
+                return (STATUS_INVALID_PARAMETER, 0);
+            };
+            if unsafe {
+                read_unaligned(file_object as *const i16) != nt_io_manager::WDM_X64_IO_TYPE_FILE
+                    || read_unaligned((file_object + 2) as *const u16)
+                        != WDM_X64_FILE_OBJECT_SIZE as u16
+            } {
+                return (STATUS_INVALID_PARAMETER, 0);
+            }
+            io_manager_mut()
+                .bind_hosted_file_identity(domain, address, file)
+                .map(|identity| identity.binding_generation())
+        }
+        2 => io_manager_mut()
+            .unbind_authenticated_hosted_file(domain, file, address, request_id)
+            .map(|_| 0),
+        3 => io_manager_mut()
+            .hosted_file_identity_at(domain, file, address)
+            .map(|identity| identity.map_or(0, |identity| identity.binding_generation())),
+        _ => unreachable!("validated File service operation"),
+    };
+    match result {
+        Ok(information) => (STATUS_SUCCESS, information),
+        Err(status) => (status.raw(), 0),
+    }
 }
 
 pub(crate) fn service_hosted_hal_acpi_interrupt_model(
@@ -57846,6 +57847,7 @@ pub(crate) unsafe fn unload_driver_by_name(
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    hosted_file_retirements::preflight_unload(index, inst)?;
     io_manager_mut().can_unload_hosted_provider(domain)?;
 
     let unload_state = io_manager_mut()
@@ -58400,7 +58402,16 @@ unsafe fn dispatch_irp_for_instance_exact(
             });
         }
     }
-    let Some(transfer_guard) = enter_active_hosted_irp_transfer(sh, canonical_irp_id, in_data, out)
+    let file_create = dispatch_request
+        .filter(|request| major::is_create_major(request.major) && request.file_id != 0)
+        .map(|request| {
+            (
+                FileId(request.file_id),
+                instance_domain_identity(d).expect("validated physical dispatch domain"),
+            )
+        });
+    let Some(transfer_guard) =
+        enter_active_hosted_irp_transfer(sh, canonical_irp_id, file_create, in_data, out)
     else {
         return Some(HostedIrpTransportResult::NotDispatched {
             status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
@@ -59311,9 +59322,20 @@ fn release_hosted_file_with_provenance(file_id: u64, provenance: &[u8]) -> Resul
     } else {
         print_str(b" state=missing");
     }
-    let result = io
-        .release_external_file(ClientId(IO_MANAGER_COMPONENT_ID), FileId(file_id))
-        .map_err(|status| status.raw() as u32);
+    let client = ClientId(IO_MANAGER_COMPONENT_ID);
+    let result = match io.release_external_file(client, FileId(file_id)) {
+        Err(nt_status::NtStatus::DELETE_PENDING)
+            if io.file(FileId(file_id)).is_some_and(|file| {
+                matches!(file.state, FileState::Allocated | FileState::Closed)
+            }) =>
+        {
+            // A failed CREATE can outlive its IRP while a projection retirement is outstanding.
+            // Transfer the unpublished File owner explicitly before its native caller lets go.
+            io.defer_unopened_external_file_release(client, FileId(file_id))
+        }
+        result => result,
+    }
+    .map_err(|status| status.raw() as u32);
     print_str(b" status=0x");
     print_hex64(result.as_ref().err().copied().unwrap_or(0) as u64);
     print_str(b"\n");

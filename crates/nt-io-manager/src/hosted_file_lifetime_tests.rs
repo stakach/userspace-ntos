@@ -2,12 +2,13 @@
 //! These are host-model lifecycle tests, not native registration or IPC evidence.
 
 use crate::{
-    CreateOptions, DeviceCharacteristics, DeviceFlags, DeviceType, DispatchContext,
-    DispatchOutcome, DriverCompletion, DriverDispatchBackend, FileId, HostedFileUnbindOutcome,
-    IoManager, IrpId, IrpProjection, MockDriverBackend, MockObjectPort, ShareAccess,
+    CreateOptions, CreateParameters, DeviceCharacteristics, DeviceFlags, DeviceType,
+    DispatchContext, DispatchOutcome, DriverCompletion, DriverDispatchBackend,
+    ExternalDispatchResult, FileId, FileState, HostedFileUnbindOutcome, IoManager, IoParameters,
+    IrpId, IrpProjection, MockDriverBackend, MockObjectPort, ShareAccess,
 };
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use nt_io_abi::major;
 use nt_status::NtStatus;
 use nt_types::{AccessMask, ClientId, HandleValue, NtPath, UnicodeString};
@@ -16,6 +17,7 @@ struct Recording {
     backend: MockDriverBackend,
     calls: Rc<RefCell<Vec<u8>>>,
     pending_close: bool,
+    deny_create: Rc<Cell<bool>>,
 }
 
 impl DriverDispatchBackend for Recording {
@@ -25,6 +27,13 @@ impl DriverDispatchBackend for Recording {
         irp: &IrpProjection,
     ) -> Result<DispatchOutcome, NtStatus> {
         self.calls.borrow_mut().push(irp.major);
+        if irp.major == major::IRP_MJ_CREATE && self.deny_create.get() {
+            return Ok(DispatchOutcome::Completed {
+                status: NtStatus::ACCESS_DENIED,
+                information: 0,
+                file_context: None,
+            });
+        }
         if irp.major == major::IRP_MJ_CLOSE && self.pending_close {
             self.backend.set_force_pending(true);
             self.backend.set_pending_completion(NtStatus::SUCCESS, 0);
@@ -51,6 +60,7 @@ struct Fixture {
     handle: HandleValue,
     file: FileId,
     calls: Rc<RefCell<Vec<u8>>>,
+    deny_create: Rc<Cell<bool>>,
 }
 
 impl Fixture {
@@ -58,6 +68,7 @@ impl Fixture {
         let mut io = IoManager::new(MockObjectPort::new());
         let client = io.register_client();
         let calls = Rc::new(RefCell::new(Vec::new()));
+        let deny_create = Rc::new(Cell::new(false));
         let driver = io
             .create_driver(
                 &NtPath::parse_str(r"\Driver\ProjectionLifetime").unwrap(),
@@ -65,6 +76,7 @@ impl Fixture {
                     backend: MockDriverBackend::new(),
                     calls: calls.clone(),
                     pending_close,
+                    deny_create: deny_create.clone(),
                 }),
             )
             .unwrap();
@@ -98,6 +110,7 @@ impl Fixture {
             handle,
             file,
             calls,
+            deny_create,
         }
     }
 
@@ -244,6 +257,143 @@ fn unpublished_file_release_refusal_keeps_retry_ownership_with_the_caller() {
     f.io.release_external_file(f.client, file).unwrap();
     assert!(f.io.file(file).is_none());
     f.io.unregister_hosted_domain(domain).unwrap();
+    f.io.close(f.client, f.handle).unwrap();
+    f.io.pump();
+    assert_eq!(f.io.file_count(), 0);
+}
+
+#[test]
+fn explicit_unopened_handoff_retires_allocated_and_failed_create_after_binding_drain() {
+    for fail_create in [false, true] {
+        let mut f = Fixture::new(false);
+        let device = f.io.file(f.file).unwrap().device_id;
+        let file =
+            f.io.allocate_external_file(
+                f.client,
+                device,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::empty(),
+                UnicodeString::from_str("Unpublished"),
+            )
+            .unwrap();
+        let domain = f.io.register_hosted_domain();
+        let binding =
+            f.io.bind_hosted_file_identity(domain, 0x9000, file)
+                .unwrap();
+        if fail_create {
+            f.deny_create.set(true);
+            assert_eq!(
+                f.io.build_and_dispatch_external_to_device(
+                    f.client,
+                    device,
+                    Some(file),
+                    0,
+                    42,
+                    major::IRP_MJ_CREATE,
+                    IoParameters::Create(CreateParameters {
+                        desired_access: AccessMask::GENERIC_READ,
+                        share_access: ShareAccess::READ,
+                        ..Default::default()
+                    }),
+                    0,
+                    0,
+                    &mut [],
+                ),
+                Ok(ExternalDispatchResult::Completed {
+                    status: NtStatus::ACCESS_DENIED,
+                    information: 0,
+                    file_context: None,
+                })
+            );
+        }
+        let expected_state = if fail_create {
+            FileState::Closed
+        } else {
+            FileState::Allocated
+        };
+        assert_eq!(f.io.file(file).unwrap().state, expected_state);
+        assert_eq!(
+            f.io.release_external_file(f.client, file),
+            Err(NtStatus::DELETE_PENDING)
+        );
+        assert!(!f.io.file(file).unwrap().close_deferred);
+        assert!(!f.io.file(file).unwrap().close_retry_queued);
+        let calls_before = f.calls.borrow().clone();
+        assert_eq!(
+            f.io.defer_unopened_external_file_release(f.client, file),
+            Ok(())
+        );
+        assert!(f.io.file(file).unwrap().close_deferred);
+        assert!(f.io.file(file).unwrap().close_retry_queued);
+        assert_eq!(
+            f.io.defer_unopened_external_file_release(f.client, file),
+            Ok(())
+        );
+        assert_eq!(*f.calls.borrow(), calls_before);
+        f.io.pump();
+        assert_eq!(f.io.file(file).unwrap().state, expected_state);
+        assert_eq!(*f.calls.borrow(), calls_before);
+        assert_eq!(
+            f.io.hosted_file_identity_at(domain, file, 0x9000),
+            Ok(Some(binding))
+        );
+        f.io.unbind_hosted_file_identity(binding).unwrap();
+        f.io.pump();
+        assert!(f.io.file(file).is_none());
+        assert_eq!(
+            *f.calls.borrow(),
+            calls_before,
+            "unopened File must not receive CLEANUP or CLOSE"
+        );
+        assert_eq!(f.io.irp_count(), 0);
+        f.io.unregister_hosted_domain(domain).unwrap();
+        f.io.close(f.client, f.handle).unwrap();
+        f.io.pump();
+        assert_eq!(f.io.file_count(), 0);
+    }
+}
+
+#[test]
+fn unopened_handoff_rejects_wrong_identity_and_open_lifetime_without_mutation() {
+    let mut f = Fixture::new(false);
+    let other_client = f.io.register_client();
+    let device = f.io.file(f.file).unwrap().device_id;
+    let file =
+        f.io.allocate_external_file(
+            f.client,
+            device,
+            AccessMask::GENERIC_READ,
+            ShareAccess::READ,
+            CreateOptions::empty(),
+            UnicodeString::from_str("Unpublished"),
+        )
+        .unwrap();
+    let calls_before = f.calls.borrow().clone();
+    assert_eq!(
+        f.io.defer_unopened_external_file_release(other_client, file),
+        Err(NtStatus::INVALID_HANDLE)
+    );
+    assert_eq!(
+        f.io.defer_unopened_external_file_release(f.client, FileId::NULL),
+        Err(NtStatus::INVALID_HANDLE)
+    );
+    assert_eq!(
+        f.io.defer_unopened_external_file_release(f.client, f.file),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    for (id, state) in [(file, FileState::Allocated), (f.file, FileState::Open)] {
+        let record = f.io.file(id).unwrap();
+        assert_eq!(record.state, state);
+        assert!(!record.close_deferred);
+        assert!(!record.close_retry_queued);
+        assert!(!record.cleanup_dispatched);
+        assert!(!record.close_dispatched);
+        assert_eq!(record.outstanding_irp_refs, 0);
+    }
+    assert_eq!(*f.calls.borrow(), calls_before);
+    assert_eq!(f.io.irp_count(), 0);
+    f.io.release_external_file(f.client, file).unwrap();
     f.io.close(f.client, f.handle).unwrap();
     f.io.pump();
     assert_eq!(f.io.file_count(), 0);

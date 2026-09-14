@@ -23,6 +23,27 @@ enum LifecycleDispatch {
 }
 
 impl<P: ObjectManagerPort> IoManager<P> {
+    /// Transfer retry ownership of an unopened external File to the canonical close pump.
+    /// Unlike a refused `release_external_file`, success promises deferred retirement once
+    /// projection bindings and pointer owners drain. This only sets latches: no backend entry,
+    /// IPC, allocation, or synthetic CLEANUP/CLOSE is needed for an Allocated or failed File.
+    pub fn defer_unopened_external_file_release(
+        &mut self,
+        client: ClientId,
+        file_id: FileId,
+    ) -> Result<(), NtStatus> {
+        let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
+        if file.client_id != client {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        if !matches!(file.state, FileState::Allocated | FileState::Closed) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.file_mut(file_id).expect("validated unopened File").close_deferred = true;
+        self.queue_deferred_file_close(file_id);
+        Ok(())
+    }
+
     /// Release the final host-owned handle to a canonical File. Integration
     /// hosts use this when their process handle table is outside the Object
     /// Manager port. CLEANUP is issued once, CLOSE waits for every IRP ACK, and

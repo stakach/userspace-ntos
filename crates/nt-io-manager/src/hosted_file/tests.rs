@@ -4,7 +4,7 @@ use crate::{
     MockObjectPort, ShareAccess,
 };
 use alloc::boxed::Box;
-use nt_types::{AccessMask, ClientId, NtPath};
+use nt_types::{AccessMask, ClientId, HandleValue, NtPath};
 
 struct Fixture {
     io: IoManager<MockObjectPort>,
@@ -12,6 +12,7 @@ struct Fixture {
     domain: HostedDomainIdentity,
     device: DeviceId,
     file: FileId,
+    handle: HandleValue,
 }
 
 impl Fixture {
@@ -55,6 +56,7 @@ impl Fixture {
             domain,
             device,
             file,
+            handle,
         }
     }
 
@@ -379,4 +381,193 @@ fn invalid_file_address_and_cookie_never_publish_bindings() {
         );
     }
     assert_eq!(f.io.hosted_file_identities(f.file), Ok(Vec::new()));
+}
+
+#[test]
+fn authenticated_tuple_lookup_never_substitutes_another_address_or_file() {
+    let mut f = Fixture::new();
+    let receipt = f.bind(0x5000);
+    let other = f.another_file();
+    f.io.bind_hosted_file_identity(f.domain, 0x5010, other)
+        .unwrap();
+    assert_eq!(
+        f.io.hosted_file_identity_at(f.domain, f.file, 0x5000),
+        Ok(Some(receipt))
+    );
+    assert_eq!(
+        f.io.hosted_file_identity_at(f.domain, f.file, 0x5010),
+        Ok(None)
+    );
+    assert_eq!(
+        f.io.hosted_file_identity_at(f.domain, other, 0x5000),
+        Ok(None)
+    );
+    f.io.device_mut(f.device).unwrap().top_of_stack = DeviceId::NULL;
+    f.io.file_mut(f.file).unwrap().close_dispatched = true;
+    assert_eq!(
+        f.io.hosted_file_identity_at(f.domain, f.file, 0x5000),
+        Ok(Some(receipt))
+    );
+}
+
+#[test]
+fn authenticated_retirement_preserves_same_tuple_and_reused_address_replacements() {
+    let mut f = Fixture::new();
+    let first = f.bind(0x5000);
+    assert_eq!(
+        f.io.unbind_authenticated_hosted_file(f.domain, f.file, 0x5000, first.binding_generation()),
+        Ok(HostedFileUnbindOutcome::Removed)
+    );
+    let replacement = f.bind(0x5000);
+    assert_eq!(
+        f.io.unbind_authenticated_hosted_file(f.domain, f.file, 0x5000, first.binding_generation()),
+        Ok(HostedFileUnbindOutcome::AlreadyAbsent)
+    );
+    assert_eq!(
+        f.io.hosted_file_identity_at(f.domain, f.file, 0x5000),
+        Ok(Some(replacement))
+    );
+    f.io.unbind_hosted_file_identity(replacement).unwrap();
+    let other = f.another_file();
+    let reused =
+        f.io.bind_hosted_file_identity(f.domain, 0x5000, other)
+            .unwrap();
+    assert_eq!(
+        f.io.unbind_authenticated_hosted_file(
+            f.domain,
+            f.file,
+            0x5000,
+            replacement.binding_generation()
+        ),
+        Ok(HostedFileUnbindOutcome::AlreadyAbsent)
+    );
+    assert_eq!(
+        f.io.unbind_authenticated_hosted_file(
+            f.domain,
+            other,
+            0x5000,
+            replacement.binding_generation()
+        ),
+        Ok(HostedFileUnbindOutcome::AlreadyAbsent)
+    );
+    assert_eq!(
+        f.io.hosted_file_identity_at(f.domain, other, 0x5000),
+        Ok(Some(reused))
+    );
+}
+
+#[test]
+fn authenticated_retirement_honors_leases_and_replays_after_file_record_removal() {
+    let mut f = Fixture::new();
+    let receipt = f.bind(0x5000);
+    let mut lease = f.io.lease_hosted_file_identity(receipt).unwrap();
+    assert_eq!(
+        f.io.unbind_authenticated_hosted_file(
+            f.domain,
+            f.file,
+            0x5000,
+            receipt.binding_generation()
+        ),
+        Err(NtStatus::DELETE_PENDING)
+    );
+    assert!(lease.is_held());
+    assert_eq!(
+        f.io.hosted_file_identity_at(f.domain, f.file, 0x5000),
+        Ok(Some(receipt))
+    );
+    f.io.release_hosted_file_publication(&mut lease).unwrap();
+    assert_eq!(
+        f.io.unbind_authenticated_hosted_file(
+            f.domain,
+            f.file,
+            0x5000,
+            receipt.binding_generation()
+        ),
+        Ok(HostedFileUnbindOutcome::Removed)
+    );
+    f.io.close(f.client, f.handle).unwrap();
+    f.io.pump();
+    assert!(f.io.file(f.file).is_none());
+    assert_eq!(
+        f.io.hosted_file_identity_at(f.domain, f.file, 0x5000),
+        Ok(None)
+    );
+    assert_eq!(
+        f.io.unbind_authenticated_hosted_file(
+            f.domain,
+            f.file,
+            0x5000,
+            receipt.binding_generation()
+        ),
+        Ok(HostedFileUnbindOutcome::AlreadyAbsent)
+    );
+}
+
+#[test]
+fn authenticated_helpers_reject_invalid_domain_fields_and_unissued_generations() {
+    let mut f = Fixture::new();
+    let receipt = f.bind(0x5000);
+    let retired_domain = f.io.register_hosted_domain();
+    f.io.unregister_hosted_domain(retired_domain).unwrap();
+    let replacement_domain = f.io.register_hosted_domain();
+    assert_eq!(
+        retired_domain.domain_id.slot(),
+        replacement_domain.domain_id.slot()
+    );
+    for domain in [
+        HostedDomainIdentity::default(),
+        retired_domain,
+        HostedDomainIdentity {
+            cookie: 0,
+            ..f.domain
+        },
+        HostedDomainIdentity {
+            cookie: f.domain.cookie.wrapping_add(1),
+            ..f.domain
+        },
+    ] {
+        assert_eq!(
+            f.io.hosted_file_identity_at(domain, f.file, 0x5000),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            f.io.unbind_authenticated_hosted_file(
+                domain,
+                f.file,
+                0x5000,
+                receipt.binding_generation()
+            ),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+    }
+    for (file, address) in [(FileId::NULL, 0x5000), (f.file, 0)] {
+        assert_eq!(
+            f.io.hosted_file_identity_at(f.domain, file, address),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            f.io.unbind_authenticated_hosted_file(
+                f.domain,
+                file,
+                address,
+                receipt.binding_generation()
+            ),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+    }
+    for generation in [0, receipt.binding_generation() + 1, u64::MAX] {
+        assert_eq!(
+            f.io.unbind_authenticated_hosted_file(f.domain, f.file, 0x5000, generation),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+    }
+    let empty_domain = f.io.register_hosted_domain();
+    assert_eq!(
+        f.io.unbind_authenticated_hosted_file(empty_domain, f.file, 0x5000, 1),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(
+        f.io.hosted_file_identities(f.file),
+        Ok(alloc::vec![receipt])
+    );
 }

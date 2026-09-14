@@ -34114,23 +34114,47 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         pass. No native binding transport, provider readback or VM run is claimed. The last
         measured 27 strict win32k imports and desktop acceptance remain open. The next step is
         native authenticated publication and independently owned retirement, described below.
-      - [ ] Register every native File projection with exact hosted-domain ownership.
-        The 2026-09-14 audit found hosted_domain's typed File bind/unbind APIs have no native
-        driver_launch callers. Component-local FILE_OBJECTS is not an authoritative cross-domain
-        registry. Bind before driver entry; unbind exact identity on final CLOSE/failed-CREATE
-        retirement, including retained-completion ACK, not CLEANUP. Use the canonical per-File
-        enumeration and leases above, carrying exact domain, File, address and binding generation.
-        Current device attachments cannot identify detached filters or retained older projections.
-        Native publication must authenticate the active pump channel and exact admitted CREATE,
-        not trust a caller-supplied FileId. Reserve local slot/IRP owners before reverse bind and
-        resolve uncertain replies before reclaiming a possibly registered allocation. Use Live /
-        Retiring component File slots with exact receipts; failed unbind retains the allocation
-        outside the retiring IRP graph and is redriven by idle/unload maintenance. Do not convert
-        a genuine inline completion into synthetic STATUS_PENDING to hide publication failures.
-        Both immediate completion and retained ACK paths must transfer retirement ownership
-        before freeing graphs or tombstoning IRP owners; they currently reclaim in different order.
-        Refused Allocated/Closed external File release retains caller ownership: DELETE_PENDING
-        does not promise automatic close-queue retirement. Keep and retry that owner explicitly.
+      - [x] Wire generic IRP-host File projection registration and independently owned retirement
+        (2026-09-14; host/composed/native-build validation recorded below).
+        The new File service authenticates the active pump channel and executive-owned admitted
+        CREATE/File tuple, uses the physical provider domain rather than dependent-driver completion
+        attribution, and validates the live pool allocation and WDM Type/Size before binding.
+        Reserved local slots and IRP ownership exist before reverse IPC; only a valid nonzero
+        binding receipt makes the projection Live. CLOSE/failed-CREATE retirement, including ACK,
+        moves storage into Retiring ownership before graph reclamation, never at CLEANUP.
+        Exact generation unbind is replayable. An uncertain bind is resolved by authoritative
+        QUERY without publishing a usable object or freeing possibly bound storage. A tested
+        reply codec rejects malformed/informational replies, including synthetic STATUS_PENDING.
+        The old local-only registry/free path is replaced by focused hosted_file_objects and
+        hosted_file_retirements modules. Bounded rotating component drains and one-second executive
+        timer retries service idle domains without holding manager/table borrows across IPC.
+        Unload and direct instance teardown retain barriers while local retirement is outstanding.
+        Review found failed-CREATE abandonment could drop a refused Allocated/Closed File release.
+        An explicit memory-only deferred-release handoff closes this gap without changing the
+        original release API's refusal semantics or manufacturing a driver CLOSE for failed CREATE.
+        All 761 selected tests pass without failures or ignored cases: 17 driver-runtime,
+        714 I/O Manager library (with object-manager), 15 composed and 15 doc tests. New coverage
+        includes exact wire retirement, stale/reused receipts, irrevocable local retirement,
+        malformed replies, dropped bind/unbind acknowledgements, publication-lease refusal and
+        explicit failed-CREATE release handoff. Evidence:
+        .tmp/test-native-file-projection-runtime-20260914.log,
+        .tmp/test-native-file-projection-manager-20260914.log,
+        .tmp/test-native-file-projection-composed-20260914.log and
+        .tmp/test-native-file-projection-doc-20260914.log. Independent review found no further
+        blocker after the pool-provenance check and failed-CREATE ownership fix.
+        Serialized native release builds pass: executive in 36.89s with the unchanged 294
+        warnings and standalone I/O Manager in 2.36s without warnings. Evidence:
+        .tmp/build-native-file-projection-executive-20260914.log and
+        .tmp/build-native-file-projection-io-manager-20260914.log. Scoped formatting and diff
+        checks pass. No native IPC execution, provider readback, or VM run is claimed; the last
+        measured 27 strict win32k imports and desktop acceptance remain open. Review split the
+        remaining non-IRP projection and runtime acceptance work into the next item below.
+      - [ ] Complete non-IRP File projection ownership and native registration acceptance.
+        The video_device FILE_OBJECT singleton remains outside the generic run_irp registration
+        path. Replace its overwrite/reuse lifetime with exact canonical per-open binding and
+        retirement ownership before claiming every native projection is covered. Validate generic
+        registration/retirement in the VM, including failed CREATE, retained ACK, provider domains,
+        idle retry and unload barriers. Host tests and release builds do not prove those paths ran.
         Audit/reconcile canonical and provider-realized File body state using those bindings:
         initial headers do not prove ongoing Event/Busy/current-position synchronization, and
         CREATE's delete-on-close option is not proof that the filesystem set FO_DELETE_ON_CLOSE.

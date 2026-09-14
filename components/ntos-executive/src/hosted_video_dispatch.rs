@@ -142,7 +142,7 @@ unsafe fn dispatch_video_start_io_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let Some(transfer_guard) = enter_active_hosted_irp_transfer(sh, 0, in_data, out) else {
+    let Some(transfer_guard) = enter_active_hosted_irp_transfer(sh, 0, None, in_data, out) else {
         return HostedIrpTransportResult::NotDispatched {
             status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
         };

@@ -14,12 +14,14 @@
 extern crate alloc;
 
 mod arena;
+mod file_projection;
 mod pool;
 mod projections;
 mod strings;
 mod sync;
 
 pub use arena::Arena;
+pub use file_projection::{decode_file_projection_reply, FileProjectionSlot};
 pub use pool::{Pool, PoolBlock, PoolError};
 pub use projections::{ObjectEntry, ObjectKind, ObjectTable};
 pub use sync::{EventState, EventTable, Irql, APC_LEVEL, DISPATCH_LEVEL, PASSIVE_LEVEL};

@@ -149,6 +149,66 @@ impl<P> IoManager<P> {
             .ok_or(NtStatus::INVALID_PARAMETER)
     }
 
+    /// Observe only the exact authenticated domain/File/address tuple. Retirement may outlive
+    /// the canonical File record, so absence is independent of File lookup and device topology.
+    /// The receipt grants no lifetime; acquire a publication lease before using its projection.
+    pub fn hosted_file_identity_at(
+        &self,
+        domain: HostedDomainIdentity,
+        file: FileId,
+        address: u64,
+    ) -> Result<Option<HostedFileIdentity>, NtStatus> {
+        if file == FileId::NULL || address == 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let record = self
+            .hosted_domains
+            .get(domain.domain_id)
+            .filter(|record| domain.cookie != 0 && record.cookie() == domain.cookie)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        Ok(record
+            .files
+            .iter()
+            .find(|binding| binding.identity.file == file && binding.identity.address == address)
+            .map(|binding| binding.identity))
+    }
+
+    /// Retire a wire identity only in the broker-authenticated domain. Historical generations
+    /// are idempotent, but zero/future generations are not valid retirement receipts. A stored
+    /// opaque receipt is required for removal; no receipt is reconstructed from caller fields.
+    pub fn unbind_authenticated_hosted_file(
+        &mut self,
+        domain: HostedDomainIdentity,
+        file: FileId,
+        address: u64,
+        generation: u64,
+    ) -> Result<HostedFileUnbindOutcome, NtStatus> {
+        if file == FileId::NULL || address == 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let record = self
+            .hosted_domains
+            .get(domain.domain_id)
+            .filter(|record| domain.cookie != 0 && record.cookie() == domain.cookie)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if generation == 0 || generation > record.file_binding_sequence {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let identity = record
+            .files
+            .iter()
+            .find(|binding| {
+                binding.identity.file == file
+                    && binding.identity.address == address
+                    && binding.identity.sequence == generation
+            })
+            .map(|binding| binding.identity);
+        match identity {
+            Some(identity) => self.unbind_hosted_file_identity(identity),
+            None => Ok(HostedFileUnbindOutcome::AlreadyAbsent),
+        }
+    }
+
     /// Exact teardown remains valid after CLOSE; leased native storage must not be freed yet.
     /// Retrying a retired receipt returns AlreadyAbsent without removing any replacement binding.
     /// The final unbind only queues retained close work; it invokes no backend or callback.
