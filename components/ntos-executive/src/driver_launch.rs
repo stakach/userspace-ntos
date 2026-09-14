@@ -805,7 +805,6 @@ const fn hosted_interrupt_policy(irql: u8, mode: u8, share: u8) -> u64 {
 }
 
 const POOL_DATA_OFF: u64 = 0x1000;
-const FILE_OPENED_INFORMATION: u64 = 1;
 const STATUS_PENDING: u32 = 0x0000_0103;
 
 const IRP_MJ_READ: u64 = major::IRP_MJ_READ as u64;
@@ -32915,6 +32914,11 @@ unsafe fn component_dispatch_video_add_device(drv: u64, pdo: u64) -> (i32, u64) 
     {
         return (STATUS_INVALID_DEVICE_REQUEST, 0);
     }
+    let Some(extension_size) = extension_size
+        .checked_add(nt_video_miniport::VIDEO_PORT_DEVICE_STATE_SIZE as u32)
+    else {
+        return (STATUS_INVALID_PARAMETER, 0);
+    };
     let mut device_object = 0u64;
     let status = s_io_create_device(
         drv,
@@ -32934,59 +32938,6 @@ unsafe fn component_dispatch_video_add_device(drv: u64, pdo: u64) -> (i32, u64) 
         }
     } else {
         (status, 0)
-    }
-}
-
-unsafe fn component_video_hw_extension() -> Result<u64, i32> {
-    let device = read_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DEVICE_OBJECT) as *const u64);
-    component_video_hw_extension_for_device(device)
-}
-
-unsafe fn component_video_hw_extension_for_device(device: u64) -> Result<u64, i32> {
-    if read_volatile((FSD_SHARED_VADDR + SH_VIDEO_PORT_INITIALIZED) as *const u32) == 0 {
-        return Err(0xC000_0010u32 as i32); // STATUS_INVALID_DEVICE_REQUEST
-    }
-    let capacity = component_pool_allocation_capacity(device).ok_or(STATUS_INVALID_PARAMETER)?;
-    let extension_size =
-        read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_DEVICE_EXTENSION_SIZE) as *const u32);
-    let required = WDM_X64_DEVICE_OBJECT_SIZE as u64 + u64::from(extension_size);
-    if extension_size == 0 || capacity < required {
-        return Err(STATUS_INVALID_DEVICE_REQUEST);
-    }
-    let driver = read_volatile((FSD_SHARED_VADDR + SH_DRVOBJ) as *const u64);
-    let extension = device + WDM_X64_DEVICE_OBJECT_SIZE as u64;
-    if read_unaligned(device as *const i16) != WDM_X64_IO_TYPE_DEVICE
-        || u64::from(read_unaligned((device + 2) as *const u16)) != required
-        || read_unaligned((device + 8) as *const u64) != driver
-        || read_unaligned((device + 0x40) as *const u64) != extension
-        || read_unaligned((device + 0x48) as *const u32) != nt_video_miniport::FILE_DEVICE_VIDEO
-    {
-        return Err(STATUS_INVALID_DEVICE_REQUEST);
-    }
-    Ok(extension)
-}
-
-unsafe fn component_dispatch_video_initialize(device: u64) -> (i32, u64) {
-    let initialize = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE) as *const u64);
-    let hw_extension = match component_video_hw_extension_for_device(device) {
-        Ok(hw_extension) if initialize != 0 => hw_extension,
-        _ => return (0xC000_0010u32 as i32, 0), // STATUS_INVALID_DEVICE_REQUEST
-    };
-    let init: extern "win64" fn(u64) -> u8 = core::mem::transmute(initialize as *const ());
-    let ok = init(hw_extension);
-    let calls = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_CALLS) as *const u64);
-    write_volatile(
-        (FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_CALLS) as *mut u64,
-        calls.saturating_add(1),
-    );
-    write_volatile(
-        (FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_OK) as *mut u8,
-        ok,
-    );
-    if ok != 0 {
-        (0, FILE_OPENED_INFORMATION)
-    } else {
-        (0xC000_0001u32 as i32, 0) // STATUS_UNSUCCESSFUL
     }
 }
 
@@ -33329,7 +33280,8 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
         {
             return (0xC000_0010u32 as i32, 0); // STATUS_INVALID_DEVICE_REQUEST
         }
-        let hw_extension = match component_video_hw_extension() {
+        let device = read_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DEVICE_OBJECT) as *const u64);
+        let hw_extension = match hosted_video_port_control::begin_find_adapter(device) {
             Ok(extension) => extension,
             Err(status) => return (status, 0),
         };
@@ -33343,6 +33295,7 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
             FSD_ARG_VADDR,
             (&mut again as *mut u8) as u64,
         );
+        hosted_video_port_control::finish_find_adapter(device, status == VP_NO_ERROR);
         let calls = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_FIND_ADAPTER_CALLS) as *const u64);
         write_volatile(
             (FSD_SHARED_VADDR + SH_VIDEO_FIND_ADAPTER_CALLS) as *mut u64,

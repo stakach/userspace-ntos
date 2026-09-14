@@ -9,6 +9,13 @@
 
 mod control;
 pub use control::{classify_start_io_status, VideoControlCompletion, VideoControlProtocolError};
+mod lifecycle;
+pub use lifecycle::{
+    validate_device_control_requestor, VideoAdapterDiscoveryState,
+    VideoHardwareInitializationState, VideoOpenAction,
+    VideoOpenCompletion, VideoPortDeviceState, VideoPortDeviceStateCell, VideoPortLifecycleError,
+    VIDEO_PORT_DEVICE_STATE_SIZE,
+};
 
 pub const FILE_DEVICE_VIDEO: u32 = 0x23;
 

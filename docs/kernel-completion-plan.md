@@ -34245,6 +34245,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         No VM, native pending-video execution or desktop acceptance is claimed. The last measured
         27 strict win32k imports remain open; review expanded the remaining lifecycle/registry
         prerequisites below rather than marking the whole bridge complete.
+      - [x] Retain per-Device VideoPort discovery and hardware initialization state
+        (2026-09-14; host/composed/native-build verified below).
+        Before admitting additional bridge callers, prevent every CREATE from resetting hardware.
+        Store checked port-owned state before each Device's separate hardware-extension bytes;
+        claim discovery and initialization atomically before callback entry and retain the actual
+        success/failure outcome. User opens and exact FILE_READ_ATTRIBUTES opens do not initialize.
+        Normal opens require successful discovery; repeated opens reuse initialization success or
+        fail with the retained configuration error. Do not copy NT5's DeviceOpened fast path that
+        can hide a previous initialization failure. Preserve raw CREATE Information where NT5 sets
+        FILE_OPEN before its configuration checks. Keep CLOSE from erasing hardware state.
+        Native control admission checks actual IRP.RequestorMode and the user brightness allowlist.
+        Host policy tests and native wiring do not establish user-mode provenance at IRP ingress:
+        the current generic WDM producer still initializes RequestorMode to KernelMode. Correct
+        authenticated provenance, session access, queued same-Device contention, and real PnP
+        stop/restart ownership remain open. Busy is an explicit admission failure pending that
+        queue, not synthetic pending or a claim of complete concurrent VideoPort semantics.
+        The production no-std VideoPortDeviceStateCell owns the 16-byte aligned prefix and
+        validates serialized integer state before atomic compare/exchange. Native code reuses
+        that cell, not a second implementation. Discovery retries are admitted only after failed
+        discovery; successful discovery cannot silently rerun without an explicit restart lifetime.
+        A callback fault leaves its claim Running rather than pretending it never entered.
+        All 772 selected tests pass with no failures or ignored cases: 35 video library tests,
+        four WDM composition tests, 717 I/O Manager library tests and 16 exact-control/native-File
+        protocol/video-projection regressions. Eight new library tests include real host-thread
+        contention over the production cell (one discovery, initialization and finish winner),
+        invalid snapshots/modes, access-only opens, discovery retry, retained success/failure and
+        independent devices. Two new composition cases verify combined Device/prefix/hardware
+        allocation layout and unchanged hardware/header bytes across state updates and opens.
+        Evidence: .tmp/test-video-device-lifecycle-20260914.log and
+        .tmp/test-video-device-lifecycle-io-regression-20260914.log. The serialized executive
+        release build passes in 39.68s with the unchanged 294 warnings; standalone I/O Manager
+        also builds without warnings. Evidence: .tmp/build-video-device-lifecycle-executive-20260914.log
+        and .tmp/build-video-device-lifecycle-io-manager-20260914.log. Scoped formatting and diff
+        checks pass. No native callback execution, VM boot, complete multi-adapter acceptance or
+        desktop proof is claimed; the last measured 27 strict win32k imports remain open.
       - [ ] Replace the native video IOCTL bridge with authenticated, owned File-less requests.
         Retain the physical win32k caller, exact Device authority, input/output buffers and reply
         continuation before dispatch. Use detached exact-device preparation rather than holding
@@ -34269,11 +34304,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Device registry identity: snapshotting on inline CREATE return does not protect staged
         records from other ARG-using imports during HwInitialize, deferred completion or future
         concurrent lanes, and driver-wide starting-device metadata is not per-adapter identity.
-        Complete per-Device VideoPort lifecycle policy alongside that state: NT5 CREATE at 564
-        distinguishes user/attribute-only opens, checks FindAdapter success and retains HwInitStatus
-        so repeated opens cannot reinitialize hardware. The ordinary-IRP conversion above preserves
-        existing initialization behavior; it does not yet supply those port-owned lifecycle fields
-        or the requestor-mode/session control access checks at 749.
+        Finish per-Device lifecycle policy beyond the state checkpoint above: authenticated
+        RequestorMode provenance, session/control access, and stop/restart/removal transitions.
+        Do not turn concurrent initialization or discovery into a second miniport callback.
       - [ ] Replace legacy video pointer acquisition with authenticated per-call File ownership.
         NT5 base/ntos/io/iomgr/iosubs.c:7393 and ReactOS ntoskrnl/io/iomgr/device.c:264 open a NEW
         File for each IoGetDeviceObjectPointer call with caller DesiredAccess, no sharing,

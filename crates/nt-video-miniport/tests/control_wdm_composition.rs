@@ -6,8 +6,10 @@ use nt_io_manager::{
     WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IRP_SIZE,
 };
 use nt_video_miniport::{
-    classify_start_io_status, VideoRequestPacketX64, VideoStatusBlockX64, FILE_DEVICE_VIDEO,
-    IOCTL_VIDEO_QUERY_CURRENT_MODE, VIDEO_MODE_INFORMATION_SIZE, VIDEO_REQUEST_PACKET_X64_SIZE,
+    classify_start_io_status, VideoAdapterDiscoveryState, VideoHardwareInitializationState,
+    VideoOpenAction, VideoPortDeviceState, VideoRequestPacketX64, VideoStatusBlockX64,
+    FILE_DEVICE_VIDEO, IOCTL_VIDEO_QUERY_CURRENT_MODE, VIDEO_MODE_INFORMATION_SIZE,
+    VIDEO_PORT_DEVICE_STATE_SIZE, VIDEO_REQUEST_PACKET_X64_SIZE,
 };
 
 const IO_STATUS_OFFSET: usize = 0x30;
@@ -203,5 +205,171 @@ fn vp_completion_mapping_updates_only_original_irp_io_status_with_full_width_inf
             );
             assert_eq!(*request.device, original_device);
         }
+    }
+}
+
+const HARDWARE_EXTENSION_SIZE: usize = 32;
+const HARDWARE_EXTENSION_OFFSET: usize = WDM_X64_DEVICE_OBJECT_SIZE + VIDEO_PORT_DEVICE_STATE_SIZE;
+const COMBINED_DEVICE_SIZE: usize = HARDWARE_EXTENSION_OFFSET + HARDWARE_EXTENSION_SIZE;
+
+#[repr(align(16))]
+struct CombinedDevice([u8; COMBINED_DEVICE_SIZE]);
+
+impl CombinedDevice {
+    fn new() -> Box<Self> {
+        let mut device = Box::new(Self([0; COMBINED_DEVICE_SIZE]));
+        let prefix_address = device.0.as_ptr() as u64 + WDM_X64_DEVICE_OBJECT_SIZE as u64;
+        write_wdm_device_object(
+            &mut device.0[..WDM_X64_DEVICE_OBJECT_SIZE],
+            WdmDeviceObjectInit {
+                size_field: COMBINED_DEVICE_SIZE as u16,
+                device_extension: prefix_address,
+                device_type: FILE_DEVICE_VIDEO,
+                stack_size: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        device.store(VideoPortDeviceState::new());
+        device
+    }
+
+    fn state(&self) -> VideoPortDeviceState {
+        VideoPortDeviceState::parse(&self.0[WDM_X64_DEVICE_OBJECT_SIZE..HARDWARE_EXTENSION_OFFSET])
+            .unwrap()
+    }
+
+    fn store(&mut self, state: VideoPortDeviceState) {
+        assert_eq!(
+            state.write(&mut self.0[WDM_X64_DEVICE_OBJECT_SIZE..HARDWARE_EXTENSION_OFFSET]),
+            Ok(VIDEO_PORT_DEVICE_STATE_SIZE)
+        );
+    }
+
+    fn assert_layout(&self) {
+        assert_eq!(self.0.as_ptr() as usize % 16, 0);
+        assert_eq!(
+            (self.0.as_ptr() as usize + HARDWARE_EXTENSION_OFFSET) % 16,
+            0
+        );
+        assert_eq!(
+            u64_at(&self.0, 0x40),
+            self.0.as_ptr() as u64 + WDM_X64_DEVICE_OBJECT_SIZE as u64
+        );
+        assert_eq!(
+            u16::from_le_bytes(self.0[2..4].try_into().unwrap()) as usize,
+            COMBINED_DEVICE_SIZE
+        );
+    }
+}
+
+#[test]
+fn combined_devices_keep_discovery_and_initialization_state_independent_of_each_other_and_hw_bytes()
+{
+    let mut first = CombinedDevice::new();
+    let mut second = CombinedDevice::new();
+    first.assert_layout();
+    second.assert_layout();
+    assert_ne!(first.0.as_ptr(), second.0.as_ptr());
+    assert_eq!(
+        &first.0[HARDWARE_EXTENSION_OFFSET..],
+        &[0; HARDWARE_EXTENSION_SIZE]
+    );
+    assert_eq!(
+        &second.0[HARDWARE_EXTENSION_OFFSET..],
+        &[0; HARDWARE_EXTENSION_SIZE]
+    );
+    let first_header = first.0[..WDM_X64_DEVICE_OBJECT_SIZE].to_vec();
+    let second_header = second.0[..WDM_X64_DEVICE_OBJECT_SIZE].to_vec();
+    // Miniport-owned contents must survive every subsequent port-state publication.
+    first.0[HARDWARE_EXTENSION_OFFSET..].fill(0x31);
+    second.0[HARDWARE_EXTENSION_OFFSET..].fill(0x72);
+    let mut first_state = first.state();
+    first_state.begin_find_adapter().unwrap();
+    first.store(first_state);
+    assert_eq!(
+        second.state().discovery_state(),
+        VideoAdapterDiscoveryState::NotCalled
+    );
+    let mut second_state = second.state();
+    second_state.begin_find_adapter().unwrap();
+    second.store(second_state);
+    first_state.record_find_adapter(true).unwrap();
+    first.store(first_state);
+    second_state.record_find_adapter(true).unwrap();
+    second.store(second_state);
+    assert_eq!(
+        first_state.begin_open(0, 0x8000_0000).unwrap(),
+        VideoOpenAction::Initialize
+    );
+    first.store(first_state);
+    assert_eq!(
+        first.state().begin_open(0, 0x8000_0000).unwrap(),
+        VideoOpenAction::Busy
+    );
+    assert_eq!(
+        second_state.begin_open(0, 0x8000_0000).unwrap(),
+        VideoOpenAction::Initialize
+    );
+    second.store(second_state);
+    assert_eq!(first_state.finish_initialize(true).unwrap().status, 0);
+    first.store(first_state);
+    assert_eq!(
+        second_state.finish_initialize(false).unwrap().status,
+        0xc000_0182
+    );
+    second.store(second_state);
+    assert_eq!(
+        first.state().initialization_state(),
+        VideoHardwareInitializationState::Succeeded
+    );
+    assert_eq!(
+        second.state().initialization_state(),
+        VideoHardwareInitializationState::Failed
+    );
+    assert_eq!(&first.0[..WDM_X64_DEVICE_OBJECT_SIZE], &first_header);
+    assert_eq!(&second.0[..WDM_X64_DEVICE_OBJECT_SIZE], &second_header);
+    assert_eq!(
+        &first.0[HARDWARE_EXTENSION_OFFSET..],
+        &[0x31; HARDWARE_EXTENSION_SIZE]
+    );
+    assert_eq!(
+        &second.0[HARDWARE_EXTENSION_OFFSET..],
+        &[0x72; HARDWARE_EXTENSION_SIZE]
+    );
+}
+
+#[test]
+fn repeated_opens_preserve_initialized_prefix_and_hardware_extension_contents() {
+    let mut device = CombinedDevice::new();
+    let mut state = device.state();
+    state.begin_find_adapter().unwrap();
+    device.store(state);
+    state.record_find_adapter(true).unwrap();
+    device.store(state);
+    assert_eq!(
+        state.begin_open(0, 0x8000_0000).unwrap(),
+        VideoOpenAction::Initialize
+    );
+    device.store(state);
+    // Model the initialized hardware context, without asserting a native allocator/cache policy.
+    device.0[HARDWARE_EXTENSION_OFFSET..].fill(0x5c);
+    state.finish_initialize(true).unwrap();
+    device.store(state);
+    let initialized = device.0;
+    for (requestor_mode, desired_access, information) in
+        [(0, 0x8000_0000, 1), (0, 0x80, 1), (1, 0x8000_0000, 0)]
+    {
+        let mut state = device.state();
+        assert_eq!(
+            state.begin_open(requestor_mode, desired_access).unwrap(),
+            VideoOpenAction::Complete {
+                status: 0,
+                information
+            }
+        );
+        device.store(state);
+        assert_eq!(device.0, initialized);
+        device.assert_layout();
     }
 }
