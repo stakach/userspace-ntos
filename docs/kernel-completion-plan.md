@@ -34552,6 +34552,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         checks pass. No VM/desktop acceptance is claimed; the last measured 27 strict win32k imports
         remain open. Review kept native suspended-return delivery and asynchronous bootstrap
         completion ownership open below rather than claiming this direct-return receipt enables waits.
+      - [x] Encode hosted return targets and retain abandoned Reply retirement
+        (2026-09-14; host/composed/native-build verified below).
+        Replace ComponentNativeContinuation's loose reply_cap/callback_context/abandon flag with
+        a checked HostedReturnTarget. Live syscall and callback-return modes retain a nonzero
+        reply; callback context exists only in its matching delivery mode. No unused Kernel
+        variant or no-op kernel delivery is introduced. Preserve ordinary syscall status replies,
+        staged callback context installation and empty callback replies through existing terminal
+        stages. Fully abandoned ordinary delivery skips user effects; an abandoned external
+        callback transfer remains uncertain/cancelled, never a fabricated successful handoff.
+        Make abandonment sticky before native effects and track Delete, Retype and checked pool
+        release separately. The previous delete-success/retype-failure path incorrectly left a
+        supposedly live reply and could repeat deletion. New exact, single-use global nonce-fenced
+        attempt tickets retain the current effect and capability after failure. Only confirmed
+        no-effects outcomes permit retry; dropped or uncertain attempts cannot replay. The target
+        becomes Abandoned only after successful recreation and pool publication. Copies are
+        metadata snapshots; the existing continuation frame remains the canonical owner.
+        Move this native retirement adapter into focused component_return.rs. Validate the actual
+        reserved parked Reply slot, reject the current executive Reply, and release all frame
+        borrows before mechanism calls. Publish intent across the entire teardown scope before
+        the first fallible operation. Defer scope teardown during terminal delivery or entered
+        provider resume so a captured return target cannot be replaced under the running pump.
+        Resume and terminal selection reject incomplete retirement. Keep unrelated ordinary LPC
+        continuation types unchanged. Replace silent pool-release success in this path with a
+        checked local publication, and retain bounded failure diagnostics for mechanism errors.
+        Microkernel source review confirms exact Reply Delete/Retype preflight before effects:
+        known invocation errors 1..10 permit current-stage retry, and root Delete's MAX result
+        is a pre-entry pinned-slot refusal. Unknown invocation/transport results are indeterminate.
+        These direct mechanism calls do not dispatch hosted callbacks; no VM proof is implied.
+        Serialized host tests pass 797 cases across 15 suites, with no failures or ignored cases:
+        .tmp/test-component-hosted-return-20260914.log (nt-user-host, nt-component-suspension
+        and nt-provider-wait). Six focused state tests plus a compile-fail ticket test cover both
+        delivery modes, sticky intent, every retirement stage, no-effects retry, dropped/uncertain
+        attempts, nonce exhaustion and cross-instance same-capability fencing. Four composition
+        tests use real suspension lanes to cover selected cancellation, Retype-only retry,
+        ineligible incomplete retirement, terminal stage ownership and stale replacement tickets.
+        These tests model mechanism receipts; they do not execute native Delete/Retype or IPC.
+        Independent native and microkernel source reviews found no blocker within this scope.
+        Serialized native release builds pass: executive in 38.36s with the unchanged 294 warnings
+        and standalone I/O Manager without warnings. Evidence:
+        .tmp/build-component-hosted-return-executive-20260914.log and
+        .tmp/build-component-hosted-return-io-manager-20260914.log. Scoped formatting and diff
+        checks pass; the old abandonment fields and single-pass teardown loop are removed.
+        No VM/desktop acceptance is claimed; the last measured 27 strict win32k imports remain
+        open. Kernel terminal-pending receipt integration and asynchronous bootstrap delivery
+        remain required below before enabling kernel provider waits.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -34575,6 +34620,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         PendingProviderWaitDispatch currently requires hosted client/callback contexts, and
         component_terminal delivers CompletedWin32kDispatch to a hosted syscall reply. A kernel
         terminal recipient must preserve its real initiating caller and return contract instead.
+        Hosted return delivery/abandonment is now explicitly typed as above. Connect the kernel
+        receipt to the existing terminal lifecycle without manufacturing a frame or external token:
+        retain the exact TerminalIdentity and status as terminal-pending, deny ordinary receipt ACK
+        while native terminal authority remains, then expose a deliverable result only after exact
+        terminal retirement. finish_terminal may make the final lane Idle, so calling the current
+        frame-free record_completion afterward is invalid; do not weaken its active-frame guard.
         DriverEntry now consumes a retained direct-return receipt but still depends on synchronous
         component_pump completion; retain that completion ownership across any asynchronous park.
         Use the new retained-lifetime check for Suspended eligibility, followed by strict execution

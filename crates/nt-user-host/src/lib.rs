@@ -14,6 +14,7 @@ pub mod commit_release;
 pub mod object_wait;
 pub mod current_apc;
 pub mod pending_caller;
+pub mod hosted_return_target;
 
 mod mechanism;
 mod ntdll;

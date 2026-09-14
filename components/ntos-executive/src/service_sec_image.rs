@@ -3,9 +3,12 @@
 #![allow(clippy::all)]
 use crate::exec_handler::{HostedCreatePublication, ProviderLocalEventTransfer};
 use crate::*;
+use nt_user_host::hosted_return_target::HostedReturnTarget;
 
 #[path = "component_terminal.rs"]
 mod component_terminal;
+#[path = "component_return.rs"]
+mod component_return;
 #[path = "component_callback_transfer.rs"]
 mod component_callback_transfer;
 #[path = "kernel_provider_activation.rs"]
@@ -219,9 +222,7 @@ impl ComponentSuspensionCompletion {
 #[derive(Clone, Copy)]
 struct ComponentNativeContinuation {
     pending: PendingComponentDispatch,
-    reply_cap: u64,
-    callback_context: Option<win32k_glue::StagedUserCallbackContext>,
-    abandon_native_reply: bool,
+    return_target: HostedReturnTarget<win32k_glue::StagedUserCallbackContext>,
 }
 
 #[derive(Clone, Copy)]
@@ -1747,7 +1748,8 @@ unsafe fn component_suspension_resume_top(
     loop {
         let lane_resume = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
             .next_resumable_if(|frame| {
-                win32k_glue::win32k_client_context_is_admitted(frame.continuation.pending.client())
+                frame.continuation.return_target.can_resume()
+                    && win32k_glue::win32k_client_context_is_admitted(frame.continuation.pending.client())
             })?;
         let lane = lane_resume.lane;
         let reply_object = lane_resume.binding.reply_object;
@@ -2073,9 +2075,11 @@ unsafe fn provider_wait_admit_retained(
     reply_cap: u64,
     callback_transfer: Option<ComponentCallbackTransfer>,
 ) -> bool {
-    if reply_cap == 0 {
+    let Ok(return_target) = HostedReturnTarget::new(
+        reply_cap, callback_transfer.map(|transfer| transfer.context),
+    ) else {
         return false;
-    }
+    };
     let Some(owner) = provider_wait_expected_owner(pending) else {
         return false;
     };
@@ -2083,9 +2087,7 @@ unsafe fn provider_wait_admit_retained(
     let sequence = next_dispatcher_wait_sequence();
     let continuation = ComponentNativeContinuation {
         pending: PendingComponentDispatch::Provider(pending),
-        reply_cap,
-        callback_context: callback_transfer.map(|transfer| transfer.context),
-        abandon_native_reply: false,
+        return_target,
     };
     let lane = pending.dispatch.lane;
     let Ok(binding) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane) else {
@@ -2223,10 +2225,12 @@ unsafe fn lpc_wait_admit_retained(
     let Ok(reservation) = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() else {
         return false;
     };
-    if reply_cap == 0 {
+    let Ok(return_target) = HostedReturnTarget::new(
+        reply_cap, callback_transfer.map(|transfer| transfer.context),
+    ) else {
         let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
         return false;
-    }
+    };
     let Some(owner) = lpc_wait_expected_owner(pending) else {
         let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
         return false;
@@ -2235,9 +2239,7 @@ unsafe fn lpc_wait_admit_retained(
     let sequence = next_dispatcher_wait_sequence();
     let continuation = ComponentNativeContinuation {
         pending: PendingComponentDispatch::Lpc(pending),
-        reply_cap,
-        callback_context: callback_transfer.map(|transfer| transfer.context),
-        abandon_native_reply: false,
+        return_target,
     };
     let lane = pending.dispatch.lane;
     let Ok(binding) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane) else {
@@ -2327,48 +2329,6 @@ unsafe fn component_suspension_drain_ready(
     drained
 }
 
-unsafe fn component_suspension_prepare_abandoned_replies(
-    scope: nt_component_suspension::SuspensionScope,
-) -> bool {
-    // Terminal delivery owns the reply through its final local ACK. Teardown must not delete
-    // or retype that capability while a copyout, context write, or reply is in flight.
-    if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).has_terminal_in_scope(scope) {
-        return false;
-    }
-    loop {
-        let target = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
-            .frames()
-            .find(|(_, frame)| {
-                scope.matches(frame.owner) && !frame.continuation.abandon_native_reply
-            })
-            .map(|(lane, frame)| (lane, frame.key));
-        let Some((lane, wait_key)) = target else {
-            return true;
-        };
-        let frame = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-            .frame_mut(lane, wait_key)
-            .ok()
-            .flatten()
-            .expect("provider wait teardown target disappeared");
-        let cap = frame.continuation.reply_cap;
-        if cap != 0 {
-            let deleted = cnode_delete_r(cap);
-            let retyped = if deleted == 0 {
-                untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
-            } else {
-                u64::MAX
-            };
-            if deleted != 0 || retyped != 0 {
-                return false;
-            }
-            release_reply_pool_cap(cap);
-            frame.continuation.reply_cap = 0;
-            PROVIDER_WAIT_NATIVE_REPLIES_ABANDONED.fetch_add(1, Ordering::Relaxed);
-        }
-        frame.continuation.abandon_native_reply = true;
-    }
-}
-
 unsafe fn component_suspension_cancel_scope(
     nt_handler: &mut ExecNtHandler,
     scope: nt_component_suspension::SuspensionScope,
@@ -2379,7 +2339,7 @@ unsafe fn component_suspension_cancel_scope(
     if !(&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).contains_scope(scope) {
         return true;
     }
-    if !component_suspension_prepare_abandoned_replies(scope) {
+    if !component_return::prepare_abandoned_replies(scope) {
         return false;
     }
     while let Some((lane, wait_key)) =

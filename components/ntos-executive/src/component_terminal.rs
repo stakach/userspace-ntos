@@ -2,6 +2,7 @@
 
 use super::*;
 use nt_component_suspension::{TerminalPhase, TerminalStage, TerminalStageOutcome};
+use nt_user_host::hosted_return_target::HostedReply;
 
 pub(super) struct NativeTerminal {
     dispatch: Option<win32k_glue::CompletedWin32kDispatch>,
@@ -164,10 +165,13 @@ unsafe fn process_output(
     procs: &mut [ProcExec],
     pfilled: &mut [[u64; 512]],
 ) {
-    if continuation.abandon_native_reply {
-        assert_eq!(continuation.reply_cap, 0);
+    if continuation.return_target.is_abandoned() {
         return;
     }
+    assert!(
+        continuation.return_target.delivery().is_some(),
+        "retiring target cannot deliver output"
+    );
     let Some(dispatch) = terminal.dispatch else {
         return;
     };
@@ -196,18 +200,16 @@ unsafe fn process_output(
 }
 
 unsafe fn retire_reply(continuation: ComponentNativeContinuation) -> Result<(), u32> {
-    if continuation.abandon_native_reply {
-        assert_eq!(continuation.reply_cap, 0);
+    if continuation.return_target.is_abandoned() {
         return Ok(());
     }
-    let record = wait_reply_pool_mut()
-        .iter_mut()
-        .find(|record| record.cap == continuation.reply_cap && record.used)
+    let reply = continuation
+        .return_target
+        .delivery()
         .ok_or(0xC000_0008u32)?;
     // This local mutation and finish_terminal below perform no IPC or allocation. The reply
     // remains reserved until its mechanism ACK, and the terminal row is the sole retiring owner.
-    record.used = false;
-    Ok(())
+    parked_reply::retire_sent(reply.reply_cap())
 }
 
 pub(super) unsafe fn drain(
@@ -219,9 +221,10 @@ pub(super) unsafe fn drain(
     let mut cursor = None;
     while let Some(identity) =
         (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).next_terminal_if(|identity, terminal| {
-            cursor.is_none_or(|cursor| {
-                (terminal.frame.admission_sequence, identity.lane().index) > cursor
-            })
+            terminal.frame.continuation.return_target.can_resume()
+                && cursor.is_none_or(|cursor| {
+                    (terminal.frame.admission_sequence, identity.lane().index) > cursor
+                })
         })
     {
         let reply_object = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
@@ -251,12 +254,13 @@ pub(super) unsafe fn drain(
                         .expect("callback stage lost its owned payload");
                     // Only local payload ownership crosses IPC; the coordinator's Invoking
                     // phase fences new execution and teardown without retaining a global borrow.
-                    let result = if continuation.abandon_native_reply {
-                        assert_eq!(continuation.reply_cap, 0);
+                    let result = if continuation.return_target.is_abandoned() {
                         // Logical cancellation is not proof that the parked callback completed.
                         // Retain it for acknowledged cancellation/quiescence, never fake a Reply.
                         Err(0xC000_0120)
                     } else {
+                        let reply = continuation.return_target.delivery()
+                            .expect("retiring target cannot transfer a callback");
                         match stage {
                             TerminalStage::Output => callback.prepare(),
                             TerminalStage::Context => callback.install(),
@@ -264,7 +268,7 @@ pub(super) unsafe fn drain(
                             TerminalStage::Reply => {
                                 if callback.phase() != component_callback_transfer::TransferPhase::Published {
                                     Err(0xC000_000D)
-                                } else if client_reply_on(continuation.reply_cap, 0, 0, 0, 0, 0) {
+                                } else if client_reply_on(reply.reply_cap(), 0, 0, 0, 0, 0) {
                                     Ok(())
                                 } else {
                                     Err(0xC000_0001)
@@ -298,26 +302,29 @@ pub(super) unsafe fn drain(
                         .expect("terminal output ACK lost its owner");
                     continue;
                 }
-                let accepted = if continuation.abandon_native_reply {
-                    assert_eq!(continuation.reply_cap, 0);
+                let accepted = if continuation.return_target.is_abandoned() {
                     true
                 } else {
+                    let reply = continuation.return_target.delivery()
+                        .expect("retiring target cannot deliver a terminal result");
                     match stage {
-                        TerminalStage::Context => {
-                            continuation.callback_context.is_none_or(|context| {
+                        TerminalStage::Context => match reply {
+                            HostedReply::Syscall { .. } => true,
+                            HostedReply::Callback { context, .. } => {
                                 win32k_glue::complete_staged_user_callback_context(
                                     context,
                                     payload.status,
                                 )
-                            })
-                        }
-                        TerminalStage::Reply => {
-                            if continuation.callback_context.is_some() {
-                                client_reply_on(continuation.reply_cap, 0, 0, 0, 0, 0)
-                            } else {
-                                reply_parked_syscall(continuation.reply_cap, payload.status)
                             }
-                        }
+                        },
+                        TerminalStage::Reply => match reply {
+                            HostedReply::Callback { reply_cap, .. } => {
+                                client_reply_on(reply_cap, 0, 0, 0, 0, 0)
+                            }
+                            HostedReply::Syscall { reply_cap } => {
+                                reply_parked_syscall(reply_cap, payload.status)
+                            }
+                        },
                         TerminalStage::Publication => true,
                         TerminalStage::Output => unreachable!(),
                     }
