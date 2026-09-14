@@ -39,12 +39,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
 ### Current Desktop Frontier
 
 Latest measured NT boot (2026-09-14): a fresh normal headless build/boot reaches strict win32k
-admission with 27 absent bindings. Source audit corrected the initial reading of its 28 diagnostic
-lines: MmMapViewInSystemSpace is bound, but global registry rejection caused the first IAT lookup
-to report it as an additional miss. The executive stops before DriverEntry or desktop rendering;
+admission with exactly 27 unresolved-import diagnostics and an explicit incomplete-registry
+rejection. MmMapViewInSystemSpace no longer appears as a spurious extra miss from global catalog
+failure. The executive stops before DriverEntry or desktop rendering;
 the VM was terminated at that deterministic barrier. Evidence and the exact import set are in the
-IRQ receive-continuation checkpoint below. Older desktop proofs are historical baselines, not
-acceptance of the current provider cutover.
+strict-registry and IRQ receive-continuation checkpoints below. Older desktop proofs are historical
+baselines, not acceptance of the current provider cutover.
 
 - [x] Correct secured-memory ownership and native VM protection/lifetime enforcement (tranche 19).
 - [x] Extract and harden the shared AMD64 unwind interpreter (tranche 20).
@@ -34804,6 +34804,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         allocation-failure rejection; a failed catalog no longer invents a miss on the first bound
         image import. Three regressions cover incomplete/complete catalogs and allocation failure.
         All 49 nt-compat-exports tests pass: .tmp/test-strict-registry-admission-20260914.log.
+        Fresh normal ./run.sh validation after commit 7d35e932 rebuilt ntdll, the executive,
+        rust-micro and disk image, then reached exactly 27 unresolved-import lines followed by
+        "reject image: incomplete kernel export registry" and the main.rs:29960 rejection.
+        Evidence: .tmp/run-kernel-wait-capture-20260914.log and
+        .tmp/boot-kernel-wait-capture-20260914.log. QEMU was terminated with SIGTERM immediately
+        after confirming this deterministic barrier, within BOOT_TIMEOUT_SECONDS=300; the runner
+        correctly exits failure without a successful guest/Explorer verdict. No QEMU remains.
+        This is live proof of strict loader reporting, not native kernel-wait or desktop proof.
         This corrects reporting, not implementation coverage. The existing system-space mapping
         binding remains a legacy pool-backed implementation needing real section/VSpace ownership;
         do not count the absence of its misleading diagnostic as a completed Mm cutover.
