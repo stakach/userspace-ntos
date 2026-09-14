@@ -4602,10 +4602,14 @@ unsafe fn current_provider_wait_owner() -> Option<nt_provider_wait::ProviderWait
     let owner = nt_provider_wait::ProviderWaitOwner {
         provider_domain: provider.domain,
         provider_generation: provider.generation,
-        client_pi: header.client_pi,
-        client_generation,
-        client_tid: header.client_tid,
-        client_badge: header.client_badge,
+        caller: nt_component_suspension::SuspensionCaller::Hosted(
+            nt_component_suspension::SuspensionHostedClient {
+                client_pi: header.client_pi,
+                client_generation,
+                client_tid: header.client_tid,
+                client_badge: header.client_badge,
+            },
+        ),
         dispatch_id: header.dispatch_id,
     };
     if !owner.is_valid() {
@@ -4644,6 +4648,9 @@ unsafe fn provider_wait_rendezvous(
     timeout: u64,
 ) -> i32 {
     let Some(owner) = current_provider_wait_owner() else {
+        return 0xC000_000Du32 as i32;
+    };
+    let Some(client) = owner.hosted_client() else {
         return 0xC000_000Du32 as i32;
     };
     let Some(wait_id) = next_provider_wait_id() else {
@@ -4703,7 +4710,7 @@ unsafe fn provider_wait_rendezvous(
     trace_provider_wait_component(
         b"submit",
         wait_id,
-        (u64::from(owner.client_pi) << 32) | owner.client_tid,
+        (u64::from(client.client_pi) << 32) | client.client_tid,
         objects.len() as u64,
     );
     let mut outgoing = W32_PROVIDER_WAIT_LABEL << 12;

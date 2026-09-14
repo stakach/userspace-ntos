@@ -14,10 +14,12 @@ fn owner(id: u64) -> SuspensionOwner {
     SuspensionOwner {
         provider_domain: 3,
         provider_generation: 7,
-        client_pi: 2,
-        client_generation: 11,
-        client_tid: 24,
-        client_badge: 4,
+        caller: SuspensionCaller::Hosted(SuspensionHostedClient {
+            client_pi: 2,
+            client_generation: 11,
+            client_tid: 24,
+            client_badge: 4,
+        }),
         dispatch_id: id,
     }
 }

@@ -146,14 +146,18 @@ impl nt_provider_wait::ProviderDispatcherWaitBackend for ExecNtHandler {
             domain: owner.provider_domain,
             generation: owner.provider_generation,
         };
-        let Some(client_pid) = self.pm_pid_for_pi(owner.client_pi as usize) else {
+        // Kernel wait admission requires its real activation and thread lease, not a process ID.
+        let Some(client) = owner.hosted_client() else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        let Some(client_pid) = self.pm_pid_for_pi(client.client_pi as usize) else {
             return Err(STATUS_INVALID_PARAMETER);
         };
         let current_client_generation = self
-            .hosted_process_generation(owner.client_pi as usize)
+            .hosted_process_generation(client.client_pi as usize)
             .unwrap_or(0);
         if !crate::win32k_provider_domain_is_current(provider)
-            || current_client_generation != owner.client_generation
+            || current_client_generation != client.client_generation
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
@@ -175,7 +179,7 @@ impl nt_provider_wait::ProviderDispatcherWaitBackend for ExecNtHandler {
                     ),
                     nt_kernel_exec::EventObjectOwner::new(
                         client_pid as u64,
-                        owner.client_generation,
+                        client.client_generation,
                     ),
                 ) {
                     return Err(STATUS_INVALID_PARAMETER);

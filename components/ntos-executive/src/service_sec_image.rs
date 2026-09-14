@@ -1476,10 +1476,14 @@ fn provider_wait_expected_owner(
     let owner = nt_provider_wait::ProviderWaitOwner {
         provider_domain: identity.domain,
         provider_generation: identity.generation,
-        client_pi: pending.client.pi,
-        client_generation: pending.client.generation,
-        client_tid: pending.client.tid,
-        client_badge: pending.client.badge,
+        caller: nt_component_suspension::SuspensionCaller::Hosted(
+            nt_component_suspension::SuspensionHostedClient {
+                client_pi: pending.client.pi,
+                client_generation: pending.client.generation,
+                client_tid: pending.client.tid,
+                client_badge: pending.client.badge,
+            },
+        ),
         dispatch_id: pending.dispatch.dispatch_id,
     };
     owner.is_valid().then_some(owner)
@@ -1497,10 +1501,14 @@ fn lpc_wait_expected_owner(
     let owner = nt_provider_wait::ProviderWaitOwner {
         provider_domain: identity.domain,
         provider_generation: identity.generation,
-        client_pi: pending.client.pi,
-        client_generation: pending.client.generation,
-        client_tid: pending.client.tid,
-        client_badge: pending.client.badge,
+        caller: nt_component_suspension::SuspensionCaller::Hosted(
+            nt_component_suspension::SuspensionHostedClient {
+                client_pi: pending.client.pi,
+                client_generation: pending.client.generation,
+                client_tid: pending.client.tid,
+                client_badge: pending.client.badge,
+            },
+        ),
         dispatch_id: pending.dispatch.dispatch_id,
     };
     owner.is_valid().then_some(owner)
@@ -1512,20 +1520,6 @@ fn component_expected_owner(
     match pending {
         PendingComponentDispatch::Provider(pending) => provider_wait_expected_owner(pending),
         PendingComponentDispatch::Lpc(pending) => lpc_wait_expected_owner(pending),
-    }
-}
-
-fn component_suspension_owner(
-    owner: nt_provider_wait::ProviderWaitOwner,
-) -> nt_component_suspension::SuspensionOwner {
-    nt_component_suspension::SuspensionOwner {
-        provider_domain: owner.provider_domain,
-        provider_generation: owner.provider_generation,
-        client_pi: owner.client_pi,
-        client_generation: owner.client_generation,
-        client_tid: owner.client_tid,
-        client_badge: owner.client_badge,
-        dispatch_id: owner.dispatch_id,
     }
 }
 
@@ -1856,7 +1850,7 @@ unsafe fn component_suspension_resume_top(
                         resume.key,
                         next_key,
                         sequence,
-                        component_suspension_owner(next_owner),
+                        next_owner,
                         next_continuation,
                     )
                     .is_err()
@@ -2059,7 +2053,7 @@ unsafe fn provider_wait_admit_retained(
             transfer.token,
             provider_wait_key(wait_id),
             sequence,
-            component_suspension_owner(owner),
+            owner,
             continuation,
         )
     } else {
@@ -2068,7 +2062,7 @@ unsafe fn provider_wait_admit_retained(
             binding.reply_object,
             provider_wait_key(wait_id),
             sequence,
-            component_suspension_owner(owner),
+            owner,
             continuation,
         )
     };
@@ -2212,7 +2206,7 @@ unsafe fn lpc_wait_admit_retained(
             transfer.token,
             key,
             sequence,
-            component_suspension_owner(owner),
+            owner,
             continuation,
         )
     } else {
@@ -2221,7 +2215,7 @@ unsafe fn lpc_wait_admit_retained(
             binding.reply_object,
             key,
             sequence,
-            component_suspension_owner(owner),
+            owner,
             continuation,
         )
     };
@@ -2457,7 +2451,9 @@ pub(crate) unsafe fn provider_wait_cancel_client_process(
 /// fence stale generations: process-slot reuse must not make those records refer to a new VM.
 pub(crate) unsafe fn client_has_vm_continuations(pi: u32) -> bool {
     if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).frames()
-        .any(|(_, frame)| frame.owner.client_pi == pi)
+        .any(|(_, frame)| {
+            frame.owner.hosted_client().is_some_and(|client| client.client_pi == pi)
+        })
         || (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS)).iter()
             .any(|waiter| waiter.used && waiter.pi == pi)
         || (&*core::ptr::addr_of!(DEFERRED_CALLBACK_RETURNS)).iter()
@@ -2477,11 +2473,13 @@ pub(crate) unsafe fn client_has_vm_continuations(pi: u32) -> bool {
             .is_some_and(|wait| wait.continuation.pi == pi))
 }
 
-fn component_suspension_top_owns_dispatch(dispatch_id: u64) -> bool {
+fn component_suspension_owns_hosted_dispatch(dispatch_id: u64) -> bool {
     unsafe {
         (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
             .frames()
-            .any(|(_, frame)| frame.owner.dispatch_id == dispatch_id)
+            .any(|(_, frame)| {
+                frame.owner.hosted_client().is_some() && frame.owner.dispatch_id == dispatch_id
+            })
     }
 }
 
@@ -11083,7 +11081,7 @@ pub(crate) unsafe fn service_sec_image(
                                         procs,
                                         pfilled,
                                     );
-                                    if component_suspension_top_owns_dispatch(dispatch_id) {
+                                    if component_suspension_owns_hosted_dispatch(dispatch_id) {
                                         mark_wait_parked!(pi, resume_ip);
                                     }
                                     let _ = finalize_service_loop_state(&mut nt_handler);
@@ -11121,7 +11119,7 @@ pub(crate) unsafe fn service_sec_image(
                                         procs,
                                         pfilled,
                                     );
-                                    if component_suspension_top_owns_dispatch(dispatch_id) {
+                                    if component_suspension_owns_hosted_dispatch(dispatch_id) {
                                         mark_wait_parked!(pi, resume_ip);
                                     }
                                     let _ = finalize_service_loop_state(&mut nt_handler);
@@ -17070,7 +17068,7 @@ pub(crate) unsafe fn service_sec_image(
                 procs[pi].ntfaults = ntfaults;
                 pfilled[pi] = *filled_pages;
                 let _ = component_suspension_drain_ready(&mut nt_handler, procs, pfilled);
-                if component_suspension_top_owns_dispatch(component_suspension_admitted_dispatch_id)
+                if component_suspension_owns_hosted_dispatch(component_suspension_admitted_dispatch_id)
                 {
                     mark_wait_parked!(pi, resume_ip);
                 }

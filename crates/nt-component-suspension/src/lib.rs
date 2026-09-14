@@ -51,111 +51,8 @@ impl SuspensionKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SuspensionOwner {
-    pub provider_domain: u64,
-    pub provider_generation: u64,
-    pub client_pi: u32,
-    pub client_generation: u64,
-    pub client_tid: u64,
-    pub client_badge: u64,
-    pub dispatch_id: u64,
-}
-
-impl SuspensionOwner {
-    pub const fn is_valid(self) -> bool {
-        self.provider_domain != 0
-            && self.provider_generation != 0
-            && self.client_generation != 0
-            && self.client_tid != 0
-            && self.client_badge != 0
-            && self.dispatch_id != 0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SuspensionScope {
-    Provider {
-        domain: u64,
-        generation: u64,
-    },
-    Process {
-        domain: u64,
-        provider_generation: u64,
-        client_pi: u32,
-        client_generation: u64,
-    },
-    Thread {
-        domain: u64,
-        provider_generation: u64,
-        client_pi: u32,
-        client_generation: u64,
-        client_tid: u64,
-        client_badge: u64,
-    },
-}
-
-impl SuspensionScope {
-    pub const fn is_valid(self) -> bool {
-        match self {
-            Self::Provider { domain, generation } => domain != 0 && generation != 0,
-            Self::Process {
-                domain,
-                provider_generation,
-                client_generation,
-                ..
-            } => domain != 0 && provider_generation != 0 && client_generation != 0,
-            Self::Thread {
-                domain,
-                provider_generation,
-                client_generation,
-                client_tid,
-                client_badge,
-                ..
-            } => {
-                domain != 0
-                    && provider_generation != 0
-                    && client_generation != 0
-                    && client_tid != 0
-                    && client_badge != 0
-            }
-        }
-    }
-
-    pub const fn matches(self, owner: SuspensionOwner) -> bool {
-        match self {
-            Self::Provider { domain, generation } => {
-                owner.provider_domain == domain && owner.provider_generation == generation
-            }
-            Self::Process {
-                domain,
-                provider_generation,
-                client_pi,
-                client_generation,
-            } => {
-                owner.provider_domain == domain
-                    && owner.provider_generation == provider_generation
-                    && owner.client_pi == client_pi
-                    && owner.client_generation == client_generation
-            }
-            Self::Thread {
-                domain,
-                provider_generation,
-                client_pi,
-                client_generation,
-                client_tid,
-                client_badge,
-            } => {
-                owner.provider_domain == domain
-                    && owner.provider_generation == provider_generation
-                    && owner.client_pi == client_pi
-                    && owner.client_generation == client_generation
-                    && owner.client_tid == client_tid
-                    && owner.client_badge == client_badge
-            }
-        }
-    }
-}
+mod owner;
+pub use owner::{SuspensionCaller, SuspensionHostedClient, SuspensionOwner, SuspensionScope};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SuspensionPhase<R> {
@@ -407,9 +304,7 @@ impl<C, R> ComponentSuspensionStack<C, R> {
         }
         if self.frames.iter().any(|frame| {
             frame.key == key
-                || (frame.owner.provider_domain == owner.provider_domain
-                    && frame.owner.provider_generation == owner.provider_generation
-                    && frame.owner.dispatch_id == owner.dispatch_id)
+                || frame.owner.same_dispatch(owner)
         }) {
             return Err(SuspensionError::DuplicateIdentity);
         }
@@ -729,6 +624,22 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         self.active_dispatch_identity(identity.lane) == Ok(Some(identity))
     }
 
+    fn validate_dispatch_owner(
+        &self,
+        handle: LaneHandle,
+        owner: SuspensionOwner,
+    ) -> Result<(), LaneError> {
+        if let SuspensionCaller::Kernel { lane } = owner.caller {
+            let dispatch = self
+                .active_dispatch_identity(handle)?
+                .ok_or(LaneError::InvalidIdentity)?;
+            if !owner.is_valid() || lane != handle || owner.dispatch_id != dispatch.epoch() {
+                return Err(LaneError::InvalidIdentity);
+            }
+        }
+        Ok(())
+    }
+
     pub fn suspension_count(&self, handle: LaneHandle) -> Result<usize, LaneError> {
         Ok(self.lane(handle)?.suspensions.len())
     }
@@ -1013,13 +924,12 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             return Err(LaneError::InvalidIdentity);
         }
         self.validate_running(handle, reply_object)?;
+        self.validate_dispatch_owner(handle, owner)?;
         if self.slots.iter().any(|slot| {
             slot.lane.as_ref().is_some_and(|lane| {
                 lane.suspensions.get(key).is_some()
                     || lane.suspensions.frames().iter().any(|frame| {
-                        frame.owner.provider_domain == owner.provider_domain
-                            && frame.owner.provider_generation == owner.provider_generation
-                            && frame.owner.dispatch_id == owner.dispatch_id
+                        frame.owner.same_dispatch(owner)
                     })
             })
         }) {
@@ -1048,13 +958,12 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         continuation: C,
     ) -> Result<(), LaneError> {
         self.validate_running(handle, reply_object)?;
+        self.validate_dispatch_owner(handle, owner)?;
         if self.slots.iter().any(|slot| {
             slot.lane.as_ref().is_some_and(|lane| {
                 lane.suspensions.get(key).is_some()
                     || lane.suspensions.frames().iter().any(|frame| {
-                        frame.owner.provider_domain == owner.provider_domain
-                            && frame.owner.provider_generation == owner.provider_generation
-                            && frame.owner.dispatch_id == owner.dispatch_id
+                        frame.owner.same_dispatch(owner)
                     })
             })
         }) {
@@ -1318,6 +1227,7 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
         continuation: C,
     ) -> Result<(), LaneError> {
         self.validate_running(handle, reply_object)?;
+        self.validate_dispatch_owner(handle, owner)?;
         if self.slots.iter().any(|slot| {
             slot.lane
                 .as_ref()
@@ -1372,6 +1282,9 @@ impl<C, R: Clone> ComponentSuspensionLanes<C, R> {
 mod dispatch_identity_tests;
 
 #[cfg(test)]
+mod kernel_owner_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1379,10 +1292,12 @@ mod tests {
         SuspensionOwner {
             provider_domain: 3,
             provider_generation: 7,
-            client_pi: 2,
-            client_generation: 11,
-            client_tid: 24 + dispatch_id,
-            client_badge: 4 + dispatch_id,
+            caller: SuspensionCaller::Hosted(SuspensionHostedClient {
+                client_pi: 2,
+                client_generation: 11,
+                client_tid: 24 + dispatch_id,
+                client_badge: 4 + dispatch_id,
+            }),
             dispatch_id,
         }
     }

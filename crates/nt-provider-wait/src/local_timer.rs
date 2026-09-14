@@ -781,10 +781,12 @@ mod tests {
         ProviderWaitOwner {
             provider_domain: 7,
             provider_generation: 3,
-            client_pi: 2,
-            client_generation: 4,
-            client_tid: 24,
-            client_badge: 9,
+            caller: crate::SuspensionCaller::Hosted(crate::SuspensionHostedClient {
+                client_pi: 2,
+                client_generation: 4,
+                client_tid: 24,
+                client_badge: 9,
+            }),
             dispatch_id: 11,
         }
     }

@@ -3375,11 +3375,14 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     let Some(request) = pending.request.validate().ok() else {
         return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     };
+    let Some(client) = request.owner.hosted_client() else {
+        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+    };
     if request.wait_id != wait_id
-        || request.owner.client_pi != pending.client.pi
-        || request.owner.client_generation != pending.client.generation
-        || request.owner.client_tid != pending.client.tid
-        || request.owner.client_badge != pending.client.badge
+        || client.client_pi != pending.client.pi
+        || client.client_generation != pending.client.generation
+        || client.client_tid != pending.client.tid
+        || client.client_badge != pending.client.badge
         || request.owner.dispatch_id != pending.dispatch.dispatch_id
     {
         return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);

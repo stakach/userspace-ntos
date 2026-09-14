@@ -111,10 +111,7 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
     }
 
     pub fn lease_count(&self) -> usize {
-        self.waiters
-            .iter()
-            .map(|waiter| waiter.leases.len())
-            .sum()
+        self.waiters.iter().map(|waiter| waiter.leases.len()).sum()
     }
 
     pub fn contains(&self, wait_id: u64) -> bool {
@@ -152,10 +149,7 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
             return Err(ProviderDispatcherWaitError::InvalidAdmissionSequence);
         }
         if self.waiters.iter().any(|waiter| {
-            waiter.wait_id == request.wait_id
-                || (waiter.owner.provider_domain == request.owner.provider_domain
-                    && waiter.owner.provider_generation == request.owner.provider_generation
-                    && waiter.owner.dispatch_id == request.owner.dispatch_id)
+            waiter.wait_id == request.wait_id || waiter.owner.same_dispatch(request.owner)
         }) {
             return Err(ProviderDispatcherWaitError::DuplicateWait);
         }
@@ -509,10 +503,12 @@ mod tests {
         ProviderWaitOwner {
             provider_domain: 7,
             provider_generation: 2,
-            client_pi: 3,
-            client_generation: 5,
-            client_tid: 11,
-            client_badge: 13,
+            caller: crate::SuspensionCaller::Hosted(crate::SuspensionHostedClient {
+                client_pi: 3,
+                client_generation: 5,
+                client_tid: 11,
+                client_badge: 13,
+            }),
             dispatch_id,
         }
     }
@@ -588,6 +584,84 @@ mod tests {
             })
         );
         assert!(!backend.events[&(2, 1)].signaled);
+        assert_eq!(backend.lease_count(), 0);
+    }
+
+    #[test]
+    fn kernel_wait_requires_exact_lane_generation_and_caller_kind_before_leasing() {
+        let hosted = owner(1);
+        let identity = ProviderWaitOwner {
+            caller: crate::SuspensionCaller::Kernel {
+                lane: crate::LaneHandle {
+                    index: 0,
+                    generation: 4,
+                },
+            },
+            ..hosted
+        };
+        let wait = request(
+            identity,
+            40,
+            ProviderWaitType::Any,
+            ProviderWaitTimeoutKind::Infinite,
+            0,
+            &[event(1)],
+        );
+        let mut backend = Backend::default();
+        backend.insert(identity, event(1), false, false);
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
+        for expected in [
+            hosted,
+            ProviderWaitOwner {
+                provider_generation: 3,
+                ..identity
+            },
+            ProviderWaitOwner {
+                caller: crate::SuspensionCaller::Kernel {
+                    lane: crate::LaneHandle {
+                        index: 0,
+                        generation: 5,
+                    },
+                },
+                ..identity
+            },
+            ProviderWaitOwner {
+                caller: crate::SuspensionCaller::Kernel {
+                    lane: crate::LaneHandle {
+                        index: 1,
+                        generation: 4,
+                    },
+                },
+                ..identity
+            },
+        ] {
+            assert_eq!(
+                arbiter.admit(&mut backend, &wait, expected, 1, now(0, 0)),
+                Err(ProviderDispatcherWaitError::OwnerMismatch),
+            );
+            assert_eq!(backend.lease_count(), 0);
+            assert!(arbiter.is_empty());
+        }
+        assert_eq!(
+            arbiter.admit(&mut backend, &wait, identity, 1, now(0, 0)),
+            Ok(ProviderDispatcherWaitAdmission::Parked { wait_id: 40 }),
+        );
+        let duplicate = request(
+            identity,
+            41,
+            ProviderWaitType::Any,
+            ProviderWaitTimeoutKind::Infinite,
+            0,
+            &[event(1)],
+        );
+        assert_eq!(
+            arbiter.admit(&mut backend, &duplicate, identity, 2, now(0, 0)),
+            Err(ProviderDispatcherWaitError::DuplicateWait),
+        );
+        assert_eq!(backend.lease_count(), 1);
+        arbiter
+            .cancel(&mut backend, 40, 0xC000_0120u32 as i32)
+            .unwrap();
         assert_eq!(backend.lease_count(), 0);
     }
 
@@ -681,7 +755,10 @@ mod tests {
             4,
             now(0, 0),
         );
-        assert_eq!(result, Err(ProviderDispatcherWaitError::Backend("injected")));
+        assert_eq!(
+            result,
+            Err(ProviderDispatcherWaitError::Backend("injected"))
+        );
         assert_eq!(backend.lease_count(), 0);
         assert!(arbiter.is_empty());
     }
@@ -772,22 +849,12 @@ mod tests {
             Ok(ProviderDispatcherWaitAdmission::Parked { wait_id: 25 })
         );
         assert!(arbiter
-            .interrupt_alertable(
-                &mut backend,
-                25,
-                identity,
-                ProviderWaitInterrupt::UserApc,
-            )
+            .interrupt_alertable(&mut backend, 25, identity, ProviderWaitInterrupt::UserApc,)
             .is_none());
         assert_eq!(backend.lease_count(), 1);
 
         let completion = arbiter
-            .interrupt_alertable(
-                &mut backend,
-                25,
-                identity,
-                ProviderWaitInterrupt::Alerted,
-            )
+            .interrupt_alertable(&mut backend, 25, identity, ProviderWaitInterrupt::Alerted)
             .unwrap();
         assert_eq!(completion.status, STATUS_ALERTED);
         assert!(!completion.cancelled);
@@ -824,12 +891,7 @@ mod tests {
             )
             .is_none());
         let completion = arbiter
-            .interrupt_alertable(
-                &mut backend,
-                26,
-                identity,
-                ProviderWaitInterrupt::UserApc,
-            )
+            .interrupt_alertable(&mut backend, 26, identity, ProviderWaitInterrupt::UserApc)
             .unwrap();
         assert_eq!(completion.status, STATUS_USER_APC);
         assert!(!completion.cancelled);

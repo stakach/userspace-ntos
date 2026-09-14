@@ -9,10 +9,12 @@ fn owner(id: u64) -> SuspensionOwner {
     SuspensionOwner {
         provider_domain: 1,
         provider_generation: 2,
-        client_pi: 3,
-        client_generation: 4,
-        client_tid: 5,
-        client_badge: 6,
+        caller: SuspensionCaller::Hosted(SuspensionHostedClient {
+            client_pi: 3,
+            client_generation: 4,
+            client_tid: 5,
+            client_badge: 6,
+        }),
         dispatch_id: id,
     }
 }
@@ -190,7 +192,10 @@ fn exact_identity_binding_scope_and_other_coordinator_reject_without_effects() {
     let reply = binding(1).reply_object;
     assert!(lanes.terminal(identity, reply + 1).is_err());
     let mut wrong_owner = identity;
-    wrong_owner.owner.client_generation += 1;
+    let SuspensionCaller::Hosted(client) = &mut wrong_owner.owner.caller else {
+        unreachable!()
+    };
+    client.client_generation += 1;
     let mut wrong_provider = identity;
     wrong_provider.owner.provider_generation += 1;
     let mut wrong_key = identity;
@@ -452,8 +457,11 @@ fn terminal_blocks_buried_owners_from_scope_teardown_and_mutation() {
     let reply = binding(1).reply_object;
     let child_key = SuspensionKey::lpc_request(2);
     let child_owner = SuspensionOwner {
-        client_tid: 77,
-        client_badge: 88,
+        caller: SuspensionCaller::Hosted(SuspensionHostedClient {
+            client_tid: 77,
+            client_badge: 88,
+            ..owner(2).hosted_client().unwrap()
+        }),
         ..owner(2)
     };
     lanes

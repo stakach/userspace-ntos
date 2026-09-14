@@ -34328,13 +34328,54 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         checks pass. No VM, pending Eng execution or desktop acceptance is claimed; the last
         measured 27 strict win32k imports remain open. Review split the shared kernel-only wait
         prerequisite below before attempting the native bridge replacement.
+      - [x] Share tagged provider-wait and component-suspension caller ownership
+        (2026-09-14; host/composed/native-build verified below).
+        Replace duplicate owner records with one canonical owner in nt-component-suspension,
+        reexported by nt-provider-wait. Distinguish hosted clients from exact kernel lanes;
+        never encode a kernel caller as a zero-filled hosted client. Preserve hosted dispatch
+        duplicate detection while separating hosted callback IDs from kernel activation epochs.
+        Validate kernel owners against the live lane generation and dispatch epoch when admitting,
+        transferring or rearming a physical suspension. Process/thread teardown must affect only
+        hosted callers; provider and exact kernel-lane teardown must retain their own scope.
+        Version the wait wire format and reject unknown kinds, stale versions and dirty inactive
+        identity fields. Migrate current native hosted consumers and remove the manual owner-copy
+        adapter. Remove the obsolete ProviderWaitStack and its separate phase/resume/teardown
+        types: repository production callers already use the shared component lanes. Exercise
+        the new wait/teardown composition on those lanes instead of preserving a second state
+        machine solely for old tests. The canonical types now live in focused owner.rs; native
+        hosted constructors, event authorization, resume and continuation observers explicitly
+        select hosted clients. A hosted callback observer cannot match a kernel epoch with the
+        same numeric dispatch ID. This establishes the shared contract, not native kernel wait
+        admission: keep that path closed until real activation context, thread leases and return
+        ownership are wired.
+        All 382 host tests pass across seven suites with no failures or ignored cases: 64 component
+        suspension, 55 provider wait, 260 kernel executive, two composed integration and one
+        documentation test. Nine new tests cover explicit caller shape/dispatch namespaces,
+        generation/epoch-exact admission and rearm, failed external transfer retaining its token,
+        mixed teardown, ABI v2 roundtrips/dirty inactive fields/old-version rejection, lease-atomic
+        owner mismatch, completion before wait and staged terminal retirement. Existing shared
+        component tests retain ordering, cancellation, rollback and depth coverage after removal
+        of the eight obsolete provider-only stack tests. Evidence:
+        .tmp/test-tagged-provider-wait-full-20260914.log. The two composed cases also pass after
+        strengthening the pending-owner case to use deliberately colliding hosted/kernel dispatch
+        IDs: .tmp/test-tagged-provider-wait-composed-20260914.log. They exercise the production
+        lane/ABI/arbiter APIs with a modeled event backend, not native IPC or kernel thread leases.
+        Independent cross-review found no further blocker within this bounded scope. Serialized
+        release builds pass: executive in 36.67s with the unchanged 294 warnings and standalone
+        I/O Manager in 0.06s without warnings. Evidence:
+        .tmp/build-tagged-provider-wait-executive-20260914.log and
+        .tmp/build-tagged-provider-wait-io-manager-20260914.log. Scoped formatting and diff checks
+        pass; source search confirms the old owner-copy adapter, ProviderWaitStack and its
+        separate teardown/phase/resume types are gone. No VM, native kernel wait, pending Eng
+        execution or desktop acceptance is claimed; the last measured 27 strict win32k imports
+        remain open. Review refined the native activation, thread-lifetime and IRQL work below.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
         provider_wait_rendezvous, service_sec_image provider admission, exec_handler object
         admission). DriverEntry and kernel-only activations cannot use that contract unchanged.
-        Give the shared provider-wait contract an explicit authenticated caller kind, retaining
-        the real provider generation, physical lane and dispatch activation independently of
+        Carry the shared caller kind through native admission and resume, retaining the real
+        provider generation, physical lane and dispatch activation independently of
         optional hosted-client identity. Keep hosted process/thread teardown scoped to hosted
         callers, and provider/lane teardown effective for both kinds. Exercise completion before
         wait, nested activation, stale dispatch and generation, cancellation and teardown in the
@@ -34342,6 +34383,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         kind must not authorize blocking from ISR/DPC execution. Do not add a video-only
         suspension variant, infer a caller kind from failed lookup, or manufacture a hosted
         client for a kernel caller.
+        Native audit found DriverEntry already starts a physical lane with PumpChannel.kernel_caller
+        carrying InitialSystemIdentity, but that value owns no canonical thread reference. Acquire
+        the real thread lifetime before parking, publish/capture its activation independently of
+        callback headers, and preserve a typed kernel return continuation across repark/teardown.
+        Do not relax the current hosted-only event authorization to manufacture process ownership.
+        KeGetCurrentIrql is currently patched to constant PASSIVE_LEVEL in win32k_subsystem; replace
+        that with real lane-local IRQL before enabling kernel waits. Existing EventTable polling
+        rejects all IRQL above APC_LEVEL; separately implement the correct DISPATCH_LEVEL zero-time
+        poll versus blocking-wait distinction rather than relying on the constant patch.
       - [ ] Replace the native video IOCTL bridge with authenticated, owned File-less requests.
         Retain the physical win32k caller, exact Device authority, input/output buffers and reply
         continuation before dispatch. Use detached exact-device preparation rather than holding

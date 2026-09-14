@@ -1,7 +1,9 @@
-use crate::ProviderWaitOwner;
+use crate::{LaneHandle, ProviderWaitOwner, SuspensionCaller, SuspensionHostedClient};
 
 pub const PROVIDER_WAIT_ABI_MAGIC: u32 = u32::from_le_bytes(*b"PWT1");
-pub const PROVIDER_WAIT_ABI_VERSION: u16 = 1;
+pub const PROVIDER_WAIT_ABI_VERSION: u16 = 2;
+pub const PROVIDER_WAIT_CALLER_HOSTED: u32 = 1;
+pub const PROVIDER_WAIT_CALLER_KERNEL: u32 = 2;
 pub const PROVIDER_WAIT_SHARED_MAGIC: u32 = u32::from_le_bytes(*b"PWS1");
 pub const PROVIDER_WAIT_RESULT_MAGIC: u32 = u32::from_le_bytes(*b"PWR1");
 pub const PROVIDER_WAIT_MAX_OBJECTS: usize = 64;
@@ -158,6 +160,9 @@ pub struct ProviderWaitHeader {
     pub wait_id: u64,
     pub provider_domain: u64,
     pub provider_generation: u64,
+    pub caller_kind: u32,
+    pub kernel_lane_index: u32,
+    pub kernel_lane_generation: u64,
     pub client_pi: u32,
     pub owner_reserved: u32,
     pub client_generation: u64,
@@ -182,6 +187,9 @@ impl ProviderWaitHeader {
         wait_id: 0,
         provider_domain: 0,
         provider_generation: 0,
+        caller_kind: 0,
+        kernel_lane_index: 0,
+        kernel_lane_generation: 0,
         client_pi: 0,
         owner_reserved: 0,
         client_generation: 0,
@@ -190,15 +198,49 @@ impl ProviderWaitHeader {
         dispatch_id: 0,
     };
 
-    pub const fn owner(self) -> ProviderWaitOwner {
-        ProviderWaitOwner {
+    pub const fn owner(self) -> Option<ProviderWaitOwner> {
+        if self.owner_reserved != 0 {
+            return None;
+        }
+        let caller = match self.caller_kind {
+            PROVIDER_WAIT_CALLER_HOSTED => {
+                if self.kernel_lane_index != 0 || self.kernel_lane_generation != 0 {
+                    return None;
+                }
+                SuspensionCaller::Hosted(SuspensionHostedClient {
+                    client_pi: self.client_pi,
+                    client_generation: self.client_generation,
+                    client_tid: self.client_tid,
+                    client_badge: self.client_badge,
+                })
+            }
+            PROVIDER_WAIT_CALLER_KERNEL => {
+                if self.client_pi != 0
+                    || self.client_generation != 0
+                    || self.client_tid != 0
+                    || self.client_badge != 0
+                {
+                    return None;
+                }
+                SuspensionCaller::Kernel {
+                    lane: LaneHandle {
+                        index: self.kernel_lane_index,
+                        generation: self.kernel_lane_generation,
+                    },
+                }
+            }
+            _ => return None,
+        };
+        let owner = ProviderWaitOwner {
             provider_domain: self.provider_domain,
             provider_generation: self.provider_generation,
-            client_pi: self.client_pi,
-            client_generation: self.client_generation,
-            client_tid: self.client_tid,
-            client_badge: self.client_badge,
             dispatch_id: self.dispatch_id,
+            caller,
+        };
+        if owner.is_valid() {
+            Some(owner)
+        } else {
+            None
         }
     }
 }
@@ -390,6 +432,10 @@ impl ProviderWaitRequest {
         }
 
         *self = Self::empty();
+        let (caller_kind, client, lane) = match metadata.owner.caller {
+            SuspensionCaller::Hosted(client) => (PROVIDER_WAIT_CALLER_HOSTED, Some(client), None),
+            SuspensionCaller::Kernel { lane } => (PROVIDER_WAIT_CALLER_KERNEL, None, Some(lane)),
+        };
         self.header = ProviderWaitHeader {
             magic: PROVIDER_WAIT_ABI_MAGIC,
             version: PROVIDER_WAIT_ABI_VERSION,
@@ -407,11 +453,14 @@ impl ProviderWaitRequest {
             wait_id: metadata.wait_id,
             provider_domain: metadata.owner.provider_domain,
             provider_generation: metadata.owner.provider_generation,
-            client_pi: metadata.owner.client_pi,
+            caller_kind,
+            kernel_lane_index: lane.map_or(0, |lane| lane.index),
+            kernel_lane_generation: lane.map_or(0, |lane| lane.generation),
+            client_pi: client.map_or(0, |client| client.client_pi),
             owner_reserved: 0,
-            client_generation: metadata.owner.client_generation,
-            client_tid: metadata.owner.client_tid,
-            client_badge: metadata.owner.client_badge,
+            client_generation: client.map_or(0, |client| client.client_generation),
+            client_tid: client.map_or(0, |client| client.client_tid),
+            client_badge: client.map_or(0, |client| client.client_badge),
             dispatch_id: metadata.owner.dispatch_id,
         };
         self.objects[..objects.len()].copy_from_slice(objects);
@@ -438,9 +487,13 @@ impl ProviderWaitRequest {
         if self.header.request_size as usize != request_size {
             return Err(ProviderWaitAbiError::InvalidHeader);
         }
-        if self.header.wait_id == 0 || !self.header.owner().is_valid() {
+        if self.header.wait_id == 0 {
             return Err(ProviderWaitAbiError::InvalidIdentity);
         }
+        let owner = self
+            .header
+            .owner()
+            .ok_or(ProviderWaitAbiError::InvalidIdentity)?;
         let wait_type = ProviderWaitType::from_wire(self.header.wait_type)
             .ok_or(ProviderWaitAbiError::InvalidWaitType)?;
         let wait_mode = ProviderWaitMode::from_wire(self.header.wait_mode)
@@ -484,7 +537,7 @@ impl ProviderWaitRequest {
 
         Ok(ValidatedProviderWait {
             wait_id: self.header.wait_id,
-            owner: self.header.owner(),
+            owner,
             wait_type,
             wait_mode,
             alertable,
@@ -503,10 +556,12 @@ mod tests {
         ProviderWaitOwner {
             provider_domain: 9,
             provider_generation: 3,
-            client_pi: 2,
-            client_generation: 4,
-            client_tid: 24,
-            client_badge: 7,
+            caller: SuspensionCaller::Hosted(SuspensionHostedClient {
+                client_pi: 2,
+                client_generation: 4,
+                client_tid: 24,
+                client_badge: 7,
+            }),
             dispatch_id: 11,
         }
     }
@@ -544,6 +599,92 @@ mod tests {
         request.begin(metadata(), &objects).unwrap();
         assert_eq!(request.validate().unwrap().objects.len(), 64);
         assert!(core::mem::size_of::<ProviderWaitRequest>() <= 0x1000);
+    }
+
+    #[test]
+    fn kernel_owner_round_trips_without_hosted_client_fields() {
+        let object = ProviderWaitObject::new(ProviderWaitObjectType::Event, 4, 2);
+        let mut request = ProviderWaitRequest::empty();
+        for index in [0, u32::MAX] {
+            let mut meta = metadata();
+            meta.owner.caller = SuspensionCaller::Kernel {
+                lane: LaneHandle {
+                    index,
+                    generation: 8,
+                },
+            };
+            request.begin(meta, &[object]).unwrap();
+            assert_eq!(request.header.version, 2);
+            assert_eq!(request.header.caller_kind, PROVIDER_WAIT_CALLER_KERNEL);
+            assert_eq!(request.header.kernel_lane_index, index);
+            assert_eq!(request.header.kernel_lane_generation, 8);
+            assert_eq!(request.header.client_pi, 0);
+            assert_eq!(request.header.client_generation, 0);
+            assert_eq!(request.header.client_tid, 0);
+            assert_eq!(request.header.client_badge, 0);
+            assert_eq!(request.validate().unwrap().owner, meta.owner);
+            assert_eq!(request.header.owner(), Some(meta.owner));
+        }
+        request.header.kernel_lane_generation = 0;
+        assert_eq!(request.header.owner(), None);
+        assert_eq!(
+            request.validate(),
+            Err(ProviderWaitAbiError::InvalidIdentity)
+        );
+    }
+
+    #[test]
+    fn caller_tag_and_inactive_wire_fields_are_not_ambiguous() {
+        let object = ProviderWaitObject::new(ProviderWaitObjectType::Event, 4, 2);
+        let mut request = ProviderWaitRequest::empty();
+        request.begin(metadata(), &[object]).unwrap();
+        let hosted = request;
+        for tag in [0, 3, u32::MAX] {
+            request = hosted;
+            request.header.caller_kind = tag;
+            assert_eq!(
+                request.validate(),
+                Err(ProviderWaitAbiError::InvalidIdentity)
+            );
+        }
+        for mutate in [
+            (|h: &mut ProviderWaitHeader| h.kernel_lane_index = 1) as fn(&mut ProviderWaitHeader),
+            |h: &mut ProviderWaitHeader| h.kernel_lane_generation = 1,
+        ] {
+            request = hosted;
+            mutate(&mut request.header);
+            assert_eq!(
+                request.validate(),
+                Err(ProviderWaitAbiError::InvalidIdentity)
+            );
+        }
+        let mut meta = metadata();
+        meta.owner.caller = SuspensionCaller::Kernel {
+            lane: LaneHandle {
+                index: 0,
+                generation: 1,
+            },
+        };
+        request.begin(meta, &[object]).unwrap();
+        let kernel = request;
+        for mutate in [
+            (|h: &mut ProviderWaitHeader| h.client_pi = 1) as fn(&mut ProviderWaitHeader),
+            |h: &mut ProviderWaitHeader| h.client_generation = 1,
+            |h: &mut ProviderWaitHeader| h.client_tid = 1,
+            |h: &mut ProviderWaitHeader| h.client_badge = 1,
+        ] {
+            request = kernel;
+            mutate(&mut request.header);
+            assert_eq!(
+                request.validate(),
+                Err(ProviderWaitAbiError::InvalidIdentity)
+            );
+        }
+        for valid in [hosted, kernel] {
+            request = valid;
+            request.header.version = 1;
+            assert_eq!(request.validate(), Err(ProviderWaitAbiError::InvalidHeader));
+        }
     }
 
     #[test]
