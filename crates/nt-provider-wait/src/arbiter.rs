@@ -4,7 +4,8 @@ use nt_time::{Deadline, TimeSnapshot};
 
 use crate::{
     ProviderWaitAbiError, ProviderWaitObject, ProviderWaitObjectType, ProviderWaitOwner,
-    ProviderWaitRequest, ProviderWaitTimeoutKind, ProviderWaitType,
+    ProviderWaitRequest, ProviderWaitTimeoutKind, ProviderWaitType, ValidatedProviderWait,
+    PROVIDER_WAIT_MAX_OBJECTS,
 };
 
 pub const STATUS_WAIT_0: i32 = 0;
@@ -54,6 +55,7 @@ pub enum ProviderDispatcherWaitError<E> {
     UnsupportedObjectType,
     InvalidAdmissionSequence,
     DuplicateWait,
+    NotPoll,
     NoCapacity,
     Backend(E),
 }
@@ -118,19 +120,59 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
         self.waiters.iter().any(|waiter| waiter.wait_id == wait_id)
     }
 
-    pub fn admit<B>(
-        &mut self,
+    /// Complete a zero-timeout wait synchronously without allocating or registering a waiter.
+    /// The backend owns lease acquisition; every acquired lease is released before returning.
+    pub fn poll<B>(
+        &self,
         backend: &mut B,
         shared_request: &ProviderWaitRequest,
         expected_owner: ProviderWaitOwner,
-        admission_sequence: u64,
-        now: TimeSnapshot,
-    ) -> Result<ProviderDispatcherWaitAdmission, ProviderDispatcherWaitError<B::Error>>
+    ) -> Result<i32, ProviderDispatcherWaitError<B::Error>>
     where
         B: ProviderDispatcherWaitBackend<Lease = L>,
     {
-        // Never retain a borrow into a page the provider can overwrite on a nested dispatch.
         let captured = *shared_request;
+        let request = Self::validate_request(&captured, expected_owner)?;
+        if request.timeout_kind != ProviderWaitTimeoutKind::Poll {
+            return Err(ProviderDispatcherWaitError::NotPoll);
+        }
+        self.validate_unique(&request)?;
+
+        // Validated requests contain 1..=MAX objects. Seed the bounded array from the first real
+        // lease so no default, sentinel lease, unsafe initialization or heap storage is needed.
+        let first = backend
+            .acquire_dispatcher_wait(request.owner, request.objects[0])
+            .map_err(ProviderDispatcherWaitError::Backend)?;
+        let mut leases = [first; PROVIDER_WAIT_MAX_OBJECTS];
+        let mut count = 1;
+        for object in request.objects[1..].iter().copied() {
+            match backend.acquire_dispatcher_wait(request.owner, object) {
+                Ok(lease) => {
+                    leases[count] = lease;
+                    count += 1;
+                }
+                Err(error) => {
+                    Self::release_leases(backend, &leases[..count]);
+                    return Err(ProviderDispatcherWaitError::Backend(error));
+                }
+            }
+        }
+        let leases = &leases[..count];
+        let status = match Self::ready_selection(backend, request.wait_type, leases) {
+            Some(index) => {
+                Self::consume_selection(backend, request.wait_type, leases, index);
+                STATUS_WAIT_0 + index as i32
+            }
+            None => STATUS_TIMEOUT,
+        };
+        Self::release_leases(backend, leases);
+        Ok(status)
+    }
+
+    fn validate_request<E>(
+        captured: &ProviderWaitRequest,
+        expected_owner: ProviderWaitOwner,
+    ) -> Result<ValidatedProviderWait<'_>, ProviderDispatcherWaitError<E>> {
         let request = captured
             .validate()
             .map_err(ProviderDispatcherWaitError::InvalidRequest)?;
@@ -145,14 +187,39 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
         }) {
             return Err(ProviderDispatcherWaitError::UnsupportedObjectType);
         }
-        if admission_sequence == 0 {
-            return Err(ProviderDispatcherWaitError::InvalidAdmissionSequence);
-        }
+        Ok(request)
+    }
+
+    fn validate_unique<E>(
+        &self,
+        request: &ValidatedProviderWait<'_>,
+    ) -> Result<(), ProviderDispatcherWaitError<E>> {
         if self.waiters.iter().any(|waiter| {
             waiter.wait_id == request.wait_id || waiter.owner.same_dispatch(request.owner)
         }) {
             return Err(ProviderDispatcherWaitError::DuplicateWait);
         }
+        Ok(())
+    }
+
+    pub fn admit<B>(
+        &mut self,
+        backend: &mut B,
+        shared_request: &ProviderWaitRequest,
+        expected_owner: ProviderWaitOwner,
+        admission_sequence: u64,
+        now: TimeSnapshot,
+    ) -> Result<ProviderDispatcherWaitAdmission, ProviderDispatcherWaitError<B::Error>>
+    where
+        B: ProviderDispatcherWaitBackend<Lease = L>,
+    {
+        // Never retain a borrow into a page the provider can overwrite on a nested dispatch.
+        let captured = *shared_request;
+        let request = Self::validate_request(&captured, expected_owner)?;
+        if admission_sequence == 0 {
+            return Err(ProviderDispatcherWaitError::InvalidAdmissionSequence);
+        }
+        self.validate_unique(&request)?;
 
         let mut objects = Vec::new();
         objects
@@ -553,6 +620,218 @@ mod tests {
             system_time_100ns,
             clock_generation: 0,
         }
+    }
+
+    #[test]
+    fn synchronous_poll_completes_or_times_out_without_persistent_storage() {
+        let identity = owner(1);
+        let mut backend = Backend::default();
+        backend.insert(identity, event(1), false, false);
+        backend.insert(identity, event(2), false, true);
+        let arbiter = ProviderDispatcherWaitArbiter::new();
+        let poll = request(
+            identity,
+            10,
+            ProviderWaitType::Any,
+            ProviderWaitTimeoutKind::Poll,
+            0,
+            &[event(1), event(2)],
+        );
+        assert_eq!(arbiter.poll(&mut backend, &poll, identity), Ok(1));
+        assert!(!backend.events[&(2, 1)].signaled);
+        assert_eq!(
+            arbiter.poll(&mut backend, &poll, identity),
+            Ok(STATUS_TIMEOUT)
+        );
+        assert_eq!(backend.lease_count(), 0);
+        assert!(backend.leases.is_empty());
+        assert!(arbiter.is_empty());
+        assert_eq!(arbiter.waiters.capacity(), 0);
+    }
+
+    #[test]
+    fn synchronous_poll_rejects_nonpoll_and_wrong_owner_before_acquiring() {
+        let identity = owner(2);
+        let mut backend = Backend::default();
+        backend.insert(identity, event(1), false, true);
+        let arbiter = ProviderDispatcherWaitArbiter::new();
+        for (kind, timeout) in [
+            (ProviderWaitTimeoutKind::Infinite, 0),
+            (ProviderWaitTimeoutKind::Relative, -1),
+            (ProviderWaitTimeoutKind::Absolute, 1),
+        ] {
+            let blocking = request(
+                identity,
+                11,
+                ProviderWaitType::Any,
+                kind,
+                timeout,
+                &[event(1)],
+            );
+            assert_eq!(
+                arbiter.poll(&mut backend, &blocking, identity),
+                Err(ProviderDispatcherWaitError::NotPoll)
+            );
+        }
+        let poll = request(
+            identity,
+            11,
+            ProviderWaitType::Any,
+            ProviderWaitTimeoutKind::Poll,
+            0,
+            &[event(1)],
+        );
+        assert_eq!(
+            arbiter.poll(&mut backend, &poll, owner(3)),
+            Err(ProviderDispatcherWaitError::OwnerMismatch)
+        );
+        assert_eq!(backend.next_lease, 0);
+        assert!(backend.events[&(1, 1)].signaled);
+        assert_eq!(arbiter.waiters.capacity(), 0);
+    }
+
+    #[test]
+    fn synchronous_poll_acquires_all_before_consumption_and_wait_all_is_atomic() {
+        let identity = owner(4);
+        let mut backend = Backend::default();
+        backend.insert(identity, event(1), false, true);
+        backend.insert(identity, event(2), true, false);
+        let arbiter = ProviderDispatcherWaitArbiter::new();
+        let stale = ProviderWaitObject::new(ProviderWaitObjectType::Event, 2, 2);
+        for wait_type in [ProviderWaitType::Any, ProviderWaitType::All] {
+            let poll = request(
+                identity,
+                12,
+                wait_type,
+                ProviderWaitTimeoutKind::Poll,
+                0,
+                &[event(1), stale],
+            );
+            assert_eq!(
+                arbiter.poll(&mut backend, &poll, identity),
+                Err(ProviderDispatcherWaitError::Backend("missing"))
+            );
+            assert!(backend.events[&(1, 1)].signaled);
+            assert_eq!(backend.lease_count(), 0);
+            assert!(backend.leases.is_empty());
+        }
+        let all = request(
+            identity,
+            12,
+            ProviderWaitType::All,
+            ProviderWaitTimeoutKind::Poll,
+            0,
+            &[event(1), event(2)],
+        );
+        assert_eq!(
+            arbiter.poll(&mut backend, &all, identity),
+            Ok(STATUS_TIMEOUT)
+        );
+        assert!(backend.events[&(1, 1)].signaled);
+        assert_eq!(backend.lease_count(), 0);
+        backend.set(event(2));
+        assert_eq!(
+            arbiter.poll(&mut backend, &all, identity),
+            Ok(STATUS_WAIT_0)
+        );
+        assert!(!backend.events[&(1, 1)].signaled);
+        assert!(backend.events[&(2, 1)].signaled);
+        assert_eq!(backend.lease_count(), 0);
+        assert_eq!(arbiter.waiters.capacity(), 0);
+    }
+
+    #[test]
+    fn synchronous_poll_does_not_replace_parked_wait_or_duplicate_its_dispatch() {
+        let identity = owner(5);
+        let polling = owner(6);
+        let mut backend = Backend::default();
+        backend.insert(identity, event(1), false, false);
+        backend.insert(identity, event(2), false, true);
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
+        let blocking = request(
+            identity,
+            13,
+            ProviderWaitType::Any,
+            ProviderWaitTimeoutKind::Infinite,
+            0,
+            &[event(1)],
+        );
+        assert_eq!(
+            arbiter.admit(&mut backend, &blocking, identity, 1, now(0, 0)),
+            Ok(ProviderDispatcherWaitAdmission::Parked { wait_id: 13 })
+        );
+        let capacity = arbiter.waiters.capacity();
+        let old_leases = backend.leases.clone();
+        let acquired = backend.next_lease;
+        for (claim, wait_id) in [(identity, 14), (polling, 13)] {
+            let duplicate = request(
+                claim,
+                wait_id,
+                ProviderWaitType::Any,
+                ProviderWaitTimeoutKind::Poll,
+                0,
+                &[event(2)],
+            );
+            assert_eq!(
+                arbiter.poll(&mut backend, &duplicate, claim),
+                Err(ProviderDispatcherWaitError::DuplicateWait)
+            );
+        }
+        assert_eq!(backend.next_lease, acquired);
+        assert!(backend.events[&(2, 1)].signaled);
+        let poll = request(
+            polling,
+            14,
+            ProviderWaitType::Any,
+            ProviderWaitTimeoutKind::Poll,
+            0,
+            &[event(2)],
+        );
+        assert_eq!(
+            arbiter.poll(&mut backend, &poll, polling),
+            Ok(STATUS_WAIT_0)
+        );
+        assert_eq!(backend.leases, old_leases);
+        assert_eq!(arbiter.waiters.capacity(), capacity);
+        assert_eq!(arbiter.len(), 1);
+        assert_eq!(arbiter.lease_count(), 1);
+        backend.set(event(1));
+        let completion = arbiter.pop_ready(&mut backend).unwrap();
+        assert_eq!(completion.owner, identity);
+        assert_eq!(completion.wait_id, 13);
+        assert_eq!(completion.admission_sequence, 1);
+        assert_eq!(backend.lease_count(), 0);
+    }
+
+    #[test]
+    fn synchronous_poll_supports_the_complete_bounded_object_set() {
+        let identity = owner(7);
+        let mut backend = Backend::default();
+        let mut objects = [ProviderWaitObject::EMPTY; PROVIDER_WAIT_MAX_OBJECTS];
+        for (index, object) in objects.iter_mut().enumerate() {
+            *object = event(index as u64 + 1);
+            backend.insert(identity, *object, false, true);
+        }
+        let arbiter = ProviderDispatcherWaitArbiter::new();
+        let all = request(
+            identity,
+            15,
+            ProviderWaitType::All,
+            ProviderWaitTimeoutKind::Poll,
+            0,
+            &objects,
+        );
+        assert_eq!(
+            arbiter.poll(&mut backend, &all, identity),
+            Ok(STATUS_WAIT_0)
+        );
+        assert!(backend
+            .events
+            .values()
+            .all(|event| !event.signaled && event.leases == 0));
+        assert_eq!(backend.next_lease, PROVIDER_WAIT_MAX_OBJECTS as u64);
+        assert!(backend.leases.is_empty());
+        assert_eq!(arbiter.waiters.capacity(), 0);
     }
 
     #[test]

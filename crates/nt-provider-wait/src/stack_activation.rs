@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 
-use crate::ProviderEventBacking;
+use crate::{ProviderEventBacking, ProviderWaitTimeoutKind};
+use nt_kernel_exec::{IrqlState, PASSIVE_LEVEL};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderStackLaneHandle {
@@ -60,6 +61,14 @@ pub enum ProviderStackActivationError {
     NotTop,
     AddressOutsideLane,
     CrossLaneStorage,
+    InvalidIrql,
+    InvalidIrqlTransition,
+    UnbalancedIrql,
+}
+
+struct ProviderStackActivationRecord {
+    identity: ProviderStackEventActivation,
+    irql: IrqlState,
 }
 
 struct ProviderStackLaneRecord {
@@ -68,7 +77,7 @@ struct ProviderStackLaneRecord {
     lane_id: u64,
     stack_base: u64,
     stack_bytes: u64,
-    activations: Vec<ProviderStackEventActivation>,
+    activations: Vec<ProviderStackActivationRecord>,
 }
 
 impl ProviderStackLaneRecord {
@@ -253,7 +262,10 @@ impl ProviderStackActivationCatalog {
             dispatch_id,
             generation,
         };
-        lane.activations.push(activation);
+        lane.activations.push(ProviderStackActivationRecord {
+            identity: activation,
+            irql: IrqlState::new(),
+        });
         Ok(activation)
     }
 
@@ -264,8 +276,59 @@ impl ProviderStackActivationCatalog {
         self.lane(handle)?
             .activations
             .last()
-            .copied()
+            .map(|record| record.identity)
             .ok_or(ProviderStackActivationError::NoActiveActivation)
+    }
+
+    pub fn current_irql(
+        &self,
+        activation: ProviderStackEventActivation,
+    ) -> Result<u8, ProviderStackActivationError> {
+        Ok(self.activation(activation)?.irql.current())
+    }
+
+    pub fn raise_irql(
+        &mut self,
+        activation: ProviderStackEventActivation,
+        new: u8,
+    ) -> Result<u8, ProviderStackActivationError> {
+        let record = self.activation_mut(activation)?;
+        if new > 15 {
+            return Err(ProviderStackActivationError::InvalidIrql);
+        }
+        record
+            .irql
+            .try_raise(new)
+            .map_err(|_| ProviderStackActivationError::InvalidIrqlTransition)
+    }
+
+    pub fn lower_irql(
+        &mut self,
+        activation: ProviderStackEventActivation,
+        new: u8,
+    ) -> Result<(), ProviderStackActivationError> {
+        let record = self.activation_mut(activation)?;
+        if new > 15 {
+            return Err(ProviderStackActivationError::InvalidIrql);
+        }
+        record
+            .irql
+            .try_lower(new)
+            .map_err(|_| ProviderStackActivationError::InvalidIrqlTransition)
+    }
+
+    /// Admission depends on the requested timeout form, not current object readiness.
+    pub fn can_wait(
+        &self,
+        activation: ProviderStackEventActivation,
+        timeout: ProviderWaitTimeoutKind,
+    ) -> Result<bool, ProviderStackActivationError> {
+        let irql = &self.activation(activation)?.irql;
+        Ok(if timeout == ProviderWaitTimeoutKind::Poll {
+            irql.can_poll()
+        } else {
+            irql.can_wait()
+        })
     }
 
     pub fn classify_event_storage(
@@ -286,12 +349,34 @@ impl ProviderStackActivationCatalog {
         &mut self,
         activation: ProviderStackEventActivation,
     ) -> Result<(), ProviderStackActivationError> {
-        let lane = self.lane_mut(activation.lane)?;
-        if lane.activations.last().copied() != Some(activation) {
-            return Err(ProviderStackActivationError::NotTop);
+        if self.activation(activation)?.irql.current() != PASSIVE_LEVEL {
+            return Err(ProviderStackActivationError::UnbalancedIrql);
         }
+        let lane = self.lane_mut(activation.lane)?;
         lane.activations.pop();
         Ok(())
+    }
+
+    fn activation(
+        &self,
+        activation: ProviderStackEventActivation,
+    ) -> Result<&ProviderStackActivationRecord, ProviderStackActivationError> {
+        self.lane(activation.lane)?
+            .activations
+            .last()
+            .filter(|record| record.identity == activation)
+            .ok_or(ProviderStackActivationError::NotTop)
+    }
+
+    fn activation_mut(
+        &mut self,
+        activation: ProviderStackEventActivation,
+    ) -> Result<&mut ProviderStackActivationRecord, ProviderStackActivationError> {
+        self.lane_mut(activation.lane)?
+            .activations
+            .last_mut()
+            .filter(|record| record.identity == activation)
+            .ok_or(ProviderStackActivationError::NotTop)
     }
 
     fn lane(
@@ -314,6 +399,10 @@ impl ProviderStackActivationCatalog {
             .ok_or(ProviderStackActivationError::StaleLane)
     }
 }
+
+#[cfg(test)]
+#[path = "stack_activation_irql_tests.rs"]
+mod irql_tests;
 
 #[cfg(test)]
 mod tests {

@@ -11,4 +11,5 @@ path = "src/lib.rs"
 
 [dependencies]
 nt-component-suspension.workspace = true
+nt-kernel-exec.workspace = true
 nt-time.workspace = true

@@ -630,6 +630,62 @@ type UserCallbackDispatchContext = nt_user_callback::DispatchContext;
 static mut USER_CALLBACK_CURRENT_DISPATCH: UserCallbackDispatchContext =
     UserCallbackDispatchContext::EMPTY;
 
+/// Authenticate an inline poll from the active physical pump and retained logical requestor.
+/// Shared callback/wait headers supply claims, never the expected dispatch identity.
+pub(crate) unsafe fn current_provider_poll_owner(
+    channel: &crate::spawn_hosts::PumpChannel,
+) -> Option<nt_provider_wait::ProviderWaitOwner> {
+    if channel.kernel_caller.is_some()
+        || channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
+        || !channel.caps.provider_wait
+        || channel.shared_va != win32k_subsystem::WIN32K_SHARED_VADDR
+        || channel.dispatch_label != win32k_subsystem::W32_DISPATCH_LABEL
+    {
+        return None;
+    }
+    let caller = channel.logical_caller?;
+    let nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =
+        caller.process().generation
+    else {
+        return None;
+    };
+    let pi = u32::try_from(caller.pi()).ok()?;
+    if u64::from(pi) != channel.client_pi
+        || generation != channel.client_generation
+        || !crate::service_sec_image::validate_provider_logical_caller(caller)
+    {
+        return None;
+    }
+    let lane = win32k_physical_lane_for_channel(
+        channel.tcb,
+        channel.fault_ep,
+        channel.reply_cap,
+    )?;
+    let dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    if dispatch.lane != lane
+        || dispatch.dispatch_id == 0
+        || !crate::service_sec_image::component_execution_lane_is_running(lane)
+        || crate::service_sec_image::component_execution_dispatch_identity(lane).is_none()
+    {
+        return None;
+    }
+    let provider = crate::current_win32k_provider_domain()?;
+    let owner = nt_provider_wait::ProviderWaitOwner {
+        provider_domain: provider.domain,
+        provider_generation: provider.generation,
+        dispatch_id: dispatch.dispatch_id,
+        caller: nt_provider_wait::SuspensionCaller::Hosted(
+            nt_provider_wait::SuspensionHostedClient {
+                client_pi: pi,
+                client_generation: generation,
+                client_tid: u64::from(caller.thread().thread_id()),
+                client_badge: caller.badge(),
+            },
+        ),
+    };
+    owner.is_valid().then_some(owner)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct PendingProviderWaitDispatch {
     pub request: nt_provider_wait::ProviderWaitRequest,

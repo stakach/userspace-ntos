@@ -10,6 +10,12 @@ pub const APC_LEVEL: u8 = 1;
 /// `DISPATCH_LEVEL` — DPC + spin-lock context.
 pub const DISPATCH_LEVEL: u8 = 2;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrqlTransitionError {
+    RaiseWouldLower,
+    LowerWouldRaise,
+}
+
 /// The current simulated IRQL of a Driver Host execution context.
 #[derive(Debug, Default)]
 pub struct IrqlState {
@@ -35,22 +41,33 @@ impl IrqlState {
     /// (and rejected — the level is left unchanged).
     pub fn raise(&mut self, new: u8) -> u8 {
         let old = self.level;
-        if new < old {
-            self.invalid_transitions += 1;
-        } else {
-            self.level = new;
-        }
+        let _ = self.try_raise(new);
         old
+    }
+
+    pub fn try_raise(&mut self, new: u8) -> Result<u8, IrqlTransitionError> {
+        let old = self.level;
+        if new < old {
+            self.invalid_transitions = self.invalid_transitions.saturating_add(1);
+            return Err(IrqlTransitionError::RaiseWouldLower);
+        }
+        self.level = new;
+        Ok(old)
     }
 
     /// `KeLowerIrql(new)` — lower to `new` (must be `<=` current). A "lower" that
     /// raises is rejected + recorded.
     pub fn lower(&mut self, new: u8) {
+        let _ = self.try_lower(new);
+    }
+
+    pub fn try_lower(&mut self, new: u8) -> Result<(), IrqlTransitionError> {
         if new > self.level {
-            self.invalid_transitions += 1;
-        } else {
-            self.level = new;
+            self.invalid_transitions = self.invalid_transitions.saturating_add(1);
+            return Err(IrqlTransitionError::LowerWouldRaise);
         }
+        self.level = new;
+        Ok(())
     }
 
     /// Run `f` at IRQL `new` (raising if needed), restoring the prior level after.
@@ -138,5 +155,19 @@ mod tests {
         let mut irql = IrqlState::new();
         irql.with_irql(DISPATCH_LEVEL, |i| assert_eq!(i.current(), DISPATCH_LEVEL));
         assert_eq!(irql.current(), PASSIVE_LEVEL);
+    }
+
+    #[test]
+    fn checked_transitions_preserve_generic_levels_and_reject_wrong_direction() {
+        let mut irql = IrqlState::new();
+        assert_eq!(irql.try_raise(u8::MAX), Ok(PASSIVE_LEVEL));
+        assert_eq!(irql.try_raise(0), Err(IrqlTransitionError::RaiseWouldLower));
+        assert_eq!(irql.current(), u8::MAX);
+        assert_eq!(irql.try_lower(3), Ok(()));
+        assert_eq!(irql.try_lower(4), Err(IrqlTransitionError::LowerWouldRaise));
+        assert_eq!(irql.current(), 3);
+        assert_eq!(irql.try_raise(3), Ok(3));
+        assert_eq!(irql.try_lower(3), Ok(()));
+        assert_eq!(irql.invalid_transitions(), 2);
     }
 }

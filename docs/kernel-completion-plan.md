@@ -34408,6 +34408,57 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         service branch are gone. No VM, native kernel wait or desktop acceptance is claimed;
         the last measured 27 strict win32k imports remain open. Review refined the component
         activation publication, terminal retirement and durable-allocation prerequisites below.
+      - [x] Preserve activation-local IRQL and complete zero-time provider polls inline
+        (2026-09-14; host/composed/native-build verified below).
+        Store checked IRQL alongside each existing provider stack activation, preserving the
+        exact lane/generation/top-token contract and Event backing identity. Nested activations
+        start at PASSIVE independently of the parked caller; sibling lanes retain independent
+        levels. Reject stale/non-top access, x64 levels above HIGH_LEVEL, wrong transition
+        direction and return with unbalanced IRQL. Reuse IrqlState checked transitions rather
+        than a second level machine; retain the existing generic runtime APIs.
+        Replace win32k's constant-zero CR8 getter patch with a checked five-byte relative jump
+        to the executing activation's getter, preserving full RAX. The pure patch planner
+        validates original CR8+RET bytes, address arithmetic and signed displacement before
+        any write. Image mismatch now rejects loading instead of warning and continuing.
+        Keep the existing pinned-image RVA explicit; this is not generic inline-instruction
+        translation or proof for a different win32k build. Bind the x64 get/raise/lower helpers
+        to real activation state; illegal context/transitions fail closed without returning a
+        fabricated level. KeUserModeCallback requires PASSIVE; dispatcher and LPC blocking
+        waits permit APC_LEVEL. Unsafe fast-mutex imports keep their original IRQL behavior.
+        Explicit zero-time polls may run at DISPATCH_LEVEL and now complete on the current
+        pump's Reply without logical lane suspension, continuation allocation, waiter
+        registration or nested win32k dispatch. Authenticate the expected hosted owner from
+        the retained root dispatch context, live logical caller and exact physical channel,
+        never from shared callback claims. Core arbiter polling acquires all real dispatcher
+        leases before selection, releases every lease on success/failure and uses bounded
+        stack storage without reserving persistent waiter storage. Native backend lease
+        metadata remains in a durable allocation scope. Expire canonical timers and select
+        older pending waiters before a new poll can consume a synchronization timer; selection
+        records completion only and cannot schedule another provider lane during the poll.
+        Preflight balanced IRQL before Event backing retirement, release the catalog borrow
+        before its broker IPC, then reborrow/revalidate before finishing the activation.
+        Kernel-only wait/poll authority, full DPC/ISR and spinlock scheduling remain unenabled;
+        this checkpoint must not be reported as completing those separate systems.
+        Serialized host run passed 1,039 tests across 15 suites with no failures or ignored cases,
+        covering nt-component-suspension, nt-kernel-exec, nt-provider-wait and nt-user-host:
+        .tmp/test-provider-activation-irql-20260914.log. New tests cover checked transitions,
+        nested/sibling activation IRQL, stale/non-top/range rejection, unbalanced return,
+        timeout-form admission, CR8 opcode/RET and rel32 boundaries, synchronous poll lease
+        rollback, WaitAll atomicity, duplicate/stale owner rejection and maximum object count.
+        Three additional production timer/arbiter composition tests pass:
+        .tmp/test-provider-inline-timer-poll-20260914.log. These cover older synchronization
+        waiters, unclaimed synchronization expiration and persistent notification signals while
+        a separate real lane remains Running; they do not execute native IPC or scheduling.
+        Review fixed timer readiness ordering and preserved LPC waits at APC_LEVEL, then found
+        no remaining blocker within this scope. Backend lease allocations use durable storage
+        even inside transient root pump scopes. Serialized native release builds pass: executive
+        in 38.59s with the unchanged 294 warnings and standalone I/O Manager without warnings.
+        Evidence: .tmp/build-provider-activation-irql-executive-20260914.log and
+        .tmp/build-provider-activation-irql-io-manager-20260914.log. Scoped formatting and diff
+        checks pass. The constant-PASSIVE getter and borrow across Event-retirement IPC are gone.
+        No VM, native kernel wait or desktop acceptance is claimed; the last measured 27 strict
+        win32k imports remain open. Review also recorded the pre-existing native provider APC
+        admission gap below rather than claiming full alertable wait semantics from poll tests.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -34435,11 +34486,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Future runtime activation capture must allocate its retained rows in durable storage,
         outside any rewindable per-turn scratch scope; current DriverEntry capture precedes it.
         Do not relax the current hosted-only event authorization to manufacture process ownership.
-        KeGetCurrentIrql is currently patched to constant PASSIVE_LEVEL in win32k_subsystem; replace
-        that with real lane-local IRQL before enabling kernel waits. EventStore now distinguishes
-        DISPATCH_LEVEL zero-time polling from blocking wait policy; wire the native wait adapter
-        to actual activation IRQL rather than relying on the constant patch. Shared driver-host
-        IRQL bytes and win32k's shared KPCR cannot represent multiple independently parked lanes.
+        Activation-local IRQL and inline hosted polling are implemented above. Carry the same
+        restrictions through kernel activation publication/resume; do not substitute shared
+        driver-host IRQL bytes or win32k's shared KPCR for independently parked lanes. Keep
+        unsupported DPC/ISR delivery and spinlock scheduling explicit until their complete
+        execution/exclusion contracts exist, including all provider-to-provider suspension paths.
+        Wire native provider alert/APC admission and interruption as a separate outstanding wait
+        contract: core interrupt_alertable currently has no production caller, and native user-APC
+        reconciliation covers object/File waits but not provider waits. Inline polls preserve the
+        previous provider poll behavior; they do not prove complete alertable/UserMode semantics.
       - [ ] Replace the native video IOCTL bridge with authenticated, owned File-less requests.
         Retain the physical win32k caller, exact Device authority, input/output buffers and reply
         continuation before dispatch. Use detached exact-device preparation rather than holding

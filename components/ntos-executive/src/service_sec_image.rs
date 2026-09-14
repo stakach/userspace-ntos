@@ -297,6 +297,13 @@ pub(crate) unsafe fn component_execution_lane_is_idle(
         == Ok(nt_component_suspension::LanePhase::Idle)
 }
 
+pub(crate) unsafe fn component_execution_lane_is_running(
+    lane: nt_component_suspension::LaneHandle,
+) -> bool {
+    (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).phase(lane)
+        == Ok(nt_component_suspension::LanePhase::Running)
+}
+
 pub(crate) unsafe fn component_execution_lane_needs_capacity() -> bool {
     (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).needs_idle_lane()
 }
@@ -1446,6 +1453,7 @@ fn provider_wait_error_detail(
         nt_provider_wait::ProviderDispatcherWaitError::InvalidAdmissionSequence => 4,
         nt_provider_wait::ProviderDispatcherWaitError::DuplicateWait => 5,
         nt_provider_wait::ProviderDispatcherWaitError::NoCapacity => 6,
+        nt_provider_wait::ProviderDispatcherWaitError::NotPoll => 7,
         nt_provider_wait::ProviderDispatcherWaitError::Backend(status) => {
             0x1_0000_0000 | u64::from(status)
         }
@@ -1489,6 +1497,42 @@ fn provider_wait_expected_owner(
         dispatch_id: pending.dispatch.dispatch_id,
     };
     owner.is_valid().then_some(owner)
+}
+
+/// Complete an explicit zero-time poll on the current pump's bound Reply. No logical lane
+/// suspension, continuation allocation, waiter registration or nested dispatch is allowed here.
+pub(crate) unsafe fn service_provider_wait_poll(channel: &spawn_hosts::PumpChannel) -> bool {
+    let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
+        as *mut nt_provider_wait::ProviderWaitSharedPage;
+    let request = core::ptr::read_volatile(core::ptr::addr_of!((*page).request));
+    if request.header.timeout_kind != nt_provider_wait::ProviderWaitTimeoutKind::Poll as u32 {
+        return false;
+    }
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    let status = match win32k_glue::current_provider_poll_owner(channel) {
+        Some(owner) if !handler.is_null()
+            && request.validate().is_ok_and(|validated| validated.owner == owner) => {
+            let _durable = allocator::enter_durable();
+            // Select older waiters before a new poll can consume a just-expired synchronization
+            // timer. Selection only records completions; it cannot resume another provider lane.
+            if (*handler).provider_timer_expire_due(nt_time_snapshot()) != 0 {
+                provider_wait_select_ready(&mut *handler);
+            }
+            match (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).poll(
+                &mut *handler, &request, owner,
+            ) {
+                Ok(status) => status,
+                Err(error) => provider_wait_status_for_error(error),
+            }
+        }
+        _ => 0xC000_000Du32 as i32,
+    };
+    core::ptr::write_volatile(
+        core::ptr::addr_of_mut!((*page).result),
+        nt_provider_wait::ProviderWaitResult::completed(request.header.wait_id, status),
+    );
+    trace_provider_wait_admission(b"poll-inline", request.header.wait_id, status, request.header.object_count as u64);
+    true
 }
 
 fn lpc_wait_expected_owner(

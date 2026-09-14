@@ -13,6 +13,7 @@
 extern crate alloc;
 
 mod completion;
+pub mod cr8_getter_patch;
 mod cyclic_ids;
 pub mod dbg;
 mod dispatcher_wait;
@@ -90,7 +91,7 @@ pub use interrupt_rundown::{
     InterruptLineIdentity, InterruptLineMask, InterruptLineRundown, InterruptLineScanCompletion,
     InterruptRundownState,
 };
-pub use irql::{IrqlState, APC_LEVEL, DISPATCH_LEVEL, PASSIVE_LEVEL};
+pub use irql::{IrqlState, IrqlTransitionError, APC_LEVEL, DISPATCH_LEVEL, PASSIVE_LEVEL};
 pub use lookaside::{
     general_lookaside, init_general_lookaside, DEFAULT_MAXIMUM_DEPTH, POOL_TYPE_NONPAGED,
     POOL_TYPE_PAGED,

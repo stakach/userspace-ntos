@@ -30,6 +30,8 @@
 //! so the component calls them at the same VA.
 
 use alloc::vec::Vec;
+#[path = "win32k_irql.rs"]
+mod irql;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 use nt_compat_exports::{
     ssdt::{
@@ -3832,18 +3834,19 @@ unsafe fn retire_provider_local_events_for_backing(
 unsafe fn finish_provider_stack_event_activation(
     activation: ProviderStackEventActivation,
 ) -> bool {
-    let Some(activations) =
-        (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS)).as_mut()
-    else {
-        return false;
-    };
-    if activations.active(activation.lane).ok() != Some(activation) {
+    if !(&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
+        .as_ref()
+        .is_some_and(|activations| activations.current_irql(activation) == Ok(nt_kernel_exec::PASSIVE_LEVEL))
+    {
         return false;
     }
+    // Event retirement may broker IPC. Keep no catalog borrow across reentrant execution.
     if !retire_provider_local_events_for_backing(activation.backing()) {
         return false;
     }
-    activations.finish(activation).is_ok()
+    (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
+        .as_mut()
+        .is_some_and(|activations| activations.finish(activation).is_ok())
 }
 
 unsafe fn retire_existing_provider_local_event(body: u64) -> bool {
@@ -4647,6 +4650,10 @@ unsafe fn provider_wait_rendezvous(
     alertable: u8,
     timeout: u64,
 ) -> i32 {
+    let Some((timeout_kind, timeout_100ns)) = provider_wait_timeout(timeout) else {
+        return 0xC000_000Du32 as i32;
+    };
+    irql::require_wait(timeout_kind);
     let Some(owner) = current_provider_wait_owner() else {
         return 0xC000_000Du32 as i32;
     };
@@ -4655,9 +4662,6 @@ unsafe fn provider_wait_rendezvous(
     };
     let Some(wait_id) = next_provider_wait_id() else {
         return 0xC000_009Au32 as i32;
-    };
-    let Some((timeout_kind, timeout_100ns)) = provider_wait_timeout(timeout) else {
-        return 0xC000_000Du32 as i32;
     };
     let wait_mode = match wait_mode {
         0 => nt_provider_wait::ProviderWaitMode::Kernel,
@@ -4728,6 +4732,9 @@ unsafe fn provider_wait_rendezvous(
                 return status;
             }
             W32_DISPATCH_LABEL => {
+                if timeout_kind == nt_provider_wait::ProviderWaitTimeoutKind::Poll {
+                    irql::protocol_fault(b"nested dispatch during synchronous poll");
+                }
                 let (status, info) = win32k_dispatch(&crate::spawn_hosts::DispatchReq {
                     sel: read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64),
                     drv: 0,
@@ -6420,6 +6427,7 @@ extern "win64" fn s_lpc_request_wait_reply_port(
     request: *const u8,
     reply: *mut u8,
 ) -> i32 {
+    irql::require_wait(nt_provider_wait::ProviderWaitTimeoutKind::Infinite);
     if port_object == 0
         || !unsafe { (&*core::ptr::addr_of!(WIN32K_LPC_PORT_REFERENCES)).contains(port_object) }
     {
@@ -13656,25 +13664,21 @@ unsafe fn patch_eng_device_io_control() {
 /// unique CR8 access in the image (verified by opcode scan).
 const KE_GET_CURRENT_IRQL_RVA: u64 = 0x305c0;
 
-/// Patch win32k's inlined KeGetCurrentIrql (`mov rax,cr8`) to `xor rax,rax; nop` so it returns
-/// PASSIVE_LEVEL (0) instead of executing the CPL-0-only CR8 read (which #GPs in our user-mode
-/// component). Runs in `load_into` while win32k is mapped RW in the executive. Verifies the exact
-/// bytes first (44 0F 20 C0) so a future rebuild that moves the helper fails loudly rather than
-/// corrupting an unrelated instruction.
-unsafe fn patch_ke_get_current_irql() {
+/// Redirect the exact privileged helper to activation-local IRQL. No padding beyond its five
+/// bytes is assumed; a changed image or unreachable target rejects loading before execution.
+unsafe fn patch_ke_get_current_irql() -> bool {
     let p = WIN32K_CODE_VA + KE_GET_CURRENT_IRQL_RVA;
-    if read_volatile(p as *const u8) == 0x44
-        && read_volatile((p + 1) as *const u8) == 0x0F
-        && read_volatile((p + 2) as *const u8) == 0x20
-        && read_volatile((p + 3) as *const u8) == 0xC0
-    {
-        write_volatile(p as *mut u8, 0x48); // xor rax, rax
-        write_volatile((p + 1) as *mut u8, 0x31);
-        write_volatile((p + 2) as *mut u8, 0xC0);
-        write_volatile((p + 3) as *mut u8, 0x90); // nop (preserve the following ret)
-    } else {
-        print_str(b"[win32k] WARN: KeGetCurrentIrql cr8 bytes not found at RVA 0x305c0\n");
+    let original = core::slice::from_raw_parts(p as *const u8, 5);
+    let Ok(patch) = nt_kernel_exec::cr8_getter_patch::plan_cr8_getter_redirect(
+        original, p, irql::read_cr8 as *const () as u64,
+    ) else {
+        print_str(b"[win32k] reject image: invalid KeGetCurrentIrql redirect\n");
+        return false;
+    };
+    for (index, byte) in patch.iter().enumerate() {
+        write_volatile((p + index as u64) as *mut u8, *byte);
     }
+    true
 }
 
 // --- win32k -> client user-mode callback bridge (KeUserModeCallback) --------------------------
@@ -13717,6 +13721,7 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
     out_buf: *mut u64,
     out_len: *mut u32,
 ) -> i32 {
+    irql::require_passive(b"KeUserModeCallback");
     unsafe {
         let Some(contract) = nt_user_callback::UserCallbackContract::for_api(api) else {
             return 0xC000_00BBu32 as i32;
@@ -14138,6 +14143,10 @@ fn register_trampolines() -> bool {
     reg.bind("ZwCreateEvent", s_zw_create_event as usize as u64);
     reg.bind("NtCreateEvent", s_zw_create_event as usize as u64);
     reg.bind("KeInitializeEvent", s_ke_initialize_event as usize as u64);
+    reg.bind("KeGetCurrentIrql", irql::get_current as *const () as u64);
+    reg.bind("KfRaiseIrql", irql::raise as *const () as u64);
+    reg.bind("KeLowerIrql", irql::lower as *const () as u64);
+    reg.bind("KeRaiseIrqlToDpcLevel", irql::raise_to_dpc as *const () as u64);
     reg.bind("KeInitializeTimer", s_ke_initialize_timer as usize as u64);
     reg.bind(
         "KeInitializeTimerEx",
@@ -15217,13 +15226,10 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) ->
     // Patch win32k's EngDeviceIoControl export to the executive-owned video-device boundary.
     patch_eng_device_io_control();
 
-    // Patch win32k's inlined KeGetCurrentIrql helper (RVA 0x305c0 = `mov rax,cr8; ret`) to
-    // `xor rax,rax; nop; ret` (= return PASSIVE_LEVEL). CR8 (the x64 IRQL register) is CPL-0 only, so
-    // the read #GPs in our user-mode component; the window-position/lock path (co_WinPosSetWindowPos →
-    // focus/activation) reaches it. There is exactly ONE CR8 access in the image (verified by opcode
-    // scan), and our single-threaded, interrupt-free host is always at PASSIVE_LEVEL, so returning 0 is
-    // authentic.
-    patch_ke_get_current_irql();
+    // CR8 is privileged; its getter must observe the exact executing provider activation.
+    if !patch_ke_get_current_irql() {
+        return None;
+    }
 
     // NOTE: the FIRST-LIGHT binary patch (`patch_skip_cursor_tail`) that made
     // co_IntInitializeDesktopGraphics return early — skipping the cursor/icon/menu/show-desktop tail —
