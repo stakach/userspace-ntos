@@ -43,7 +43,8 @@ admission with exactly 27 unresolved-import diagnostics and an explicit incomple
 rejection. MmMapViewInSystemSpace no longer appears as a spurious extra miss from global catalog
 failure. The executive stops before DriverEntry or desktop rendering;
 the VM was terminated at that deterministic barrier. Evidence and the exact import set are in the
-dispatcher-bootstrap, strict-registry and IRQ receive-continuation checkpoints below. Older desktop
+kernel Event transport, dispatcher-bootstrap, strict-registry and IRQ receive-continuation
+checkpoints below. Older desktop
 proofs are historical baselines, not acceptance of the current provider cutover.
 
 - [x] Correct secured-memory ownership and native VM protection/lifetime enforcement (tranche 19).
@@ -34928,6 +34929,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         git diff --check pass. Native rollback, deferred-retirement and ACK transport execution
         remain a runtime proof obligation beyond the strict-import barrier; host tests do not
         establish that the production bootstrap has executed those Event requests.
+        Fresh production-path validation after commit fff73346: normal ./run.sh rebuilt the
+        staged disk and reached the same 27 unresolved imports, explicit incomplete-registry
+        rejection and main.rs:29960 stop. Evidence: .tmp/run-kernel-event-transport-20260915.log
+        and .tmp/boot-kernel-event-transport-20260915.log. QEMU was stopped with SIGTERM after
+        confirming the deterministic barrier, within BOOT_TIMEOUT_SECONDS=300; the runner exits
+        failure without a guest success/Explorer verdict. No QEMU remains. This establishes
+        unchanged early boot progress, not DriverEntry Event execution, handler handoff, complete
+        kernel waits or desktop paint. Review leaves native signaling/pulse arbitration, timer
+        ownership and the full typed kernel wait lifecycle open below.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
