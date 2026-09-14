@@ -34847,6 +34847,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/build-kernel-wait-capture-executive-20260914.log and
         .tmp/build-kernel-wait-capture-io-manager-20260914.log. Independent native review, scoped
         formatting checks and git diff --check pass. Full kernel wait delivery remains open.
+      - [x] Move canonical dispatcher ownership from bootstrap without reconstruction (2026-09-15).
+        Initialize one durable DispatcherBootstrapSeed after Ps bootstrap and before providers.
+        Its namespace entries, anonymous-object sequence, EventStore, EventObjectRegistry and
+        provider Timer table move together into the one live ExecNtHandler. Namespace indices are
+        native dispatcher identities, so neither namespace reconstruction nor counter reset is
+        permitted at handoff. Explicit Uninitialized/Owned/Transferred phases reject duplicate use.
+        The shared non-Clone DispatcherState carries original signal state, leases, pending signal
+        sequences and reclaim records; moving it is not wait completion or resource retirement.
+        Remove the obsolete native ProviderDispatcherTransfer, Event export/import reconstruction,
+        timer take helper and constructor arguments. Remove the core ProviderLocalEventTransferRecord,
+        import/export methods, transfer-only errors and their obsolete serialization tests. Preserve
+        the existing service-context clear before publishing the sole live handler. Runtime event
+        methods continue to use the same backing indices and canonical registry objects.
+        Add EventObjectRegistry::acquire_provider_local_wait: authorize the exact live local Event
+        and provider domain/generation before acquiring its real ProviderWait lease. Local retirement
+        refuses new leases but preserves existing ones until exact release/reclaim. Existing hosted
+        waits now use this helper for Provider-owned Events. Process-owned projected Event policy
+        remains separate, including valid waits through a retained pointer after handle deletion.
+        The provider owner argument is authenticated-adapter metadata, not an execution capability.
+        Five ownership-move tests cover namespace/state/identity correspondence, all Event lease
+        kinds, delivering/retriggered signal order, deferred deletion/reclaim and Timer deadlines,
+        periods, signal consumption and lease-deferred retirement. Three local-acquisition tests
+        cover exact ownership, unchanged rejection and process-projection lifetime preservation;
+        a compile-fail test rejects cloning the dispatcher aggregate. Initial validation found that
+        nt-kernel-exec was only a dev dependency of nt-user-host; move it to production dependencies
+        for the real shared state. The rerun passes 1,129 tests across 17 suites, with no failures or
+        ignored cases: .tmp/test-dispatcher-bootstrap-20260915-rerun.log. Executive release passes
+        in 38.94s with unchanged 297 warnings; standalone I/O Manager passes without warnings.
+        Evidence: .tmp/build-dispatcher-bootstrap-executive-20260915.log and
+        .tmp/build-dispatcher-bootstrap-io-manager-20260915.log. Independent native review, scoped
+        formatting checks and git diff --check pass; no old transfer API consumers remain.
+        Plan review: early Event transport still requires full channel/caller authentication and
+        access to the bootstrap owner, as specified below. This checkpoint establishes ownership,
+        not bootstrap Event publication, timer scheduling or kernel wait admission. Native kernel
+        waits remain disabled; strict import/desktop acceptance is not implied by the host tests.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -34875,12 +34910,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         recipient must preserve its real initiating caller and return contract, not deliver a
         CompletedWin32kDispatch to a hosted syscall reply.
         Next admission dependency: the native Event/timer wait backend currently requires both
-        a hosted client and the live ExecNtHandler; DriverEntry precedes that handler. Give
-        bootstrap and runtime one canonical dispatcher ownership path, with authenticated
-        kernel activation/object leases, before inserting a kernel suspension frame. Do not
+        a hosted client and the live ExecNtHandler; DriverEntry precedes that handler. The intact
+        bootstrap dispatcher state checkpoint above replaces reconstruction, but early provider
+        operations still need an authenticated access route. Pass the full PumpChannel and bound
+        Reply into Event transport, validate the exact message shape/executor plus retained kernel
+        activation, and derive the provider from that caller. Route only provider-local operations
+        to bootstrap state; process handles/projected pointers must keep their distinct authority.
+        Complete kernel activation/object leases before inserting a kernel suspension frame. Do not
         instantiate a second event manager, invent a hosted process ID, or park a frame without
         a readiness owner. Follow with exact owned admission, resume transport and typed kernel
         terminal effects; the request snapshot alone does not satisfy any of those contracts.
+        Release bootstrap/runtime state borrows before wake/redrive or broker IPC. Timer registration
+        is not pre-loop expiration support: preserve actual deadline/queue ownership across runtime
+        publication instead of resetting any queue that has acquired live bootstrap work.
+        The moved Option<ProviderTimerTable> retains the existing single-provider limitation; use
+        a generation-keyed provider catalog before extending timer service to unrelated drivers.
         Hosted return delivery/abandonment is now explicitly typed as above. Use the kernel
         terminal-pending lifecycle checkpoint above when a genuine resumed kernel return occurs;
         do not manufacture a frame or external token to call it. Deliver to the real kernel

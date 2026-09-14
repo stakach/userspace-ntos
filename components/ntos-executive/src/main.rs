@@ -70,6 +70,7 @@ mod hosted_process_runtime;
 pub(crate) use hosted_process_runtime::*;
 mod process_vm_retirement;
 mod ps_bootstrap;
+mod dispatcher_bootstrap;
 mod ps_object_retirement;
 mod provider_ps;
 mod sec_image_diagnostic;
@@ -23988,8 +23989,6 @@ unsafe fn initialize_exec_nt_handler_once(
     hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     driver_starts: DriverStartBootstrap,
     bootstrap_system_journal_records: u32,
-    provider_local_events: Vec<exec_handler::ProviderLocalEventTransfer>,
-    provider_timers: Option<nt_provider_wait::ProviderTimerTable>,
 ) -> &'static mut ExecNtHandler {
     assert!(!EXEC_NT_HANDLER_INITIALIZED.swap(true, Ordering::AcqRel),
         "the live executive handler has one owner and cannot be reinitialized");
@@ -24001,8 +24000,6 @@ unsafe fn initialize_exec_nt_handler_once(
         hosted_images,
         driver_starts,
         bootstrap_system_journal_records,
-        provider_local_events,
-        provider_timers,
     )
 }
 
@@ -28050,6 +28047,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     map_own_heap();
     ps_bootstrap::initialize(_start as *const () as u64, bootinfo as u64)
         .expect("initialize canonical Ps and token ownership before provider activation");
+    dispatcher_bootstrap::initialize()
+        .expect("initialize canonical dispatcher ownership before provider activation");
     register_boot_persistent_clock(bi);
     if !client_frame_registry_reserve_initial() {
         panic!("client frame registry allocation failed");

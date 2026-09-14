@@ -69,7 +69,7 @@ pub use event::{map_event_access, EventKind, EventStore, WaitManyResult, WaitRes
 pub use event_object::{
     EventLeaseId, EventLeaseKind, EventObjectError, EventObjectId, EventObjectOwner,
     EventObjectRegistry, EventObjectSnapshot, PendingEventSignal, ProviderEventProjectionCatalog,
-    ProviderEventProjectionError, ProviderLocalEventTransferRecord, RetiredEventObject,
+    ProviderEventProjectionError, RetiredEventObject,
     SignalQueueResult,
 };
 pub use hosted_dpc::{

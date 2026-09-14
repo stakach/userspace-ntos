@@ -121,11 +121,6 @@ const GUID_DEVICE_SURPRISE_REMOVAL_BYTES: [u8; 16] = [
     0x00, 0xf0, 0x5a, 0xce, 0xdd, 0x80, 0xd2, 0x11, 0xa8, 0x8d, 0x00, 0xa0, 0xc9, 0x69, 0x6b, 0x4b,
 ];
 
-pub(crate) struct ProviderLocalEventTransfer {
-    record: nt_kernel_exec::ProviderLocalEventTransferRecord,
-    state: Option<(nt_kernel_exec::EventKind, bool)>,
-}
-
 #[derive(Clone, Copy)]
 pub(crate) enum ProviderDispatcherLease {
     Event(nt_kernel_exec::EventLeaseId),
@@ -172,23 +167,30 @@ impl nt_provider_wait::ProviderDispatcherWaitBackend for ExecNtHandler {
                     .event_objects
                     .snapshot(id)
                     .map_err(|_| STATUS_INVALID_PARAMETER)?;
-                if !snapshot.authorizes_provider_wait(
-                    nt_kernel_exec::EventObjectOwner::provider(
-                        provider.domain,
-                        provider.generation,
-                    ),
-                    nt_kernel_exec::EventObjectOwner::new(
-                        client_pid as u64,
-                        client.client_generation,
-                    ),
-                ) {
-                    return Err(STATUS_INVALID_PARAMETER);
+                let provider_owner = nt_kernel_exec::EventObjectOwner::provider(
+                    provider.domain,
+                    provider.generation,
+                );
+                let event_lease = match snapshot.owner {
+                    nt_kernel_exec::EventObjectOwner::Provider { .. } => self
+                        .event_objects
+                        .acquire_provider_local_wait(id, provider_owner),
+                    nt_kernel_exec::EventObjectOwner::Process { .. } => {
+                        if !snapshot.authorizes_provider_wait(
+                            provider_owner,
+                            nt_kernel_exec::EventObjectOwner::new(
+                                client_pid as u64,
+                                client.client_generation,
+                            ),
+                        ) {
+                            return Err(STATUS_INVALID_PARAMETER);
+                        }
+                        self.event_objects
+                            .acquire_wait(id, nt_kernel_exec::EventLeaseKind::ProviderWait)
+                    }
                 }
-                ProviderDispatcherLease::Event(
-                    self.event_objects
-                        .acquire_wait(id, nt_kernel_exec::EventLeaseKind::ProviderWait)
-                        .map_err(|_| STATUS_INVALID_PARAMETER)?,
-                )
+                .map_err(|_| STATUS_INVALID_PARAMETER)?;
+                ProviderDispatcherLease::Event(event_lease)
             }
             Some(nt_provider_wait::ProviderWaitObjectType::Timer) => {
                 ProviderDispatcherLease::Timer(
@@ -3237,7 +3239,7 @@ fn persistent_clock_error_status(error: nt_persistent_clock::ClockError) -> u32 
 }
 
 #[inline(never)]
-fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
+pub(super) fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
     let mut v = alloc::vec::Vec::with_capacity(192);
     ObjEntry::push_dir(&mut v, b"", OBJ_PARENT_ROOT, true).expect("object namespace root"); // 0 = root "\"
     for d in [
@@ -3930,8 +3932,6 @@ impl ExecNtHandler {
         hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
         driver_starts: DriverStartBootstrap,
         bootstrap_system_journal_records: u32,
-        provider_local_events: Vec<ProviderLocalEventTransfer>,
-        provider_timers: Option<nt_provider_wait::ProviderTimerTable>,
     ) -> &'static mut Self {
         // The REAL SECURITY + SAM hives the storage host read BY PATH off
         // `\reactos\system32\config\{security,sam}`. Borrow the staged bytes (no copy) and parse
@@ -4082,6 +4082,16 @@ impl ExecNtHandler {
         let nt_user_host::ps_bootstrap::PsBootstrapParts {
             pm, mut token_store, anonymous_logon_tokens,
         } = ps.into_parts();
+        let crate::dispatcher_bootstrap::DispatcherBootstrapSeed {
+            obj_ns,
+            anon_event_seq,
+            dispatcher,
+        } = crate::dispatcher_bootstrap::take();
+        let nt_user_host::dispatcher_state::DispatcherState {
+            events,
+            event_objects,
+            provider_timers,
+        } = dispatcher;
         let root_security =
             nt_user_host::registry_bootstrap::prepare_registry_root_security(&pm, &mut token_store)
                 .expect("initialize registry root security from bootstrap subject");
@@ -4119,12 +4129,9 @@ impl ExecNtHandler {
             secured_virtual_memory,
             nt_address_space::SecuredVirtualMemoryTable::new()
         );
-        write_field!(obj_ns, build_initial_object_namespace());
-        write_field!(events, nt_kernel_exec::EventStore::with_capacity(192));
-        write_field!(
-            event_objects,
-            nt_kernel_exec::EventObjectRegistry::with_capacity(192, 192)
-        );
+        write_field!(obj_ns, obj_ns);
+        write_field!(events, events);
+        write_field!(event_objects, event_objects);
         write_field!(provider_timers, provider_timers);
         write_field!(user_timers, nt_user_timer::TimerTable::with_capacity(32));
         write_field!(user_timer_rearm_requested, false);
@@ -4216,7 +4223,7 @@ impl ExecNtHandler {
         write_field!(pending_file_irp_drain, None);
         write_field!(dbgk_block_request, false);
         write_field!(pipe_endpoint_progress, false);
-        write_field!(anon_event_seq, 0);
+        write_field!(anon_event_seq, anon_event_seq);
         write_field!(pnp_live_action, None);
         write_field!(pnp_live_action_reply_tail, None);
         write_field!(pnp_start_device_reply_tail, None);
@@ -4264,9 +4271,6 @@ impl ExecNtHandler {
             bootstrap_system_journal_records != 0
         );
         let handler = &mut *slot;
-        handler
-            .import_provider_local_events(provider_local_events)
-            .expect("transfer quiescent provider-local Events into live executive");
         for (pi, &pid) in bootstrap_pids.iter().enumerate() {
             let main_tid = bootstrap_main_tids[pi];
             if pid != 0 && main_tid != 0 {
@@ -25169,82 +25173,6 @@ impl ExecNtHandler {
         );
         let metadata = u64::from(event_type == 1) | (u64::from(initial_state) << 1);
         Ok((id, metadata))
-    }
-
-    pub(crate) fn export_provider_local_events(
-        &self,
-    ) -> Result<Vec<ProviderLocalEventTransfer>, nt_kernel_exec::EventObjectError> {
-        let records = self.event_objects.provider_local_transfer_records()?;
-        let mut transfer = Vec::new();
-        transfer
-            .try_reserve_exact(records.len())
-            .map_err(|_| nt_kernel_exec::EventObjectError::OutOfMemory)?;
-        for record in records {
-            let state = if record.live {
-                Some(
-                    self.events
-                        .query_existing(record.source_native_identity)
-                        .ok_or(nt_kernel_exec::EventObjectError::InvalidNativeIdentity)?,
-                )
-            } else {
-                None
-            };
-            transfer.push(ProviderLocalEventTransfer { record, state });
-        }
-        Ok(transfer)
-    }
-
-    pub(crate) fn take_provider_timer_table(
-        &mut self,
-    ) -> Option<nt_provider_wait::ProviderTimerTable> {
-        self.provider_timers.take()
-    }
-
-    fn import_provider_local_events(
-        &mut self,
-        transfer: Vec<ProviderLocalEventTransfer>,
-    ) -> Result<(), nt_kernel_exec::EventObjectError> {
-        for item in transfer {
-            let native_identity = if let Some((kind, signaled)) = item.state {
-                let index = self
-                    .obj_create_anon_event(
-                        matches!(kind, nt_kernel_exec::EventKind::Synchronization),
-                        signaled,
-                    )
-                    .ok_or(nt_kernel_exec::EventObjectError::OutOfMemory)?;
-                Some(index as u64)
-            } else {
-                None
-            };
-            if let Err(error) = self
-                .event_objects
-                .import_provider_local_transfer(item.record, native_identity)
-            {
-                if let Some(native_identity) = native_identity {
-                    if let Ok(index) = usize::try_from(native_identity) {
-                        self.rollback_new_event(index);
-                    }
-                }
-                return Err(error);
-            }
-            let nt_kernel_exec::EventObjectOwner::Provider { domain, generation } =
-                item.record.owner
-            else {
-                unreachable!("provider Event transfer validated its owner")
-            };
-            trace_provider_local_event(
-                if item.record.live {
-                    b"transfer-live"
-                } else {
-                    b"transfer-tombstone"
-                },
-                nt_provider_wait::ProviderDomainIdentity { domain, generation },
-                item.record.provider_local_identity,
-                Some(item.record.id),
-                native_identity.unwrap_or(0),
-            );
-        }
-        Ok(())
     }
 
     fn provider_local_event_identity(

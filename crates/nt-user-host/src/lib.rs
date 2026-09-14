@@ -13,6 +13,7 @@ extern crate alloc;
 pub mod commit_release;
 pub mod object_wait;
 pub mod current_apc;
+pub mod dispatcher_state;
 pub mod pending_caller;
 pub mod hosted_return_target;
 

@@ -15,6 +15,7 @@ nt-process = { workspace = true }
 nt-types = { workspace = true }
 nt-security = { workspace = true }
 nt-provider-wait = { workspace = true }
+nt-kernel-exec = { workspace = true }
 nt-component-suspension = { workspace = true }
 nt-config-manager = { workspace = true }
 nt-fs = { workspace = true }
@@ -33,4 +34,3 @@ nt-fs = { workspace = true }
 nt-syscall = { workspace = true }
 nt-thread-start = { workspace = true }
 nt-io-completion = { workspace = true }
-nt-kernel-exec = { workspace = true }

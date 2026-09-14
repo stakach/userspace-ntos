@@ -1,7 +1,7 @@
 //! `service_sec_image` — the per-process SEC_IMAGE demand-fault service loop.
 //! Extracted verbatim from `main.rs` (pure reorg; no logic change).
 #![allow(clippy::all)]
-use crate::exec_handler::{HostedCreatePublication, ProviderLocalEventTransfer};
+use crate::exec_handler::HostedCreatePublication;
 use crate::*;
 use nt_user_host::hosted_return_target::HostedReturnTarget;
 
@@ -4097,11 +4097,6 @@ unsafe fn clear_service_delay_drain_context() {
     SERVICE_CRASH_PARKED_MASK.store(0, Ordering::Release);
 }
 
-struct ProviderDispatcherTransfer {
-    local_events: Vec<ProviderLocalEventTransfer>,
-    timers: Option<nt_provider_wait::ProviderTimerTable>,
-}
-
 /// Admission for kernel aliases of managed section views. The nested provider pump uses the
 /// existing live handler and process epoch; legacy copybacks are serialized by the same owner.
 /// `None` means this is not a data-section view, never that admission failed.
@@ -4125,29 +4120,6 @@ pub(crate) unsafe fn service_admit_section_alias(
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     }
     handler.prepare_mapped_section_alias(pi, page, write).map(Some)
-}
-
-unsafe fn take_provider_dispatcher_transfer() -> ProviderDispatcherTransfer {
-    let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
-    let transfer = if handler_ptr.is_null() {
-        ProviderDispatcherTransfer {
-            local_events: Vec::new(),
-            timers: None,
-        }
-    } else {
-        let local_events = (&*handler_ptr)
-            .export_provider_local_events()
-            .expect("provider-local Event state must be quiescent at live-service transition");
-        let timers = (&mut *handler_ptr).take_provider_timer_table();
-        ProviderDispatcherTransfer {
-            local_events,
-            timers,
-        }
-    };
-    // Provider requests are serialized through root. Hide the obsolete owner before replacing its
-    // static storage; the new handler is published only after all transferred backing exists.
-    clear_service_delay_drain_context();
-    transfer
 }
 
 #[inline]
@@ -8017,13 +7989,11 @@ pub(crate) unsafe fn service_sec_image(
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the remaining legacy
     // broker-owned SSNs continue through the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
-    let provider_dispatcher = take_provider_dispatcher_transfer();
+    clear_service_delay_drain_context();
     let mut nt_handler = initialize_exec_nt_handler_once(
         exe_image_catalog as *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
         driver_starts,
         bootstrap_system_journal_records,
-        provider_dispatcher.local_events,
-        provider_dispatcher.timers,
     );
     print_str(b"[sec-init] handler-ready\n");
     nt_handler.register_main_thread_spawn(primary_pi, primary_spawn)
