@@ -3401,6 +3401,7 @@ pub(crate) fn service_dll_pe_store_stats() -> DllPeStoreStats {
 /// This boundary also progresses retained wait effects on timer-only activity, when no new user
 /// syscall can arrive to drive a failed context write or capability retirement.
 fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
+    unsafe { kernel_provider_activation::redrive_ready_completions() };
     unsafe { inline_file_retirement::redrive(nt_handler) };
     unsafe { crate::object_wait_apc::redrive(nt_handler) };
     unsafe { crate::object_wait_reply::redrive(nt_handler) };

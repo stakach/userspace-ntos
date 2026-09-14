@@ -14,6 +14,9 @@ mod terminal_completion;
 #[path = "provider_kernel_recipient_tests.rs"]
 mod recipient_completion;
 
+#[path = "provider_kernel_completion_cursor_tests.rs"]
+mod completion_cursor;
+
 type Lanes = ComponentSuspensionLanes<u64, i32>;
 
 fn bootstrap() -> PsBootstrapState {

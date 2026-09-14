@@ -34671,6 +34671,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Independent ownership/native reviews found no blocker after separating retained observation
         from retryable local return recording. These checks do not prove native mechanisms or desktop
         rendering: no VM boot was run, and the last measured 27 strict win32k imports remain open.
+      - [x] Claim initial bootstrap execution once and redrive genuine ready receipts
+        (2026-09-14; validation recorded below).
+        Add host-testable KernelProviderPumpProgress to the canonical recipient. Claim its first
+        entry before copying the retained channel; the private native wrapper releases all
+        activation/Ps borrows before component_pump and records the outcome with that exact,
+        non-Clone attempt. Remove the repeated initial-channel getter and public unclaimed
+        observation entry point. A dropped ticket stays Invoking; wrong/replayed tickets cannot
+        mutate either owner. Exact malformed observations seal Invalid while retaining evidence.
+        Distinguish returned, callback/provider/LPC suspended, scheduler-yielded and walled facts.
+        Only the exact completed reply-cap shape reads SH_DE_STATUS, before shared-bank reuse.
+        No stopped state authorizes a second first pump or fabricates a return.
+        Add a bounded cursor over canonical Ready activation rows, not another delivery registry.
+        Each pass excludes later captures and visits each eligible row at most once; failed ACK
+        cannot spin or starve a sibling, and terminal-pending/unfinished rows cannot emit receipts.
+        Eager bootstrap and the outer service-loop finalizer now share owned completion delivery.
+        Before successful readiness, verify the original provider generation and idle physical
+        binding; preserve the entire IPC message buffer across nested initialization, hold a
+        reentrancy guard, reject busy execution, and use durable allocation for persistent work.
+        Empty-Ready passes do not save/restore the IPC buffer. Exact ACK transfers the destination
+        only after both Ps references retire; errors retain it for a later outer pass. Negative
+        NTSTATUS retires ownership without readiness. No coordinator borrow crosses readiness IPC.
+        This supersedes the preceding checkpoint's synchronous-only ACK failure behavior, not
+        its real-return requirement. Early boot proof is not retroactively marked successful when
+        delivery is deferred. Full scheduler/endpoint ownership and kernel wait admission remain
+        open; current scheduler-yield producers require IRQ-capable IRP pumps and cannot be reused
+        for DriverEntry's Syscall pump. Do not enable that capability without a real resume path.
+        Eight guard tests and its compile-fail ownership check cover every stop/return shape,
+        conflicting flags, cap/status mismatches, dropped/foreign/replayed tickets and nonce
+        exhaustion. Five cursor composition tests cover failed ACK with sibling progress,
+        bounded late capture, readiness behind the cursor, pending terminal/local-retirement
+        exclusion and forged/foreign/stale receipts. The serialized run passes 824 cases across
+        15 suites, with no failures or ignored cases: .tmp/test-kernel-bootstrap-progress-20260914.log
+        (nt-user-host, nt-component-suspension, nt-provider-wait). Native executive release build
+        passes in 38.79s with the unchanged 294 warnings; standalone I/O Manager also passes without
+        warnings. Evidence: .tmp/build-kernel-bootstrap-progress-executive-20260914.log and
+        .tmp/build-kernel-bootstrap-progress-io-manager-20260914.log. Scoped formatting/diff checks
+        and independent native ownership review pass. These checks are not native mechanism or
+        desktop proof: no VM boot was run, and the last measured 27 strict win32k imports remain open.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -34706,9 +34744,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         uncertain external effects as retryable local errors.
         DriverEntry now retains its real channel/observed outcome/destination alongside the kernel
         activation, and consumes that destination through exact acknowledgment as described above.
-        It still depends on synchronous component_pump execution: implement authenticated stopped
-        job scheduling and deferred bootstrap consumption, including retry after failed ACK. Do
-        not repump the initial channel after a wall or infer a resume action from a missing receipt.
+        Its initial entry is now single-use and genuine Ready consumption retries after failed ACK
+        at the outer boundary as described above. Execution still depends on synchronous
+        component_pump: implement authenticated stopped-job scheduling and receive-endpoint
+        ownership before asynchronous startup. Do not repump the initial channel after a wall or
+        infer a resume action from a missing receipt.
         Use the new retained-lifetime check for Suspended eligibility, followed by strict execution
         authorization after begin_resume. An exited caller remains owned but cannot regain execution
         through retained validation; implement its real cancellation/unwind contract explicitly.

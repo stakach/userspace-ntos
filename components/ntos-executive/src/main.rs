@@ -30322,26 +30322,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 ps_bootstrap::initial_system_projection()
                     .expect("DriverEntry requires the canonical initial System objects").identity,
             ).expect("DriverEntry must retain its canonical caller before pumping requests");
-            let init_ch = service_sec_image::kernel_provider_activation::initial_driver_entry_channel(init_caller)
-                .expect("DriverEntry must use its retained initiating channel");
-            let init_pr = spawn_hosts::component_pump(&init_ch);
+            let (init_pr, init_receipt) = service_sec_image::kernel_provider_activation::run_initial_driver_entry(init_caller)
+                .expect("DriverEntry must retain its exact entered pump and outcome");
             let faults = init_pr.faults;
             let demand = init_pr.demand;
             let finished = init_pr.completed;
             let (wall_ip, wall_addr, wall_label) =
                 (init_pr.wall_ip, init_pr.wall_addr, init_pr.wall_label);
-            let init_completion = service_sec_image::kernel_provider_activation::record_driver_entry_pump(
-                &init_ch, &init_pr,
-            ).expect("DriverEntry pump must retain its exact kernel outcome")
-                .map(|receipt| {
-                    service_sec_image::kernel_provider_activation::accept_driver_entry_completion(receipt)
-                        .expect("accepted DriverEntry result must deliver its retained destination")
-                });
-            let de_status = init_completion.as_ref().map(|completion| completion.status());
+            let de_status = init_receipt.map(|receipt| receipt.status() as i32);
 
             // Readiness follows an acknowledged successful initialization result, not merely a
             // return to the component loop. A failed DriverEntry must not receive client dispatches.
-            let initialized = init_completion.is_some_and(|completion| completion.initialize());
+            let initialized = init_receipt.is_some_and(|receipt| {
+                match service_sec_image::kernel_provider_activation::deliver_driver_entry_completion(receipt) {
+                    Ok(initialized) => initialized,
+                    // Deferred acknowledgment is retained for the outer loop, not boot success.
+                    Err(_) => false,
+                }
+            });
 
             let verdict = core::ptr::read_volatile(
                 (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_VERDICT)

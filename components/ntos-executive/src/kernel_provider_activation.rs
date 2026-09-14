@@ -5,11 +5,11 @@ use nt_component_suspension::{LaneBinding, LaneHandle};
 use nt_user_host::provider_kernel_activation::{
     KernelProviderActivations, KernelProviderCaller, KernelProviderCompletionReceipt,
 };
+use nt_user_host::provider_kernel_pump::{KernelProviderPumpAttempt, KernelProviderPumpFacts};
 
 #[path = "kernel_bootstrap.rs"]
 mod bootstrap;
-pub(crate) use bootstrap::DriverEntryCompletion;
-use bootstrap::DriverEntryRecipient;
+use bootstrap::{DriverEntryCompletion, DriverEntryRecipient};
 
 static mut ACTIVATIONS: KernelProviderActivations<DriverEntryRecipient> =
     KernelProviderActivations::new();
@@ -96,6 +96,7 @@ pub(crate) unsafe fn capture_win32k_initial_system(
     if lanes.binding(lane) != Ok(channel_binding(channel)) {
         return Err(nt_process::STATUS_INVALID_HANDLE);
     }
+    let recipient = DriverEntryRecipient::new(*channel)?;
     with_provider_process_manager(|pm| {
         if !pm.validate_initial_system_caller(system) {
             return Err(nt_process::STATUS_INVALID_HANDLE);
@@ -111,27 +112,36 @@ pub(crate) unsafe fn capture_win32k_initial_system(
                 provider,
                 lane,
                 native,
-                DriverEntryRecipient::new(*channel),
+                recipient,
             )
             .map_err(|(status, _recipient)| status)
     })
 }
 
-/// Recover the initiating channel from its durable destination before the first pump. This is
-/// not a resume API: stopped execution requires its own authenticated scheduler transition.
-pub(crate) unsafe fn initial_driver_entry_channel(
+/// Claim the first pump exactly once and release all canonical borrows before entering it.
+/// This is not a resume API: stopped execution needs its own authenticated scheduler transition.
+pub(crate) unsafe fn run_initial_driver_entry(
     caller: KernelProviderCaller,
-) -> Result<spawn_hosts::PumpChannel, u32> {
-    with_provider_process_manager(|pm| {
-        let activations = &*core::ptr::addr_of!(ACTIVATIONS);
+) -> Result<
+    (
+        spawn_hosts::PumpResult,
+        Option<KernelProviderCompletionReceipt>,
+    ),
+    u32,
+> {
+    let (channel, mut attempt) = with_provider_process_manager(|pm| {
+        let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
         activations.validate(
             caller,
             pm,
             &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
             &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
         )?;
-        activations.recipient(caller)?.initial_channel(caller)
-    })
+        activations.recipient_mut(caller)?.begin_initial(caller)
+    })?;
+    let result = spawn_hosts::component_pump(&channel);
+    let receipt = record_driver_entry_pump(&channel, &mut attempt, &result)?;
+    Ok((result, receipt))
 }
 
 pub(super) unsafe fn service_ps(
@@ -160,26 +170,26 @@ pub(super) unsafe fn service_ps(
 
 /// Capture the real initialization return before the shared page or physical lane is reused.
 /// A wall, scheduler yield or parked wait is not completion and retains the activation unchanged.
-pub(crate) unsafe fn record_driver_entry_pump(
+unsafe fn record_driver_entry_pump(
     channel: &spawn_hosts::PumpChannel,
+    attempt: &mut KernelProviderPumpAttempt,
     result: &spawn_hosts::PumpResult,
 ) -> Result<Option<KernelProviderCompletionReceipt>, u32> {
     let caller = authenticated_channel_caller(channel)?;
-    let returned = result.completed
-        && !result.callback_suspended
-        && !result.provider_wait_suspended
-        && !result.lpc_wait_suspended
-        && !result.scheduler_yielded
-        && result.reply_cap == channel.reply_cap;
-    let status = returned.then(|| {
+    let facts = KernelProviderPumpFacts {
+        reply_cap: result.reply_cap,
+        completed: result.completed,
+        callback_suspended: result.callback_suspended,
+        provider_wait_suspended: result.provider_wait_suspended,
+        lpc_wait_suspended: result.lpc_wait_suspended,
+        scheduler_yielded: result.scheduler_yielded,
+    };
+    let status = facts.is_return(channel.reply_cap).then(|| {
         core::ptr::read_volatile((channel.shared_va + win32k_subsystem::SH_DE_STATUS) as *const u32)
     });
     (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
         .recipient_mut(caller)?
-        .observe(*result, status)?;
-    if result.completed && !returned {
-        return Err(nt_process::STATUS_INVALID_PARAMETER);
-    }
+        .observe(attempt, *result, facts, status)?;
     finish_observed_driver_entry_return(caller)
 }
 
@@ -212,7 +222,7 @@ pub(crate) unsafe fn finish_observed_driver_entry_return(
 
 /// Only the initiating kernel recipient acknowledges its retained result. The exact receipt and
 /// both Ps references survive a failed acknowledgment; shared bytes are never read again here.
-pub(crate) unsafe fn accept_driver_entry_completion(
+unsafe fn accept_driver_entry_completion(
     receipt: KernelProviderCompletionReceipt,
 ) -> Result<DriverEntryCompletion, u32> {
     with_provider_process_manager(|pm| {
@@ -220,4 +230,101 @@ pub(crate) unsafe fn accept_driver_entry_completion(
             .acknowledge_completion_with_recipient(receipt, pm)
             .map(|(status, recipient)| DriverEntryCompletion::new(status, recipient))
     })
+}
+
+static DELIVERY_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DELIVERY_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+struct CompletionDeliveryPass {
+    _message: crate::ipc_message::SavedMessageBuffer,
+}
+
+impl CompletionDeliveryPass {
+    unsafe fn enter() -> Result<Self, u32> {
+        if component_execution_is_busy()
+            || DELIVERY_ACTIVE
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
+        }
+        Ok(Self {
+            _message: crate::ipc_message::SavedMessageBuffer::capture(),
+        })
+    }
+
+    unsafe fn deliver(&self, receipt: KernelProviderCompletionReceipt) -> Result<bool, u32> {
+        if component_execution_is_busy() {
+            return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
+        }
+        // Cleanup of a failed DriverEntry needs no new execution. Successful delayed readiness
+        // still requires the original live provider and idle physical lane before releasing refs.
+        if (receipt.status() as i32) >= 0
+            && !(&*core::ptr::addr_of!(ACTIVATIONS))
+                .recipient(receipt.caller())?
+                .can_initialize(receipt.caller())
+        {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        let completion = accept_driver_entry_completion(receipt)?;
+        // Neither an activation nor a Ps-manager borrow crosses readiness's nested IPC.
+        Ok(completion.initialize())
+    }
+}
+
+impl Drop for CompletionDeliveryPass {
+    fn drop(&mut self) {
+        DELIVERY_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+fn report_deferred(receipt: KernelProviderCompletionReceipt, status: u32) {
+    if DELIVERY_FAILURES.fetch_add(1, Ordering::Relaxed) < 16 {
+        print_str(b"[kernel-bootstrap] completion retained provider=");
+        print_u64(receipt.caller().owner().provider_domain);
+        print_str(b" status=0x");
+        print_hex(status);
+        print_str(b"\n");
+    }
+}
+
+/// Eager bootstrap uses exactly the same guarded delivery as the outer-loop retry boundary.
+pub(crate) unsafe fn deliver_driver_entry_completion(
+    receipt: KernelProviderCompletionReceipt,
+) -> Result<bool, u32> {
+    let _durable = allocator::enter_durable();
+    match CompletionDeliveryPass::enter() {
+        Ok(pass) => {
+            let result = pass.deliver(receipt);
+            if let Err(status) = result {
+                report_deferred(receipt, status);
+            }
+            result
+        }
+        Err(status) => Err(status),
+    }
+}
+
+/// Retry only genuine Ready receipts, once per bounded pass. Never invoke this from a nested
+/// pump timer hook: it may initialize providers and is an outer scheduler-boundary operation.
+pub(super) unsafe fn redrive_ready_completions() {
+    let mut cursor = (&*core::ptr::addr_of!(ACTIVATIONS)).completion_cursor();
+    let Some(mut receipt) = (&*core::ptr::addr_of!(ACTIVATIONS)).next_ready_completion(&mut cursor)
+    else {
+        return;
+    };
+    let Ok(pass) = CompletionDeliveryPass::enter() else {
+        return;
+    };
+    let _durable = allocator::enter_durable();
+    loop {
+        if let Err(status) = pass.deliver(receipt) {
+            report_deferred(receipt, status);
+        }
+        let Some(next) = (&*core::ptr::addr_of!(ACTIVATIONS)).next_ready_completion(&mut cursor)
+        else {
+            break;
+        };
+        receipt = next;
+    }
 }

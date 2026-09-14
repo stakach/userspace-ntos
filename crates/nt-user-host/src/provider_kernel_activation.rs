@@ -86,6 +86,13 @@ pub struct KernelProviderCompletionReceipt {
     status: u32,
 }
 
+/// Bounded selection metadata, not completion authority. A pass excludes later captures and
+/// visits each ready row at most once, so failed acknowledgment cannot spin or starve a sibling.
+pub struct KernelProviderCompletionCursor {
+    after: u64,
+    through: u64,
+}
+
 impl KernelProviderCompletionReceipt {
     pub const fn caller(self) -> KernelProviderCaller {
         self.caller
@@ -405,6 +412,42 @@ impl<D> KernelProviderActivations<D> {
             })
             .ok_or(STATUS_INVALID_HANDLE)?;
         Ok(KernelProviderCompletionReceipt { caller, status })
+    }
+
+    pub fn completion_cursor(&self) -> KernelProviderCompletionCursor {
+        KernelProviderCompletionCursor {
+            after: 0,
+            through: self
+                .rows
+                .iter()
+                .map(|row| row.caller.activation)
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    /// Advance selection before any delivery effects. Rows becoming ready behind the cursor
+    /// wait for the next pass; unfinished and terminal-pending rows cannot produce receipts.
+    pub fn next_ready_completion(
+        &self,
+        cursor: &mut KernelProviderCompletionCursor,
+    ) -> Option<KernelProviderCompletionReceipt> {
+        let selected = self
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let Some(Completion::Ready(status)) = row.completion else {
+                    return None;
+                };
+                (row.caller.activation > cursor.after && row.caller.activation <= cursor.through)
+                    .then_some(KernelProviderCompletionReceipt {
+                        caller: row.caller,
+                        status,
+                    })
+            })
+            .min_by_key(|receipt| receipt.caller.activation);
+        cursor.after = selected.map_or(cursor.through, |receipt| receipt.caller.activation);
+        selected
     }
 
     /// Acknowledge the exact retained result after delivery. No provider, dispatch or caller
