@@ -344,7 +344,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
     }
 
     pub(crate) fn release_file_record(&mut self, file_id: FileId) -> Result<(), NtStatus> {
-        if self.file_reference_count(file_id) != 0 { return Err(NtStatus::DELETE_PENDING); }
+        // Projection ownership outlives CLOSE dispatch but must retire before the canonical body
+        // and its Object Manager reference. It is not an ordinary reference that blocks CLOSE.
+        if self.file_reference_count(file_id) != 0 || self.has_hosted_file_bindings(file_id) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
         let (client, reference, refs) = self
             .file(file_id)
             .map(|file| {

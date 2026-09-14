@@ -34085,13 +34085,52 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         git diff --check pass. No VM or native provider readback is claimed; the last measured
         27 strict win32k imports and desktop acceptance remain open. Next is exact native File
         projection registration, followed by runtime synchronization and mode publication below.
+      - [x] Give canonical File projections generation-bearing receipts and explicit publication
+        leases (2026-09-14; host/composed/native-build validation recorded below).
+        Replace tuple-only File bind/unbind with opaque manager/domain/File/address/generation
+        receipts in a focused hosted_file module; keep unrelated Driver/Device bindings unchanged.
+        Exact replays retain their receipt, while unbind/rebind gets a nonwrapping generation.
+        Removed versus AlreadyAbsent outcomes permit retirement replay without erasing a newer
+        binding at the same address. Enumerate all File projections independently of topology.
+        Non-Clone publication leases pin exact projections and refuse unbind until released;
+        callers separately retain the canonical File for an operation. Registry membership blocks
+        final File/Object Manager reference removal, not CLOSE dispatch, avoiding a reference
+        cycle. Final unbind queues existing close work without IPC, allocation or backend entry.
+        A snapshot plus individual leases does not close admission to later bindings; versioned
+        publication coordination remains required below before crossing reentrant boundaries.
+        All 729 selected host/doc tests pass without failures or ignored cases: 704 manager
+        library, 10 existing mode-commit/Busy-retirement/published-wait teardown regressions,
+        and 15 doc tests. Nine new registry tests cover receipt/address reuse, cross-manager and
+        domain generations, overflow, lifecycle admission and explicit lease ownership. Three
+        new composed lifetime tests cover inline/pending backend CLOSE, retained Object Manager
+        references, separate pointer-reference and projection barriers, and refused unpublished
+        File release with explicit caller retry. The new compile-fail example prevents copying
+        publication ownership. Evidence: .tmp/test-hosted-file-bindings-composed-20260914.log
+        and .tmp/test-hosted-file-bindings-doc-20260914.log. Independent review found no blocker.
+        Serialized native release builds pass: executive in 36.98s with the unchanged 294
+        warnings and standalone I/O Manager in 2.38s without warnings. Evidence:
+        .tmp/build-hosted-file-bindings-executive-20260914.log and
+        .tmp/build-hosted-file-bindings-io-manager-20260914.log. Scoped formatting and diff checks
+        pass. No native binding transport, provider readback or VM run is claimed. The last
+        measured 27 strict win32k imports and desktop acceptance remain open. The next step is
+        native authenticated publication and independently owned retirement, described below.
       - [ ] Register every native File projection with exact hosted-domain ownership.
         The 2026-09-14 audit found hosted_domain's typed File bind/unbind APIs have no native
         driver_launch callers. Component-local FILE_OBJECTS is not an authoritative cross-domain
         registry. Bind before driver entry; unbind exact identity on final CLOSE/failed-CREATE
-        retirement, including retained-completion ACK, not CLEANUP. Add per-File enumeration
-        and binding leases with domain generation/cookie, FileId, address and binding generation.
+        retirement, including retained-completion ACK, not CLEANUP. Use the canonical per-File
+        enumeration and leases above, carrying exact domain, File, address and binding generation.
         Current device attachments cannot identify detached filters or retained older projections.
+        Native publication must authenticate the active pump channel and exact admitted CREATE,
+        not trust a caller-supplied FileId. Reserve local slot/IRP owners before reverse bind and
+        resolve uncertain replies before reclaiming a possibly registered allocation. Use Live /
+        Retiring component File slots with exact receipts; failed unbind retains the allocation
+        outside the retiring IRP graph and is redriven by idle/unload maintenance. Do not convert
+        a genuine inline completion into synthetic STATUS_PENDING to hide publication failures.
+        Both immediate completion and retained ACK paths must transfer retirement ownership
+        before freeing graphs or tombstoning IRP owners; they currently reclaim in different order.
+        Refused Allocated/Closed external File release retains caller ownership: DELETE_PENDING
+        does not promise automatic close-queue retirement. Keep and retry that owner explicitly.
         Audit/reconcile canonical and provider-realized File body state using those bindings:
         initial headers do not prove ongoing Event/Busy/current-position synchronization, and
         CREATE's delete-on-close option is not proof that the filesystem set FO_DELETE_ON_CLOSE.

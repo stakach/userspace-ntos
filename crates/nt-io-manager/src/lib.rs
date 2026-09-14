@@ -47,6 +47,9 @@ mod file_reference;
 pub mod file_io_capture;
 mod file_information;
 mod hosted_domain;
+mod hosted_file;
+#[cfg(test)]
+mod hosted_file_lifetime_tests;
 mod hosted_device_pointer;
 pub mod inline_file_retirement;
 mod irp;
@@ -131,6 +134,7 @@ pub use file_information::{
     FileInformationContract,
 };
 pub use hosted_domain::{HostedDomainIdentity, HostedDomainRecord, HostedProviderIdentity};
+pub use hosted_file::{HostedFileIdentity, HostedFilePublicationLease, HostedFileUnbindOutcome};
 pub use irp::{
     request_input_fingerprint, BufferAccess, CancelState, CreateParameters,
     DeviceControlParameters, InformationParameters, IoBufferRef, IoParameters, IoStackLocation,
@@ -1003,7 +1007,9 @@ impl<P> IoManager<P> {
         self.files.get_mut(id)
     }
     pub(crate) fn remove_file(&mut self, id: FileId) -> Option<FileRecord> {
-        if self.file_reference_count(id) != 0 { return None; }
+        if self.file_reference_count(id) != 0 || self.has_hosted_file_bindings(id) {
+            return None;
+        }
         if self
             .files
             .get(id)

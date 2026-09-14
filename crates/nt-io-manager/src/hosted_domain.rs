@@ -8,7 +8,8 @@ use alloc::vec::Vec;
 
 use nt_status::NtStatus;
 
-use crate::{DeviceId, DriverId, FileId, HostedDomainId, IoManager};
+use crate::hosted_file::HostedFileBinding;
+use crate::{DeviceId, DriverId, HostedDomainId, IoManager};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HostedPointerBinding<I> {
@@ -41,7 +42,8 @@ pub struct HostedDomainRecord {
     provider: Option<HostedDomainIdentity>,
     drivers: Vec<HostedPointerBinding<DriverId>>,
     devices: Vec<HostedPointerBinding<DeviceId>>,
-    files: Vec<HostedPointerBinding<FileId>>,
+    pub(crate) files: Vec<HostedFileBinding>,
+    pub(crate) file_binding_sequence: u64,
 }
 
 impl HostedDomainRecord {
@@ -52,6 +54,7 @@ impl HostedDomainRecord {
             drivers: Vec::new(),
             devices: Vec::new(),
             files: Vec::new(),
+            file_binding_sequence: 0,
         }
     }
 
@@ -345,23 +348,6 @@ impl<P> IoManager<P> {
         bind(&mut domain.devices, address, device)
     }
 
-    pub fn bind_hosted_file_identity(
-        &mut self,
-        identity: HostedDomainIdentity,
-        address: u64,
-        file: FileId,
-    ) -> Result<(), NtStatus> {
-        if self.file(file).is_none() {
-            return Err(NtStatus::INVALID_HANDLE);
-        }
-        let domain = self
-            .hosted_domains
-            .get_mut(identity.domain_id)
-            .filter(|domain| identity.cookie != 0 && domain.cookie == identity.cookie)
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        bind(&mut domain.files, address, file)
-    }
-
     /// Remove one exact hosted DriverObject projection. Stale teardown cannot erase a replacement
     /// binding that reuses either the address or canonical id.
     pub fn unbind_hosted_driver_identity(
@@ -398,22 +384,6 @@ impl<P> IoManager<P> {
         unbind(&mut domain.devices, address, device)
     }
 
-    /// Remove one exact hosted FileObject projection.
-    pub fn unbind_hosted_file_identity(
-        &mut self,
-        identity: HostedDomainIdentity,
-        address: u64,
-        file: FileId,
-    ) -> bool {
-        let Some(domain) = self.hosted_domains.get_mut(identity.domain_id) else {
-            return false;
-        };
-        if identity.cookie == 0 || domain.cookie != identity.cookie {
-            return false;
-        }
-        unbind(&mut domain.files, address, file)
-    }
-
     pub fn hosted_driver_by_identity(
         &self,
         identity: HostedDomainIdentity,
@@ -442,19 +412,6 @@ impl<P> IoManager<P> {
         self.device(id).map(|_| id)
     }
 
-    pub fn hosted_file_by_identity(
-        &self,
-        identity: HostedDomainIdentity,
-        address: u64,
-    ) -> Option<FileId> {
-        let record = self.hosted_domains.get(identity.domain_id)?;
-        if identity.cookie == 0 || record.cookie != identity.cookie {
-            return None;
-        }
-        let id = resolve(&record.files, address)?;
-        self.file(id).map(|_| id)
-    }
-
     pub fn hosted_driver_address_by_identity(
         &self,
         identity: HostedDomainIdentity,
@@ -480,19 +437,6 @@ impl<P> IoManager<P> {
             return None;
         }
         address_of(&record.devices, device)
-    }
-
-    pub fn hosted_file_address_by_identity(
-        &self,
-        identity: HostedDomainIdentity,
-        file: FileId,
-    ) -> Option<u64> {
-        self.file(file)?;
-        let record = self.hosted_domains.get(identity.domain_id)?;
-        if identity.cookie == 0 || record.cookie != identity.cookie {
-            return None;
-        }
-        address_of(&record.files, file)
     }
 }
 
@@ -752,9 +696,12 @@ mod tests {
             io.bind_hosted_device_identity(dependent_identity, 0x4000, device),
             Ok(())
         );
+        let file_binding = io
+            .bind_hosted_file_identity(dependent_identity, 0x5000, file)
+            .unwrap();
         assert_eq!(
             io.bind_hosted_file_identity(dependent_identity, 0x5000, file),
-            Ok(())
+            Ok(file_binding)
         );
         assert_eq!(
             io.hosted_file_by_identity(dependent_identity, 0x5000),
@@ -808,13 +755,15 @@ mod tests {
             Ok(())
         );
 
-        assert!(!io.unbind_hosted_file_identity(dependent_identity, 0x5008, file));
-        assert!(io.unbind_hosted_file_identity(dependent_identity, 0x5000, file));
-        assert_eq!(io.hosted_file_by_identity(dependent_identity, 0x5000), None);
+        assert_eq!(io.hosted_file_by_identity(dependent_identity, 0x5008), None);
         assert_eq!(
-            io.bind_hosted_file_identity(dependent_identity, 0x5008, file),
-            Ok(())
+            io.unbind_hosted_file_identity(file_binding),
+            Ok(crate::HostedFileUnbindOutcome::Removed)
         );
+        assert_eq!(io.hosted_file_by_identity(dependent_identity, 0x5000), None);
+        assert!(io
+            .bind_hosted_file_identity(dependent_identity, 0x5008, file)
+            .is_ok());
 
         assert_eq!(
             io.set_hosted_domain_provider(dependent_identity, provider_identity),
