@@ -1184,10 +1184,10 @@ pub const W32_EVENT_OP_PUBLISH_LOCAL: u64 = nt_user_host::provider_local_event_r
 pub const W32_EVENT_OP_RETIRE_LOCAL: u64 = nt_user_host::provider_local_event_request::RETIRE;
 pub const W32_EVENT_OP_ACK_LOCAL_RETIREMENT: u64 =
     nt_user_host::provider_local_event_request::ACK_RETIREMENT;
-pub const W32_EVENT_OP_SET_LOCAL: u64 = 16;
+pub const W32_EVENT_OP_SET_LOCAL: u64 = nt_user_host::provider_local_event_request::SET;
 pub const W32_EVENT_OP_RESET_LOCAL: u64 = nt_user_host::provider_local_event_request::RESET;
 pub const W32_EVENT_OP_CLEAR_LOCAL: u64 = nt_user_host::provider_local_event_request::CLEAR;
-pub const W32_EVENT_OP_PULSE_LOCAL: u64 = 19;
+pub const W32_EVENT_OP_PULSE_LOCAL: u64 = nt_user_host::provider_local_event_request::PULSE;
 pub const W32_EVENT_OP_READ_LOCAL: u64 = nt_user_host::provider_local_event_request::READ;
 pub const W32_TIMER_OP_PUBLISH_LOCAL: u64 = 21;
 pub const W32_TIMER_OP_RETIRE_LOCAL: u64 = 22;

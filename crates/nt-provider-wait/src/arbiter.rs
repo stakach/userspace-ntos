@@ -292,17 +292,50 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
     where
         B: ProviderDispatcherWaitBackend<Lease = L>,
     {
+        self.oldest_event_consumer(backend, object)
+            .map(|(slot, _)| self.waiters[slot].admission_sequence)
+    }
+
+    fn oldest_event_consumer<B>(
+        &self,
+        backend: &B,
+        object: ProviderWaitObject,
+    ) -> Option<(usize, usize)>
+    where
+        B: ProviderDispatcherWaitBackend<Lease = L>,
+    {
         self.waiters
             .iter()
-            .filter_map(|waiter| {
+            .enumerate()
+            .filter_map(|(slot, waiter)| {
                 let selected = Self::ready_selection(backend, waiter.wait_type, &waiter.leases)?;
                 let consumes = match waiter.wait_type {
                     ProviderWaitType::All => waiter.objects.contains(&object),
                     ProviderWaitType::Any => waiter.objects[selected] == object,
                 };
-                consumes.then_some(waiter.admission_sequence)
+                consumes.then_some((slot, selected, waiter.admission_sequence))
             })
-            .min()
+            .min_by_key(|(_, _, sequence)| *sequence)
+            .map(|(slot, selected, _)| (slot, selected))
+    }
+
+    /// Complete exactly the oldest ready waiter that consumes `object`, after rechecking the
+    /// admission sequence selected by cross-domain Event arbitration. A stale selection has no
+    /// effects: it cannot consume another ready object or release any retained leases.
+    pub fn pop_event_ready<B>(
+        &mut self,
+        backend: &mut B,
+        object: ProviderWaitObject,
+        expected_sequence: u64,
+    ) -> Option<ProviderDispatcherWaitCompletion>
+    where
+        B: ProviderDispatcherWaitBackend<Lease = L>,
+    {
+        let (slot, selected) = self.oldest_event_consumer(backend, object)?;
+        if self.waiters[slot].admission_sequence != expected_sequence {
+            return None;
+        }
+        Some(self.complete_ready(backend, slot, selected))
     }
 
     pub fn pop_ready<B>(&mut self, backend: &mut B) -> Option<ProviderDispatcherWaitCompletion>
@@ -319,16 +352,28 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
             })
             .min_by_key(|(_, _, sequence)| *sequence)
             .map(|(slot, selected, _)| (slot, selected))?;
+        Some(self.complete_ready(backend, slot, selected))
+    }
+
+    fn complete_ready<B>(
+        &mut self,
+        backend: &mut B,
+        slot: usize,
+        selected: usize,
+    ) -> ProviderDispatcherWaitCompletion
+    where
+        B: ProviderDispatcherWaitBackend<Lease = L>,
+    {
         let waiter = self.waiters.remove(slot);
         Self::consume_selection(backend, waiter.wait_type, &waiter.leases, selected);
         Self::release_leases(backend, &waiter.leases);
-        Some(ProviderDispatcherWaitCompletion {
+        ProviderDispatcherWaitCompletion {
             wait_id: waiter.wait_id,
             owner: waiter.owner,
             admission_sequence: waiter.admission_sequence,
             status: STATUS_WAIT_0 + selected as i32,
             cancelled: false,
-        })
+        }
     }
 
     pub fn next_deadline(&self, now: TimeSnapshot) -> Option<u64> {
@@ -1287,5 +1332,220 @@ mod tests {
                 .wait_id,
             18
         );
+    }
+
+    fn park(
+        arbiter: &mut ProviderDispatcherWaitArbiter<u64>,
+        backend: &mut Backend,
+        sequence: u64,
+        wait_type: ProviderWaitType,
+        objects: &[ProviderWaitObject],
+    ) {
+        let identity = owner(sequence);
+        let wait = request(
+            identity,
+            sequence,
+            wait_type,
+            ProviderWaitTimeoutKind::Infinite,
+            0,
+            objects,
+        );
+        assert_eq!(
+            arbiter.admit(backend, &wait, identity, sequence, now(0, 0)),
+            Ok(ProviderDispatcherWaitAdmission::Parked { wait_id: sequence })
+        );
+    }
+
+    #[test]
+    fn targeted_ready_filters_unrelated_waits_and_unselected_wait_any_objects() {
+        let mut backend = Backend::default();
+        for id in 1..=3 {
+            backend.insert(owner(1), event(id), false, false);
+        }
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
+        park(
+            &mut arbiter,
+            &mut backend,
+            1,
+            ProviderWaitType::Any,
+            &[event(1)],
+        );
+        park(
+            &mut arbiter,
+            &mut backend,
+            2,
+            ProviderWaitType::Any,
+            &[event(1), event(2)],
+        );
+        park(
+            &mut arbiter,
+            &mut backend,
+            3,
+            ProviderWaitType::Any,
+            &[event(3), event(2)],
+        );
+        backend.set(event(1));
+        backend.set(event(2));
+        assert_eq!(
+            arbiter.oldest_event_consumer_sequence(&backend, event(2)),
+            Some(3)
+        );
+        assert_eq!(arbiter.pop_event_ready(&mut backend, event(3), 3), None);
+        let completion = arbiter.pop_event_ready(&mut backend, event(2), 3).unwrap();
+        assert_eq!(completion.wait_id, 3);
+        assert_eq!(completion.owner, owner(3));
+        assert_eq!(completion.status, STATUS_WAIT_0 + 1);
+        assert!(!completion.cancelled);
+        assert!(backend.events[&(1, 1)].signaled);
+        assert!(!backend.events[&(2, 1)].signaled);
+        assert_eq!(arbiter.len(), 2);
+        assert_eq!(backend.lease_count(), 3);
+        assert_eq!(arbiter.pop_ready(&mut backend).unwrap().wait_id, 1);
+        assert!(arbiter.contains(2));
+    }
+
+    #[test]
+    fn targeted_stale_sequence_preserves_waiters_signals_and_exact_leases() {
+        let mut backend = Backend::default();
+        backend.insert(owner(1), event(1), true, false);
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
+        for sequence in [20, 10] {
+            park(
+                &mut arbiter,
+                &mut backend,
+                sequence,
+                ProviderWaitType::Any,
+                &[event(1)],
+            );
+        }
+        backend.set(event(1));
+        let leases = backend.leases.clone();
+        for stale in [0, 20, u64::MAX] {
+            assert_eq!(arbiter.pop_event_ready(&mut backend, event(1), stale), None);
+            assert_eq!(backend.leases, leases);
+            assert_eq!(backend.lease_count(), 2);
+            assert_eq!(arbiter.len(), 2);
+            assert!(arbiter.contains(10) && arbiter.contains(20));
+            assert!(backend.events[&(1, 1)].signaled);
+        }
+        assert_eq!(
+            arbiter
+                .pop_event_ready(&mut backend, event(1), 10)
+                .unwrap()
+                .wait_id,
+            10
+        );
+        let remaining_leases = backend.leases.clone();
+        assert_eq!(arbiter.pop_event_ready(&mut backend, event(1), 10), None);
+        assert_eq!(backend.leases, remaining_leases);
+        assert_eq!(arbiter.len(), 1);
+        assert!(backend.events[&(1, 1)].signaled);
+        assert_eq!(
+            arbiter
+                .pop_event_ready(&mut backend, event(1), 20)
+                .unwrap()
+                .wait_id,
+            20
+        );
+        assert!(backend.leases.is_empty());
+    }
+
+    #[test]
+    fn targeted_wait_all_rechecks_competing_resource_before_consuming_anything() {
+        let mut backend = Backend::default();
+        for id in 1..=2 {
+            backend.insert(owner(1), event(id), false, false);
+        }
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
+        park(
+            &mut arbiter,
+            &mut backend,
+            10,
+            ProviderWaitType::All,
+            &[event(2), event(1)],
+        );
+        park(
+            &mut arbiter,
+            &mut backend,
+            5,
+            ProviderWaitType::Any,
+            &[event(2)],
+        );
+        backend.set(event(1));
+        assert_eq!(
+            arbiter.oldest_event_consumer_sequence(&backend, event(1)),
+            None
+        );
+        assert_eq!(arbiter.pop_event_ready(&mut backend, event(1), 10), None);
+        assert!(backend.events[&(1, 1)].signaled);
+        backend.set(event(2));
+        assert_eq!(
+            arbiter.oldest_event_consumer_sequence(&backend, event(1)),
+            Some(10)
+        );
+        assert_eq!(
+            arbiter
+                .pop_event_ready(&mut backend, event(2), 5)
+                .unwrap()
+                .wait_id,
+            5
+        );
+        let leases = backend.leases.clone();
+        assert_eq!(arbiter.pop_event_ready(&mut backend, event(1), 10), None);
+        assert_eq!(backend.leases, leases);
+        assert!(backend.events[&(1, 1)].signaled);
+        backend.set(event(2));
+        let completion = arbiter.pop_event_ready(&mut backend, event(1), 10).unwrap();
+        assert_eq!(completion.wait_id, 10);
+        assert_eq!(completion.status, STATUS_WAIT_0);
+        assert!(backend
+            .events
+            .values()
+            .all(|event| !event.signaled && event.leases == 0));
+        assert!(arbiter.is_empty());
+    }
+
+    #[test]
+    fn targeted_synchronization_event_completes_only_one_waiter_per_signal() {
+        let mut backend = Backend::default();
+        backend.insert(owner(1), event(1), false, false);
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
+        for sequence in [20, 10] {
+            park(
+                &mut arbiter,
+                &mut backend,
+                sequence,
+                ProviderWaitType::Any,
+                &[event(1)],
+            );
+        }
+        backend.set(event(1));
+        assert_eq!(
+            arbiter
+                .pop_event_ready(&mut backend, event(1), 10)
+                .unwrap()
+                .wait_id,
+            10
+        );
+        assert_eq!(
+            arbiter.oldest_event_consumer_sequence(&backend, event(1)),
+            None
+        );
+        let leases = backend.leases.clone();
+        assert_eq!(arbiter.pop_event_ready(&mut backend, event(1), 20), None);
+        assert_eq!(backend.leases, leases);
+        assert_eq!(backend.lease_count(), 1);
+        assert!(arbiter.contains(20));
+        backend.set(event(1));
+        assert_eq!(
+            arbiter
+                .pop_event_ready(&mut backend, event(1), 20)
+                .unwrap()
+                .wait_id,
+            20
+        );
+        assert!(!backend.events[&(1, 1)].signaled);
+        assert!(backend.leases.is_empty());
+        assert!(arbiter.is_empty());
     }
 }

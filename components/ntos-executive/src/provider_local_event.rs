@@ -106,19 +106,6 @@ impl<'a> LocalEventState<'a> {
         Ok((id, index, kind, signaled))
     }
 
-    pub(crate) fn set(
-        &mut self,
-        provider: ProviderDomainIdentity,
-        local: u64,
-    ) -> Result<(bool, EventObjectId, usize, EventKind), u32> {
-        let (id, index, kind, _) = self.identity(provider, local)?;
-        let previous = self
-            .events
-            .set_existing(index as u64)
-            .ok_or(INVALID_PARAMETER)?;
-        Ok((previous, id, index, kind))
-    }
-
     pub(crate) fn reset(
         &mut self,
         provider: ProviderDomainIdentity,
@@ -262,6 +249,64 @@ pub(crate) fn create_anonymous_event(
 }
 
 static TRACE_N: AtomicU64 = AtomicU64::new(0);
+
+/// Both entry adapters authenticate the provider before calling this live-dispatcher operation.
+/// The operation lease spans selection, any reply-cleanup reentry, and the final state readback.
+pub(crate) unsafe fn signal(
+    handler: &mut ExecNtHandler,
+    provider: ProviderDomainIdentity,
+    local: u64,
+    mode: nt_kernel_exec::EventSignalMode,
+) -> Result<(i32, u64, u64, u64), u32> {
+    let _durable = allocator::enter_durable();
+    let (id, index, _, _) = LocalEventState::new(
+        &mut handler.obj_ns,
+        &mut handler.anon_event_seq,
+        &mut handler.events,
+        &mut handler.event_objects,
+    )
+    .identity(provider, local)?;
+    let lease = handler
+        .event_objects
+        .acquire_wait(id, nt_kernel_exec::EventLeaseKind::Operation)
+        .map_err(|_| INSUFFICIENT_RESOURCES)?;
+    let result = (|| {
+        let previous = handler
+            .events
+            .set_existing(index as u64)
+            .ok_or(INVALID_PARAMETER)?;
+        if !previous {
+            match mode {
+                nt_kernel_exec::EventSignalMode::Set => {
+                    crate::wait_wake_event_set(index, handler);
+                }
+                nt_kernel_exec::EventSignalMode::Pulse => {
+                    crate::wait_wake_event_pulse(index, handler);
+                }
+            }
+        } else if mode == nt_kernel_exec::EventSignalMode::Pulse {
+            assert!(handler.events.clear_existing(index as u64));
+        }
+        let (_, current) = handler
+            .events
+            .query_existing(index as u64)
+            .expect("pinned local Event lost its dispatcher backing");
+        let current = if mode == nt_kernel_exec::EventSignalMode::Set {
+            current
+        } else {
+            false
+        };
+        Ok((0, u64::from(previous), u64::from(current), 0))
+    })();
+    if let Some(retired) = handler
+        .event_objects
+        .release_wait(lease, nt_kernel_exec::EventLeaseKind::Operation)
+        .expect("local Event operation lost its exact lease")
+    {
+        handler.finalize_retired_event_object(retired);
+    }
+    result
+}
 
 pub(crate) fn trace(
     op: &[u8],

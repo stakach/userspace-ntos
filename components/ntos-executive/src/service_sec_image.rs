@@ -1255,12 +1255,24 @@ unsafe fn gui_message_wait_reassign_selected(event: nt_kernel_exec::EventObjectI
     true
 }
 
-pub(crate) unsafe fn gui_message_wait_oldest_unselected_sequence(
+pub(crate) unsafe fn gui_message_wait_oldest_event_consumer_sequence(
+    nt_handler: &ExecNtHandler,
     event: nt_kernel_exec::EventObjectId,
 ) -> Option<u64> {
+    if nt_handler.event_ready_by_id(event).ok()
+        != Some((nt_kernel_exec::EventKind::Synchronization, true))
+    {
+        return None;
+    }
     (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS))
         .iter()
-        .filter(|waiter| waiter.used && waiter.queue_event == event && !waiter.event_selected)
+        .filter(|waiter| {
+            waiter.used && waiter.queue_event == event && !waiter.event_selected
+                && !waiter.reply_deleted && waiter.reply_cap != 0
+                && nt_handler.event_objects.event_for_lease(
+                    waiter.queue_event_lease, nt_kernel_exec::EventLeaseKind::GuiWait,
+                ) == Ok(event)
+        })
         .map(|waiter| waiter.sequence)
         .min()
 }
@@ -1412,28 +1424,30 @@ unsafe fn gui_message_wait_select_level_inner(
     true
 }
 
-pub(crate) unsafe fn gui_message_wait_select_pulse(
+pub(crate) unsafe fn gui_message_wait_select_event_consumer(
     nt_handler: &mut ExecNtHandler,
     event: nt_kernel_exec::EventObjectId,
+    expected_sequence: u64,
 ) -> bool {
-    if event.is_null() {
+    if gui_message_wait_oldest_event_consumer_sequence(nt_handler, event) != Some(expected_sequence) {
         return false;
     }
     let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
     let Some(index) = waiters
         .iter()
-        .enumerate()
-        .filter(|(_, waiter)| waiter.used && waiter.queue_event == event && !waiter.event_selected)
-        .min_by_key(|(_, waiter)| waiter.sequence)
-        .map(|(index, _)| index)
+        .position(|waiter| waiter.used && waiter.queue_event == event
+            && !waiter.event_selected && waiter.sequence == expected_sequence)
     else {
         return false;
     };
     let waiter = &mut waiters[index];
     waiter.event_selected = true;
     nt_handler
+        .consume_event_by_id(event)
+        .expect("selected GUI synchronization Event was not signaled");
+    nt_handler
         .queue_event_signal(event)
-        .expect("selected GUI pulse lost its registry identity");
+        .expect("selected GUI Event lost its registry identity");
     true
 }
 
@@ -2045,6 +2059,30 @@ pub(crate) fn provider_wait_oldest_event_consumer_sequence(
         (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER))
             .oldest_event_consumer_sequence(nt_handler, object)
     }
+}
+
+pub(crate) unsafe fn provider_wait_select_event_consumer(
+    nt_handler: &mut ExecNtHandler,
+    id: nt_kernel_exec::EventObjectId,
+    expected_sequence: u64,
+) -> bool {
+    let object = nt_provider_wait::ProviderWaitObject::new(
+        nt_provider_wait::ProviderWaitObjectType::Event,
+        id.0.slot() + 1,
+        u64::from(id.0.generation().0),
+    );
+    let Some(completion) = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER))
+        .pop_event_ready(nt_handler, object, expected_sequence)
+    else {
+        return false;
+    };
+    (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+        .select(
+            provider_wait_key(completion.wait_id),
+            ComponentSuspensionCompletion::provider(completion.status),
+        )
+        .expect("provider Event selection lost its owned continuation");
+    true
 }
 
 pub(crate) unsafe fn provider_wait_select_ready(nt_handler: &mut ExecNtHandler) -> u64 {
@@ -4318,40 +4356,32 @@ pub(crate) unsafe fn service_win32k_event_request(
             let Some(provider) = crate::current_win32k_provider_domain() else {
                 return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
             };
-            let Some(slot) = arg2.checked_sub(1) else {
-                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
-            };
-            let Ok(generation) = u32::try_from(arg3) else {
+            let Some(id) = nt_kernel_exec::EventObjectId::from_wire_parts(arg2, arg3) else {
                 return (STATUS_INVALID_PARAMETER, 0, 0, 0);
             };
             handler
                 .provider_ack_local_event_retirement(
                     provider,
                     arg1,
-                    nt_kernel_exec::EventObjectId(nt_types::ObjectId::new(
-                        nt_types::Generation(generation),
-                        slot,
-                    )),
+                    id,
                 )
                 .map(|()| (0, 0, 0, 0))
                 .unwrap_or_else(|status| (status as i32, 0, 0, 0))
         }
-        crate::win32k_subsystem::W32_EVENT_OP_SET_LOCAL => {
+        crate::win32k_subsystem::W32_EVENT_OP_SET_LOCAL
+        | crate::win32k_subsystem::W32_EVENT_OP_PULSE_LOCAL => {
             let Some(provider) = crate::current_win32k_provider_domain() else {
                 return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
             };
-            match handler.provider_set_local_event(provider, arg1) {
-                Ok((previous, _id, index, _kind)) => {
-                    if !previous {
-                        let _ = crate::wait_wake_event_set(index, handler);
-                    }
-                    let current = handler
-                        .provider_read_local_event(provider, arg1)
-                        .expect("newly signalled local provider Event lost canonical identity");
-                    (0, u64::from(previous), u64::from(current), 0)
-                }
-                Err(status) => (status as i32, 0, 0, 0),
-            }
+            use nt_user_host::provider_local_event_request::LocalEventRequest;
+            let mode = match LocalEventRequest::decode(op, arg1, arg2, arg3) {
+                Ok(LocalEventRequest::Set { .. }) => nt_kernel_exec::EventSignalMode::Set,
+                Ok(LocalEventRequest::Pulse { .. }) => nt_kernel_exec::EventSignalMode::Pulse,
+                Err(status) => return (status as i32, 0, 0, 0),
+                _ => unreachable!("local signaling opcode decoded as another operation"),
+            };
+            crate::provider_local_event::signal(handler, provider, arg1, mode)
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
         }
         crate::win32k_subsystem::W32_EVENT_OP_RESET_LOCAL => {
             let Some(provider) = crate::current_win32k_provider_domain() else {
@@ -4370,24 +4400,6 @@ pub(crate) unsafe fn service_win32k_event_request(
                 .provider_clear_local_event(provider, arg1)
                 .map(|()| (0, 0, 0, 0))
                 .unwrap_or_else(|status| (status as i32, 0, 0, 0))
-        }
-        crate::win32k_subsystem::W32_EVENT_OP_PULSE_LOCAL => {
-            let Some(provider) = crate::current_win32k_provider_domain() else {
-                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
-            };
-            match handler.provider_set_local_event(provider, arg1) {
-                Ok((previous, _id, index, _kind)) => {
-                    if previous {
-                        handler
-                            .provider_reset_local_event(provider, arg1)
-                            .expect("local provider pulse lost canonical Event identity");
-                    } else {
-                        let _ = crate::wait_wake_event_pulse(index, handler);
-                    }
-                    (0, u64::from(previous), 0, 0)
-                }
-                Err(status) => (status as i32, 0, 0, 0),
-            }
         }
         crate::win32k_subsystem::W32_EVENT_OP_READ_LOCAL => {
             let Some(provider) = crate::current_win32k_provider_domain() else {

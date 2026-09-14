@@ -17,6 +17,7 @@ pub mod cr8_getter_patch;
 mod cyclic_ids;
 pub mod dbg;
 mod dispatcher_wait;
+mod event_signal;
 mod dpc;
 mod driver_thread;
 mod event;
@@ -54,11 +55,12 @@ pub use completion::{CancelResult, CompleteResult, CompletionState, CompletionTr
 pub use cyclic_ids::{select_cyclic_ids, CyclicIdSelection};
 pub use dispatcher_wait::{
     classify_dispatcher_wait_timeout, consume_dispatcher, dispatcher_ready,
-    oldest_dispatcher_wait_source, poll_dispatchers, signal_dispatcher_for_wait,
+    poll_dispatchers, signal_dispatcher_for_wait,
     DispatcherConsumeResult, DispatcherObject, DispatcherSignalError, DispatcherSignalObject,
     DispatcherWaitResult, DispatcherWaitSource, DispatcherWaitTimeout,
 };
 pub use dpc::{DpcImportance, DpcQueue};
+pub use event_signal::{select_event_signal, EventSignalMode, EventSignalSelector};
 pub use driver_thread::{
     HostedDispatcherCompletion, HostedDispatcherWaitAdmission, HostedDispatcherWaitError,
     HostedDispatcherWaitQueue, HostedDispatcherWaiter, HostedDispatcherWake, HostedDriverThread,

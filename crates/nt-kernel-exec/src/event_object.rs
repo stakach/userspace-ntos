@@ -1,8 +1,8 @@
 //! Generation-fenced ownership for executive Event objects projected into a kernel provider.
 //!
 //! An NT Event has one canonical executive identity. Process handles, provider object pointers,
-//! native waits, GUI waits, and queued cross-component signals are independent references to that
-//! identity. Raw provider pointers are projection data only: they are never used as object ids.
+//! native waits, GUI waits, transient operations, and queued cross-component signals independently
+//! retain that identity. Raw provider pointers are projection data only, never object ids.
 
 use alloc::vec::Vec;
 
@@ -34,7 +34,7 @@ impl EventObjectId {
     }
 }
 
-/// Unique ownership token for one parked wait. Releasing a stale or already-released token fails.
+/// Unique ownership token for one wait or operation. Stale or already-released tokens fail.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct EventLeaseId(pub ObjectId);
@@ -83,13 +83,15 @@ impl EventObjectOwner {
     }
 }
 
-/// Wait references need unique lease tokens so timeout, cancellation, wake, and publication
-/// rollback can each prove they release exactly the reference they acquired.
+/// Wait and transient operation references use exact tokens so completion, cancellation, and
+/// publication rollback release only the reference they acquired.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventLeaseKind {
     NativeWait,
     GuiWait,
     ProviderWait,
+    /// Pins canonical backing through a local signal transaction, without queuing a signal.
+    Operation,
 }
 
 /// Why a registry operation was refused.
@@ -219,6 +221,7 @@ pub struct EventObjectSnapshot {
     pub native_wait_leases: u32,
     pub gui_wait_leases: u32,
     pub provider_wait_leases: u32,
+    pub operation_leases: u32,
     pub signal_leases: u32,
 }
 
@@ -292,6 +295,7 @@ struct EventRecord {
     native_wait_leases: u32,
     gui_wait_leases: u32,
     provider_wait_leases: u32,
+    operation_leases: u32,
     signal: SignalState,
 }
 
@@ -309,6 +313,7 @@ impl EventRecord {
         native_wait_leases: 0,
         gui_wait_leases: 0,
         provider_wait_leases: 0,
+        operation_leases: 0,
         signal: SignalState::None,
     };
 
@@ -318,6 +323,7 @@ impl EventRecord {
             + u64::from(self.native_wait_leases)
             + u64::from(self.gui_wait_leases)
             + u64::from(self.provider_wait_leases)
+            + u64::from(self.operation_leases)
             + u64::from(!matches!(self.signal, SignalState::None))
     }
 
@@ -334,6 +340,7 @@ impl EventRecord {
             native_wait_leases: self.native_wait_leases,
             gui_wait_leases: self.gui_wait_leases,
             provider_wait_leases: self.provider_wait_leases,
+            operation_leases: self.operation_leases,
             signal_leases: u32::from(!matches!(self.signal, SignalState::None)),
         }
     }
@@ -706,6 +713,12 @@ impl EventObjectRegistry {
                     return Err(error);
                 }
             }
+            EventLeaseKind::Operation => {
+                if let Err(error) = Self::increment(&mut self.events[event_slot].operation_leases) {
+                    self.leases[lease_slot].generation = generation;
+                    return Err(error);
+                }
+            }
         }
         self.leases[lease_slot] = LeaseRecord {
             generation,
@@ -745,6 +758,7 @@ impl EventObjectRegistry {
             EventLeaseKind::NativeWait => &mut self.events[event_slot].native_wait_leases,
             EventLeaseKind::GuiWait => &mut self.events[event_slot].gui_wait_leases,
             EventLeaseKind::ProviderWait => &mut self.events[event_slot].provider_wait_leases,
+            EventLeaseKind::Operation => &mut self.events[event_slot].operation_leases,
         };
         if *count == 0 {
             return Err(EventObjectError::StaleLease);
@@ -1027,6 +1041,127 @@ mod tests {
     }
 
     #[test]
+    fn operation_pins_local_and_projected_event_after_final_wait_release() {
+        for local in [true, false] {
+            let mut registry = EventObjectRegistry::new();
+            let owner = if local {
+                EventObjectOwner::provider(7, 3)
+            } else {
+                EventObjectOwner::new(42, 9)
+            };
+            let id = if local {
+                registry.create_provider_local(owner, 11, 101).unwrap()
+            } else {
+                let id = registry.create(owner, 101).unwrap();
+                registry.retain_pointer_or_install(id, 0xD000).unwrap();
+                id
+            };
+            let wait = registry.acquire_wait(id, EventLeaseKind::ProviderWait).unwrap();
+            let operation = registry.acquire_wait(id, EventLeaseKind::Operation).unwrap();
+            assert_eq!(registry.request_delete(id), Ok(None));
+            if !local {
+                assert_eq!(registry.release_pointer_by_body(0xD000), Ok(None));
+            }
+            assert_eq!(
+                registry.release_wait(wait, EventLeaseKind::ProviderWait),
+                Ok(None)
+            );
+            let snapshot = registry.snapshot(id).unwrap();
+            assert!(snapshot.delete_pending);
+            assert_eq!(snapshot.operation_leases, 1);
+            assert_eq!(snapshot.provider_wait_leases, 0);
+            assert_eq!(snapshot.pointer_leases, 0);
+            assert_eq!(snapshot.handle_leases, 0);
+            assert_eq!(snapshot.signal_leases, 0);
+            assert_eq!(registry.queued_signal_count(), 0);
+            assert_eq!(registry.take_next_signal(), None);
+            assert_eq!(registry.event_for_lease(operation, EventLeaseKind::Operation), Ok(id));
+
+            let retired = registry.release_wait(operation, EventLeaseKind::Operation)
+                .unwrap().unwrap();
+            assert_eq!(retired.id, id);
+            assert_eq!(retired.owner, owner);
+            assert_eq!(retired.native_identity, 101);
+            assert_eq!(registry.snapshot(id), Err(EventObjectError::StaleObject));
+            assert_eq!(registry.live_lease_count(), 0);
+            if local {
+                assert_eq!(retired.provider_local_identity, Some(11));
+                assert_eq!(registry.pending_provider_local_reclaim(owner, 11), Some(id));
+            } else {
+                assert_eq!(retired.provider_body, Some(0xD000));
+                assert_eq!(registry.pending_provider_reclaim(), Some((id, 0xD000)));
+            }
+            assert_eq!(
+                registry.release_wait(operation, EventLeaseKind::Operation),
+                Err(EventObjectError::StaleLease)
+            );
+        }
+    }
+
+    #[test]
+    fn operation_lease_rejects_wrong_kind_and_stale_generation_without_mutation() {
+        let mut registry = EventObjectRegistry::new();
+        let id = registry.create(EventObjectOwner::new(42, 9), 101).unwrap();
+        let wait = registry.acquire_wait(id, EventLeaseKind::NativeWait).unwrap();
+        let old = registry.acquire_wait(id, EventLeaseKind::Operation).unwrap();
+        let snapshot = registry.snapshot(id).unwrap();
+        for (lease, wrong_kind) in [
+            (wait, EventLeaseKind::Operation),
+            (old, EventLeaseKind::NativeWait),
+            (old, EventLeaseKind::GuiWait),
+            (old, EventLeaseKind::ProviderWait),
+        ] {
+            assert_eq!(
+                registry.event_for_lease(lease, wrong_kind),
+                Err(EventObjectError::WrongLeaseKind)
+            );
+            assert_eq!(registry.release_wait(lease, wrong_kind), Err(EventObjectError::WrongLeaseKind));
+            assert_eq!(registry.snapshot(id), Ok(snapshot));
+        }
+        assert_eq!(registry.release_wait(old, EventLeaseKind::Operation), Ok(None));
+        let current = registry.acquire_wait(id, EventLeaseKind::Operation).unwrap();
+        assert_eq!(old.0.slot(), current.0.slot());
+        assert_ne!(old.0.generation(), current.0.generation());
+        let snapshot = registry.snapshot(id).unwrap();
+        assert_eq!(
+            registry.release_wait(old, EventLeaseKind::Operation),
+            Err(EventObjectError::StaleLease)
+        );
+        assert_eq!(registry.snapshot(id), Ok(snapshot));
+        assert_eq!(registry.release_wait(wait, EventLeaseKind::NativeWait), Ok(None));
+        assert_eq!(registry.release_wait(current, EventLeaseKind::Operation), Ok(None));
+        assert_eq!(registry.snapshot(id).unwrap().operation_leases, 0);
+    }
+
+    #[test]
+    fn operation_leases_do_not_queue_coalesce_or_complete_pending_signals() {
+        let mut registry = EventObjectRegistry::new();
+        let id = registry.create(EventObjectOwner::new(42, 9), 101).unwrap();
+        registry.queue_signal(id).unwrap();
+        let slot = registry.event_slot(id).unwrap();
+        let queued = registry.events[slot].signal;
+        let sequence = registry.next_signal_sequence;
+        let first = registry.acquire_wait(id, EventLeaseKind::Operation).unwrap();
+        assert_eq!(registry.events[slot].signal, queued);
+        assert_eq!(registry.next_signal_sequence, sequence);
+        assert_eq!(registry.queued_signal_count(), 1);
+        assert_eq!(registry.release_wait(first, EventLeaseKind::Operation), Ok(None));
+        assert_eq!(registry.events[slot].signal, queued);
+        assert_eq!(registry.next_signal_sequence, sequence);
+
+        let signal = registry.take_next_signal().unwrap();
+        assert_eq!(signal.id, id);
+        let delivering = registry.events[slot].signal;
+        let second = registry.acquire_wait(id, EventLeaseKind::Operation).unwrap();
+        assert_eq!(registry.events[slot].signal, delivering);
+        assert_eq!(registry.release_wait(second, EventLeaseKind::Operation), Ok(None));
+        assert_eq!(registry.events[slot].signal, delivering);
+        assert_eq!(registry.next_signal_sequence, sequence);
+        assert_eq!(registry.complete_signal(id), Ok(None));
+        assert_eq!(registry.snapshot(id).unwrap().signal_leases, 0);
+    }
+
+    #[test]
     fn every_lease_class_independently_defers_reclamation() {
         let mut registry = EventObjectRegistry::new();
         let id = create(&mut registry, 9);
@@ -1040,6 +1175,7 @@ mod tests {
         let provider = registry
             .acquire_wait(id, EventLeaseKind::ProviderWait)
             .unwrap();
+        let operation = registry.acquire_wait(id, EventLeaseKind::Operation).unwrap();
         registry.queue_signal(id).unwrap();
         registry.request_delete(id).unwrap();
 
@@ -1059,7 +1195,11 @@ mod tests {
             .is_none());
         let pending = registry.take_next_signal().unwrap();
         assert_eq!(pending.id, id);
-        let retired = registry.complete_signal(id).unwrap().unwrap();
+        assert!(registry.complete_signal(id).unwrap().is_none());
+        let retired = registry
+            .release_wait(operation, EventLeaseKind::Operation)
+            .unwrap()
+            .unwrap();
         assert_eq!(retired.provider_body, Some(0x9000));
         assert_eq!(retired.native_identity, 9);
     }

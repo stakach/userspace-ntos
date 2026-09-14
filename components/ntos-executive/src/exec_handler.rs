@@ -24917,7 +24917,7 @@ impl ExecNtHandler {
         }
     }
 
-    fn finalize_retired_event_object(
+    pub(crate) fn finalize_retired_event_object(
         &mut self,
         retired: nt_kernel_exec::RetiredEventObject,
     ) {
@@ -25127,18 +25127,6 @@ impl ExecNtHandler {
             &mut self.events,
             &mut self.event_objects,
         )
-    }
-
-    pub(crate) fn provider_set_local_event(
-        &mut self,
-        provider: nt_provider_wait::ProviderDomainIdentity,
-        local_identity: u64,
-    ) -> Result<(bool, nt_kernel_exec::EventObjectId, usize, nt_kernel_exec::EventKind), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if !crate::win32k_provider_domain_is_current(provider) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        self.provider_local_events().set(provider, local_identity)
     }
 
     pub(crate) fn provider_reset_local_event(

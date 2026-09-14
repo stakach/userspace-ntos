@@ -48,6 +48,7 @@ mod object_wait;
 use object_wait::*;
 mod object_wait_apc;
 mod object_wait_reply;
+mod dispatcher_signal;
 mod file_reference_retirement;
 mod hosted_termination;
 mod parked_reply;
@@ -18606,15 +18607,10 @@ unsafe fn wait_park_multi(
 }
 
 /// Wake every waiter whose NT wait-object condition is satisfied. Synchronization events and
-/// semaphore tokens are consumed in waiter-slot order; process/thread objects are level-signalled.
+/// semaphore tokens are consumed in admission-sequence order; process/thread objects are level-signalled.
 unsafe fn wait_wake_dispatcher_set(handler: &mut ExecNtHandler) -> u64 {
-    wait_wake_dispatcher(handler, None).woken
-}
-
-#[derive(Clone, Copy)]
-struct DispatcherWakeResult {
-    woken: u64,
-    pulse_event_consumed: bool,
+    wait_select_dispatcher_ready(handler);
+    object_wait_reply::redrive(handler)
 }
 
 /// Close the readiness-to-registration window between native syscall dispatch and reply-cap
@@ -18626,91 +18622,14 @@ unsafe fn wait_recheck_after_park(handler: &mut ExecNtHandler, tid: u64) -> bool
     object_waiter_contains_tid(tid)
 }
 
-/// Pulse uses the same waiter selection, but clears the event before any parked thread resumes.
-unsafe fn wait_wake_dispatcher_pulse(
-    just_set: usize,
-    handler: &mut ExecNtHandler,
-) -> DispatcherWakeResult {
-    wait_wake_dispatcher(handler, Some(just_set))
-}
-
-/// Complete one false-to-true Event transition across native and hosted-GUI wait owners.
+/// Complete one false-to-true Event transition across all admitted wait owners.
 unsafe fn wait_wake_event_set(index: usize, handler: &mut ExecNtHandler) -> u64 {
-    let Some(id) = handler.event_id_for_index(index) else {
-        return wait_wake_dispatcher_set(handler);
-    };
-    let native_sequence = object_waiter_oldest_event_consumer_sequence(handler, index);
-    let gui_sequence =
-        crate::service_sec_image::gui_message_wait_oldest_unselected_sequence(id);
-    let provider_sequence =
-        crate::service_sec_image::provider_wait_oldest_event_consumer_sequence(handler, id);
-    let oldest = nt_kernel_exec::oldest_dispatcher_wait_source(&[
-        (nt_kernel_exec::DispatcherWaitSource::Native, native_sequence),
-        (nt_kernel_exec::DispatcherWaitSource::Gui, gui_sequence),
-        (
-            nt_kernel_exec::DispatcherWaitSource::Provider,
-            provider_sequence,
-        ),
-    ]);
-    let mut woken = 0;
-    match oldest {
-        Some(nt_kernel_exec::DispatcherWaitSource::Gui) => {
-            let _ = crate::service_sec_image::gui_message_wait_select_level(handler, id);
-            woken += wait_wake_dispatcher_set(handler);
-            woken += crate::service_sec_image::provider_wait_select_ready(handler);
-        }
-        Some(nt_kernel_exec::DispatcherWaitSource::Provider) => {
-            woken += crate::service_sec_image::provider_wait_select_ready(handler);
-            woken += wait_wake_dispatcher_set(handler);
-            let _ = crate::service_sec_image::gui_message_wait_select_level(handler, id);
-        }
-        _ => {
-            woken += wait_wake_dispatcher_set(handler);
-            let _ = crate::service_sec_image::gui_message_wait_select_level(handler, id);
-            woken += crate::service_sec_image::provider_wait_select_ready(handler);
-        }
-    }
-    woken
+    dispatcher_signal::wake(index, handler, nt_kernel_exec::EventSignalMode::Set)
 }
 
 /// Complete one pulse selection before the transient Event state can reach a late waiter.
 unsafe fn wait_wake_event_pulse(index: usize, handler: &mut ExecNtHandler) -> u64 {
-    if let Some(id) = handler.event_id_for_index(index) {
-        let native_sequence = object_waiter_oldest_event_consumer_sequence(handler, index);
-        let gui_sequence =
-            crate::service_sec_image::gui_message_wait_oldest_unselected_sequence(id);
-        let provider_sequence =
-            crate::service_sec_image::provider_wait_oldest_event_consumer_sequence(handler, id);
-        let oldest = nt_kernel_exec::oldest_dispatcher_wait_source(&[
-            (nt_kernel_exec::DispatcherWaitSource::Native, native_sequence),
-            (nt_kernel_exec::DispatcherWaitSource::Gui, gui_sequence),
-            (
-                nt_kernel_exec::DispatcherWaitSource::Provider,
-                provider_sequence,
-            ),
-        ]);
-        match oldest {
-            Some(nt_kernel_exec::DispatcherWaitSource::Gui) => {
-                let selected = crate::service_sec_image::gui_message_wait_select_pulse(handler, id);
-                if selected {
-                    let _ = handler.events.reset_existing(index as u64);
-                }
-            }
-            Some(nt_kernel_exec::DispatcherWaitSource::Provider) => {
-                let _ = crate::service_sec_image::provider_wait_select_ready(handler);
-            }
-            _ => {}
-        }
-    }
-    let result = wait_wake_dispatcher_pulse(index, handler);
-    if !result.pulse_event_consumed {
-        if let Some(id) = handler.event_id_for_index(index) {
-            crate::service_sec_image::gui_message_wait_select_pulse(handler, id);
-        }
-    }
-    result
-        .woken
-        .saturating_add(crate::service_sec_image::provider_wait_select_ready(handler))
+    dispatcher_signal::wake(index, handler, nt_kernel_exec::EventSignalMode::Pulse)
 }
 
 fn object_waiter_ready_selection(
@@ -18764,80 +18683,68 @@ fn object_waiter_oldest_event_consumer_sequence(
     None
 }
 
-unsafe fn wait_wake_dispatcher(
-    handler: &mut ExecNtHandler,
-    pulse_event: Option<usize>,
-) -> DispatcherWakeResult {
+unsafe fn wait_select_dispatcher_ready(handler: &mut ExecNtHandler) {
     // Selected results already consumed dispatcher state. Preserve them across cleanup reentry;
     // only unselected records participate in another arbitration pass.
     let mut sequence = 0;
     while let Some((identity, record)) = object_waiter_next_after_sequence(sequence) {
         sequence = record.sequence;
-        let count = record.count as usize;
-        let Some((selected_slot, mut wake_index)) =
-            object_waiter_ready_selection(handler, record)
-        else {
-            continue;
-        };
-        let mutant_limit = if record.wait_all {
-            record.objects[..count.min(WAITER_MAX_EVENTS)]
-                .iter()
-                .copied()
-                .any(|object| handler.wait_object_mutant_limit_for(object, record.tid))
-        } else {
-            handler.wait_object_mutant_limit_for(record.objects[selected_slot], record.tid)
-        };
-        // Consume the selected dispatcher transaction only after the condition is known to hold.
-        if mutant_limit {
-            wake_index = 0xC000_0191; // STATUS_MUTANT_LIMIT_EXCEEDED
-        } else if record.wait_all {
-            let mut abandoned = false;
-            for k in 0..count.min(WAITER_MAX_EVENTS) {
-                let object = record.objects[k];
-                if WaitObject::from_raw(object.raw()).is_none() {
-                    continue;
-                };
-                abandoned |= handler.wait_object_consume_for(object, record.tid)
-                    == nt_kernel_exec::DispatcherConsumeResult::Abandoned;
-            }
-            if abandoned {
-                wake_index = 0x80;
-            }
-        } else {
-            let object = record.objects[selected_slot];
-            if WaitObject::from_raw(object.raw()).is_some() {
-                match handler.wait_object_consume_for(object, record.tid) {
-                    nt_kernel_exec::DispatcherConsumeResult::Abandoned => {
-                        wake_index = 0x80 + wake_index;
-                    }
-                    nt_kernel_exec::DispatcherConsumeResult::MutantLimitExceeded => {
-                        wake_index = 0xC000_0191;
-                    }
-                    nt_kernel_exec::DispatcherConsumeResult::Consumed
-                    | nt_kernel_exec::DispatcherConsumeResult::NotReady => {}
-                }
-            }
+        let _ = object_waiter_select_ready(handler, identity, record);
+    }
+}
+
+unsafe fn object_waiter_select_ready(
+    handler: &mut ExecNtHandler,
+    identity: nt_user_host::object_wait::ObjectWaiterIdentity,
+    record: ObjectWaiterRecord,
+) -> bool {
+    let count = record.count as usize;
+    let Some((selected_slot, mut wake_index)) = object_waiter_ready_selection(handler, record) else {
+        return false;
+    };
+    let mutant_limit = if record.wait_all {
+        record.objects[..count].iter().copied()
+            .any(|object| handler.wait_object_mutant_limit_for(object, record.tid))
+    } else {
+        handler.wait_object_mutant_limit_for(record.objects[selected_slot], record.tid)
+    };
+    if mutant_limit {
+        wake_index = 0xC000_0191;
+    } else if record.wait_all {
+        let mut abandoned = false;
+        for object in record.objects[..count].iter().copied() {
+            abandoned |= handler.wait_object_consume_for(object, record.tid)
+                == nt_kernel_exec::DispatcherConsumeResult::Abandoned;
         }
-        object_wait_reply::select(identity, wake_index);
+        if abandoned {
+            wake_index = 0x80;
+        }
+    } else {
+        match handler.wait_object_consume_for(record.objects[selected_slot], record.tid) {
+            nt_kernel_exec::DispatcherConsumeResult::Abandoned => wake_index += 0x80,
+            nt_kernel_exec::DispatcherConsumeResult::MutantLimitExceeded => {
+                wake_index = 0xC000_0191;
+            }
+            nt_kernel_exec::DispatcherConsumeResult::Consumed
+            | nt_kernel_exec::DispatcherConsumeResult::NotReady => {}
+        }
     }
+    object_wait_reply::select(identity, wake_index);
+    true
+}
 
-    let pulse_event_consumed = pulse_event.is_some_and(|index| {
-        handler
-            .events
-            .query_existing(index as u64)
-            .is_some_and(|(kind, signaled)| {
-                matches!(kind, nt_kernel_exec::EventKind::Synchronization) && !signaled
-            })
-    });
-    if let Some(index) = pulse_event {
-        let _ = handler.events.reset_existing(index as u64);
+unsafe fn object_waiter_select_event_consumer(
+    handler: &mut ExecNtHandler,
+    event_index: usize,
+    expected_sequence: u64,
+) -> bool {
+    if object_waiter_oldest_event_consumer_sequence(handler, event_index) != Some(expected_sequence) {
+        return false;
     }
-
-    let woken = object_wait_reply::redrive(handler);
-    DispatcherWakeResult {
-        woken,
-        pulse_event_consumed,
-    }
+    let Some((identity, record)) = object_waiter_next_after_sequence(expected_sequence.saturating_sub(1)) else {
+        return false;
+    };
+    record.sequence == expected_sequence && object_waiter_select_ready(handler, identity, record)
 }
 
 unsafe fn wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {

@@ -34938,6 +34938,48 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         unchanged early boot progress, not DriverEntry Event execution, handler handoff, complete
         kernel waits or desktop paint. Review leaves native signaling/pulse arbitration, timer
         ownership and the full typed kernel wait lifecycle open below.
+      - [x] Arbitrate Event signaling across wait owners before reply delivery (2026-09-15).
+        Replace whole-family wake draining with shared nt-kernel-exec::select_event_signal.
+        Recompute the oldest ready native, GUI and provider consumer of the exact triggering
+        Event after every single complete wait transaction. A wait-any whose selected object is
+        elsewhere is not a consumer; an incomplete wait-all consumes nothing. This preserves
+        synchronization single-consumer semantics and admission ordering when notification
+        wait-all transactions compete for another synchronization object. All notification
+        consumers are selected before pulse clear, and all pulse state is cleared before replies
+        can resume callers. Remove the obsolete source-only arbiter, native pulse result/wrapper
+        and post-clear GUI/provider scans. Keep bulk native/provider scans for their separate
+        general readiness callers, with native selection factored away from reply delivery.
+        Add exact-sequence ProviderDispatcherWaitArbiter::pop_event_ready and native/GUI
+        select-one adapters. Selection publishes durable native reply or component continuation
+        state without resuming it. GUI queue Event admission remains synchronization-only.
+        Add generation-checked EventLeaseKind::Operation and distinct operation_leases accounting.
+        Operation references pin canonical backing across provider wait-lease release, selection,
+        pulse clear, reply-cleanup reentry and final SET readback; they do not create a handle,
+        a provider pointer or a queued/coalesced Event signal. Exact release alone can complete
+        pending retirement. Stale/wrong-kind release and signal-queue independence are tested.
+        Authenticated kernel SET_LOCAL/PULSE_LOCAL now share the hosted live-handler operation.
+        SET returns previous plus actual post-arbitration current state; PULSE returns previous
+        and clears before delivery, matching ReactOS/NT5. Already-signaled shortcuts retain those
+        references' semantics. Decode exact nonzero local identity and zero unused arguments.
+        Refuse both operations before touching bootstrap storage when no live dispatcher exists;
+        do not infer a hosted process or enable kernel wait admission. Remove replaced local SET
+        facade/runtime wrappers and duplicated hosted signal bodies. Hosted local retirement ACK
+        now also uses the shared width-checked EventObjectId conversion instead of truncating IDs.
+        Serialized validation passes 1,157 tests across 17 suites, with no failures or ignored
+        cases: .tmp/test-event-signal-arbitration-20260915.log. After removing the obsolete
+        source-only helper and its test, the final nt-kernel-exec library rerun passes 278/278:
+        .tmp/test-event-signal-cleanup-20260915.log. The selector tests cover notification pulses
+        across all owner families, synchronization single consumers, cross-family wait-all
+        competition, wait-any target filtering, and empty pulse versus persistent SET state.
+        Targeted provider arbitration tests reject stale sequences without consuming state or
+        releasing leases. Executive release passes in 38.97s with unchanged 297 warnings;
+        standalone I/O Manager passes without warnings. Evidence:
+        .tmp/build-event-signal-executive-20260915.log and
+        .tmp/build-event-signal-io-manager-20260915.log. Independent source review and
+        git diff --check pass; no consumers of replaced machinery remain. Native reply-cleanup
+        reentry during signaling still needs production-path proof beyond the strict-import
+        barrier. Genuine DriverEntry signaling still requires early readiness ownership;
+        live-handler support does not satisfy that dependency or establish desktop acceptance.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -34968,17 +35010,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Next admission dependency: the native Event/timer wait backend currently requires both
         a hosted client and the live ExecNtHandler; DriverEntry precedes that handler. The intact
         bootstrap dispatcher state checkpoint above replaces reconstruction, but early provider
-        memory-local Event operations now use the authenticated route above. Complete SET/PULSE
-        through real wake arbitration and timers through pre-loop deadline ownership next;
-        process handles/projected pointers must keep their distinct authority. Do not broaden the
-        six-operation decoder until those mechanisms are complete and independently tested.
-        Live-handler kernel SET can reuse wait_wake_event_set after releasing the local facade
-        borrow, without enabling kernel wait admission. Audit found a shared PULSE ordering gap:
-        with a native waiter oldest on a Notification Event, wait_wake_dispatcher_pulse clears
-        the transient signal before the final provider readiness scan. Repair shared selection
-        so every eligible notification waiter is selected before clearing or resuming; cover
-        native/provider ordering, synchronization single-consumer behavior, wait-all and empty
-        pulses in host tests. Bootstrap has no native waiter scheduler: keep signaling refused
+        memory-local Event operations now use the authenticated route above. Live-handler SET/PULSE
+        use the shared exact-one arbitration checkpoint above; early signaling and timers still
+        need pre-loop readiness/deadline ownership. Process handles/projected pointers must keep
+        their distinct authority. Bootstrap has no native waiter scheduler: keep signaling refused
         until its genuine no-waiter invariant or complete early wake ownership is established.
         Complete kernel activation/object leases before inserting a kernel suspension frame. Do not
         instantiate a second event manager, invent a hosted process ID, or park a frame without

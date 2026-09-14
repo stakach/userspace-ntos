@@ -1,12 +1,14 @@
-//! Strict scalar decoding for kernel provider-local Event operations without wake effects.
+//! Strict scalar decoding for authenticated kernel provider-local Event operations.
 
 use nt_kernel_exec::EventObjectId;
 
 pub const PUBLISH: u64 = 13;
 pub const RETIRE: u64 = 14;
 pub const ACK_RETIREMENT: u64 = 15;
+pub const SET: u64 = 16;
 pub const RESET: u64 = 17;
 pub const CLEAR: u64 = 18;
+pub const PULSE: u64 = 19;
 pub const READ: u64 = 20;
 
 const INVALID_PARAMETER: u32 = 0xC000_000D;
@@ -35,14 +37,27 @@ pub enum LocalEventRequest {
     Read {
         local: u64,
     },
+    Set {
+        local: u64,
+    },
+    Pulse {
+        local: u64,
+    },
 }
 
 impl LocalEventRequest {
-    /// Decode only operations whose full contract is memory-local. SET/PULSE require wake
-    /// arbitration; timers require deadline ownership; process handles require other authority.
-    /// Refuse those operations rather than routing them through a fabricated hosted client.
+    /// Wake operations require the live dispatcher, not merely bootstrap object storage.
+    pub const fn requires_dispatcher(self) -> bool {
+        matches!(self, Self::Set { .. } | Self::Pulse { .. })
+    }
+
+    /// Timers require deadline ownership; process handles require other authority. Refuse those
+    /// operations rather than routing them through a fabricated hosted client.
     pub fn decode(op: u64, local: u64, arg2: u64, arg3: u64) -> Result<Self, u32> {
-        if !matches!(op, PUBLISH | RETIRE | ACK_RETIREMENT | RESET | CLEAR | READ) {
+        if !matches!(
+            op,
+            PUBLISH | RETIRE | ACK_RETIREMENT | SET | RESET | CLEAR | PULSE | READ
+        ) {
             return Err(NOT_SUPPORTED);
         }
         if local == 0 {
@@ -57,10 +72,12 @@ impl LocalEventRequest {
             ACK_RETIREMENT => EventObjectId::from_wire_parts(arg2, arg3)
                 .map(|id| Self::Ack { local, id })
                 .ok_or(INVALID_PARAMETER),
-            RETIRE | RESET | CLEAR | READ if arg2 == 0 && arg3 == 0 => Ok(match op {
+            RETIRE | SET | RESET | CLEAR | PULSE | READ if arg2 == 0 && arg3 == 0 => Ok(match op {
                 RETIRE => Self::Retire { local },
+                SET => Self::Set { local },
                 RESET => Self::Reset { local },
                 CLEAR => Self::Clear { local },
+                PULSE => Self::Pulse { local },
                 _ => Self::Read { local },
             }),
             _ => Err(INVALID_PARAMETER),

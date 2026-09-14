@@ -1,4 +1,4 @@
-//! Memory-local Event operations after canonical kernel activation authentication.
+//! Event operations after canonical kernel activation authentication.
 
 use super::*;
 use nt_user_host::provider_local_event_request::LocalEventRequest;
@@ -38,6 +38,7 @@ fn execute(
             state.ack(provider, local, id)?;
             (0, 0, 0, 0)
         }
+        LocalEventRequest::Set { .. } | LocalEventRequest::Pulse { .. } => return Err(0xC000_00BB),
     })
 }
 
@@ -48,6 +49,25 @@ pub(super) unsafe fn dispatch(
     let _durable = allocator::enter_durable();
     let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if let Some(handler) = handler.as_mut() {
+        match request {
+            LocalEventRequest::Set { local } => {
+                return crate::provider_local_event::signal(
+                    handler,
+                    provider,
+                    local,
+                    nt_kernel_exec::EventSignalMode::Set,
+                );
+            }
+            LocalEventRequest::Pulse { local } => {
+                return crate::provider_local_event::signal(
+                    handler,
+                    provider,
+                    local,
+                    nt_kernel_exec::EventSignalMode::Pulse,
+                );
+            }
+            _ => {}
+        }
         let mut state = crate::provider_local_event::LocalEventState::new(
             &mut handler.obj_ns,
             &mut handler.anon_event_seq,
@@ -56,6 +76,9 @@ pub(super) unsafe fn dispatch(
         );
         execute(&mut state, provider, request)
     } else {
+        if request.requires_dispatcher() {
+            return Err(0xC000_00BB);
+        }
         dispatcher_bootstrap::with_local_events(|state| execute(state, provider, request))
     }
 }

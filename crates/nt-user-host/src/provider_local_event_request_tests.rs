@@ -33,6 +33,8 @@ fn memory_local_operations_require_zero_unused_scalar_arguments() {
         (RESET, LocalEventRequest::Reset { local: 41 }),
         (CLEAR, LocalEventRequest::Clear { local: 41 }),
         (READ, LocalEventRequest::Read { local: 41 }),
+        (SET, LocalEventRequest::Set { local: 41 }),
+        (PULSE, LocalEventRequest::Pulse { local: 41 }),
     ] {
         assert_eq!(LocalEventRequest::decode(op, 41, 0, 0), Ok(expected));
         for (arg2, arg3) in [(1, 0), (0, 1), (1, 1), (u64::MAX, 0), (0, u64::MAX)] {
@@ -46,7 +48,16 @@ fn memory_local_operations_require_zero_unused_scalar_arguments() {
 
 #[test]
 fn all_supported_operations_reject_zero_local_identity_without_truncating_valid_local() {
-    for op in [PUBLISH, RETIRE, ACK_RETIREMENT, RESET, CLEAR, READ] {
+    for op in [
+        PUBLISH,
+        RETIRE,
+        ACK_RETIREMENT,
+        SET,
+        RESET,
+        CLEAR,
+        PULSE,
+        READ,
+    ] {
         let (arg2, arg3) = if op == ACK_RETIREMENT { (1, 1) } else { (0, 0) };
         assert_eq!(
             LocalEventRequest::decode(op, 0, arg2, arg3),
@@ -110,9 +121,12 @@ fn retirement_ack_rejects_overwide_or_zero_fields_instead_of_aliasing_an_id() {
 }
 
 #[test]
-fn process_handle_set_pulse_timer_and_unknown_operations_have_no_fake_local_semantics() {
+fn process_handle_timer_and_unknown_operations_have_no_fake_local_semantics() {
     for op in (0..=64).chain([1u64 << 32, u64::MAX]) {
-        if matches!(op, PUBLISH | RETIRE | ACK_RETIREMENT | RESET | CLEAR | READ) {
+        if matches!(
+            op,
+            PUBLISH | RETIRE | ACK_RETIREMENT | SET | RESET | CLEAR | PULSE | READ
+        ) {
             continue;
         }
         assert_eq!(LocalEventRequest::decode(op, 41, 0, 0), Err(NOT_SUPPORTED));
@@ -120,5 +134,23 @@ fn process_handle_set_pulse_timer_and_unknown_operations_have_no_fake_local_sema
             LocalEventRequest::decode(op, 0, u64::MAX, u64::MAX),
             Err(NOT_SUPPORTED)
         );
+    }
+}
+
+#[test]
+fn signaling_requires_live_dispatcher_but_memory_local_operations_do_not() {
+    for op in [
+        PUBLISH,
+        RETIRE,
+        ACK_RETIREMENT,
+        SET,
+        RESET,
+        CLEAR,
+        PULSE,
+        READ,
+    ] {
+        let (a, b) = if op == ACK_RETIREMENT { (1, 1) } else { (0, 0) };
+        let request = LocalEventRequest::decode(op, 41, a, b).unwrap();
+        assert_eq!(request.requires_dispatcher(), matches!(op, SET | PULSE));
     }
 }
