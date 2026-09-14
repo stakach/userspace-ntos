@@ -38,13 +38,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Latest measured NT boot (2026-09-14): a fresh normal headless build/boot reaches strict win32k
+Latest measured NT boot (2026-09-15): a fresh normal headless build/boot reaches strict win32k
 admission with exactly 27 unresolved-import diagnostics and an explicit incomplete-registry
 rejection. MmMapViewInSystemSpace no longer appears as a spurious extra miss from global catalog
 failure. The executive stops before DriverEntry or desktop rendering;
 the VM was terminated at that deterministic barrier. Evidence and the exact import set are in the
-strict-registry and IRQ receive-continuation checkpoints below. Older desktop proofs are historical
-baselines, not acceptance of the current provider cutover.
+dispatcher-bootstrap, strict-registry and IRQ receive-continuation checkpoints below. Older desktop
+proofs are historical baselines, not acceptance of the current provider cutover.
 
 - [x] Correct secured-memory ownership and native VM protection/lifetime enforcement (tranche 19).
 - [x] Extract and harden the shared AMD64 unwind interpreter (tranche 20).
@@ -34878,6 +34878,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Evidence: .tmp/build-dispatcher-bootstrap-executive-20260915.log and
         .tmp/build-dispatcher-bootstrap-io-manager-20260915.log. Independent native review, scoped
         formatting checks and git diff --check pass; no old transfer API consumers remain.
+        Fresh production-path validation after commit 50c3d208: normal ./run.sh rebuilt ntdll,
+        the executive, rust-micro and disk image. The guest passes early dispatcher construction
+        and reaches the unchanged 27 unresolved bindings, explicit incomplete-registry rejection,
+        and main.rs:29959 stop. Logs: .tmp/run-dispatcher-bootstrap-20260915.log and
+        .tmp/boot-dispatcher-bootstrap-20260915.log. QEMU was stopped with SIGTERM on confirmation
+        of that barrier, within BOOT_TIMEOUT_SECONDS=300. The runner exits failure without a guest
+        success/Explorer verdict, as required. No QEMU remains. This boot exercises bootstrap
+        initialization, not the later handler handoff, kernel Event transport or desktop paint.
         Plan review: early Event transport still requires full channel/caller authentication and
         access to the bootstrap owner, as specified below. This checkpoint establishes ownership,
         not bootstrap Event publication, timer scheduling or kernel wait admission. Native kernel
