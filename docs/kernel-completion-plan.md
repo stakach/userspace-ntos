@@ -38,10 +38,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Latest measured NT boot (2026-09-07): B3 provider exception work is active. The complete win32k
-import gate has 27 unresolved code imports and blocks desktop acceptance. Subsequent host and
-standalone microkernel validation is recorded below; it is not a new NT desktop proof. The older
-desktop proofs are historical baselines, not acceptance of the current provider cutover.
+Latest measured NT boot (2026-09-14): a fresh normal headless build/boot reaches strict win32k
+admission and reports 28 unresolved code imports, including MmMapViewInSystemSpace. This supersedes
+the older 27-import measurement. The executive stops before DriverEntry or desktop rendering;
+the VM was terminated at that deterministic barrier. Evidence and the exact import set are in the
+IRQ receive-continuation checkpoint below. Older desktop proofs are historical baselines, not
+acceptance of the current provider cutover.
 
 - [x] Correct secured-memory ownership and native VM protection/lifetime enforcement (tranche 19).
 - [x] Extract and harden the shared AMD64 unwind interpreter (tranche 20).
@@ -34772,7 +34774,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/build-kernel-irq-receive-executive-20260914-rerun.log and
         .tmp/build-kernel-irq-receive-io-manager-20260914.log. Independent source reviews and scoped
         formatting/diff checks pass. Native IRQ-yield execution and desktop proof are not implied;
-        the last measured strict win32k frontier is still 27 imports pending a fresh boot below.
+        the fresh boot measurement below supersedes the older 27-import frontier.
+        Fresh production-path validation: BOOT_TIMEOUT_SECONDS=300 with normal ./run.sh rebuilt
+        ntdll, the executive, rust-micro and disk image, then launched the real headless gate.
+        Logs: .tmp/run-kernel-irq-receive-20260914.log and
+        .tmp/boot-kernel-irq-receive-20260914.log. The boot passes live Config Manager hive seeding,
+        disk section demand paging, win32k staging and NLS validation, then strict admission reports
+        28 unresolved imports and main.rs rejects the image before DriverEntry. QEMU was stopped
+        with SIGTERM at this deterministic barrier after about 70 seconds, within the 300-second
+        VM deadline; the runner correctly exits failure without a successful guest verdict.
+        No native DriverEntry IRQ-yield execution, desktop paint or screenshot proof is claimed.
+        Current unresolved set:
+        ZwCreateSection, ExRaiseAccessViolation, KeAttachProcess, KeDetachProcess, ExRaiseStatus,
+        KeStackAttachProcess, ZwReadFile, ZwCancelIoFile, ZwDeviceIoControlFile, KeIsAttachedProcess,
+        ObAssignSecurity, ZwCreateDirectoryObject, ZwOpenDirectoryObject, ZwQueryDirectoryObject,
+        ZwQueryObject, ZwQueryDirectoryFile, RtlUnwindEx, ZwQueryInformationFile,
+        ZwUnmapViewOfSection, ZwMapViewOfSection, ZwCreateFile, IoSynchronousInvalidateDeviceRelations,
+        IoOpenDeviceRegistryKey, IofCallDriver, IoBuildSynchronousFsdRequest,
+        IoBuildDeviceIoControlRequest, KeUnstackDetachProcess, MmMapViewInSystemSpace.
+        Plan review: retain strict admission and finish the authenticated native wait/IRP, section,
+        attach and exception contracts below before rerunning desktop acceptance. Do not use the
+        earlier host tests or this pre-DriverEntry run as proof of the new receive mechanism.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
