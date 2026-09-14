@@ -1,4 +1,4 @@
-//! Single-use first-pump observation retained by a canonical kernel activation recipient.
+//! Single-use pump entries retained by a canonical kernel activation recipient.
 //! This guard records execution progress, not scheduler or provider authority.
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -103,8 +103,8 @@ enum Progress {
     Observed(KernelProviderPumpDisposition),
 }
 
-/// Owned by the activation recipient; neither cloning nor dropping grants a second entry.
-/// Authentication must precede begin_initial, and no coordinator borrow may cross the pump.
+/// Owned by the activation recipient; dropping a ticket never grants a replacement entry.
+/// Authentication must precede each entry, and no coordinator borrow may cross the pump.
 #[derive(Debug)]
 pub struct KernelProviderPumpProgress {
     reply_cap: u64,
@@ -123,14 +123,28 @@ impl KernelProviderPumpProgress {
     }
 
     pub fn begin_initial(&mut self) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
-        self.begin_initial_with_counter(&NEXT_ATTEMPT)
+        self.begin_entry(Progress::Ready, &NEXT_ATTEMPT)
     }
 
-    fn begin_initial_with_counter(
+    /// Claim receive continuation before native scheduler effects can perform nested IPC.
+    /// Authenticate the same live activation/channel before claiming and again after scheduling,
+    /// then receive without transmitting another request. Failure never reopens the claim.
+    /// This is not a reply/resume operation for a callback, provider wait, LPC wait, or wall.
+    pub fn begin_receive_after_yield(
         &mut self,
+    ) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
+        self.begin_entry(
+            Progress::Observed(KernelProviderPumpDisposition::SchedulerYielded),
+            &NEXT_ATTEMPT,
+        )
+    }
+
+    fn begin_entry(
+        &mut self,
+        expected: Progress,
         counter: &AtomicU64,
     ) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
-        if self.progress != Progress::Ready {
+        if self.progress != expected {
             return Err(PumpProgressError::NotReady);
         }
         let nonce = counter

@@ -91,7 +91,7 @@ unsafe fn drain_instance(index: usize, inst: DriverInstance) -> Result<u64, nt_s
 /// One physical-instance snapshot per retry; no canonical manager or instance-table borrow
 /// survives the control IPC, whose reverse calls can mutate both tables.
 pub(super) unsafe fn drain() -> u64 {
-    if HOSTED_COMPONENT_PUMP_DEPTH.load(Ordering::Acquire) != 0 {
+    if hosted_component_dispatch_active() {
         return 0;
     }
     let Some(_drain) = DrainGuard::enter() else {
@@ -131,7 +131,7 @@ pub(super) unsafe fn preflight_unload(
     if !pending(expected) {
         return Ok(());
     }
-    if HOSTED_COMPONENT_PUMP_DEPTH.load(Ordering::Acquire) != 0 {
+    if hosted_component_dispatch_active() {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     let _drain = DrainGuard::enter().ok_or(nt_status::NtStatus::DEVICE_BUSY)?;

@@ -34740,6 +34740,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         desktop rendering: no VM boot was run, and the last measured 27 strict win32k imports
         remain open. Future owned kernel continuations must use the owned transition APIs;
         compatibility wrappers intentionally retain their old discard-on-error contract.
+      - [x] Continue authenticated IRQ-yielded bootstrap by receiving, without replaying requests
+        (2026-09-14; host/native-build verified; runtime acceptance remains separate).
+        Claim a fresh non-Clone receive attempt only from the canonical SchedulerYielded state;
+        nonce exhaustion preserves the yield, and dropped/foreign/replayed attempts cannot reenter.
+        Claim before scheduler IPC, validate the original live caller/dispatch/binding before and
+        after dedicated IRQ/DPC work, then continue directly at pump_recv on the retained Reply.
+        Only the claimed bootstrap adapter enables kernel_irq_yield; ordinary hosted GUI channels
+        remain excluded. An IRQ yield leaves the provider TCB and its Running lane owned, not an
+        invented wait frame. Callback/provider/LPC suspension and walls do not use this transition.
+        Replace the hosted driver's initial=RecvFirst retry loop with the same explicit receive
+        continuation, preserving its live rotated Reply object and cumulative fault/demand/assert
+        accounting. Demand and assert limits cannot reset on every IRQ. Preserve dispatch-depth
+        ownership across yield; release on real return/wall or transfer once to a typed suspension.
+        Factor the shared bounded scheduler scope into component_scheduler.rs; hold it across the
+        whole invocation, preserve the IPC message buffer around nested IRQ/DPC work and allocate
+        durable scheduler state outside turn scratch. Remove the unused active-bank vector and
+        redundant IRQ-drain wrapper. Bank isolation is provided by dedicated IRQ arenas and retained
+        lane ownership, not by that old list. Existing admission-failure results use one constructor.
+        This enables synchronous IRQ scheduling during DriverEntry, not asynchronous bootstrap or
+        kernel wait admission. Endpoint fan-in, stopped wait transport, kernel terminal delivery,
+        event leases and real caller-exit unwind remain open below.
+        Five new guard tests cover repeated yields, invalid/foreign/replayed/dropped receive
+        attempts and nonce exhaustion. Five accounting tests cover cumulative limits, saturation,
+        retained depth and exactly-once release/transfer by the active snapshot. Serialized tests
+        pass 847 cases across 15 suites with no failures or ignored cases:
+        .tmp/test-kernel-irq-receive-20260914.log. The initial native build found two retirement
+        helpers still reading the removed depth counter; both now use the shared activity query.
+        Executive release rebuild passes in 35.47s with the unchanged 294 warnings, and standalone
+        I/O Manager passes without warnings. Evidence:
+        .tmp/build-kernel-irq-receive-executive-20260914-rerun.log and
+        .tmp/build-kernel-irq-receive-io-manager-20260914.log. Independent source reviews and scoped
+        formatting/diff checks pass. Native IRQ-yield execution and desktop proof are not implied;
+        the last measured strict win32k frontier is still 27 imports pending a fresh boot below.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -34795,7 +34828,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Distinguish wait suspension from IRQ receive yield. Existing hosted_component_pump already
         drains real IRQ/DPC work and then receives on the same channel without replaying a request.
         That yield does not suspend the provider TCB or release its Running lane/shared bank.
-        Reuse this mechanism only after an exact authenticated receive-continuation ticket exists;
+        The authenticated receive-continuation checkpoint above now reuses this mechanism;
         do not manufacture an external suspension token for it. True asynchronous bootstrap also
         needs endpoint fan-in or an authenticated receiver: polling its endpoint once before
         blocking on the hosted endpoint leaves a lost-wakeup window and is not a scheduler.

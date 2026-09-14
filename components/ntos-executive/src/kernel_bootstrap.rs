@@ -42,7 +42,32 @@ impl DriverEntryRecipient {
         let attempt = self.progress.begin_initial().map_err(pump_error)?;
         let mut channel = self.channel;
         channel.kernel_caller = Some(caller);
+        channel.caps.kernel_irq_yield = true;
         Ok((channel, attempt))
+    }
+
+    pub(super) fn begin_receive_after_yield(
+        &mut self,
+        caller: KernelProviderCaller,
+    ) -> Result<
+        (
+            spawn_hosts::PumpChannel,
+            KernelProviderPumpAttempt,
+            spawn_hosts::PumpResult,
+        ),
+        u32,
+    > {
+        let previous = self
+            .observation
+            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let attempt = self
+            .progress
+            .begin_receive_after_yield()
+            .map_err(pump_error)?;
+        let mut channel = self.channel;
+        channel.kernel_caller = Some(caller);
+        channel.caps.kernel_irq_yield = true;
+        Ok((channel, attempt, previous))
     }
 
     pub(super) fn observe(

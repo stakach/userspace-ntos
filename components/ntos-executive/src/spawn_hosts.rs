@@ -127,6 +127,9 @@ pub(crate) struct HostCaps {
     pub usermode_callback: bool,
     /// win32k: retain a provider dispatch whose kernel-mode wait is owned by the executive.
     pub provider_wait: bool,
+    /// The caller owns a scheduler scope and an authenticated receive-only IRQ continuation.
+    /// Set only by the kernel bootstrap adapter after claiming its retained pump attempt.
+    pub kernel_irq_yield: bool,
     /// win32k: carry wide (>4) stack args through caller RSP or explicit `SH_REQ_A4..` staging.
     // Capability-surface documentation (§2.3) — see `usermode_callback`; not read by the pump.
     #[allow(dead_code)]
@@ -1547,7 +1550,7 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel, reply_cap: u64) -> Option<
         if pump_deadman_tripped() {
             return Some(PumpMessage::deadman_wall());
         }
-        if ch.caps.kind == ReqKind::Irp && irq {
+        if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield) && irq {
             return Some(PumpMessage::scheduler_yield());
         }
         return None;
@@ -1694,8 +1697,7 @@ struct PumpLoopOutcome {
     wall_flags: u64,
     wall_exception: u64,
     wall_code: u64,
-    faults: u64,
-    demand: u64,
+    accounting: nt_user_host::component_pump::ComponentPumpAccounting,
 }
 
 impl PumpLoopOutcome {
@@ -1713,8 +1715,7 @@ impl PumpLoopOutcome {
             wall_flags: 0,
             wall_exception: 0,
             wall_code: 0,
-            faults: 0,
-            demand: 0,
+            accounting: nt_user_host::component_pump::ComponentPumpAccounting::new(false),
         }
     }
 
@@ -1779,7 +1780,7 @@ unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
             if pump_deadman_tripped() {
                 return PumpMessage::deadman_wall();
             }
-            if ch.caps.kind == ReqKind::Irp && irq {
+            if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield) && irq {
                 return PumpMessage::scheduler_yield();
             }
             if timer {
@@ -1861,7 +1862,7 @@ unsafe fn pump_reply_recv4(
         if pump_deadman_tripped() {
             return PumpMessage::deadman_wall();
         }
-        if ch.caps.kind == ReqKind::Irp && irq {
+        if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield) && irq {
             return PumpMessage::scheduler_yield();
         }
         if timer {
@@ -1955,8 +1956,8 @@ pub(crate) struct PumpResult {
     pub provider_wait_suspended: bool,
     /// The component is blocked in an ordinary retained LPC request/reply rendezvous.
     pub lpc_wait_suspended: bool,
-    /// The component request is still live, but hosted scheduler work must run before its pump
-    /// continues. The caller resumes with `RecvFirst` on this same reply object.
+    /// The request remains live while IRQ scheduler work runs. Continue its receive half on this
+    /// reply object with the same accounting; do not replay an initial request or callback resume.
     pub scheduler_yielded: bool,
     /// Wall diagnostics (only meaningful when `!completed`).
     pub wall_ip: u64,
@@ -1967,6 +1968,41 @@ pub(crate) struct PumpResult {
     pub wall_code: u64,
     pub faults: u64,
     pub demand: u64,
+    accounting: nt_user_host::component_pump::ComponentPumpAccounting,
+}
+
+impl PumpResult {
+    /// An adapter's genuine admission failure, never a provider completion or resumable yield.
+    pub(crate) fn refused(status: i32, reply_cap: u64) -> Self {
+        Self {
+            status,
+            result: status as u32 as u64,
+            reply_cap,
+            completed: false,
+            callback_suspended: false,
+            provider_wait_suspended: false,
+            lpc_wait_suspended: false,
+            scheduler_yielded: false,
+            wall_ip: 0,
+            wall_addr: 0,
+            wall_label: 0,
+            wall_flags: 0,
+            wall_exception: 0,
+            wall_code: 0,
+            faults: 0,
+            demand: 0,
+            accounting: nt_user_host::component_pump::ComponentPumpAccounting::new(false),
+        }
+    }
+
+    fn is_receive_yield(&self) -> bool {
+        self.reply_cap != 0
+            && self.scheduler_yielded
+            && !self.completed
+            && !self.callback_suspended
+            && !self.provider_wait_suspended
+            && !self.lpc_wait_suspended
+    }
 }
 
 /// One operation on a dedicated hosted-interrupt lane. The component remains blocked in its
@@ -2191,20 +2227,20 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
             break;
         }
         if label == 6 {
-            outcome.faults += 1;
+            outcome.accounting.record_fault();
             if !pump_service_vm_fault(
                 ch,
                 label,
                 msg.m0,
                 msg.m1,
                 msg.m3,
-                outcome.faults,
-                outcome.demand,
+                outcome.accounting.faults(),
+                outcome.accounting.demand(),
             ) {
                 outcome.wall(msg);
                 break;
             }
-            outcome.demand += 1;
+            outcome.accounting.record_demand();
             msg = hosted_irq_reply_recv(ch, ch.reply_cap, 0, [0; 4]);
             continue;
         }
@@ -2227,8 +2263,8 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
         wall_flags: outcome.wall_flags,
         wall_exception: outcome.wall_exception,
         wall_code: outcome.wall_code,
-        faults: outcome.faults,
-        demand: outcome.demand,
+        faults: outcome.accounting.faults(),
+        demand: outcome.accounting.demand(),
     }
 }
 
@@ -2245,6 +2281,26 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
 /// [`HARNESS_SYSCALL_DISPATCHES`] per `caps.kind` — the durable proof the traffic is on the harness.
 pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
     component_pump_inner(ch, PumpResume::None)
+}
+
+/// Continue the receive half of an entered pump. IRQ yield may follow an already transmitted
+/// reply: neither the request tag nor any reply half may be sent again. The caller retains the
+/// invocation's channel/authority and scheduler scope across this operation.
+pub(crate) unsafe fn component_pump_continue_receive(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+) -> Result<PumpResult, u32> {
+    if !previous.is_receive_yield()
+        || !(ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
+        || (ch.caps.kernel_irq_yield && previous.reply_cap != ch.reply_cap)
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    crate::provider_bugcheck::stop_if_pending();
+    let mut reply_cap = previous.reply_cap;
+    let first = pump_recv(ch, reply_cap);
+    let outcome = component_pump_loop(ch, first, &mut reply_cap, previous.accounting);
+    Ok(pump_finish_slice(ch, outcome, reply_cap))
 }
 
 pub(crate) unsafe fn component_pump_resume_user_callback(ch: &PumpChannel) -> PumpResult {
@@ -2298,7 +2354,12 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume: PumpResume) -> PumpResu
     } else {
         pump_recv(ch, reply_cap)
     };
-    let outcome = component_pump_loop(ch, first, &mut reply_cap);
+    let outcome = component_pump_loop(
+        ch,
+        first,
+        &mut reply_cap,
+        nt_user_host::component_pump::ComponentPumpAccounting::new(owns_depth),
+    );
     if ch.initial == InitialAction::RecvFirst {
         let detail = if outcome.completed {
             ch.dispatch_label
@@ -2307,12 +2368,7 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume: PumpResume) -> PumpResu
         };
         trace_component_handoff(b"pump-recvfirst-exit", ch.tcb, reply_cap, detail);
     }
-    pump_leave_depth(
-        owns_depth,
-        outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended,
-    );
-    pump_suspend_walled_component(ch, outcome);
-    pump_result_from_outcome(ch, outcome, reply_cap)
+    pump_finish_slice(ch, outcome, reply_cap)
 }
 
 #[inline(never)]
@@ -2363,10 +2419,11 @@ unsafe fn component_pump_loop(
     ch: &PumpChannel,
     first: PumpMessage,
     reply_cap: &mut u64,
+    accounting: nt_user_host::component_pump::ComponentPumpAccounting,
 ) -> PumpLoopOutcome {
     let mut msg = first;
     let mut outcome = PumpLoopOutcome::new();
-    let mut skips = 0u64; // win32k int-0x2c asserts skipped this dispatch (bounded -> wall).
+    outcome.accounting = accounting;
     loop {
         if msg.scheduler_yield {
             outcome.scheduler_yielded = true;
@@ -2959,20 +3016,20 @@ unsafe fn component_pump_loop(
             pump_reply_recv_into!(ch, *reply_cap, msg, 1, result);
             continue;
         } else if label == 6 {
-            outcome.faults += 1;
+            outcome.accounting.record_fault();
             if !pump_service_vm_fault(
                 ch,
                 label,
                 msg.m0,
                 msg.m1,
                 msg.m3,
-                outcome.faults,
-                outcome.demand,
+                outcome.accounting.faults(),
+                outcome.accounting.demand(),
             ) {
                 outcome.wall(msg);
                 break;
             }
-            outcome.demand += 1;
+            outcome.accounting.record_demand();
             // Resume the server + recv the next fault/DONE with one composite reply+receive. A
             // VMFault reply is restarted unconditionally (`fault.rs`), and the receive half
             // re-registers `R`. A nested demand fault therefore rides the SAME reply object as the
@@ -2999,14 +3056,14 @@ unsafe fn component_pump_loop(
             let is_int2c = in_win32k
                 && core::ptr::read_volatile(msg.m0 as *const u8) == 0xCD
                 && core::ptr::read_volatile((msg.m0 + 1) as *const u8) == 0x2C;
-            if is_int2c && skips < W32_ASSERT_SKIP_BOUND {
+            if is_int2c && outcome.accounting.assert_skips() < W32_ASSERT_SKIP_BOUND {
                 if crate::DEBUG_TRACE && crate::W32_ASSERT_LOG.fetch_add(1, Ordering::Relaxed) < 40
                 {
                     crate::print_str(b"[w32disp] skip int 0x2c assert @ RVA 0x");
                     crate::print_hex(msg.m0.wrapping_sub(code_va) as u32);
                     crate::print_str(b"\n");
                 }
-                skips += 1;
+                outcome.accounting.record_assert_skip();
                 // UserException(3) reply: len 1, MR0 = the resume FaultIP (past `CD 2C`). This is
                 // the ONLY non-zero-length reply the component pump ever emits (risk R4).
                 pump_reply_recv_into!(ch, *reply_cap, msg, 1, msg.m0 + 2);
@@ -3581,16 +3638,26 @@ unsafe fn pump_service_io_port_fault(
 }
 
 #[inline(never)]
-fn pump_leave_depth(owns_depth: bool, component_suspended: bool) {
-    // Retire this level from the depth gauge unless a typed callback/provider/LPC continuation now
-    // owns it. Suspended levels remain outstanding until the exact resume pump completes them.
-    if owns_depth {
-        if component_suspended {
+unsafe fn pump_finish_slice(
+    ch: &PumpChannel,
+    mut outcome: PumpLoopOutcome,
+    reply_cap: u64,
+) -> PumpResult {
+    use nt_user_host::component_pump::PumpDepthDisposition;
+    match outcome.accounting.after_slice(
+        outcome.scheduler_yielded,
+        outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended,
+    ) {
+        PumpDepthDisposition::None | PumpDepthDisposition::Retained => {}
+        PumpDepthDisposition::Suspended => {
             SUSPENDED_COMPONENT_OUTSTANDING.fetch_add(1, Ordering::Relaxed);
-        } else {
+        }
+        PumpDepthDisposition::Released => {
             dispatch_depth_leave();
         }
     }
+    pump_suspend_walled_component(ch, outcome);
+    pump_result_from_outcome(ch, outcome, reply_cap)
 }
 
 #[inline(never)]
@@ -3696,8 +3763,9 @@ unsafe fn pump_result_from_outcome(
         wall_flags: outcome.wall_flags,
         wall_exception: outcome.wall_exception,
         wall_code: outcome.wall_code,
-        faults: outcome.faults,
-        demand: outcome.demand,
+        faults: outcome.accounting.faults(),
+        demand: outcome.accounting.demand(),
+        accounting: outcome.accounting,
     }
 }
 

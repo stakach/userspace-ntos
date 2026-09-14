@@ -24,6 +24,11 @@
 #[allow(dead_code)]// Activated only by the atomic ISR/DPC/provider cutover tracked in the plan.
 mod hosted_irq_broker;
 
+#[path = "component_scheduler.rs"]
+mod component_scheduler;
+use component_scheduler::hosted_component_pump;
+pub(crate) use component_scheduler::ComponentSchedulerScope;
+
 #[path = "device_property.rs"]
 pub(crate) mod device_property;
 
@@ -17185,16 +17190,9 @@ static HOSTED_WORK_QUEUE_WALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_WORK_QUEUE_WALL_TRACE_CAP: u64 = 8;
 static HOSTED_WORK_QUEUE_CAPACITY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_WORK_QUEUE_CAPACITY_TRACE_CAP: u64 = 8;
-static HOSTED_COMPONENT_PUMP_DEPTH: AtomicU64 = AtomicU64::new(0);
-
 pub(crate) fn hosted_component_dispatch_active() -> bool {
-    HOSTED_COMPONENT_PUMP_DEPTH.load(Ordering::Acquire) != 0
+    component_scheduler::is_active()
 }
-/// Request banks currently owned by live hosted-component pumps. This is a call-stack ledger, not a
-/// driver identity table: nested dispatch may use any idle bank, while IRQ/DPC work targeting an
-/// occupied bank remains queued until its owner returns.
-static mut ACTIVE_HOSTED_COMPONENT_BANKS: Option<Vec<u64>> = None;
-static HOSTED_COMPONENT_SCHEDULER_YIELDS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_WORK_QUEUE_DRAIN_ACTIVE: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_TRACE_CAP: u64 = 24;
 static mut HOSTED_PROVIDER_POINTER_ALLOCATIONS: Option<Vec<HostedProviderPointerAllocation>> = None;
@@ -28595,67 +28593,6 @@ unsafe fn trace_provider_io_port_range_export(
     print_str(b"\n");
 }
 
-struct HostedComponentPumpDepthGuard {
-    bank_depth: usize,
-}
-
-impl HostedComponentPumpDepthGuard {
-    unsafe fn enter(shared_va: u64) -> Self {
-        let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_HOSTED_COMPONENT_BANKS);
-        if slot.is_none() {
-            *slot = Some(Vec::new());
-        }
-        let banks = slot.as_mut().unwrap();
-        let bank_depth = banks.len();
-        banks.push(shared_va);
-        HOSTED_COMPONENT_PUMP_DEPTH.fetch_add(1, Ordering::AcqRel);
-        Self { bank_depth }
-    }
-}
-
-impl Drop for HostedComponentPumpDepthGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let banks = (*core::ptr::addr_of_mut!(ACTIVE_HOSTED_COMPONENT_BANKS))
-                .as_mut()
-                .expect("hosted component bank stack disappeared");
-            assert_eq!(banks.len(), self.bank_depth + 1);
-            banks.pop();
-            let previous = HOSTED_COMPONENT_PUMP_DEPTH.fetch_sub(1, Ordering::Release);
-            assert!(previous != 0, "hosted component pump depth underflow");
-        }
-    }
-}
-
-unsafe fn hosted_component_pump(
-    ch: &crate::spawn_hosts::PumpChannel,
-) -> crate::spawn_hosts::PumpResult {
-    let _depth = HostedComponentPumpDepthGuard::enter(ch.shared_va);
-    let mut active = *ch;
-    loop {
-        let result = crate::spawn_hosts::component_pump(&active);
-        if !result.scheduler_yielded {
-            return result;
-        }
-        let yield_number = HOSTED_COMPONENT_SCHEDULER_YIELDS.fetch_add(1, Ordering::Relaxed) + 1;
-        let irq_lines = drain_pending_hosted_irqs_for_scheduler_yield();
-        let dpcs = drain_hosted_driver_dpcs();
-        if yield_number <= 16 {
-            print_str(b"[hosted-scheduler] resume component bank=0x");
-            print_hex64(active.shared_va);
-            print_str(b" after yield #");
-            print_u64(yield_number);
-            print_str(b" irq-lines=");
-            print_u64(irq_lines);
-            print_str(b" dpcs=");
-            print_u64(dpcs);
-            print_str(b"\n");
-        }
-        active.initial = crate::spawn_hosts::InitialAction::RecvFirst;
-        active.reply_cap = result.reply_cap;
-    }
-}
-
 pub(crate) unsafe fn service_hosted_provider_export(
     dependent_channel: &crate::spawn_hosts::PumpChannel,
     provider_export_rva: u64,
@@ -29473,7 +29410,7 @@ impl Drop for HostedWorkQueueDrainGuard {
 /// work ownership dynamic (no NIC/driver bitset or identity list) and prevents a nested callback
 /// from running a passive worker before that outer state is released.
 unsafe fn drain_hosted_work_queues_at_passive_level() -> Result<u64, i32> {
-    if HOSTED_COMPONENT_PUMP_DEPTH.load(Ordering::Acquire) != 0 {
+    if component_scheduler::is_active() {
         return Ok(0);
     }
     let Some(_drain) = HostedWorkQueueDrainGuard::enter() else {
@@ -48469,10 +48406,6 @@ unsafe fn drain_pending_hosted_irqs_snapshot() -> u64 {
         HOSTED_IRQ_PENDING_EVENTS.fetch_or(deferred, Ordering::AcqRel);
     }
     serviced
-}
-
-unsafe fn drain_pending_hosted_irqs_for_scheduler_yield() -> u64 {
-    drain_pending_hosted_irqs_snapshot()
 }
 
 pub(crate) unsafe fn drain_pending_hosted_irqs() -> u64 {

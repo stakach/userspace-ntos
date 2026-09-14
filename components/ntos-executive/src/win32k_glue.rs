@@ -202,6 +202,7 @@ unsafe fn win32k_lane_channel(
             client_attach: attach_client,
             usermode_callback,
             provider_wait,
+            kernel_irq_yield: false,
             wide_arg_marshal: true,
             assert_skip: true,
             sparse_vspace: true,
@@ -3265,47 +3266,17 @@ unsafe fn resume_suspended_user_callback_component(
         || client.badge != request.client_badge
         || !win32k_client_context_is_admitted(win32k_client_context_from_callback_client(client))
     {
-        return crate::spawn_hosts::PumpResult {
-            status: 0xC000_000Du32 as i32,
-            result: 0xC000_000Du32 as u64,
-            reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
-            completed: false,
-            callback_suspended: false,
-            provider_wait_suspended: false,
-            lpc_wait_suspended: false,
-            scheduler_yielded: false,
-            wall_ip: 0,
-            wall_addr: 0,
-            wall_label: 0,
-            wall_flags: 0,
-            wall_exception: 0,
-            wall_code: 0,
-            faults: 0,
-            demand: 0,
-        };
+        return crate::spawn_hosts::PumpResult::refused(
+            0xC000_000Du32 as i32, REPLY_W32_SLOT.load(Ordering::Relaxed),
+        );
     }
     let dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     let lane = dispatch.lane;
     let callback_token = u64::from(request.callback_id);
     if dispatch.dispatch_id != request.dispatch_id || !lane.is_valid() || callback_token == 0 {
-        return crate::spawn_hosts::PumpResult {
-            status: 0xC000_000Du32 as i32,
-            result: 0xC000_000Du32 as u64,
-            reply_cap: 0,
-            completed: false,
-            callback_suspended: false,
-            provider_wait_suspended: false,
-            lpc_wait_suspended: false,
-            scheduler_yielded: false,
-            wall_ip: 0,
-            wall_addr: 0,
-            wall_label: 0,
-            wall_flags: 0,
-            wall_exception: 0,
-            wall_code: 0,
-            faults: 0,
-            demand: 0,
-        };
+        return crate::spawn_hosts::PumpResult::refused(
+            0xC000_000Du32 as i32, 0,
+        );
     }
     let Some(channel) = win32k_lane_channel(
         lane,
@@ -3355,44 +3326,14 @@ unsafe fn resume_suspended_user_callback_component(
         client.ethread,
         callback_process_role_code(client.process_role) as u64,
     ) {
-        return crate::spawn_hosts::PumpResult {
-            status: 0xC000_000Du32 as i32,
-            result: 0xC000_000Du32 as u64,
-            reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
-            completed: false,
-            callback_suspended: false,
-            provider_wait_suspended: false,
-            lpc_wait_suspended: false,
-            scheduler_yielded: false,
-            wall_ip: 0,
-            wall_addr: 0,
-            wall_label: 0,
-            wall_flags: 0,
-            wall_exception: 0,
-            wall_code: 0,
-            faults: 0,
-            demand: 0,
-        };
+        return crate::spawn_hosts::PumpResult::refused(
+            0xC000_000Du32 as i32, REPLY_W32_SLOT.load(Ordering::Relaxed),
+        );
     }
     if !crate::service_sec_image::resume_external_component_execution_lane(lane, callback_token) {
-        return crate::spawn_hosts::PumpResult {
-            status: 0xC000_000Du32 as i32,
-            result: 0xC000_000Du32 as u64,
-            reply_cap: 0,
-            completed: false,
-            callback_suspended: false,
-            provider_wait_suspended: false,
-            lpc_wait_suspended: false,
-            scheduler_yielded: false,
-            wall_ip: 0,
-            wall_addr: 0,
-            wall_label: 0,
-            wall_flags: 0,
-            wall_exception: 0,
-            wall_code: 0,
-            faults: 0,
-            demand: 0,
-        };
+        return crate::spawn_hosts::PumpResult::refused(
+            0xC000_000Du32 as i32, 0,
+        );
     }
     let pr = crate::spawn_hosts::component_pump_resume_user_callback(&channel);
     retire_win32k_on_wall(&pr);

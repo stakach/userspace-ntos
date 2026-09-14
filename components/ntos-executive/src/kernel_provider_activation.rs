@@ -118,8 +118,8 @@ pub(crate) unsafe fn capture_win32k_initial_system(
     })
 }
 
-/// Claim the first pump exactly once and release all canonical borrows before entering it.
-/// This is not a resume API: stopped execution needs its own authenticated scheduler transition.
+/// Claim the first pump once, then only genuine IRQ-yield receive continuations. The provider
+/// retains its Running lane throughout; walls and typed waits do not enter this scheduler path.
 pub(crate) unsafe fn run_initial_driver_entry(
     caller: KernelProviderCaller,
 ) -> Result<
@@ -129,6 +129,7 @@ pub(crate) unsafe fn run_initial_driver_entry(
     ),
     u32,
 > {
+    let scope = driver_launch::ComponentSchedulerScope::enter();
     let (channel, mut attempt) = with_provider_process_manager(|pm| {
         let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
         activations.validate(
@@ -139,8 +140,35 @@ pub(crate) unsafe fn run_initial_driver_entry(
         )?;
         activations.recipient_mut(caller)?.begin_initial(caller)
     })?;
-    let result = spawn_hosts::component_pump(&channel);
-    let receipt = record_driver_entry_pump(&channel, &mut attempt, &result)?;
+    let mut result = spawn_hosts::component_pump(&channel);
+    let mut receipt = record_driver_entry_pump(&channel, &mut attempt, &result)?;
+    while result.scheduler_yielded {
+        let (receiving, mut receive_attempt, previous) = with_provider_process_manager(|pm| {
+            let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
+            activations.validate(
+                caller,
+                pm,
+                &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+                &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
+            )?;
+            activations
+                .recipient_mut(caller)?
+                .begin_receive_after_yield(caller)
+        })?;
+        scope.service_irq_yield(receiving.shared_va);
+        // Dedicated IRQ workers can perform nested IPC. Recheck authority after those effects,
+        // without minting another attempt or permitting a failed entered continuation to replay.
+        with_provider_process_manager(|pm| {
+            (&*core::ptr::addr_of!(ACTIVATIONS)).validate(
+                caller,
+                pm,
+                &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+                &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
+            )
+        })?;
+        result = spawn_hosts::component_pump_continue_receive(&receiving, &previous)?;
+        receipt = record_driver_entry_pump(&receiving, &mut receive_attempt, &result)?;
+    }
     Ok((result, receipt))
 }
 
