@@ -43,8 +43,8 @@ admission with exactly 27 unresolved-import diagnostics and an explicit incomple
 rejection. MmMapViewInSystemSpace no longer appears as a spurious extra miss from global catalog
 failure. The executive stops before DriverEntry or desktop rendering;
 the VM was terminated at that deterministic barrier. Evidence and the exact import set are in the
-Event signal arbitration, kernel Event transport, dispatcher-bootstrap, strict-registry and IRQ receive-continuation
-checkpoints below. Older desktop
+bootstrap unobserved Event signaling, Event signal arbitration, kernel Event transport,
+dispatcher-bootstrap, strict-registry and IRQ receive-continuation checkpoints below. Older desktop
 proofs are historical baselines, not acceptance of the current provider cutover.
 
 - [x] Correct secured-memory ownership and native VM protection/lifetime enforcement (tranche 19).
@@ -35020,6 +35020,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         unchanged, and no requires_dispatcher consumers remain. Real DriverEntry transport
         execution is still a proof obligation beyond the strict-import barrier; host transition
         and handoff tests do not establish native execution or desktop acceptance.
+        Fresh normal boot after 6dee43fc reaches the unchanged 27 unresolved imports and explicit
+        incomplete-registry rejection at main.rs:29867. Logs:
+        .tmp/run-bootstrap-event-signal-20260915.log and
+        .tmp/boot-bootstrap-event-signal-20260915.log. QEMU was stopped with SIGTERM at the confirmed
+        barrier within BOOT_TIMEOUT_SECONDS=300; the runner exits failure without a successful
+        guest completion or Explorer verdict. No QEMU remains. This verifies unchanged early
+        boot progress, not native execution of unobserved signaling or DriverEntry completion.
+      - [ ] Share strict Event backing checks for provider-wait admission and readiness.
+        The live ExecNtHandler backend currently validates registry authority when acquiring an
+        Event lease without preflighting EventStore backing; readiness uses read_state, which
+        silently treats missing backing as unsignalled. Introduce shared helpers over the existing
+        registry/store for backing-checked admission, exact ProviderWait lease readiness and
+        consumption, and use them immediately in the live adapter. Do not add an alternate
+        dispatcher store or defer native integration until bootstrap wait admission. Preserve
+        hosted-client generation/current-provider validation and the distinct authority of
+        process-projected Events. Invalid backing at admission must fail without leaking a lease;
+        missing backing after admission is an invariant violation, not indefinite not-ready.
+        Keep native namespace validation and synchronous exact retirement in the adapter; do not
+        create an allocation-backed cleanup queue. Test real ProviderDispatcherWaitArbiter
+        ready/pending/poll/wait-all paths, synchronization consumption, missing backing,
+        delete-pending retained leases and ownership transfer with exact live leases. Reuse these
+        helpers for bootstrap only after typed kernel continuation, Reply/shared-bank ownership
+        and real readiness/deadline scheduling are complete. This slice does not enable kernel
+        wait admission or satisfy the remaining DriverEntry/export dependencies.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
