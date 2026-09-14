@@ -5,6 +5,7 @@
 //! fields, and `impl` blocks auto-attach to the type crate-wide.
 #![allow(clippy::all)]
 use crate::*;
+use crate::provider_local_event::trace as trace_provider_local_event;
 use nt_io_abi::major;
 use nt_io_manager::{LocalFileObject, PendingFileRoute};
 
@@ -499,7 +500,6 @@ static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NAMED_EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
-static PROVIDER_LOCAL_EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_TIMER_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EVENT_DELETE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_POST_LSA_REGISTRY_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -1780,40 +1780,6 @@ fn trace_named_event_object(
             print_str(b" signaled=");
             print_u64(signaled as u64);
         }
-    }
-    print_str(b"\n");
-}
-
-fn trace_provider_local_event(
-    op: &[u8],
-    provider: nt_provider_wait::ProviderDomainIdentity,
-    local_identity: u64,
-    id: Option<nt_kernel_exec::EventObjectId>,
-    native_identity: u64,
-) {
-    let n = PROVIDER_LOCAL_EVENT_TRACE_N.fetch_add(1, Ordering::Relaxed);
-    if n >= 64 {
-        return;
-    }
-    print_str(b"[provider-local-event] #");
-    print_u64(n + 1);
-    print_str(b" op=");
-    print_str(op);
-    print_str(b" provider=");
-    print_u64(provider.domain);
-    print_str(b"/");
-    print_u64(provider.generation);
-    print_str(b" local=0x");
-    print_hex_u64(local_identity);
-    if let Some(id) = id {
-        print_str(b" canonical=");
-        print_u64(id.0.slot().saturating_add(1));
-        print_str(b"/");
-        print_u64(u64::from(id.0.generation().0));
-    }
-    if native_identity != 0 {
-        print_str(b" native=");
-        print_u64(native_identity);
     }
     print_str(b"\n");
 }
@@ -24955,6 +24921,14 @@ impl ExecNtHandler {
         &mut self,
         retired: nt_kernel_exec::RetiredEventObject,
     ) {
+        if retired.provider_local_identity.is_some() {
+            crate::provider_local_event::finalize_local_backing(
+                &mut self.obj_ns,
+                &mut self.events,
+                retired,
+            );
+            return;
+        }
         let Ok(index) = usize::try_from(retired.native_identity) else {
             return;
         };
@@ -25139,79 +25113,20 @@ impl ExecNtHandler {
         initial_state: bool,
     ) -> Result<(nt_kernel_exec::EventObjectId, u64), u32> {
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
-        if !crate::win32k_provider_domain_is_current(provider)
-            || local_identity == 0
-            || event_type > 1
-        {
+        if !crate::win32k_provider_domain_is_current(provider) {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let index = self
-            .obj_create_anon_event(event_type == 1, initial_state)
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        let owner = nt_kernel_exec::EventObjectOwner::provider(
-            provider.domain,
-            provider.generation,
-        );
-        let id = match self.event_objects.create_provider_local(
-            owner,
-            local_identity,
-            index as u64,
-        ) {
-            Ok(id) => id,
-            Err(_) => {
-                self.rollback_new_event(index);
-                return Err(STATUS_INSUFFICIENT_RESOURCES);
-            }
-        };
-        trace_provider_local_event(
-            b"publish",
-            provider,
-            local_identity,
-            Some(id),
-            index as u64,
-        );
-        let metadata = u64::from(event_type == 1) | (u64::from(initial_state) << 1);
-        Ok((id, metadata))
+        self.provider_local_events()
+            .publish(provider, local_identity, event_type, initial_state)
     }
 
-    fn provider_local_event_identity(
-        &self,
-        provider: nt_provider_wait::ProviderDomainIdentity,
-        local_identity: u64,
-    ) -> Result<
-        (
-            nt_kernel_exec::EventObjectId,
-            usize,
-            nt_kernel_exec::EventKind,
-            bool,
-        ),
-        u32,
-    > {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if !crate::win32k_provider_domain_is_current(provider) || local_identity == 0 {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let id = self
-            .event_objects
-            .id_for_provider_local(
-                nt_kernel_exec::EventObjectOwner::provider(
-                    provider.domain,
-                    provider.generation,
-                ),
-                local_identity,
-            )
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        let snapshot = self
-            .event_objects
-            .snapshot(id)
-            .map_err(|_| STATUS_INVALID_PARAMETER)?;
-        let index = usize::try_from(snapshot.native_identity).map_err(|_| STATUS_INVALID_PARAMETER)?;
-        let (kind, signaled) = self
-            .events
-            .query_existing(index as u64)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        Ok((id, index, kind, signaled))
+    fn provider_local_events(&mut self) -> crate::provider_local_event::LocalEventState<'_> {
+        crate::provider_local_event::LocalEventState::new(
+            &mut self.obj_ns,
+            &mut self.anon_event_seq,
+            &mut self.events,
+            &mut self.event_objects,
+        )
     }
 
     pub(crate) fn provider_set_local_event(
@@ -25220,13 +25135,10 @@ impl ExecNtHandler {
         local_identity: u64,
     ) -> Result<(bool, nt_kernel_exec::EventObjectId, usize, nt_kernel_exec::EventKind), u32> {
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        let (id, index, kind, _) =
-            self.provider_local_event_identity(provider, local_identity)?;
-        let previous = self
-            .events
-            .set_existing(index as u64)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        Ok((previous, id, index, kind))
+        if !crate::win32k_provider_domain_is_current(provider) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.provider_local_events().set(provider, local_identity)
     }
 
     pub(crate) fn provider_reset_local_event(
@@ -25235,10 +25147,10 @@ impl ExecNtHandler {
         local_identity: u64,
     ) -> Result<bool, u32> {
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        let (_, index, _, _) = self.provider_local_event_identity(provider, local_identity)?;
-        self.events
-            .reset_existing(index as u64)
-            .ok_or(STATUS_INVALID_PARAMETER)
+        if !crate::win32k_provider_domain_is_current(provider) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.provider_local_events().reset(provider, local_identity)
     }
 
     pub(crate) fn provider_clear_local_event(
@@ -25247,20 +25159,22 @@ impl ExecNtHandler {
         local_identity: u64,
     ) -> Result<(), u32> {
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        let (_, index, _, _) = self.provider_local_event_identity(provider, local_identity)?;
-        self.events
-            .clear_existing(index as u64)
-            .then_some(())
-            .ok_or(STATUS_INVALID_PARAMETER)
+        if !crate::win32k_provider_domain_is_current(provider) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.provider_local_events().clear(provider, local_identity)
     }
 
     pub(crate) fn provider_read_local_event(
-        &self,
+        &mut self,
         provider: nt_provider_wait::ProviderDomainIdentity,
         local_identity: u64,
     ) -> Result<bool, u32> {
-        self.provider_local_event_identity(provider, local_identity)
-            .map(|(_, _, _, signaled)| signaled)
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if !crate::win32k_provider_domain_is_current(provider) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.provider_local_events().read(provider, local_identity)
     }
 
     pub(crate) fn provider_retire_local_event(
@@ -25269,33 +25183,10 @@ impl ExecNtHandler {
         local_identity: u64,
     ) -> Result<Option<nt_kernel_exec::EventObjectId>, u32> {
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if !crate::win32k_provider_domain_is_current(provider) || local_identity == 0 {
+        if !crate::win32k_provider_domain_is_current(provider) {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let owner = nt_kernel_exec::EventObjectOwner::provider(
-            provider.domain,
-            provider.generation,
-        );
-        if let Some(id) = self
-            .event_objects
-            .pending_provider_local_reclaim(owner, local_identity)
-        {
-            trace_provider_local_event(b"retire-pending", provider, local_identity, Some(id), 0);
-            return Ok(Some(id));
-        }
-        let id = self
-            .event_objects
-            .id_for_provider_local(owner, local_identity)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        trace_provider_local_event(b"retire", provider, local_identity, Some(id), 0);
-        match self.request_event_object_delete(id, b"provider-retire", false) {
-            Ok(Some(retired)) => {
-                self.finalize_retired_event_object(retired);
-                Ok(Some(id))
-            }
-            Ok(None) => Ok(None),
-            Err(_) => Err(STATUS_INVALID_PARAMETER),
-        }
+        self.provider_local_events().retire(provider, local_identity)
     }
 
     pub(crate) fn provider_ack_local_event_retirement(
@@ -25308,17 +25199,7 @@ impl ExecNtHandler {
         if !crate::win32k_provider_domain_is_current(provider) {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        trace_provider_local_event(b"ack", provider, local_identity, Some(id), 0);
-        self.event_objects
-            .complete_provider_local_reclaim(
-                id,
-                nt_kernel_exec::EventObjectOwner::provider(
-                    provider.domain,
-                    provider.generation,
-                ),
-                local_identity,
-            )
-            .map_err(|_| STATUS_INVALID_PARAMETER)
+        self.provider_local_events().ack(provider, local_identity, id)
     }
 
     pub(crate) fn provider_publish_local_timer(
@@ -31508,37 +31389,13 @@ impl ExecNtHandler {
         auto_reset: bool,
         initial_state: bool,
     ) -> Option<usize> {
-        // Unique 4-byte synthetic name "a" + a 24-bit counter, so obj_child never matches two anon
-        // events (they live under a private parent id 250 that no name walk reaches).
-        let n = self.anon_event_seq;
-        self.anon_event_seq = self.anon_event_seq.wrapping_add(1);
-        let name = [
-            b'a',
-            (n & 0xff) as u8,
-            ((n >> 8) & 0xff) as u8,
-            ((n >> 16) & 0xff) as u8,
-        ];
-        let index = ObjEntry::push_kind(
+        crate::provider_local_event::create_anonymous_event(
             &mut self.obj_ns,
-            &name,
-            OBJ_PARENT_ANONYMOUS,
-            OBJ_KIND_EVENT,
-            &[],
-            false,
-        )?;
-        if !self.events.try_initialize(
-            index as u64,
-            if auto_reset {
-                EventKind::Synchronization
-            } else {
-                EventKind::Notification
-            },
+            &mut self.anon_event_seq,
+            &mut self.events,
+            auto_reset,
             initial_state,
-        ) {
-            self.obj_ns.pop();
-            return None;
-        }
-        Some(index)
+        )
     }
 
     pub(crate) fn obj_create_anon_timer(&mut self, auto_reset: bool) -> Option<usize> {

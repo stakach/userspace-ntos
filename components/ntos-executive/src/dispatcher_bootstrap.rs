@@ -47,3 +47,20 @@ pub(crate) unsafe fn take() -> DispatcherBootstrapSeed {
         }
     }
 }
+
+/// Memory-only access while bootstrap owns the original stores. No borrow may escape into IPC.
+/// Once transferred, callers must use the live handler; no replacement seed is constructed.
+pub(crate) unsafe fn with_local_events<R>(
+    operation: impl FnOnce(&mut crate::provider_local_event::LocalEventState<'_>) -> Result<R, u32>,
+) -> Result<R, u32> {
+    let BootstrapPhase::Owned(seed) = &mut *core::ptr::addr_of_mut!(BOOTSTRAP) else {
+        return Err(0xC000_00A3);
+    };
+    let mut state = crate::provider_local_event::LocalEventState::new(
+        &mut seed.obj_ns,
+        &mut seed.anon_event_seq,
+        &mut seed.dispatcher.events,
+        &mut seed.dispatcher.event_objects,
+    );
+    operation(&mut state)
+}

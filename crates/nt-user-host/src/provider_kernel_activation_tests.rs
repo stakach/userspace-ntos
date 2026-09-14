@@ -23,6 +23,9 @@ mod resume;
 #[path = "provider_kernel_wait_capture_tests.rs"]
 mod wait_capture;
 
+#[path = "provider_kernel_service_tests.rs"]
+mod service;
+
 type Lanes = ComponentSuspensionLanes<u64, i32>;
 
 fn bootstrap() -> PsBootstrapState {

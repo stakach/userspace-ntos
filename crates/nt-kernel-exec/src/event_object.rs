@@ -24,7 +24,10 @@ impl EventObjectId {
     pub fn from_wire_parts(one_based_slot: u64, generation: u64) -> Option<Self> {
         let slot = one_based_slot.checked_sub(1)?;
         let generation = u32::try_from(generation).ok()?;
-        if generation == 0 || slot >= (1u64 << 40) {
+        if generation == 0
+            || u64::from(generation) >= (1u64 << nt_types::GEN_BITS)
+            || slot >= (1u64 << nt_types::SLOT_BITS)
+        {
             return None;
         }
         Some(Self(ObjectId::new(Generation(generation), slot)))
@@ -544,6 +547,9 @@ impl EventObjectRegistry {
             return Err(EventObjectError::ProviderBodyInUse);
         }
         let slot = self.event_slot(id)?;
+        if self.events[slot].provider_local_identity.is_some() {
+            return Err(EventObjectError::InvalidProviderBody);
+        }
         match self.events[slot].provider_body {
             None => {
                 self.events[slot].provider_body = Some(body);
@@ -604,6 +610,9 @@ impl EventObjectRegistry {
             return Err(EventObjectError::InvalidProviderBody);
         }
         let slot = self.event_slot(id)?;
+        if self.events[slot].provider_local_identity.is_some() {
+            return Err(EventObjectError::InvalidProviderBody);
+        }
         if let Some(body) = self.events[slot].provider_body {
             Self::increment(&mut self.events[slot].pointer_leases)?;
             return Ok((body, false));
@@ -1089,6 +1098,112 @@ mod tests {
             Err(EventObjectError::ProviderBodyInUse)
         );
         assert_eq!(registry.provider_body(a), Ok(Some(0xA000)));
+    }
+
+    #[test]
+    fn embedded_event_cannot_install_or_retain_a_projected_provider_body() {
+        let mut registry = EventObjectRegistry::new();
+        let provider = EventObjectOwner::provider(7, 3);
+        let embedded = registry.create_provider_local(provider, 41, 11).unwrap();
+        let before = registry.snapshot(embedded).unwrap();
+        assert_eq!(
+            registry.install_provider_body(embedded, 0x9000),
+            Err(EventObjectError::InvalidProviderBody)
+        );
+        assert_eq!(
+            registry.retain_pointer_or_install(embedded, 0x9000),
+            Err(EventObjectError::InvalidProviderBody)
+        );
+        assert_eq!(registry.snapshot(embedded), Ok(before));
+        assert_eq!(registry.provider_body(embedded), Ok(None));
+        assert_eq!(registry.id_for_provider_body(0x9000), None);
+        assert_eq!(registry.id_for_provider_local(provider, 41), Some(embedded));
+        assert_eq!(registry.id_for_native(11), Some(embedded));
+        assert_eq!(registry.live_lease_count(), 0);
+        let process = create(&mut registry, 12);
+        assert_eq!(
+            registry.retain_pointer_or_install(process, 0x9000),
+            Ok((0x9000, true))
+        );
+        assert_eq!(registry.id_for_provider_body(0x9000), Some(process));
+    }
+
+    #[test]
+    fn embedded_projection_refusal_preserves_leases_signals_and_pending_retirement() {
+        for delete_pending in [false, true] {
+            let mut registry = EventObjectRegistry::new();
+            let provider = EventObjectOwner::provider(7, 3);
+            let embedded = registry.create_provider_local(provider, 41, 11).unwrap();
+            registry.retain_handle(embedded).unwrap();
+            let lease = registry.acquire_provider_local_wait(embedded, provider).unwrap();
+            registry.queue_signal(embedded).unwrap();
+            if delete_pending {
+                assert_eq!(registry.request_delete(embedded), Ok(None));
+            }
+            let before = registry.snapshot(embedded).unwrap();
+            assert_eq!(before.delete_pending, delete_pending);
+            assert_eq!(before.handle_leases, 1);
+            assert_eq!(before.provider_wait_leases, 1);
+            assert_eq!(before.signal_leases, 1);
+            for body in [0, 0x9000, u64::MAX] {
+                assert_eq!(
+                    registry.install_provider_body(embedded, body),
+                    Err(EventObjectError::InvalidProviderBody)
+                );
+                assert_eq!(
+                    registry.retain_pointer_or_install(embedded, body),
+                    Err(EventObjectError::InvalidProviderBody)
+                );
+                assert_eq!(registry.snapshot(embedded), Ok(before));
+            }
+            assert_eq!(registry.live_lease_count(), 1);
+            assert_eq!(registry.queued_signal_count(), 1);
+            assert_eq!(
+                registry.event_for_lease(lease, EventLeaseKind::ProviderWait),
+                Ok(embedded)
+            );
+            assert_eq!(registry.pending_provider_local_reclaim(provider, 41), None);
+            assert_eq!(registry.release_handle(embedded), Ok(None));
+            assert_eq!(
+                registry.release_wait(lease, EventLeaseKind::ProviderWait),
+                Ok(None)
+            );
+            assert_eq!(registry.take_next_signal().unwrap().id, embedded);
+            let retired = registry.complete_signal(embedded).unwrap();
+            assert_eq!(retired.is_some(), delete_pending);
+            if let Some(retired) = retired {
+                assert_eq!(retired.provider_body, None);
+                assert_eq!(retired.provider_local_identity, Some(41));
+                assert_eq!(
+                    registry.pending_provider_local_reclaim(provider, 41),
+                    Some(embedded)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn process_projection_installation_and_existing_pointer_retention_still_work() {
+        let mut registry = EventObjectRegistry::new();
+        let process = create(&mut registry, 11);
+        registry.retain_handle(process).unwrap();
+        assert_eq!(registry.install_provider_body(process, 0x9000), Ok(()));
+        assert_eq!(registry.install_provider_body(process, 0x9000), Ok(()));
+        assert_eq!(
+            registry.retain_pointer_or_install(process, 0xa000),
+            Ok((0x9000, false))
+        );
+        assert_eq!(registry.retain_pointer(process), Ok(0x9000));
+        let before = registry.snapshot(process).unwrap();
+        assert_eq!(before.provider_local_identity, None);
+        assert_eq!(before.provider_body, Some(0x9000));
+        assert_eq!(before.pointer_leases, 2);
+        assert_eq!(
+            registry.install_provider_body(process, 0xa000),
+            Err(EventObjectError::ProviderBodyInUse)
+        );
+        assert_eq!(registry.snapshot(process), Ok(before));
+        assert_eq!(registry.id_for_provider_body(0xa000), None);
     }
 
     #[test]

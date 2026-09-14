@@ -71,6 +71,7 @@ pub(crate) use hosted_process_runtime::*;
 mod process_vm_retirement;
 mod ps_bootstrap;
 mod dispatcher_bootstrap;
+mod provider_local_event;
 mod ps_object_retirement;
 mod provider_ps;
 mod sec_image_diagnostic;

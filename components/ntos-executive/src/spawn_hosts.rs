@@ -2532,8 +2532,10 @@ unsafe fn component_pump_loop(
         {
             let (status, out1, out2, out3) = unsafe {
                 crate::service_sec_image::service_win32k_event_request(
-                    ch.client_pi,
-                    ch.client_generation,
+                    ch,
+                    *reply_cap,
+                    msg.badge,
+                    msg.mi,
                     msg.m0,
                     msg.m1,
                     msg.m2,

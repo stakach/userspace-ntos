@@ -9,6 +9,8 @@ use nt_user_host::provider_kernel_pump::{KernelProviderPumpAttempt, KernelProvid
 
 #[path = "kernel_bootstrap.rs"]
 mod bootstrap;
+#[path = "kernel_provider_event.rs"]
+mod event;
 use bootstrap::{DriverEntryCompletion, DriverEntryRecipient};
 
 static mut ACTIVATIONS: KernelProviderActivations<DriverEntryRecipient> =
@@ -194,6 +196,41 @@ pub(super) unsafe fn service_ps(
         Ok(result) => result,
         Err(status) => (status as i32, 0, 0, 0),
     }
+}
+
+pub(super) unsafe fn service_event(
+    channel: &spawn_hosts::PumpChannel,
+    envelope: nt_user_host::provider_kernel_activation::KernelProviderServiceEnvelope,
+    op: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> (i32, u64, u64, u64) {
+    let result = (|| {
+        let caller = authenticated_channel_caller(channel)?;
+        with_provider_process_manager(|pm| {
+            (&*core::ptr::addr_of!(ACTIVATIONS)).validate_service_call(
+                caller,
+                pm,
+                &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+                &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
+                envelope,
+                (win32k_subsystem::W32_EVENT_LABEL << 12) | 4,
+            )
+        })?;
+        let request = nt_user_host::provider_local_event_request::LocalEventRequest::decode(
+            op, arg1, arg2, arg3,
+        )?;
+        let owner = caller.owner();
+        event::dispatch(
+            nt_provider_wait::ProviderDomainIdentity {
+                domain: owner.provider_domain,
+                generation: owner.provider_generation,
+            },
+            request,
+        )
+    })();
+    result.unwrap_or_else(|status| (status as i32, 0, 0, 0))
 }
 
 /// Capture the real initialization return before the shared page or physical lane is reused.

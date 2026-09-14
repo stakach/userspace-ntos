@@ -34890,6 +34890,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         access to the bootstrap owner, as specified below. This checkpoint establishes ownership,
         not bootstrap Event publication, timer scheduling or kernel wait admission. Native kernel
         waits remain disabled; strict import/desktop acceptance is not implied by the host tests.
+      - [x] Authenticate memory-local kernel Event transport against retained activation (2026-09-15).
+        Pass the complete PumpChannel, observed badge/message-info and active Reply object from
+        the native receiver. Validate exact channel routing/binding, canonical Ps references,
+        live provider generation, Running lane and dispatch epoch before acquiring dispatcher
+        state. Require badge zero, the bound nonzero Reply and the exact four-word Event tag,
+        including reserved/capability bits. Kernel requests return through this branch on both
+        success and failure; they never fall through to a synthetic hosted process identity.
+        Share LocalEventState across bootstrap and runtime for PUBLISH_LOCAL, READ_LOCAL,
+        RESET_LOCAL, CLEAR_LOCAL, RETIRE_LOCAL and ACK_LOCAL_RETIREMENT. The same durable
+        allocation, canonical registry and namespace backing implement both phases. Remove the
+        replaced runtime local-operation and anonymous-allocation bodies. Preserve runtime
+        provider-domain authorization and the separate process-owned projection path.
+        Preflight retirement backing before canonical deletion; both immediate and final-lease
+        deferred retirement must remove the exact live Event backing before reporting reclaim
+        readiness. Broken backing is not a successful ACK opportunity. The shared wire decoder
+        rejects malformed scalar/type/boolean fields and overwide IDs. Fix EventObjectId's shared
+        wire conversion to enforce its actual 24-bit generation width, preventing truncated
+        generations from aliasing valid objects; retain the 40-bit slot bound.
+        Enforce the no-projection invariant in both EventObjectRegistry body-installation entry
+        points: embedded provider-local rows cannot acquire projected process-Event bodies or
+        pointer leases. Tests preserve existing wait/handle/signal leases and pending deletion on
+        refusal, while ordinary process projection installation and retention remain unchanged.
+        SET/PULSE, timers and handle/projected-object requests remain explicitly unsupported for
+        kernel activations. No mutable service-state borrow crosses broker IPC or wake delivery.
+        This enables the memory-local transport contract, not kernel wait admission or desktop
+        acceptance. Twelve new envelope/decoder cases cover all 64 message-info bit flips,
+        badge/Reply mismatch, foreign or stale authority, suspended/completed activations,
+        malformed scalar fields, unsupported operations and exact wire-ID bounds. The full
+        serialized run passes 1,141 tests across 17 suites with no failures or ignored cases:
+        .tmp/test-kernel-event-transport-20260915.log. After the projection invariant and its
+        three tests, the final library rerun passes nt-kernel-exec 271/271 and nt-user-host
+        635/635: .tmp/test-kernel-event-projection-20260915.log. Executive release passes in
+        39.11s with unchanged 297 warnings; standalone I/O Manager passes without warnings.
+        Evidence: .tmp/build-kernel-event-transport-executive-20260915.log and
+        .tmp/build-kernel-event-transport-io-manager-20260915.log. Independent native review and
+        git diff --check pass. Native rollback, deferred-retirement and ACK transport execution
+        remain a runtime proof obligation beyond the strict-import barrier; host tests do not
+        establish that the production bootstrap has executed those Event requests.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -34920,10 +34958,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Next admission dependency: the native Event/timer wait backend currently requires both
         a hosted client and the live ExecNtHandler; DriverEntry precedes that handler. The intact
         bootstrap dispatcher state checkpoint above replaces reconstruction, but early provider
-        operations still need an authenticated access route. Pass the full PumpChannel and bound
-        Reply into Event transport, validate the exact message shape/executor plus retained kernel
-        activation, and derive the provider from that caller. Route only provider-local operations
-        to bootstrap state; process handles/projected pointers must keep their distinct authority.
+        memory-local Event operations now use the authenticated route above. Complete SET/PULSE
+        through real wake arbitration and timers through pre-loop deadline ownership next;
+        process handles/projected pointers must keep their distinct authority. Do not broaden the
+        six-operation decoder until those mechanisms are complete and independently tested.
+        Live-handler kernel SET can reuse wait_wake_event_set after releasing the local facade
+        borrow, without enabling kernel wait admission. Audit found a shared PULSE ordering gap:
+        with a native waiter oldest on a Notification Event, wait_wake_dispatcher_pulse clears
+        the transient signal before the final provider readiness scan. Repair shared selection
+        so every eligible notification waiter is selected before clearing or resuming; cover
+        native/provider ordering, synchronization single-consumer behavior, wait-all and empty
+        pulses in host tests. Bootstrap has no native waiter scheduler: keep signaling refused
+        until its genuine no-waiter invariant or complete early wake ownership is established.
         Complete kernel activation/object leases before inserting a kernel suspension frame. Do not
         instantiate a second event manager, invent a hosted process ID, or park a frame without
         a readiness owner. Follow with exact owned admission, resume transport and typed kernel

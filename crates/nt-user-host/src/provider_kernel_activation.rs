@@ -72,6 +72,15 @@ pub struct KernelProviderWaitCapture {
     request: ProviderWaitRequest,
 }
 
+/// Transport observations supplied by the native receiver, not values asserted by a provider.
+/// This metadata is only useful alongside validation of the retained live activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelProviderServiceEnvelope {
+    pub badge: u64,
+    pub message_info: u64,
+    pub reply_cap: u64,
+}
+
 impl KernelProviderWaitCapture {
     pub const fn caller(self) -> KernelProviderCaller {
         self.caller
@@ -306,6 +315,28 @@ impl<D> KernelProviderActivations<D> {
             return Err(STATUS_INVALID_PARAMETER);
         }
         Ok(KernelProviderWaitCapture { caller, request })
+    }
+
+    /// Authenticate a scalar service request before acquiring any service-state borrow. The
+    /// adapter separately checks channel routing and supplies its protocol's exact message tag.
+    pub fn validate_service_call<C, R, T>(
+        &self,
+        caller: KernelProviderCaller,
+        pm: &ProcessManager,
+        catalog: &ProviderDomainCatalog,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        envelope: KernelProviderServiceEnvelope,
+        expected_message_info: u64,
+    ) -> Result<(), u32> {
+        self.validate(caller, pm, catalog, lanes)?;
+        if envelope.badge != 0
+            || envelope.reply_cap == 0
+            || envelope.reply_cap != caller.binding.reply_object
+            || envelope.message_info != expected_message_info
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(())
     }
 
     /// Check eligibility before changing a selected wait to Running. Retained lifetime alone

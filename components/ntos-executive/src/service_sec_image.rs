@@ -4138,12 +4138,14 @@ pub(crate) unsafe fn rearm_registered_delay_timer() -> bool {
     true
 }
 
-/// Service one scalar win32k Event ownership request against the sole live executive handler.
+/// Route kernel Event requests through their retained activation; hosted requests use the live handler.
 /// The nested component pump is serialized with native dispatch, so no second handler pointer or
 /// lock domain is introduced. GUI redrive remains deferred until the outer dispatch can resume.
 pub(crate) unsafe fn service_win32k_event_request(
-    client_pi: u64,
-    client_generation: u64,
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    message_info: u64,
     op: u64,
     arg1: u64,
     arg2: u64,
@@ -4151,6 +4153,22 @@ pub(crate) unsafe fn service_win32k_event_request(
 ) -> (i32, u64, u64, u64) {
     const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
     const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
+    if channel.kernel_caller.is_some() {
+        return kernel_provider_activation::service_event(
+            channel,
+            nt_user_host::provider_kernel_activation::KernelProviderServiceEnvelope {
+                badge,
+                message_info,
+                reply_cap,
+            },
+            op,
+            arg1,
+            arg2,
+            arg3,
+        );
+    }
+    let client_pi = channel.client_pi;
+    let client_generation = channel.client_generation;
     let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if handler_ptr.is_null() {
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);

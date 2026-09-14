@@ -27,6 +27,7 @@ pub mod native_call_owner;
 pub mod gui_exit;
 pub mod provider_kernel_activation;
 pub mod provider_kernel_pump;
+pub mod provider_local_event_request;
 pub mod component_pump;
 pub mod provider_logical_caller;
 pub mod provider_irp_requestor;
