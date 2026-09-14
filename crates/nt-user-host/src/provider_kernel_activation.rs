@@ -3,9 +3,9 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use nt_component_suspension::{
-    ComponentSuspensionLanes, LaneBinding, LaneDispatchIdentity, LaneHandle, LanePhase,
-    RetiredTerminal, SuspensionCaller, SuspensionKey, SuspensionOwner, TerminalIdentity,
-    TerminalPhase,
+    ComponentSuspensionLanes, LaneBinding, LaneDispatchIdentity, LaneError, LaneHandle, LanePhase,
+    RetiredTerminal, SuspensionCaller, SuspensionKey, SuspensionOwner, SuspensionPhase,
+    SuspensionResume, TerminalIdentity, TerminalPhase,
 };
 use nt_process::{
     native_handle::{NativeHandleCaller, NativeThreadProcessReference},
@@ -91,6 +91,13 @@ pub struct KernelProviderCompletionReceipt {
 pub struct KernelProviderCompletionCursor {
     after: u64,
     through: u64,
+}
+
+/// Keep authority refusal distinct from a busy or capacity-limited scheduler transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelProviderResumeError {
+    Authority(u32),
+    Lane(LaneError),
 }
 
 impl KernelProviderCompletionReceipt {
@@ -242,6 +249,61 @@ impl<D> KernelProviderActivations<D> {
             .find(|row| row.caller == caller)
             .ok_or(STATUS_INVALID_HANDLE)?;
         pm.validate_native_handle_caller(row.native_caller)
+    }
+
+    /// Check eligibility before changing a selected wait to Running. Retained lifetime alone
+    /// permits caller exit for cleanup, whereas both normal and cancellation resumes execute
+    /// provider code and require the original live caller. This does not claim a pump or endpoint.
+    pub fn validate_resume<C, R, T>(
+        &self,
+        caller: KernelProviderCaller,
+        pm: &ProcessManager,
+        catalog: &ProviderDomainCatalog,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        key: SuspensionKey,
+    ) -> Result<(), u32> {
+        self.validate_retained(caller, pm, catalog, lanes)?;
+        let lane = caller.dispatch.lane();
+        if lanes.phase(lane) != Ok(LanePhase::Suspended) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let frame = lanes
+            .top(lane)
+            .map_err(|_| STATUS_INVALID_HANDLE)?
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if frame.key != key
+            || frame.owner != caller.owner()
+            || !matches!(
+                frame.phase,
+                SuspensionPhase::Selected { .. } | SuspensionPhase::Cancelled { .. }
+            )
+        {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let row = self
+            .rows
+            .iter()
+            .find(|row| row.caller == caller)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        pm.validate_native_handle_caller(row.native_caller)
+    }
+
+    /// Atomically authorize and select the existing suspension for execution. All canonical
+    /// caller checks precede the lane mutation; scheduler refusal preserves the selected frame.
+    /// The native adapter must release these borrows before any resume mechanism is invoked.
+    pub fn begin_resume<C, R: Clone, T>(
+        &self,
+        caller: KernelProviderCaller,
+        pm: &ProcessManager,
+        catalog: &ProviderDomainCatalog,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        key: SuspensionKey,
+    ) -> Result<SuspensionResume<R>, KernelProviderResumeError> {
+        self.validate_resume(caller, pm, catalog, lanes, key)
+            .map_err(KernelProviderResumeError::Authority)?;
+        lanes
+            .begin_resume(caller.dispatch.lane(), caller.binding.reply_object, key)
+            .map_err(KernelProviderResumeError::Lane)
     }
 
     /// Record only a genuine provider return observed by the authenticated native adapter.

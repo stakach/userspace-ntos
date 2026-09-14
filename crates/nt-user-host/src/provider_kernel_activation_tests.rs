@@ -17,6 +17,9 @@ mod recipient_completion;
 #[path = "provider_kernel_completion_cursor_tests.rs"]
 mod completion_cursor;
 
+#[path = "provider_kernel_resume_tests.rs"]
+mod resume;
+
 type Lanes = ComponentSuspensionLanes<u64, i32>;
 
 fn bootstrap() -> PsBootstrapState {

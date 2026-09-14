@@ -34709,6 +34709,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/build-kernel-bootstrap-progress-io-manager-20260914.log. Scoped formatting/diff checks
         and independent native ownership review pass. These checks are not native mechanism or
         desktop proof: no VM boot was run, and the last measured 27 strict win32k imports remain open.
+      - [x] Authenticate kernel wait resume before lane mutation and preserve owned continuations
+        (2026-09-14; host/composed/native-build verified below).
+        Add canonical validate_resume/begin_resume to KernelProviderActivations. Check retained
+        provider/catalog/dispatch/binding and Ps references, then exact Suspended selected/cancelled
+        top key/owner and the original live native caller before the lane transition. Retained
+        ownership after caller exit is cleanup authority only, including cancelled waits. Preserve
+        the selected frame and both references on refusal, and distinguish authority errors from
+        scheduler Busy/NoCapacity. No borrow crosses an execution mechanism.
+        Add owned suspension admission, external-token transfer and repark APIs returning the
+        offered continuation on rejection. Successful repark transfers the old continuation back
+        to its caller rather than dropping it. Keep one validation/mutation implementation behind
+        compatibility wrappers so existing copyable hosted paths preserve their behavior.
+        These are prerequisites for native kernel wait continuations, not new wait capabilities
+        or endpoint ownership. Genuine stopped-pump resume, kernel terminal delivery, event leases
+        and caller-exit unwind remain open in the next item.
+        Seven canonical resume tests cover live selected/cancelled execution, duplicate refusal,
+        exited caller retention, foreign manager/catalog and retired provider, wrong key/owner/
+        binding, competing Running work, replacement dispatch epochs and terminal-pending
+        exclusion. Six non-Clone drop-counted tests cover exact allocation identity on rejection,
+        injected reserve failure, cross-lane duplicate ownership, repark transfer of the old
+        continuation, external-token retention and compatibility-wrapper drop behavior.
+        Serialized validation passes 837 cases across 15 suites with no failures or ignored cases:
+        .tmp/test-kernel-resume-admission-20260914.log (nt-user-host, nt-component-suspension,
+        nt-provider-wait). Native executive release build passes in 37.88s with the unchanged
+        294 warnings; standalone I/O Manager also passes without warnings. Evidence:
+        .tmp/build-kernel-resume-admission-executive-20260914.log and
+        .tmp/build-kernel-resume-admission-io-manager-20260914.log. Independent source reviews and
+        scoped formatting/diff checks pass. These checks do not prove native mechanisms or
+        desktop rendering: no VM boot was run, and the last measured 27 strict win32k imports
+        remain open. Future owned kernel continuations must use the owned transition APIs;
+        compatibility wrappers intentionally retain their old discard-on-error contract.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -34749,8 +34780,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         component_pump: implement authenticated stopped-job scheduling and receive-endpoint
         ownership before asynchronous startup. Do not repump the initial channel after a wall or
         infer a resume action from a missing receipt.
-        Use the new retained-lifetime check for Suspended eligibility, followed by strict execution
-        authorization after begin_resume. An exited caller remains owned but cannot regain execution
+        Use canonical kernel resume admission to validate the live native caller and exact
+        selected/cancelled top before begin_resume changes the lane. Retained-lifetime validation
+        alone is not eligibility: checking liveness only after that transition can strand an
+        exited caller's lane Running. An exited caller remains owned but cannot regain execution
         through retained validation; implement its real cancellation/unwind contract explicitly.
         Preserve exact epoch, binding and canonical Ps references in both checks. Complete
         terminal/cancellation cleanup for retained activation rows after walls/uncertain replies;
@@ -34759,6 +34792,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         do not add an unused alternate teardown path just to invoke the new count observer.
         Future runtime activation capture must allocate its retained rows in durable storage,
         outside any rewindable per-turn scratch scope; current DriverEntry capture precedes it.
+        Distinguish wait suspension from IRQ receive yield. Existing hosted_component_pump already
+        drains real IRQ/DPC work and then receives on the same channel without replaying a request.
+        That yield does not suspend the provider TCB or release its Running lane/shared bank.
+        Reuse this mechanism only after an exact authenticated receive-continuation ticket exists;
+        do not manufacture an external suspension token for it. True asynchronous bootstrap also
+        needs endpoint fan-in or an authenticated receiver: polling its endpoint once before
+        blocking on the hosted endpoint leaves a lost-wakeup window and is not a scheduler.
         Do not relax the current hosted-only event authorization to manufacture process ownership.
         Activation-local IRQL and inline hosted polling are implemented above. Carry the same
         restrictions through kernel activation publication/resume; do not substitute shared

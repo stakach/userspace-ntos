@@ -299,21 +299,46 @@ impl<C, R> ComponentSuspensionStack<C, R> {
         owner: SuspensionOwner,
         continuation: C,
     ) -> Result<(), SuspensionError> {
+        self.admit_owned(key, admission_sequence, owner, continuation)
+            .map_err(|(error, _continuation)| error)
+    }
+
+    /// Return the original continuation on rejection; reserve before publishing its frame.
+    pub fn admit_owned(
+        &mut self,
+        key: SuspensionKey,
+        admission_sequence: u64,
+        owner: SuspensionOwner,
+        continuation: C,
+    ) -> Result<(), (SuspensionError, C)> {
+        self.admit_owned_with_capacity(key, admission_sequence, owner, continuation, |frames| {
+            frames.try_reserve(1).map_err(|_| SuspensionError::NoCapacity)
+        })
+    }
+
+    fn admit_owned_with_capacity(
+        &mut self,
+        key: SuspensionKey,
+        admission_sequence: u64,
+        owner: SuspensionOwner,
+        continuation: C,
+        reserve: impl FnOnce(&mut Vec<SuspensionFrame<C, R>>) -> Result<(), SuspensionError>,
+    ) -> Result<(), (SuspensionError, C)> {
         if !key.is_valid() || admission_sequence == 0 || !owner.is_valid() {
-            return Err(SuspensionError::InvalidIdentity);
+            return Err((SuspensionError::InvalidIdentity, continuation));
         }
         if self.frames.iter().any(|frame| {
             frame.key == key
                 || frame.owner.same_dispatch(owner)
         }) {
-            return Err(SuspensionError::DuplicateIdentity);
+            return Err((SuspensionError::DuplicateIdentity, continuation));
         }
         if self.frames.len() >= self.max_depth {
-            return Err(SuspensionError::Overflow);
+            return Err((SuspensionError::Overflow, continuation));
         }
-        self.frames
-            .try_reserve(1)
-            .map_err(|_| SuspensionError::NoCapacity)?;
+        if let Err(error) = reserve(&mut self.frames) {
+            return Err((error, continuation));
+        }
         self.frames.push(SuspensionFrame {
             key,
             admission_sequence,
@@ -419,24 +444,45 @@ impl<C, R: Clone> ComponentSuspensionStack<C, R> {
         owner: SuspensionOwner,
         continuation: C,
     ) -> Result<(), SuspensionError> {
+        self.rearm_owned(
+            completed_key,
+            next_key,
+            admission_sequence,
+            owner,
+            continuation,
+        )
+        .map(|_previous| ())
+        .map_err(|(error, _continuation)| error)
+    }
+
+    /// Rejection preserves both continuations; success returns the replaced continuation.
+    pub fn rearm_owned(
+        &mut self,
+        completed_key: SuspensionKey,
+        next_key: SuspensionKey,
+        admission_sequence: u64,
+        owner: SuspensionOwner,
+        continuation: C,
+    ) -> Result<C, (SuspensionError, C)> {
         if !next_key.is_valid() || admission_sequence == 0 || !owner.is_valid() {
-            return Err(SuspensionError::InvalidIdentity);
+            return Err((SuspensionError::InvalidIdentity, continuation));
         }
         if self.frames.iter().any(|frame| frame.key == next_key) {
-            return Err(SuspensionError::DuplicateIdentity);
+            return Err((SuspensionError::DuplicateIdentity, continuation));
         }
-        let frame = self.frames.last_mut().ok_or(SuspensionError::NotFound)?;
+        let Some(frame) = self.frames.last_mut() else {
+            return Err((SuspensionError::NotFound, continuation));
+        };
         if frame.key != completed_key {
-            return Err(SuspensionError::NotTop);
+            return Err((SuspensionError::NotTop, continuation));
         }
         if !matches!(frame.phase, SuspensionPhase::Resuming { .. }) || frame.owner != owner {
-            return Err(SuspensionError::InvalidPhase);
+            return Err((SuspensionError::InvalidPhase, continuation));
         }
         frame.key = next_key;
         frame.admission_sequence = admission_sequence;
         frame.phase = SuspensionPhase::Waiting;
-        frame.continuation = continuation;
-        Ok(())
+        Ok(core::mem::replace(&mut frame.continuation, continuation))
     }
 
     pub fn complete_dispatch(
@@ -920,11 +966,38 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         continuation: C,
     ) -> Result<(), LaneError> {
+        self.transfer_external_to_suspension_running_owned(
+            handle,
+            reply_object,
+            external_token,
+            key,
+            admission_sequence,
+            owner,
+            continuation,
+        )
+        .map_err(|(error, _continuation)| error)
+    }
+
+    /// Rejection retains the external token and returns the unadmitted continuation.
+    pub fn transfer_external_to_suspension_running_owned(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        external_token: u64,
+        key: SuspensionKey,
+        admission_sequence: u64,
+        owner: SuspensionOwner,
+        continuation: C,
+    ) -> Result<(), (LaneError, C)> {
         if external_token == 0 {
-            return Err(LaneError::InvalidIdentity);
+            return Err((LaneError::InvalidIdentity, continuation));
         }
-        self.validate_running(handle, reply_object)?;
-        self.validate_dispatch_owner(handle, owner)?;
+        if let Err(error) = self
+            .validate_running(handle, reply_object)
+            .and_then(|()| self.validate_dispatch_owner(handle, owner))
+        {
+            return Err((error, continuation));
+        }
         if self.slots.iter().any(|slot| {
             slot.lane.as_ref().is_some_and(|lane| {
                 lane.suspensions.get(key).is_some()
@@ -933,15 +1006,21 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
                     })
             })
         }) {
-            return Err(LaneError::Suspension(SuspensionError::DuplicateIdentity));
+            return Err((
+                LaneError::Suspension(SuspensionError::DuplicateIdentity),
+                continuation,
+            ));
         }
-        let lane = self.lane_mut(handle)?;
+        let lane = match self.lane_mut(handle) {
+            Ok(lane) => lane,
+            Err(error) => return Err((error, continuation)),
+        };
         if lane.external_tokens.last().copied() != Some(external_token) {
-            return Err(LaneError::InvalidPhase);
+            return Err((LaneError::InvalidPhase, continuation));
         }
         lane.suspensions
-            .admit(key, admission_sequence, owner, continuation)
-            .map_err(LaneError::Suspension)?;
+            .admit_owned(key, admission_sequence, owner, continuation)
+            .map_err(|(error, continuation)| (LaneError::Suspension(error), continuation))?;
         lane.external_tokens.pop();
         lane.phase = LanePhase::Suspended;
         self.running = None;
@@ -957,8 +1036,33 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         continuation: C,
     ) -> Result<(), LaneError> {
-        self.validate_running(handle, reply_object)?;
-        self.validate_dispatch_owner(handle, owner)?;
+        self.admit_running_owned(
+            handle,
+            reply_object,
+            key,
+            admission_sequence,
+            owner,
+            continuation,
+        )
+        .map_err(|(error, _continuation)| error)
+    }
+
+    /// Transfer a continuation only after every lane and frame admission check succeeds.
+    pub fn admit_running_owned(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        key: SuspensionKey,
+        admission_sequence: u64,
+        owner: SuspensionOwner,
+        continuation: C,
+    ) -> Result<(), (LaneError, C)> {
+        if let Err(error) = self
+            .validate_running(handle, reply_object)
+            .and_then(|()| self.validate_dispatch_owner(handle, owner))
+        {
+            return Err((error, continuation));
+        }
         if self.slots.iter().any(|slot| {
             slot.lane.as_ref().is_some_and(|lane| {
                 lane.suspensions.get(key).is_some()
@@ -967,12 +1071,18 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
                     })
             })
         }) {
-            return Err(LaneError::Suspension(SuspensionError::DuplicateIdentity));
+            return Err((
+                LaneError::Suspension(SuspensionError::DuplicateIdentity),
+                continuation,
+            ));
         }
-        let lane = self.lane_mut(handle)?;
+        let lane = match self.lane_mut(handle) {
+            Ok(lane) => lane,
+            Err(error) => return Err((error, continuation)),
+        };
         lane.suspensions
-            .admit(key, admission_sequence, owner, continuation)
-            .map_err(LaneError::Suspension)?;
+            .admit_owned(key, admission_sequence, owner, continuation)
+            .map_err(|(error, continuation)| (LaneError::Suspension(error), continuation))?;
         lane.phase = LanePhase::Suspended;
         self.running = None;
         Ok(())
@@ -1226,28 +1336,62 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         continuation: C,
     ) -> Result<(), LaneError> {
-        self.validate_running(handle, reply_object)?;
-        self.validate_dispatch_owner(handle, owner)?;
+        self.rearm_running_owned(
+            handle,
+            reply_object,
+            completed_key,
+            next_key,
+            admission_sequence,
+            owner,
+            continuation,
+        )
+        .map(|_previous| ())
+        .map_err(|(error, _continuation)| error)
+    }
+
+    /// Preserve both continuations on rejected repark; return the replaced one on success.
+    pub fn rearm_running_owned(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        completed_key: SuspensionKey,
+        next_key: SuspensionKey,
+        admission_sequence: u64,
+        owner: SuspensionOwner,
+        continuation: C,
+    ) -> Result<C, (LaneError, C)> {
+        if let Err(error) = self
+            .validate_running(handle, reply_object)
+            .and_then(|()| self.validate_dispatch_owner(handle, owner))
+        {
+            return Err((error, continuation));
+        }
         if self.slots.iter().any(|slot| {
             slot.lane
                 .as_ref()
                 .is_some_and(|lane| lane.suspensions.get(next_key).is_some())
         }) {
-            return Err(LaneError::Suspension(SuspensionError::DuplicateIdentity));
+            return Err((
+                LaneError::Suspension(SuspensionError::DuplicateIdentity),
+                continuation,
+            ));
         }
-        let lane = self.lane_mut(handle)?;
-        lane.suspensions
-            .rearm(
+        let lane = match self.lane_mut(handle) {
+            Ok(lane) => lane,
+            Err(error) => return Err((error, continuation)),
+        };
+        let previous = lane.suspensions
+            .rearm_owned(
                 completed_key,
                 next_key,
                 admission_sequence,
                 owner,
                 continuation,
             )
-            .map_err(LaneError::Suspension)?;
+            .map_err(|(error, continuation)| (LaneError::Suspension(error), continuation))?;
         lane.phase = LanePhase::Suspended;
         self.running = None;
-        Ok(())
+        Ok(previous)
     }
 
 }
@@ -1284,6 +1428,9 @@ mod dispatch_identity_tests;
 
 #[cfg(test)]
 mod kernel_owner_tests;
+
+#[cfg(test)]
+mod owned_continuation_tests;
 
 #[cfg(test)]
 mod tests {
