@@ -233,6 +233,31 @@ pub(super) unsafe fn service_event(
     result.unwrap_or_else(|status| (status as i32, 0, 0, 0))
 }
 
+/// Authenticate the current bound call before borrowing dispatcher state. Polling retains the
+/// Running activation and cannot publish a suspension or deliver another lane's continuation.
+pub(super) unsafe fn service_event_poll(
+    channel: &spawn_hosts::PumpChannel,
+    envelope: nt_user_host::provider_kernel_activation::KernelProviderServiceEnvelope,
+    request: &nt_provider_wait::ProviderWaitRequest,
+) -> i32 {
+    let result = (|| {
+        let caller = authenticated_channel_caller(channel)?;
+        with_provider_process_manager(|pm| {
+            (&*core::ptr::addr_of!(ACTIVATIONS)).validate_event_poll(
+                caller,
+                pm,
+                &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+                &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
+                envelope,
+                win32k_subsystem::W32_PROVIDER_WAIT_LABEL << 12,
+                request,
+            )
+        })?;
+        event::poll(caller.owner(), request)
+    })();
+    result.unwrap_or_else(|status| status as i32)
+}
+
 /// Capture the real initialization return before the shared page or physical lane is reused.
 /// A wall, scheduler yield or parked wait is not completion and retains the activation unchanged.
 unsafe fn record_driver_entry_pump(

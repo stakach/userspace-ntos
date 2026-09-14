@@ -339,6 +339,36 @@ impl<D> KernelProviderActivations<D> {
         Ok(())
     }
 
+    /// Authorize only a synchronous, non-alertable Event poll. This does not admit a parked
+    /// continuation or validate object backing; the dispatcher must do that before consumption.
+    pub fn validate_event_poll<C, R, T>(
+        &self,
+        caller: KernelProviderCaller,
+        pm: &ProcessManager,
+        catalog: &ProviderDomainCatalog,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        envelope: KernelProviderServiceEnvelope,
+        expected_message_info: u64,
+        request: &ProviderWaitRequest,
+    ) -> Result<(), u32> {
+        self.validate_service_call(
+            caller,
+            pm,
+            catalog,
+            lanes,
+            envelope,
+            expected_message_info,
+        )?;
+        let request = request.validate().map_err(|_| STATUS_INVALID_PARAMETER)?;
+        if request.owner != caller.owner() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if !request.is_kernel_event_poll() {
+            return Err(0xc000_00bb); // STATUS_NOT_SUPPORTED
+        }
+        Ok(())
+    }
+
     /// Check eligibility before changing a selected wait to Running. Retained lifetime alone
     /// permits caller exit for cleanup, whereas both normal and cancellation resumes execute
     /// provider code and require the original live caller. This does not claim a pump or endpoint.

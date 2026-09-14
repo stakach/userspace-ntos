@@ -4,6 +4,9 @@ use super::*;
 use nt_kernel_exec::{EventObjectId, EventObjectOwner, EventObjectRegistry, EventStore};
 use nt_provider_wait::ProviderDomainIdentity;
 
+#[path = "provider_local_event_poll.rs"]
+mod poll;
+
 const INVALID_PARAMETER: u32 = 0xC000_000D;
 const INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 

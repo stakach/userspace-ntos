@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "provider_kernel_event_poll_tests.rs"]
+mod event_poll;
+
 const MESSAGE_INFO: u64 = (0x785 << 12) | 4;
 
 struct Fixture {

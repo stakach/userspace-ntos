@@ -35058,25 +35058,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Reuse these helpers for blocking bootstrap waits only after typed kernel continuation,
         Reply/shared-bank ownership and real readiness/deadline scheduling are complete. This
         slice does not enable kernel waits or satisfy the remaining DriverEntry/export dependencies.
-      - [ ] Implement authenticated kernel zero-time Event waits through the real transport.
-        This is the next bounded production slice, not permission to admit blocking kernel waits.
-        In win32k_subsystem::provider_wait_rendezvous, preserve an explicit kernel or hosted
-        request context; a kernel poll must not depend on callback headers or fabricated client
-        fields. Reject blocking kernel requests before publishing them. In spawn_hosts, route
-        kernel polls separately from caps.provider_wait so DriverEntry's blocking-wait capability
-        remains disabled. Pass the actual incoming PumpMessage and bound Reply into canonical
-        kernel activation/channel validation, not merely the shared request's claimed owner.
-        In service_provider_wait_poll, use the existing arbiter's poll operation over the original
-        bootstrap Owned or live stores with the strict Event helpers above and synchronous native
-        namespace retirement. Retain Running lane/activation and exact Reply ownership; do not
-        allocate a continuation, publish a waiter, admit nested dispatch or change a suspension
-        queue. Require Event-only kernel requests until real Timer expiration ordering exists.
-        Test completion-before-poll, both Event kinds, wait-all atomicity, stale activation/header/
-        Reply rejection and exact cleanup without lane or queue transitions. Poll support does
-        not satisfy stopped-job scheduling, receive-endpoint ownership, timer deadlines or typed
-        kernel continuation wake/resume required by the following blocking-wait cutover.
+      - [x] Implement authenticated kernel zero-time Event waits through the real transport (2026-09-15).
+        The component now captures an explicit Hosted or KernelPoll context before publishing a
+        wait request. Kernel polls neither read nor restore a callback header: their real stack
+        activation and owner must remain unchanged across the synchronous call. Blocking kernel
+        requests are rejected before IPC. Component and executive share the supported-contract
+        predicate after strict ABI validation: zero-time, non-alertable, Kernel-mode Events only.
+        Both caller kinds now validate the raw reply message-info (label zero, length one), instead
+        of losing the length through call_on. Nested dispatch remains forbidden during any poll.
+        Normal pump dispatch and timer-yield receive classification route kernel requests without
+        enabling DriverEntry's caps.provider_wait. The actual incoming badge, full message-info
+        (wait label, length zero) and bound Reply reach validate_event_poll, which checks the exact
+        retained canonical Running activation and request owner before borrowing dispatcher state.
+        PM/activation borrows end before the native adapter borrows the original bootstrap Owned
+        or live namespace/Event stores. A local-Event-only backend uses the existing global arbiter,
+        strict backing/lease helpers, synchronous exact retirement and existing lease counters.
+        No second arbiter, dispatcher store, waiter, continuation, nested dispatch or lane transition
+        is introduced. Unsupported kernel requests return an explicit error and cannot fall through
+        to hosted suspension. Existing hosted Timer expiration ordering remains unchanged; kernel
+        Timer polls, projected process Events and APC delivery still require their real contracts.
+        Ten shared tests cover exact message tags (including every bit), badge/Reply/owner/ABI
+        rejection, unsupported contracts, stale/suspended/replaced/completed activations, exited
+        callers and retired providers. Real arbiter tests cover completion-before-poll, both Event
+        kinds, wait-all atomicity and missing-backing rollback with unchanged lane/Ps ownership.
+        Serialized validation passes 1,190 tests across 17 suites without failures or ignored
+        cases: .tmp/test-kernel-event-poll-20260915.log. Executive release passes in 37.80s with
+        unchanged 297 warnings; standalone I/O Manager passes without warnings. Evidence:
+        .tmp/build-kernel-event-poll-executive-20260915.log and
+        .tmp/build-kernel-event-poll-io-manager-20260915.log. Independent native/transport review,
+        scoped formatting and git diff --check pass. Native execution remains to be observed
+        beyond the strict import barrier; host/build validation is not DriverEntry or desktop
+        acceptance. Poll support does not satisfy stopped-job scheduling,
+        receive-endpoint ownership, timer deadlines or typed kernel continuation wake/resume
+        required by the following blocking-wait cutover.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
-        Existing win32k provider waits derive their owner from a hosted syscall/callback header
+        Next whole ownership slice: extend the existing KernelProviderPumpProgress and
+        DriverEntryRecipient beyond initial entry/IRQ receive continuation to a single-use resume
+        ticket for an exact selected or cancelled ProviderWaitSuspended observation. Couple
+        canonical begin_resume with that ticket, retain Reply/shared-bank ownership through
+        repeated waits, and deliver eventual return to the retained kernel recipient. The current
+        wait_capture slot is observation-only, not such a resume path. Exercise stale/wrong
+        selection, exited callers, repark, uncertain execution without replay and terminal delivery.
+        Keep blocking admission disabled until real readiness scheduling and this ownership
+        contract are both wired; Timer expiration and receive-endpoint fan-in remain necessary
+        for asynchronous boot rather than being implied by successful synchronous Event polls.
+        Existing blocking win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
         provider_wait_rendezvous, service_sec_image provider admission, exec_handler object
         admission). DriverEntry and kernel-only activations cannot use that contract unchanged.
@@ -35093,7 +35119,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         as described above. Component publication now uses the explicit mapping checkpoint above,
         independently of callback headers; preserve a typed kernel return continuation across
         repark/teardown next. Local stack ordinals must never be reinterpreted as executive lane
-        identities. Native kernel wait admission remains disabled. Complete
+        identities. Native blocking kernel wait admission remains disabled; the synchronous
+        Event poll above retains its Running activation and introduces no continuation. Complete
         readiness/resume/terminal delivery for the typed native kernel alternative without
         making hosted-client fields optional placeholders. HostedNativeContinuation now holds
         PendingComponentDispatch plus HostedReturnTarget, while ComponentNativeContinuation::Kernel
@@ -35102,21 +35129,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         hosted selectors and terminal processing explicitly exclude it. A kernel terminal
         recipient must preserve its real initiating caller and return contract, not deliver a
         CompletedWin32kDispatch to a hosted syscall reply.
-        Next admission dependency: the native Event/timer wait backend currently requires both
+        Next blocking-admission dependency: the native Event/timer wait backend currently requires both
         a hosted client and the live ExecNtHandler; DriverEntry precedes that handler. The intact
         bootstrap dispatcher state checkpoint above replaces reconstruction, but early provider
         memory-local Event operations now use the authenticated route above. Live-handler SET/PULSE
         use shared exact-one arbitration; bootstrap SET/PULSE now validate the canonical
         no-observer invariant as above. Observed early signaling and timers still need pre-loop
         readiness/deadline ownership. Process handles/projected pointers keep distinct authority.
-        Kernel rendezvous still rejects a kernel owner before publishing a wait request, while
+        Kernel rendezvous still rejects blocking kernel requests before publication, while
         native/GUI wait publication requires the live handler. Preserve those admission guards
         until the complete ownership and wake/resume mechanisms below are implemented.
         Subsequent real kernel waits must use the existing ProviderDispatcherWaitArbiter over
         the same bootstrap stores, publish the typed kernel continuation and exact dispatcher
         leases, and retain Reply/shared-bank authority before queue progress. Do not simply
-        remove the hosted-client guard: the current rendezvous also assumes hosted callback
-        request context. Timer deadlines must join the actual boot scheduler and moved table.
+        remove the hosted-client guard: the current blocking rendezvous also assumes hosted
+        callback request context. The typed KernelPoll context is synchronous, not a retained
+        blocking continuation. Timer deadlines must join the actual boot scheduler and moved table.
         Complete kernel activation/object leases before inserting a kernel suspension frame. Do not
         instantiate a second event manager, invent a hosted process ID, or park a frame without
         a readiness owner. Follow with exact owned admission, resume transport and typed kernel

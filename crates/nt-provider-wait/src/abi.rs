@@ -419,6 +419,20 @@ pub struct ValidatedProviderWait<'a> {
     pub objects: &'a [ProviderWaitObject],
 }
 
+impl ValidatedProviderWait<'_> {
+    /// The synchronous kernel subset needs neither suspension scheduling nor APC/timer delivery.
+    /// This is a contract check after ABI validation, not authentication of the claimed owner.
+    pub fn is_kernel_event_poll(&self) -> bool {
+        matches!(self.owner.caller, SuspensionCaller::Kernel { .. })
+            && self.timeout_kind == ProviderWaitTimeoutKind::Poll
+            && self.wait_mode == ProviderWaitMode::Kernel
+            && !self.alertable
+            && self.objects.iter().all(|object| {
+                object.typed() == Some(ProviderWaitObjectType::Event)
+            })
+    }
+}
+
 impl ProviderWaitRequest {
     pub const fn empty() -> Self {
         Self {

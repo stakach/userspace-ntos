@@ -3,6 +3,26 @@
 use super::*;
 use nt_user_host::provider_local_event_request::LocalEventRequest;
 
+pub(super) unsafe fn poll(
+    owner: nt_provider_wait::ProviderWaitOwner,
+    request: &nt_provider_wait::ProviderWaitRequest,
+) -> Result<i32, u32> {
+    let _durable = allocator::enter_durable();
+    let arbiter = &*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER);
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if let Some(handler) = handler.as_mut() {
+        crate::provider_local_event::LocalEventState::new(
+            &mut handler.obj_ns,
+            &mut handler.anon_event_seq,
+            &mut handler.events,
+            &mut handler.event_objects,
+        )
+        .poll(arbiter, request, owner)
+    } else {
+        dispatcher_bootstrap::with_local_events(|state| state.poll(arbiter, request, owner))
+    }
+}
+
 fn execute(
     state: &mut crate::provider_local_event::LocalEventState<'_>,
     provider: nt_provider_wait::ProviderDomainIdentity,

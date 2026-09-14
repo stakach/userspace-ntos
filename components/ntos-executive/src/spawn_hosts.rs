@@ -1471,7 +1471,9 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
         || (crate::driver_launch::is_fsd_component_service_label(label)
             && ch.caps.kind == ReqKind::Irp)
         || (label == crate::win32k_subsystem::W32_USER_CALLBACK_LABEL && ch.caps.usermode_callback)
-        || (label == crate::win32k_subsystem::W32_PROVIDER_WAIT_LABEL && ch.caps.provider_wait)
+        || (label == crate::win32k_subsystem::W32_PROVIDER_WAIT_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+            && (ch.caps.provider_wait || ch.kernel_caller.is_some()))
         || (label == crate::win32k_subsystem::W32_LPC_WAIT_LABEL
             && ch.caps.kind == ReqKind::Syscall)
         || (label == crate::win32k_subsystem::W32_GDI_LOAD_LABEL
@@ -2480,10 +2482,17 @@ unsafe fn component_pump_loop(
             );
             continue;
         } else if label == crate::win32k_subsystem::W32_PROVIDER_WAIT_LABEL
-            && ch.caps.provider_wait
+            && (ch.caps.provider_wait || ch.kernel_caller.is_some())
             && ch.caps.kind == ReqKind::Syscall
         {
-            if crate::service_sec_image::service_provider_wait_poll(ch) {
+            if crate::service_sec_image::service_provider_wait_poll(
+                ch,
+                nt_user_host::provider_kernel_activation::KernelProviderServiceEnvelope {
+                    badge: msg.badge,
+                    message_info: msg.mi,
+                    reply_cap: *reply_cap,
+                },
+            ) {
                 pump_reply_recv_into!(
                     ch,
                     *reply_cap,
@@ -2493,6 +2502,7 @@ unsafe fn component_pump_loop(
                 );
                 continue;
             }
+            assert!(ch.kernel_caller.is_none(), "kernel wait must not enter hosted suspension");
             // The executive validates and admits the copied shared-page request only after the
             // native caller's continuation storage is reserved. Keep this Call bound until then.
             outcome.provider_wait_suspended = true;

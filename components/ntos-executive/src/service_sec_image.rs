@@ -1541,37 +1541,52 @@ fn provider_wait_expected_owner(
 
 /// Complete an explicit zero-time poll on the current pump's bound Reply. No logical lane
 /// suspension, continuation allocation, waiter registration or nested dispatch is allowed here.
-pub(crate) unsafe fn service_provider_wait_poll(channel: &spawn_hosts::PumpChannel) -> bool {
+pub(crate) unsafe fn service_provider_wait_poll(
+    channel: &spawn_hosts::PumpChannel,
+    envelope: nt_user_host::provider_kernel_activation::KernelProviderServiceEnvelope,
+) -> bool {
     let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
         as *mut nt_provider_wait::ProviderWaitSharedPage;
     let request = core::ptr::read_volatile(core::ptr::addr_of!((*page).request));
-    if request.header.timeout_kind != nt_provider_wait::ProviderWaitTimeoutKind::Poll as u32 {
+    if channel.kernel_caller.is_none()
+        && request.header.timeout_kind != nt_provider_wait::ProviderWaitTimeoutKind::Poll as u32
+    {
         return false;
     }
     let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
-    let status = match win32k_glue::current_provider_poll_owner(channel) {
-        Some(owner) if !handler.is_null()
-            && request.validate().is_ok_and(|validated| validated.owner == owner) => {
-            let _durable = allocator::enter_durable();
-            // Select older waiters before a new poll can consume a just-expired synchronization
-            // timer. Selection only records completions; it cannot resume another provider lane.
-            if (*handler).provider_timer_expire_due(nt_time_snapshot()) != 0 {
-                provider_wait_select_ready(&mut *handler);
+    let status = if channel.kernel_caller.is_some() {
+        // Unsupported kernel requests complete with an error; they never enter suspension admission.
+        kernel_provider_activation::service_event_poll(channel, envelope, &request)
+    } else {
+        match win32k_glue::current_provider_poll_owner(channel) {
+            Some(owner) if !handler.is_null()
+                && request.validate().is_ok_and(|validated| validated.owner == owner) => {
+                let _durable = allocator::enter_durable();
+                // Select older waiters before a new poll can consume a just-expired synchronization
+                // timer. Selection only records completions; it cannot resume another provider lane.
+                if (*handler).provider_timer_expire_due(nt_time_snapshot()) != 0 {
+                    provider_wait_select_ready(&mut *handler);
+                }
+                match (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).poll(
+                    &mut *handler, &request, owner,
+                ) {
+                    Ok(status) => status,
+                    Err(error) => provider_wait_status_for_error(error),
+                }
             }
-            match (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).poll(
-                &mut *handler, &request, owner,
-            ) {
-                Ok(status) => status,
-                Err(error) => provider_wait_status_for_error(error),
-            }
+            _ => 0xC000_000Du32 as i32,
         }
-        _ => 0xC000_000Du32 as i32,
     };
     core::ptr::write_volatile(
         core::ptr::addr_of_mut!((*page).result),
         nt_provider_wait::ProviderWaitResult::completed(request.header.wait_id, status),
     );
-    trace_provider_wait_admission(b"poll-inline", request.header.wait_id, status, request.header.object_count as u64);
+    trace_provider_wait_admission(
+        if channel.kernel_caller.is_some() { b"poll-kernel" } else { b"poll-inline" },
+        request.header.wait_id,
+        status,
+        request.header.object_count as u64,
+    );
     true
 }
 

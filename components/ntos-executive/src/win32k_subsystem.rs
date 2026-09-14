@@ -32,6 +32,8 @@
 use alloc::vec::Vec;
 #[path = "win32k_irql.rs"]
 mod irql;
+#[path = "win32k_provider_wait_context.rs"]
+mod provider_wait_context;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 use nt_compat_exports::{
     ssdt::{
@@ -4684,9 +4686,6 @@ unsafe fn provider_wait_rendezvous(
     let Some(owner) = current_provider_wait_owner() else {
         return 0xC000_000Du32 as i32;
     };
-    let Some(client) = owner.hosted_client() else {
-        return 0xC000_000Du32 as i32;
-    };
     let Some(wait_id) = next_provider_wait_id() else {
         return 0xC000_009Au32 as i32;
     };
@@ -4720,40 +4719,36 @@ unsafe fn provider_wait_rendezvous(
         trace_provider_wait_component(b"invalid-request", wait_id, objects.len() as u64, timeout);
         return 0xC000_000Du32 as i32;
     }
+    let wait_context = match provider_wait_context::ProviderWaitContext::capture(&request) {
+        Ok(context) => context,
+        Err(status) => return status as i32,
+    };
     write_volatile(core::ptr::addr_of_mut!((*page).request), request);
     write_volatile(
         core::ptr::addr_of_mut!((*page).result),
         nt_provider_wait::ProviderWaitResult::EMPTY,
     );
 
-    let callback_frame =
-        (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *const nt_user_callback::CallbackFrame;
-    let owner_header = read_volatile(core::ptr::addr_of!((*callback_frame).header));
-    let Some(wait_context) = callback_request_context_for_request(&owner_header) else {
-        trace_provider_wait_component(
-            b"missing-context",
-            (u64::from(owner_header.client_pi) << 32) | owner_header.client_tid,
-            owner_header.client_badge,
-            owner_header.dispatch_id,
-        );
-        return 0xC000_000Du32 as i32;
-    };
     trace_provider_wait_component(
         b"submit",
         wait_id,
-        (u64::from(client.client_pi) << 32) | client.client_tid,
+        owner.dispatch_id,
         objects.len() as u64,
     );
     let mut outgoing = W32_PROVIDER_WAIT_LABEL << 12;
     loop {
-        let (_label, tag, _, _, _) = crate::driver_launch::call_on(outgoing);
+        let (reply_info, tag, _, _, _) =
+            crate::driver_launch::call_on4_raw(outgoing, 0, 0, 0, 0);
+        if reply_info != 1 {
+            return 0xC000_000Du32 as i32;
+        }
         match tag {
             W32_PROVIDER_WAIT_RESUME_LABEL => {
                 let result = read_volatile(core::ptr::addr_of!((*page).result));
                 let Some(status) = result.validate(wait_id) else {
                     return 0xC000_0001u32 as i32;
                 };
-                if !restore_user_callback_request_context(wait_context) {
+                if !wait_context.restore() {
                     return 0xC000_000Du32 as i32;
                 }
                 return status;
@@ -4766,7 +4761,7 @@ unsafe fn provider_wait_rendezvous(
                     sel: read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64),
                     drv: 0,
                 });
-                if !restore_user_callback_request_context(wait_context) {
+                if !wait_context.restore() {
                     return 0xC000_000Du32 as i32;
                 }
                 write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut u64, info);
