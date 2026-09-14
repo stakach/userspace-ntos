@@ -190,6 +190,11 @@ impl KernelProviderPumpProgress {
             _ => None,
         }
     }
+
+    pub fn observed_provider_wait(&self, reply_cap: u64) -> bool {
+        self.reply_cap == reply_cap
+            && self.disposition() == Some(KernelProviderPumpDisposition::ProviderWaitSuspended)
+    }
 }
 
 #[cfg(test)]

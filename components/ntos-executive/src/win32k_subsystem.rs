@@ -14724,22 +14724,14 @@ fn register_trampolines() -> bool {
         );
         di += 1;
     }
-    let mut complete = reg.stats().allocation_failures == 0;
-    for name in WIN32K_NTOSKRNL_IMPORTS
-        .iter()
-        .chain(WIN32K_HAL_IMPORTS.iter())
-    {
-        if reg.lookup(name).is_none_or(|address| address == 0) {
-            unsafe { log_unresolved_win32k_import(name.as_bytes()) };
-            complete = false;
-        }
-    }
-    complete
+    reg.check_required(
+        WIN32K_NTOSKRNL_IMPORTS.iter().chain(WIN32K_HAL_IMPORTS.iter()).copied(),
+        |name| unsafe { log_unresolved_win32k_import(name.as_bytes()) },
+    )
 }
 
-/// Resolve an import name to its IAT-slot value: a code trampoline VA, or (for the 11 data
-/// exports) the data-cell address. An absent binding returns zero so the PE loader can reject the
-/// image before any driver code executes; unresolved imports never receive a success trampoline.
+/// Admit the complete required catalog before resolving individual image imports. Failure is a
+/// catalog rejection, not evidence that an already-bound IAT name is itself unresolved.
 pub(crate) fn initialize_export_registry() -> bool {
     unsafe {
         if !WIN32K_EXPORTS_READY {
@@ -15106,6 +15098,10 @@ unsafe fn validate_and_publish_win32k_nls(nls_sizes: [usize; 3]) -> bool {
 /// Returns the DriverEntry RVA.
 pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) -> Option<u32> {
     if !validate_and_publish_win32k_nls(nls_sizes) {
+        return None;
+    }
+    if !initialize_export_registry() {
+        print_str(b"[win32k-import] reject image: incomplete kernel export registry\n");
         return None;
     }
     let e = read_unaligned((src_va + 0x3c) as *const u32) as u64; // e_lfanew

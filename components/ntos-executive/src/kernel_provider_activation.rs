@@ -218,6 +218,28 @@ unsafe fn record_driver_entry_pump(
     (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
         .recipient_mut(caller)?
         .observe(attempt, *result, facts, status)?;
+    if result.provider_wait_suspended {
+        let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
+            as *const nt_provider_wait::ProviderWaitSharedPage;
+        let request = core::ptr::read_volatile(core::ptr::addr_of!((*page).request));
+        // No mechanism call or bank release separates observation, capture and retention.
+        // Keep the lane Running and exclusive until real readiness admission is implemented.
+        with_provider_process_manager(|pm| {
+            let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
+            let capture = activations.capture_provider_wait(
+                caller,
+                pm,
+                &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+                &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
+                result.reply_cap,
+                activations.recipient(caller)?.progress(),
+                request,
+            );
+            activations
+                .recipient_mut(caller)?
+                .retain_provider_wait(request, capture)
+        })?;
+    }
     finish_observed_driver_entry_return(caller)
 }
 

@@ -160,7 +160,7 @@ fn report_retained_failure(lane: nt_component_suspension::LaneHandle) {
 
 unsafe fn process_output(
     nt_handler: &mut ExecNtHandler,
-    continuation: ComponentNativeContinuation,
+    continuation: HostedNativeContinuation,
     terminal: &mut NativeTerminal,
     procs: &mut [ProcExec],
     pfilled: &mut [[u64; 512]],
@@ -199,7 +199,7 @@ unsafe fn process_output(
     }
 }
 
-unsafe fn retire_reply(continuation: ComponentNativeContinuation) -> Result<(), u32> {
+unsafe fn retire_reply(continuation: HostedNativeContinuation) -> Result<(), u32> {
     if continuation.return_target.is_abandoned() {
         return Ok(());
     }
@@ -221,7 +221,9 @@ pub(super) unsafe fn drain(
     let mut cursor = None;
     while let Some(identity) =
         (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).next_terminal_if(|identity, terminal| {
-            terminal.frame.continuation.return_target.can_resume()
+            terminal.frame.continuation.hosted().is_some_and(|hosted| {
+                hosted.return_target.can_resume()
+            })
                 && cursor.is_none_or(|cursor| {
                     (terminal.frame.admission_sequence, identity.lane().index) > cursor
                 })
@@ -241,6 +243,13 @@ pub(super) unsafe fn drain(
                 terminal.phase,
                 (terminal.frame.admission_sequence, identity.lane().index),
             )
+        };
+        let continuation = match continuation {
+            ComponentNativeContinuation::Hosted(hosted) => hosted,
+            ComponentNativeContinuation::Kernel(_) => {
+                cursor = Some(order);
+                continue;
+            }
         };
         match phase {
             TerminalPhase::Ready { stage, .. } => {

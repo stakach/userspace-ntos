@@ -39,8 +39,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
 ### Current Desktop Frontier
 
 Latest measured NT boot (2026-09-14): a fresh normal headless build/boot reaches strict win32k
-admission and reports 28 unresolved code imports, including MmMapViewInSystemSpace. This supersedes
-the older 27-import measurement. The executive stops before DriverEntry or desktop rendering;
+admission with 27 absent bindings. Source audit corrected the initial reading of its 28 diagnostic
+lines: MmMapViewInSystemSpace is bound, but global registry rejection caused the first IAT lookup
+to report it as an additional miss. The executive stops before DriverEntry or desktop rendering;
 the VM was terminated at that deterministic barrier. Evidence and the exact import set are in the
 IRQ receive-continuation checkpoint below. Older desktop proofs are historical baselines, not
 acceptance of the current provider cutover.
@@ -34774,27 +34775,70 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/build-kernel-irq-receive-executive-20260914-rerun.log and
         .tmp/build-kernel-irq-receive-io-manager-20260914.log. Independent source reviews and scoped
         formatting/diff checks pass. Native IRQ-yield execution and desktop proof are not implied;
-        the fresh boot measurement below supersedes the older 27-import frontier.
+        the fresh boot measurement below confirms the strict import frontier.
         Fresh production-path validation: BOOT_TIMEOUT_SECONDS=300 with normal ./run.sh rebuilt
         ntdll, the executive, rust-micro and disk image, then launched the real headless gate.
         Logs: .tmp/run-kernel-irq-receive-20260914.log and
         .tmp/boot-kernel-irq-receive-20260914.log. The boot passes live Config Manager hive seeding,
         disk section demand paging, win32k staging and NLS validation, then strict admission reports
-        28 unresolved imports and main.rs rejects the image before DriverEntry. QEMU was stopped
+        28 unresolved-import diagnostic lines and main.rs rejects the image before DriverEntry.
+        Subsequent source audit identifies 27 genuinely absent bindings and one registry-failure
+        cascade on the already-bound MmMapViewInSystemSpace, corrected below. QEMU was stopped
         with SIGTERM at this deterministic barrier after about 70 seconds, within the 300-second
         VM deadline; the runner correctly exits failure without a successful guest verdict.
         No native DriverEntry IRQ-yield execution, desktop paint or screenshot proof is claimed.
-        Current unresolved set:
+        Current absent binding set:
         ZwCreateSection, ExRaiseAccessViolation, KeAttachProcess, KeDetachProcess, ExRaiseStatus,
         KeStackAttachProcess, ZwReadFile, ZwCancelIoFile, ZwDeviceIoControlFile, KeIsAttachedProcess,
         ObAssignSecurity, ZwCreateDirectoryObject, ZwOpenDirectoryObject, ZwQueryDirectoryObject,
         ZwQueryObject, ZwQueryDirectoryFile, RtlUnwindEx, ZwQueryInformationFile,
         ZwUnmapViewOfSection, ZwMapViewOfSection, ZwCreateFile, IoSynchronousInvalidateDeviceRelations,
         IoOpenDeviceRegistryKey, IofCallDriver, IoBuildSynchronousFsdRequest,
-        IoBuildDeviceIoControlRequest, KeUnstackDetachProcess, MmMapViewInSystemSpace.
+        IoBuildDeviceIoControlRequest, KeUnstackDetachProcess.
         Plan review: retain strict admission and finish the authenticated native wait/IRP, section,
         attach and exception contracts below before rerunning desktop acceptance. Do not use the
         earlier host tests or this pre-DriverEntry run as proof of the new receive mechanism.
+      - [x] Separate strict registry admission from individual IAT resolution (2026-09-14).
+        Reject an incomplete required export catalog before copying the image or patching its IAT.
+        DriverExportRegistry::check_required reports only absent or zero bindings and preserves
+        allocation-failure rejection; a failed catalog no longer invents a miss on the first bound
+        image import. Three regressions cover incomplete/complete catalogs and allocation failure.
+        All 49 nt-compat-exports tests pass: .tmp/test-strict-registry-admission-20260914.log.
+        This corrects reporting, not implementation coverage. The existing system-space mapping
+        binding remains a legacy pool-backed implementation needing real section/VSpace ownership;
+        do not count the absence of its misleading diagnostic as a completed Mm cutover.
+      - [x] Capture stopped kernel wait requests and separate native continuation targets (2026-09-14).
+        KernelProviderWaitCapture holds a private caller/request snapshot validated against the
+        retained live activation, current provider catalog, physical dispatch/binding, exact Reply
+        value and well-formed wire owner. The adapter must supply progress from that same canonical
+        recipient; the core progress guard checks the Reply and actual ProviderWaitSuspended shape,
+        not a separately authenticated activation. Capture is copyable routing metadata, not
+        execution authority, dispatcher leases or permission to block at any IRQL.
+        DriverEntry records the real pump observation and copies the request while its lane/bank
+        remain exclusive, with no intervening mechanism call. Its recipient retains either the
+        validated capture or the exact rejected request/status before propagating failure. Review
+        caught and fixed the initial loss of rejected-request evidence. Repeated retention cannot
+        overwrite the first observation. No shared-page reread is needed to reconstruct it later.
+        ComponentNativeContinuation now distinguishes Hosted and Kernel targets. Hosted payload,
+        callback state and Reply lifecycle remain together; no kernel caller receives fabricated
+        hosted fields. Hosted resume/terminal selectors exclude the Kernel alternative, and scope
+        teardown refuses a matching kernel frame before any hosted Reply effects. Provider/lane
+        quiescence therefore cannot treat kernel state as an abandoned hosted client.
+        The Kernel lane variant remains preparatory: there is no production admission constructor,
+        and caps.provider_wait is still disabled for DriverEntry. The capture hook likewise has no
+        new native execution proof at the strict pre-DriverEntry boot barrier. Do not confuse
+        capture with a suspended frame or readiness owner; those remaining contracts follow below.
+        Eight new tests cover copied snapshot independence, all 32 pump-stop flag combinations,
+        wrong/fresh/unobserved Reply progress, malformed requests, foreign hosted/kernel owners,
+        stale dispatch/catalog/lane/ProcessManager identities and caller exit. They verify unchanged
+        references/lane state and no new resume/pump authority. Serialized validation passes 855
+        tests across 15 suites: .tmp/test-kernel-wait-capture-20260914.log. Combined with the 49
+        export-registry cases above, 904 tests pass with no failures or ignored cases. Executive
+        release passes in 41.56s with 297 warnings (294 existing plus three unused preparatory
+        continuation-state warnings); standalone I/O Manager passes without warnings. Evidence:
+        .tmp/build-kernel-wait-capture-executive-20260914.log and
+        .tmp/build-kernel-wait-capture-io-manager-20260914.log. Independent native review, scoped
+        formatting checks and git diff --check pass. Full kernel wait delivery remains open.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -34814,10 +34858,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         independently of callback headers; preserve a typed kernel return continuation across
         repark/teardown next. Local stack ordinals must never be reinterpreted as executive lane
         identities. Native kernel wait admission remains disabled. Complete
-        the native return types without making hosted-client fields optional placeholders:
-        PendingProviderWaitDispatch currently requires hosted client/callback contexts, and
-        component_terminal delivers CompletedWin32kDispatch to a hosted syscall reply. A kernel
-        terminal recipient must preserve its real initiating caller and return contract instead.
+        readiness/resume/terminal delivery for the typed native kernel alternative without
+        making hosted-client fields optional placeholders. HostedNativeContinuation now holds
+        PendingComponentDispatch plus HostedReturnTarget, while ComponentNativeContinuation::Kernel
+        holds KernelProviderWaitCapture with the real caller and validated owned request snapshot.
+        That Kernel variant is preparatory and has no production lane-admission constructor yet;
+        hosted selectors and terminal processing explicitly exclude it. A kernel terminal
+        recipient must preserve its real initiating caller and return contract, not deliver a
+        CompletedWin32kDispatch to a hosted syscall reply.
+        Next admission dependency: the native Event/timer wait backend currently requires both
+        a hosted client and the live ExecNtHandler; DriverEntry precedes that handler. Give
+        bootstrap and runtime one canonical dispatcher ownership path, with authenticated
+        kernel activation/object leases, before inserting a kernel suspension frame. Do not
+        instantiate a second event manager, invent a hosted process ID, or park a frame without
+        a readiness owner. Follow with exact owned admission, resume transport and typed kernel
+        terminal effects; the request snapshot alone does not satisfy any of those contracts.
         Hosted return delivery/abandonment is now explicitly typed as above. Use the kernel
         terminal-pending lifecycle checkpoint above when a genuine resumed kernel return occurs;
         do not manufacture a frame or external token to call it. Deliver to the real kernel

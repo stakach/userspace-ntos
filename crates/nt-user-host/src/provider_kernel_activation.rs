@@ -1,5 +1,6 @@
 //! Root-owned kernel provider activations, independent of hosted callback headers.
 
+use crate::provider_kernel_pump::KernelProviderPumpProgress;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use nt_component_suspension::{
@@ -12,7 +13,9 @@ use nt_process::{
     ProcessManager, ThreadLifetime, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_HANDLE,
     STATUS_INVALID_PARAMETER,
 };
-use nt_provider_wait::{CatalogIdentity, ProviderDomainCatalog, ProviderDomainIdentity};
+use nt_provider_wait::{
+    CatalogIdentity, ProviderDomainCatalog, ProviderDomainIdentity, ProviderWaitRequest,
+};
 
 static NEXT_ACTIVATION: AtomicU64 = AtomicU64::new(1);
 
@@ -58,6 +61,32 @@ impl KernelProviderCaller {
 
     pub const fn thread(self) -> ThreadLifetime {
         self.thread
+    }
+}
+
+/// Validated request snapshot, not admission or execution authority. The canonical activation
+/// retains the caller's Ps references; copying this metadata neither acquires nor releases them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelProviderWaitCapture {
+    caller: KernelProviderCaller,
+    request: ProviderWaitRequest,
+}
+
+impl KernelProviderWaitCapture {
+    pub const fn caller(self) -> KernelProviderCaller {
+        self.caller
+    }
+
+    pub const fn request(&self) -> &ProviderWaitRequest {
+        &self.request
+    }
+
+    pub const fn owner(self) -> SuspensionOwner {
+        self.caller.owner()
+    }
+
+    pub const fn key(self) -> SuspensionKey {
+        SuspensionKey::provider_wait(self.request.header.wait_id)
     }
 }
 
@@ -249,6 +278,34 @@ impl<D> KernelProviderActivations<D> {
             .find(|row| row.caller == caller)
             .ok_or(STATUS_INVALID_HANDLE)?;
         pm.validate_native_handle_caller(row.native_caller)
+    }
+
+    /// Copy a stopped provider's request while its bank is still exclusively held. The adapter
+    /// supplies progress from this activation's recipient after observing the exact pump attempt.
+    /// This does not acquire dispatcher leases, mutate lanes, or authorize blocking at any IRQL.
+    /// Those contracts must be satisfied separately before admitting the captured continuation.
+    pub fn capture_provider_wait<C, R, T>(
+        &self,
+        caller: KernelProviderCaller,
+        pm: &ProcessManager,
+        catalog: &ProviderDomainCatalog,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        bound_reply: u64,
+        progress: &KernelProviderPumpProgress,
+        request: ProviderWaitRequest,
+    ) -> Result<KernelProviderWaitCapture, u32> {
+        self.validate(caller, pm, catalog, lanes)?;
+        if bound_reply != caller.binding.reply_object
+            || !progress.observed_provider_wait(bound_reply)
+            || request
+                .validate()
+                .map_err(|_| STATUS_INVALID_PARAMETER)?
+                .owner
+                != caller.owner()
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(KernelProviderWaitCapture { caller, request })
     }
 
     /// Check eligibility before changing a selected wait to Running. Retained lifetime alone

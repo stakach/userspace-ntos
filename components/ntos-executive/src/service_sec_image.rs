@@ -220,9 +220,32 @@ impl ComponentSuspensionCompletion {
 }
 
 #[derive(Clone, Copy)]
-struct ComponentNativeContinuation {
+struct HostedNativeContinuation {
     pending: PendingComponentDispatch,
     return_target: HostedReturnTarget<win32k_glue::StagedUserCallbackContext>,
+}
+
+#[derive(Clone, Copy)]
+enum ComponentNativeContinuation {
+    Hosted(HostedNativeContinuation),
+    // No admission or execution route until kernel dispatcher leases and terminal delivery exist.
+    Kernel(nt_user_host::provider_kernel_activation::KernelProviderWaitCapture),
+}
+
+impl ComponentNativeContinuation {
+    fn hosted(&self) -> Option<&HostedNativeContinuation> {
+        match self {
+            Self::Hosted(hosted) => Some(hosted),
+            Self::Kernel(_) => None,
+        }
+    }
+
+    fn hosted_mut(&mut self) -> Option<&mut HostedNativeContinuation> {
+        match self {
+            Self::Hosted(hosted) => Some(hosted),
+            Self::Kernel(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -474,10 +497,12 @@ pub(crate) fn provider_wait_runtime_stats() -> ProviderWaitRuntimeStats {
             active_continuations: (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
                 .frames()
                 .filter(|(_, frame)| {
-                    matches!(
-                        frame.continuation.pending,
-                        PendingComponentDispatch::Provider(_)
-                    )
+                    match frame.continuation {
+                        ComponentNativeContinuation::Hosted(hosted) => {
+                            matches!(hosted.pending, PendingComponentDispatch::Provider(_))
+                        }
+                        ComponentNativeContinuation::Kernel(_) => true,
+                    }
                 })
                 .count(),
             active_component_continuations: (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
@@ -1748,8 +1773,13 @@ unsafe fn component_suspension_resume_top(
     loop {
         let lane_resume = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
             .next_resumable_if(|frame| {
-                frame.continuation.return_target.can_resume()
-                    && win32k_glue::win32k_client_context_is_admitted(frame.continuation.pending.client())
+                match frame.continuation {
+                    ComponentNativeContinuation::Hosted(hosted) => {
+                        hosted.return_target.can_resume()
+                            && win32k_glue::win32k_client_context_is_admitted(hosted.pending.client())
+                    }
+                    ComponentNativeContinuation::Kernel(_) => false,
+                }
             })?;
         let lane = lane_resume.lane;
         let reply_object = lane_resume.binding.reply_object;
@@ -1758,6 +1788,10 @@ unsafe fn component_suspension_resume_top(
             .frame(lane, resume.key)
             .ok()??
             .clone();
+        let continuation = match frame.continuation {
+            ComponentNativeContinuation::Hosted(hosted) => hosted,
+            ComponentNativeContinuation::Kernel(_) => return None,
+        };
         // Reserve all handoff storage before entering a provider that may yield a callback.
         // Refusal leaves the selected source wait and its reply authority unchanged.
         let Ok(mut callback_transfer) = component_callback_transfer::CallbackTransfer::reserve() else {
@@ -1772,7 +1806,7 @@ unsafe fn component_suspension_resume_top(
             return None;
         }
         let provider_resume = matches!(
-            frame.continuation.pending,
+            continuation.pending,
             PendingComponentDispatch::Provider(_)
         );
         if provider_resume {
@@ -1781,7 +1815,7 @@ unsafe fn component_suspension_resume_top(
                 PROVIDER_WAIT_SUCCESSFUL_RESUMES.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let pump_completion = match frame.continuation.pending {
+        let pump_completion = match continuation.pending {
             PendingComponentDispatch::Provider(pending) => {
                 match win32k_glue::resume_suspended_provider_wait_component(
                     pending,
@@ -1849,7 +1883,7 @@ unsafe fn component_suspension_resume_top(
             }
             ComponentPumpCompletion::UserCallbackSuspended => {
                 let captured = callback_transfer.capture(
-                    frame.continuation.pending.client(), lane, frame.owner.dispatch_id,
+                    continuation.pending.client(), lane, frame.owner.dispatch_id,
                 );
                 component_terminal::retain_callback_transfer(
                     lane, reply_object, resume.key, frame.owner, callback_transfer, captured,
@@ -1889,7 +1923,7 @@ unsafe fn component_suspension_resume_top(
                 };
                 let next_key = component_suspension_key(next);
                 let sequence = next_dispatcher_wait_sequence();
-                let mut next_continuation = frame.continuation;
+                let mut next_continuation = continuation;
                 next_continuation.pending = next;
                 if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                     .rearm_running(
@@ -1899,7 +1933,7 @@ unsafe fn component_suspension_resume_top(
                         next_key,
                         sequence,
                         next_owner,
-                        next_continuation,
+                        ComponentNativeContinuation::Hosted(next_continuation),
                     )
                     .is_err()
                 {
@@ -2085,10 +2119,10 @@ unsafe fn provider_wait_admit_retained(
     };
     let wait_id = pending.request.header.wait_id;
     let sequence = next_dispatcher_wait_sequence();
-    let continuation = ComponentNativeContinuation {
+    let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
         pending: PendingComponentDispatch::Provider(pending),
         return_target,
-    };
+    });
     let lane = pending.dispatch.lane;
     let Ok(binding) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane) else {
         return false;
@@ -2237,10 +2271,10 @@ unsafe fn lpc_wait_admit_retained(
     };
     let key = nt_component_suspension::SuspensionKey::lpc_request(pending.request.generation);
     let sequence = next_dispatcher_wait_sequence();
-    let continuation = ComponentNativeContinuation {
+    let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
         pending: PendingComponentDispatch::Lpc(pending),
         return_target,
-    };
+    });
     let lane = pending.dispatch.lane;
     let Ok(binding) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane) else {
         let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);

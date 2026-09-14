@@ -6,10 +6,19 @@ use nt_user_host::provider_kernel_pump::{
     KernelProviderPumpProgress, PumpProgressError,
 };
 
+enum DriverEntryWaitObservation {
+    Captured(nt_user_host::provider_kernel_activation::KernelProviderWaitCapture),
+    Rejected {
+        request: nt_provider_wait::ProviderWaitRequest,
+        status: u32,
+    },
+}
+
 pub(super) struct DriverEntryRecipient {
     channel: spawn_hosts::PumpChannel,
     progress: KernelProviderPumpProgress,
     observation: Option<spawn_hosts::PumpResult>,
+    wait_capture: Option<DriverEntryWaitObservation>,
 }
 
 fn pump_error(error: PumpProgressError) -> u32 {
@@ -25,6 +34,7 @@ impl DriverEntryRecipient {
             progress: KernelProviderPumpProgress::new(channel.reply_cap).map_err(pump_error)?,
             channel,
             observation: None,
+            wait_capture: None,
         })
     }
 
@@ -92,6 +102,32 @@ impl DriverEntryRecipient {
         match self.progress.disposition() {
             Some(KernelProviderPumpDisposition::Returned(status)) => Some(status),
             _ => None,
+        }
+    }
+
+    pub(super) fn progress(&self) -> &KernelProviderPumpProgress {
+        &self.progress
+    }
+
+    pub(super) fn retain_provider_wait(
+        &mut self,
+        request: nt_provider_wait::ProviderWaitRequest,
+        capture: Result<nt_user_host::provider_kernel_activation::KernelProviderWaitCapture, u32>,
+    ) -> Result<(), u32> {
+        if self.wait_capture.is_some()
+            || !self.progress.observed_provider_wait(self.channel.reply_cap)
+        {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        match capture {
+            Ok(capture) => {
+                self.wait_capture = Some(DriverEntryWaitObservation::Captured(capture));
+                Ok(())
+            }
+            Err(status) => {
+                self.wait_capture = Some(DriverEntryWaitObservation::Rejected { request, status });
+                Err(status)
+            }
         }
     }
 

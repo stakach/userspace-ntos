@@ -101,6 +101,24 @@ impl DriverExportRegistry {
             .map(|binding| binding.va)
     }
 
+    /// Check catalog readiness separately from resolving an image's individual IAT entries.
+    /// Report every genuinely absent or zero binding, even after an allocation failure. A failed
+    /// catalog does not make its already-bound names unresolved.
+    pub fn check_required<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a str>,
+        mut report_missing: impl FnMut(&'a str),
+    ) -> bool {
+        let mut complete = self.allocation_failures == 0;
+        for name in names {
+            if self.lookup(name).is_none_or(|address| address == 0) {
+                report_missing(name);
+                complete = false;
+            }
+        }
+        complete
+    }
+
     /// True if `name` has a registered trampoline (vs a fail-soft default).
     pub fn is_bound(&self, name: &str) -> bool {
         self.lookup(name).is_some()
@@ -162,6 +180,53 @@ mod tests {
         let mut reg = DriverExportRegistry::new();
         reg.bind("IoCreateDevice", 1);
         assert_eq!(reg.lookup("TotallyMadeUp"), None);
+    }
+
+    #[test]
+    fn incomplete_catalog_does_not_report_bound_first_image_import() {
+        let mut reg = DriverExportRegistry::new();
+        assert!(reg.bind("MmMapViewInSystemSpace", 0x1000));
+        assert!(reg.bind("ZwCreateSection", 0));
+        let required = ["MmMapViewInSystemSpace", "ZwCreateSection", "ZwReadFile"];
+        let mut missing = Vec::new();
+        assert!(!reg.check_required(required, |name| missing.push(name)));
+        assert_eq!(missing, ["ZwCreateSection", "ZwReadFile"]);
+        assert_eq!(reg.lookup(required[0]), Some(0x1000));
+
+        missing.clear();
+        assert!(!reg.check_required(required, |name| missing.push(name)));
+        assert_eq!(missing, ["ZwCreateSection", "ZwReadFile"]);
+        assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn complete_catalog_allows_real_lookup_and_preserves_unknown_import_failure() {
+        let mut reg = DriverExportRegistry::new();
+        let required = ["MmMapViewInSystemSpace", "ZwCreateSection"];
+        for (index, name) in required.iter().enumerate() {
+            assert!(reg.bind(name, 0x1000 + index as u64));
+        }
+        assert!(reg.check_required(required, |_| panic!("complete catalog reported a miss")));
+        assert_eq!(reg.lookup(required[0]), Some(0x1000));
+        assert_eq!(reg.lookup("NotARequiredOrBoundImport"), None);
+    }
+
+    #[test]
+    fn allocation_failure_rejects_catalog_without_inventing_missing_names() {
+        let mut reg = DriverExportRegistry::new();
+        assert!(reg.bind("MmMapViewInSystemSpace", 0x1000));
+        assert!(!reg.reserve_initial(usize::MAX));
+        assert!(!reg.check_required(["MmMapViewInSystemSpace"], |_| {
+            panic!("allocation failure misreported a bound import")
+        }));
+        let mut missing = Vec::new();
+        assert!(
+            !reg.check_required(["MmMapViewInSystemSpace", "ZwReadFile"], |name| {
+                missing.push(name)
+            })
+        );
+        assert_eq!(missing, ["ZwReadFile"]);
+        assert_eq!(reg.stats().allocation_failures, 1);
     }
 
     #[test]

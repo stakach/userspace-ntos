@@ -71,6 +71,17 @@ unsafe fn invoke(effect: RetirementEffect, cap: u64) -> RetirementOutcome {
 pub(super) unsafe fn prepare_abandoned_replies(
     scope: nt_component_suspension::SuspensionScope,
 ) -> bool {
+    // Kernel activations own a different return recipient. Keep them visible to scope quiescence,
+    // but never apply hosted Reply retirement or cancellation to their retained wait capture.
+    if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+        .frames()
+        .any(|(_, frame)| {
+            scope.matches(frame.owner)
+                && matches!(frame.continuation, ComponentNativeContinuation::Kernel(_))
+        })
+    {
+        return false;
+    }
     // A terminal stage owns its reply through delivery ACK. It cannot be torn down here.
     if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).has_terminal_in_scope(scope) {
         return false;
@@ -94,24 +105,31 @@ pub(super) unsafe fn prepare_abandoned_replies(
         let target = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
             .frames()
             .find(|(_, frame)| {
-                scope.matches(frame.owner) && frame.continuation.return_target.delivery().is_some()
+                scope.matches(frame.owner)
+                    && frame.continuation.hosted().is_some_and(|hosted| {
+                        hosted.return_target.delivery().is_some()
+                    })
             })
             .map(|(lane, frame)| (lane, frame.key));
         let Some((lane, key)) = target else { break };
-        (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+        let frame = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
             .frame_mut(lane, key)
             .ok()
             .flatten()
-            .expect("hosted return abandonment lost its frame")
-            .continuation
-            .return_target
-            .request_abandonment();
+            .expect("hosted return abandonment lost its frame");
+        let Some(hosted) = frame.continuation.hosted_mut() else {
+            return false;
+        };
+        hosted.return_target.request_abandonment();
     }
     loop {
         let target = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
             .frames()
             .find(|(_, frame)| {
-                scope.matches(frame.owner) && !frame.continuation.return_target.is_abandoned()
+                scope.matches(frame.owner)
+                    && frame.continuation.hosted().is_some_and(|hosted| {
+                        !hosted.return_target.is_abandoned()
+                    })
             })
             .map(|(lane, frame)| (lane, frame.key, frame.owner));
         let Some((lane, key, owner)) = target else {
@@ -123,7 +141,10 @@ pub(super) unsafe fn prepare_abandoned_replies(
                 .ok()
                 .flatten()
                 .expect("hosted return retirement lost its frame");
-            let Ok(attempt) = frame.continuation.return_target.begin_retirement() else {
+            let Some(hosted) = frame.continuation.hosted_mut() else {
+                return false;
+            };
+            let Ok(attempt) = hosted.return_target.begin_retirement() else {
                 return false;
             };
             attempt
@@ -139,12 +160,13 @@ pub(super) unsafe fn prepare_abandoned_replies(
                 frame.owner, owner,
                 "hosted return retirement changed caller"
             );
-            frame
-                .continuation
-                .return_target
+            let Some(hosted) = frame.continuation.hosted_mut() else {
+                return false;
+            };
+            hosted.return_target
                 .record_retirement(&mut attempt, outcome)
                 .expect("hosted return retirement lost its exact effect receipt");
-            frame.continuation.return_target.is_abandoned()
+            hosted.return_target.is_abandoned()
         };
         if abandoned {
             PROVIDER_WAIT_NATIVE_REPLIES_ABANDONED.fetch_add(1, Ordering::Relaxed);
