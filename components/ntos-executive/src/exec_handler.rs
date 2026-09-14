@@ -168,26 +168,37 @@ impl nt_provider_wait::ProviderDispatcherWaitBackend for ExecNtHandler {
                     .event_objects
                     .snapshot(id)
                     .map_err(|_| STATUS_INVALID_PARAMETER)?;
+                let index = usize::try_from(snapshot.native_identity)
+                    .map_err(|_| STATUS_INVALID_PARAMETER)?;
+                if !self.obj_ns.get(index).is_some_and(|entry| {
+                    entry.is_live() && entry.kind == OBJ_KIND_EVENT
+                }) {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
                 let provider_owner = nt_kernel_exec::EventObjectOwner::provider(
                     provider.domain,
                     provider.generation,
                 );
                 let event_lease = match snapshot.owner {
-                    nt_kernel_exec::EventObjectOwner::Provider { .. } => self
-                        .event_objects
-                        .acquire_provider_local_wait(id, provider_owner),
+                    nt_kernel_exec::EventObjectOwner::Provider { .. } => {
+                        nt_kernel_exec::acquire_provider_local_event_wait(
+                            &mut self.event_objects,
+                            &self.events,
+                            id,
+                            provider_owner,
+                        )
+                    }
                     nt_kernel_exec::EventObjectOwner::Process { .. } => {
-                        if !snapshot.authorizes_provider_wait(
+                        nt_kernel_exec::acquire_projected_provider_event_wait(
+                            &mut self.event_objects,
+                            &self.events,
+                            id,
                             provider_owner,
                             nt_kernel_exec::EventObjectOwner::new(
                                 client_pid as u64,
                                 client.client_generation,
                             ),
-                        ) {
-                            return Err(STATUS_INVALID_PARAMETER);
-                        }
-                        self.event_objects
-                            .acquire_wait(id, nt_kernel_exec::EventLeaseKind::ProviderWait)
+                        )
                     }
                 }
                 .map_err(|_| STATUS_INVALID_PARAMETER)?;
@@ -211,15 +222,12 @@ impl nt_provider_wait::ProviderDispatcherWaitBackend for ExecNtHandler {
     fn dispatcher_is_ready(&self, lease: Self::Lease) -> bool {
         match lease {
             ProviderDispatcherLease::Event(lease) => {
-                let id = self
-                    .event_objects
-                    .event_for_lease(lease, nt_kernel_exec::EventLeaseKind::ProviderWait)
-                    .expect("provider Event wait lost its canonical lease");
-                let snapshot = self
-                    .event_objects
-                    .snapshot(id)
-                    .expect("provider Event wait lease resolved a stale object");
-                self.events.read_state(snapshot.native_identity)
+                nt_kernel_exec::provider_event_wait_is_ready(
+                    &self.event_objects,
+                    &self.events,
+                    lease,
+                )
+                .expect("provider Event wait lost its canonical lease or backing")
             }
             ProviderDispatcherLease::Timer(lease) => self
                 .provider_timers
@@ -233,16 +241,13 @@ impl nt_provider_wait::ProviderDispatcherWaitBackend for ExecNtHandler {
     fn consume_ready_dispatcher(&mut self, lease: Self::Lease) {
         match lease {
             ProviderDispatcherLease::Event(lease) => {
-                let id = self
-                    .event_objects
-                    .event_for_lease(lease, nt_kernel_exec::EventLeaseKind::ProviderWait)
-                    .expect("provider Event wait lost its canonical lease");
-                let snapshot = self
-                    .event_objects
-                    .snapshot(id)
-                    .expect("provider Event wait lease resolved a stale object");
                 assert!(
-                    self.events.consume_existing(snapshot.native_identity),
+                    nt_kernel_exec::consume_provider_event_wait(
+                        &self.event_objects,
+                        &mut self.events,
+                        lease,
+                    )
+                    .expect("provider Event wait lost its canonical lease or backing"),
                     "provider Event wait selected an unsignalled object"
                 );
             }

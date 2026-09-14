@@ -22,6 +22,7 @@ mod dpc;
 mod driver_thread;
 mod event;
 mod event_object;
+mod event_wait;
 pub mod executive_sync;
 pub mod gdi_bitmap;
 mod hosted_dpc;
@@ -71,6 +72,10 @@ pub use driver_thread::{
     HOSTED_DRIVER_THREAD_HANDLE_BASE,
 };
 pub use event::{map_event_access, EventKind, EventStore, WaitManyResult, WaitResult};
+pub use event_wait::{
+    acquire_projected_provider_event_wait, acquire_provider_local_event_wait,
+    consume_provider_event_wait, provider_event_wait_is_ready, ProviderEventWaitError,
+};
 pub use event_object::{
     EventLeaseId, EventLeaseKind, EventObjectError, EventObjectId, EventObjectOwner,
     EventObjectRegistry, EventObjectSnapshot, PendingEventSignal, ProviderEventProjectionCatalog,

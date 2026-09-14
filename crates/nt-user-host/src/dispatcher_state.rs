@@ -31,3 +31,7 @@ impl DispatcherState {
 #[cfg(test)]
 #[path = "dispatcher_state_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "provider_event_wait_tests.rs"]
+mod provider_event_wait_tests;

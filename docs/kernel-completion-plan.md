@@ -35027,23 +35027,54 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         barrier within BOOT_TIMEOUT_SECONDS=300; the runner exits failure without a successful
         guest completion or Explorer verdict. No QEMU remains. This verifies unchanged early
         boot progress, not native execution of unobserved signaling or DriverEntry completion.
-      - [ ] Share strict Event backing checks for provider-wait admission and readiness.
-        The live ExecNtHandler backend currently validates registry authority when acquiring an
-        Event lease without preflighting EventStore backing; readiness uses read_state, which
-        silently treats missing backing as unsignalled. Introduce shared helpers over the existing
-        registry/store for backing-checked admission, exact ProviderWait lease readiness and
-        consumption, and use them immediately in the live adapter. Do not add an alternate
-        dispatcher store or defer native integration until bootstrap wait admission. Preserve
-        hosted-client generation/current-provider validation and the distinct authority of
-        process-projected Events. Invalid backing at admission must fail without leaking a lease;
-        missing backing after admission is an invariant violation, not indefinite not-ready.
-        Keep native namespace validation and synchronous exact retirement in the adapter; do not
-        create an allocation-backed cleanup queue. Test real ProviderDispatcherWaitArbiter
-        ready/pending/poll/wait-all paths, synchronization consumption, missing backing,
-        delete-pending retained leases and ownership transfer with exact live leases. Reuse these
-        helpers for bootstrap only after typed kernel continuation, Reply/shared-bank ownership
-        and real readiness/deadline scheduling are complete. This slice does not enable kernel
-        wait admission or satisfy the remaining DriverEntry/export dependencies.
+      - [x] Share strict Event backing checks for provider-wait admission and readiness (2026-09-15).
+        nt-kernel-exec::event_wait now provides backing-checked local and projected admission,
+        exact ProviderWait lease readiness and consumption over the existing registry/EventStore.
+        Both admission paths reject missing backing before allocating a lease. Provider-local
+        admission retains exact owner/local identity and deletion checks; process projection
+        admission validates provider/client owner kinds and generations, exact client ownership
+        and a retained projection pointer. A delete-pending process Event remains waitable while
+        that pointer is retained, unlike a retiring provider-local Event. Readiness and consumption
+        resolve the exact ProviderWait lease and distinguish missing backing from unsignalled
+        state. The live ExecNtHandler now uses these helpers, preflights the live namespace Event
+        entry, and treats post-admission backing loss as an invariant failure. Remove its permissive
+        read_state path and duplicated lease resolution. Existing hosted-client/current-provider
+        authentication, Timer handling and synchronous exact native retirement remain unchanged.
+        No alternate store, deferred cleanup queue, new lifetime authority or kernel admission
+        was introduced. Eight core tests cover Event kinds/states, missing backing before/after
+        admission, nonmutating authority refusals, wrong-kind/null/recycled leases and distinct
+        local/projected deletion rules. Six real ProviderDispatcherWaitArbiter integration tests
+        cover ready/pending/poll/wait-all, missing second-backing rollback without consuming the
+        first Event, synchronization consumption, delete-pending completion and moving the original
+        DispatcherState with exact parked leases intact. Serialized validation passes 1,180 tests
+        across 17 suites with no failures or ignored cases, including compile-fail ownership
+        checks: .tmp/test-provider-event-backing-20260915.log. Executive release passes in 38.52s
+        with unchanged 297 warnings; standalone I/O Manager passes without warnings. Evidence:
+        .tmp/build-provider-event-backing-executive-20260915.log and
+        .tmp/build-provider-event-backing-io-manager-20260915.log. Independent review, scoped
+        formatting and git diff --check pass. No native boot was rerun for this slice: the latest
+        measured boot remains the explicit 27-import rejection above, before this wait backend
+        can execute. Host and native-build results do not establish DriverEntry or desktop proof.
+        Reuse these helpers for blocking bootstrap waits only after typed kernel continuation,
+        Reply/shared-bank ownership and real readiness/deadline scheduling are complete. This
+        slice does not enable kernel waits or satisfy the remaining DriverEntry/export dependencies.
+      - [ ] Implement authenticated kernel zero-time Event waits through the real transport.
+        This is the next bounded production slice, not permission to admit blocking kernel waits.
+        In win32k_subsystem::provider_wait_rendezvous, preserve an explicit kernel or hosted
+        request context; a kernel poll must not depend on callback headers or fabricated client
+        fields. Reject blocking kernel requests before publishing them. In spawn_hosts, route
+        kernel polls separately from caps.provider_wait so DriverEntry's blocking-wait capability
+        remains disabled. Pass the actual incoming PumpMessage and bound Reply into canonical
+        kernel activation/channel validation, not merely the shared request's claimed owner.
+        In service_provider_wait_poll, use the existing arbiter's poll operation over the original
+        bootstrap Owned or live stores with the strict Event helpers above and synchronous native
+        namespace retirement. Retain Running lane/activation and exact Reply ownership; do not
+        allocate a continuation, publish a waiter, admit nested dispatch or change a suspension
+        queue. Require Event-only kernel requests until real Timer expiration ordering exists.
+        Test completion-before-poll, both Event kinds, wait-all atomicity, stale activation/header/
+        Reply rejection and exact cleanup without lane or queue transitions. Poll support does
+        not satisfy stopped-job scheduling, receive-endpoint ownership, timer deadlines or typed
+        kernel continuation wake/resume required by the following blocking-wait cutover.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
