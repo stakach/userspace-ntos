@@ -6,7 +6,13 @@ use nt_user_host::provider_kernel_activation::{
     KernelProviderActivations, KernelProviderCaller, KernelProviderCompletionReceipt,
 };
 
-static mut ACTIVATIONS: KernelProviderActivations = KernelProviderActivations::new();
+#[path = "kernel_bootstrap.rs"]
+mod bootstrap;
+pub(crate) use bootstrap::DriverEntryCompletion;
+use bootstrap::DriverEntryRecipient;
+
+static mut ACTIVATIONS: KernelProviderActivations<DriverEntryRecipient> =
+    KernelProviderActivations::new();
 
 fn channel_binding(channel: &spawn_hosts::PumpChannel) -> LaneBinding {
     LaneBinding {
@@ -33,6 +39,8 @@ fn authenticated_channel_caller(
         || channel.shared_va != win32k_subsystem::WIN32K_SHARED_VADDR
         || channel.dispatch_label != win32k_subsystem::W32_DISPATCH_LABEL
         || caller.binding() != channel_binding(channel)
+        || !unsafe { (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller) }
+            .is_ok_and(|recipient| recipient.matches(channel))
         || current_win32k_provider_domain().is_none_or(|provider| {
             caller.owner().provider_domain != provider.domain
                 || caller.owner().provider_generation != provider.generation
@@ -94,14 +102,35 @@ pub(crate) unsafe fn capture_win32k_initial_system(
         }
         let native =
             pm.capture_native_handle_caller(system.thread(), nt_types::AccessMode::KernelMode)?;
-        (&mut *core::ptr::addr_of_mut!(ACTIVATIONS)).capture(
+        let _durable = allocator::enter_durable();
+        (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
+            .capture_with_recipient(
+                pm,
+                &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+                lanes,
+                provider,
+                lane,
+                native,
+                DriverEntryRecipient::new(*channel),
+            )
+            .map_err(|(status, _recipient)| status)
+    })
+}
+
+/// Recover the initiating channel from its durable destination before the first pump. This is
+/// not a resume API: stopped execution requires its own authenticated scheduler transition.
+pub(crate) unsafe fn initial_driver_entry_channel(
+    caller: KernelProviderCaller,
+) -> Result<spawn_hosts::PumpChannel, u32> {
+    with_provider_process_manager(|pm| {
+        let activations = &*core::ptr::addr_of!(ACTIVATIONS);
+        activations.validate(
+            caller,
             pm,
             &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
-            lanes,
-            provider,
-            lane,
-            native,
-        )
+            &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
+        )?;
+        activations.recipient(caller)?.initial_channel(caller)
     })
 }
 
@@ -131,23 +160,43 @@ pub(super) unsafe fn service_ps(
 
 /// Capture the real initialization return before the shared page or physical lane is reused.
 /// A wall, scheduler yield or parked wait is not completion and retains the activation unchanged.
-pub(crate) unsafe fn record_driver_entry_return(
+pub(crate) unsafe fn record_driver_entry_pump(
     channel: &spawn_hosts::PumpChannel,
     result: &spawn_hosts::PumpResult,
-) -> Result<KernelProviderCompletionReceipt, u32> {
+) -> Result<Option<KernelProviderCompletionReceipt>, u32> {
     let caller = authenticated_channel_caller(channel)?;
-    if !result.completed
-        || result.callback_suspended
-        || result.provider_wait_suspended
-        || result.lpc_wait_suspended
-        || result.scheduler_yielded
-        || result.reply_cap != channel.reply_cap
-    {
+    let returned = result.completed
+        && !result.callback_suspended
+        && !result.provider_wait_suspended
+        && !result.lpc_wait_suspended
+        && !result.scheduler_yielded
+        && result.reply_cap == channel.reply_cap;
+    let status = returned.then(|| {
+        core::ptr::read_volatile((channel.shared_va + win32k_subsystem::SH_DE_STATUS) as *const u32)
+    });
+    (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
+        .recipient_mut(caller)?
+        .observe(*result, status)?;
+    if result.completed && !returned {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
-    let status = core::ptr::read_volatile(
-        (channel.shared_va + win32k_subsystem::SH_DE_STATUS) as *const u32,
-    );
+    finish_observed_driver_entry_return(caller)
+}
+
+/// Retry local completion recording from retained evidence only. This never repumps a stopped
+/// component, rereads its shared bank, or repeats return-side cleanup after publication.
+pub(crate) unsafe fn finish_observed_driver_entry_return(
+    caller: KernelProviderCaller,
+) -> Result<Option<KernelProviderCompletionReceipt>, u32> {
+    if let Ok(receipt) = (&*core::ptr::addr_of!(ACTIVATIONS)).completion(caller) {
+        return Ok(Some(receipt));
+    }
+    let Some(status) = (&*core::ptr::addr_of!(ACTIVATIONS))
+        .recipient(caller)?
+        .observed_return()
+    else {
+        return Ok(None);
+    };
     let receipt = with_provider_process_manager(|pm| {
         (&mut *core::ptr::addr_of_mut!(ACTIVATIONS)).record_completion(
             caller,
@@ -158,15 +207,17 @@ pub(crate) unsafe fn record_driver_entry_return(
         )
     })?;
     crate::driver_launch::win32k_device_properties::retire_completed_transfers();
-    Ok(receipt)
+    Ok(Some(receipt))
 }
 
 /// Only the initiating kernel recipient acknowledges its retained result. The exact receipt and
 /// both Ps references survive a failed acknowledgment; shared bytes are never read again here.
-pub(crate) unsafe fn acknowledge_completion(
+pub(crate) unsafe fn accept_driver_entry_completion(
     receipt: KernelProviderCompletionReceipt,
-) -> Result<u32, u32> {
+) -> Result<DriverEntryCompletion, u32> {
     with_provider_process_manager(|pm| {
-        (&mut *core::ptr::addr_of_mut!(ACTIVATIONS)).acknowledge_completion(receipt, pm)
+        (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
+            .acknowledge_completion_with_recipient(receipt, pm)
+            .map(|(status, recipient)| DriverEntryCompletion::new(status, recipient))
     })
 }

@@ -30255,7 +30255,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // `RecvFirst`: startup faults and the activation handoff are Calls. DriverEntry cannot
             // begin until this pump publishes its retained kernel caller through that handoff.
             let code_va = win32k_subsystem::WIN32K_CODE_VA;
-            let mut init_ch = spawn_hosts::PumpChannel {
+            let init_ch = spawn_hosts::PumpChannel {
                 fault_ep: w_fault,
                 pml4: host_pml4,
                 code_va,
@@ -30322,65 +30322,26 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 ps_bootstrap::initial_system_projection()
                     .expect("DriverEntry requires the canonical initial System objects").identity,
             ).expect("DriverEntry must retain its canonical caller before pumping requests");
-            init_ch.kernel_caller = Some(init_caller);
+            let init_ch = service_sec_image::kernel_provider_activation::initial_driver_entry_channel(init_caller)
+                .expect("DriverEntry must use its retained initiating channel");
             let init_pr = spawn_hosts::component_pump(&init_ch);
             let faults = init_pr.faults;
             let demand = init_pr.demand;
             let finished = init_pr.completed;
             let (wall_ip, wall_addr, wall_label) =
                 (init_pr.wall_ip, init_pr.wall_addr, init_pr.wall_label);
-            let init_completion = if finished {
-                Some(service_sec_image::kernel_provider_activation::record_driver_entry_return(
-                    &init_ch, &init_pr,
-                ).expect("DriverEntry return must retain its exact kernel completion"))
-            } else {
-                None
-            };
-            let de_status = init_completion.map(|receipt| receipt.status() as i32);
-            if let Some(receipt) = init_completion {
-                service_sec_image::kernel_provider_activation::acknowledge_completion(receipt)
-                    .expect("accepted DriverEntry result must retire both caller references");
-            }
-            let initialized = de_status.is_some_and(|status| status >= 0);
+            let init_completion = service_sec_image::kernel_provider_activation::record_driver_entry_pump(
+                &init_ch, &init_pr,
+            ).expect("DriverEntry pump must retain its exact kernel outcome")
+                .map(|receipt| {
+                    service_sec_image::kernel_provider_activation::accept_driver_entry_completion(receipt)
+                        .expect("accepted DriverEntry result must deliver its retained destination")
+                });
+            let de_status = init_completion.as_ref().map(|completion| completion.status());
 
             // Readiness follows an acknowledged successful initialization result, not merely a
             // return to the component loop. A failed DriverEntry must not receive client dispatches.
-            if initialized {
-                WIN32K_FAULT_EP.store(w_fault, Ordering::Relaxed);
-                WIN32K_HOST_PML4.store(host_pml4, Ordering::Relaxed);
-                if !win32k_glue::initialize_win32k_physical_lane(host_pml4) {
-                    panic!("win32k secondary execution lane failed its ready handshake");
-                }
-                register_win32k_gdi_loader(host_pml4);
-                // Host win32k's non-native static import DLLs and patch their IAT descriptors before
-                // any routed NtUser/NtGdi dispatch can call them.
-                load_win32k_static_import_drivers(host_pml4);
-                // Record the display route selected from the real SYSTEM hive. The actual
-                // HARDWARE\DEVICEMAP\VIDEO route is published only by the hosted videoprt miniport
-                // after PnP AddDevice/START_DEVICE succeeds.
-                if let Some(display_spec) = system_hive_display_driver_spec() {
-                    let display_spec_view = display_spec.win32k_spec();
-                    print_str(b"[win32k-svc] display service=");
-                    print_str(display_spec.service_name());
-                    print_str(b" driver=");
-                    print_str(display_spec_view.display_driver_leaf);
-                    print_str(b" description=");
-                    print_str(display_spec_view.device_description);
-                    print_str(b" mode=");
-                    print_u64(display_spec_view.mode.width as u64);
-                    print_str(b"x");
-                    print_u64(display_spec_view.mode.height as u64);
-                    print_str(b" stride=");
-                    print_u64(display_spec_view.mode.stride as u64);
-                    print_str(b" size=0x");
-                    print_hex(display_spec_view.framebuffer_size as u32);
-                    print_str(b"\n");
-                } else {
-                    print_str(
-                        b"[win32k-svc] no loadable display Device0 in SYSTEM hive and ReactOS FS\n",
-                    );
-                }
-            }
+            let initialized = init_completion.is_some_and(|completion| completion.initialize());
 
             let verdict = core::ptr::read_volatile(
                 (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_VERDICT)

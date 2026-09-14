@@ -34632,6 +34632,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         and .tmp/build-kernel-terminal-io-manager-20260914.log. Scoped formatting/diff checks pass.
         These are host composition and native build checks, not native mechanism/desktop proof.
         No VM boot was run; the last measured 27 strict win32k imports remain open.
+      - [x] Retain the initiating kernel bootstrap destination through acknowledgment
+        (2026-09-14; host/composed/native-build verified below).
+        Parameterize the existing KernelProviderActivations row by its owned destination rather
+        than introducing another status/authority table. Reserve row storage before Ps capture;
+        rejected capture returns the original destination, and failed reference retirement leaves
+        it in the same row. Exact acknowledgment transfers canonical status and the non-Clone
+        destination together only after both references retire. Ordinary cleanup also returns its
+        owned destination instead of discarding it. Freeze mutable destination metadata once a
+        return or terminal-pending result is recorded; destination access is not execution authority.
+        DriverEntry now retains its original PumpChannel and actual pump observation in that row
+        under durable allocation before the first pump. Recover the initiating channel with the
+        exact kernel caller, and check its retained physical binding/VSpace on native requests.
+        Capture actual returned status before shared-bank reuse; a stopped/yielded/parked pump
+        remains observed evidence, never a result. Retry recording from retained observed status
+        without repumping or rereading shared bytes; published receipt lookup cannot repeat the
+        return-side device-property cleanup. Preserve all stopped PumpResult facts for future
+        authenticated scheduler handling rather than losing them with the startup stack.
+        Consume an acknowledged, non-copyable DriverEntryCompletion to perform readiness from
+        its original channel. Move that existing setup into focused kernel_bootstrap.rs: preserve
+        endpoint/PML4 publication, secondary lane handshake, GDI loader/static imports and display
+        diagnostics in their existing order. Negative NTSTATUS never publishes readiness.
+        No synthetic frame, callback token, hosted client or new kernel wait capability is added.
+        The current bootstrap still consumes synchronously and fails closed on ACK error; retained
+        ownership does not claim an automatic scheduler retry. Full async startup and the FSD
+        loader's separate initialization path remain outstanding below.
+        Five focused tests use non-Clone, drop-counted destinations to check allocation identity
+        across early/foreign-manager/duplicate capture refusal, stopped/parked retention, exact
+        receipt failures and transfer, terminal-pending freeze/local retirement, and independent
+        provider/lane ownership through failed cleanup. Corrected a test fixture that attempted
+        two Running jobs in the shared execution slot; production dispatch admission was unchanged.
+        The serialized full rerun passes 810 cases across 15 suites, with no failures or ignored
+        cases: .tmp/test-kernel-recipient-20260914-rerun.log (nt-user-host, nt-component-suspension,
+        nt-provider-wait). Native release builds pass for the executive in 38.88s with the unchanged
+        294 warnings and standalone I/O Manager in 0.06s without warnings. Evidence:
+        .tmp/build-kernel-recipient-executive-20260914.log and
+        .tmp/build-kernel-recipient-io-manager-20260914.log. Scoped formatting/diff checks pass.
+        Independent ownership/native reviews found no blocker after separating retained observation
+        from retryable local return recording. These checks do not prove native mechanisms or desktop
+        rendering: no VM boot was run, and the last measured 27 strict win32k imports remain open.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -34665,8 +34704,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         borrows before ticketed terminal mechanism calls, then finish through the exact core
         terminal wrapper. Its local-retirement result is local bookkeeping only; do not report
         uncertain external effects as retryable local errors.
-        DriverEntry now consumes a retained direct-return receipt but still depends on synchronous
-        component_pump completion; retain that completion ownership across any asynchronous park.
+        DriverEntry now retains its real channel/observed outcome/destination alongside the kernel
+        activation, and consumes that destination through exact acknowledgment as described above.
+        It still depends on synchronous component_pump execution: implement authenticated stopped
+        job scheduling and deferred bootstrap consumption, including retry after failed ACK. Do
+        not repump the initial channel after a wall or infer a resume action from a missing receipt.
         Use the new retained-lifetime check for Suspended eligibility, followed by strict execution
         authorization after begin_resume. An exited caller remains owned but cannot regain execution
         through retained validation; implement its real cancellation/unwind contract explicitly.

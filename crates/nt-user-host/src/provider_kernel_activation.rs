@@ -61,11 +61,12 @@ impl KernelProviderCaller {
     }
 }
 
-struct Activation {
+struct Activation<D> {
     caller: KernelProviderCaller,
     native_caller: NativeHandleCaller,
     reference: NativeThreadProcessReference,
     completion: Option<Completion>,
+    recipient: D,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,11 +99,11 @@ impl KernelProviderCompletionReceipt {
 /// Holds both original requestor objects through dispatch, parking and uncertain completion.
 /// Release is explicit and retryable; dropping this table is not reference retirement.
 #[must_use = "retire all activations through their original ProcessManager"]
-pub struct KernelProviderActivations {
-    rows: Vec<Activation>,
+pub struct KernelProviderActivations<D = ()> {
+    rows: Vec<Activation<D>>,
 }
 
-impl KernelProviderActivations {
+impl<D> KernelProviderActivations<D> {
     pub const fn new() -> Self {
         Self { rows: Vec::new() }
     }
@@ -110,7 +111,9 @@ impl KernelProviderActivations {
     /// The adapter authenticates the kernel thread and provider-to-channel routing before entry.
     /// Capture only a running physical job issued by the shared lane machinery. Reserve storage
     /// before acquiring either Ps reference; no fallible publication follows the pair acquisition.
-    pub fn capture<C, R, T>(
+    /// The recipient is owned by this same row across parking and failed acknowledgment.
+    /// Rejection returns it unchanged; successful publication cannot allocate after Ps capture.
+    pub fn capture_with_recipient<C, R, T>(
         &mut self,
         pm: &mut ProcessManager,
         catalog: &ProviderDomainCatalog,
@@ -118,40 +121,68 @@ impl KernelProviderActivations {
         provider: ProviderDomainIdentity,
         lane: LaneHandle,
         native_caller: NativeHandleCaller,
-    ) -> Result<KernelProviderCaller, u32> {
-        let catalog_identity = catalog.identity().ok_or(STATUS_INVALID_HANDLE)?;
-        if !catalog.contains(provider) || lanes.phase(lane) != Ok(LanePhase::Running) {
-            return Err(STATUS_INVALID_HANDLE);
-        }
-        let dispatch = lanes
-            .active_dispatch_identity(lane)
-            .map_err(|_| STATUS_INVALID_HANDLE)?
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        // A physical dispatch cannot acquire a second logical caller, even in another domain.
-        if self.rows.iter().any(|row| row.caller.dispatch == dispatch) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let binding = lanes.binding(lane).map_err(|_| STATUS_INVALID_HANDLE)?;
-        self.rows
-            .try_reserve(1)
-            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        let activation = next_activation(&NEXT_ACTIVATION)?;
-        let reference = pm.reference_native_requestor(native_caller)?;
-        let caller = KernelProviderCaller {
-            activation,
-            catalog: catalog_identity,
-            provider,
-            dispatch,
-            binding,
-            thread: reference.thread_lifetime(),
+        recipient: D,
+    ) -> Result<KernelProviderCaller, (u32, D)> {
+        let prepared = (|| {
+            let catalog_identity = catalog.identity().ok_or(STATUS_INVALID_HANDLE)?;
+            if !catalog.contains(provider) || lanes.phase(lane) != Ok(LanePhase::Running) {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+            let dispatch = lanes
+                .active_dispatch_identity(lane)
+                .map_err(|_| STATUS_INVALID_HANDLE)?
+                .ok_or(STATUS_INVALID_HANDLE)?;
+            // A physical dispatch cannot acquire a second logical caller, even in another domain.
+            if self.rows.iter().any(|row| row.caller.dispatch == dispatch) {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            let binding = lanes.binding(lane).map_err(|_| STATUS_INVALID_HANDLE)?;
+            self.rows
+                .try_reserve(1)
+                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+            let activation = next_activation(&NEXT_ACTIVATION)?;
+            let reference = pm.reference_native_requestor(native_caller)?;
+            let caller = KernelProviderCaller {
+                activation,
+                catalog: catalog_identity,
+                provider,
+                dispatch,
+                binding,
+                thread: reference.thread_lifetime(),
+            };
+            Ok((caller, reference))
+        })();
+        let (caller, reference) = match prepared {
+            Ok(prepared) => prepared,
+            Err(status) => return Err((status, recipient)),
         };
         self.rows.push(Activation {
             caller,
             native_caller,
             reference,
             completion: None,
+            recipient,
         });
         Ok(caller)
+    }
+
+    /// Routing/destination metadata only; accessing it does not authorize execution or completion.
+    pub fn recipient(&self, caller: KernelProviderCaller) -> Result<&D, u32> {
+        self.rows
+            .iter()
+            .find(|row| row.caller == caller)
+            .map(|row| &row.recipient)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    /// Update local metadata of an unfinished activation only. Do not hold this borrow across
+    /// native mechanisms, replace its destination, or treat metadata as dispatch authority.
+    pub fn recipient_mut(&mut self, caller: KernelProviderCaller) -> Result<&mut D, u32> {
+        self.rows
+            .iter_mut()
+            .find(|row| row.caller == caller && row.completion.is_none())
+            .map(|row| &mut row.recipient)
+            .ok_or(STATUS_INVALID_HANDLE)
     }
 
     /// Validate an owned, unfinished job in either its running or suspended phase. Caller exit
@@ -378,11 +409,13 @@ impl KernelProviderActivations {
 
     /// Acknowledge the exact retained result after delivery. No provider, dispatch or caller
     /// liveness is required; failure preserves both the result and the complete reference pair.
-    pub fn acknowledge_completion(
+    /// Transfer its owned destination only after successful pair retirement. No fallible work
+    /// follows release; failure leaves destination, result and references in the original row.
+    pub fn acknowledge_completion_with_recipient(
         &mut self,
         receipt: KernelProviderCompletionReceipt,
         pm: &mut ProcessManager,
-    ) -> Result<u32, u32> {
+    ) -> Result<(u32, D), u32> {
         let index = self
             .rows
             .iter()
@@ -392,18 +425,18 @@ impl KernelProviderActivations {
             })
             .ok_or(STATUS_INVALID_HANDLE)?;
         self.rows[index].reference.release(pm)?;
-        self.rows.remove(index);
-        Ok(receipt.status)
+        let row = self.rows.remove(index);
+        Ok((receipt.status, row.recipient))
     }
 
     /// Call only after native execution/reply ownership has ended or been safely cancelled. The
     /// exact record fences retries; caller exit and provider retirement do not invalidate cleanup.
     /// Failed reference release leaves the entire row available for a later retry.
-    pub fn release(
+    pub fn release_with_recipient(
         &mut self,
         caller: KernelProviderCaller,
         pm: &mut ProcessManager,
-    ) -> Result<(), u32> {
+    ) -> Result<D, u32> {
         let index = self
             .rows
             .iter()
@@ -413,8 +446,7 @@ impl KernelProviderActivations {
             return Err(STATUS_INVALID_PARAMETER);
         }
         self.rows[index].reference.release(pm)?;
-        self.rows.remove(index);
-        Ok(())
+        Ok(self.rows.remove(index).recipient)
     }
 
     /// Includes terminal/failed-release rows, not merely jobs currently executing on a lane.
@@ -430,7 +462,39 @@ impl KernelProviderActivations {
     }
 }
 
-impl Default for KernelProviderActivations {
+impl KernelProviderActivations<()> {
+    pub fn capture<C, R, T>(
+        &mut self,
+        pm: &mut ProcessManager,
+        catalog: &ProviderDomainCatalog,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        provider: ProviderDomainIdentity,
+        lane: LaneHandle,
+        native_caller: NativeHandleCaller,
+    ) -> Result<KernelProviderCaller, u32> {
+        self.capture_with_recipient(pm, catalog, lanes, provider, lane, native_caller, ())
+            .map_err(|(status, ())| status)
+    }
+
+    pub fn acknowledge_completion(
+        &mut self,
+        receipt: KernelProviderCompletionReceipt,
+        pm: &mut ProcessManager,
+    ) -> Result<u32, u32> {
+        self.acknowledge_completion_with_recipient(receipt, pm)
+            .map(|(status, ())| status)
+    }
+
+    pub fn release(
+        &mut self,
+        caller: KernelProviderCaller,
+        pm: &mut ProcessManager,
+    ) -> Result<(), u32> {
+        self.release_with_recipient(caller, pm)
+    }
+}
+
+impl<D> Default for KernelProviderActivations<D> {
     fn default() -> Self {
         Self::new()
     }
