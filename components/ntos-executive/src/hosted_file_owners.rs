@@ -4,9 +4,9 @@ use super::*;
 use nt_io_manager::detached_file_irp::{
     ExternalFileIrpBuffers, ExternalFileIrpCancelPhase, ExternalFileIrpCancelReturn,
     ExternalFileIrpCompletionInvocation, ExternalFileIrpCompletionReturn,
-    ExternalFileIrpCopyReturn, ExternalFileIrpRequest, ExternalFileIrpResult,
-    ExternalFileIrpReturn, ExternalFileIrpTerminal, PreparedExternalFileIrp,
-    RetainedExternalFileIrp,
+    ExternalFileIrpCopyReturn, ExternalFileIrpDispatchPolicy, ExternalFileIrpOutputCapture,
+    ExternalFileIrpRequest, ExternalFileIrpResult, ExternalFileIrpReturn, ExternalFileIrpTerminal,
+    PreparedExternalFileIrp, RetainedExternalFileIrp,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,6 +73,8 @@ struct Row {
     payload: Option<Payload>,
     blocked_status: Option<nt_status::NtStatus>,
     completion: Option<nt_io_manager::CompletedIrp>,
+    /// Selected once with preparation; retries must not reinterpret the original output contract.
+    output_capture: ExternalFileIrpOutputCapture,
     retry_after: u64,
     work_ready: bool,
 }
@@ -159,7 +161,7 @@ fn remove(id: u64) {
     rows().swap_remove(index);
 }
 
-fn reserve() -> Result<u64, nt_status::NtStatus> {
+fn reserve(output_capture: ExternalFileIrpOutputCapture) -> Result<u64, nt_status::NtStatus> {
     let id = unsafe { NEXT_ID };
     let next = id
         .checked_add(1)
@@ -180,6 +182,7 @@ fn reserve() -> Result<u64, nt_status::NtStatus> {
         payload: None,
         blocked_status: None,
         completion: None,
+        output_capture,
         retry_after: 0,
         work_ready: false,
     });
@@ -305,10 +308,12 @@ pub(super) enum DispatchResult {
     },
 }
 
+/// Exact-device callers must authenticate and retain their Device and completion recipient.
 pub(super) fn dispatch(
     request: ExternalFileIrpRequest,
     input: &[u8],
     initial_output: &[u8],
+    policy: ExternalFileIrpDispatchPolicy,
 ) -> Result<DispatchResult, nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let copy = |source: &[u8]| -> Result<Vec<u8>, nt_status::NtStatus> {
@@ -320,8 +325,9 @@ pub(super) fn dispatch(
         Ok(bytes)
     };
     let buffers = ExternalFileIrpBuffers::new(copy(input)?, copy(initial_output)?);
-    let id = reserve()?;
-    let prepared = match io_manager_mut().prepare_external_file_irp_owned(request, buffers) {
+    let id = reserve(policy.output_capture())?;
+    let preparation = policy.prepare(io_manager_mut(), request, buffers);
+    let prepared = match preparation {
         Ok(prepared) => prepared,
         Err(status) => {
             remove(id);
@@ -407,7 +413,10 @@ fn ensure_completion(id: u64) -> Result<(), nt_status::NtStatus> {
         .expect("idle File owner missing payload");
     match payload {
         Payload::Retained(retained) => {
-            match io_manager_mut().prepare_external_file_irp_completion(retained) {
+            let capture = row(id).output_capture;
+            match io_manager_mut()
+                .prepare_external_file_irp_completion_with_capture(retained, capture)
+            {
                 Ok(completion) => {
                     row(id).completion = Some(*completion.completion());
                     keep(id, Payload::Completion(completion));

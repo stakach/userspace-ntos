@@ -66,17 +66,18 @@ pub const fn valid_initial_information(
     }
 }
 
-/// Whether the driver consumes the caller's initial output bytes. Buffered
-/// control requests keep their input staging buffer rather than overwriting it.
+/// Whether native admission must seed the caller's output allocation. Nonbuffered device
+/// controls retain untouched caller bytes even when Information describes only partial output.
+/// Buffered controls keep their input staging buffer rather than overwriting it.
 pub const fn initial_output_required(major: u8, control_code: u32, output_len: u32) -> bool {
     output_len != 0
         && (major == major::IRP_MJ_QUERY_INFORMATION
             || (matches!(
                 major,
-                major::IRP_MJ_DEVICE_CONTROL
-                    | major::IRP_MJ_INTERNAL_DEVICE_CONTROL
-                    | major::IRP_MJ_FILE_SYSTEM_CONTROL
-            ) && ioctl::method(control_code) == ioctl::METHOD_IN_DIRECT))
+                major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+            ) && ioctl::method(control_code) != ioctl::METHOD_BUFFERED)
+            || (major == major::IRP_MJ_FILE_SYSTEM_CONTROL
+                && ioctl::method(control_code) == ioctl::METHOD_IN_DIRECT))
 }
 
 /// Validate the major/minor/filter/flag shape of a directory notification IRP.
@@ -785,7 +786,11 @@ mod tests {
             ] {
                 assert_eq!(
                     initial_output_required(major, control, 16),
-                    control == ioctl::METHOD_IN_DIRECT
+                    if major == major::IRP_MJ_FILE_SYSTEM_CONTROL {
+                        control == ioctl::METHOD_IN_DIRECT
+                    } else {
+                        control != ioctl::METHOD_BUFFERED
+                    }
                 );
                 assert!(!initial_output_required(major, control, 0));
             }

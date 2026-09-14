@@ -194,8 +194,8 @@ pub use read_write::{
     FILE_USE_FILE_POINTER_POSITION, FILE_WRITE_TO_END_OF_FILE,
 };
 pub use retained_completion::{
-    completion_output_transfer_len, RetainedCompletion, RetainedCompletionError,
-    RetainedIrpCompletion,
+    completion_output_transfer_len, retained_control_output_transfer_len, RetainedCompletion,
+    RetainedCompletionError, RetainedIrpCompletion,
 };
 pub use store::{GenStore, IoId};
 pub use synchronous_io::{

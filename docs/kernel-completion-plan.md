@@ -34280,6 +34280,68 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         and .tmp/build-video-device-lifecycle-io-manager-20260914.log. Scoped formatting and diff
         checks pass. No native callback execution, VM boot, complete multi-adapter acceptance or
         desktop proof is claimed; the last measured 27 strict win32k imports remain open.
+      - [x] Pair native detached dispatch routing with immutable completion-capture policy
+        (2026-09-14; host/composed/native-build verified below).
+        Use one host-testable ExternalFileIrpDispatchPolicy at native request admission. Existing
+        File callers explicitly select top-of-stack preparation plus Information capture; exact
+        File-less Device controls select exact-device preparation plus original-method capture.
+        Store the capture policy in the durable native owner before dispatch and preserve it
+        through pending, cancellation, copy and ACK retries. Do not infer it from a mutable lower
+        driver's IOCTL or change legacy File callers implicitly. The native owner can then accept
+        the exact policy without a duplicate request registry or a manager borrow across IPC.
+        This prerequisite does not claim an Eng caller has switched to the new policy.
+        Review also found native producers truncated every retained output to Information,
+        preventing the new direct/neither policy from retrieving the full buffer. Capture the
+        original method in the existing PendingIrp owner before driver entry and snapshot it in
+        the generation-claimed completion target. Both IoCompleteRequest and inline dispatch
+        now use one host-testable retention-length helper: ordinary/internal direct/neither
+        controls retain full capacity, while buffered, FSCTL and other majors retain their old
+        byte-count behavior. Preserve the existing PnP capability-payload exception. Caller copy
+        policy still governs which retained bytes are delivered; legacy File callers do not
+        silently start copying the full buffer. The retained-copy consumer is unchanged.
+        Final transport review found a second prerequisite: native admission seeded only
+        IN_DIRECT output. Extend the shared I/O ABI seed predicate to all nonbuffered ordinary
+        and internal controls so OUT_DIRECT/NEITHER untouched bytes survive full capture. Keep
+        buffered input and existing FSCTL seed behavior unchanged. The existing authenticated,
+        bounded output-seed transfer already carries the owned caller buffer; no new wire
+        fields or shared transfer window are needed.
+        A failed retained direct/neither capture has no substitute source: inline delivery
+        preserves its zero source/length, and asynchronous copy remains owned/refused until its
+        capture can be fulfilled. This is not a claim of automatic quarantine recovery. The
+        immutable method survives same-provider raw IRP forwarding; general native cross-provider
+        control forwarding is not proven by this checkpoint.
+        All 890 tests in the full I/O ABI and I/O Manager suites pass across 34 suites with no
+        failures or ignored cases: 30 ABI, 722 I/O Manager library, 123 integration and 15
+        documentation tests. Five new library tests cover paired routing/capture, concurrent
+        out-of-order owners, cancellation and copy/ACK retries, retention extent and unchanged
+        non-control behavior. A 24-case composition within those tests combines the production
+        seed predicate, retention helper and owned capture/ACK to preserve distinct untouched
+        tail bytes for both control majors, all nonbuffered methods, zero/short Information and
+        success/error status. The existing ABI seed matrix now also checks OUT_DIRECT/NEITHER.
+        Evidence: .tmp/test-native-control-capture-seeded-full-20260914.log. These are host
+        policy/composition tests, not execution of the native IPC, pool or completion routines.
+        Final independent review found no further blocker within this bounded scope.
+        Serialized native release builds pass: executive in 38.57s with the unchanged 294
+        warnings and standalone I/O Manager in 2.49s without warnings. Evidence:
+        .tmp/build-native-control-capture-executive-20260914.log and
+        .tmp/build-native-control-capture-io-manager-20260914.log. Scoped formatting and diff
+        checks pass. No VM, pending Eng execution or desktop acceptance is claimed; the last
+        measured 27 strict win32k imports remain open. Review split the shared kernel-only wait
+        prerequisite below before attempting the native bridge replacement.
+      - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
+        Existing win32k provider waits derive their owner from a hosted syscall/callback header
+        and live process generation (win32k_subsystem::current_provider_wait_owner and
+        provider_wait_rendezvous, service_sec_image provider admission, exec_handler object
+        admission). DriverEntry and kernel-only activations cannot use that contract unchanged.
+        Give the shared provider-wait contract an explicit authenticated caller kind, retaining
+        the real provider generation, physical lane and dispatch activation independently of
+        optional hosted-client identity. Keep hosted process/thread teardown scoped to hosted
+        callers, and provider/lane teardown effective for both kinds. Exercise completion before
+        wait, nested activation, stale dispatch and generation, cancellation and teardown in the
+        shared crates before native wiring. Preserve wait IRQL restrictions: a kernel caller
+        kind must not authorize blocking from ISR/DPC execution. Do not add a video-only
+        suspension variant, infer a caller kind from failed lookup, or manufacture a hosted
+        client for a kernel caller.
       - [ ] Replace the native video IOCTL bridge with authenticated, owned File-less requests.
         Retain the physical win32k caller, exact Device authority, input/output buffers and reply
         continuation before dispatch. Use detached exact-device preparation rather than holding
@@ -34307,6 +34369,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Finish per-Device lifecycle policy beyond the state checkpoint above: authenticated
         RequestorMode provenance, session/control access, and stop/restart/removal transitions.
         Do not turn concurrent initialization or discovery into a second miniport callback.
+        Use the generalized authenticated provider wait caller ownership from the prerequisite
+        above for pending delivery, including DriverEntry and kernel-only activations.
+        Reuse real per-request synchronization events for completion, including completion before
+        wait, but add an explicit completion-event lifetime lease (not a fake dispatcher waiter).
+        Retain a caller reference to the exact consumer Device registration, not only its Device
+        body. Add File-less terminal recipient observation independently of completed_irp_exact,
+        which currently requires a File. Capture output before signaling and retain result/token
+        ownership through retrieval, caller copy, backend ACK and reply delivery. Exercise stale
+        identities, nested submissions, interrupted wait, partial-copy/lost-ACK retry and teardown
+        before removing the shared video window and legacy immediate-reply service.
       - [ ] Replace legacy video pointer acquisition with authenticated per-call File ownership.
         NT5 base/ntos/io/iomgr/iosubs.c:7393 and ReactOS ntoskrnl/io/iomgr/device.c:264 open a NEW
         File for each IoGetDeviceObjectPointer call with caller DesiredAccess, no sharing,

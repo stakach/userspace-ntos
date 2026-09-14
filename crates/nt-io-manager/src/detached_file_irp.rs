@@ -248,6 +248,8 @@ owner_accessors!(ExternalFileIrpCompletionInvocation, owner);
 
 mod operations;
 pub use operations::*;
+mod policy;
+pub use policy::ExternalFileIrpDispatchPolicy;
 
 impl ExternalFileIrpInvocation {
     pub fn buffers_mut(&mut self) -> ExternalFileIrpBufferView<'_> {

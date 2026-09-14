@@ -16,6 +16,28 @@ pub const fn completion_output_transfer_len(information: u64, output_capacity: u
     }
 }
 
+/// Native bytes retained before the caller's completion capture policy is applied.
+///
+/// Direct and neither device controls expose their whole output buffer independently of
+/// `IoStatus.Information`. The method must come from the original request, not a driver-mutated
+/// stack location. Other operations retain their existing byte-count behavior.
+pub const fn retained_control_output_transfer_len(
+    major: u8,
+    original_method: u8,
+    information: u64,
+    output_capacity: u64,
+) -> u64 {
+    if (major == nt_io_abi::major::IRP_MJ_DEVICE_CONTROL
+        || major == nt_io_abi::major::IRP_MJ_INTERNAL_DEVICE_CONTROL)
+        && original_method >= nt_io_abi::ioctl::METHOD_IN_DIRECT as u8
+        && original_method <= nt_io_abi::ioctl::METHOD_NEITHER as u8
+    {
+        output_capacity
+    } else {
+        completion_output_transfer_len(information, output_capacity)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetainedIrpCompletion {
@@ -173,5 +195,58 @@ mod tests {
         assert_eq!(completion_output_transfer_len(4_748, 20), 20);
         assert_eq!(completion_output_transfer_len(12, 20), 12);
         assert_eq!(completion_output_transfer_len(0, 20), 0);
+    }
+
+    #[test]
+    fn native_control_retention_preserves_method_specific_output_extent() {
+        use nt_io_abi::major;
+
+        for major in [
+            major::IRP_MJ_DEVICE_CONTROL,
+            major::IRP_MJ_INTERNAL_DEVICE_CONTROL,
+        ] {
+            for method in 0..=4 {
+                for capacity in [0, 20, u32::MAX as u64 + 1] {
+                    for information in [0, 12, 4_748, u64::MAX] {
+                        let expected = if (1..=3).contains(&method) {
+                            capacity
+                        } else {
+                            information.min(capacity)
+                        };
+                        assert_eq!(
+                            retained_control_output_transfer_len(
+                                major,
+                                method,
+                                information,
+                                capacity
+                            ),
+                            expected,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn other_native_majors_keep_information_bounded_retention() {
+        use nt_io_abi::major;
+
+        for major in [
+            major::IRP_MJ_READ,
+            major::IRP_MJ_QUERY_INFORMATION,
+            major::IRP_MJ_FILE_SYSTEM_CONTROL,
+            major::IRP_MJ_PNP,
+            u8::MAX,
+        ] {
+            for method in 0..=4 {
+                for information in [0, 12, 4_748] {
+                    assert_eq!(
+                        retained_control_output_transfer_len(major, method, information, 20),
+                        information.min(20),
+                    );
+                }
+            }
+        }
     }
 }

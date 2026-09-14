@@ -893,7 +893,9 @@ struct PendingIrp {
     /// Whether THIS IRP owns the FILE_OBJECT block. Only a transient FILE_OBJECT may be freed on
     /// completion; registered per-open FILE_OBJECTs live until cleanup/close.
     owns_fo: bool,
-    _pad: [u8; 3],
+    /// Immutable transfer method captured before the driver can modify its stack location.
+    control_method: u8,
+    _pad: [u8; 2],
     /// Completion is published in this owner record before any request buffer is reclaimed.
     completion: nt_io_manager::RetainedIrpCompletion,
 }
@@ -1082,6 +1084,7 @@ fn pending_irp_returns_read_bytes(major: u64, minor: u64, fsctl: u64, output_len
 fn pending_irp_completion_output_len(
     major: u64,
     minor: u64,
+    control_method: u8,
     output_len: u64,
     information: u64,
 ) -> u64 {
@@ -1091,7 +1094,12 @@ fn pending_irp_completion_output_len(
     {
         output_len
     } else {
-        information.min(output_len)
+        nt_io_manager::retained_control_output_transfer_len(
+            major as u8,
+            control_method,
+            information,
+            output_len,
+        )
     }
 }
 
@@ -1562,6 +1570,7 @@ struct PendingIrpCompletionTarget {
     completion_source_kind: u8,
     major: u8,
     minor: u8,
+    control_method: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -1622,6 +1631,10 @@ unsafe fn claim_pending_irp_completion(irp: u64) -> Option<PendingIrpCompletionC
                         ),
                         minor: read_volatile(
                             (entry + core::mem::offset_of!(PendingIrp, minor) as u64) as *const u8,
+                        ),
+                        control_method: read_volatile(
+                            (entry + core::mem::offset_of!(PendingIrp, control_method) as u64)
+                                as *const u8,
                         ),
                     },
                 });
@@ -10735,9 +10748,13 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         // original buffered-I/O allocation while completing a queued read.
         let sysbuf = read_unaligned((irp + 0x18) as *const u64);
         let irp_flags = read_unaligned((irp + 0x10) as *const u32);
-        let length =
-            nt_io_manager::completion_output_transfer_len(information, target.output_capacity)
-                .min(u32::MAX as u64) as usize;
+        let length = nt_io_manager::retained_control_output_transfer_len(
+            target.major,
+            target.control_method,
+            information,
+            target.output_capacity,
+        )
+        .min(u32::MAX as u64) as usize;
         let source = if length == 0 {
             0
         } else if target.completion_source_kind == COMPLETION_SOURCE_REQUEST_DATA {
@@ -34703,7 +34720,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         completion_source_kind,
         read_completion,
         owns_fo,
-        _pad: [0; 3],
+        control_method: control_method.unwrap_or(ioctl::METHOD_BUFFERED) as u8,
+        _pad: [0; 2],
         completion: nt_io_manager::RetainedIrpCompletion::pending(),
     };
     let Some(owner_node) = insert_pending_irp(canonical_irp_id, initial_owner) else {
@@ -35013,11 +35031,32 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             }
         }
         if read_completion {
-            let copy_len = pending_irp_completion_output_len(major, minor, outlen, info);
-            let source = retained_completion
-                .map(|completion| completion.source)
-                .filter(|source| *source != 0)
-                .unwrap_or(data);
+            let copy_len = pending_irp_completion_output_len(
+                major,
+                minor,
+                completed.control_method,
+                outlen,
+                info,
+            );
+            let full_control_output = (major == IRP_MJ_DEVICE_CONTROL
+                || major == IRP_MJ_INTERNAL_DEVICE_CONTROL)
+                && (ioctl::METHOD_IN_DIRECT as u8..=ioctl::METHOD_NEITHER as u8)
+                    .contains(&completed.control_method);
+            let (source, copy_len) = if full_control_output {
+                // A failed retained capture has no source or payload; do not substitute the
+                // original buffer after the completion path has rejected its ownership.
+                retained_completion
+                    .map(|completion| (completion.source, copy_len.min(completion.length as u64)))
+                    .unwrap_or((data, copy_len))
+            } else {
+                (
+                    retained_completion
+                        .map(|completion| completion.source)
+                        .filter(|source| *source != 0)
+                        .unwrap_or(data),
+                    copy_len,
+                )
+            };
             if copy_len != 0 && !pool_push_request_bytes(canonical_irp_id, source, 0, 0, copy_len) {
                 st = 0xC000_0001u32 as i32; // STATUS_UNSUCCESSFUL
                 info = 0;
@@ -42704,6 +42743,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
         },
         in_data,
         out,
+        nt_io_manager::detached_file_irp::ExternalFileIrpDispatchPolicy::File,
     ).map_err(|status| status.raw() as u32)?;
     match result {
         hosted_file_owners::DispatchResult::Returned {
