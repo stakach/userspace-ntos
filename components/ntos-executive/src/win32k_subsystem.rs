@@ -161,7 +161,6 @@ static WIN32K_DRIVER_OBJECT: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_LOCAL_EVENT_INITIALIZATIONS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_COMPONENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WIN32K_SHUTDOWN_EVENT: AtomicU64 = AtomicU64::new(0);
-const PROVIDER_DRIVER_ENTRY_DISPATCH_ID: u64 = u64::MAX;
 const WIN32K_STACK_BYTES: u64 = 32 * 0x1000;
 const WIN32K_PRIMARY_STACK_LANE_ID: u64 = 1;
 const WIN32K_STACK_ACTIVATION_DEPTH: usize = 64;
@@ -583,6 +582,24 @@ unsafe fn begin_provider_stack_event_activation(
     let activation = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
         .as_mut()?
         .begin_for_stack_pointer(current_stack_pointer(), dispatch_id)
+        .ok()?;
+    Some(ProviderStackEventActivationGuard { activation })
+}
+
+unsafe fn capture_kernel_provider_stack_activation() -> Option<ProviderStackEventActivationGuard> {
+    let provider = registered_provider_wait_domain()?;
+    // No activation catalog borrow may cross the rendezvous. The root validates its retained
+    // caller and physical dispatch before writing the descriptor and replying.
+    let (reply_info, status, _, _, _) =
+        crate::driver_launch::call_on4_raw(W32_KERNEL_ACTIVATION_LABEL << 12, 0, 0, 0, 0);
+    if reply_info != 1 || status != nt_process::STATUS_SUCCESS as u64 {
+        return None;
+    }
+    let page = WIN32K_PROVIDER_WAIT_VADDR as *const nt_provider_wait::ProviderWaitSharedPage;
+    let descriptor = read_volatile(core::ptr::addr_of!((*page).kernel_activation));
+    let activation = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
+        .as_mut()?
+        .begin_kernel_for_stack_pointer(current_stack_pointer(), provider, descriptor)
         .ok()?;
     Some(ProviderStackEventActivationGuard { activation })
 }
@@ -1148,6 +1165,8 @@ pub const W32_ATOM_OP_ADD_INTEGER: u64 = 2;
 pub const W32_MM_SECURE_LABEL: u64 = 0x77F;
 pub const W32_DEVICE_PROPERTY_LABEL: u64 = 0x780;
 pub const W32_DEVICE_POINTER_LABEL: u64 = 0x781;
+/// Root-authenticated kernel activation handoff before entering provider code.
+pub const W32_KERNEL_ACTIVATION_LABEL: u64 = 0x78E;
 pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
 pub const W32_MM_SECURE_OP_UNSECURE: u64 = 2;
 pub const W32_EVENT_OP_CREATE: u64 = 1;
@@ -4597,10 +4616,18 @@ unsafe fn provider_wait_object_for_dispatcher(
 }
 
 unsafe fn current_provider_wait_owner() -> Option<nt_provider_wait::ProviderWaitOwner> {
+    let activation = active_provider_stack_event_activation()?;
+    let activations = (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS)).as_ref()?;
+    if let Some(owner) = activations.owner(activation).ok()? {
+        return Some(owner);
+    }
     let provider = registered_provider_wait_domain()?;
     let callback_frame =
         (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *const nt_user_callback::CallbackFrame;
     let header = read_volatile(core::ptr::addr_of!((*callback_frame).header));
+    if header.dispatch_id != activation.dispatch_id {
+        return None;
+    }
     let client_generation = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_GENERATION) as *const u64);
     let owner = nt_provider_wait::ProviderWaitOwner {
         provider_domain: provider.domain,
@@ -15275,9 +15302,7 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
         print_str(b"[win32k-host] ERROR: provider local Event tracking initialization failed\n");
         park();
     }
-    let Some(driver_activation) =
-        begin_provider_stack_event_activation(PROVIDER_DRIVER_ENTRY_DISPATCH_ID)
-    else {
+    let Some(driver_activation) = capture_kernel_provider_stack_activation() else {
         print_str(b"[win32k-host] ERROR: DriverEntry stack activation failed\n");
         park();
     };

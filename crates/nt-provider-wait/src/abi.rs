@@ -1,7 +1,10 @@
-use crate::{LaneHandle, ProviderWaitOwner, SuspensionCaller, SuspensionHostedClient};
+use crate::{
+    KernelProviderActivationDescriptor, LaneHandle, ProviderWaitOwner, SuspensionCaller,
+    SuspensionHostedClient,
+};
 
 pub const PROVIDER_WAIT_ABI_MAGIC: u32 = u32::from_le_bytes(*b"PWT1");
-pub const PROVIDER_WAIT_ABI_VERSION: u16 = 2;
+pub const PROVIDER_WAIT_ABI_VERSION: u16 = 3;
 pub const PROVIDER_WAIT_CALLER_HOSTED: u32 = 1;
 pub const PROVIDER_WAIT_CALLER_KERNEL: u32 = 2;
 pub const PROVIDER_WAIT_SHARED_MAGIC: u32 = u32::from_le_bytes(*b"PWS1");
@@ -315,6 +318,7 @@ pub struct ProviderWaitSharedPage {
     pub control: ProviderWaitSharedControl,
     pub request: ProviderWaitRequest,
     pub result: ProviderWaitResult,
+    pub kernel_activation: KernelProviderActivationDescriptor,
 }
 
 impl ProviderWaitSharedPage {
@@ -323,6 +327,7 @@ impl ProviderWaitSharedPage {
             control: ProviderWaitSharedControl::EMPTY,
             request: ProviderWaitRequest::empty(),
             result: ProviderWaitResult::EMPTY,
+            kernel_activation: KernelProviderActivationDescriptor::EMPTY,
         }
     }
 }
@@ -614,7 +619,7 @@ mod tests {
                 },
             };
             request.begin(meta, &[object]).unwrap();
-            assert_eq!(request.header.version, 2);
+            assert_eq!(request.header.version, 3);
             assert_eq!(request.header.caller_kind, PROVIDER_WAIT_CALLER_KERNEL);
             assert_eq!(request.header.kernel_lane_index, index);
             assert_eq!(request.header.kernel_lane_generation, 8);

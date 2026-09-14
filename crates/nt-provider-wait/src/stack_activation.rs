@@ -1,6 +1,9 @@
 use alloc::vec::Vec;
 
-use crate::{ProviderEventBacking, ProviderWaitTimeoutKind};
+use crate::{
+    KernelProviderActivationDescriptor, KernelProviderActivationError, ProviderDomainIdentity,
+    ProviderEventBacking, ProviderWaitOwner, ProviderWaitTimeoutKind,
+};
 use nt_kernel_exec::{IrqlState, PASSIVE_LEVEL};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,11 +67,17 @@ pub enum ProviderStackActivationError {
     InvalidIrql,
     InvalidIrqlTransition,
     UnbalancedIrql,
+    InvalidKernelDescriptor(KernelProviderActivationError),
+    KernelBindingMismatch,
+    KernelLaneAlreadyBound,
+    KernelDispatchActive,
+    StaleKernelDispatch,
 }
 
 struct ProviderStackActivationRecord {
     identity: ProviderStackEventActivation,
     irql: IrqlState,
+    owner: Option<ProviderWaitOwner>,
 }
 
 struct ProviderStackLaneRecord {
@@ -78,6 +87,7 @@ struct ProviderStackLaneRecord {
     stack_base: u64,
     stack_bytes: u64,
     activations: Vec<ProviderStackActivationRecord>,
+    last_kernel_owner: Option<ProviderWaitOwner>,
 }
 
 impl ProviderStackLaneRecord {
@@ -89,6 +99,7 @@ impl ProviderStackLaneRecord {
             stack_base: 0,
             stack_bytes: 0,
             activations: Vec::new(),
+            last_kernel_owner: None,
         }
     }
 
@@ -176,6 +187,7 @@ impl ProviderStackActivationCatalog {
             stack_base,
             stack_bytes,
             activations: Vec::new(),
+            last_kernel_owner: None,
         };
         Ok(self.lanes[slot].binding(slot).handle)
     }
@@ -238,6 +250,55 @@ impl ProviderStackActivationCatalog {
         handle: ProviderStackLaneHandle,
         dispatch_id: u64,
     ) -> Result<ProviderStackEventActivation, ProviderStackActivationError> {
+        self.begin_with_owner(handle, dispatch_id, None)
+    }
+
+    /// Bind copied root metadata to this activation, never to a guessed local lane ordinal.
+    /// A local lane keeps its root binding and epoch fence until explicit unregistration.
+    pub fn begin_kernel_for_stack_pointer(
+        &mut self,
+        stack_pointer: u64,
+        expected_provider: ProviderDomainIdentity,
+        descriptor: KernelProviderActivationDescriptor,
+    ) -> Result<ProviderStackEventActivation, ProviderStackActivationError> {
+        let owner = descriptor
+            .validate(expected_provider)
+            .map_err(ProviderStackActivationError::InvalidKernelDescriptor)?;
+        let (binding, _) = self.resolve(stack_pointer, 1)?;
+        let lane = self.lane(binding.handle)?;
+        if let Some(previous) = lane.last_kernel_owner {
+            if !same_kernel_lane(previous, owner) {
+                return Err(ProviderStackActivationError::KernelBindingMismatch);
+            }
+            if owner.dispatch_id <= previous.dispatch_id {
+                return Err(ProviderStackActivationError::StaleKernelDispatch);
+            }
+        }
+        for (index, lane) in self.lanes.iter().enumerate().filter(|(_, lane)| lane.live) {
+            if index != binding.handle.slot as usize
+                && lane
+                    .last_kernel_owner
+                    .is_some_and(|previous| previous.caller == owner.caller)
+            {
+                return Err(ProviderStackActivationError::KernelLaneAlreadyBound);
+            }
+            if lane.activations.iter().any(|record| {
+                record
+                    .owner
+                    .is_some_and(|active| active.caller == owner.caller)
+            }) {
+                return Err(ProviderStackActivationError::KernelDispatchActive);
+            }
+        }
+        self.begin_with_owner(binding.handle, owner.dispatch_id, Some(owner))
+    }
+
+    fn begin_with_owner(
+        &mut self,
+        handle: ProviderStackLaneHandle,
+        dispatch_id: u64,
+        owner: Option<ProviderWaitOwner>,
+    ) -> Result<ProviderStackEventActivation, ProviderStackActivationError> {
         if dispatch_id == 0 {
             return Err(ProviderStackActivationError::InvalidDispatch);
         }
@@ -265,7 +326,11 @@ impl ProviderStackActivationCatalog {
         lane.activations.push(ProviderStackActivationRecord {
             identity: activation,
             irql: IrqlState::new(),
+            owner,
         });
+        if let Some(owner) = owner {
+            lane.last_kernel_owner = Some(owner);
+        }
         Ok(activation)
     }
 
@@ -285,6 +350,14 @@ impl ProviderStackActivationCatalog {
         activation: ProviderStackEventActivation,
     ) -> Result<u8, ProviderStackActivationError> {
         Ok(self.activation(activation)?.irql.current())
+    }
+
+    /// An unbound nested activation cannot borrow the suspended outer caller's authority.
+    pub fn owner(
+        &self,
+        activation: ProviderStackEventActivation,
+    ) -> Result<Option<ProviderWaitOwner>, ProviderStackActivationError> {
+        Ok(self.activation(activation)?.owner)
     }
 
     pub fn raise_irql(
@@ -399,6 +472,16 @@ impl ProviderStackActivationCatalog {
             .ok_or(ProviderStackActivationError::StaleLane)
     }
 }
+
+fn same_kernel_lane(left: ProviderWaitOwner, right: ProviderWaitOwner) -> bool {
+    left.provider_domain == right.provider_domain
+        && left.provider_generation == right.provider_generation
+        && left.caller == right.caller
+}
+
+#[cfg(test)]
+#[path = "stack_activation_owner_tests.rs"]
+mod owner_tests;
 
 #[cfg(test)]
 #[path = "stack_activation_irql_tests.rs"]

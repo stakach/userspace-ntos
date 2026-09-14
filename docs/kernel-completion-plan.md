@@ -34459,6 +34459,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         No VM, native kernel wait or desktop acceptance is claimed; the last measured 27 strict
         win32k imports remain open. Review also recorded the pre-existing native provider APC
         admission gap below rather than claiming full alertable wait semantics from poll tests.
+      - [x] Publish the retained kernel activation before component DriverEntry
+        (2026-09-14; host/composed/native-build verified below).
+        Replace the local u64::MAX dispatch sentinel with a synchronous activation handoff.
+        The component TCB may start before root capture, but blocks before DriverEntry until
+        the executive validates the retained canonical caller, provider domain, physical channel,
+        Running lane and exact dispatch epoch. Require an exact zero-word/no-cap request,
+        unbadged sender and the channel's actual Reply object. Failed requests cannot mutate
+        the shared descriptor. The component checks the exact status-only reply and copies a
+        strictly versioned 64-byte descriptor into its stack activation, independently of any
+        callback header. This descriptor is metadata, never authority for root admission.
+        Provider wait ABI v3 includes the separate activation field; root initializes the whole
+        typed page before publishing it. Local lane ordinals remain distinct from executive
+        LaneHandle/epoch. Pin the explicit mapping and highest admitted epoch until local lane
+        unregistration; reject replay, rebinding and duplicate physical-lane aliases without
+        changing the replay fence on failed admission. Preserve exact-top ownership with IRQL;
+        an unbound nested activation cannot inherit the suspended kernel owner's authority.
+        Kernel owner lookup no longer falls through to hosted callback claims. Existing kernel
+        wait rejection remains before wait-ID allocation and shared request publication. Keep
+        the owner through Event retirement IPC and successful activation finish. Reuse retained
+        root authentication for kernel Ps calls; do not treat descriptor possession as a token.
+        The single shared descriptor is limited to the current serialized DriverEntry consumer.
+        Concurrent kernel jobs require lane-private publication or fully correlated handoff
+        storage before enablement; no concurrent kernel admission or wait-resume proof is claimed.
+        Serialized host runs pass 1,050 tests across 16 suites with no failures or ignored cases:
+        .tmp/test-kernel-activation-publication-core-20260914.log (409) and
+        .tmp/test-kernel-activation-publication-host-20260914.log (641). Six new descriptor/stack
+        tests cover strict layout and malformed fields, foreign providers, root/local lane
+        separation, nested owner/IRQL restoration, duplicate lanes, stale generations/epochs and
+        capacity rollback. Two production composition tests use real ProcessManager references,
+        KernelProviderActivations and ComponentSuspensionLanes to exercise capture/publication,
+        stack return, root completion, release and next-dispatch rejection. A descriptor remains
+        parseable after release but cannot authorize root execution. These are host composition
+        tests, not native IPC or scheduling proof. Independent native and core reviews found no
+        blocker within this scope; the shared page remains 1,784 bytes within its existing 4 KiB
+        mapping. Existing local activation nonce consumption on capacity failure is unchanged;
+        the new root binding/epoch fence is only committed after successful admission.
+        Serialized native release builds pass: executive in 38.33s with the unchanged 294
+        warnings and standalone I/O Manager without warnings. Evidence:
+        .tmp/build-kernel-activation-publication-executive-20260914.log and
+        .tmp/build-kernel-activation-publication-io-manager-20260914.log. Scoped formatting and
+        diff checks pass. The DriverEntry sentinel is removed, not retained as a fallback.
+        No VM or desktop acceptance is claimed; the last measured 27 strict win32k imports
+        remain open. Review refined the typed terminal, suspended validation and bootstrap
+        completion ownership prerequisites below before native kernel wait admission.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -34474,11 +34518,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         suspension variant, infer a caller kind from failed lookup, or manufacture a hosted
         client for a kernel caller.
         DriverEntry now retains canonical process/thread references and a root-side lane activation
-        as described above. Publish/capture that exact activation in the component independently of
-        callback headers, and preserve a typed kernel return continuation across repark/teardown.
-        Component stack-activation ordinals and DriverEntry's existing u64::MAX local sentinel are
-        not the executive LaneDispatchIdentity; publish an explicit authenticated mapping, never
-        reinterpret one as the other. Native kernel wait admission remains disabled. Complete
+        as described above. Component publication now uses the explicit mapping checkpoint above,
+        independently of callback headers; preserve a typed kernel return continuation across
+        repark/teardown next. Local stack ordinals must never be reinterpreted as executive lane
+        identities. Native kernel wait admission remains disabled. Complete
+        the native return types without making hosted-client fields optional placeholders:
+        PendingProviderWaitDispatch currently requires hosted client/callback contexts, and
+        component_terminal delivers CompletedWin32kDispatch to a hosted syscall reply. A kernel
+        terminal recipient must preserve its real initiating caller and return contract instead.
+        DriverEntry readiness currently depends on synchronous component_pump completion; retain
+        that completion ownership across any asynchronous park. Separate retained-lifetime
+        eligibility from execution admission: KernelProviderActivations::validate requires Running
+        and cannot be used unchanged to select a Suspended job before begin_resume. Preserve exact
+        epoch, binding and canonical Ps references in both checks. Complete
         terminal/cancellation cleanup for retained activation rows after walls/uncertain replies;
         when provider/catalog retirement is wired, its quiescence checks must include these rows
         even if the physical lane is idle. There is currently no native catalog retirement caller;

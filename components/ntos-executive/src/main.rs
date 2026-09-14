@@ -29854,13 +29854,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let provider_wait_identity = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_DOMAINS))
                 .register()
                 .expect("win32k provider-domain allocation failed");
+            let mut provider_wait_page = nt_provider_wait::ProviderWaitSharedPage::empty();
+            provider_wait_page.control =
+                nt_provider_wait::ProviderWaitSharedControl::published(provider_wait_identity);
             core::ptr::write_volatile(
-                core::ptr::addr_of_mut!(
-                    (*(win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-                        as *mut nt_provider_wait::ProviderWaitSharedPage))
-                    .control
-                ),
-                nt_provider_wait::ProviderWaitSharedControl::published(provider_wait_identity),
+                win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
+                    as *mut nt_provider_wait::ProviderWaitSharedPage,
+                provider_wait_page,
             );
             WIN32K_PROVIDER_DOMAIN.store(provider_wait_identity.domain, Ordering::Release);
             WIN32K_PROVIDER_GENERATION
@@ -30252,8 +30252,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             //     every later dispatch answers), not parked in a bare `Recv`;
             //   * its demand-page faults are Calls too, and answering them through `reply_to`
             //     instead of `R_win32k` is precisely the clobber this migration removes.
-            // `RecvFirst`: the component is mid-DriverEntry — a blocked SENDER (fault Call) or about
-            // to issue its ready Call — so the pump starts by RECEIVING, exactly as the old loop did.
+            // `RecvFirst`: startup faults and the activation handoff are Calls. DriverEntry cannot
+            // begin until this pump publishes its retained kernel caller through that handoff.
             let code_va = win32k_subsystem::WIN32K_CODE_VA;
             let mut init_ch = spawn_hosts::PumpChannel {
                 fault_ep: w_fault,

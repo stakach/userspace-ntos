@@ -21,6 +21,56 @@ fn kernel_channel(channel: &spawn_hosts::PumpChannel) -> bool {
         && channel.caps.kind == spawn_hosts::ReqKind::Syscall
 }
 
+fn authenticated_channel_caller(
+    channel: &spawn_hosts::PumpChannel,
+) -> Result<KernelProviderCaller, u32> {
+    let caller = channel
+        .kernel_caller
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    if !kernel_channel(channel)
+        || channel.shared_va != win32k_subsystem::WIN32K_SHARED_VADDR
+        || channel.dispatch_label != win32k_subsystem::W32_DISPATCH_LABEL
+        || caller.binding() != channel_binding(channel)
+        || current_win32k_provider_domain().is_none_or(|provider| {
+            caller.owner().provider_domain != provider.domain
+                || caller.owner().provider_generation != provider.generation
+        })
+    {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    Ok(caller)
+}
+
+/// The component blocks in this request before DriverEntry. Capture may occur after its TCB was
+/// started, but the reply cannot publish an owner until the root has retained the real activation.
+pub(crate) unsafe fn publish(channel: &spawn_hosts::PumpChannel) -> u32 {
+    let descriptor = (|| {
+        let caller = authenticated_channel_caller(channel)?;
+        with_provider_process_manager(|pm| {
+            (&*core::ptr::addr_of!(ACTIVATIONS)).validate(
+                caller,
+                pm,
+                &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+                &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
+            )?;
+            nt_provider_wait::KernelProviderActivationDescriptor::new(caller.owner())
+                .map_err(|_| nt_process::STATUS_INVALID_PARAMETER)
+        })
+    })();
+    match descriptor {
+        Ok(descriptor) => {
+            let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
+                as *mut nt_provider_wait::ProviderWaitSharedPage;
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*page).kernel_activation),
+                descriptor,
+            );
+            nt_process::STATUS_SUCCESS
+        }
+        Err(status) => status,
+    }
+}
+
 /// DriverEntry is the first native consumer. Its bootstrap designation is authenticated before
 /// capturing a general kernel activation; subsequent uses require the retained row, not System.
 pub(crate) unsafe fn capture_win32k_initial_system(
@@ -60,14 +110,7 @@ pub(super) unsafe fn service_ps(
     object: u64,
     value: u64,
 ) -> (i32, u64, u64, u64) {
-    if !kernel_channel(channel)
-        || channel.kernel_caller != Some(caller)
-        || caller.binding() != channel_binding(channel)
-        || current_win32k_provider_domain().is_none_or(|provider| {
-            caller.owner().provider_domain != provider.domain
-                || caller.owner().provider_generation != provider.generation
-        })
-    {
+    if authenticated_channel_caller(channel) != Ok(caller) {
         return (nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0);
     }
     match with_provider_process_manager(|pm| {

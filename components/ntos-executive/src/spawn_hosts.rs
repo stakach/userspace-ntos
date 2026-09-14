@@ -1480,6 +1480,8 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
             && ch.caps.kind == ReqKind::Syscall)
         || (label == crate::win32k_subsystem::W32_EVENT_LABEL && ch.caps.kind == ReqKind::Syscall)
         || (label == crate::win32k_subsystem::W32_PS_LABEL && ch.caps.kind == ReqKind::Syscall)
+        || (label == crate::win32k_subsystem::W32_KERNEL_ACTIVATION_LABEL
+            && ch.caps.kind == ReqKind::Syscall)
         || (label == crate::win32k_subsystem::W32_ATOM_LABEL
             && ch.caps.kind == ReqKind::Syscall)
         || (label == crate::win32k_subsystem::W32_MM_SECURE_LABEL
@@ -2491,6 +2493,19 @@ unsafe fn component_pump_loop(
                 out2,
                 out3
             );
+            continue;
+        } else if label == crate::win32k_subsystem::W32_KERNEL_ACTIVATION_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let status = if msg.badge == 0
+                && *reply_cap == ch.reply_cap
+                && msg.mi == crate::win32k_subsystem::W32_KERNEL_ACTIVATION_LABEL << 12
+            {
+                crate::service_sec_image::kernel_provider_activation::publish(ch)
+            } else {
+                nt_process::STATUS_INVALID_PARAMETER
+            };
+            pump_reply_recv_into!(ch, *reply_cap, msg, REQUEST_TAG_LEN, status as u64);
             continue;
         } else if label == crate::win32k_subsystem::W32_PS_LABEL
             && ch.caps.kind == ReqKind::Syscall

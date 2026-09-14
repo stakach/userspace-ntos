@@ -1,6 +1,10 @@
 use super::*;
 use crate::ps_bootstrap::PsBootstrapState;
 use nt_process::ThreadState;
+use nt_provider_wait::{
+    KernelProviderActivationDescriptor, ProviderStackActivationCatalog,
+    ProviderStackActivationError,
+};
 use nt_types::AccessMode;
 
 type Lanes = ComponentSuspensionLanes<u64, i32>;
@@ -487,4 +491,166 @@ fn activation_counter_rejects_invalid_and_exhausted_values_without_wrapping() {
         Err(STATUS_INSUFFICIENT_RESOURCES)
     );
     assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+}
+
+#[test]
+fn root_descriptor_publication_preserves_identity_and_nested_local_irql_isolation() {
+    let mut parts = bootstrap().into_parts();
+    let native = requestor(&mut parts.pm, 0x3000);
+    let mut domains = ProviderDomainCatalog::new();
+    let provider = domains.register().unwrap();
+    let mut lanes = Lanes::new(2, 4);
+    let _idle_lane = lanes.allocate(binding(1)).unwrap();
+    let root_lane = lanes.allocate(binding(2)).unwrap();
+    let reply = binding(2).reply_object;
+    lanes.begin_dispatch(root_lane, reply).unwrap();
+    let mut activations = KernelProviderActivations::new();
+    let caller = activations
+        .capture(&mut parts.pm, &domains, &lanes, provider, root_lane, native)
+        .unwrap();
+    let descriptor = KernelProviderActivationDescriptor::new(caller.owner()).unwrap();
+    assert_eq!(descriptor.validate(provider), Ok(caller.owner()));
+    assert_eq!(
+        activations.validate(caller, &parts.pm, &domains, &lanes),
+        Ok(())
+    );
+
+    let mut stacks = ProviderStackActivationCatalog::new(1, 4).unwrap();
+    let local_lane = stacks.register_lane(91, 0x8000, 0x1000).unwrap();
+    assert_ne!(local_lane.slot(), root_lane.index);
+    let outer = stacks
+        .begin_kernel_for_stack_pointer(0x8800, provider, descriptor)
+        .unwrap();
+    assert_eq!(outer.lane, local_lane);
+    assert_eq!(outer.lane_id, 91);
+    assert_eq!(outer.dispatch_id, caller.owner().dispatch_id);
+    assert_eq!(stacks.owner(outer), Ok(Some(caller.owner())));
+    assert_eq!(
+        stacks.raise_irql(outer, nt_kernel_exec::DISPATCH_LEVEL),
+        Ok(0)
+    );
+
+    // This is local activation composition, not an invocation of native provider or IPC code.
+    let nested = stacks.begin_for_stack_pointer(0x8700, 17).unwrap();
+    assert_eq!(stacks.owner(nested), Ok(None));
+    assert_eq!(
+        stacks.current_irql(nested),
+        Ok(nt_kernel_exec::PASSIVE_LEVEL)
+    );
+    assert_eq!(
+        stacks.owner(outer),
+        Err(ProviderStackActivationError::NotTop)
+    );
+    stacks
+        .raise_irql(nested, nt_kernel_exec::APC_LEVEL)
+        .unwrap();
+    assert_eq!(stacks.current_irql(nested), Ok(nt_kernel_exec::APC_LEVEL));
+    stacks
+        .lower_irql(nested, nt_kernel_exec::PASSIVE_LEVEL)
+        .unwrap();
+    stacks.finish(nested).unwrap();
+    assert_eq!(stacks.active(local_lane), Ok(outer));
+    assert_eq!(stacks.owner(outer), Ok(Some(caller.owner())));
+    assert_eq!(
+        stacks.current_irql(outer),
+        Ok(nt_kernel_exec::DISPATCH_LEVEL)
+    );
+    assert_eq!(references(&parts.pm, caller.thread()), (1, 1));
+    stacks
+        .lower_irql(outer, nt_kernel_exec::PASSIVE_LEVEL)
+        .unwrap();
+    stacks.finish(outer).unwrap();
+    assert_eq!(
+        stacks.owner(outer),
+        Err(ProviderStackActivationError::NotTop)
+    );
+    assert_eq!(
+        activations.validate(caller, &parts.pm, &domains, &lanes),
+        Ok(())
+    );
+    lanes.finish_dispatch(root_lane, reply).unwrap();
+    assert_eq!(
+        activations.validate(caller, &parts.pm, &domains, &lanes),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    activations.release(caller, &mut parts.pm).unwrap();
+    assert_eq!(references(&parts.pm, caller.thread()), (0, 0));
+    assert_eq!(descriptor.validate(provider), Ok(caller.owner()));
+    assert_eq!(
+        activations.validate(caller, &parts.pm, &domains, &lanes),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    stacks.unregister_lane(local_lane).unwrap();
+}
+
+#[test]
+fn parseable_old_descriptor_cannot_authorize_a_new_root_job_or_released_capture() {
+    let mut parts = bootstrap().into_parts();
+    let native = requestor(&mut parts.pm, 0x3000);
+    let mut domains = ProviderDomainCatalog::new();
+    let provider = domains.register().unwrap();
+    let mut lanes = Lanes::new(1, 4);
+    let root_lane = lanes.allocate(binding(1)).unwrap();
+    let reply = binding(1).reply_object;
+    let mut activations = KernelProviderActivations::new();
+    let mut stacks = ProviderStackActivationCatalog::new(1, 4).unwrap();
+    let local_lane = stacks.register_lane(73, 0x8000, 0x1000).unwrap();
+    lanes.begin_dispatch(root_lane, reply).unwrap();
+    let old = activations
+        .capture(&mut parts.pm, &domains, &lanes, provider, root_lane, native)
+        .unwrap();
+    let old_descriptor = KernelProviderActivationDescriptor::new(old.owner()).unwrap();
+    let first = stacks
+        .begin_kernel_for_stack_pointer(0x8800, provider, old_descriptor)
+        .unwrap();
+    stacks.finish(first).unwrap();
+    lanes.finish_dispatch(root_lane, reply).unwrap();
+    lanes.begin_dispatch(root_lane, reply).unwrap();
+    assert_eq!(old_descriptor.validate(provider), Ok(old.owner()));
+    assert_eq!(
+        activations.validate(old, &parts.pm, &domains, &lanes),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        stacks.begin_kernel_for_stack_pointer(0x8800, provider, old_descriptor),
+        Err(ProviderStackActivationError::StaleKernelDispatch)
+    );
+
+    let next = activations
+        .capture(&mut parts.pm, &domains, &lanes, provider, root_lane, native)
+        .unwrap();
+    let next_descriptor = KernelProviderActivationDescriptor::new(next.owner()).unwrap();
+    assert!(next_descriptor.dispatch_epoch > old_descriptor.dispatch_epoch);
+    assert_eq!(references(&parts.pm, next.thread()), (2, 2));
+    activations.release(old, &mut parts.pm).unwrap();
+    assert_eq!(references(&parts.pm, next.thread()), (1, 1));
+    assert_eq!(old_descriptor.validate(provider), Ok(old.owner()));
+    assert_eq!(
+        activations.validate(old, &parts.pm, &domains, &lanes),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        activations.validate(next, &parts.pm, &domains, &lanes),
+        Ok(())
+    );
+    let second = stacks
+        .begin_kernel_for_stack_pointer(0x8800, provider, next_descriptor)
+        .unwrap();
+    assert_eq!(stacks.owner(second), Ok(Some(next.owner())));
+    assert_eq!(second.lane, local_lane);
+    assert_eq!(second.lane_id, 73);
+    assert_ne!(second.generation, first.generation);
+    stacks.finish(second).unwrap();
+    lanes.finish_dispatch(root_lane, reply).unwrap();
+    activations.release(next, &mut parts.pm).unwrap();
+    assert_eq!(next_descriptor.validate(provider), Ok(next.owner()));
+    assert_eq!(
+        activations.validate(next, &parts.pm, &domains, &lanes),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(references(&parts.pm, next.thread()), (0, 0));
+    assert_eq!(
+        activations.retained_for_provider(domains.identity().unwrap(), provider),
+        0
+    );
 }
