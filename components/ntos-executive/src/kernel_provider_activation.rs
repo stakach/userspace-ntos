@@ -2,7 +2,9 @@
 
 use super::*;
 use nt_component_suspension::{LaneBinding, LaneHandle};
-use nt_user_host::provider_kernel_activation::{KernelProviderActivations, KernelProviderCaller};
+use nt_user_host::provider_kernel_activation::{
+    KernelProviderActivations, KernelProviderCaller, KernelProviderCompletionReceipt,
+};
 
 static mut ACTIVATIONS: KernelProviderActivations = KernelProviderActivations::new();
 
@@ -127,16 +129,44 @@ pub(super) unsafe fn service_ps(
     }
 }
 
-/// Only the observed completion sentinel may retire DriverEntry. A wall or uncertain reply keeps
-/// the row and both references; future terminal/cancellation wiring must retire those explicitly.
-pub(crate) unsafe fn release_completed(caller: KernelProviderCaller) -> Result<(), u32> {
-    let nt_component_suspension::SuspensionCaller::Kernel { lane } = caller.owner().caller else {
-        return Err(nt_process::STATUS_INVALID_PARAMETER);
-    };
-    if !component_execution_lane_is_idle(lane) {
+/// Capture the real initialization return before the shared page or physical lane is reused.
+/// A wall, scheduler yield or parked wait is not completion and retains the activation unchanged.
+pub(crate) unsafe fn record_driver_entry_return(
+    channel: &spawn_hosts::PumpChannel,
+    result: &spawn_hosts::PumpResult,
+) -> Result<KernelProviderCompletionReceipt, u32> {
+    let caller = authenticated_channel_caller(channel)?;
+    if !result.completed
+        || result.callback_suspended
+        || result.provider_wait_suspended
+        || result.lpc_wait_suspended
+        || result.scheduler_yielded
+        || result.reply_cap != channel.reply_cap
+    {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
+    let status = core::ptr::read_volatile(
+        (channel.shared_va + win32k_subsystem::SH_DE_STATUS) as *const u32,
+    );
+    let receipt = with_provider_process_manager(|pm| {
+        (&mut *core::ptr::addr_of_mut!(ACTIVATIONS)).record_completion(
+            caller,
+            pm,
+            &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+            &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS),
+            status,
+        )
+    })?;
+    crate::driver_launch::win32k_device_properties::retire_completed_transfers();
+    Ok(receipt)
+}
+
+/// Only the initiating kernel recipient acknowledges its retained result. The exact receipt and
+/// both Ps references survive a failed acknowledgment; shared bytes are never read again here.
+pub(crate) unsafe fn acknowledge_completion(
+    receipt: KernelProviderCompletionReceipt,
+) -> Result<u32, u32> {
     with_provider_process_manager(|pm| {
-        (&mut *core::ptr::addr_of_mut!(ACTIVATIONS)).release(caller, pm)
+        (&mut *core::ptr::addr_of_mut!(ACTIVATIONS)).acknowledge_completion(receipt, pm)
     })
 }

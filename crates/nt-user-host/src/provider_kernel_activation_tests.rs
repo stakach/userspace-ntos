@@ -1,5 +1,6 @@
 use super::*;
 use crate::ps_bootstrap::PsBootstrapState;
+use nt_component_suspension::{SuspensionKey, TerminalStage, TerminalStageOutcome};
 use nt_process::ThreadState;
 use nt_provider_wait::{
     KernelProviderActivationDescriptor, ProviderStackActivationCatalog,
@@ -653,4 +654,227 @@ fn parseable_old_descriptor_cannot_authorize_a_new_root_job_or_released_capture(
         activations.retained_for_provider(domains.identity().unwrap(), provider),
         0
     );
+}
+
+#[test]
+fn suspended_selected_cancelled_and_terminal_work_cannot_publish_a_return() {
+    for cancel in [false, true] {
+        let mut parts = bootstrap().into_parts();
+        let native = requestor(&mut parts.pm, 0x3000);
+        let mut domains = ProviderDomainCatalog::new();
+        let provider = domains.register().unwrap();
+        let mut lanes = Lanes::new(1, 4);
+        let lane = lanes.allocate(binding(1)).unwrap();
+        let reply = binding(1).reply_object;
+        lanes.begin_dispatch(lane, reply).unwrap();
+        let mut activations = KernelProviderActivations::new();
+        let caller = activations
+            .capture(&mut parts.pm, &domains, &lanes, provider, lane, native)
+            .unwrap();
+        assert!(activations.completion(caller).is_err());
+        lanes.suspend_running(lane, reply, 70).unwrap();
+        assert_eq!(
+            activations.validate_retained(caller, &parts.pm, &domains, &lanes),
+            Ok(())
+        );
+        assert!(activations
+            .record_completion(caller, &parts.pm, &domains, &mut lanes, 0)
+            .is_err());
+        lanes.resume_external(lane, reply, 70).unwrap();
+        let key = SuspensionKey::provider_wait(71);
+        lanes
+            .admit_running(lane, reply, key, 1, caller.owner(), 500)
+            .unwrap();
+        assert_eq!(
+            activations.validate_retained(caller, &parts.pm, &domains, &lanes),
+            Ok(())
+        );
+        assert!(activations
+            .record_completion(caller, &parts.pm, &domains, &mut lanes, 0)
+            .is_err());
+        lanes.select(key, 0).unwrap();
+        assert!(activations
+            .record_completion(caller, &parts.pm, &domains, &mut lanes, 0)
+            .is_err());
+        if cancel {
+            lanes.cancel(key, 0xc000_0120u32 as i32).unwrap();
+            assert!(activations
+                .record_completion(caller, &parts.pm, &domains, &mut lanes, 0)
+                .is_err());
+        }
+        lanes.begin_resume(lane, reply, key).unwrap();
+        assert!(activations
+            .record_completion(caller, &parts.pm, &domains, &mut lanes, 0)
+            .is_err());
+        let terminal = lanes
+            .retain_terminal_running(lane, reply, key, caller.owner(), ())
+            .unwrap();
+        assert!(activations
+            .record_completion(caller, &parts.pm, &domains, &mut lanes, 0)
+            .is_err());
+        assert!(activations.completion(caller).is_err());
+        assert_eq!(references(&parts.pm, caller.thread()), (1, 1));
+        for stage in [
+            TerminalStage::Output,
+            TerminalStage::Context,
+            TerminalStage::Publication,
+            TerminalStage::Reply,
+        ] {
+            let mut attempt = lanes.begin_terminal_stage(terminal, reply, stage).unwrap();
+            lanes
+                .record_terminal_stage(&mut attempt, reply, TerminalStageOutcome::Acknowledged)
+                .unwrap();
+        }
+        lanes
+            .finish_terminal(terminal, reply, Ok(()))
+            .unwrap()
+            .unwrap();
+        lanes.resume_external(lane, reply, 70).unwrap();
+        lanes.retire_external_running(lane, reply, 70).unwrap();
+        let receipt = activations
+            .record_completion(caller, &parts.pm, &domains, &mut lanes, 0xc000_0001)
+            .unwrap();
+        assert_eq!(receipt.caller(), caller);
+        assert_eq!(receipt.status(), 0xc000_0001);
+        assert_eq!(lanes.phase(lane), Ok(LanePhase::Idle));
+        assert_eq!(lanes.active_dispatch_identity(lane), Ok(None));
+        assert_eq!(activations.completion(caller), Ok(receipt));
+        assert_eq!(references(&parts.pm, caller.thread()), (1, 1));
+        assert!(activations.release(caller, &mut parts.pm).is_err());
+        assert_eq!(activations.completion(caller), Ok(receipt));
+        assert_eq!(
+            activations.acknowledge_completion(receipt, &mut parts.pm),
+            Ok(0xc000_0001)
+        );
+        assert_eq!(references(&parts.pm, caller.thread()), (0, 0));
+        assert!(activations.completion(caller).is_err());
+    }
+}
+
+#[test]
+fn caller_exit_allows_retained_return_and_failed_ack_survives_provider_retirement() {
+    let mut parts = bootstrap().into_parts();
+    let native = requestor(&mut parts.pm, 0x3000);
+    let mut foreign = bootstrap().into_parts();
+    let _foreign_native = requestor(&mut foreign.pm, 0x3000);
+    let mut domains = ProviderDomainCatalog::new();
+    let provider = domains.register().unwrap();
+    let mut lanes = Lanes::new(1, 4);
+    let lane = lanes.allocate(binding(1)).unwrap();
+    lanes.begin_dispatch(lane, binding(1).reply_object).unwrap();
+    let mut activations = KernelProviderActivations::new();
+    let caller = activations
+        .capture(&mut parts.pm, &domains, &lanes, provider, lane, native)
+        .unwrap();
+    parts
+        .pm
+        .terminate_thread(caller.thread().thread_id(), 0)
+        .unwrap();
+    assert_eq!(
+        activations.validate_retained(caller, &parts.pm, &domains, &lanes),
+        Ok(())
+    );
+    assert!(activations
+        .validate(caller, &parts.pm, &domains, &lanes)
+        .is_err());
+    assert!(activations
+        .validate_retained(caller, &foreign.pm, &domains, &lanes)
+        .is_err());
+    let receipt = activations
+        .record_completion(caller, &parts.pm, &domains, &mut lanes, 0)
+        .unwrap();
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::Idle));
+    assert!(!parts.pm.can_reclaim_thread(caller.thread().thread_id()));
+    assert!(activations
+        .acknowledge_completion(receipt, &mut foreign.pm)
+        .is_err());
+    assert_eq!(activations.completion(caller), Ok(receipt));
+    assert_eq!(references(&parts.pm, caller.thread()), (1, 1));
+    let foreign_thread = foreign
+        .pm
+        .thread_lifetime(caller.thread().thread_id())
+        .unwrap();
+    assert_eq!(references(&foreign.pm, foreign_thread), (0, 0));
+    domains.retire(provider, 0).unwrap();
+    assert_eq!(
+        activations.acknowledge_completion(receipt, &mut parts.pm),
+        Ok(0)
+    );
+    assert!(parts.pm.can_reclaim_thread(caller.thread().thread_id()));
+    assert_eq!(references(&parts.pm, caller.thread()), (0, 0));
+    assert!(activations
+        .acknowledge_completion(receipt, &mut parts.pm)
+        .is_err());
+}
+
+#[test]
+fn completion_receipts_cannot_retire_foreign_tables_or_a_later_job() {
+    let mut parts = bootstrap().into_parts();
+    let native = requestor(&mut parts.pm, 0x3000);
+    let mut domains = ProviderDomainCatalog::new();
+    let provider = domains.register().unwrap();
+    let mut lanes = Lanes::new(1, 4);
+    let lane = lanes.allocate(binding(1)).unwrap();
+    let reply = binding(1).reply_object;
+    lanes.begin_dispatch(lane, reply).unwrap();
+    let mut activations = KernelProviderActivations::new();
+    let mut foreign_table = KernelProviderActivations::new();
+    let old = activations
+        .capture(&mut parts.pm, &domains, &lanes, provider, lane, native)
+        .unwrap();
+    let foreign = foreign_table
+        .capture(&mut parts.pm, &domains, &lanes, provider, lane, native)
+        .unwrap();
+    let receipt = activations
+        .record_completion(old, &parts.pm, &domains, &mut lanes, 0x4000_0001)
+        .unwrap();
+    let mut wrong_status = receipt;
+    wrong_status.status = 0;
+    assert!(activations
+        .acknowledge_completion(wrong_status, &mut parts.pm)
+        .is_err());
+    assert_eq!(activations.completion(old), Ok(receipt));
+    assert!(foreign_table
+        .acknowledge_completion(receipt, &mut parts.pm)
+        .is_err());
+    assert_eq!(references(&parts.pm, old.thread()), (2, 2));
+    foreign_table.release(foreign, &mut parts.pm).unwrap();
+    lanes.begin_dispatch(lane, reply).unwrap();
+    let next = activations
+        .capture(&mut parts.pm, &domains, &lanes, provider, lane, native)
+        .unwrap();
+    assert_ne!(next.owner().dispatch_id, old.owner().dispatch_id);
+    assert!(activations
+        .record_completion(old, &parts.pm, &domains, &mut lanes, 0)
+        .is_err());
+    assert_eq!(
+        activations.validate(next, &parts.pm, &domains, &lanes),
+        Ok(())
+    );
+    assert_eq!(activations.completion(old), Ok(receipt));
+    assert_eq!(
+        activations.acknowledge_completion(receipt, &mut parts.pm),
+        Ok(0x4000_0001)
+    );
+    assert!(activations
+        .acknowledge_completion(receipt, &mut parts.pm)
+        .is_err());
+    assert_eq!(references(&parts.pm, next.thread()), (1, 1));
+    assert_eq!(
+        activations.validate(next, &parts.pm, &domains, &lanes),
+        Ok(())
+    );
+    let next_receipt = activations
+        .record_completion(next, &parts.pm, &domains, &mut lanes, 0)
+        .unwrap();
+    assert!(activations
+        .acknowledge_completion(receipt, &mut parts.pm)
+        .is_err());
+    assert_eq!(activations.completion(next), Ok(next_receipt));
+    assert_eq!(references(&parts.pm, next.thread()), (1, 1));
+    assert_eq!(
+        activations.acknowledge_completion(next_receipt, &mut parts.pm),
+        Ok(0)
+    );
+    assert_eq!(references(&parts.pm, next.thread()), (0, 0));
 }

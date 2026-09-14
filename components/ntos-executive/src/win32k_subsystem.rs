@@ -807,7 +807,6 @@ unsafe fn registered_win32k_provider_argc(ssn: u64) -> Option<u64> {
 
 // verdict bits
 pub const V_ENTERED: u32 = 1; // host called into DriverEntry
-pub const V_SUCCESS: u32 = 4; // DriverEntry returned STATUS_SUCCESS
 pub const V_SSDT: u32 = 8; // KeAddSystemServiceTable recorded the win32k table
 pub const V_CALLOUT_ENTERED: u32 = 0x80; // invoked win32k's process-create callout
 pub const V_CALLOUT_RETURNED: u32 = 0x100; // process-create callout returned (did not fault)
@@ -15416,7 +15415,7 @@ pub unsafe extern "C" fn win32k_dispatch_lane_entry(lane_ordinal: u64) -> ! {
 /// record registered service-table routing. GUI process/thread callouts belong to subsequent
 /// authenticated client dispatches, not provider initialization.
 unsafe fn win32k_post_driver_entry(status: i32, drv: u64) {
-    if status == 0 {
+    if status >= 0 {
         WIN32K_DRIVER_OBJECT.store(drv, Ordering::Release);
     }
     let driver_activation =
@@ -15442,7 +15441,7 @@ unsafe fn win32k_post_driver_entry(status: i32, drv: u64) {
     print_hex(v);
     print_str(b"\n");
 
-    if status == 0 {
+    if status >= 0 {
         record_registered_ntuser_handler();
     }
 }

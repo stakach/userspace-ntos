@@ -164,9 +164,9 @@ impl NativeThreadProcessReference {
         }
     }
 
-    /// No caller/runtime liveness is required after capture. Both identities and release floors
-    /// are checked before either count changes; a failed release retains the complete pair.
-    pub fn release(&mut self, pm: &mut ProcessManager) -> Result<(), u32> {
+    /// Validate retained ownership without authorizing execution or requiring caller liveness.
+    /// Both identities and reference floors are checked without changing either count.
+    pub fn validate(&self, pm: &ProcessManager) -> Result<(), u32> {
         self.process.validate(pm)?;
         self.thread.validate(pm)?;
         let lifetime = self.thread_lifetime();
@@ -190,11 +190,21 @@ impl NativeThreadProcessReference {
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
+        Ok(())
+    }
+
+    /// No caller/runtime liveness is required after capture. Both identities and release floors
+    /// are checked before either count changes; a failed release retains the complete pair.
+    pub fn release(&mut self, pm: &mut ProcessManager) -> Result<(), u32> {
+        self.validate(pm)?;
+        let lifetime = self.thread_lifetime();
+        let pid = lifetime.process_id();
+        let tid = lifetime.thread_id();
         pm.processes
             .get_mut(&pid)
             .unwrap()
-            .kernel_pointer_references = process_count - 1;
-        pm.threads.get_mut(&tid).unwrap().kernel_pointer_references = thread_count - 1;
+            .kernel_pointer_references -= 1;
+        pm.threads.get_mut(&tid).unwrap().kernel_pointer_references -= 1;
         self.process.held = false;
         self.thread.held = false;
         Ok(())

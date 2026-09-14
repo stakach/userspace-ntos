@@ -34503,6 +34503,55 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         No VM or desktop acceptance is claimed; the last measured 27 strict win32k imports
         remain open. Review refined the typed terminal, suspended validation and bootstrap
         completion ownership prerequisites below before native kernel wait admission.
+      - [x] Retain kernel completion receipts and separate lifetime from execution authorization
+        (2026-09-14; host/composed/native-build verified below).
+        Factor a read-only NativeThreadProcessReference validation from its atomic release
+        preflight. Check both original manager designations, held references, canonical bodies,
+        thread incarnation and count floors without requiring a live caller. Kernel activation
+        retained validation checks the exact nonce-bearing row, live provider/catalog, physical
+        binding and active epoch in Running or Suspended state. Execution validation additionally
+        requires Running and the original live native caller; retained ownership is not permission
+        to resume an exited thread. Provider retirement still prevents new execution, while exact
+        reference/result cleanup remains possible independently of provider and caller liveness.
+        Store an observed u32 NTSTATUS in the existing activation row and return a private-field,
+        exact-caller completion receipt. Recording requires a real adapter-observed provider return
+        and successful finish_dispatch on the exact physical job; active suspension/terminal frames
+        prevent publication. No waiter, cancellation, timeout or wall is converted into completion.
+        The result and both Ps references remain retained after the lane becomes Idle. Exact ACK
+        releases both references before removing the row; failed ACK preserves the entire result
+        and pair for retry. Ordinary release rejects completed rows rather than discarding an
+        unacknowledged result. Receipts remain routing metadata, not independently owned references.
+        Wire the direct DriverEntry return as the first native recipient. Require the authenticated
+        channel, actual completed pump result, unchanged Reply object and no suspended/yield flags;
+        copy SH_DE_STATUS before channel/shared-page reuse. The initiating boot path accepts and
+        acknowledges that receipt before publishing readiness. Failed DriverEntry returns retire
+        their result but cannot initialize secondary lanes or receive client/fault-probe dispatches.
+        Readiness and the success check now use the acknowledged NT_SUCCESS result, not shared
+        verdict bytes. Provider post-entry publication also accepts informational success statuses.
+        Remove the old separate finish/release_completed path and win32k-only V_SUCCESS gate.
+        Preserve completed device-property transfer retirement after the atomic lane/result update,
+        with all ProcessManager, activation-table and lane borrows released before that cleanup.
+        This is the direct-return recipient checkpoint, not native kernel wait/terminal delivery.
+        Integrate the existing suspension terminal stages with this recipient before enabling
+        kernel waits; do not bypass live frames to call the direct-return completion API.
+        Serialized host tests pass 1,059 cases across 16 suites, with no failures or ignored cases:
+        .tmp/test-kernel-completion-receipts-20260914.log (nt-process, nt-user-host,
+        nt-component-suspension and nt-provider-wait). Reference-pair regressions now exercise
+        read-only validation, wrong manager/body/floors, caller exit, manager move and bootstrap
+        root release. Three new kernel lifecycle tests cover suspended/selected/cancelled/resuming
+        and terminal refusal, real completion after frame retirement, retained error/informational
+        statuses, foreign/altered/double/stale receipts, ACK retry after provider retirement, and
+        a subsequent job on the same physical lane. Both Ps references remain pinned until exact
+        ACK. Independent core/native reviews found no blocker after preserving the replaced
+        wrapper's successful-only device-property cleanup. Tests compose the real host ownership
+        machinery; they do not execute native IPC or prove kernel wait scheduling.
+        Serialized native release builds pass: executive in 38.77s with the unchanged 294 warnings
+        and standalone I/O Manager without warnings. Evidence:
+        .tmp/build-kernel-completion-receipts-executive-20260914.log and
+        .tmp/build-kernel-completion-receipts-io-manager-20260914.log. Scoped formatting and diff
+        checks pass. No VM/desktop acceptance is claimed; the last measured 27 strict win32k imports
+        remain open. Review kept native suspended-return delivery and asynchronous bootstrap
+        completion ownership open below rather than claiming this direct-return receipt enables waits.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -34526,11 +34575,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         PendingProviderWaitDispatch currently requires hosted client/callback contexts, and
         component_terminal delivers CompletedWin32kDispatch to a hosted syscall reply. A kernel
         terminal recipient must preserve its real initiating caller and return contract instead.
-        DriverEntry readiness currently depends on synchronous component_pump completion; retain
-        that completion ownership across any asynchronous park. Separate retained-lifetime
-        eligibility from execution admission: KernelProviderActivations::validate requires Running
-        and cannot be used unchanged to select a Suspended job before begin_resume. Preserve exact
-        epoch, binding and canonical Ps references in both checks. Complete
+        DriverEntry now consumes a retained direct-return receipt but still depends on synchronous
+        component_pump completion; retain that completion ownership across any asynchronous park.
+        Use the new retained-lifetime check for Suspended eligibility, followed by strict execution
+        authorization after begin_resume. An exited caller remains owned but cannot regain execution
+        through retained validation; implement its real cancellation/unwind contract explicitly.
+        Preserve exact epoch, binding and canonical Ps references in both checks. Complete
         terminal/cancellation cleanup for retained activation rows after walls/uncertain replies;
         when provider/catalog retirement is wired, its quiescence checks must include these rows
         even if the physical lane is idle. There is currently no native catalog retirement caller;

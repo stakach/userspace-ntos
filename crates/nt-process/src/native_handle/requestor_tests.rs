@@ -37,11 +37,14 @@ fn original_thread_and_process_are_retained_and_released_atomically() {
     assert_eq!(owner.process_body(), Some(0x3000));
     assert_eq!(owner.thread_body(), Some(0x4000));
     assert_eq!(counts(&pm, caller), (1, 1));
+    assert_eq!(owner.validate(&pm), Ok(()));
+    assert_eq!(counts(&pm, caller), (1, 1));
     owner.release(&mut pm).unwrap();
     assert_eq!(counts(&pm, caller), (0, 0));
     assert!(!owner.is_held());
     assert_eq!(owner.process_body(), None);
     assert_eq!(owner.thread_body(), None);
+    assert_eq!(owner.validate(&pm), Err(STATUS_INVALID_HANDLE));
     assert_eq!(owner.release(&mut pm), Err(STATUS_INVALID_HANDLE));
     assert_eq!(counts(&pm, caller), (0, 0));
 }
@@ -113,6 +116,7 @@ fn foreign_manager_and_user_mode_cannot_capture_or_release_pair() {
         STATUS_ACCESS_DENIED
     );
     let mut owner = pm.reference_native_requestor(caller).unwrap();
+    assert_eq!(owner.validate(&foreign), Err(STATUS_INVALID_HANDLE));
     assert_eq!(owner.release(&mut foreign), Err(STATUS_INVALID_HANDLE));
     assert!(owner.is_held());
     assert_eq!(counts(&pm, caller), (1, 1));
@@ -137,6 +141,7 @@ fn release_validates_both_bodies_before_changing_either_count() {
                 .unwrap()
                 .kernel_process_object = Some(0x9000);
         }
+        assert_eq!(owner.validate(&pm), Err(STATUS_INVALID_HANDLE));
         assert_eq!(owner.release(&mut pm), Err(STATUS_INVALID_HANDLE));
         assert_eq!(counts(&pm, caller), (1, 1));
         assert!(owner.is_held());
@@ -174,6 +179,8 @@ fn release_checks_both_floors_before_mutating_pair() {
                 .kernel_pointer_references = 0;
         }
         let before = counts(&pm, caller);
+        assert_eq!(owner.validate(&pm), Err(STATUS_INVALID_PARAMETER));
+        assert_eq!(counts(&pm, caller), before);
         assert_eq!(owner.release(&mut pm), Err(STATUS_INVALID_PARAMETER));
         assert_eq!(counts(&pm, caller), before);
         assert!(owner.is_held());
@@ -217,6 +224,7 @@ fn exited_thread_remains_releasable_but_cannot_reactivate_while_pair_held() {
     let mut owner = pm.reference_native_requestor(caller).unwrap();
     let tid = caller.original_thread().thread_id();
     pm.terminate_thread(tid, 0).unwrap();
+    assert_eq!(owner.validate(&pm), Ok(()));
     assert!(pm.reference_native_requestor(caller).is_err());
     assert!(!pm.can_reclaim_thread(tid));
     assert!(pm
@@ -245,8 +253,23 @@ fn pair_blocks_process_deletion_until_both_owners_return() {
     let mut owner = pm.reference_native_requestor(caller).unwrap();
     let pid = caller.original_thread().process_id();
     pm.terminate_process(pid, 0).unwrap();
+    assert_eq!(owner.validate(&pm), Ok(()));
     assert!(!pm.process_object_delete_ready(pid));
     assert!(pm.abort_process_creation(pid).is_none());
     owner.release(&mut pm).unwrap();
     assert!(pm.abort_process_creation(pid).is_some());
+}
+
+#[test]
+fn retained_pair_validation_survives_manager_move_and_bootstrap_root_release() {
+    let (mut pm, caller) = fixture();
+    let mut owner = pm.reference_native_requestor(caller).unwrap();
+    let identity = pm.initial_system_identity().unwrap();
+    pm.release_initial_system_references(identity).unwrap();
+    assert!(pm.validate_native_handle_caller(caller).is_err());
+    let mut moved = pm;
+    assert_eq!(owner.validate(&moved), Ok(()));
+    assert_eq!(counts(&moved, caller), (1, 1));
+    owner.release(&mut moved).unwrap();
+    assert_eq!(counts(&moved, caller), (0, 0));
 }

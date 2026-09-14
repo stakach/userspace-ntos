@@ -64,6 +64,25 @@ struct Activation {
     caller: KernelProviderCaller,
     native_caller: NativeHandleCaller,
     reference: NativeThreadProcessReference,
+    completion: Option<u32>,
+}
+
+/// Exact metadata for a retained, observed kernel return. Copying this receipt does not transfer
+/// ownership; only acknowledgment through the originating table can release the requestor pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelProviderCompletionReceipt {
+    caller: KernelProviderCaller,
+    status: u32,
+}
+
+impl KernelProviderCompletionReceipt {
+    pub const fn caller(self) -> KernelProviderCaller {
+        self.caller
+    }
+
+    pub const fn status(self) -> u32 {
+        self.status
+    }
 }
 
 /// Holds both original requestor objects through dispatch, parking and uncertain completion.
@@ -120,13 +139,14 @@ impl KernelProviderActivations {
             caller,
             native_caller,
             reference,
+            completion: None,
         });
         Ok(caller)
     }
 
-    /// Re-admit execution, not lifetime cleanup. A parked or completed lane cannot issue work;
-    /// a resumed exact job can. Never recapture the current thread to authenticate an older job.
-    pub fn validate<C, R, T>(
+    /// Validate an owned, unfinished job in either its running or suspended phase. Caller exit
+    /// does not discard its native stack or Ps references; this check never authorizes execution.
+    pub fn validate_retained<C, R, T>(
         &self,
         caller: KernelProviderCaller,
         pm: &ProcessManager,
@@ -139,16 +159,98 @@ impl KernelProviderActivations {
             .find(|row| row.caller == caller)
             .ok_or(STATUS_INVALID_HANDLE)?;
         let lane = caller.dispatch.lane();
-        if !row.reference.is_held()
+        row.reference.validate(pm)?;
+        if row.completion.is_some()
             || catalog.identity() != Some(caller.catalog)
             || !catalog.contains(caller.provider)
-            || lanes.phase(lane) != Ok(LanePhase::Running)
+            || !matches!(
+                lanes.phase(lane),
+                Ok(LanePhase::Running | LanePhase::Suspended)
+            )
             || lanes.active_dispatch_identity(lane) != Ok(Some(caller.dispatch))
             || lanes.binding(lane) != Ok(caller.binding)
         {
             return Err(STATUS_INVALID_HANDLE);
         }
+        Ok(())
+    }
+
+    /// Re-admit execution, not lifetime cleanup. A parked or completed lane cannot issue work;
+    /// a resumed exact job can. Never recapture the current thread to authenticate an older job.
+    pub fn validate<C, R, T>(
+        &self,
+        caller: KernelProviderCaller,
+        pm: &ProcessManager,
+        catalog: &ProviderDomainCatalog,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+    ) -> Result<(), u32> {
+        self.validate_retained(caller, pm, catalog, lanes)?;
+        if lanes.phase(caller.dispatch.lane()) != Ok(LanePhase::Running) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let row = self
+            .rows
+            .iter()
+            .find(|row| row.caller == caller)
+            .ok_or(STATUS_INVALID_HANDLE)?;
         pm.validate_native_handle_caller(row.native_caller)
+    }
+
+    /// Record only a genuine provider return observed by the authenticated native adapter.
+    /// Readiness, timeout, cancellation and a stopped pump are not evidence of return. Finish
+    /// the exact physical job before publishing its result; active frames prevent completion.
+    pub fn record_completion<C, R, T>(
+        &mut self,
+        caller: KernelProviderCaller,
+        pm: &ProcessManager,
+        catalog: &ProviderDomainCatalog,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        status: u32,
+    ) -> Result<KernelProviderCompletionReceipt, u32> {
+        self.validate_retained(caller, pm, catalog, lanes)?;
+        if lanes.phase(caller.dispatch.lane()) != Ok(LanePhase::Running) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let row = self
+            .rows
+            .iter_mut()
+            .find(|row| row.caller == caller)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        lanes
+            .finish_dispatch(caller.dispatch.lane(), caller.binding.reply_object)
+            .map_err(|_| STATUS_INVALID_HANDLE)?;
+        row.completion = Some(status);
+        Ok(KernelProviderCompletionReceipt { caller, status })
+    }
+
+    pub fn completion(
+        &self,
+        caller: KernelProviderCaller,
+    ) -> Result<KernelProviderCompletionReceipt, u32> {
+        let status = self
+            .rows
+            .iter()
+            .find(|row| row.caller == caller)
+            .and_then(|row| row.completion)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        Ok(KernelProviderCompletionReceipt { caller, status })
+    }
+
+    /// Acknowledge the exact retained result after delivery. No provider, dispatch or caller
+    /// liveness is required; failure preserves both the result and the complete reference pair.
+    pub fn acknowledge_completion(
+        &mut self,
+        receipt: KernelProviderCompletionReceipt,
+        pm: &mut ProcessManager,
+    ) -> Result<u32, u32> {
+        let index = self
+            .rows
+            .iter()
+            .position(|row| row.caller == receipt.caller && row.completion == Some(receipt.status))
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        self.rows[index].reference.release(pm)?;
+        self.rows.remove(index);
+        Ok(receipt.status)
     }
 
     /// Call only after native execution/reply ownership has ended or been safely cancelled. The
@@ -164,6 +266,9 @@ impl KernelProviderActivations {
             .iter()
             .position(|row| row.caller == caller)
             .ok_or(STATUS_INVALID_HANDLE)?;
+        if self.rows[index].completion.is_some() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
         self.rows[index].reference.release(pm)?;
         self.rows.remove(index);
         Ok(())

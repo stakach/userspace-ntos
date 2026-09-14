@@ -30329,17 +30329,23 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let finished = init_pr.completed;
             let (wall_ip, wall_addr, wall_label) =
                 (init_pr.wall_ip, init_pr.wall_addr, init_pr.wall_label);
+            let init_completion = if finished {
+                Some(service_sec_image::kernel_provider_activation::record_driver_entry_return(
+                    &init_ch, &init_pr,
+                ).expect("DriverEntry return must retain its exact kernel completion"))
+            } else {
+                None
+            };
+            let de_status = init_completion.map(|receipt| receipt.status() as i32);
+            if let Some(receipt) = init_completion {
+                service_sec_image::kernel_provider_activation::acknowledge_completion(receipt)
+                    .expect("accepted DriverEntry result must retire both caller references");
+            }
+            let initialized = de_status.is_some_and(|status| status >= 0);
 
-            // If DriverEntry+attach parked the component at the dispatch sentinel (`finished`), it is
-            // now blocked awaiting reply — record its fault EP + host PML4 so `win32k_dispatch` can
-            // drive its persistent service loop (Milestone B) from anywhere (the csrss loop, later).
-            if finished {
-                assert!(
-                    service_sec_image::finish_component_execution_lane(init_lane),
-                    "primary win32k initialization dispatch completion failed"
-                );
-                service_sec_image::kernel_provider_activation::release_completed(init_caller)
-                    .expect("completed DriverEntry caller references must retire together");
+            // Readiness follows an acknowledged successful initialization result, not merely a
+            // return to the component loop. A failed DriverEntry must not receive client dispatches.
+            if initialized {
                 WIN32K_FAULT_EP.store(w_fault, Ordering::Relaxed);
                 WIN32K_HOST_PML4.store(host_pml4, Ordering::Relaxed);
                 if !win32k_glue::initialize_win32k_physical_lane(host_pml4) {
@@ -30380,10 +30386,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_VERDICT)
                     as *const u32,
             );
-            let de_status = core::ptr::read_volatile(
-                (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_DE_STATUS)
-                    as *const i32,
-            );
             let ssdt_base = core::ptr::read_volatile(
                 (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SSDT_BASE)
                     as *const u64,
@@ -30401,7 +30403,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     as *const u64,
             );
             print_str(b"[win32k-svc] DriverEntry ");
-            if finished {
+            if let Some(de_status) = de_status {
                 print_str(b"RETURNED status=0x");
                 print_hex(de_status as u32);
             } else {
@@ -30551,20 +30553,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let progressed = (verdict & win32k_subsystem::V_ENTERED) != 0
                 && (verdict & win32k_subsystem::V_SSDT) != 0;
             check(b"win32k_gredriverentry_progressed", progressed, &mut passed);
-            // The milestone: win32k's DriverEntry ran to completion and returned STATUS_SUCCESS.
-            // V_SUCCESS is set right after DriverEntry returns 0, BEFORE the exploratory per-process
-            // callout/connect below — so a fault there doesn't flip this gate-critical check.
-            let success = (verdict & win32k_subsystem::V_SUCCESS) != 0;
-            if success {
-                print_str(b"[win32k-svc] DriverEntry ran to STATUS_SUCCESS\n");
+            // The receipt proves return and successful status, including informational NTSTATUS.
+            // Shared verdict bytes alone do not prove the kernel recipient accepted completion.
+            if initialized {
+                print_str(b"[win32k-svc] DriverEntry completion accepted successfully\n");
             }
-            check(b"win32k_driver_entry_success", success, &mut passed);
+            check(b"win32k_driver_entry_success", initialized, &mut passed);
 
             // The component is now parked at its persistent dispatch sentinel. Do not manufacture
             // an ownerless NtUserProcessConnect here: the first real CSRSS call supplies the native
             // process generation and handle table. Keep only the provider-fault transport proof,
             // which intentionally requires no GUI-client context.
-            if finished {
+            if initialized {
                 // --- Fix (B): prove a win32k dispatch whose handler FAULTS is resolved through the
                 // per-caller reply cap (REPLY_W32 / decode_reply), NOT the single per-TCB reply_to.
                 // SSN_TEST_FAULT's handler reads an un-demand-paged page → the executive demand-maps
