@@ -43,7 +43,7 @@ admission with exactly 27 unresolved-import diagnostics and an explicit incomple
 rejection. MmMapViewInSystemSpace no longer appears as a spurious extra miss from global catalog
 failure. The executive stops before DriverEntry or desktop rendering;
 the VM was terminated at that deterministic barrier. Evidence and the exact import set are in the
-bootstrap unobserved Event signaling, Event signal arbitration, kernel Event transport,
+kernel Event polling, bootstrap unobserved Event signaling, Event signal arbitration, kernel Event transport,
 dispatcher-bootstrap, strict-registry and IRQ receive-continuation checkpoints below. Older desktop
 proofs are historical baselines, not acceptance of the current provider cutover.
 
@@ -35091,6 +35091,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         acceptance. Poll support does not satisfy stopped-job scheduling,
         receive-endpoint ownership, timer deadlines or typed kernel continuation wake/resume
         required by the following blocking-wait cutover.
+        Fresh normal boot after 92eb974a reaches the unchanged 27 unresolved imports and explicit
+        incomplete-registry rejection at main.rs:29867. Logs: .tmp/run-kernel-event-poll-20260915.log
+        and .tmp/boot-kernel-event-poll-20260915.log. QEMU was stopped with SIGTERM at the confirmed
+        barrier within BOOT_TIMEOUT_SECONDS=300; the runner exits failure without a successful
+        guest completion or Explorer verdict. No QEMU remains. This verifies unchanged early
+        boot progress, not native kernel poll execution, DriverEntry completion or desktop rendering.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole ownership slice: extend the existing KernelProviderPumpProgress and
         DriverEntryRecipient beyond initial entry/IRQ receive continuation to a single-use resume
