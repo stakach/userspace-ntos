@@ -58,13 +58,13 @@ pub(super) unsafe fn retain_callback_transfer(
             Ok(identity) => (identity, None),
             Err((_error, payload)) => (
                 lanes.retain_terminal_running(lane, reply_object, key, owner, payload)
-                    .expect("callback handoff rejection lost its source owner"),
+                    .unwrap_or_else(|(error, _)| panic!("callback handoff rejection lost its source owner: {:?}", error)),
                 Some(0xC000_000D),
             ),
         },
         Err(status) => (
             lanes.retain_terminal_running(lane, reply_object, key, owner, payload)
-                .expect("callback capture failure lost its source owner"),
+                .unwrap_or_else(|(error, _)| panic!("callback capture failure lost its source owner: {:?}", error)),
             Some(status),
         ),
     };
@@ -92,7 +92,7 @@ pub(super) unsafe fn retain_incomplete_provider(
     let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
     let identity = lanes
         .retain_terminal_running(lane, reply_object, key, owner, payload)
-        .expect("rejected component re-wait lost its retained authority");
+        .unwrap_or_else(|(error, _)| panic!("rejected component re-wait lost its retained authority: {:?}", error));
     let mut attempt = lanes
         .begin_terminal_stage(identity, reply_object, TerminalStage::Output)
         .expect("rejected component re-wait lost its uncertainty owner");

@@ -4,7 +4,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use nt_component_suspension::{
     ComponentSuspensionLanes, LaneBinding, LaneDispatchIdentity, LaneHandle, LanePhase,
-    SuspensionCaller, SuspensionOwner,
+    RetiredTerminal, SuspensionCaller, SuspensionKey, SuspensionOwner, TerminalIdentity,
+    TerminalPhase,
 };
 use nt_process::{
     native_handle::{NativeHandleCaller, NativeThreadProcessReference},
@@ -64,7 +65,16 @@ struct Activation {
     caller: KernelProviderCaller,
     native_caller: NativeHandleCaller,
     reference: NativeThreadProcessReference,
-    completion: Option<u32>,
+    completion: Option<Completion>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Completion {
+    TerminalPending {
+        status: u32,
+        terminal: TerminalIdentity,
+    },
+    Ready(u32),
 }
 
 /// Exact metadata for a retained, observed kernel return. Copying this receipt does not transfer
@@ -219,8 +229,135 @@ impl KernelProviderActivations {
         lanes
             .finish_dispatch(caller.dispatch.lane(), caller.binding.reply_object)
             .map_err(|_| STATUS_INVALID_HANDLE)?;
-        row.completion = Some(status);
+        row.completion = Some(Completion::Ready(status));
         Ok(KernelProviderCompletionReceipt { caller, status })
+    }
+
+    /// Retain an observed return from the final resumed suspension and its terminal authority
+    /// together. The adapter supplies the actual return status, not the wait selection result.
+    /// No new frame or external token is manufactured; nested work must finish first. Rejection
+    /// returns the owned payload, leaving both activation and source suspension unchanged.
+    pub fn retain_terminal_completion<C, R, T>(
+        &mut self,
+        caller: KernelProviderCaller,
+        pm: &ProcessManager,
+        catalog: &ProviderDomainCatalog,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        key: SuspensionKey,
+        payload: T,
+        status: u32,
+    ) -> Result<TerminalIdentity, (u32, T)> {
+        if let Err(status) = self.validate_retained(caller, pm, catalog, lanes) {
+            return Err((status, payload));
+        }
+        let lane = caller.dispatch.lane();
+        if lanes.phase(lane) != Ok(LanePhase::Running)
+            || lanes.suspension_count(lane) != Ok(1)
+            || lanes.external_depth(lane) != Ok(0)
+        {
+            return Err((STATUS_INVALID_HANDLE, payload));
+        }
+        let row = self
+            .rows
+            .iter_mut()
+            .find(|row| row.caller == caller)
+            .expect("validated activation disappeared before terminal retention");
+        let terminal = lanes
+            .retain_terminal_running(
+                lane,
+                caller.binding.reply_object,
+                key,
+                caller.owner(),
+                payload,
+            )
+            .map_err(|(_, payload)| (STATUS_INVALID_HANDLE, payload))?;
+        // All fallible validation precedes the lane transition; publication cannot allocate.
+        row.completion = Some(Completion::TerminalPending { status, terminal });
+        Ok(terminal)
+    }
+
+    /// Authenticate retained terminal ownership before local delivery bookkeeping. This does
+    /// not authorize provider execution or receipt acknowledgment. Caller/provider exit does
+    /// not invalidate cleanup, but the original Ps pair and exact physical terminal must remain.
+    pub fn validate_terminal_completion<C, R, T>(
+        &self,
+        caller: KernelProviderCaller,
+        pm: &ProcessManager,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        terminal: TerminalIdentity,
+    ) -> Result<(), u32> {
+        let row = self
+            .rows
+            .iter()
+            .find(|row| row.caller == caller)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if !matches!(row.completion,
+            Some(Completion::TerminalPending { terminal: retained, .. }) if retained == terminal)
+        {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        row.reference.validate(pm)?;
+        let lane = caller.dispatch.lane();
+        if terminal.lane() != lane
+            || terminal.owner() != caller.owner()
+            || terminal.external_token().is_some()
+            || lanes.active_dispatch_identity(lane) != Ok(Some(caller.dispatch))
+            || lanes.binding(lane) != Ok(caller.binding)
+            || lanes.suspension_count(lane) != Ok(1)
+            || lanes.external_depth(lane) != Ok(0)
+        {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        lanes
+            .terminal(terminal, caller.binding.reply_object)
+            .map_err(|_| STATUS_INVALID_HANDLE)?;
+        Ok(())
+    }
+
+    /// Publish a deliverable receipt only after exact terminal retirement. Before performing
+    /// local bookkeeping, the adapter must validate_terminal_completion and observe the
+    /// terminal's Acknowledged phase. External mechanisms belong to the ticketed terminal
+    /// stages, outside borrowed coordinator state; local_retirement reports only local
+    /// bookkeeping. Its failure retains the pending status for local retry, not mechanism replay.
+    pub fn finish_terminal_completion<C, R: Clone, T>(
+        &mut self,
+        caller: KernelProviderCaller,
+        pm: &ProcessManager,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        terminal: TerminalIdentity,
+        local_retirement: Result<(), u32>,
+    ) -> Result<Option<(KernelProviderCompletionReceipt, RetiredTerminal<C, R, T>)>, u32> {
+        self.validate_terminal_completion(caller, pm, lanes, terminal)?;
+        let row = self
+            .rows
+            .iter_mut()
+            .find(|row| row.caller == caller)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let Some(Completion::TerminalPending { status, .. }) = row.completion else {
+            unreachable!("validated pending terminal lost its completion");
+        };
+        if !matches!(
+            lanes
+                .terminal(terminal, caller.binding.reply_object)
+                .map_err(|_| STATUS_INVALID_HANDLE)?
+                .phase,
+            TerminalPhase::Acknowledged { .. }
+        ) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let Some(retired) = lanes
+            .finish_terminal(terminal, caller.binding.reply_object, local_retirement)
+            .map_err(|_| STATUS_INVALID_HANDLE)?
+        else {
+            return Ok(None);
+        };
+        // finish_terminal retires the last frame and makes the lane Idle. Do not call the
+        // frame-free Running completion path here; the exact return is already retained.
+        row.completion = Some(Completion::Ready(status));
+        Ok(Some((
+            KernelProviderCompletionReceipt { caller, status },
+            retired,
+        )))
     }
 
     pub fn completion(
@@ -231,7 +368,10 @@ impl KernelProviderActivations {
             .rows
             .iter()
             .find(|row| row.caller == caller)
-            .and_then(|row| row.completion)
+            .and_then(|row| match row.completion {
+                Some(Completion::Ready(status)) => Some(status),
+                _ => None,
+            })
             .ok_or(STATUS_INVALID_HANDLE)?;
         Ok(KernelProviderCompletionReceipt { caller, status })
     }
@@ -246,7 +386,10 @@ impl KernelProviderActivations {
         let index = self
             .rows
             .iter()
-            .position(|row| row.caller == receipt.caller && row.completion == Some(receipt.status))
+            .position(|row| {
+                row.caller == receipt.caller
+                    && row.completion == Some(Completion::Ready(receipt.status))
+            })
             .ok_or(STATUS_INVALID_HANDLE)?;
         self.rows[index].reference.release(pm)?;
         self.rows.remove(index);

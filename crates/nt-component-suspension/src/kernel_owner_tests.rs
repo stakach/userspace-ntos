@@ -163,7 +163,7 @@ fn kernel_admission_and_rearm_require_current_lane_and_epoch() {
     lanes.begin_resume(lane, reply, next).unwrap();
     assert_eq!(
         lanes.retain_terminal_running(lane, reply, next, hosted(owner.dispatch_id), ()),
-        Err(LaneError::Suspension(SuspensionError::InvalidIdentity))
+        Err((LaneError::Suspension(SuspensionError::InvalidIdentity), ()))
     );
     assert_eq!(lanes.phase(lane), Ok(LanePhase::Running));
     lanes

@@ -1261,7 +1261,8 @@ impl<C, R: Clone> ComponentSuspensionLanes<C, R> {
         key: SuspensionKey,
         owner: SuspensionOwner,
     ) -> Result<CompletedSuspension<C, R>, LaneError> {
-        let identity = self.retain_terminal_running(lane, reply, key, owner, ())?;
+        let identity = self.retain_terminal_running(lane, reply, key, owner, ())
+            .map_err(|(error, ())| error)?;
         for stage in [
             TerminalStage::Output,
             TerminalStage::Context,

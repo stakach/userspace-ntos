@@ -1844,7 +1844,7 @@ unsafe fn component_suspension_resume_top(
                         frame.owner,
                         component_terminal::NativeTerminal::completed(dispatch),
                     )
-                    .expect("completed component lost its terminal owner");
+                    .unwrap_or_else(|(error, _)| panic!("completed component lost its terminal owner: {:?}", error));
                 return Some(ComponentSuspensionRuntimeOutcome::Terminal);
             }
             ComponentPumpCompletion::UserCallbackSuspended => {

@@ -8,6 +8,9 @@ use nt_provider_wait::{
 };
 use nt_types::AccessMode;
 
+#[path = "provider_kernel_terminal_tests.rs"]
+mod terminal_completion;
+
 type Lanes = ComponentSuspensionLanes<u64, i32>;
 
 fn bootstrap() -> PsBootstrapState {

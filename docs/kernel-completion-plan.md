@@ -34597,6 +34597,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         No VM/desktop acceptance is claimed; the last measured 27 strict win32k imports remain
         open. Kernel terminal-pending receipt integration and asynchronous bootstrap delivery
         remain required below before enabling kernel provider waits.
+      - [x] Retain kernel returns through exact terminal completion
+        (2026-09-14; host/composed/native-build verified below).
+        Add TerminalPending versus Ready to the existing kernel activation record. Retain the
+        genuine final resumed return and its terminal identity atomically using the existing
+        suspension frame; require the exact canonical requestor pair, live provider/catalog,
+        dispatch epoch, binding and kernel owner, one frame and no external tokens. Do not
+        manufacture a frame or callback token for synchronous DriverEntry. Deny direct result
+        lookup, receipt acknowledgment, execution and ordinary release while terminal authority
+        remains. Preserve original return status independently of the selected wait result.
+        Authenticate the exact terminal and retained Ps pair before local retirement; publish a
+        Ready receipt only after every terminal stage and successful exact local retirement.
+        No-effects stage failures remain retryable; entered/dropped/uncertain effects remain
+        owned without replay. A local retirement failure retains TerminalPending for local retry.
+        Caller exit and provider retirement do not erase already retained cleanup authority.
+        Return owned terminal payloads on admission failure, consistently for ordinary and
+        external terminal retention; remove the ordinary path's payload-discarding error map.
+        Keep native kernel wait admission disabled: native pending dispatch, resume and terminal
+        recipients still require hosted client state. Their typed kernel counterpart and durable
+        asynchronous bootstrap completion remain the next production wiring boundary below.
+        Eight focused tests cover rejected phase/key/owner/catalog/manager admission, extra
+        frames/tokens, premature ACK/release, cancellation versus genuine return, all four stages
+        under no-effects/uncertain/dropped attempts, local and reference-release retry after
+        caller/provider exit, foreign tables, same-lane dispatch reuse and replaced lane generation.
+        Owned Box payloads survive both wrapper and underlying terminal rejection at the same
+        allocation address, then enter the real retained terminal on retry. Wait selection and
+        provider return status remain distinct. Independent core/native ownership reviews found
+        no blocker; no second terminal coordinator or alternate native teardown path was added.
+        Serialized host tests pass 805 cases across 15 suites, with no failures or ignored cases:
+        .tmp/test-kernel-terminal-lanes-20260914.log (nt-component-suspension, nt-provider-wait)
+        and .tmp/test-kernel-terminal-activation-20260914.log (nt-user-host). Serialized release
+        builds pass for the executive in 39.10s with the unchanged 294 warnings and standalone
+        I/O Manager in 0.06s without warnings. Evidence: .tmp/build-kernel-terminal-executive-20260914.log
+        and .tmp/build-kernel-terminal-io-manager-20260914.log. Scoped formatting/diff checks pass.
+        These are host composition and native build checks, not native mechanism/desktop proof.
+        No VM boot was run; the last measured 27 strict win32k imports remain open.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -34620,12 +34655,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         PendingProviderWaitDispatch currently requires hosted client/callback contexts, and
         component_terminal delivers CompletedWin32kDispatch to a hosted syscall reply. A kernel
         terminal recipient must preserve its real initiating caller and return contract instead.
-        Hosted return delivery/abandonment is now explicitly typed as above. Connect the kernel
-        receipt to the existing terminal lifecycle without manufacturing a frame or external token:
-        retain the exact TerminalIdentity and status as terminal-pending, deny ordinary receipt ACK
-        while native terminal authority remains, then expose a deliverable result only after exact
-        terminal retirement. finish_terminal may make the final lane Idle, so calling the current
-        frame-free record_completion afterward is invalid; do not weaken its active-frame guard.
+        Hosted return delivery/abandonment is now explicitly typed as above. Use the kernel
+        terminal-pending lifecycle checkpoint above when a genuine resumed kernel return occurs;
+        do not manufacture a frame or external token to call it. Deliver to the real kernel
+        recipient before exact terminal retirement makes its retained receipt ready. The final
+        lane becomes Idle during retirement, so do not call frame-free record_completion afterward
+        or weaken that method's active-frame guard. Native local effects must authenticate the
+        pending terminal and observe Acknowledged before retiring authority, release all global
+        borrows before ticketed terminal mechanism calls, then finish through the exact core
+        terminal wrapper. Its local-retirement result is local bookkeeping only; do not report
+        uncertain external effects as retryable local errors.
         DriverEntry now consumes a retained direct-return receipt but still depends on synchronous
         component_pump completion; retain that completion ownership across any asynchronous park.
         Use the new retained-lifetime check for Suspended eligibility, followed by strict execution

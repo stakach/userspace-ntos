@@ -111,6 +111,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
 
     /// Publish the returned result without releasing its original suspension or native authority.
     /// The resume epoch was reserved before the provider ran; this transition cannot allocate.
+    /// Rejection returns the owned payload without changing the source suspension.
     pub fn retain_terminal_running(
         &mut self,
         handle: LaneHandle,
@@ -118,9 +119,8 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         key: SuspensionKey,
         owner: SuspensionOwner,
         payload: T,
-    ) -> Result<TerminalIdentity, LaneError> {
+    ) -> Result<TerminalIdentity, (LaneError, T)> {
         self.retain_running(handle, reply_object, key, owner, None, payload)
-            .map_err(|(error, _)| error)
     }
 
     /// Retain a callback transfer without releasing its original native reply or suspension.
