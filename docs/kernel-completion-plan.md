@@ -43,7 +43,7 @@ admission with exactly 27 unresolved-import diagnostics and an explicit incomple
 rejection. MmMapViewInSystemSpace no longer appears as a spurious extra miss from global catalog
 failure. The executive stops before DriverEntry or desktop rendering;
 the VM was terminated at that deterministic barrier. Evidence and the exact import set are in the
-kernel Event transport, dispatcher-bootstrap, strict-registry and IRQ receive-continuation
+Event signal arbitration, kernel Event transport, dispatcher-bootstrap, strict-registry and IRQ receive-continuation
 checkpoints below. Older desktop
 proofs are historical baselines, not acceptance of the current provider cutover.
 
@@ -34980,6 +34980,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         reentry during signaling still needs production-path proof beyond the strict-import
         barrier. Genuine DriverEntry signaling still requires early readiness ownership;
         live-handler support does not satisfy that dependency or establish desktop acceptance.
+        Fresh normal boot after dbe6373b reaches the unchanged 27 unresolved imports and explicit
+        incomplete-registry rejection at main.rs:29867. Logs: .tmp/run-event-signal-20260915.log
+        and .tmp/boot-event-signal-20260915.log. QEMU was stopped with SIGTERM after confirming
+        that barrier, within BOOT_TIMEOUT_SECONDS=300. The runner exits failure without a guest
+        success/Explorer verdict; no QEMU remains. This confirms unchanged early boot progress,
+        not execution of the new signaling path, DriverEntry completion or desktop rendering.
       - [ ] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Existing win32k provider waits derive their owner from a hosted syscall/callback header
         and live process generation (win32k_subsystem::current_provider_wait_owner and
@@ -35015,6 +35021,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         need pre-loop readiness/deadline ownership. Process handles/projected pointers must keep
         their distinct authority. Bootstrap has no native waiter scheduler: keep signaling refused
         until its genuine no-waiter invariant or complete early wake ownership is established.
+        Review identifies a bounded next slice: kernel rendezvous currently rejects a kernel
+        owner before publishing a wait request, while native/GUI wait publication requires the
+        live handler. Validate bootstrap signaling against the exact Provider-local Event,
+        live namespace backing, no deletion and zero wait/signal/operation/handle/pointer
+        references, including legacy namespace wait_references. Only then can an exclusive
+        bootstrap-state borrow perform real no-waiter SET or PULSE; reject mismatches before
+        mutation. A null live-handler pointer alone is not evidence of absent observers.
+        Subsequent real kernel waits must use the existing ProviderDispatcherWaitArbiter over
+        the same bootstrap stores, publish the typed kernel continuation and exact dispatcher
+        leases, and retain Reply/shared-bank authority before queue progress. Do not simply
+        remove the hosted-client guard: the current rendezvous also assumes hosted callback
+        request context. Timer deadlines must join the actual boot scheduler and moved table.
         Complete kernel activation/object leases before inserting a kernel suspension frame. Do not
         instantiate a second event manager, invent a hosted process ID, or park a frame without
         a readiness owner. Follow with exact owned admission, resume transport and typed kernel
