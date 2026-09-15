@@ -419,18 +419,60 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
     where
         B: ProviderDispatcherWaitBackend<Lease = L>,
     {
-        let (slot, selected) = self.oldest_event_consumer(backend, object)?;
-        if self.waiters[slot].admission_sequence != expected_sequence {
-            return None;
+        match self.pop_event_ready_with(backend, object, expected_sequence, |_| {
+            Ok::<_, core::convert::Infallible>(())
+        }) {
+            Ok(completion) => completion.map(|(completion, ())| completion),
+            Err(error) => match error {},
         }
-        Some(self.complete_ready(backend, slot, selected))
+    }
+
+    /// Publish the exact Event completion before consuming readiness or releasing its leases.
+    /// A stale sequence does not invoke publication. See `pop_ready_with` for its contract.
+    pub fn pop_event_ready_with<B, O, E>(
+        &mut self,
+        backend: &mut B,
+        object: ProviderWaitObject,
+        expected_sequence: u64,
+        publish: impl FnOnce(ProviderDispatcherWaitCompletion) -> Result<O, E>,
+    ) -> Result<Option<(ProviderDispatcherWaitCompletion, O)>, E>
+    where
+        B: ProviderDispatcherWaitBackend<Lease = L>,
+    {
+        let Some((slot, selected)) = self.oldest_event_consumer(backend, object) else {
+            return Ok(None);
+        };
+        if self.waiters[slot].admission_sequence != expected_sequence {
+            return Ok(None);
+        }
+        let output = publish(self.completion(slot, STATUS_WAIT_0 + selected as i32, false))?;
+        Ok(Some((self.complete_ready(backend, slot, selected), output)))
     }
 
     pub fn pop_ready<B>(&mut self, backend: &mut B) -> Option<ProviderDispatcherWaitCompletion>
     where
         B: ProviderDispatcherWaitBackend<Lease = L>,
     {
-        let (slot, selected) = self
+        match self.pop_ready_with(backend, |_| Ok::<_, core::convert::Infallible>(())) {
+            Ok(completion) => completion.map(|(completion, ())| completion),
+            Err(error) => match error {},
+        }
+    }
+
+    /// Publish the oldest ready completion before any destructive dispatcher operation.
+    /// Rejection retains this waiter, its readiness and all leases; it never skips to a younger
+    /// candidate. Publication must be memory-local and serialized with this arbiter/backend,
+    /// with no IPC, scheduling, reentry or backend mutation. Failure must have no side effects;
+    /// success must leave only the infallible readiness consumption and lease retirement here.
+    pub fn pop_ready_with<B, O, E>(
+        &mut self,
+        backend: &mut B,
+        publish: impl FnOnce(ProviderDispatcherWaitCompletion) -> Result<O, E>,
+    ) -> Result<Option<(ProviderDispatcherWaitCompletion, O)>, E>
+    where
+        B: ProviderDispatcherWaitBackend<Lease = L>,
+    {
+        let Some((slot, selected)) = self
             .waiters
             .iter()
             .enumerate()
@@ -439,8 +481,12 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
                     .map(|selected| (slot, selected, waiter.admission_sequence))
             })
             .min_by_key(|(_, _, sequence)| *sequence)
-            .map(|(slot, selected, _)| (slot, selected))?;
-        Some(self.complete_ready(backend, slot, selected))
+            .map(|(slot, selected, _)| (slot, selected))
+        else {
+            return Ok(None);
+        };
+        let output = publish(self.completion(slot, STATUS_WAIT_0 + selected as i32, false))?;
+        Ok(Some((self.complete_ready(backend, slot, selected), output)))
     }
 
     fn complete_ready<B>(
@@ -452,16 +498,11 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
     where
         B: ProviderDispatcherWaitBackend<Lease = L>,
     {
+        let completion = self.completion(slot, STATUS_WAIT_0 + selected as i32, false);
         let waiter = self.waiters.remove(slot);
         Self::consume_selection(backend, waiter.wait_type, &waiter.leases, selected);
         Self::release_leases(backend, &waiter.leases);
-        ProviderDispatcherWaitCompletion {
-            wait_id: waiter.wait_id,
-            owner: waiter.owner,
-            admission_sequence: waiter.admission_sequence,
-            status: STATUS_WAIT_0 + selected as i32,
-            cancelled: false,
-        }
+        completion
     }
 
     pub fn next_deadline(&self, now: TimeSnapshot) -> Option<u64> {
@@ -479,7 +520,24 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
     where
         B: ProviderDispatcherWaitBackend<Lease = L>,
     {
-        let slot = self
+        match self.pop_due_with(backend, now, |_| Ok::<_, core::convert::Infallible>(())) {
+            Ok(completion) => completion.map(|(completion, ())| completion),
+            Err(error) => match error {},
+        }
+    }
+
+    /// Publish the oldest due timeout before removing its waiter or releasing its leases.
+    /// Rejection preserves deadline ordering. See `pop_ready_with` for the publication contract.
+    pub fn pop_due_with<B, O, E>(
+        &mut self,
+        backend: &mut B,
+        now: TimeSnapshot,
+        publish: impl FnOnce(ProviderDispatcherWaitCompletion) -> Result<O, E>,
+    ) -> Result<Option<(ProviderDispatcherWaitCompletion, O)>, E>
+    where
+        B: ProviderDispatcherWaitBackend<Lease = L>,
+    {
+        let Some(slot) = self
             .waiters
             .iter()
             .enumerate()
@@ -487,8 +545,12 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
             .min_by_key(|(_, waiter)| {
                 (waiter.deadline.ordering_key(now), waiter.admission_sequence)
             })
-            .map(|(slot, _)| slot)?;
-        Some(self.remove(backend, slot, STATUS_TIMEOUT, false))
+            .map(|(slot, _)| slot)
+        else {
+            return Ok(None);
+        };
+        let output = publish(self.completion(slot, STATUS_TIMEOUT, false))?;
+        Ok(Some((self.remove(backend, slot, STATUS_TIMEOUT, false), output)))
     }
 
     pub fn cancel<B>(
@@ -543,8 +605,19 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
     where
         B: ProviderDispatcherWaitBackend<Lease = L>,
     {
+        let completion = self.completion(slot, status, cancelled);
         let waiter = self.waiters.remove(slot);
         Self::release_leases(backend, &waiter.leases);
+        completion
+    }
+
+    fn completion(
+        &self,
+        slot: usize,
+        status: i32,
+        cancelled: bool,
+    ) -> ProviderDispatcherWaitCompletion {
+        let waiter = &self.waiters[slot];
         ProviderDispatcherWaitCompletion {
             wait_id: waiter.wait_id,
             owner: waiter.owner,

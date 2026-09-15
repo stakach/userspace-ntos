@@ -35263,6 +35263,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         independent ownership review pass. No boot was rerun: this refactor does not enable
         blocking or introduce a stopped-job scheduler, and the last measured boot remains the
         strict 27-import rejection, not desktop rendering.
+      - [x] Publish exact caller-aware readiness before consuming dispatcher resources (2026-09-15).
+        The existing arbiter now supports guarded ready/Event-consumer/timeout publication;
+        legacy pop methods delegate through the same implementation. Refusal preserves the
+        oldest candidate, readiness and all leases without skipping to younger waiters. The
+        shared selector matches the exact frame, full caller tuple and admission sequence,
+        requires Waiting, and checks the physical kernel lane before invoking the typed route.
+        Native routing validates retained hosted request/client/dispatch/lane metadata or the
+        kernel capture's caller/key, and rejects mismatched continuation kinds. All three native
+        pop-then-key-only-select paths are replaced. Provider status was already caller-neutral;
+        the typed retained continuation owns its eventual return route, never a manufactured
+        hosted reply. Buried hosted Waiting frames remain selectable without becoming runnable
+        ahead of newer frames. Selection does not authorize execution of an exited caller;
+        canonical resume validation and cancellation ownership remain distinct contracts.
+        The four native readiness helpers now require only the original dispatcher backend and
+        exact lease type, not ExecNtHandler, so bootstrap can reuse them once its scheduling
+        ownership exists. Event fairness and deadline ordering are unchanged. Three parameterized
+        arbiter tests cover refusal/retry, mixed caller ordering, Any/All, absent/stale candidates,
+        absolute/relative deadlines and owned publication output. Eight shared routing tests use
+        real Event storage/backend/lanes for owner/sequence/phase/continuation rejection, physical
+        lane checks, buried selection, timeout preservation and retry. The existing real kernel
+        admission test now publishes readiness through this path before claiming its resume ticket.
+        Validation passes 1,262 tests across 19 suites without failures or ignored cases:
+        .tmp/test-caller-readiness-20260915.log. Executive release passes in 38.51s with unchanged
+        303 warnings; standalone I/O Manager passes without warnings. Evidence:
+        .tmp/build-caller-readiness-executive-20260915.log and
+        .tmp/build-caller-readiness-io-manager-20260915.log. Builds/tests were serialized; scoped
+        formatting, git diff --check and independent ownership review pass. No boot was rerun;
+        the last measured frontier remains the strict 27-import rejection. This publication is
+        not a pre-loop scheduler, receive-endpoint fan-in or permission to enable kernel blocking.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: give the stopped kernel job an actual readiness owner,
         then use the lease-backed initial/repark publication above rather than stacking another
@@ -35271,10 +35300,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         delivery and retirement/ACK rather than frame-free record_completion or a hosted reply.
         Wire the new selected-kernel execution entry only after readiness/repark ownership exists.
         Use the field-borrowed backend above in the canonical PM/activation transaction; do not
-        retain a whole ExecNtHandler borrow alongside it. Existing native readiness selectors
-        still construct hosted provider completions: route by the actual retained caller kind
-        before admitting kernel waits. Bootstrap signaling still rejects observed Events until
-        this owner-aware wake selection and readiness scheduling are installed.
+        retain a whole ExecNtHandler borrow alongside it. Use the exact caller-aware readiness
+        publication above before admitting kernel waits. Bootstrap signaling still rejects
+        observed Events until owner-aware wake selection and readiness scheduling are installed.
         Keep blocking admission disabled until real readiness scheduling and this ownership
         contract are both wired; Timer expiration and receive-endpoint fan-in remain necessary
         for asynchronous boot rather than being implied by successful synchronous Event polls.

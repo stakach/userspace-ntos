@@ -202,10 +202,25 @@ fn first_wait_publishes_real_event_readiness_and_keeps_original_recipient() {
             assert_eq!(frame.phase, SuspensionPhase::Waiting);
             assert_eq!(state.event_objects.live_lease_count(), 1);
             assert_eq!(state.events.set_existing(101), Some(false));
-            let ready = arbiter.pop_ready(&mut backend(&mut state, None)).unwrap();
+            let expected = f.capture;
+            let (ready, selected_lane) = arbiter
+                .pop_ready_with(&mut backend(&mut state, None), |completion| {
+                    crate::provider_wait_selection::select_provider_wait(
+                        &mut f.lanes,
+                        completion,
+                        |lane, capture, completion| {
+                            if *capture != expected || lane != expected.caller().dispatch.lane() {
+                                return Err(STATUS_INVALID_HANDLE);
+                            }
+                            Ok(completion.status)
+                        },
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected_lane, f.caller.dispatch.lane());
             assert_eq!(ready.owner, f.caller.owner());
             assert_eq!(ready.admission_sequence, 1);
-            f.lanes.select(f.capture.key(), ready.status).unwrap();
         }
         assert_eq!(state.event_objects.live_lease_count(), 0);
         assert!(!state.events.read_state(101));

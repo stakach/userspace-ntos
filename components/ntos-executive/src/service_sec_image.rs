@@ -5,6 +5,8 @@ use crate::exec_handler::HostedCreatePublication;
 use crate::*;
 use nt_user_host::hosted_return_target::HostedReturnTarget;
 
+#[path = "provider_wait_selection.rs"]
+mod wait_selection;
 #[path = "component_terminal.rs"]
 mod component_terminal;
 #[path = "component_return.rs"]
@@ -228,7 +230,7 @@ struct HostedNativeContinuation {
 #[derive(Clone, Copy)]
 enum ComponentNativeContinuation {
     Hosted(HostedNativeContinuation),
-    // No admission or execution route until kernel dispatcher leases and terminal delivery exist.
+    // Native blocking admission still requires the stopped-job scheduler and receive ownership.
     Kernel(nt_user_host::provider_kernel_activation::KernelProviderWaitCapture),
 }
 
@@ -2070,10 +2072,13 @@ unsafe fn component_suspension_resume_top(
     }
 }
 
-pub(crate) fn provider_wait_oldest_event_consumer_sequence(
-    nt_handler: &ExecNtHandler,
+pub(crate) fn provider_wait_oldest_event_consumer_sequence<B>(
+    backend: &B,
     id: nt_kernel_exec::EventObjectId,
-) -> Option<u64> {
+) -> Option<u64>
+where
+    B: nt_provider_wait::ProviderDispatcherWaitBackend<Lease = crate::exec_handler::ProviderDispatcherLease>,
+{
     let object = nt_provider_wait::ProviderWaitObject::new(
         nt_provider_wait::ProviderWaitObjectType::Event,
         id.0.slot().checked_add(1)?,
@@ -2081,48 +2086,41 @@ pub(crate) fn provider_wait_oldest_event_consumer_sequence(
     );
     unsafe {
         (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER))
-            .oldest_event_consumer_sequence(nt_handler, object)
+            .oldest_event_consumer_sequence(backend, object)
     }
 }
 
-pub(crate) unsafe fn provider_wait_select_event_consumer(
-    nt_handler: &mut ExecNtHandler,
+pub(crate) unsafe fn provider_wait_select_event_consumer<B>(
+    backend: &mut B,
     id: nt_kernel_exec::EventObjectId,
     expected_sequence: u64,
-) -> bool {
+) -> bool
+where
+    B: nt_provider_wait::ProviderDispatcherWaitBackend<Lease = crate::exec_handler::ProviderDispatcherLease>,
+{
     let object = nt_provider_wait::ProviderWaitObject::new(
         nt_provider_wait::ProviderWaitObjectType::Event,
         id.0.slot() + 1,
         u64::from(id.0.generation().0),
     );
-    let Some(completion) = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER))
-        .pop_event_ready(nt_handler, object, expected_sequence)
-    else {
-        return false;
-    };
-    (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-        .select(
-            provider_wait_key(completion.wait_id),
-            ComponentSuspensionCompletion::provider(completion.status),
-        )
-        .expect("provider Event selection lost its owned continuation");
-    true
+    (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER))
+        .pop_event_ready_with(backend, object, expected_sequence, |completion| {
+            wait_selection::publish(completion)
+        })
+        .expect("provider Event selection lost its exact owned continuation")
+        .is_some()
 }
 
-pub(crate) unsafe fn provider_wait_select_ready(nt_handler: &mut ExecNtHandler) -> u64 {
+pub(crate) unsafe fn provider_wait_select_ready<B>(backend: &mut B) -> u64
+where
+    B: nt_provider_wait::ProviderDispatcherWaitBackend<Lease = crate::exec_handler::ProviderDispatcherLease>,
+{
     let mut selected = 0;
-    while let Some(completion) =
-        (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).pop_ready(nt_handler)
+    while (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER))
+        .pop_ready_with(backend, |completion| wait_selection::publish(completion))
+        .expect("provider readiness lost its exact owned continuation")
+        .is_some()
     {
-        if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-            .select(
-                provider_wait_key(completion.wait_id),
-                ComponentSuspensionCompletion::provider(completion.status),
-            )
-            .is_err()
-        {
-            panic!("provider wait arbiter selected an unowned continuation");
-        }
         selected += 1;
     }
     selected
@@ -2132,23 +2130,19 @@ pub(crate) fn provider_wait_next_deadline(now: nt_delay_execution::TimeSnapshot)
     unsafe { (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).next_deadline(now) }
 }
 
-pub(crate) unsafe fn provider_wait_select_due(
-    nt_handler: &mut ExecNtHandler,
+pub(crate) unsafe fn provider_wait_select_due<B>(
+    backend: &mut B,
     now: nt_delay_execution::TimeSnapshot,
-) -> u64 {
+) -> u64
+where
+    B: nt_provider_wait::ProviderDispatcherWaitBackend<Lease = crate::exec_handler::ProviderDispatcherLease>,
+{
     let mut selected = 0;
-    while let Some(completion) =
-        (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).pop_due(nt_handler, now)
+    while (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER))
+        .pop_due_with(backend, now, |completion| wait_selection::publish(completion))
+        .expect("provider timeout lost its exact owned continuation")
+        .is_some()
     {
-        if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-            .select(
-                provider_wait_key(completion.wait_id),
-                ComponentSuspensionCompletion::provider(completion.status),
-            )
-            .is_err()
-        {
-            panic!("provider wait timeout selected an unowned continuation");
-        }
         selected += 1;
     }
     selected

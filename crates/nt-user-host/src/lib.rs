@@ -15,6 +15,7 @@ pub mod object_wait;
 pub mod current_apc;
 pub mod dispatcher_state;
 pub mod provider_dispatcher_backend;
+pub mod provider_wait_selection;
 pub mod pending_caller;
 pub mod hosted_return_target;
 
