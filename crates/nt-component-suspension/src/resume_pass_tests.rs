@@ -307,3 +307,99 @@ fn unburied_resuming_frame_is_not_reexecuted_in_either_pass() {
         SuspensionPhase::Resuming { .. }
     ));
 }
+
+#[test]
+fn bounded_execution_keeps_new_work_on_a_real_future_wake() {
+    let mut lanes = Lanes::new(2, 2);
+    let first = add(&mut lanes, 1, 1, true);
+    let mut wake = ResumeWake::new(10, 40).unwrap();
+    wake.reconcile(lanes.next_resumable().is_some(), 100);
+    let mut ticket = wake.begin_pass(100).unwrap().unwrap();
+    let mut pass = lanes.resume_pass();
+    let candidate = lanes.next_resumable_in_pass(&mut pass, |_| true).unwrap();
+    let owner = lanes.top(first).unwrap().unwrap().owner;
+    lanes
+        .begin_resume(
+            first,
+            candidate.binding.reply_object,
+            candidate.suspension.key,
+        )
+        .unwrap();
+    lanes
+        .deliver_terminal_for_test(
+            first,
+            candidate.binding.reply_object,
+            candidate.suspension.key,
+            owner,
+        )
+        .unwrap();
+    let next = add(&mut lanes, 2, 2, false);
+    assert!(lanes.next_resumable_in_pass(&mut pass, |_| true).is_none());
+    wake.finish_pass(&mut ticket, 105, lanes.next_resumable().is_some(), true)
+        .unwrap();
+    assert_eq!(wake.next_deadline(), Some(115));
+    assert!(wake.begin_pass(114).unwrap().is_none());
+    let mut ticket = wake.begin_pass(115).unwrap().unwrap();
+    let candidate = lanes
+        .next_resumable_in_pass(&mut lanes.resume_pass(), |_| true)
+        .unwrap();
+    assert_eq!(candidate.lane, next);
+    let owner = lanes.top(next).unwrap().unwrap().owner;
+    lanes
+        .begin_resume(
+            next,
+            candidate.binding.reply_object,
+            candidate.suspension.key,
+        )
+        .unwrap();
+    lanes
+        .deliver_terminal_for_test(
+            next,
+            candidate.binding.reply_object,
+            candidate.suspension.key,
+            owner,
+        )
+        .unwrap();
+    wake.finish_pass(&mut ticket, 120, lanes.next_resumable().is_some(), true)
+        .unwrap();
+    assert_eq!(wake.next_deadline(), None);
+}
+
+#[test]
+fn physical_busy_suppression_retains_wake_until_token_release() {
+    let mut lanes = Lanes::new(2, 2);
+    let selected = add(&mut lanes, 1, 1, true);
+    let binding = LaneBinding {
+        executor_id: 102,
+        receive_endpoint: 202,
+        reply_object: 302,
+    };
+    let running = lanes.allocate(binding).unwrap();
+    let mut wake = ResumeWake::new(10, 40).unwrap();
+    wake.reconcile(lanes.next_resumable().is_some(), 100);
+    lanes.begin_dispatch(running, binding.reply_object).unwrap();
+    // The native timer masks demand while physical execution is occupied; it must not
+    // reconcile a temporarily unselectable lane as absent work or acknowledge a timer query.
+    let timer_deadline = if lanes.execution_busy() {
+        None
+    } else {
+        wake.next_deadline()
+    };
+    assert_eq!(timer_deadline, None);
+    assert_eq!(wake.next_deadline(), Some(100));
+    lanes
+        .finish_dispatch(running, binding.reply_object)
+        .unwrap();
+    wake.reconcile(lanes.next_resumable().is_some(), 200);
+    assert_eq!(wake.next_deadline(), Some(100));
+    let mut ticket = wake.begin_pass(200).unwrap().unwrap();
+    let candidate = lanes.next_resumable().unwrap();
+    assert_eq!(candidate.lane, selected);
+    // A rejected claim leaves its canonical frame intact and earns a bounded retry.
+    assert!(lanes
+        .begin_resume(selected, 999, candidate.suspension.key)
+        .is_err());
+    wake.finish_pass(&mut ticket, 200, lanes.next_resumable().is_some(), false)
+        .unwrap();
+    assert_eq!(wake.next_deadline(), Some(210));
+}

@@ -35365,6 +35365,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         independent selection/boundary review pass. No boot rerun: the strict 27-import rejection
         remains the measured frontier, not desktop rendering. Native execution is intentionally
         not wired until the ready-work wake and no-borrow outer ownership described below exist.
+      - [x] Own selected-work wake demand and bounded retry pacing (2026-09-16).
+        ResumeWake in nt-component-suspension owns only scheduling demand and its deadline; all
+        continuations remain in the original lanes. Repeated canonical readiness scans preserve
+        an existing deadline, including its retry backoff. Timer deadline queries are read-only:
+        observing or unsuccessfully programming a timer cannot acknowledge pending work.
+        An exact globally unique, non-clone ticket claims one outer execution pass. Running passes
+        exclude reentry and hide their deadline; dropping a ticket retains uncertain ownership.
+        Only the exact finish can retire the pass, using a fresh post-terminal/repark work scan.
+        Productive passes with remaining work yield for a configured positive minimum interval;
+        refused/no-progress passes use bounded exponential retry delays. Reconciliation cannot
+        continually shorten or restart them. Work disappearing before entry cancels the deadline
+        and resets backoff. Exhausted identities or unrepresentable future deadlines fail without
+        discarding pending/active ownership or synthesizing an immediate retry.
+        Eight state-machine tests, two integration tests with real lane selection/claim/retirement,
+        and a compile-fail ticket-forgery check cover these contracts. Physical busy suppression
+        preserves demand until token release; new work outside a bounded pass earns a future wake.
+        This shared owner is not yet connected to the native timer source or execution loop.
+        Do not publish a native ready-work deadline until the outer consumer is installed, or it
+        would repeatedly wake without an execution owner. Serialized validation passes 1,302 tests
+        across 19 suites with no failures or ignored cases: .tmp/test-resume-wake-20260916.log.
+        Executive release passes in 41.01s with the same 302 warnings; standalone I/O Manager
+        release also passes. Evidence: .tmp/build-resume-wake-executive-20260916.log and
+        .tmp/build-resume-wake-io-manager-20260916.log. Scoped formatting and git diff --check pass.
+        No boot rerun: the measured strict 27-import frontier is unchanged.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: schedule selected kernel resumes alongside hosted work
         using the retained activation and physical channel without replaying initial entry. The
@@ -35377,11 +35401,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Wire the completed bounded pass and exact eligibility contracts above into one native
         caller-neutral execution owner. Borrowed legacy hosted drains must not skip an older
         eligible kernel candidate or execute nested work while the outer pass owns scheduling.
-        Supply an explicit ready-work wake/retry owner before enabling that pass: selection removes
-        waits from the arbiter, so its parked deadlines cannot wake selected work. A top-of-loop
-        pass alone strands immediate rewaits or work selected immediately before a blocking receive;
-        watchdog polling or perpetual immediate timer rearming is not a substitute. Cover wake
-        delivery/refusal, bounded retry, newly selected work and every receive barrier in tests.
+        Wire the shared ready-work wake/retry owner above before enabling that pass: selection
+        removes waits from the arbiter, so its parked deadlines cannot wake selected work. A
+        top-of-loop pass alone strands immediate rewaits or work selected before a blocking receive;
+        watchdog polling or perpetual immediate timer rearming is not a substitute. Add its
+        read-only deadline to delay_timer_next_deadline with a distinct source, without consuming
+        demand in nested timer hooks or treating rearm_registered_delay_timer's boolean as proof
+        that PIT programming succeeded. Temporarily suppress the source while a physical lane is
+        busy, but retain demand and guarantee reconcile/rearm after token release before receive.
+        Base successful-pass pacing on acknowledged execution/repark/retirement progress, not
+        merely scanning or claiming a candidate; otherwise persistent refusals evade backoff.
+        Cover native wake delivery/refusal, newly selected work and every receive barrier in tests.
         Pump only at an outer pre-reply/pre-receive boundary: no whole ExecNtHandler, PM, lane,
         activation, procs/pfilled slice or Event-backend reference may cross execution, because
         native services can reacquire published executive state through ExecLoopCtx. Casting a
