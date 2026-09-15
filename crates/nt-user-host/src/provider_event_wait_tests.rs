@@ -1,9 +1,8 @@
 use super::DispatcherState;
 use nt_component_suspension::{SuspensionCaller, SuspensionHostedClient};
 use nt_kernel_exec::{
-    acquire_provider_local_event_wait, consume_provider_event_wait, provider_event_wait_is_ready,
-    EventKind, EventLeaseId, EventLeaseKind, EventObjectError, EventObjectId, EventObjectOwner,
-    ProviderEventWaitError, TimeSnapshot,
+    provider_event_wait_is_ready, EventKind, EventLeaseId, EventLeaseKind, EventObjectError,
+    EventObjectId, EventObjectOwner, TimeSnapshot,
 };
 use nt_provider_wait::{
     ProviderDispatcherWaitAdmission, ProviderDispatcherWaitArbiter, ProviderDispatcherWaitBackend,
@@ -28,51 +27,71 @@ impl<'a> Backend<'a> {
     }
 }
 
+struct Backing;
+
+impl crate::provider_dispatcher_backend::ProviderEventBacking for Backing {
+    fn is_live_event(&self, _: u64) -> bool {
+        true
+    }
+
+    fn retire_event(
+        &mut self,
+        events: &mut nt_kernel_exec::EventStore,
+        retired: nt_kernel_exec::RetiredEventObject,
+    ) {
+        assert!(events.remove_existing(retired.native_identity));
+    }
+}
+
+impl Backend<'_> {
+    fn objects(
+        &mut self,
+    ) -> crate::provider_dispatcher_backend::ProviderDispatcherObjects<'_, Backing> {
+        crate::provider_dispatcher_backend::ProviderDispatcherObjects {
+            events: &mut self.state.events,
+            event_objects: &mut self.state.event_objects,
+            timers: self.state.provider_timers.as_mut(),
+            backing: Backing,
+            access: Some(
+                crate::provider_dispatcher_backend::ProviderDispatcherAccess::hosted(owner(), 2)
+                    .unwrap(),
+            ),
+        }
+    }
+}
+
 impl ProviderDispatcherWaitBackend for Backend<'_> {
-    type Lease = EventLeaseId;
-    type Error = ProviderEventWaitError;
+    type Lease = crate::provider_dispatcher_backend::ProviderDispatcherLease;
+    type Error = u32;
 
     fn acquire_dispatcher_wait(
         &mut self,
         owner: ProviderWaitOwner,
         object: ProviderWaitObject,
-    ) -> Result<EventLeaseId, Self::Error> {
-        let id = EventObjectId::from_wire_parts(object.object_id, object.object_generation).ok_or(
-            ProviderEventWaitError::Registry(EventObjectError::StaleObject),
-        )?;
-        let lease = acquire_provider_local_event_wait(
-            &mut self.state.event_objects,
-            &self.state.events,
-            id,
-            EventObjectOwner::provider(owner.provider_domain, owner.provider_generation),
-        )?;
-        self.last_acquired = Some(lease);
+    ) -> Result<Self::Lease, u32> {
+        let lease = self.objects().acquire_dispatcher_wait(owner, object)?;
+        let Self::Lease::Event(event) = lease else {
+            panic!("Event test acquired a Timer")
+        };
+        self.last_acquired = Some(event);
         Ok(lease)
     }
 
-    fn dispatcher_is_ready(&self, lease: EventLeaseId) -> bool {
-        provider_event_wait_is_ready(&self.state.event_objects, &self.state.events, lease)
-            .expect("acquired Event backing and lease must remain valid")
-    }
-
-    fn consume_ready_dispatcher(&mut self, lease: EventLeaseId) {
-        assert!(consume_provider_event_wait(
+    fn dispatcher_is_ready(&self, lease: Self::Lease) -> bool {
+        crate::provider_dispatcher_backend::dispatcher_lease_is_ready(
             &self.state.event_objects,
-            &mut self.state.events,
+            &self.state.events,
+            self.state.provider_timers.as_ref(),
             lease,
         )
-        .expect("acquired Event backing and lease must remain valid"));
     }
 
-    fn release_dispatcher_wait(&mut self, lease: EventLeaseId) {
-        if let Some(retired) = self
-            .state
-            .event_objects
-            .release_wait(lease, EventLeaseKind::ProviderWait)
-            .unwrap()
-        {
-            assert!(self.state.events.remove_existing(retired.native_identity));
-        }
+    fn consume_ready_dispatcher(&mut self, lease: Self::Lease) {
+        self.objects().consume_ready_dispatcher(lease);
+    }
+
+    fn release_dispatcher_wait(&mut self, lease: Self::Lease) {
+        self.objects().release_dispatcher_wait(lease);
     }
 }
 
@@ -270,7 +289,7 @@ fn missing_second_backing_rolls_back_admission_and_poll_without_consuming_first(
                 ProviderWaitTimeoutKind::Infinite
             },
         );
-        let error = ProviderDispatcherWaitError::Backend(ProviderEventWaitError::MissingBacking);
+        let error = ProviderDispatcherWaitError::Backend(0xC000_000D);
         if poll {
             assert_eq!(arbiter.poll(&mut backend, &wait, owner()), Err(error));
         } else {

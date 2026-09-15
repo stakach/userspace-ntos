@@ -3,23 +3,28 @@
 use super::*;
 use nt_user_host::provider_local_event_request::LocalEventRequest;
 
-pub(super) unsafe fn poll(
-    owner: nt_provider_wait::ProviderWaitOwner,
-    request: &nt_provider_wait::ProviderWaitRequest,
-) -> Result<i32, u32> {
+/// Keep canonical caller validation and Event access in one memory-local transaction. Project
+/// disjoint fields directly: forming a whole-handler reference would alias the retained PM.
+pub(super) unsafe fn with_dispatcher<R>(
+    operation: impl FnOnce(
+        &mut nt_process::ProcessManager,
+        &mut crate::provider_local_event::LocalEventState<'_>,
+    ) -> Result<R, u32>,
+) -> Result<R, u32> {
     let _durable = allocator::enter_durable();
-    let arbiter = &*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER);
     let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
-    if let Some(handler) = handler.as_mut() {
-        crate::provider_local_event::LocalEventState::new(
-            &mut handler.obj_ns,
-            &mut handler.anon_event_seq,
-            &mut handler.events,
-            &mut handler.event_objects,
-        )
-        .poll(arbiter, request, owner)
+    if handler.is_null() {
+        ps_bootstrap::with_process_manager(|pm| {
+            dispatcher_bootstrap::with_local_events(|state| operation(pm, state))
+        })
     } else {
-        dispatcher_bootstrap::with_local_events(|state| state.poll(arbiter, request, owner))
+        let mut state = crate::provider_local_event::LocalEventState::new(
+            &mut (*handler).obj_ns,
+            &mut (*handler).anon_event_seq,
+            &mut (*handler).events,
+            &mut (*handler).event_objects,
+        );
+        operation(&mut (*handler).pm, &mut state)
     }
 }
 

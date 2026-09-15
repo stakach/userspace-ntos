@@ -261,7 +261,7 @@ pub(super) unsafe fn service_event(
     result.unwrap_or_else(|status| (status as i32, 0, 0, 0))
 }
 
-/// Authenticate the current bound call before borrowing dispatcher state. Polling retains the
+/// Authenticate the current bound call while borrowing dispatcher state. Polling retains the
 /// Running activation and cannot publish a suspension or deliver another lane's continuation.
 pub(super) unsafe fn service_event_poll(
     channel: &spawn_hosts::PumpChannel,
@@ -270,7 +270,7 @@ pub(super) unsafe fn service_event_poll(
 ) -> i32 {
     let result = (|| {
         let caller = authenticated_channel_caller(channel)?;
-        with_provider_process_manager(|pm| {
+        event::with_dispatcher(|pm, state| {
             (&*core::ptr::addr_of!(ACTIVATIONS)).validate_event_poll(
                 caller,
                 pm,
@@ -279,9 +279,9 @@ pub(super) unsafe fn service_event_poll(
                 envelope,
                 win32k_subsystem::W32_PROVIDER_WAIT_LABEL << 12,
                 request,
-            )
-        })?;
-        event::poll(caller.owner(), request)
+            )?;
+            state.poll(&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER), request, caller.owner())
+        })
     })();
     result.unwrap_or_else(|status| status as i32)
 }

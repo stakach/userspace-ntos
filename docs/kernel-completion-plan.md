@@ -35237,6 +35237,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         scoped formatting and git diff --check pass. No boot was rerun; the latest verified
         frontier remains the strict 27-import rejection, not native readiness/repark acceptance
         or desktop rendering.
+      - [x] Borrow canonical dispatcher fields independently of native caller authentication (2026-09-15).
+        Event/Timer lease acquisition, readiness, consumption and release now use the host-testable
+        ProviderDispatcherObjects backend. It borrows original dispatcher fields and native
+        namespace backing, not ExecNtHandler or ProcessManager. Hosted admission retains live
+        provider/process validation on every acquisition; kernel scope remains exact-owner,
+        provider-local Events only, without projected process Events or Timer permission. A
+        selection-only backend cannot acquire new leases. The replaced hosted and kernel-poll
+        lease implementations are removed, and the native adapter lives in a focused module.
+        Native retirement and instrumentation remain memory-local with the existing backing and
+        reclaim protocol. Kernel Event polls validate and access backing in one durable
+        PM/dispatcher transaction, using disjoint live-handler field projections or original
+        bootstrap stores. No whole-handler reference aliases the retained ProcessManager.
+        Seven new backend tests cover complete owner mismatches, kernel scope restrictions,
+        projected process generation/pointer authority, missing namespace/backing, retained lease
+        retirement, mixed Event/Timer readiness and acquisition rollback. The existing six Event
+        tests and seven kernel admission/repark tests now use this production backend, replacing
+        their handwritten lease implementations. Final validation passes 1,251 tests across 18
+        suites with no failures or ignored cases: .tmp/test-borrowed-dispatcher-final-20260915.log.
+        Executive release passes in 37.30s with unchanged 303 warnings; standalone I/O Manager
+        passes without warnings. Evidence: .tmp/build-borrowed-dispatcher-executive-20260915.log
+        and .tmp/build-borrowed-dispatcher-io-manager-20260915.log. A release attempt accidentally
+        started during the earlier suite's documentation tests was stopped; final tests and both
+        successful release checks were rerun serially. Scoped formatting, git diff --check and
+        independent ownership review pass. No boot was rerun: this refactor does not enable
+        blocking or introduce a stopped-job scheduler, and the last measured boot remains the
+        strict 27-import rejection, not desktop rendering.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: give the stopped kernel job an actual readiness owner,
         then use the lease-backed initial/repark publication above rather than stacking another
@@ -35244,8 +35270,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         kernel-local terminal consumer above for genuine returns; preserve its exact recipient
         delivery and retirement/ACK rather than frame-free record_completion or a hosted reply.
         Wire the new selected-kernel execution entry only after readiness/repark ownership exists.
-        Adapt the native Event backend by borrowing only its original dispatcher fields; do not
-        retain a whole ExecNtHandler borrow alongside the canonical PM/activation transaction.
+        Use the field-borrowed backend above in the canonical PM/activation transaction; do not
+        retain a whole ExecNtHandler borrow alongside it. Existing native readiness selectors
+        still construct hosted provider completions: route by the actual retained caller kind
+        before admitting kernel waits. Bootstrap signaling still rejects observed Events until
+        this owner-aware wake selection and readiness scheduling are installed.
         Keep blocking admission disabled until real readiness scheduling and this ownership
         contract are both wired; Timer expiration and receive-endpoint fan-in remain necessary
         for asynchronous boot rather than being implied by successful synchronous Event polls.
@@ -35277,8 +35306,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         local terminal consumer is now wired as above. A kernel terminal
         recipient must preserve its real initiating caller and return contract, not deliver a
         CompletedWin32kDispatch to a hosted syscall reply.
-        Next blocking-admission dependency: the native Event/timer wait backend currently requires both
-        a hosted client and the live ExecNtHandler; DriverEntry precedes that handler. The intact
+        Next blocking-admission dependency: the native hosted wait admission adapter still requires
+        a hosted client and the live ExecNtHandler; DriverEntry precedes that handler. The shared
+        field-borrowed backend removes this object-access dependency, not the readiness owner.
+        The intact
         bootstrap dispatcher state checkpoint above replaces reconstruction, but early provider
         memory-local Event operations now use the authenticated route above. Live-handler SET/PULSE
         use shared exact-one arbitration; bootstrap SET/PULSE now validate the canonical

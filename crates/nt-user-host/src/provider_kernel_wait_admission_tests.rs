@@ -1,51 +1,35 @@
 use super::*;
 use crate::dispatcher_state::DispatcherState;
-use nt_kernel_exec::{
-    acquire_provider_local_event_wait, consume_provider_event_wait, provider_event_wait_is_ready,
-    EventKind, EventLeaseId, EventLeaseKind, EventObjectError, EventObjectId, EventObjectOwner,
-    ProviderEventWaitError, TimeSnapshot,
+use crate::provider_dispatcher_backend::{
+    ProviderDispatcherAccess, ProviderDispatcherLease, ProviderDispatcherObjects,
+    ProviderEventBacking,
 };
+use nt_kernel_exec::{EventKind, EventObjectOwner, EventStore, RetiredEventObject, TimeSnapshot};
 use nt_provider_wait::{
-    ProviderDispatcherWaitAdmission as Admission, ProviderDispatcherWaitArbiter,
-    ProviderDispatcherWaitBackend, ProviderWaitOwner,
+    ProviderDispatcherWaitAdmission as Admission, ProviderDispatcherWaitArbiter, ProviderWaitOwner,
 };
 
-struct Backend<'a>(&'a mut DispatcherState);
-impl ProviderDispatcherWaitBackend for Backend<'_> {
-    type Lease = EventLeaseId;
-    type Error = ProviderEventWaitError;
-    fn acquire_dispatcher_wait(
-        &mut self,
-        owner: ProviderWaitOwner,
-        object: ProviderWaitObject,
-    ) -> Result<EventLeaseId, Self::Error> {
-        let id = EventObjectId::from_wire_parts(object.object_id, object.object_generation).ok_or(
-            ProviderEventWaitError::Registry(EventObjectError::StaleObject),
-        )?;
-        acquire_provider_local_event_wait(
-            &mut self.0.event_objects,
-            &self.0.events,
-            id,
-            EventObjectOwner::provider(owner.provider_domain, owner.provider_generation),
-        )
+struct Backing;
+impl ProviderEventBacking for Backing {
+    fn is_live_event(&self, native_identity: u64) -> bool {
+        native_identity == 101
     }
-    fn dispatcher_is_ready(&self, lease: EventLeaseId) -> bool {
-        provider_event_wait_is_ready(&self.0.event_objects, &self.0.events, lease).unwrap()
+
+    fn retire_event(&mut self, events: &mut EventStore, retired: RetiredEventObject) {
+        assert!(events.remove_existing(retired.native_identity));
     }
-    fn consume_ready_dispatcher(&mut self, lease: EventLeaseId) {
-        assert!(
-            consume_provider_event_wait(&self.0.event_objects, &mut self.0.events, lease).unwrap()
-        );
-    }
-    fn release_dispatcher_wait(&mut self, lease: EventLeaseId) {
-        if let Some(retired) = self
-            .0
-            .event_objects
-            .release_wait(lease, EventLeaseKind::ProviderWait)
-            .unwrap()
-        {
-            assert!(self.0.events.remove_existing(retired.native_identity));
-        }
+}
+
+fn backend(
+    state: &mut DispatcherState,
+    owner: Option<ProviderWaitOwner>,
+) -> ProviderDispatcherObjects<'_, Backing> {
+    ProviderDispatcherObjects {
+        events: &mut state.events,
+        event_objects: &mut state.event_objects,
+        timers: state.provider_timers.as_mut(),
+        backing: Backing,
+        access: owner.map(|owner| ProviderDispatcherAccess::kernel_events(owner).unwrap()),
     }
 }
 
@@ -94,12 +78,12 @@ fn fixture(signaled: bool) -> (Fixture, DispatcherState) {
 fn admit(
     f: &mut Fixture,
     state: &mut DispatcherState,
-    arbiter: &mut ProviderDispatcherWaitArbiter<EventLeaseId>,
+    arbiter: &mut ProviderDispatcherWaitArbiter<ProviderDispatcherLease>,
     sequence: u64,
 ) -> Result<
     Admission,
     (
-        KernelProviderWaitAdmissionError<ProviderEventWaitError>,
+        KernelProviderWaitAdmissionError<u32>,
         KernelProviderWaitCapture,
     ),
 > {
@@ -109,7 +93,7 @@ fn admit(
         &f.catalog,
         &mut f.lanes,
         arbiter,
-        &mut Backend(state),
+        &mut backend(state, Some(f.caller.owner())),
         f.capture,
         sequence,
         now(),
@@ -162,13 +146,13 @@ fn next_capture_with(
 fn repark(
     f: &mut Fixture,
     state: &mut DispatcherState,
-    arbiter: &mut ProviderDispatcherWaitArbiter<EventLeaseId>,
+    arbiter: &mut ProviderDispatcherWaitArbiter<ProviderDispatcherLease>,
     next: KernelProviderWaitCapture,
     sequence: u64,
 ) -> Result<
     (Admission, KernelProviderWaitCapture),
     (
-        KernelProviderWaitAdmissionError<ProviderEventWaitError>,
+        KernelProviderWaitAdmissionError<u32>,
         KernelProviderWaitCapture,
     ),
 > {
@@ -178,7 +162,7 @@ fn repark(
         &f.catalog,
         &mut f.lanes,
         arbiter,
-        &mut Backend(state),
+        &mut backend(state, Some(f.caller.owner())),
         f.capture,
         next,
         sequence,
@@ -218,7 +202,7 @@ fn first_wait_publishes_real_event_readiness_and_keeps_original_recipient() {
             assert_eq!(frame.phase, SuspensionPhase::Waiting);
             assert_eq!(state.event_objects.live_lease_count(), 1);
             assert_eq!(state.events.set_existing(101), Some(false));
-            let ready = arbiter.pop_ready(&mut Backend(&mut state)).unwrap();
+            let ready = arbiter.pop_ready(&mut backend(&mut state, None)).unwrap();
             assert_eq!(ready.owner, f.caller.owner());
             assert_eq!(ready.admission_sequence, 1);
             f.lanes.select(f.capture.key(), ready.status).unwrap();
@@ -419,7 +403,7 @@ fn foreign_manager_or_offered_continuation_cannot_publish_the_captured_wait() {
                 &f.catalog,
                 &mut f.lanes,
                 &mut arbiter,
-                &mut Backend(&mut state),
+                &mut backend(&mut state, Some(f.caller.owner())),
                 f.capture,
                 1,
                 now(),
