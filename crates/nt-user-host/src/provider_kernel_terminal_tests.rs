@@ -4,12 +4,7 @@ use nt_component_suspension::TerminalPhase;
 type TerminalLanes = ComponentSuspensionLanes<u64, i32, u64>;
 const STATUS: u32 = 0xc000_0001;
 const PAYLOAD: u64 = 0x1234;
-const STAGES: [TerminalStage; 4] = [
-    TerminalStage::Output,
-    TerminalStage::Context,
-    TerminalStage::Publication,
-    TerminalStage::Reply,
-];
+const STAGES: [TerminalStage; 1] = [TerminalStage::LocalDelivery];
 
 struct Fixture {
     pm: ProcessManager,

@@ -272,12 +272,7 @@ fn pending_terminal_freezes_destination_until_exact_terminal_retirement_and_ack(
         .activations
         .release_with_recipient(caller, &mut f.pm)
         .is_err());
-    for stage in [
-        TerminalStage::Output,
-        TerminalStage::Context,
-        TerminalStage::Publication,
-        TerminalStage::Reply,
-    ] {
+    for stage in [TerminalStage::LocalDelivery] {
         let mut attempt = f
             .lanes
             .begin_terminal_stage(terminal, reply, stage)

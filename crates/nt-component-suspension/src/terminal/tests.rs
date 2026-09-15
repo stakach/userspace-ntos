@@ -3,6 +3,9 @@ use super::*;
 #[path = "handoff_tests.rs"]
 mod handoff_tests;
 
+#[path = "local_delivery_tests.rs"]
+mod local_delivery_tests;
+
 type Lanes = ComponentSuspensionLanes<u64, u32, u64>;
 
 fn owner(id: u64) -> SuspensionOwner {

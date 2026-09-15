@@ -46,6 +46,18 @@ impl NativeTerminal {
         payload
     }
 
+    pub(super) fn kernel_result(
+        &self,
+    ) -> Option<(nt_user_host::provider_kernel_activation::KernelProviderCaller, u32)> {
+        match self.returned {
+            NativeReturn::Kernel { caller, status }
+                if self.status == status as u64
+                    && self.rejected_repark.is_none()
+                    && self.callback.is_none() => Some((caller, status)),
+            _ => None,
+        }
+    }
+
     fn metadata(&self) -> Self {
         Self {
             returned: self.returned,
@@ -273,6 +285,7 @@ pub(super) unsafe fn drain(
         );
         match phase {
             TerminalPhase::Ready { stage, .. } => {
+                assert_ne!(stage, TerminalStage::LocalDelivery, "hosted terminal cannot acknowledge local delivery");
                 let mut attempt = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                     .begin_terminal_stage(identity, reply_object, stage)
                     .expect("terminal stage changed before entry");
@@ -291,6 +304,7 @@ pub(super) unsafe fn drain(
                         let reply = continuation.return_target.delivery()
                             .expect("retiring target cannot transfer a callback");
                         match stage {
+                            TerminalStage::LocalDelivery => unreachable!("hosted callback cannot use kernel-local delivery"),
                             TerminalStage::Output => callback.prepare(),
                             TerminalStage::Context => callback.install(),
                             TerminalStage::Publication => callback.publish(),
@@ -337,6 +351,7 @@ pub(super) unsafe fn drain(
                     let reply = continuation.return_target.delivery()
                         .expect("retiring target cannot deliver a terminal result");
                     match stage {
+                        TerminalStage::LocalDelivery => unreachable!("hosted return cannot use kernel-local delivery"),
                         TerminalStage::Context => match reply {
                             HostedReply::Syscall { .. } => true,
                             HostedReply::Callback { context, .. } => {

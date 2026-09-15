@@ -117,6 +117,22 @@ impl DriverEntryRecipient {
         self.observation
     }
 
+    pub(super) fn deliver_terminal_return(
+        &mut self,
+        terminal: nt_component_suspension::TerminalIdentity,
+        status: u32,
+    ) -> Result<(), u32> {
+        self.wait.deliver_terminal_return(terminal, status)
+    }
+
+    pub(super) fn delivered_terminal_return(
+        &self,
+        terminal: nt_component_suspension::TerminalIdentity,
+        status: u32,
+    ) -> bool {
+        self.wait.delivered_terminal_return(terminal, status)
+    }
+
     pub(super) fn retain_provider_wait(
         &mut self,
         request: nt_provider_wait::ProviderWaitRequest,

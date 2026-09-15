@@ -60,7 +60,7 @@ pub(crate) enum DriverEntryWaitOutcome {
 }
 
 /// Readiness must select the real typed frame before this entry. Admission remains disabled
-/// until dispatcher leases, repeated-wait admission and kernel terminal delivery are wired.
+/// until dispatcher leases, readiness and repeated-wait admission are wired.
 pub(crate) unsafe fn run_driver_entry_wait_resume(
     caller: KernelProviderCaller,
     capture: KernelProviderWaitCapture,

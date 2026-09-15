@@ -5,7 +5,7 @@ use crate::provider_kernel_pump::{
     KernelProviderPumpAttempt, KernelProviderPumpDisposition, KernelProviderPumpFacts,
     KernelProviderPumpProgress, PumpProgressError,
 };
-use nt_component_suspension::SuspensionResume;
+use nt_component_suspension::{SuspensionResume, TerminalIdentity};
 use nt_process::STATUS_INVALID_PARAMETER;
 use nt_provider_wait::ProviderWaitRequest;
 
@@ -24,6 +24,7 @@ pub struct KernelProviderWaitState {
     progress: KernelProviderPumpProgress,
     wait: Option<WaitObservation>,
     active_resume: Option<KernelProviderWaitCapture>,
+    delivered_return: Option<(TerminalIdentity, u32)>,
 }
 
 pub trait KernelProviderWaitRecipient {
@@ -53,6 +54,7 @@ impl KernelProviderWaitState {
             progress: KernelProviderPumpProgress::new(reply_cap)?,
             wait: None,
             active_resume: None,
+            delivered_return: None,
         })
     }
 
@@ -122,6 +124,34 @@ impl KernelProviderWaitState {
     /// It is distinct from that new stopped request until the next canonical resume is claimed.
     pub(crate) fn active_resume(&self) -> Option<KernelProviderWaitCapture> {
         self.active_resume
+    }
+
+    /// Copy the observed native return into this original recipient's terminal destination.
+    /// The canonical activation must authenticate an entered local-delivery ticket first.
+    /// Every refusal precedes mutation, so the native adapter can report NoEffects on error.
+    pub fn deliver_terminal_return(
+        &mut self,
+        terminal: TerminalIdentity,
+        status: u32,
+    ) -> Result<(), u32> {
+        let capture = self.active_resume.ok_or(STATUS_INVALID_PARAMETER)?;
+        if self.progress.disposition() != Some(KernelProviderPumpDisposition::Returned(status))
+            || self.wait.is_some()
+            || terminal.owner() != capture.owner()
+            || terminal.key() != capture.key()
+            || terminal.external_token().is_some()
+            || self
+                .delivered_return
+                .is_some_and(|delivered| delivered != (terminal, status))
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.delivered_return = Some((terminal, status));
+        Ok(())
+    }
+
+    pub fn delivered_terminal_return(&self, terminal: TerminalIdentity, status: u32) -> bool {
+        self.delivered_return == Some((terminal, status))
     }
 
     pub fn rejected_wait(&self) -> Option<(&ProviderWaitRequest, u32)> {

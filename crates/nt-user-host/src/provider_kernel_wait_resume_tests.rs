@@ -14,6 +14,8 @@ use nt_provider_wait::{
 
 #[path = "provider_kernel_wait_execution_tests.rs"]
 mod execution;
+#[path = "provider_kernel_local_delivery_tests.rs"]
+mod local_delivery;
 
 struct Recipient {
     state: KernelProviderWaitState,
@@ -526,12 +528,7 @@ fn repeated_waits_return_only_through_terminal_retirement_and_exact_ack() {
     assert!(f.activations.recipient_mut(f.caller).is_err());
     assert!(f.activations.completion(f.caller).is_err());
     assert_eq!(references(&f.pm, f.caller.thread()), (1, 1));
-    for stage in [
-        TerminalStage::Output,
-        TerminalStage::Context,
-        TerminalStage::Publication,
-        TerminalStage::Reply,
-    ] {
+    for stage in [TerminalStage::LocalDelivery] {
         let mut stage_attempt = f
             .lanes
             .begin_terminal_stage(terminal, reply, stage)

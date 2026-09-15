@@ -177,12 +177,7 @@ fn terminal_pending_is_invisible_until_exact_terminal_retirement() {
         .unwrap();
     let mut cursor = f.activations.completion_cursor();
     assert_eq!(f.activations.next_ready_completion(&mut cursor), None);
-    for stage in [
-        TerminalStage::Output,
-        TerminalStage::Context,
-        TerminalStage::Publication,
-        TerminalStage::Reply,
-    ] {
+    for stage in [TerminalStage::LocalDelivery] {
         let mut attempt = f
             .lanes
             .begin_terminal_stage(terminal, reply, stage)

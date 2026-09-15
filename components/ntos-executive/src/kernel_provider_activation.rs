@@ -13,6 +13,8 @@ mod bootstrap;
 mod event;
 #[path = "kernel_provider_resume.rs"]
 pub(super) mod resume;
+#[path = "kernel_provider_terminal.rs"]
+mod terminal;
 use bootstrap::{DriverEntryCompletion, DriverEntryRecipient};
 
 static mut ACTIVATIONS: KernelProviderActivations<DriverEntryRecipient> =
@@ -443,18 +445,26 @@ pub(crate) unsafe fn deliver_driver_entry_completion(
     }
 }
 
-/// Retry only genuine Ready receipts, once per bounded pass. Never invoke this from a nested
-/// pump timer hook: it may initialize providers and is an outer scheduler-boundary operation.
+/// Deliver retained kernel terminals and genuine Ready receipts, once per bounded pass.
+/// Never invoke from a nested pump timer hook: initialization belongs to the outer scheduler.
 pub(super) unsafe fn redrive_ready_completions() {
     let mut cursor = (&*core::ptr::addr_of!(ACTIVATIONS)).completion_cursor();
-    let Some(mut receipt) = (&*core::ptr::addr_of!(ACTIVATIONS)).next_ready_completion(&mut cursor)
-    else {
+    if (&*core::ptr::addr_of!(ACTIVATIONS)).next_ready_completion(&mut cursor).is_none()
+        && !terminal::has_ready()
+    {
         return;
-    };
+    }
     let Ok(pass) = CompletionDeliveryPass::enter() else {
         return;
     };
     let _durable = allocator::enter_durable();
+    terminal::drain();
+    // Terminal retirement can publish an older activation than the initial readiness probe.
+    cursor = (&*core::ptr::addr_of!(ACTIVATIONS)).completion_cursor();
+    let Some(mut receipt) = (&*core::ptr::addr_of!(ACTIVATIONS)).next_ready_completion(&mut cursor)
+    else {
+        return;
+    };
     loop {
         if let Err(status) = pass.deliver(receipt) {
             report_deferred(receipt, status);

@@ -35168,13 +35168,47 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         review and git diff --check pass. No boot was rerun: the latest measured frontier remains
         the 27-import rejection above. These tests/builds do not prove native resume execution,
         readiness/repark/terminal ACK, DriverEntry completion or desktop rendering.
+      - [x] Deliver native kernel terminals to their original local recipient (2026-09-15).
+        The core terminal state machine now distinguishes LocalDelivery from the existing
+        Output/Context/Publication/Reply protocol. A real local-delivery ACK goes directly to
+        Acknowledged; kernel jobs no longer acknowledge fictitious hosted stages. Existing
+        hosted and callback terminals retain their full protocol and reject LocalDelivery.
+        Kernel terminal retention selects the local protocol. with_terminal_recipient validates
+        the canonical PM, retained caller, exact pending terminal and unconsumed LocalDelivery
+        attempt before exposing the original recipient and payload for memory-local work.
+        The ordinary recipient_mut guard remains closed throughout terminal processing.
+        DriverEntry's recipient accepts only its actual observed return and active wait origin,
+        preserving an exact terminal/status delivery record. Wrong status, wrong ownership and
+        unobserved returns have no effects; an identical delivery is idempotent. The native drain
+        checks the typed kernel payload and delivers locally before recording ACK. It retires
+        only the exact acknowledged frame with matching delivery evidence, then the existing
+        Ready completion pass owns initialization and final Ps-reference acknowledgment.
+        No hosted reply, callback context, shared-bank reread or frame-free completion is used.
+        The bounded drain runs inside the real outer completion-delivery guard; failed local
+        attempts move its cursor forward while retaining ownership, and uncertain or dropped
+        attempts remain ineligible for replay. No global state borrow crosses transfer cleanup
+        or readiness initialization. Readiness/admission still cannot construct a production
+        kernel wait frame, so this completes the terminal consumer, not blocking execution or
+        native terminal acceptance in a VM. Five core tests exercise local-only sequencing,
+        full-protocol separation, busy fencing, stale tickets, failed retirement, no-effects
+        retry and lost/uncertain ACK. Five integration tests exercise the real observed status,
+        exact pending recipient access, canonical authority rejection, caller/provider exit
+        and original bank/Ps-reference retention through local delivery, retirement and final ACK.
+        Earlier kernel terminal tests now use the actual local protocol; hosted protocol tests
+        remain unchanged. Final serialized validation passes 1,231 tests across 17 suites with
+        no failures or ignored cases: .tmp/test-kernel-local-delivery-final-20260915.log.
+        Executive release passes in 39.00s with the unchanged 303 warnings; standalone I/O Manager
+        passes without warnings. Evidence: .tmp/build-kernel-local-delivery-executive-20260915.log
+        and .tmp/build-kernel-local-delivery-io-manager-20260915.log. Scoped formatting and
+        git diff --check pass. No boot was rerun; the latest measured boot remains the strict
+        27-import rejection above, not native kernel-wait acceptance or desktop rendering.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: give the stopped kernel job an actual readiness owner,
         then repark a repeated request through rearm_running_owned rather than stacking another
-        frame over the old Resuming wait. Preserve both continuations on failed repark. Complete
-        kernel-local terminal stages and exact retirement/ACK from the retained active-frame return
-        above, delivering only to the original kernel recipient, never frame-free record_completion
-        or a hosted reply. Wire the new selected-kernel execution entry only after these contracts.
+        frame over the old Resuming wait. Preserve both continuations on failed repark. Use the
+        kernel-local terminal consumer above for genuine returns; preserve its exact recipient
+        delivery and retirement/ACK rather than frame-free record_completion or a hosted reply.
+        Wire the new selected-kernel execution entry only after readiness/repark ownership exists.
         Keep blocking admission disabled until real readiness scheduling and this ownership
         contract are both wired; Timer expiration and receive-endpoint fan-in remain necessary
         for asynchronous boot rather than being implied by successful synchronous Event polls.
@@ -35202,7 +35236,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         PendingComponentDispatch plus HostedReturnTarget, while ComponentNativeContinuation::Kernel
         holds KernelProviderWaitCapture with the real caller and validated owned request snapshot.
         That Kernel variant is preparatory and has no production lane-admission constructor yet;
-        hosted selectors and terminal processing explicitly exclude it. A kernel terminal
+        hosted selectors and hosted terminal processing explicitly exclude it; the separate
+        local terminal consumer is now wired as above. A kernel terminal
         recipient must preserve its real initiating caller and return contract, not deliver a
         CompletedWin32kDispatch to a hosted syscall reply.
         Next blocking-admission dependency: the native Event/timer wait backend currently requires both
@@ -35237,7 +35272,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         lane becomes Idle during retirement, so do not call frame-free record_completion afterward
         or weaken that method's active-frame guard. Native local effects must authenticate the
         pending terminal and observe Acknowledged before retiring authority, release all global
-        borrows before ticketed terminal mechanism calls, then finish through the exact core
+        borrows before external terminal mechanism calls, then finish through the exact core
         terminal wrapper. Its local-retirement result is local bookkeeping only; do not report
         uncertain external effects as retryable local errors.
         DriverEntry now retains its real channel/observed outcome/destination alongside the kernel

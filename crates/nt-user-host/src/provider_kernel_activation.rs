@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use nt_component_suspension::{
     ComponentSuspensionLanes, LaneBinding, LaneDispatchIdentity, LaneError, LaneHandle, LanePhase,
     RetiredTerminal, SuspensionCaller, SuspensionKey, SuspensionOwner, SuspensionPhase,
-    SuspensionResume, TerminalIdentity, TerminalPhase,
+    SuspensionResume, TerminalAttempt, TerminalIdentity, TerminalPhase, TerminalStage,
 };
 use nt_process::{
     native_handle::{NativeHandleCaller, NativeThreadProcessReference},
@@ -555,6 +555,7 @@ impl<D> KernelProviderActivations<D> {
 
     /// Retain an observed return from the final resumed suspension and its terminal authority
     /// together. The adapter supplies the actual return status, not the wait selection result.
+    /// Kernel recipients use one explicit local-delivery stage, not hosted context/Reply stages.
     /// No new frame or external token is manufactured; nested work must finish first. Rejection
     /// returns the owned payload, leaving both activation and source suspension unchanged.
     pub fn retain_terminal_completion<C, R, T>(
@@ -583,7 +584,7 @@ impl<D> KernelProviderActivations<D> {
             .find(|row| row.caller == caller)
             .expect("validated activation disappeared before terminal retention");
         let terminal = lanes
-            .retain_terminal_running(
+            .retain_local_terminal_running(
                 lane,
                 caller.binding.reply_object,
                 key,
@@ -632,6 +633,37 @@ impl<D> KernelProviderActivations<D> {
             .terminal(terminal, caller.binding.reply_object)
             .map_err(|_| STATUS_INVALID_HANDLE)?;
         Ok(())
+    }
+
+    /// Access the original destination only under its exact entered local-delivery ticket.
+    /// This closure is memory-local: do not perform IPC, scheduler work or replace the recipient.
+    /// Returning an error from the closure does not itself classify or acknowledge its effects.
+    pub fn with_terminal_recipient<C, R, T, O>(
+        &mut self,
+        caller: KernelProviderCaller,
+        pm: &ProcessManager,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        terminal: TerminalIdentity,
+        attempt: &TerminalAttempt,
+        deliver: impl FnOnce(&mut D, &mut T, u32) -> O,
+    ) -> Result<O, u32> {
+        self.validate_terminal_completion(caller, pm, lanes, terminal)?;
+        if attempt.identity() != terminal || attempt.stage() != TerminalStage::LocalDelivery {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let row = self
+            .rows
+            .iter_mut()
+            .find(|row| row.caller == caller)
+            .expect("validated terminal destination disappeared");
+        let Some(Completion::TerminalPending { status, .. }) = row.completion else {
+            unreachable!("validated terminal destination lost its result");
+        };
+        lanes
+            .with_terminal_payload(attempt, caller.binding.reply_object, |payload| {
+                deliver(&mut row.recipient, payload, status)
+            })
+            .map_err(|_| STATUS_INVALID_HANDLE)
     }
 
     /// Publish a deliverable receipt only after exact terminal retirement. Before performing

@@ -36,6 +36,8 @@ pub enum TerminalStage {
     Context,
     Publication,
     Reply,
+    /// Deliver to an executive-local recipient; no hosted context or Reply is involved.
+    LocalDelivery,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +84,17 @@ pub struct TerminalAttempt {
     consumed: bool,
 }
 
+impl TerminalAttempt {
+    /// Routing metadata only; the coordinator still authenticates the outstanding ticket.
+    pub const fn identity(&self) -> TerminalIdentity {
+        self.identity
+    }
+
+    pub const fn stage(&self) -> TerminalStage {
+        self.stage
+    }
+}
+
 pub struct TerminalView<'a, C, R, T> {
     pub frame: &'a SuspensionFrame<C, R>,
     pub payload: &'a T,
@@ -120,7 +133,20 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         payload: T,
     ) -> Result<TerminalIdentity, (LaneError, T)> {
-        self.retain_running(handle, reply_object, key, owner, None, payload)
+        self.retain_running(handle, reply_object, key, owner, None, TerminalStage::Output, payload)
+    }
+
+    /// Retain a returned result whose sole mechanism is delivery to a local recipient.
+    /// Its exact ticket must be acknowledged before the original frame can be retired.
+    pub fn retain_local_terminal_running(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        key: SuspensionKey,
+        owner: SuspensionOwner,
+        payload: T,
+    ) -> Result<TerminalIdentity, (LaneError, T)> {
+        self.retain_running(handle, reply_object, key, owner, None, TerminalStage::LocalDelivery, payload)
     }
 
     /// Retain a callback transfer without releasing its original native reply or suspension.
@@ -137,7 +163,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         if token == 0 {
             return Err((LaneError::InvalidIdentity, payload));
         }
-        self.retain_running(handle, reply_object, key, owner, Some(token), payload)
+        self.retain_running(handle, reply_object, key, owner, Some(token), TerminalStage::Output, payload)
     }
 
     fn retain_running(
@@ -147,6 +173,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         key: SuspensionKey,
         owner: SuspensionOwner,
         external_token: Option<u64>,
+        first_stage: TerminalStage,
         payload: T,
     ) -> Result<TerminalIdentity, (LaneError, T)> {
         let identity = match self.validate_terminal_retention(handle, reply_object, key, owner, external_token) {
@@ -158,7 +185,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             identity,
             payload,
             phase: TerminalPhase::Ready {
-                stage: TerminalStage::Output,
+                stage: first_stage,
                 last_error: None,
             },
             next_attempt: 1,
@@ -474,6 +501,7 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
 fn next_phase(stage: TerminalStage, outcome: TerminalStageOutcome) -> TerminalPhase {
     match outcome {
         TerminalStageOutcome::Acknowledged => match stage {
+            TerminalStage::LocalDelivery => TerminalPhase::Acknowledged { local_error: None },
             TerminalStage::Output => TerminalPhase::Ready {
                 stage: TerminalStage::Context,
                 last_error: None,
