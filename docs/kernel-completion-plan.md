@@ -35130,13 +35130,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         remains the 27-import rejection above, before DriverEntry or this resume path can execute.
         The native claim adapter is preparatory: no production blocking admission or resume pump
         caller exists yet. Host terminal tests do not establish native repark or terminal delivery.
+      - [x] Implement the retained native kernel wait execution entry (2026-09-15).
+        A focused kernel_provider_resume module consumes the canonical nonclone claim, changes
+        DriverEntry's receive-only initial channel to ReplyRequest, publishes the selected wait
+        result and invokes the actual provider-wait resume transport. No hosted context, callback
+        header or CompletedWin32kDispatch is manufactured. Shared validate_wait_execution checks
+        the live canonical caller, exact Running dispatch, Resuming top/capture, recipient's
+        active resume origin and unobserved pump nonce before effects. The active origin survives
+        fresh IRQ receive tickets: even a matching stale frame/capture pair cannot substitute an
+        older observation after a wait ID is reused. Initial and resumed entry share the same
+        receive-after-yield loop, with observations retained before scheduler work and exact
+        execution revalidation afterward, with no PM/activation/lane borrow across IPC.
+        ComponentPumpAccounting now retains whether a suspension transferred dispatch depth.
+        Kernel resume carries the original cumulative fault/demand accounting instead of resetting
+        it or unconditionally decrementing SUSPENDED_COMPONENT_OUTSTANDING. Receive-first
+        DriverEntry owns no counted depth, so repeated waits must neither underflow that counter
+        nor acquire fake depth. Existing hosted resume entry points remain unchanged.
+        Pump observation/capture is separate from frame-free initial completion. A genuine
+        resumed SH_DE_STATUS return is retained with a typed kernel payload through the existing
+        active-frame terminal contract. Hosted terminal delivery explicitly rejects that payload.
+        Repeated physical waits retain their new capture in the recipient while the old Resuming
+        frame remains owned; no unleased repark or synthetic readiness is introduced.
+        This entry is preparatory and has no production selector/admission caller. Kernel terminal
+        ACK/delivery and dispatcher-backed repeated-wait repark are still outstanding below;
+        merely returning a terminal identity or next capture is not their completion.
+        Eight new execution-validation tests cover selected/cancelled execution, stale/foreign
+        attempts, yielded receive, changed frames, canonical authority loss and reused wait IDs,
+        including the paired stale-frame/capture regression found during independent review.
+        Three accounting tests cover repeated counted/uncounted waits, cumulative diagnostics
+        and rejection of active/finished snapshots. Final serialized validation passes 1,221 tests
+        across 17 suites with no failures or ignored cases:
+        .tmp/test-kernel-wait-execution-final-20260915.log. Executive release passes in 39.08s
+        with 303 warnings (seven additional unused-code warnings for this gated native surface);
+        standalone I/O Manager passes without warnings. Build evidence:
+        .tmp/build-kernel-wait-execution-executive-20260915.log and
+        .tmp/build-kernel-wait-execution-io-manager-20260915.log. Scoped formatting, independent
+        review and git diff --check pass. No boot was rerun: the latest measured frontier remains
+        the 27-import rejection above. These tests/builds do not prove native resume execution,
+        readiness/repark/terminal ACK, DriverEntry completion or desktop rendering.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
-        Next whole native execution slice: consume the owned resume ticket through the real
-        selected-kernel pump, revalidate after scheduling before effects, preserve the Reply/shared
-        bank across IRQ yields, and repark a repeated request through rearm_running_owned rather
-        than stacking another frame over the old Resuming wait. Preserve both continuations on
-        failed repark. A genuine resumed return must use retained active-frame terminal completion
-        and the original kernel recipient, never frame-free record_completion or a hosted reply.
+        Next whole native ownership slice: give the stopped kernel job an actual readiness owner,
+        then repark a repeated request through rearm_running_owned rather than stacking another
+        frame over the old Resuming wait. Preserve both continuations on failed repark. Complete
+        kernel-local terminal stages and exact retirement/ACK from the retained active-frame return
+        above, delivering only to the original kernel recipient, never frame-free record_completion
+        or a hosted reply. Wire the new selected-kernel execution entry only after these contracts.
         Keep blocking admission disabled until real readiness scheduling and this ownership
         contract are both wired; Timer expiration and receive-endpoint fan-in remain necessary
         for asynchronous boot rather than being implied by successful synchronous Event polls.

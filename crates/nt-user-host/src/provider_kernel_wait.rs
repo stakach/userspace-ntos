@@ -23,6 +23,7 @@ enum WaitObservation {
 pub struct KernelProviderWaitState {
     progress: KernelProviderPumpProgress,
     wait: Option<WaitObservation>,
+    active_resume: Option<KernelProviderWaitCapture>,
 }
 
 pub trait KernelProviderWaitRecipient {
@@ -51,6 +52,7 @@ impl KernelProviderWaitState {
         Ok(Self {
             progress: KernelProviderPumpProgress::new(reply_cap)?,
             wait: None,
+            active_resume: None,
         })
     }
 
@@ -116,6 +118,12 @@ impl KernelProviderWaitState {
         }
     }
 
+    /// The entered frame's origin survives IRQ receive tickets and a subsequent physical wait.
+    /// It is distinct from that new stopped request until the next canonical resume is claimed.
+    pub(crate) fn active_resume(&self) -> Option<KernelProviderWaitCapture> {
+        self.active_resume
+    }
+
     pub fn rejected_wait(&self) -> Option<(&ProviderWaitRequest, u32)> {
         match &self.wait {
             Some(WaitObservation::Rejected { request, status }) => Some((request, *status)),
@@ -142,6 +150,7 @@ impl KernelProviderWaitState {
         assert_eq!(self.captured_wait(), Some(capture));
         self.progress
             .commit_provider_wait_resume(capture.observation(), attempt);
+        self.active_resume = Some(capture);
         self.wait = None;
     }
 }

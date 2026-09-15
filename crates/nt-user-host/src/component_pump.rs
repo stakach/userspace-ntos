@@ -10,11 +10,18 @@ pub enum PumpDepthDisposition {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccountingPhase {
+    Active { owns_depth: bool },
+    Suspended { transferred_depth: bool },
+    Finished,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ComponentPumpAccounting {
     faults: u64,
     demand: u64,
     assert_skips: u64,
-    owns_depth: bool,
+    phase: AccountingPhase,
 }
 
 impl ComponentPumpAccounting {
@@ -23,7 +30,7 @@ impl ComponentPumpAccounting {
             faults: 0,
             demand: 0,
             assert_skips: 0,
-            owns_depth,
+            phase: AccountingPhase::Active { owns_depth },
         }
     }
 
@@ -40,7 +47,21 @@ impl ComponentPumpAccounting {
     }
 
     pub const fn owns_depth(self) -> bool {
-        self.owns_depth
+        matches!(self.phase, AccountingPhase::Active { owns_depth: true })
+    }
+
+    /// Carry diagnostics into a genuine resumed suspension. The returned flag says whether
+    /// its suspended-depth diagnostic must be consumed; an uncounted bootstrap wait returns
+    /// Some(false). Snapshot metadata is not execution authority: the caller must own a unique
+    /// resume claim before applying this transition or its diagnostic effect.
+    pub fn resume_suspended(&mut self) -> Option<bool> {
+        let AccountingPhase::Suspended { transferred_depth } = self.phase else {
+            return None;
+        };
+        self.phase = AccountingPhase::Active {
+            owns_depth: transferred_depth,
+        };
+        Some(transferred_depth)
     }
 
     pub fn record_fault(&mut self) {
@@ -63,17 +84,32 @@ impl ComponentPumpAccounting {
         scheduler_yielded: bool,
         component_suspended: bool,
     ) -> PumpDepthDisposition {
-        if !self.owns_depth {
+        let AccountingPhase::Active { owns_depth } = self.phase else {
             return PumpDepthDisposition::None;
-        }
+        };
         if scheduler_yielded {
-            return PumpDepthDisposition::Retained;
+            return if owns_depth {
+                PumpDepthDisposition::Retained
+            } else {
+                PumpDepthDisposition::None
+            };
         }
-        self.owns_depth = false;
         if component_suspended {
-            PumpDepthDisposition::Suspended
+            self.phase = AccountingPhase::Suspended {
+                transferred_depth: owns_depth,
+            };
+            if owns_depth {
+                PumpDepthDisposition::Suspended
+            } else {
+                PumpDepthDisposition::None
+            }
         } else {
-            PumpDepthDisposition::Released
+            self.phase = AccountingPhase::Finished;
+            if owns_depth {
+                PumpDepthDisposition::Released
+            } else {
+                PumpDepthDisposition::None
+            }
         }
     }
 }

@@ -1,6 +1,6 @@
 //! Root-owned kernel provider activations, independent of hosted callback headers.
 
-use crate::provider_kernel_pump::KernelProviderPumpProgress;
+use crate::provider_kernel_pump::{KernelProviderPumpAttempt, KernelProviderPumpProgress};
 use crate::provider_kernel_pump::{KernelProviderPumpObservation, PumpProgressError};
 use crate::provider_kernel_wait::{
     KernelProviderWaitContinuation, KernelProviderWaitRecipient, KernelProviderWaitResume,
@@ -485,6 +485,45 @@ impl<D> KernelProviderActivations<D> {
             attempt,
             selection,
         })
+    }
+
+    /// Revalidate a claimed wait entry after scheduler work, before touching the bank or Reply.
+    /// A live Running activation alone is insufficient: the exact Resuming frame and the
+    /// recipient's unique unobserved attempt must still belong to this capture.
+    pub fn validate_wait_execution<C, R, T>(
+        &mut self,
+        caller: KernelProviderCaller,
+        pm: &ProcessManager,
+        catalog: &ProviderDomainCatalog,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        capture: KernelProviderWaitCapture,
+        attempt: &KernelProviderPumpAttempt,
+    ) -> Result<(), u32>
+    where
+        C: KernelProviderWaitContinuation,
+        D: KernelProviderWaitRecipient,
+    {
+        self.validate(caller, pm, catalog, lanes)?;
+        let frame = lanes
+            .top(caller.dispatch.lane())
+            .map_err(|_| STATUS_INVALID_HANDLE)?
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if capture.caller() != caller
+            || frame.key != capture.key()
+            || frame.owner != caller.owner()
+            || frame.continuation.kernel_wait_capture() != Some(capture)
+            || !matches!(frame.phase, SuspensionPhase::Resuming { .. })
+        {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let state = self.recipient_mut(caller)?.kernel_wait_state();
+        if state.active_resume() != Some(capture) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        state
+            .progress()
+            .validate_attempt(attempt)
+            .map_err(|_| STATUS_INVALID_HANDLE)
     }
 
     /// Record only a genuine provider return observed by the authenticated native adapter.

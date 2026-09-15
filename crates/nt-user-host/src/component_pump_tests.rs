@@ -38,7 +38,7 @@ fn all_counters_saturate_without_reopening_budget() {
         faults: u64::MAX - 1,
         demand: u64::MAX - 1,
         assert_skips: u64::MAX - 1,
-        owns_depth: true,
+        phase: AccountingPhase::Active { owns_depth: true },
     };
     for _ in 0..3 {
         accounting.record_fault();
@@ -110,4 +110,78 @@ fn yield_never_releases_or_transfers_depth() {
         accounting.after_slice(false, true),
         PumpDepthDisposition::Suspended
     );
+}
+
+#[test]
+fn repeated_counted_waits_carry_depth_and_cumulative_budgets() {
+    let mut accounting = ComponentPumpAccounting::new(true);
+    for count in 1..=4 {
+        accounting.record_fault();
+        accounting.record_demand();
+        accounting.record_assert_skip();
+        assert_eq!(
+            accounting.after_slice(false, true),
+            PumpDepthDisposition::Suspended
+        );
+        assert_eq!(accounting.resume_suspended(), Some(true));
+        assert_eq!(accounting.resume_suspended(), None);
+        assert_eq!(accounting.faults(), count);
+        assert_eq!(accounting.demand(), count);
+        assert_eq!(accounting.assert_skips(), count);
+        assert_eq!(
+            accounting.after_slice(true, false),
+            PumpDepthDisposition::Retained
+        );
+    }
+    assert_eq!(
+        accounting.after_slice(false, false),
+        PumpDepthDisposition::Released
+    );
+    assert_eq!(accounting.resume_suspended(), None);
+}
+
+#[test]
+fn bootstrap_wait_resume_never_invents_or_consumes_dispatch_depth() {
+    let mut accounting = ComponentPumpAccounting::new(false);
+    for count in 1..=4 {
+        accounting.record_fault();
+        accounting.record_demand();
+        assert_eq!(
+            accounting.after_slice(false, true),
+            PumpDepthDisposition::None
+        );
+        assert_eq!(accounting.resume_suspended(), Some(false));
+        assert!(!accounting.owns_depth());
+        assert_eq!(
+            accounting.after_slice(true, false),
+            PumpDepthDisposition::None
+        );
+        assert_eq!(accounting.faults(), count);
+        assert_eq!(accounting.demand(), count);
+    }
+    assert_eq!(
+        accounting.after_slice(false, false),
+        PumpDepthDisposition::None
+    );
+    assert_eq!(accounting.resume_suspended(), None);
+}
+
+#[test]
+fn only_suspension_can_supply_resume_accounting() {
+    for owns_depth in [false, true] {
+        let mut accounting = ComponentPumpAccounting::new(owns_depth);
+        let initial = accounting;
+        assert_eq!(accounting.resume_suspended(), None);
+        assert_eq!(accounting, initial);
+        accounting.after_slice(true, false);
+        let yielded = accounting;
+        assert_eq!(accounting.resume_suspended(), None);
+        assert_eq!(accounting, yielded);
+        accounting.after_slice(false, false);
+        let finished = accounting;
+        assert_eq!(accounting.resume_suspended(), None);
+        assert_eq!(accounting, finished);
+        accounting.after_slice(false, true);
+        assert_eq!(accounting, finished);
+    }
 }

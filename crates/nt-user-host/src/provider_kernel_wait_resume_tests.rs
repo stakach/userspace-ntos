@@ -12,6 +12,9 @@ use nt_provider_wait::{
     ProviderWaitRequestMetadata, ProviderWaitTimeoutKind, ProviderWaitType,
 };
 
+#[path = "provider_kernel_wait_execution_tests.rs"]
+mod execution;
+
 struct Recipient {
     state: KernelProviderWaitState,
     bank: Box<u64>,

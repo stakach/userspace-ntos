@@ -2313,6 +2313,45 @@ pub(crate) unsafe fn component_pump_resume_provider_wait(ch: &PumpChannel) -> Pu
     component_pump_inner(ch, PumpResume::ProviderWait)
 }
 
+/// Resume an authenticated kernel wait without inventing hosted dispatch depth or resetting
+/// its fault budget. The native caller must hold the unique canonical resume ticket; this
+/// physical snapshot validates transport shape, not independent execution authority.
+pub(crate) unsafe fn component_pump_resume_kernel_provider_wait(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+) -> Result<PumpResult, u32> {
+    let caller = ch.kernel_caller.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let binding = caller.binding();
+    if ch.logical_caller.is_some()
+        || ch.client_pi != 0
+        || ch.client_generation != 0
+        || ch.caps.kind != ReqKind::Syscall
+        || !ch.caps.kernel_irq_yield
+        || ch.initial != InitialAction::ReplyRequest
+        || binding.executor_id != ch.tcb
+        || binding.receive_endpoint != ch.fault_ep
+        || binding.reply_object != ch.reply_cap
+        || ch.reply_cap == 0
+        || previous.reply_cap != ch.reply_cap
+        || !previous.provider_wait_suspended
+        || previous.completed
+        || previous.callback_suspended
+        || previous.lpc_wait_suspended
+        || previous.scheduler_yielded
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    let mut accounting = previous.accounting;
+    let transferred_depth = accounting
+        .resume_suspended()
+        .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+    crate::provider_bugcheck::stop_if_pending();
+    if transferred_depth {
+        SUSPENDED_COMPONENT_OUTSTANDING.fetch_sub(1, Ordering::Relaxed);
+    }
+    Ok(component_pump_enter(ch, PumpResume::ProviderWait, accounting))
+}
+
 pub(crate) unsafe fn component_pump_resume_lpc_wait(ch: &PumpChannel) -> PumpResult {
     component_pump_inner(ch, PumpResume::LpcWait)
 }
@@ -2328,6 +2367,20 @@ enum PumpResume {
 #[inline(never)]
 unsafe fn component_pump_inner(ch: &PumpChannel, resume: PumpResume) -> PumpResult {
     crate::provider_bugcheck::stop_if_pending();
+    let owns_depth = pump_enter_depth(ch, resume);
+    component_pump_enter(
+        ch,
+        resume,
+        nt_user_host::component_pump::ComponentPumpAccounting::new(owns_depth),
+    )
+}
+
+#[inline(never)]
+unsafe fn component_pump_enter(
+    ch: &PumpChannel,
+    resume: PumpResume,
+    accounting: nt_user_host::component_pump::ComponentPumpAccounting,
+) -> PumpResult {
     // (Step 4, win32k) The request fill — `w32_client_attach(client_pi)`, the SSN/args write, and the
     // wide-arg source selection — caller RSP for real syscalls or explicit SH_REQ_A4.. staging for
     // executive-originated calls — is done by the win32k caller wrapper `win32k_dispatch_wide`
@@ -2346,7 +2399,6 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume: PumpResume) -> PumpResu
     // `dispatch_label`; the callback-RESUME pump hands over `W32_USER_CALLBACK_RESUME_LABEL` on the
     // SAME outstanding Call — which is the whole of what used to be a bespoke resume preamble.
     let request_tag = pump_request_tag(ch, resume);
-    let owns_depth = pump_enter_depth(ch, resume);
     let mut reply_cap = ch.reply_cap;
     if ch.initial == InitialAction::RecvFirst {
         trace_component_handoff(b"pump-recvfirst-enter", ch.tcb, reply_cap, request_tag);
@@ -2356,12 +2408,7 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume: PumpResume) -> PumpResu
     } else {
         pump_recv(ch, reply_cap)
     };
-    let outcome = component_pump_loop(
-        ch,
-        first,
-        &mut reply_cap,
-        nt_user_host::component_pump::ComponentPumpAccounting::new(owns_depth),
-    );
+    let outcome = component_pump_loop(ch, first, &mut reply_cap, accounting);
     if ch.initial == InitialAction::RecvFirst {
         let detail = if outcome.completed {
             ch.dispatch_label

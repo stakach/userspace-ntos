@@ -4,8 +4,15 @@ use super::*;
 use nt_component_suspension::{TerminalPhase, TerminalStage, TerminalStageOutcome};
 use nt_user_host::hosted_return_target::HostedReply;
 
+#[derive(Clone, Copy)]
+enum NativeReturn {
+    Hosted(win32k_glue::CompletedWin32kDispatch),
+    Kernel { caller: nt_user_host::provider_kernel_activation::KernelProviderCaller, status: u32 },
+    Incomplete,
+}
+
 pub(super) struct NativeTerminal {
-    dispatch: Option<win32k_glue::CompletedWin32kDispatch>,
+    returned: NativeReturn,
     status: u64,
     rejected_repark: Option<PendingComponentDispatch>,
     callback: Option<component_callback_transfer::CallbackTransfer>,
@@ -14,7 +21,7 @@ pub(super) struct NativeTerminal {
 impl NativeTerminal {
     pub(super) const fn completed(dispatch: win32k_glue::CompletedWin32kDispatch) -> Self {
         Self {
-            dispatch: Some(dispatch),
+            returned: NativeReturn::Hosted(dispatch),
             status: dispatch.status,
             rejected_repark: None,
             callback: None,
@@ -23,16 +30,25 @@ impl NativeTerminal {
 
     const fn blocked(status: u32) -> Self {
         Self {
-            dispatch: None,
+            returned: NativeReturn::Incomplete,
             status: status as u64,
             rejected_repark: None,
             callback: None,
         }
     }
 
+    pub(super) const fn kernel_return(
+        caller: nt_user_host::provider_kernel_activation::KernelProviderCaller,
+        status: u32,
+    ) -> Self {
+        let mut payload = Self::blocked(status);
+        payload.returned = NativeReturn::Kernel { caller, status };
+        payload
+    }
+
     fn metadata(&self) -> Self {
         Self {
-            dispatch: self.dispatch,
+            returned: self.returned,
             status: self.status,
             rejected_repark: self.rejected_repark,
             callback: None,
@@ -172,7 +188,7 @@ unsafe fn process_output(
         continuation.return_target.delivery().is_some(),
         "retiring target cannot deliver output"
     );
-    let Some(dispatch) = terminal.dispatch else {
+    let NativeReturn::Hosted(dispatch) = terminal.returned else {
         return;
     };
     let client = continuation.pending.client();
@@ -251,6 +267,10 @@ pub(super) unsafe fn drain(
                 continue;
             }
         };
+        assert!(
+            !matches!(payload.returned, NativeReturn::Kernel { .. }),
+            "kernel return cannot be delivered to a hosted recipient"
+        );
         match phase {
             TerminalPhase::Ready { stage, .. } => {
                 let mut attempt = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))

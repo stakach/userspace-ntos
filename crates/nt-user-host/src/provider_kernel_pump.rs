@@ -234,12 +234,7 @@ impl KernelProviderPumpProgress {
         facts: KernelProviderPumpFacts,
         returned_status: Option<u32>,
     ) -> Result<KernelProviderPumpDisposition, PumpProgressError> {
-        if attempt.consumed
-            || attempt.reply_cap != self.reply_cap
-            || self.progress != Progress::Invoking(attempt.nonce)
-        {
-            return Err(PumpProgressError::WrongAttempt);
-        }
+        self.validate_attempt(attempt)?;
         let disposition = facts.classify(self.reply_cap, returned_status);
         self.progress = Progress::Observed {
             nonce: attempt.nonce,
@@ -247,6 +242,20 @@ impl KernelProviderPumpProgress {
         };
         attempt.consumed = true;
         Ok(disposition)
+    }
+
+    /// Recheck a claimed entry after scheduling, without consuming it or granting another entry.
+    pub(crate) fn validate_attempt(
+        &self,
+        attempt: &KernelProviderPumpAttempt,
+    ) -> Result<(), PumpProgressError> {
+        if attempt.consumed
+            || attempt.reply_cap != self.reply_cap
+            || self.progress != Progress::Invoking(attempt.nonce)
+        {
+            return Err(PumpProgressError::WrongAttempt);
+        }
+        Ok(())
     }
 
     pub const fn disposition(&self) -> Option<KernelProviderPumpDisposition> {

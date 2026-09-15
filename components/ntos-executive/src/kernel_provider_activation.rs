@@ -11,6 +11,8 @@ use nt_user_host::provider_kernel_pump::{KernelProviderPumpAttempt, KernelProvid
 mod bootstrap;
 #[path = "kernel_provider_event.rs"]
 mod event;
+#[path = "kernel_provider_resume.rs"]
+pub(super) mod resume;
 use bootstrap::{DriverEntryCompletion, DriverEntryRecipient};
 
 static mut ACTIVATIONS: KernelProviderActivations<DriverEntryRecipient> =
@@ -142,8 +144,38 @@ pub(crate) unsafe fn run_initial_driver_entry(
         )?;
         activations.recipient_mut(caller)?.begin_initial(caller)
     })?;
-    let mut result = spawn_hosts::component_pump(&channel);
-    let mut receipt = record_driver_entry_pump(&channel, &mut attempt, &result)?;
+    let result = spawn_hosts::component_pump(&channel);
+    observe_driver_entry_pump(&channel, &mut attempt, &result)?;
+    let result = receive_driver_entry_yields(&scope, caller, None, result)?;
+    let receipt = finish_observed_driver_entry_return(caller)?;
+    Ok((result, receipt))
+}
+
+unsafe fn validate_driver_entry_execution(
+    caller: KernelProviderCaller,
+    capture: Option<nt_user_host::provider_kernel_activation::KernelProviderWaitCapture>,
+    attempt: &KernelProviderPumpAttempt,
+) -> Result<(), u32> {
+    with_provider_process_manager(|pm| {
+        let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
+        let catalog = &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS);
+        let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+        if let Some(capture) = capture {
+            activations.validate_wait_execution(caller, pm, catalog, lanes, capture, attempt)
+        } else {
+            activations.validate(caller, pm, catalog, lanes)
+        }
+    })
+}
+
+/// Both initial entry and selected waits retain the same channel and bank through IRQ work.
+/// Receiving after a yield must never retransmit the initial request or a wait-result reply.
+unsafe fn receive_driver_entry_yields(
+    scope: &driver_launch::ComponentSchedulerScope,
+    caller: KernelProviderCaller,
+    capture: Option<nt_user_host::provider_kernel_activation::KernelProviderWaitCapture>,
+    mut result: spawn_hosts::PumpResult,
+) -> Result<spawn_hosts::PumpResult, u32> {
     while result.scheduler_yielded {
         let (receiving, mut receive_attempt, previous) = with_provider_process_manager(|pm| {
             let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
@@ -157,21 +189,15 @@ pub(crate) unsafe fn run_initial_driver_entry(
                 .recipient_mut(caller)?
                 .begin_receive_after_yield(caller)
         })?;
+        validate_driver_entry_execution(caller, capture, &receive_attempt)?;
         scope.service_irq_yield(receiving.shared_va);
         // Dedicated IRQ workers can perform nested IPC. Recheck authority after those effects,
         // without minting another attempt or permitting a failed entered continuation to replay.
-        with_provider_process_manager(|pm| {
-            (&*core::ptr::addr_of!(ACTIVATIONS)).validate(
-                caller,
-                pm,
-                &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
-                &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
-            )
-        })?;
+        validate_driver_entry_execution(caller, capture, &receive_attempt)?;
         result = spawn_hosts::component_pump_continue_receive(&receiving, &previous)?;
-        receipt = record_driver_entry_pump(&receiving, &mut receive_attempt, &result)?;
+        observe_driver_entry_pump(&receiving, &mut receive_attempt, &result)?;
     }
-    Ok((result, receipt))
+    Ok(result)
 }
 
 pub(super) unsafe fn service_ps(
@@ -258,58 +284,13 @@ pub(super) unsafe fn service_event_poll(
     result.unwrap_or_else(|status| status as i32)
 }
 
-/// Readiness scheduling must supply a real selected kernel frame. This memory-only claim does
-/// not enable blocking admission or issue a Reply; the owned ticket must cross the mechanism
-/// boundary exactly once, with no activation/PM/dispatcher borrow held.
-pub(super) unsafe fn claim_driver_entry_wait_resume(
-    caller: KernelProviderCaller,
-    capture: nt_user_host::provider_kernel_activation::KernelProviderWaitCapture,
-) -> Result<
-    (
-        spawn_hosts::PumpChannel,
-        nt_user_host::provider_kernel_wait::KernelProviderWaitResume<ComponentSuspensionCompletion>,
-    ),
-    u32,
-> {
-    let _durable = allocator::enter_durable();
-    let channel = (&*core::ptr::addr_of!(ACTIVATIONS))
-        .recipient(caller)?.execution_channel(caller);
-    if authenticated_channel_caller(&channel)? != caller {
-        return Err(nt_process::STATUS_INVALID_HANDLE);
-    }
-    let ticket = with_provider_process_manager(|pm| {
-        (&mut *core::ptr::addr_of_mut!(ACTIVATIONS)).begin_wait_resume(
-            caller,
-            pm,
-            &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
-            &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS),
-            capture,
-        ).map_err(|error| {
-            use nt_user_host::provider_kernel_activation::KernelProviderResumeError;
-            match error {
-                KernelProviderResumeError::Authority(status) => status,
-                KernelProviderResumeError::Pump(
-                    nt_user_host::provider_kernel_pump::PumpProgressError::IdentityExhausted,
-                ) | KernelProviderResumeError::Lane(nt_component_suspension::LaneError::NoCapacity) => {
-                    nt_process::STATUS_INSUFFICIENT_RESOURCES
-                }
-                KernelProviderResumeError::Lane(nt_component_suspension::LaneError::Busy) => {
-                    nt_status::NtStatus::DEVICE_BUSY.raw() as u32
-                }
-                _ => nt_process::STATUS_INVALID_PARAMETER,
-            }
-        })
-    })?;
-    Ok((channel, ticket))
-}
-
 /// Capture the real initialization return before the shared page or physical lane is reused.
 /// A wall, scheduler yield or parked wait is not completion and retains the activation unchanged.
-unsafe fn record_driver_entry_pump(
+unsafe fn observe_driver_entry_pump(
     channel: &spawn_hosts::PumpChannel,
     attempt: &mut KernelProviderPumpAttempt,
     result: &spawn_hosts::PumpResult,
-) -> Result<Option<KernelProviderCompletionReceipt>, u32> {
+) -> Result<(), u32> {
     let caller = authenticated_channel_caller(channel)?;
     let facts = KernelProviderPumpFacts {
         reply_cap: result.reply_cap,
@@ -347,7 +328,7 @@ unsafe fn record_driver_entry_pump(
                 .retain_provider_wait(request, capture)
         })?;
     }
-    finish_observed_driver_entry_return(caller)
+    Ok(())
 }
 
 /// Retry local completion recording from retained evidence only. This never repumps a stopped

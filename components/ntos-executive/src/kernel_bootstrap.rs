@@ -107,6 +107,16 @@ impl DriverEntryRecipient {
         self.wait.progress()
     }
 
+    pub(super) fn captured_wait(
+        &self,
+    ) -> Option<nt_user_host::provider_kernel_activation::KernelProviderWaitCapture> {
+        self.wait.captured_wait()
+    }
+
+    pub(super) fn observation(&self) -> Option<spawn_hosts::PumpResult> {
+        self.observation
+    }
+
     pub(super) fn retain_provider_wait(
         &mut self,
         request: nt_provider_wait::ProviderWaitRequest,
