@@ -209,6 +209,16 @@ impl KernelProviderPumpProgress {
         })
     }
 
+    pub(crate) fn validate_provider_wait_resume(
+        &self,
+        observation: KernelProviderPumpObservation,
+    ) -> Result<(), PumpProgressError> {
+        if self.provider_wait_observation(observation.reply_cap) != Some(observation) {
+            return Err(PumpProgressError::NotReady);
+        }
+        Ok(())
+    }
+
     /// Reserve the next identity before the activation owner changes canonical wait lanes.
     /// Rejection by those lanes can drop this reservation without changing pump progress.
     pub(crate) fn prepare_provider_wait_resume(
@@ -223,9 +233,7 @@ impl KernelProviderPumpProgress {
         observation: KernelProviderPumpObservation,
         counter: &AtomicU64,
     ) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
-        if self.provider_wait_observation(observation.reply_cap) != Some(observation) {
-            return Err(PumpProgressError::NotReady);
-        }
+        self.validate_provider_wait_resume(observation)?;
         self.allocate_attempt(counter, Some(observation))
     }
 

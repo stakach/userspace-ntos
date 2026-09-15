@@ -14,6 +14,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 static NEXT_DISPATCH_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 mod terminal;
+mod resume_pass;
+pub use resume_pass::ResumePass;
 pub use terminal::{
     RetiredTerminal, TerminalAttempt, TerminalIdentity, TerminalPhase, TerminalStage,
     TerminalStageOutcome, TerminalView,
@@ -1225,50 +1227,6 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
 impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
     pub fn next_resumable(&self) -> Option<LaneResume<R>> {
         self.next_resumable_if(|_| true)
-    }
-
-    /// Select the oldest eligible lane top without changing any frame or lane phase. Rejected
-    /// tops remain retained and never expose buried frames. The predicate sees only selected or
-    /// cancelled tops of suspended lanes, and is not called while a provider lane is running.
-    pub fn next_resumable_if(
-        &self,
-        mut predicate: impl FnMut(&SuspensionFrame<C, R>) -> bool,
-    ) -> Option<LaneResume<R>> {
-        if self.execution_busy() {
-            return None;
-        }
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| {
-                let lane = slot.lane.as_ref()?;
-                if lane.phase != LanePhase::Suspended {
-                    return None;
-                }
-                let frame = lane.suspensions.top()?;
-                if !matches!(
-                    frame.phase,
-                    SuspensionPhase::Selected { .. } | SuspensionPhase::Cancelled { .. }
-                ) || !predicate(frame)
-                {
-                    return None;
-                }
-                let suspension = lane.suspensions.top_resume()?;
-                let sequence = frame.admission_sequence;
-                Some((
-                    sequence,
-                    LaneResume {
-                        lane: LaneHandle {
-                            index: index as u32,
-                            generation: slot.generation,
-                        },
-                        binding: lane.binding,
-                        suspension,
-                    },
-                ))
-            })
-            .min_by_key(|(sequence, _)| *sequence)
-            .map(|(_, resume)| resume)
     }
 
     pub fn begin_resume(

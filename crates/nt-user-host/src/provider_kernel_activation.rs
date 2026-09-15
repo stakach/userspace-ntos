@@ -454,17 +454,17 @@ impl<D> KernelProviderActivations<D> {
             .map_err(KernelProviderResumeError::Lane)
     }
 
-    /// Couple the exact selected wait with the recipient's stopped pump observation. Reserve
-    /// the nonce before the fallible lane transition; no progress or capture is lost on refusal.
-    /// No scheduler effect or IPC may occur until the returned ticket has left these borrows.
-    pub fn begin_wait_resume<C, R: Clone, T>(
+    /// Authenticate the exact selected wait without reserving a nonce or changing lane/pump
+    /// state. The recipient trait requires a mutable borrow, but eligibility is observational.
+    /// A later claim must repeat these checks after any intervening scheduler or service work.
+    pub fn validate_wait_resume<C, R, T>(
         &mut self,
         caller: KernelProviderCaller,
         pm: &ProcessManager,
         catalog: &ProviderDomainCatalog,
-        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
         capture: KernelProviderWaitCapture,
-    ) -> Result<KernelProviderWaitResume<R>, KernelProviderResumeError>
+    ) -> Result<(), KernelProviderResumeError>
     where
         C: KernelProviderWaitContinuation,
         D: KernelProviderWaitRecipient,
@@ -482,6 +482,29 @@ impl<D> KernelProviderActivations<D> {
         {
             return Err(KernelProviderResumeError::Authority(STATUS_INVALID_HANDLE));
         }
+        self.recipient_mut(caller)
+            .map_err(KernelProviderResumeError::Authority)?
+            .kernel_wait_state()
+            .validate_resume(capture)
+            .map_err(KernelProviderResumeError::Pump)
+    }
+
+    /// Couple the exact selected wait with the recipient's stopped pump observation. Reserve
+    /// the nonce before the fallible lane transition; no progress or capture is lost on refusal.
+    /// No scheduler effect or IPC may occur until the returned ticket has left these borrows.
+    pub fn begin_wait_resume<C, R: Clone, T>(
+        &mut self,
+        caller: KernelProviderCaller,
+        pm: &ProcessManager,
+        catalog: &ProviderDomainCatalog,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        capture: KernelProviderWaitCapture,
+    ) -> Result<KernelProviderWaitResume<R>, KernelProviderResumeError>
+    where
+        C: KernelProviderWaitContinuation,
+        D: KernelProviderWaitRecipient,
+    {
+        self.validate_wait_resume(caller, pm, catalog, lanes, capture)?;
         let state = self
             .recipient_mut(caller)
             .map_err(KernelProviderResumeError::Authority)?

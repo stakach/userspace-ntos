@@ -35340,6 +35340,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/test-wait-origin-docs-20260915.log. Independent origin/ownership review and
         git diff --check pass. Blocking admission remains disabled. No boot rerun: the measured
         strict 27-import frontier is unchanged, and this is not desktop-rendering evidence.
+      - [x] Define exact eligibility and bounded caller-neutral resume passes (2026-09-15).
+        KernelProviderActivations::validate_wait_resume now authenticates the typed frame, live
+        retained caller, recipient capture and exact pump observation without reserving a nonce
+        or changing lane/progress state. begin_wait_resume shares those checks, repeats recipient
+        validation before reservation and still owns the atomic physical-lane claim. Eligibility
+        does not override a busy component or authorize stale or exited callers to execute.
+        ResumePass walks original selected/cancelled lane tops in admission order across both
+        caller kinds. Its starting sequence frontier excludes newer admissions/reparks; rejected
+        or unclaimed candidates are visited once per pass, and physical execution exclusion does
+        not advance the cursor. Lane generation disambiguates replacement slots. No queue, second
+        continuation store or execution authority is introduced. The existing one-shot selector
+        shares top qualification and keeps its linear scan; its hosted drain behavior is unchanged.
+        The native hosted executor now uses the completion/cancellation returned by begin_resume,
+        rather than replaying a prior candidate snapshot. Nine traversal tests and four exact
+        eligibility tests cover mixed ordering, refusals, immediate rewaits, stale capture/lane
+        generations, cancellation between observation/claim, busy execution, exhausted passes and
+        retained outer Resuming frames. Kernel execution and blocking admission remain disabled.
+        Serialized validation passes 1,291 tests across 19 suites with no failures or ignored cases:
+        .tmp/test-resume-pass-20260915.log. Executive release passes in 39.25s with the same 302
+        warnings; standalone I/O Manager passes in 0.05s without warnings. Build evidence:
+        .tmp/build-resume-pass-executive-20260915.log and
+        .tmp/build-resume-pass-io-manager-20260915.log. Scoped formatting, git diff --check and
+        independent selection/boundary review pass. No boot rerun: the strict 27-import rejection
+        remains the measured frontier, not desktop rendering. Native execution is intentionally
+        not wired until the ready-work wake and no-borrow outer ownership described below exist.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: schedule selected kernel resumes alongside hosted work
         using the retained activation and physical channel without replaying initial entry. The
@@ -35349,12 +35374,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         delivery and retirement/ACK rather than frame-free record_completion or a hosted reply.
         Wire the new selected-kernel execution entry only after readiness/repark ownership exists.
         Preserve the completed timeout-origin contract above through selection and repark.
-        Use one admission-sequence ordering for both caller kinds, with exact retained-capture
-        eligibility shared with the resume claim. Bound each execution pass by its starting
-        sequence frontier so immediate rewaits and refusals cannot spin or starve other callers.
+        Wire the completed bounded pass and exact eligibility contracts above into one native
+        caller-neutral execution owner. Borrowed legacy hosted drains must not skip an older
+        eligible kernel candidate or execute nested work while the outer pass owns scheduling.
+        Supply an explicit ready-work wake/retry owner before enabling that pass: selection removes
+        waits from the arbiter, so its parked deadlines cannot wake selected work. A top-of-loop
+        pass alone strands immediate rewaits or work selected immediately before a blocking receive;
+        watchdog polling or perpetual immediate timer rearming is not a substitute. Cover wake
+        delivery/refusal, bounded retry, newly selected work and every receive barrier in tests.
         Pump only at an outer pre-reply/pre-receive boundary: no whole ExecNtHandler, PM, lane,
-        activation or Event-backend reference may cross execution, because native services can
-        reacquire published executive state. Preserve received message registers for the entire
+        activation, procs/pfilled slice or Event-backend reference may cross execution, because
+        native services can reacquire published executive state through ExecLoopCtx. Casting a
+        borrowed helper parameter to a raw pointer does not end its caller's borrow. The outer
+        owner must expose only short-lived local borrows separated by the actual pump. Preserve
+        received message registers for the entire
         pass, exclude reentry/physical execution, and retain uncertain stops without fabricating
         a terminal. Runtime scheduling can land before bootstrap fan-in, but does not replace it.
         Use the field-borrowed backend above in the canonical PM/activation transaction; do not

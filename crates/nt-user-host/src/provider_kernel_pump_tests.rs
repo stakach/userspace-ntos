@@ -483,6 +483,10 @@ fn wrong_observation_cap_nonce_or_time_does_not_change_progress_or_allocate() {
         },
     ] {
         assert_eq!(
+            progress.validate_provider_wait_resume(wrong),
+            Err(PumpProgressError::NotReady)
+        );
+        assert_eq!(
             progress
                 .prepare_provider_wait_resume_with_counter(wrong, &counter)
                 .unwrap_err(),
@@ -524,6 +528,9 @@ fn wait_resume_identity_exhaustion_preserves_exact_observation() {
         let (progress, observation) = provider_wait_progress();
         let expected = progress.progress;
         let counter = AtomicU64::new(initial);
+        assert_eq!(progress.validate_provider_wait_resume(observation), Ok(()));
+        assert_eq!(progress.progress, expected);
+        assert_eq!(counter.load(Ordering::Relaxed), initial);
         assert_eq!(
             progress
                 .prepare_provider_wait_resume_with_counter(observation, &counter)

@@ -14,6 +14,8 @@ use nt_provider_wait::{
 
 #[path = "provider_kernel_wait_execution_tests.rs"]
 mod execution;
+#[path = "provider_kernel_wait_eligibility_tests.rs"]
+mod eligibility;
 #[path = "provider_kernel_local_delivery_tests.rs"]
 mod local_delivery;
 #[path = "provider_kernel_wait_admission_tests.rs"]

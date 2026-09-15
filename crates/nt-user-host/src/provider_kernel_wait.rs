@@ -161,13 +161,22 @@ impl KernelProviderWaitState {
         }
     }
 
+    pub(crate) fn validate_resume(
+        &self,
+        capture: KernelProviderWaitCapture,
+    ) -> Result<(), PumpProgressError> {
+        if self.captured_wait() != Some(capture) {
+            return Err(PumpProgressError::NotReady);
+        }
+        self.progress
+            .validate_provider_wait_resume(capture.observation())
+    }
+
     pub(crate) fn prepare_resume(
         &self,
         capture: KernelProviderWaitCapture,
     ) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
-        if self.captured_wait() != Some(capture) {
-            return Err(PumpProgressError::NotReady);
-        }
+        self.validate_resume(capture)?;
         self.progress
             .prepare_provider_wait_resume(capture.observation())
     }

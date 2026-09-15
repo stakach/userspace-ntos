@@ -1842,9 +1842,10 @@ unsafe fn component_suspension_resume_top(
             (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                 .begin_resume(lane, reply_object, resume.key)
         };
-        if admitted.is_err() {
+        // Claim-time cancellation/completion is authoritative, not the earlier candidate snapshot.
+        let Ok(resume) = admitted else {
             return None;
-        }
+        };
         let provider_resume = matches!(
             continuation.pending,
             PendingComponentDispatch::Provider(_)
