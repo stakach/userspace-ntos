@@ -15,6 +15,9 @@ mod event;
 pub(super) mod resume;
 #[path = "kernel_provider_terminal.rs"]
 mod terminal;
+#[path = "kernel_provider_wait_work.rs"]
+mod wait_work;
+pub(super) use wait_work::publish_runtime_waits;
 use bootstrap::{DriverEntryCompletion, DriverEntryRecipient};
 
 static mut ACTIVATIONS: KernelProviderActivations<DriverEntryRecipient> =

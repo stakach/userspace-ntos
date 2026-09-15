@@ -27,6 +27,10 @@ static NEXT_ACTIVATION: AtomicU64 = AtomicU64::new(1);
 mod wait_admission;
 pub use wait_admission::KernelProviderWaitAdmissionError;
 
+#[path = "provider_kernel_wait_work.rs"]
+mod wait_work;
+pub use wait_work::{KernelProviderWaitWork, KernelProviderWaitWorkCursor};
+
 fn next_activation(counter: &AtomicU64) -> Result<u64, u32> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {

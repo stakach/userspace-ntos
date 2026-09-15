@@ -35292,13 +35292,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         formatting, git diff --check and independent ownership review pass. No boot was rerun;
         the last measured frontier remains the strict 27-import rejection. This publication is
         not a pre-loop scheduler, receive-endpoint fan-in or permission to enable kernel blocking.
+      - [x] Discover retained stopped jobs and publish runtime waits in bounded passes (2026-09-15).
+        The original activation rows now supply a high-water cursor, not a second work queue.
+        Discovery distinguishes initial admission, a new wait with the exact active-resume origin,
+        and already admitted Waiting/Selected/Cancelled frames. It authenticates the caller,
+        observation, retained Ps pair, provider, binding and frame before proposing publication;
+        candidate metadata never substitutes for owned admission revalidation. Refusals retain
+        the source row and advance the pass instead of spinning. Offered-continuation checks
+        remain before and after lease acquisition around the shared publication-state validator.
+        The outer live-service-loop pass now uses original Event backing and canonical
+        initial/repark APIs, guarded by the registered handler, delay queue and active timer source.
+        It rearms deadlines after publication, preserving the incoming IPC message buffer and
+        releasing canonical borrows before timer programming. Replaced native continuations
+        contain only copied capture metadata; the activation retains its channel, bank and Ps
+        references. Failed admission/repark preserves the source for a later bounded pass.
+        Nine tests cover first/repeated discovery, already-admitted phases, reused wait IDs and
+        observation origins, stale caller/provider/binding, foreign authority, high-water fairness,
+        new captures after visits, rejected/uncaptured waits and non-wait pump outcomes. Serialized
+        validation passes 1,271 tests across 19 suites with no failures or ignored cases:
+        .tmp/test-stopped-wait-work-20260915.log. Executive release passes in 38.81s with 302
+        warnings (previously 303); standalone I/O Manager passes without warnings. Evidence:
+        .tmp/build-stopped-wait-work-executive-20260915.log and
+        .tmp/build-stopped-wait-work-io-manager-20260915.log. Scoped formatting, git diff --check
+        and ownership review pass. Bootstrap admission, selected-execution scheduling and blocking
+        rendezvous remain disabled. No boot was rerun; the last measured frontier remains the
+        strict 27-import rejection, not asynchronous wait acceptance or desktop rendering.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
-        Next whole native ownership slice: give the stopped kernel job an actual readiness owner,
-        then use the lease-backed initial/repark publication above rather than stacking another
+        Next whole native ownership slice: retain timeout origins across deferred publication as
+        detailed below, then schedule selected kernel resumes alongside hosted work using the
+        retained activation and physical channel without replaying initial entry. The
+        bounded runtime publication pass above owns initial/repark admission; do not stack another
         frame over the old Resuming wait. Preserve both continuations on failed repark. Use the
         kernel-local terminal consumer above for genuine returns; preserve its exact recipient
         delivery and retirement/ACK rather than frame-free record_completion or a hosted reply.
         Wire the new selected-kernel execution entry only after readiness/repark ownership exists.
+        Before enabling blocking, retain the relative-timeout origin at physical wait observation
+        and use it through deferred/retried publication, while evaluating expiry against current
+        time. The current admission APIs accept one TimeSnapshot; repeated failed publication
+        must not restart the caller's relative timeout. Absolute deadlines must keep their
+        clock-adjustment semantics rather than translating to a fabricated wall-clock target.
         Use the field-borrowed backend above in the canonical PM/activation transaction; do not
         retain a whole ExecNtHandler borrow alongside it. Use the exact caller-aware readiness
         publication above before admitting kernel waits. Bootstrap signaling still rejects
@@ -35329,8 +35361,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         making hosted-client fields optional placeholders. HostedNativeContinuation now holds
         PendingComponentDispatch plus HostedReturnTarget, while ComponentNativeContinuation::Kernel
         holds KernelProviderWaitCapture with the real caller and validated owned request snapshot.
-        That Kernel variant is preparatory and has no production lane-admission constructor yet;
-        hosted selectors and hosted terminal processing explicitly exclude it; the separate
+        The runtime publication pass now constructs that Kernel variant through owned admission;
+        blocking rendezvous remains disabled, and no selected-execution scheduler invokes it yet.
+        Hosted execution selectors and hosted terminal processing explicitly exclude it; the separate
         local terminal consumer is now wired as above. A kernel terminal
         recipient must preserve its real initiating caller and return contract, not deliver a
         CompletedWin32kDispatch to a hosted syscall reply.

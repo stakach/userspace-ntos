@@ -9,6 +9,9 @@ use nt_provider_wait::{
     ProviderDispatcherWaitAdmission as Admission, ProviderDispatcherWaitArbiter, ProviderWaitOwner,
 };
 
+#[path = "provider_kernel_wait_work_tests.rs"]
+mod work;
+
 struct Backing;
 impl ProviderEventBacking for Backing {
     fn is_live_event(&self, native_identity: u64) -> bool {

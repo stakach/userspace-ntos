@@ -111,9 +111,23 @@ impl<D: KernelProviderWaitRecipient> KernelProviderActivations<D> {
         capture: KernelProviderWaitCapture,
         continuation: &C,
     ) -> Result<(), u32> {
+        if continuation.kernel_wait_capture() != Some(capture) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        self.validate_wait_publication_state(caller, pm, catalog, lanes, previous, capture)
+    }
+
+    pub(super) fn validate_wait_publication_state<C: KernelProviderWaitContinuation, R, T>(
+        &mut self,
+        caller: KernelProviderCaller,
+        pm: &ProcessManager,
+        catalog: &ProviderDomainCatalog,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        previous: Option<KernelProviderWaitCapture>,
+        capture: KernelProviderWaitCapture,
+    ) -> Result<(), u32> {
         self.validate(caller, pm, catalog, lanes)?;
         if capture.caller() != caller
-            || continuation.kernel_wait_capture() != Some(capture)
             || lanes.external_depth(caller.dispatch.lane()) != Ok(0)
         {
             return Err(STATUS_INVALID_HANDLE);
