@@ -38,6 +38,11 @@ fn observed(reply_cap: u64, mask: u8) -> KernelProviderPumpProgress {
         .observe(
             &mut attempt,
             KernelProviderPumpFacts {
+                observed_at: nt_kernel_exec::TimeSnapshot {
+                    monotonic_100ns: 10,
+                    system_time_100ns: 100,
+                    clock_generation: 0,
+                },
                 reply_cap,
                 completed: mask & 1 != 0,
                 callback_suspended: mask & 2 != 0,

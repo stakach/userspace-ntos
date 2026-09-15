@@ -44,6 +44,11 @@ struct Fixture {
 
 fn facts(reply_cap: u64, completed: bool) -> KernelProviderPumpFacts {
     KernelProviderPumpFacts {
+        observed_at: nt_kernel_exec::TimeSnapshot {
+            monotonic_100ns: 10,
+            system_time_100ns: 100,
+            clock_generation: 0,
+        },
         reply_cap,
         completed,
         callback_suspended: false,

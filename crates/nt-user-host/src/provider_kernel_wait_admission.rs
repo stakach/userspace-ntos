@@ -203,11 +203,12 @@ impl<D: KernelProviderWaitRecipient> KernelProviderActivations<D> {
             ));
         }
         let (admission, replaced) = arbiter
-            .admit_owned(
+            .admit_owned_at(
                 backend,
                 capture.request(),
                 caller.owner(),
                 sequence,
+                capture.observed_at(),
                 now,
                 continuation,
                 |continuation| {

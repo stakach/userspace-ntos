@@ -148,6 +148,240 @@ fn no_publication(_: Continuation) -> Result<(), (&'static str, Continuation)> {
     panic!("publication must not run")
 }
 
+fn timed_request(kind: ProviderWaitTimeoutKind, interval: i64) -> ProviderWaitRequest {
+    let mut request = ProviderWaitRequest::empty();
+    request
+        .begin(
+            ProviderWaitRequestMetadata {
+                wait_id: 1,
+                owner: owner(),
+                wait_type: ProviderWaitType::Any,
+                wait_mode: ProviderWaitMode::Kernel,
+                alertable: false,
+                timeout_kind: kind,
+                timeout_100ns: interval,
+            },
+            &[
+                ProviderWaitObject::new(ProviderWaitObjectType::Event, 31, 2),
+                ProviderWaitObject::new(ProviderWaitObjectType::Event, 32, 2),
+            ],
+        )
+        .unwrap();
+    request
+}
+
+fn at(monotonic_100ns: u64, system_time_100ns: u64, clock_generation: u64) -> TimeSnapshot {
+    TimeSnapshot {
+        monotonic_100ns,
+        system_time_100ns,
+        clock_generation,
+    }
+}
+
+fn publish(continuation: Continuation) -> Result<Continuation, (&'static str, Continuation)> {
+    Ok(continuation)
+}
+
+#[test]
+fn deferred_relative_admission_keeps_the_original_deadline() {
+    for admission_time in [at(20, 500, 1), at(60, 10, 2), at(75, 900, 3)] {
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
+        let mut backend = Backend::default();
+        let drops = Rc::new(Cell::new(0));
+        let continuation = Continuation::new(&drops);
+        let address = continuation.address();
+        let (admission, published) = arbiter
+            .admit_owned_at(
+                &mut backend,
+                &timed_request(ProviderWaitTimeoutKind::Relative, -50),
+                owner(),
+                1,
+                now(),
+                admission_time,
+                continuation,
+                publish,
+            )
+            .unwrap();
+        assert_eq!(published.address(), address);
+        assert_eq!(drops.get(), 0);
+        if admission_time.monotonic_100ns < 60 {
+            assert_eq!(
+                admission,
+                ProviderDispatcherWaitAdmission::Parked { wait_id: 1 }
+            );
+            assert_eq!(arbiter.next_deadline(admission_time), Some(60));
+            assert!(arbiter.pop_due(&mut backend, at(59, 99_999, 4)).is_none());
+            let due = arbiter.pop_due(&mut backend, at(60, 1, 5)).unwrap();
+            assert_eq!(due.status, STATUS_TIMEOUT);
+            assert_eq!(due.admission_sequence, 1);
+        } else {
+            assert_eq!(
+                admission,
+                ProviderDispatcherWaitAdmission::TimedOut { wait_id: 1 }
+            );
+        }
+        assert!(arbiter.is_empty());
+        assert!(backend.leases.is_empty());
+        assert_eq!(backend.observations.consumed.get(), 0);
+        drop(published);
+        assert_eq!(drops.get(), 1);
+    }
+}
+
+#[test]
+fn deferred_rejections_retry_without_restarting_relative_timeout() {
+    for backend_failure in [false, true] {
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
+        let mut backend = Backend {
+            fail_at: backend_failure.then_some(1),
+            ..Default::default()
+        };
+        let drops = Rc::new(Cell::new(0));
+        let continuation = Continuation::new(&drops);
+        let address = continuation.address();
+        let request = timed_request(ProviderWaitTimeoutKind::Relative, -50);
+        let (error, continuation) = arbiter
+            .admit_owned_at(
+                &mut backend,
+                &request,
+                owner(),
+                1,
+                now(),
+                at(40, 130, 0),
+                continuation,
+                |continuation| {
+                    assert!(!backend_failure);
+                    Err::<Continuation, _>(("publication rejected", continuation))
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            if backend_failure {
+                ProviderDispatcherWaitPublicationError::Wait(ProviderDispatcherWaitError::Backend(
+                    "lease rejected",
+                ))
+            } else {
+                ProviderDispatcherWaitPublicationError::Publication("publication rejected")
+            }
+        );
+        assert_eq!(continuation.address(), address);
+        assert_eq!(drops.get(), 0);
+        assert_eq!(backend.observations.readiness_checks.get(), 0);
+        assert!(backend.leases.is_empty());
+        assert!(arbiter.is_empty());
+        backend.fail_at = None;
+        let (admission, published) = arbiter
+            .admit_owned_at(
+                &mut backend,
+                &request,
+                owner(),
+                2,
+                now(),
+                at(70, 160, 0),
+                continuation,
+                publish,
+            )
+            .unwrap();
+        assert_eq!(
+            admission,
+            ProviderDispatcherWaitAdmission::TimedOut { wait_id: 1 }
+        );
+        assert_eq!(published.address(), address);
+        assert!(backend.leases.is_empty());
+        assert!(arbiter.is_empty());
+        assert_eq!(backend.observations.consumed.get(), 0);
+    }
+}
+
+#[test]
+fn deferred_absolute_admission_uses_current_wallclock_without_rebasing_target() {
+    for admission_time in [at(20, 250, 1), at(20, 50, 1)] {
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
+        let mut backend = Backend::default();
+        let drops = Rc::new(Cell::new(0));
+        let (admission, _published) = arbiter
+            .admit_owned_at(
+                &mut backend,
+                &timed_request(ProviderWaitTimeoutKind::Absolute, 200),
+                owner(),
+                1,
+                now(),
+                admission_time,
+                Continuation::new(&drops),
+                publish,
+            )
+            .unwrap();
+        if admission_time.system_time_100ns >= 200 {
+            assert_eq!(
+                admission,
+                ProviderDispatcherWaitAdmission::TimedOut { wait_id: 1 }
+            );
+        } else {
+            assert_eq!(
+                admission,
+                ProviderDispatcherWaitAdmission::Parked { wait_id: 1 }
+            );
+            assert_eq!(arbiter.next_deadline(admission_time), Some(170));
+            assert!(arbiter.pop_due(&mut backend, at(200, 199, 2)).is_none());
+            assert_eq!(arbiter.next_deadline(at(200, 199, 2)), Some(201));
+            assert_eq!(
+                arbiter
+                    .pop_due(&mut backend, at(201, 300, 3))
+                    .unwrap()
+                    .status,
+                STATUS_TIMEOUT
+            );
+        }
+        assert!(arbiter.is_empty());
+        assert!(backend.leases.is_empty());
+        assert_eq!(backend.observations.consumed.get(), 0);
+    }
+}
+
+#[test]
+fn deferred_admission_consumes_readiness_before_expired_relative_or_absolute_timeouts() {
+    for (kind, interval) in [
+        (ProviderWaitTimeoutKind::Relative, -50),
+        (ProviderWaitTimeoutKind::Absolute, 150),
+    ] {
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
+        let mut backend = Backend {
+            signaled: true,
+            ..Default::default()
+        };
+        let observations = backend.observations.clone();
+        let drops = Rc::new(Cell::new(0));
+        let (admission, _published) = arbiter
+            .admit_owned_at(
+                &mut backend,
+                &timed_request(kind, interval),
+                owner(),
+                1,
+                now(),
+                at(80, 170, 0),
+                Continuation::new(&drops),
+                |continuation| {
+                    assert_eq!(observations.acquired.get(), 2);
+                    assert_eq!(observations.readiness_checks.get(), 0);
+                    publish(continuation)
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            admission,
+            ProviderDispatcherWaitAdmission::Satisfied {
+                wait_id: 1,
+                status: STATUS_WAIT_0
+            }
+        );
+        assert!(!backend.signaled);
+        assert_eq!(observations.consumed.get(), 1);
+        assert!(backend.leases.is_empty());
+        assert!(arbiter.is_empty());
+    }
+}
+
 #[test]
 fn validation_rejections_return_the_original_nonclone_continuation() {
     let mut arbiter = ProviderDispatcherWaitArbiter::new();

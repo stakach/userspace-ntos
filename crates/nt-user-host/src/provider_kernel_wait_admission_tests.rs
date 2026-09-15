@@ -11,6 +11,8 @@ use nt_provider_wait::{
 
 #[path = "provider_kernel_wait_work_tests.rs"]
 mod work;
+#[path = "provider_kernel_wait_origin_tests.rs"]
+mod origin;
 
 struct Backing;
 impl ProviderEventBacking for Backing {
@@ -114,13 +116,29 @@ fn next_capture_with(
     id: u64,
     update: impl FnOnce(&mut ProviderWaitRequest),
 ) -> KernelProviderWaitCapture {
+    next_capture_at(f, id, now(), update)
+}
+
+fn next_capture_at(
+    f: &mut Fixture,
+    id: u64,
+    observed_at: TimeSnapshot,
+    update: impl FnOnce(&mut ProviderWaitRequest),
+) -> KernelProviderWaitCapture {
     let (_, mut attempt, _) = f.resume().unwrap().into_parts();
     let reply = f.caller.binding.reply_object;
     f.activations
         .recipient_mut(f.caller)
         .unwrap()
         .state
-        .observe(&mut attempt, facts(reply, false), None)
+        .observe(
+            &mut attempt,
+            KernelProviderPumpFacts {
+                observed_at,
+                ..facts(reply, false)
+            },
+            None,
+        )
         .unwrap();
     let mut request = *f.capture.request();
     request.header.wait_id = id;

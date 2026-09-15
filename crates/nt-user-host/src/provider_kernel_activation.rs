@@ -107,6 +107,11 @@ impl KernelProviderWaitCapture {
         &self.request
     }
 
+    /// Bound to the exact observed pump stop; deferred admission must not resample this origin.
+    pub const fn observed_at(self) -> nt_kernel_exec::TimeSnapshot {
+        self.observation.observed_at()
+    }
+
     pub const fn owner(self) -> SuspensionOwner {
         self.caller.owner()
     }

@@ -4,6 +4,11 @@ const CAP: u64 = 42;
 
 fn facts(mask: u8) -> KernelProviderPumpFacts {
     KernelProviderPumpFacts {
+        observed_at: TimeSnapshot {
+            monotonic_100ns: 10,
+            system_time_100ns: 100,
+            clock_generation: 0,
+        },
         reply_cap: CAP,
         completed: mask & 1 != 0,
         callback_suspended: mask & 2 != 0,
@@ -452,7 +457,7 @@ fn repark_and_same_cap_replacement_reject_stale_observation() {
 }
 
 #[test]
-fn wrong_observation_cap_or_nonce_does_not_change_progress_or_allocate() {
+fn wrong_observation_cap_nonce_or_time_does_not_change_progress_or_allocate() {
     let (progress, observation) = provider_wait_progress();
     let expected = progress.progress;
     let counter = AtomicU64::new(80);
@@ -467,6 +472,13 @@ fn wrong_observation_cap_or_nonce_does_not_change_progress_or_allocate() {
         },
         KernelProviderPumpObservation {
             nonce: observation.nonce + 1,
+            ..observation
+        },
+        KernelProviderPumpObservation {
+            observed_at: TimeSnapshot {
+                monotonic_100ns: observation.observed_at().monotonic_100ns + 1,
+                ..observation.observed_at()
+            },
             ..observation
         },
     ] {

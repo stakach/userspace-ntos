@@ -35317,20 +35317,46 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         and ownership review pass. Bootstrap admission, selected-execution scheduling and blocking
         rendezvous remain disabled. No boot was rerun; the last measured frontier remains the
         strict 27-import rejection, not asynchronous wait acceptance or desktop rendering.
+      - [x] Retain exact wait origins across deferred publication and retries (2026-09-15).
+        Native pump observation now samples the executive clock at the physical stop and seals it
+        into the exact opaque observation/capture. This is executive acceptance time, not an
+        untrusted provider timestamp or a later scheduler/publication sample. Each resumed wait
+        receives a fresh observation; failed capture/publication cannot refresh the old origin.
+        The shared owned arbiter now accepts separate origin/current snapshots through
+        admit_owned_at; the existing immediate API delegates to that same implementation.
+        Relative deadlines use the retained monotonic origin while admission checks expiry against
+        current time. Absolute deadlines retain their system-time target and clock-adjustment
+        behavior. Ready objects still take precedence over timeout. Native initial admission and
+        repark both use the captured origin without another timeout store or scheduler queue.
+        Seven new tests cover delayed initial/repeated admission, lease/publication rejection and
+        retry, fresh rewait origins, current expiry, absolute clock changes and ready precedence;
+        the pump authority test also rejects an altered timestamp without allocating a new nonce.
+        Serialized validation passes 1,278 tests across 19 suites with no failures or ignored cases:
+        .tmp/test-wait-origin-20260915.log. Executive release passes in 39.42s with 302 warnings;
+        standalone I/O Manager release passes without warnings. Evidence:
+        .tmp/build-wait-origin-executive-20260915.log and
+        .tmp/build-wait-origin-io-manager-20260915.log. The strengthened observation-forgery
+        compile-fail example also passes in a separate 21-doctest rerun:
+        .tmp/test-wait-origin-docs-20260915.log. Independent origin/ownership review and
+        git diff --check pass. Blocking admission remains disabled. No boot rerun: the measured
+        strict 27-import frontier is unchanged, and this is not desktop-rendering evidence.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
-        Next whole native ownership slice: retain timeout origins across deferred publication as
-        detailed below, then schedule selected kernel resumes alongside hosted work using the
-        retained activation and physical channel without replaying initial entry. The
+        Next whole native ownership slice: schedule selected kernel resumes alongside hosted work
+        using the retained activation and physical channel without replaying initial entry. The
         bounded runtime publication pass above owns initial/repark admission; do not stack another
         frame over the old Resuming wait. Preserve both continuations on failed repark. Use the
         kernel-local terminal consumer above for genuine returns; preserve its exact recipient
         delivery and retirement/ACK rather than frame-free record_completion or a hosted reply.
         Wire the new selected-kernel execution entry only after readiness/repark ownership exists.
-        Before enabling blocking, retain the relative-timeout origin at physical wait observation
-        and use it through deferred/retried publication, while evaluating expiry against current
-        time. The current admission APIs accept one TimeSnapshot; repeated failed publication
-        must not restart the caller's relative timeout. Absolute deadlines must keep their
-        clock-adjustment semantics rather than translating to a fabricated wall-clock target.
+        Preserve the completed timeout-origin contract above through selection and repark.
+        Use one admission-sequence ordering for both caller kinds, with exact retained-capture
+        eligibility shared with the resume claim. Bound each execution pass by its starting
+        sequence frontier so immediate rewaits and refusals cannot spin or starve other callers.
+        Pump only at an outer pre-reply/pre-receive boundary: no whole ExecNtHandler, PM, lane,
+        activation or Event-backend reference may cross execution, because native services can
+        reacquire published executive state. Preserve received message registers for the entire
+        pass, exclude reentry/physical execution, and retain uncertain stops without fabricating
+        a terminal. Runtime scheduling can land before bootstrap fan-in, but does not replace it.
         Use the field-borrowed backend above in the canonical PM/activation transaction; do not
         retain a whole ExecNtHandler borrow alongside it. Use the exact caller-aware readiness
         publication above before admitting kernel waits. Bootstrap signaling still rejects

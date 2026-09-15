@@ -260,12 +260,49 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
     where
         B: ProviderDispatcherWaitBackend<Lease = L>,
     {
-        let (waiter, poll) = match self.prepare_admission(
+        self.admit_owned_at(
             backend,
             shared_request,
             expected_owner,
             admission_sequence,
             now,
+            now,
+            continuation,
+            publish,
+        )
+    }
+
+    /// Admit an owned continuation without restarting its timeout after deferred publication.
+    ///
+    /// `origin` is the retained snapshot from the original wait request; retries must reuse it.
+    /// Relative deadlines use its monotonic time, while absolute deadlines retain their original
+    /// system-time target. `now` determines whether that deadline has expired at admission.
+    /// Both snapshots must come from the same canonical, non-regressing monotonic clock.
+    /// Readiness still takes precedence over an expired deadline. The ownership and serialization
+    /// contract of `admit_owned` applies unchanged.
+    pub fn admit_owned_at<B, C, O, E>(
+        &mut self,
+        backend: &mut B,
+        shared_request: &ProviderWaitRequest,
+        expected_owner: ProviderWaitOwner,
+        admission_sequence: u64,
+        origin: TimeSnapshot,
+        now: TimeSnapshot,
+        continuation: C,
+        publish: impl FnOnce(C) -> Result<O, (E, C)>,
+    ) -> Result<
+        (ProviderDispatcherWaitAdmission, O),
+        (ProviderDispatcherWaitPublicationError<B::Error, E>, C),
+    >
+    where
+        B: ProviderDispatcherWaitBackend<Lease = L>,
+    {
+        let (waiter, poll) = match self.prepare_admission(
+            backend,
+            shared_request,
+            expected_owner,
+            admission_sequence,
+            origin,
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -312,7 +349,7 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
         shared_request: &ProviderWaitRequest,
         expected_owner: ProviderWaitOwner,
         admission_sequence: u64,
-        now: TimeSnapshot,
+        origin: TimeSnapshot,
     ) -> Result<(ProviderDispatcherWaitRecord<L>, bool), ProviderDispatcherWaitError<B::Error>>
     where
         B: ProviderDispatcherWaitBackend<Lease = L>,
@@ -353,7 +390,7 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
         let deadline = match request.timeout_kind {
             ProviderWaitTimeoutKind::Infinite | ProviderWaitTimeoutKind::Poll => Deadline::Infinite,
             ProviderWaitTimeoutKind::Relative | ProviderWaitTimeoutKind::Absolute => {
-                Deadline::from_nt_timeout(Some(request.timeout_100ns), now)
+                Deadline::from_nt_timeout(Some(request.timeout_100ns), origin)
             }
         };
         Ok((

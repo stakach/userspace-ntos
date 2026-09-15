@@ -298,6 +298,7 @@ unsafe fn observe_driver_entry_pump(
 ) -> Result<(), u32> {
     let caller = authenticated_channel_caller(channel)?;
     let facts = KernelProviderPumpFacts {
+        observed_at: nt_time_snapshot(),
         reply_cap: result.reply_cap,
         completed: result.completed,
         callback_suspended: result.callback_suspended,
@@ -316,7 +317,7 @@ unsafe fn observe_driver_entry_pump(
             as *const nt_provider_wait::ProviderWaitSharedPage;
         let request = core::ptr::read_volatile(core::ptr::addr_of!((*page).request));
         // No mechanism call or bank release separates observation, capture and retention.
-        // Keep the lane Running and exclusive until real readiness admission is implemented.
+        // Keep the lane Running and exclusive until owned runtime readiness admission.
         with_provider_process_manager(|pm| {
             let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
             let capture = activations.capture_provider_wait(

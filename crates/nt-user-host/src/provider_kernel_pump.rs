@@ -2,11 +2,14 @@
 //! This guard records execution progress, not scheduler or provider authority.
 
 use core::sync::atomic::{AtomicU64, Ordering};
+use nt_kernel_exec::TimeSnapshot;
 
 static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelProviderPumpFacts {
+    /// Executive clock sample at the physical stop, not a later publication/retry time.
+    pub observed_at: TimeSnapshot,
     pub reply_cap: u64,
     pub completed: bool,
     pub callback_suspended: bool,
@@ -86,12 +89,27 @@ pub enum PumpProgressError {
 ///
 /// ```compile_fail
 /// use nt_user_host::provider_kernel_pump::KernelProviderPumpObservation;
-/// let forged = KernelProviderPumpObservation { reply_cap: 42, nonce: 1 };
+/// let forged = KernelProviderPumpObservation {
+///     reply_cap: 42,
+///     nonce: 1,
+///     observed_at: nt_kernel_exec::TimeSnapshot {
+///         monotonic_100ns: 10,
+///         system_time_100ns: 100,
+///         clock_generation: 0,
+///     },
+/// };
 /// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelProviderPumpObservation {
     reply_cap: u64,
     nonce: u64,
+    observed_at: TimeSnapshot,
+}
+
+impl KernelProviderPumpObservation {
+    pub const fn observed_at(self) -> TimeSnapshot {
+        self.observed_at
+    }
 }
 
 /// One pump entry ticket. Once committed, dropping it leaves canonical progress Invoking.
@@ -116,6 +134,7 @@ enum Progress {
     Observed {
         nonce: u64,
         disposition: KernelProviderPumpDisposition,
+        observed_at: TimeSnapshot,
     },
 }
 
@@ -239,6 +258,7 @@ impl KernelProviderPumpProgress {
         self.progress = Progress::Observed {
             nonce: attempt.nonce,
             disposition,
+            observed_at: facts.observed_at,
         };
         attempt.consumed = true;
         Ok(disposition)
@@ -280,7 +300,12 @@ impl KernelProviderPumpProgress {
             Progress::Observed {
                 nonce,
                 disposition: KernelProviderPumpDisposition::ProviderWaitSuspended,
-            } => Some(KernelProviderPumpObservation { reply_cap, nonce }),
+                observed_at,
+            } => Some(KernelProviderPumpObservation {
+                reply_cap,
+                nonce,
+                observed_at,
+            }),
             _ => None,
         }
     }
