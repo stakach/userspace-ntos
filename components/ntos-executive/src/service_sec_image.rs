@@ -167,7 +167,7 @@ static mut SERVICE_EXE_IMAGE_CATALOG_WORK: nt_exe_image::OwnedHostedImageCatalog
 static mut SERVICE_HOSTED_LOADED_IMAGES_WORK: HostedLoadedImageTable =
     HostedLoadedImageTable::new();
 static mut SERVICE_GENERIC_SECTIONS_WORK: GenericSectionTable = GenericSectionTable::new();
-static mut SERVICE_DELAY_QUEUE_WORK: nt_delay_execution::Queue = nt_delay_execution::Queue::new();
+static mut SERVICE_DELAY_QUEUE_WORK: Option<nt_delay_execution::Queue> = None;
 static SERVICE_DELAY_DRAIN_HANDLER: AtomicU64 = AtomicU64::new(0);
 static SERVICE_DELAY_DRAIN_QUEUE: AtomicU64 = AtomicU64::new(0);
 
@@ -3885,14 +3885,25 @@ unsafe fn service_private_guard_page_fault(
 }
 
 #[inline(never)]
-unsafe fn reset_service_delay_queue_work() -> Option<&'static mut nt_delay_execution::Queue> {
-    let queue = &mut *core::ptr::addr_of_mut!(SERVICE_DELAY_QUEUE_WORK);
-    queue.reset(DELAY_WAITER_INITIAL_RESERVE).then_some(queue)
+pub(crate) unsafe fn initialize_service_delay_queue_work() -> Result<(), u32> {
+    let storage = &mut *core::ptr::addr_of_mut!(SERVICE_DELAY_QUEUE_WORK);
+    if storage.is_some() {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    let _durable = allocator::enter_durable();
+    let mut queue = nt_delay_execution::Queue::new();
+    if !queue.reserve_capacity(DELAY_WAITER_INITIAL_RESERVE) {
+        return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    *storage = Some(queue);
+    Ok(())
 }
 
 pub(crate) fn service_delay_queue_stats() -> (usize, usize, usize, u64, u64) {
     unsafe {
-        let queue = &*core::ptr::addr_of!(SERVICE_DELAY_QUEUE_WORK);
+        let Some(queue) = &*core::ptr::addr_of!(SERVICE_DELAY_QUEUE_WORK) else {
+            return (0, 0, 0, 0, 0);
+        };
         (
             queue.len(),
             queue.records(),
@@ -7814,7 +7825,10 @@ pub(crate) unsafe fn service_sec_image(
     print_str(b"[sec-init] handler-ready\n");
     nt_handler.register_main_thread_spawn(primary_pi, primary_spawn)
         .expect("primary runtime publication must precede first execution");
-    let delay_queue = reset_service_delay_queue_work().expect("delay wait queue allocation failed");
+    // Bootstrap and runtime retain one queue at the same address; registration cannot clear it.
+    let delay_queue = (&mut *core::ptr::addr_of_mut!(SERVICE_DELAY_QUEUE_WORK))
+        .as_mut()
+        .expect("delay wait queue must be initialized before providers");
     register_service_delay_drain_context(&mut nt_handler, delay_queue);
     // Boot drivers can publish timer deadlines before the service loop owns its
     // delay queue. Registration is the first point at which those deadlines can

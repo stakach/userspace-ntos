@@ -35423,10 +35423,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/boot-native-resume-20260916.log. No desktop or native resume execution is claimed.
         Bootstrap blocking admission remains disabled; this does not claim pre-loop fan-in or
         asynchronous DriverEntry acceptance, and runtime execution still needs end-to-end boot proof.
+      - [x] Preserve the canonical delay queue across bootstrap/runtime handoff (2026-09-16).
+        Dispatcher bootstrap now allocates the one service delay queue before providers start;
+        runtime registration borrows the same retained queue rather than clearing it. Duplicate
+        initialization is rejected. Removed Queue::reset and reset_service_delay_queue_work, so
+        service-loop startup cannot silently discard early waiters, reply capabilities or FIFO
+        sequence. Queue::reserve_capacity is non-destructive, including on allocation failure,
+        and correctly reserves against Vec length rather than capacity. Four regression tests
+        cover nonempty growth, reused slots/FIFO order, deterministic capacity failure/retry and
+        bootstrap/runtime handoff preserving relative, absolute and infinite wait ownership.
+        Serialized validation passes all 1,320 tests across 21 suites (including all 16
+        nt-delay-execution tests), with no failures or ignored cases; executive release passes
+        in 36.47s with 294 warnings. Evidence: .tmp/test-bootstrap-delay-20260916.log and
+        .tmp/build-bootstrap-delay-20260916.log. Headless boot with a 120s ceiling passes early
+        initialization and reaches the unchanged strict 27-export win32k rejection before
+        DriverEntry. The halted QEMU was explicitly stopped; run.sh exits 1 without shell proof.
+        Evidence: .tmp/run-bootstrap-delay-20260916.log and
+        .tmp/boot-bootstrap-delay-20260916.log. No native handoff or desktop proof is claimed.
+        This removes reset debt; it does not enable pre-loop wait admission or receive fan-in.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
         selected-resume scheduling now exists, but cannot service early initialization by itself. The
+        delay queue now survives that ownership transition without reset. Before sharing PIT
+        programming with bootstrap, separate delivered-shot time from newly programmed-shot
+        metadata: deferred nested ticks currently pass through delay_timer_interrupt, whose
+        LAST_REARM_WAKE_DEADLINE can describe a later rearm. Do not advance old deliveries to
+        a new future deadline. Cover rearm-before-deferred-delivery and failed programming in
+        host tests; publish armed metadata only after successful programming and retain distinct
+        programming/IRQ-ack outcomes. Bootstrap SET/PULSE must continue rejecting observed Events
+        until caller-aware readiness selection and receive/deadline scheduling are available.
         bounded runtime publication pass above owns initial/repark admission; do not stack another
         frame over the old Resuming wait. Preserve both continuations on failed repark. Use the
         kernel-local terminal consumer above for genuine returns; preserve its exact recipient

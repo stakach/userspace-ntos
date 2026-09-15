@@ -98,11 +98,11 @@ impl Queue {
         }
     }
 
-    pub fn reset(&mut self, initial_reserve: usize) -> bool {
-        self.slots.clear();
-        self.next_sequence = 0;
-        if self.slots.capacity() < initial_reserve {
-            let additional = initial_reserve - self.slots.capacity();
+    /// Reserve total record capacity without discarding waiters or restarting FIFO identity.
+    pub fn reserve_capacity(&mut self, minimum: usize) -> bool {
+        if self.slots.capacity() < minimum {
+            // Vec reservation is relative to length, not existing capacity.
+            let additional = minimum - self.slots.len();
             if self.slots.try_reserve(additional).is_err() {
                 self.allocation_failures = self.allocation_failures.saturating_add(1);
                 return false;
@@ -190,6 +190,10 @@ impl Default for Queue {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[path = "queue_reservation_tests.rs"]
+mod queue_reservation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -333,7 +337,7 @@ mod tests {
     #[test]
     fn queue_grows_and_cancels_terminated_threads() {
         let mut queue = Queue::new();
-        assert!(queue.reset(1));
+        assert!(queue.reserve_capacity(1));
         queue.insert(waiter(due_time(-10, 0, 100), 1)).unwrap();
         queue.insert(waiter(due_time(-20, 0, 100), 1)).unwrap();
         queue.insert(waiter(due_time(-30, 0, 100), 2)).unwrap();

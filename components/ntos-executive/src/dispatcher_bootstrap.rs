@@ -24,6 +24,7 @@ pub(crate) unsafe fn initialize() -> Result<(), u32> {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
     let _durable = allocator::enter_durable();
+    service_sec_image::initialize_service_delay_queue_work()?;
     let seed = DispatcherBootstrapSeed {
         obj_ns: exec_handler::build_initial_object_namespace(),
         anon_event_seq: 0,
