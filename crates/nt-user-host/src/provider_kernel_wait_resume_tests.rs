@@ -16,6 +16,8 @@ use nt_provider_wait::{
 mod execution;
 #[path = "provider_kernel_local_delivery_tests.rs"]
 mod local_delivery;
+#[path = "provider_kernel_wait_admission_tests.rs"]
+mod admission;
 
 struct Recipient {
     state: KernelProviderWaitState,
@@ -76,6 +78,10 @@ fn request(owner: SuspensionOwner, id: u64) -> ProviderWaitRequest {
 
 impl Fixture {
     fn new() -> Self {
+        Self::new_with_request(|owner| request(owner, 71))
+    }
+
+    fn new_with_request(make_request: impl FnOnce(SuspensionOwner) -> ProviderWaitRequest) -> Self {
         let mut pm = bootstrap().into_parts().pm;
         let native = requestor(&mut pm, 0x3000);
         let mut catalog = ProviderDomainCatalog::new();
@@ -104,7 +110,7 @@ impl Fixture {
                 },
             )
             .unwrap_or_else(|(status, _)| panic!("capture failed: {status:x}"));
-        let request = request(caller.owner(), 71);
+        let request = make_request(caller.owner());
         let capture = activations
             .capture_provider_wait(
                 caller,

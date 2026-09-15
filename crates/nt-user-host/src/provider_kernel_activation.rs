@@ -23,6 +23,10 @@ use nt_provider_wait::{
 
 static NEXT_ACTIVATION: AtomicU64 = AtomicU64::new(1);
 
+#[path = "provider_kernel_wait_admission.rs"]
+mod wait_admission;
+pub use wait_admission::KernelProviderWaitAdmissionError;
+
 fn next_activation(counter: &AtomicU64) -> Result<u64, u32> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {

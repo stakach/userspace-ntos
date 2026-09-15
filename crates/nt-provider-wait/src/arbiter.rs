@@ -61,6 +61,12 @@ pub enum ProviderDispatcherWaitError<E> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderDispatcherWaitPublicationError<W, P> {
+    Wait(ProviderDispatcherWaitError<W>),
+    Publication(P),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderDispatcherWaitAdmission {
     Satisfied { wait_id: u64, status: i32 },
     TimedOut { wait_id: u64 },
@@ -213,6 +219,104 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
     where
         B: ProviderDispatcherWaitBackend<Lease = L>,
     {
+        self.admit_owned(
+            backend,
+            shared_request,
+            expected_owner,
+            admission_sequence,
+            now,
+            (),
+            |()| Ok::<(), (core::convert::Infallible, ())>(()),
+        )
+        .map(|(admission, ())| admission)
+        .map_err(|(error, ())| match error {
+            ProviderDispatcherWaitPublicationError::Wait(error) => error,
+            ProviderDispatcherWaitPublicationError::Publication(error) => match error {},
+        })
+    }
+
+    /// Acquire all leases and reserve waiter storage before publishing the continuation.
+    /// Every rejection returns the offered continuation and releases any acquired leases;
+    /// successful publication is followed only by infallible selection or waiter insertion.
+    ///
+    /// `publish` must perform only local canonical ownership changes. It must not invoke IPC,
+    /// schedule execution, reenter this arbiter/backend, or invalidate the acquired leases.
+    /// The caller must retain dispatcher serialization until the admission is committed and
+    /// any immediate result is selected on the published continuation. On rejection, `publish`
+    /// must leave existing continuation ownership unchanged and return the offered value.
+    pub fn admit_owned<B, C, O, E>(
+        &mut self,
+        backend: &mut B,
+        shared_request: &ProviderWaitRequest,
+        expected_owner: ProviderWaitOwner,
+        admission_sequence: u64,
+        now: TimeSnapshot,
+        continuation: C,
+        publish: impl FnOnce(C) -> Result<O, (E, C)>,
+    ) -> Result<
+        (ProviderDispatcherWaitAdmission, O),
+        (ProviderDispatcherWaitPublicationError<B::Error, E>, C),
+    >
+    where
+        B: ProviderDispatcherWaitBackend<Lease = L>,
+    {
+        let (waiter, poll) = match self.prepare_admission(
+            backend,
+            shared_request,
+            expected_owner,
+            admission_sequence,
+            now,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err((
+                    ProviderDispatcherWaitPublicationError::Wait(error),
+                    continuation,
+                ));
+            }
+        };
+        let published = match publish(continuation) {
+            Ok(published) => published,
+            Err((error, continuation)) => {
+                Self::release_leases(backend, &waiter.leases);
+                return Err((
+                    ProviderDispatcherWaitPublicationError::Publication(error),
+                    continuation,
+                ));
+            }
+        };
+
+        let wait_id = waiter.wait_id;
+        let admission = if let Some(index) =
+            Self::ready_selection(backend, waiter.wait_type, &waiter.leases)
+        {
+            Self::consume_selection(backend, waiter.wait_type, &waiter.leases, index);
+            Self::release_leases(backend, &waiter.leases);
+            ProviderDispatcherWaitAdmission::Satisfied {
+                wait_id,
+                status: STATUS_WAIT_0 + index as i32,
+            }
+        } else if poll || waiter.deadline.is_due(now) {
+            Self::release_leases(backend, &waiter.leases);
+            ProviderDispatcherWaitAdmission::TimedOut { wait_id }
+        } else {
+            self.waiters.push(waiter);
+            ProviderDispatcherWaitAdmission::Parked { wait_id }
+        };
+        Ok((admission, published))
+    }
+
+    fn prepare_admission<B>(
+        &mut self,
+        backend: &mut B,
+        shared_request: &ProviderWaitRequest,
+        expected_owner: ProviderWaitOwner,
+        admission_sequence: u64,
+        now: TimeSnapshot,
+    ) -> Result<(ProviderDispatcherWaitRecord<L>, bool), ProviderDispatcherWaitError<B::Error>>
+    where
+        B: ProviderDispatcherWaitBackend<Lease = L>,
+    {
         // Never retain a borrow into a page the provider can overwrite on a nested dispatch.
         let captured = *shared_request;
         let request = Self::validate_request(&captured, expected_owner)?;
@@ -246,42 +350,26 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
             }
         }
 
-        if let Some(index) = Self::ready_selection(backend, request.wait_type, &leases) {
-            Self::consume_selection(backend, request.wait_type, &leases, index);
-            Self::release_leases(backend, &leases);
-            return Ok(ProviderDispatcherWaitAdmission::Satisfied {
-                wait_id: request.wait_id,
-                status: STATUS_WAIT_0 + index as i32,
-            });
-        }
-
         let deadline = match request.timeout_kind {
             ProviderWaitTimeoutKind::Infinite | ProviderWaitTimeoutKind::Poll => Deadline::Infinite,
             ProviderWaitTimeoutKind::Relative | ProviderWaitTimeoutKind::Absolute => {
                 Deadline::from_nt_timeout(Some(request.timeout_100ns), now)
             }
         };
-        if request.timeout_kind == ProviderWaitTimeoutKind::Poll || deadline.is_due(now) {
-            Self::release_leases(backend, &leases);
-            return Ok(ProviderDispatcherWaitAdmission::TimedOut {
+        Ok((
+            ProviderDispatcherWaitRecord {
                 wait_id: request.wait_id,
-            });
-        }
-
-        self.waiters.push(ProviderDispatcherWaitRecord {
-            wait_id: request.wait_id,
-            owner: request.owner,
-            admission_sequence,
-            wait_type: request.wait_type,
-            wait_mode: request.wait_mode,
-            alertable: request.alertable,
-            objects,
-            leases,
-            deadline,
-        });
-        Ok(ProviderDispatcherWaitAdmission::Parked {
-            wait_id: request.wait_id,
-        })
+                owner: request.owner,
+                admission_sequence,
+                wait_type: request.wait_type,
+                wait_mode: request.wait_mode,
+                alertable: request.alertable,
+                objects,
+                leases,
+                deadline,
+            },
+            request.timeout_kind == ProviderWaitTimeoutKind::Poll,
+        ))
     }
 
     pub fn oldest_event_consumer_sequence<B>(

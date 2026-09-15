@@ -35202,13 +35202,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         and .tmp/build-kernel-local-delivery-io-manager-20260915.log. Scoped formatting and
         git diff --check pass. No boot was rerun; the latest measured boot remains the strict
         27-import rejection above, not native kernel-wait acceptance or desktop rendering.
+      - [x] Publish kernel wait continuations only after dispatcher lease acquisition (2026-09-15).
+        ProviderDispatcherWaitArbiter::admit_owned reserves all waiter storage and acquires every
+        canonical lease before invoking owned continuation publication. ABI/owner/sequence,
+        duplicate, allocation and backend failures return the offered nonclone continuation;
+        publication rejection also releases all leases without probing or consuming readiness.
+        Once publication succeeds, only infallible readiness consumption/timeout/parking remains.
+        The existing admit API delegates through this implementation with unit ownership,
+        replacing its duplicate admission body rather than creating a second arbiter.
+        KernelProviderActivations now provides first-wait and repeated-wait publication using
+        that transaction. It validates the real live caller, retained recipient capture and
+        observation epoch before lease acquisition and again immediately before lane mutation.
+        First admission requires an empty kernel lane; repark requires the exact sole Resuming
+        frame and active resume origin. Both use the owned lane APIs. Repark returns the replaced
+        continuation on success and preserves both old/new continuations on failure; it never
+        stacks another wait over the old frame. Immediate readiness/timeout selects the new
+        canonical frame before serialization ends, while parked waits retain real arbiter leases.
+        Tests exercise the actual canonical Event registry/storage as well as nonclone owned
+        continuations, lease rollback, publication-before-consumption, duplicate live IDs, reused
+        observation epochs, stale frame/capture pairs and timeout repark. Native integration still
+        requires a durable allocation scope and memory-local backend/completion operations with
+        no IPC or scheduling inside the transaction. These shared APIs do not create a native
+        stopped-job scheduler or authorize blocking by themselves; production kernel wait
+        admission remains disabled. Six new arbiter tests cover nonclone ownership, complete
+        acquisition before publication, rollback, immediate/parked/expired waits and real owned
+        lane rearm. Seven kernel integration tests use canonical Event backing for first waits,
+        ready/timeout repark, failed publication, stale epochs, foreign manager/continuation and
+        caller/provider retirement. Final serialized validation passes 1,244 tests across 18
+        suites without failures or ignored cases:
+        .tmp/test-kernel-wait-publication-final-20260915.log. Executive release passes in 38.39s
+        with unchanged 303 warnings; standalone I/O Manager passes without warnings. Evidence:
+        .tmp/build-kernel-wait-publication-executive-20260915.log and
+        .tmp/build-kernel-wait-publication-io-manager-20260915.log. Independent ownership review,
+        scoped formatting and git diff --check pass. No boot was rerun; the latest verified
+        frontier remains the strict 27-import rejection, not native readiness/repark acceptance
+        or desktop rendering.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: give the stopped kernel job an actual readiness owner,
-        then repark a repeated request through rearm_running_owned rather than stacking another
+        then use the lease-backed initial/repark publication above rather than stacking another
         frame over the old Resuming wait. Preserve both continuations on failed repark. Use the
         kernel-local terminal consumer above for genuine returns; preserve its exact recipient
         delivery and retirement/ACK rather than frame-free record_completion or a hosted reply.
         Wire the new selected-kernel execution entry only after readiness/repark ownership exists.
+        Adapt the native Event backend by borrowing only its original dispatcher fields; do not
+        retain a whole ExecNtHandler borrow alongside the canonical PM/activation transaction.
         Keep blocking admission disabled until real readiness scheduling and this ownership
         contract are both wired; Timer expiration and receive-endpoint fan-in remain necessary
         for asynchronous boot rather than being implied by successful synchronous Event polls.
