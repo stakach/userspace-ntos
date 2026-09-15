@@ -23,6 +23,34 @@ use bootstrap::{DriverEntryCompletion, DriverEntryRecipient};
 static mut ACTIVATIONS: KernelProviderActivations<DriverEntryRecipient> =
     KernelProviderActivations::new();
 
+pub(super) unsafe fn wait_resume_is_eligible(
+    pm: &nt_process::ProcessManager,
+    capture: nt_user_host::provider_kernel_activation::KernelProviderWaitCapture,
+) -> bool {
+    (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
+        .validate_wait_resume(
+            capture.caller(), pm,
+            &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+            &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS), capture,
+        )
+        .is_ok()
+}
+
+pub(super) unsafe fn has_stopped_wait_work(pm: &nt_process::ProcessManager) -> bool {
+    let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
+    let mut cursor = activations.wait_work_cursor();
+    while let Some((_, work)) = activations.next_wait_work(
+        &mut cursor, pm,
+        &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+        &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
+    ) {
+        if work.is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
 fn channel_binding(channel: &spawn_hosts::PumpChannel) -> LaneBinding {
     LaneBinding {
         executor_id: channel.tcb,

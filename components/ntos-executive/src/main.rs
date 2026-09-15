@@ -3158,6 +3158,7 @@ const DELAY_TIMER_SOURCE_REGISTRY_CLOSE: u64 = 14;
 const DELAY_TIMER_SOURCE_CM_KEY_CLEANUP: u64 = 15;
 const DELAY_TIMER_SOURCE_CM_SNAPSHOT_CLEANUP: u64 = 16;
 const DELAY_TIMER_SOURCE_HOSTED_FILE_RETRY: u64 = 17;
+const DELAY_TIMER_SOURCE_COMPONENT_RESUME: u64 = 18;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -16754,6 +16755,7 @@ unsafe fn delay_timer_next_deadline(
     let cm_key_cleanup_deadline = cm_key_ownership::next_deadline();
     let cm_snapshot_cleanup_deadline = cm_snapshot_ownership::next_deadline();
     let hosted_file_retry_deadline = driver_launch::hosted_file_retry_deadline();
+    let component_resume_deadline = service_sec_image::component_resume::next_deadline(handler);
     let deadman_deadline = watchdog_deadline();
     let deadline = delay_deadline
         .into_iter()
@@ -16772,6 +16774,7 @@ unsafe fn delay_timer_next_deadline(
         .chain(cm_key_cleanup_deadline)
         .chain(cm_snapshot_cleanup_deadline)
         .chain(hosted_file_retry_deadline)
+        .chain(component_resume_deadline)
         .chain(deadman_deadline)
         .min()?;
     let source = if delay_deadline == Some(deadline) {
@@ -16806,6 +16809,8 @@ unsafe fn delay_timer_next_deadline(
         DELAY_TIMER_SOURCE_CM_SNAPSHOT_CLEANUP
     } else if hosted_file_retry_deadline == Some(deadline) {
         DELAY_TIMER_SOURCE_HOSTED_FILE_RETRY
+    } else if component_resume_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_COMPONENT_RESUME
     } else {
         DELAY_TIMER_SOURCE_WATCHDOG
     };
@@ -17032,6 +17037,7 @@ unsafe fn delay_timer_drain_due_work(
         + subdrain!(14, cm_key_ownership::wake_due(now_100ns))
         + subdrain!(15, cm_snapshot_ownership::wake_due(now_100ns))
         + subdrain!(16, driver_launch::hosted_file_retry_wake_due(now_100ns))
+        + service_sec_image::component_resume::wake_due(handler, now_100ns)
         + watchdog_tick
 }
 

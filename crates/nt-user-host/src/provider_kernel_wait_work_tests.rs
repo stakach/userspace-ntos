@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "provider_kernel_wait_runtime_tests.rs"]
+mod runtime;
+
 fn next_work(
     f: &mut Fixture,
 ) -> Option<(KernelProviderCaller, Result<KernelProviderWaitWork, u32>)> {

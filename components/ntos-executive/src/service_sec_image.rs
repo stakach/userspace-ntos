@@ -9,6 +9,8 @@ use nt_user_host::hosted_return_target::HostedReturnTarget;
 mod wait_selection;
 #[path = "component_terminal.rs"]
 mod component_terminal;
+#[path = "component_resume.rs"]
+pub(crate) mod component_resume;
 #[path = "component_return.rs"]
 mod component_return;
 #[path = "component_callback_transfer.rs"]
@@ -1805,270 +1807,23 @@ enum ComponentPumpCompletion {
 enum ComponentSuspensionRuntimeOutcome {
     Parked,
     Terminal,
+    Rearmed,
 }
 
 unsafe fn component_suspension_resume_top(
     nt_handler: &mut ExecNtHandler,
 ) -> Option<ComponentSuspensionRuntimeOutcome> {
+    if component_resume::is_running() {
+        return None;
+    }
     loop {
-        let lane_resume = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
-            .next_resumable_if(|frame| {
-                match frame.continuation {
-                    ComponentNativeContinuation::Hosted(hosted) => {
-                        hosted.return_target.can_resume()
-                            && win32k_glue::win32k_client_context_is_admitted(hosted.pending.client())
-                    }
-                    ComponentNativeContinuation::Kernel(_) => false,
-                }
-            })?;
-        let lane = lane_resume.lane;
-        let reply_object = lane_resume.binding.reply_object;
-        let resume = lane_resume.suspension;
-        let frame = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
-            .frame(lane, resume.key)
-            .ok()??
-            .clone();
-        let continuation = match frame.continuation {
-            ComponentNativeContinuation::Hosted(hosted) => hosted,
-            ComponentNativeContinuation::Kernel(_) => return None,
-        };
-        // Reserve all handoff storage before entering a provider that may yield a callback.
-        // Refusal leaves the selected source wait and its reply authority unchanged.
-        let Ok(mut callback_transfer) = component_callback_transfer::CallbackTransfer::reserve() else {
+        let candidate = component_resume::next_ready(nt_handler)?;
+        if matches!(candidate.continuation, ComponentNativeContinuation::Kernel(_)) {
             return None;
-        };
-        let admitted = {
-            let _durable = allocator::enter_durable();
-            (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                .begin_resume(lane, reply_object, resume.key)
-        };
-        // Claim-time cancellation/completion is authoritative, not the earlier candidate snapshot.
-        let Ok(resume) = admitted else {
-            return None;
-        };
-        let provider_resume = matches!(
-            continuation.pending,
-            PendingComponentDispatch::Provider(_)
-        );
-        if provider_resume {
-            PROVIDER_WAIT_RESUMES.fetch_add(1, Ordering::Relaxed);
-            if !resume.cancelled {
-                PROVIDER_WAIT_SUCCESSFUL_RESUMES.fetch_add(1, Ordering::Relaxed);
-            }
         }
-        let pump_completion = match continuation.pending {
-            PendingComponentDispatch::Provider(pending) => {
-                match win32k_glue::resume_suspended_provider_wait_component(
-                    pending,
-                    resume.key.id,
-                    resume.completion.status,
-                ) {
-                    win32k_glue::ProviderWaitPumpCompletion::Completed(dispatch) => {
-                        ComponentPumpCompletion::Completed(dispatch)
-                    }
-                    win32k_glue::ProviderWaitPumpCompletion::Reparked(pending) => {
-                        ComponentPumpCompletion::Reparked(PendingComponentDispatch::Provider(
-                            pending,
-                        ))
-                    }
-                    win32k_glue::ProviderWaitPumpCompletion::LpcReparked(pending) => {
-                        ComponentPumpCompletion::Reparked(PendingComponentDispatch::Lpc(pending))
-                    }
-                    win32k_glue::ProviderWaitPumpCompletion::UserCallbackSuspended => {
-                        ComponentPumpCompletion::UserCallbackSuspended
-                    }
-                    win32k_glue::ProviderWaitPumpCompletion::Failed(status) => {
-                        ComponentPumpCompletion::Failed(status)
-                    }
-                }
-            }
-            PendingComponentDispatch::Lpc(pending) => {
-                match win32k_glue::resume_suspended_lpc_wait_component(
-                    pending,
-                    resume.completion.lpc_message_id,
-                    resume.completion.status,
-                    resume.completion.lpc_reply(),
-                ) {
-                    win32k_glue::LpcWaitPumpCompletion::Completed(dispatch) => {
-                        ComponentPumpCompletion::Completed(dispatch)
-                    }
-                    win32k_glue::LpcWaitPumpCompletion::ProviderReparked(pending) => {
-                        ComponentPumpCompletion::Reparked(PendingComponentDispatch::Provider(
-                            pending,
-                        ))
-                    }
-                    win32k_glue::LpcWaitPumpCompletion::Reparked(pending) => {
-                        ComponentPumpCompletion::Reparked(PendingComponentDispatch::Lpc(pending))
-                    }
-                    win32k_glue::LpcWaitPumpCompletion::UserCallbackSuspended => {
-                        ComponentPumpCompletion::UserCallbackSuspended
-                    }
-                    win32k_glue::LpcWaitPumpCompletion::Failed(status) => {
-                        ComponentPumpCompletion::Failed(status)
-                    }
-                }
-            }
-        };
-        match pump_completion {
-            ComponentPumpCompletion::Completed(dispatch) => {
-                (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                    .retain_terminal_running(
-                        lane,
-                        reply_object,
-                        resume.key,
-                        frame.owner,
-                        component_terminal::NativeTerminal::completed(dispatch),
-                    )
-                    .unwrap_or_else(|(error, _)| panic!("completed component lost its terminal owner: {:?}", error));
-                return Some(ComponentSuspensionRuntimeOutcome::Terminal);
-            }
-            ComponentPumpCompletion::UserCallbackSuspended => {
-                let captured = callback_transfer.capture(
-                    continuation.pending.client(), lane, frame.owner.dispatch_id,
-                );
-                component_terminal::retain_callback_transfer(
-                    lane, reply_object, resume.key, frame.owner, callback_transfer, captured,
-                );
-                return Some(ComponentSuspensionRuntimeOutcome::Terminal);
-            }
-            ComponentPumpCompletion::Failed(status) => {
-                // Failed includes pre-entry rejection, a still-parked provider, and uncertain
-                // post-entry cleanup. Only Completed carries proof of an actual provider return.
-                component_terminal::retain_incomplete_provider(
-                    lane, reply_object, resume.key, frame.owner, None, status as u32,
-                );
-                return Some(ComponentSuspensionRuntimeOutcome::Terminal);
-            }
-            ComponentPumpCompletion::Reparked(next) => {
-                if matches!(next, PendingComponentDispatch::Provider(_)) {
-                    PROVIDER_WAIT_REARMS.fetch_add(1, Ordering::Relaxed);
-                }
-                let Some(next_owner) = component_expected_owner(next) else {
-                    component_terminal::retain_incomplete_provider(
-                        lane, reply_object, resume.key, frame.owner, Some(next), 0xC000_000D,
-                    );
-                    return Some(ComponentSuspensionRuntimeOutcome::Terminal);
-                };
-                let lpc_reservation = if matches!(next, PendingComponentDispatch::Lpc(_)) {
-                    match (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() {
-                        Ok(reservation) => Some(reservation),
-                        Err(_) => {
-                            component_terminal::retain_incomplete_provider(
-                                lane, reply_object, resume.key, frame.owner, Some(next), 0xC000_009A,
-                            );
-                            return Some(ComponentSuspensionRuntimeOutcome::Terminal);
-                        }
-                    }
-                } else {
-                    None
-                };
-                let next_key = component_suspension_key(next);
-                let sequence = next_dispatcher_wait_sequence();
-                let mut next_continuation = continuation;
-                next_continuation.pending = next;
-                if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                    .rearm_running(
-                        lane,
-                        reply_object,
-                        resume.key,
-                        next_key,
-                        sequence,
-                        next_owner,
-                        ComponentNativeContinuation::Hosted(next_continuation),
-                    )
-                    .is_err()
-                {
-                    if let Some(reservation) = lpc_reservation {
-                        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS))
-                            .cancel(reservation);
-                    }
-                    component_terminal::retain_incomplete_provider(
-                        lane, reply_object, resume.key, frame.owner, Some(next), 0xC000_000D,
-                    );
-                    return Some(ComponentSuspensionRuntimeOutcome::Terminal);
-                }
-                match next {
-                    PendingComponentDispatch::Provider(next) => {
-                        let admission = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER))
-                            .admit(
-                                nt_handler,
-                                &next.request,
-                                next_owner,
-                                sequence,
-                                nt_time_snapshot(),
-                            );
-                        match admission {
-                            Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::Parked { .. }) => {
-                                PROVIDER_WAIT_PARKED_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
-                                trace_provider_wait_admission(
-                                    b"repark",
-                                    next.request.header.wait_id,
-                                    0x0000_0103,
-                                    next.request.header.object_count as u64,
-                                );
-                                return Some(ComponentSuspensionRuntimeOutcome::Parked);
-                            }
-                            Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::Satisfied {
-                                wait_id,
-                                status,
-                            }) => {
-                                trace_provider_wait_admission(
-                                    b"ready-rearm",
-                                    wait_id,
-                                    status,
-                                    next.request.header.object_count as u64,
-                                );
-                                let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                                    .select(
-                                        provider_wait_key(wait_id),
-                                        ComponentSuspensionCompletion::provider(status),
-                                    );
-                            }
-                            Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::TimedOut {
-                                wait_id,
-                            }) => {
-                                trace_provider_wait_admission(
-                                    b"timeout-rearm",
-                                    wait_id,
-                                    nt_provider_wait::STATUS_TIMEOUT,
-                                    next.request.header.object_count as u64,
-                                );
-                                let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                                    .select(
-                                        provider_wait_key(wait_id),
-                                        ComponentSuspensionCompletion::provider(
-                                            nt_provider_wait::STATUS_TIMEOUT,
-                                        ),
-                                    );
-                            }
-                            Err(error) => {
-                                let status = provider_wait_status_for_error(error);
-                                trace_provider_wait_admission(
-                                    b"reject-rearm",
-                                    next.request.header.wait_id,
-                                    status,
-                                    provider_wait_error_detail(error),
-                                );
-                                let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                                    .cancel(
-                                        next_key,
-                                        ComponentSuspensionCompletion::provider(status),
-                                    );
-                            }
-                        }
-                    }
-                    PendingComponentDispatch::Lpc(next) => {
-                        if lpc_wait_begin_after_stack_admission(
-                            nt_handler,
-                            next,
-                            next_key,
-                            lpc_reservation.expect("LPC re-wait has readiness reservation"),
-                        ) {
-                            return Some(ComponentSuspensionRuntimeOutcome::Parked);
-                        }
-                    }
-                }
-            }
+        match component_resume::run_hosted(core::ptr::from_mut(nt_handler), candidate)? {
+            ComponentSuspensionRuntimeOutcome::Rearmed => continue,
+            outcome => return Some(outcome),
         }
     }
 }
@@ -2397,6 +2152,9 @@ unsafe fn component_suspension_drain_ready(
     procs: &mut [ProcExec],
     pfilled: &mut [[u64; 512]],
 ) -> u64 {
+    if component_resume::is_running() {
+        return 0;
+    }
     let mut drained = 0;
     loop {
         drained += component_terminal::drain(nt_handler, procs, pfilled);
@@ -2408,6 +2166,7 @@ unsafe fn component_suspension_drain_ready(
             // Another lane may already have a selected completion, so keep draining until the
             // coordinator reports that no resumable lane remains.
             ComponentSuspensionRuntimeOutcome::Parked
+            | ComponentSuspensionRuntimeOutcome::Rearmed
             | ComponentSuspensionRuntimeOutcome::Terminal => continue,
         }
     }
@@ -3492,6 +3251,13 @@ pub(crate) fn service_dll_pe_store_stats() -> DllPeStoreStats {
 /// This boundary also progresses retained wait effects on timer-only activity, when no new user
 /// syscall can arrive to drive a failed context write or capability retirement.
 fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
+    let status = finalize_service_loop_work(nt_handler);
+    // Include readiness created by any late post-action, on success and failure paths alike.
+    unsafe { component_resume::reconcile(nt_handler) };
+    status
+}
+
+fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
     unsafe { kernel_provider_activation::publish_runtime_waits(nt_handler) };
     unsafe { kernel_provider_activation::redrive_ready_completions() };
     unsafe { inline_file_retirement::redrive(nt_handler) };
@@ -8153,10 +7919,30 @@ pub(crate) unsafe fn service_sec_image(
             panic!("primary hosted process resume failed");
         }
     }
+    // Every blocking ingress rechecks retained work, including early fault/refusal branches.
+    // This barrier only programs wake demand; provider execution stays at the outer loop top.
+    macro_rules! component_recv {
+        ($($arg:expr),* $(,)?) => {{
+            component_resume::reconcile(&mut nt_handler);
+            recv_full_r12($($arg),*)
+        }};
+    }
+    macro_rules! component_reply_recv {
+        ($($arg:expr),* $(,)?) => {{
+            component_resume::reconcile(&mut nt_handler);
+            reply_recv_badge($($arg),*)
+        }};
+    }
+    macro_rules! component_client_reply_recv {
+        ($($arg:expr),* $(,)?) => {{
+            component_resume::reconcile(&mut nt_handler);
+            client_reply_recv_badge($($arg),*)
+        }};
+    }
     // Fix (B): the INITIAL recv also binds REPLY_MAIN (r12) so the first caller's Call is captured
     // as a reply cap, matching every reply_recv_badge recv in the loop body.
     let (mut badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
-        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+        component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
     // ★★ PARK + QUIESCE CONTRACT — see docs/n-threads-multiplex.md §1a for the authoritative catalog
     // of every park site + the quiesce predicate. Load-bearing: moving a park's location/condition or
     // changing the quiesce logic can hang the boot (never quiesce) or quiesce EARLY (miss specs / skip
@@ -8263,7 +8049,7 @@ pub(crate) unsafe fn service_sec_image(
             }
             let _ = finalize_service_loop_state(&mut nt_handler);
             let (nb, nmi, nm0, nm1, nm2, nm3) =
-                recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
             badge = nb;
             mi = nmi;
             m0 = nm0;
@@ -8352,7 +8138,7 @@ pub(crate) unsafe fn service_sec_image(
                 mark_wait_parked!($pi, $ip);
                 let _ = finalize_service_loop_state(&mut nt_handler);
                 let (nb, nmi, nm0, nm1, nm2, nm3) =
-                    recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                 badge = nb;
                 mi = nmi;
                 m0 = nm0;
@@ -8463,7 +8249,7 @@ pub(crate) unsafe fn service_sec_image(
             print_u64(mi >> 12);
             print_str(b"\n");
             assert!(drop_current_hosted_reply(), "cannot cancel rejected hosted ingress");
-            let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
             badge = received.0;
             mi = received.1;
             m0 = received.2;
@@ -8525,7 +8311,7 @@ pub(crate) unsafe fn service_sec_image(
                     stop = irq_durable_status as u64;
                     break;
                 }
-                let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                 badge = received.0;
                 mi = received.1;
                 m0 = received.2;
@@ -8752,6 +8538,8 @@ pub(crate) unsafe fn service_sec_image(
                     break;
                 }
             }
+            // Consume the delivered timer before scheduling can program the next shot.
+            component_resume::run_outer(core::ptr::from_mut(&mut *nt_handler));
             let timer_durable_status = finalize_service_loop_state(&mut nt_handler);
             if timer_durable_status != nt_fs::STATUS_SUCCESS {
                 print_str(b"[service-loop] timer checkpoint failure=0x");
@@ -8760,7 +8548,7 @@ pub(crate) unsafe fn service_sec_image(
                 stop = timer_durable_status as u64;
                 break;
             }
-            let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
             badge = received.0;
             mi = received.1;
             m0 = received.2;
@@ -8790,6 +8578,9 @@ pub(crate) unsafe fn service_sec_image(
             stop = durability_status as u64;
             break;
         }
+        // Only this outer owner can leave all executive/scratch borrows before a resume pump.
+        // Any absorbed timer deliveries have already been processed above.
+        component_resume::run_outer(core::ptr::from_mut(&mut *nt_handler));
         // Deferred work may retire a process/thread. Revalidate the complete binding before
         // selecting any role, LPC context, stack mirror or process memory state.
         let event_runtime = match (ingress, nt_handler.admit_hosted_thread_ingress(badge)) {
@@ -9080,7 +8871,7 @@ pub(crate) unsafe fn service_sec_image(
                         procs[pi].ntfaults = ntfaults;
                         pfilled[pi] = *filled_pages;
                         let (nb, nmi, nm0, nm1, nm2, nm3) =
-                            reply_recv_badge(fault_ep, 3, fip + 3, m1, m2, 0);
+                            component_reply_recv!(fault_ep, 3, fip + 3, m1, m2, 0);
                         badge = nb;
                         mi = nmi;
                         m0 = nm0;
@@ -9319,7 +9110,7 @@ pub(crate) unsafe fn service_sec_image(
                     break;
                 }
                 let (nb, nmi, nm0, nm1, nm2, nm3) =
-                    recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                 badge = nb;
                 mi = nmi;
                 m0 = nm0;
@@ -9773,7 +9564,7 @@ pub(crate) unsafe fn service_sec_image(
                             pfilled[pi] = *filled_pages;
                             let _ = finalize_service_loop_state(&mut nt_handler);
                             let (nb, nmi, nm0, nm1, nm2, nm3) =
-                                reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
+                                component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
                             trace_stack_growth_reply(pi, badge, nb, nmi, nm0, nm1, nm2, nm3);
                             badge = nb;
                             mi = nmi;
@@ -9802,7 +9593,7 @@ pub(crate) unsafe fn service_sec_image(
                     mark_wait_parked!(pi, m0);
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
-                        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                        component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -9861,7 +9652,7 @@ pub(crate) unsafe fn service_sec_image(
                     // Recv the next event WITHOUT replying to the listener (it stays blocked).
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
-                        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                        component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -10021,7 +9812,7 @@ pub(crate) unsafe fn service_sec_image(
                             pfilled[pi] = *filled_pages;
                             let _ = finalize_service_loop_state(&mut nt_handler);
                             let (nb, nmi, nm0, nm1, nm2, nm3) =
-                                reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
+                                component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
                             trace_stack_growth_reply(pi, badge, nb, nmi, nm0, nm1, nm2, nm3);
                             badge = nb;
                             mi = nmi;
@@ -10114,7 +9905,7 @@ pub(crate) unsafe fn service_sec_image(
                             pfilled[pi] = *filled_pages;
                             let _ = finalize_service_loop_state(&mut nt_handler);
                             let (nb, nmi, nm0, nm1, nm2, nm3) =
-                                reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
+                                component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
                             badge = nb;
                             mi = nmi;
                             m0 = nm0;
@@ -10159,7 +9950,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
-                    let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -10198,7 +9989,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
-                    let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -10408,7 +10199,7 @@ pub(crate) unsafe fn service_sec_image(
                         break;
                     }
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
-                        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                        component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -10487,7 +10278,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
-                        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                        component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -10634,7 +10425,7 @@ pub(crate) unsafe fn service_sec_image(
             procs[pi].first = first;
             procs[pi].ntfaults = ntfaults;
             pfilled[pi] = *filled_pages;
-            let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
+            let (nb, nmi, nm0, nm1, nm2, nm3) = component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
             badge = nb;
             mi = nmi;
             m0 = nm0;
@@ -10649,7 +10440,7 @@ pub(crate) unsafe fn service_sec_image(
         // NORMALIZE it into the fault-frame register slots the `(mi>>12)==2` arm reads, then re-label
         // the message as UnknownSyscall (2) so it flows through that arm's FULL servicing body
         // unchanged (dispatch + out-writes + spawn/park/delay post-actions). The reply is a NORMAL IPC
-        // reply (the native caller has NO pending fault): `reply_recv_badge(..,result,..)` fans
+        // reply (the native caller has NO pending fault): `component_reply_recv!(..,result,..)` fans
         // result→MR0→the caller's r10, which our native stub reads as NTSTATUS.
         let native_call_transport = (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL;
         if native_call_transport {
@@ -10910,7 +10701,7 @@ pub(crate) unsafe fn service_sec_image(
                 crate::current_apc::redrive(&mut nt_handler);
                 inline_file_retirement::redrive(&mut nt_handler);
                 let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, reply_main);
                 badge = nb;
                 mi = nmi;
                 m0 = nm0;
@@ -11042,7 +10833,7 @@ pub(crate) unsafe fn service_sec_image(
                             procs[pi].ntfaults = ntfaults;
                             pfilled[pi] = *filled_pages;
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                            let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
                             badge = nb;
                             mi = nmi;
                             m0 = nm0;
@@ -11056,7 +10847,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         reply_parked_syscall(reply_main, 0xC000_009A);
-                        let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, reply_main);
                         badge = nb;
                         mi = nmi;
                         m0 = nm0;
@@ -11154,7 +10945,7 @@ pub(crate) unsafe fn service_sec_image(
                                     let _ = finalize_service_loop_state(&mut nt_handler);
                                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                                     let (nb, nmi, nm0, nm1, nm2, nm3) =
-                                        recv_full_r12(fault_ep, new_reply);
+                                        component_recv!(fault_ep, new_reply);
                                     badge = nb;
                                     mi = nmi;
                                     m0 = nm0;
@@ -11192,7 +10983,7 @@ pub(crate) unsafe fn service_sec_image(
                                     let _ = finalize_service_loop_state(&mut nt_handler);
                                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                                     let (nb, nmi, nm0, nm1, nm2, nm3) =
-                                        recv_full_r12(fault_ep, new_reply);
+                                        component_recv!(fault_ep, new_reply);
                                     badge = nb;
                                     mi = nmi;
                                     m0 = nm0;
@@ -11216,7 +11007,7 @@ pub(crate) unsafe fn service_sec_image(
                             pfilled[pi] = *filled_pages;
                             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                             client_reply_on(reply_main, 0, 0, 0, 0, 0);
-                            let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, reply_main);
                             badge = nb;
                             mi = nmi;
                             m0 = nm0;
@@ -11362,7 +11153,7 @@ pub(crate) unsafe fn service_sec_image(
                         "File ingress refusal lost its new reply");
                     synchronous_file_cancellation::redrive(&mut nt_handler);
                     let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, reply_main);
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -11687,7 +11478,7 @@ pub(crate) unsafe fn service_sec_image(
                             pfilled[pi] = *filled_pages;
                             let _ = finalize_service_loop_state(&mut nt_handler);
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                            let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
                             badge = nb;
                             mi = nmi;
                             m0 = nm0;
@@ -11742,7 +11533,7 @@ pub(crate) unsafe fn service_sec_image(
                                 new_reply,
                             );
                         }
-                        let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
                         badge = nb;
                         mi = nmi;
                         m0 = nm0;
@@ -11822,7 +11613,7 @@ pub(crate) unsafe fn service_sec_image(
                         if drop_reply {
                             let _ = finalize_service_loop_state(&mut nt_handler);
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                            let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
                             badge = nb;
                             mi = nmi;
                             m0 = nm0;
@@ -16958,7 +16749,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
-                        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                        component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -17017,7 +16808,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
-                        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                        component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -17039,7 +16830,7 @@ pub(crate) unsafe fn service_sec_image(
                     mark_wait_parked!(pi, m0);
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
-                        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                        component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -17092,7 +16883,7 @@ pub(crate) unsafe fn service_sec_image(
                     mark_wait_parked!(pi, m0);
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
-                        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                        component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -17140,7 +16931,7 @@ pub(crate) unsafe fn service_sec_image(
                     mark_wait_parked!(pi, resume_ip);
                 }
                 let _ = finalize_service_loop_state(&mut nt_handler);
-                let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                 badge = received.0;
                 mi = received.1;
                 m0 = received.2;
@@ -17189,7 +16980,7 @@ pub(crate) unsafe fn service_sec_image(
                         break;
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
-                    let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
                     m0 = received.2;
@@ -17238,7 +17029,7 @@ pub(crate) unsafe fn service_sec_image(
                     if gui_message_wait_was_replied(pi as u32, badge) {
                         let _ = finalize_service_loop_state(&mut nt_handler);
                         let received =
-                            recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                            component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                         badge = received.0;
                         mi = received.1;
                         m0 = received.2;
@@ -17256,7 +17047,7 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     mark_wait_parked!(pi, resume_ip);
                     let _ = finalize_service_loop_state(&mut nt_handler);
-                    let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
                     m0 = received.2;
@@ -17305,7 +17096,7 @@ pub(crate) unsafe fn service_sec_image(
                         wait_parked = wait_parked_owner_mask(&nt_handler);
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
-                    let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
                     m0 = received.2;
@@ -17340,7 +17131,7 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     mark_wait_parked!(pi, resume_ip);
                     let _ = finalize_service_loop_state(&mut nt_handler);
-                    let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
                     m0 = received.2;
@@ -17381,7 +17172,7 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     mark_wait_parked!(pi, resume_ip);
                     let _ = finalize_service_loop_state(&mut nt_handler);
-                    let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
                     m0 = received.2;
@@ -17433,7 +17224,7 @@ pub(crate) unsafe fn service_sec_image(
                         mark_wait_parked!(pi, resume_ip);
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
-                    let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
                     m0 = received.2;
@@ -17460,7 +17251,7 @@ pub(crate) unsafe fn service_sec_image(
                 ) {
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                    let received = recv_full_r12(fault_ep, new_reply);
+                    let received = component_recv!(fault_ep, new_reply);
                     badge = received.0;
                     mi = received.1;
                     m0 = received.2;
@@ -17500,7 +17291,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                    let received = recv_full_r12(fault_ep, new_reply);
+                    let received = component_recv!(fault_ep, new_reply);
                     badge = received.0;
                     mi = received.1;
                     m0 = received.2;
@@ -17542,7 +17333,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                    let received = recv_full_r12(fault_ep, new_reply);
+                    let received = component_recv!(fault_ep, new_reply);
                     badge = received.0;
                     mi = received.1;
                     m0 = received.2;
@@ -17619,7 +17410,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -17671,7 +17462,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -17689,7 +17480,7 @@ pub(crate) unsafe fn service_sec_image(
             if synchronous_file_wait_parked {
                 let _ = finalize_service_loop_state(&mut nt_handler);
                 let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
                 badge = nb;
                 mi = nmi;
                 m0 = nm0;
@@ -17713,7 +17504,7 @@ pub(crate) unsafe fn service_sec_image(
                 let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
                 let _ = finalize_service_loop_state(&mut nt_handler);
                 let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
                 badge = nb;
                 mi = nmi;
                 m0 = nm0;
@@ -17735,7 +17526,7 @@ pub(crate) unsafe fn service_sec_image(
                 let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
                 let _ = finalize_service_loop_state(&mut nt_handler);
                 let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
                 badge = nb;
                 mi = nmi;
                 m0 = nm0;
@@ -17768,7 +17559,7 @@ pub(crate) unsafe fn service_sec_image(
                 if wait_for_completion {
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -17794,7 +17585,7 @@ pub(crate) unsafe fn service_sec_image(
                     let _ = file_cleanup_redrive_all(&mut nt_handler);
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -17822,7 +17613,7 @@ pub(crate) unsafe fn service_sec_image(
                 let _ = file_irp_drain_redrive_all(&mut nt_handler);
                 let _ = finalize_service_loop_state(&mut nt_handler);
                 let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
                 badge = nb;
                 mi = nmi;
                 m0 = nm0;
@@ -17862,7 +17653,7 @@ pub(crate) unsafe fn service_sec_image(
                     mark_wait_parked!(pi, resume_ip);
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
                     badge = nb;
                     mi = nmi;
                     m0 = nm0;
@@ -17905,7 +17696,7 @@ pub(crate) unsafe fn service_sec_image(
                 crate::current_apc::redrive(&mut nt_handler);
                 let _ = finalize_service_loop_state(&mut nt_handler);
                 let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
                 badge = nb;
                 mi = nmi;
                 m0 = nm0;
@@ -17948,7 +17739,7 @@ pub(crate) unsafe fn service_sec_image(
             let r0 = if redirected_user_control { 0 } else { result };
             let ((nb, nmi, nm0, nm1, nm2, nm3), native_reply_delivered) = if reply_main == 0 {
                 // Pre-retype (demo path): no reply objects exist yet, legacy `reply_to` it is.
-                (reply_recv_badge(fault_ep, len, r0, 0, 0, 0), true)
+                (component_reply_recv!(fault_ep, len, r0, 0, 0, 0), true)
             } else {
                 // A client redirected into a win32k user-mode callback resumes with the length-0
                 // fault reply the redirect staged, not with a syscall result. Current APC delivery
@@ -17964,10 +17755,10 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     let _ =
                         lpc_component_reply_commit_drain(&mut nt_handler, procs, pfilled);
-                    (recv_full_r12(fault_ep, reply_main), delivered)
+                    (component_recv!(fault_ep, reply_main), delivered)
                 } else {
                     let received =
-                        client_reply_recv_badge(fault_ep, reply_main, len, r0, 0, 0, 0);
+                        component_client_reply_recv!(fault_ep, reply_main, len, r0, 0, 0, 0);
                     let delivered = received.0 != COMPOSITE_SEND_ERROR_BADGE;
                     (received, delivered)
                 }

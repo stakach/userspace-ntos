@@ -35389,23 +35389,58 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         release also passes. Evidence: .tmp/build-resume-wake-executive-20260916.log and
         .tmp/build-resume-wake-io-manager-20260916.log. Scoped formatting and git diff --check pass.
         No boot rerun: the measured strict 27-import frontier is unchanged.
+      - [x] Wire runtime wake ownership and exact-candidate execution (2026-09-16).
+        component_resume.rs now owns the runtime pass and its retained ResumeWake; a distinct
+        timer source contributes its read-only deadline to the canonical timer minimum. Timer
+        hooks recognize due scheduler work without consuming demand or entering a provider.
+        The outer loop executes only after delivered timer work has been processed, avoiding a
+        new shot overwriting the delivered shot's deadline metadata. It preserves incoming IPC
+        registers, checkpoints live paging scratch and revalidates hosted ingress after execution.
+        All production receive/reply-receive branches now use local wake-reconciliation barriers,
+        including early fault/refusal exits; finalization also reconciles after late post-actions.
+        No-work barriers do not reprogram the timer. Programming failure cannot acknowledge demand.
+        The hosted pump body moved to component_resume_execute.rs and executes an exact selected
+        candidate, with owner/sequence checks and claim-time completion/cancellation. The outer
+        pass uses the same oldest-eligible ordering for hosted and kernel callers. Borrowed hosted
+        drains stop at an older eligible kernel candidate and do not execute nested work while the
+        outer owner is active. Kernel execution uses the retained physical channel and owned resume
+        ticket; new waits use the existing owned repark path, genuine returns use local terminal
+        delivery, and uncertain stops retain their original owner. Canonical borrows end before
+        each pump; LPC endpoint post-actions remain routed through their normal redrive.
+        Failed initial/repeated publication remains wakeable even though its physically stopped
+        lane still has Running ownership. An actual entered/unobserved pump suppresses that source
+        instead. Two new shared integration tests exercise this distinction, real Event leases,
+        failed admission/repark, retained captures, bounded retry and original timeout deadlines.
+        Serialized validation passes 1,304 tests across 19 suites with no failures or ignored cases:
+        .tmp/test-native-resume-20260916.log. Executive release passes in 38.33s with 294 warnings
+        (previously 302); standalone I/O Manager also passes. Evidence:
+        .tmp/build-native-resume-executive-20260916.log and
+        .tmp/build-native-resume-io-manager-20260916.log. The receive audit finds no bare blocking
+        receive calls in the production loop. A headless boot with a 300s ceiling reaches the
+        unchanged strict 27-export win32k import rejection and panics before DriverEntry. The
+        halted QEMU instance was explicitly stopped; run.sh exits 1 without a shell proof.
+        Evidence: .tmp/run-native-resume-20260916.log and
+        .tmp/boot-native-resume-20260916.log. No desktop or native resume execution is claimed.
+        Bootstrap blocking admission remains disabled; this does not claim pre-loop fan-in or
+        asynchronous DriverEntry acceptance, and runtime execution still needs end-to-end boot proof.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
-        Next whole native ownership slice: schedule selected kernel resumes alongside hosted work
-        using the retained activation and physical channel without replaying initial entry. The
+        Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
+        for initial kernel activations before enabling blocking DriverEntry admission. Runtime
+        selected-resume scheduling now exists, but cannot service early initialization by itself. The
         bounded runtime publication pass above owns initial/repark admission; do not stack another
         frame over the old Resuming wait. Preserve both continuations on failed repark. Use the
         kernel-local terminal consumer above for genuine returns; preserve its exact recipient
         delivery and retirement/ACK rather than frame-free record_completion or a hosted reply.
-        Wire the new selected-kernel execution entry only after readiness/repark ownership exists.
+        Preserve the selected-kernel execution entry's exact readiness/repark ownership.
         Preserve the completed timeout-origin contract above through selection and repark.
-        Wire the completed bounded pass and exact eligibility contracts above into one native
-        caller-neutral execution owner. Borrowed legacy hosted drains must not skip an older
+        Preserve the completed bounded pass and exact eligibility contracts in the native
+        caller-neutral execution owner. Borrowed hosted drains must not skip an older
         eligible kernel candidate or execute nested work while the outer pass owns scheduling.
-        Wire the shared ready-work wake/retry owner above before enabling that pass: selection
+        Retain the shared ready-work wake/retry owner above: selection
         removes waits from the arbiter, so its parked deadlines cannot wake selected work. A
         top-of-loop pass alone strands immediate rewaits or work selected before a blocking receive;
-        watchdog polling or perpetual immediate timer rearming is not a substitute. Add its
-        read-only deadline to delay_timer_next_deadline with a distinct source, without consuming
+        watchdog polling or perpetual immediate timer rearming is not a substitute. Keep its
+        read-only deadline in delay_timer_next_deadline with a distinct source, without consuming
         demand in nested timer hooks or treating rearm_registered_delay_timer's boolean as proof
         that PIT programming succeeded. Temporarily suppress the source while a physical lane is
         busy, but retain demand and guarantee reconcile/rearm after token release before receive.
@@ -35450,9 +35485,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         making hosted-client fields optional placeholders. HostedNativeContinuation now holds
         PendingComponentDispatch plus HostedReturnTarget, while ComponentNativeContinuation::Kernel
         holds KernelProviderWaitCapture with the real caller and validated owned request snapshot.
-        The runtime publication pass now constructs that Kernel variant through owned admission;
-        blocking rendezvous remains disabled, and no selected-execution scheduler invokes it yet.
-        Hosted execution selectors and hosted terminal processing explicitly exclude it; the separate
+        The runtime publication pass constructs that Kernel variant through owned admission;
+        the caller-neutral outer scheduler now invokes its exact resume. Bootstrap blocking
+        rendezvous remains disabled. Borrowed hosted execution and hosted terminal processing
+        explicitly exclude kernel execution/delivery; the separate
         local terminal consumer is now wired as above. A kernel terminal
         recipient must preserve its real initiating caller and return contract, not deliver a
         CompletedWin32kDispatch to a hosted syscall reply.
