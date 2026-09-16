@@ -35523,6 +35523,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Native source precedence was manually reviewed; shared tests cover the generic selector.
         No boot rerun: the known strict 27-export win32k rejection is unchanged. No desktop proof.
         This replaces the runtime collector; bootstrap rearm/global servicing is not enabled.
+      - [x] Separate hosted timer expiration from DPC execution (2026-09-16).
+        hosted_driver_timer_wake_due now publishes timer signal state, wakes existing driver
+        waiters and queues DPCs without entering driver code. Removed its inline DPC drain.
+        Runtime post-timer and hosted-I/O boundaries drain DPCs before creating the helper's
+        handler borrow, passing only the completed activation count into the redrive helper.
+        All three eligible component receive paths now yield for queued DPC demand as well as
+        IRQs after event bookkeeping. This prevents timer-only delivery from putting a retained
+        driver invocation back to sleep with its completion DPC still queued. Existing IRP or
+        authenticated kernel receive-yield eligibility is unchanged; dedicated IRQ exchange
+        remains latch/ACK-only and does not recursively execute DPCs.
+        Two shared regressions cover deferred activation, exact driver-owner isolation, periodic
+        coalescing and requeue during an in-flight activation. Native receive-site coverage is
+        source-reviewed, not an observed boot proof. All 1,346 host tests pass across 23 suites
+        with no failures or ignored cases (.tmp/test-timer-dpc-boundary-20260916.log).
+        Executive release passes in 40.20s with 294 warnings; I/O Manager release also passes.
+        Evidence: .tmp/build-timer-dpc-boundary-20260916.log and
+        .tmp/build-timer-dpc-boundary-io-manager-20260916.log. No boot rerun: the known strict
+        27-export win32k rejection is unchanged. No desktop or native delivery proof is claimed.
+        Review adjustment: this does not supply a general DPC retry/wake owner for self-requeued
+        work or arbitrary non-yielding channels. Complete that ownership before bootstrap blocking
+        admission. Queueing can still perform an IRQ-lane startup handshake; this is not a no-IPC
+        expiry boundary. Other hosted-I/O/retirement execution borrows still need their own audit.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
@@ -35536,8 +35558,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         rearm the PIT: hosted-driver timers, waiters, retry owners and watchdog work share it.
         The shared deadline collector now accepts explicit owner deadlines without a live handler.
         Supply bootstrap-owned deadlines and service all global owners outside bootstrap borrows
-        before changing rearm ownership. In particular hosted_driver_timer_wake_due can dispatch
-        DPCs; it must not run with a seed/backend reference alive. Retain notification demand until
+        before changing rearm ownership. Timer expiry no longer dispatches DPCs inline; scheduler
+        DPC drains must still run outside seed/backend references. Retain notification demand until
         the complete owner services it; LAST_REARM metadata is not a deadline authority.
         The bounded runtime publication pass above owns initial/repark admission; do not stack another
         frame over the old Resuming wait. Preserve both continuations on failed repark. Use the

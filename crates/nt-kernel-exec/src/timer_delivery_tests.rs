@@ -1,5 +1,71 @@
 use super::*;
+use crate::{HostedDpcOwner, HostedDpcQueueResult, HostedDpcTable};
 use alloc::vec;
+
+#[test]
+fn expired_timer_dpc_survives_until_a_separate_scheduler_claim() {
+    let mut clock = FakeClock::new();
+    let mut timers = TimerQueue::new();
+    let mut dpcs = HostedDpcTable::new();
+    let owner = HostedDpcOwner::new(1, 2, 3).unwrap();
+    let other = HostedDpcOwner::new(4, 5, 6).unwrap();
+    let identity = dpcs.register(owner, 11, 100, 200).unwrap();
+    timers.set(1, -100, 0, Some(11), &clock);
+    clock.advance_100ns(100);
+    for expiry in timers.run_due_expirations(&clock) {
+        assert_eq!(expiry.dpc_ptr, Some(identity.dpc_token));
+        assert_eq!(
+            dpcs.queue(identity, 0, 0),
+            Ok(HostedDpcQueueResult::Queued(identity))
+        );
+    }
+    assert!(timers.read_state(1));
+    assert!(timers.run_due_expirations(&clock).is_empty());
+    assert!(dpcs.has_queued());
+    assert!(!dpcs.snapshot(identity).unwrap().in_flight);
+    assert_eq!(dpcs.begin_next(other), Ok(None));
+    assert!(dpcs.has_queued());
+    let activation = dpcs.begin_next(owner).unwrap().unwrap();
+    assert_eq!(activation.identity, identity);
+    assert!(!dpcs.has_queued());
+    dpcs.complete(activation).unwrap();
+    assert_eq!(dpcs.begin_next(owner), Ok(None));
+}
+
+#[test]
+fn periodic_expirations_coalesce_before_dispatch_and_requeue_after_claim() {
+    let mut clock = FakeClock::new();
+    let mut timers = TimerQueue::new();
+    let mut dpcs = HostedDpcTable::new();
+    let owner = HostedDpcOwner::new(1, 2, 3).unwrap();
+    let identity = dpcs.register(owner, 11, 100, 200).unwrap();
+    timers.set(1, -100, 1, Some(11), &clock);
+    for (delta, expected) in [
+        (100, HostedDpcQueueResult::Queued(identity)),
+        (10_000, HostedDpcQueueResult::AlreadyQueued(identity)),
+    ] {
+        clock.advance_100ns(delta);
+        let expired = timers.run_due_expirations(&clock);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].dpc_ptr, Some(identity.dpc_token));
+        assert_eq!(dpcs.queue(identity, 0, 0), Ok(expected));
+    }
+    assert_eq!(dpcs.queued_count(owner), 1);
+    let first = dpcs.begin_next(owner).unwrap().unwrap();
+    clock.advance_100ns(10_000);
+    assert_eq!(timers.run_due_expirations(&clock).len(), 1);
+    assert_eq!(
+        dpcs.queue(identity, 0, 0),
+        Ok(HostedDpcQueueResult::Queued(identity))
+    );
+    assert!(dpcs.has_queued());
+    assert_eq!(dpcs.begin_next(owner), Ok(None));
+    dpcs.complete(first).unwrap();
+    let second = dpcs.begin_next(owner).unwrap().unwrap();
+    assert_ne!(first.sequence, second.sequence);
+    dpcs.complete(second).unwrap();
+    assert!(!dpcs.has_queued());
+}
 
 #[test]
 fn programming_writes_mode_then_low_and_high_bytes() {

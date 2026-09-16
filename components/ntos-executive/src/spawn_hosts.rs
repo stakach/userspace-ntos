@@ -1552,7 +1552,9 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel, reply_cap: u64) -> Option<
         if pump_deadman_tripped() {
             return Some(PumpMessage::deadman_wall());
         }
-        if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield) && irq {
+        if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
+            && (irq || crate::driver_launch::hosted_driver_dpc_activation_pending())
+        {
             return Some(PumpMessage::scheduler_yield());
         }
         return None;
@@ -1782,7 +1784,9 @@ unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
             if pump_deadman_tripped() {
                 return PumpMessage::deadman_wall();
             }
-            if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield) && irq {
+            if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
+                && (irq || crate::driver_launch::hosted_driver_dpc_activation_pending())
+            {
                 return PumpMessage::scheduler_yield();
             }
             if timer {
@@ -1864,7 +1868,9 @@ unsafe fn pump_reply_recv4(
         if pump_deadman_tripped() {
             return PumpMessage::deadman_wall();
         }
-        if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield) && irq {
+        if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
+            && (irq || crate::driver_launch::hosted_driver_dpc_activation_pending())
+        {
             return PumpMessage::scheduler_yield();
         }
         if timer {

@@ -287,12 +287,8 @@ impl TimerQueue {
         self.run_due_expirations_at(clock.snapshot())
     }
 
-    /// Expire all timers due at the caller's authoritative monotonic time.
-    ///
-    /// Interrupt controllers may deliver an edge at a deadline that rounds one
-    /// clock quantum ahead of a subsequent counter read. The interrupt owner
-    /// must be able to preserve that deadline rather than miss the expiry and
-    /// wait for an unrelated later interrupt.
+    /// Expire timers at the caller's sampled clock without executing their DPCs.
+    /// An interrupt notification is not evidence that a future deadline is due.
     pub fn run_due_expirations_at(&mut self, now: TimeSnapshot) -> Vec<TimerExpiry> {
         let mut fired = Vec::new();
         for t in self.timers.iter_mut() {

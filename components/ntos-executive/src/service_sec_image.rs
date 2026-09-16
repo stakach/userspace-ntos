@@ -7930,7 +7930,10 @@ pub(crate) unsafe fn service_sec_image(
         panic!("win32k export registry allocation failed");
     }
     if pending_driver_start_redrive_needed(&nt_handler) {
-        let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
+        let _ = pump_hosted_io_and_redrive_driver_starts(
+            driver_launch::drain_hosted_driver_dpcs(),
+            &mut nt_handler,
+        );
     }
     {
         let resume_error = tcb_resume_r(main_tcb);
@@ -8351,7 +8354,10 @@ pub(crate) unsafe fn service_sec_image(
         if pending_driver_start_redrive_needed(&nt_handler)
             || driver_launch::hosted_driver_dpc_activation_pending()
         {
-            let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
+            let _ = pump_hosted_io_and_redrive_driver_starts(
+                driver_launch::drain_hosted_driver_dpcs(),
+                &mut nt_handler,
+            );
         }
         {
             let started = crate::disk_census_ticks();
@@ -8375,7 +8381,10 @@ pub(crate) unsafe fn service_sec_image(
             drained
         };
         if overdue_timed_wakes != 0 {
-            let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
+            let _ = pump_hosted_io_and_redrive_driver_starts(
+                driver_launch::drain_hosted_driver_dpcs(),
+                &mut nt_handler,
+            );
             // Timer drains are scheduler bookkeeping, not forward progress by themselves. The
             // resumed waiter records a boot milestone if it publishes a new image/page or crosses a
             // shell frontier; counting the wake itself can keep boot alive forever on timeout churn.
@@ -8528,7 +8537,10 @@ pub(crate) unsafe fn service_sec_image(
         if pump_ticks != 0 {
             PUMP_TIMER_TICKS_DRAINED.fetch_add(pump_ticks, Ordering::Relaxed);
             delay_timer_interrupt(delay_queue, &mut nt_handler);
-            let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
+            let _ = pump_hosted_io_and_redrive_driver_starts(
+                driver_launch::drain_hosted_driver_dpcs(),
+                &mut nt_handler,
+            );
         }
         if badge == DELAY_TIMER_BADGE {
             if delay_queue.len() != 0 && delay_queue.has_badge_other_than(badge) {
@@ -8550,7 +8562,10 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b"\n");
             }
             delay_timer_interrupt(delay_queue, &mut nt_handler);
-            let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
+            let _ = pump_hosted_io_and_redrive_driver_starts(
+                driver_launch::drain_hosted_driver_dpcs(),
+                &mut nt_handler,
+            );
             // ★ THE DEADMAN'S TEETH. `watchdog_on_tick` (inside `recv_full_r12`) has already
             // raised a candidate; this is where the boot confirms it against the hosted-thread
             // census, then quiesces and runs the gate. Long runnable user-mode stretches are
@@ -11837,7 +11852,10 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.dbgk_block_request {
                     park_dbgk_reporter = true;
                 }
-                let hosted_io_progress = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
+                let hosted_io_progress = pump_hosted_io_and_redrive_driver_starts(
+                    driver_launch::drain_hosted_driver_dpcs(),
+                    &mut nt_handler,
+                );
                 if hosted_io_progress != 0
                     || FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
                 {
@@ -17528,7 +17546,10 @@ pub(crate) unsafe fn service_sec_image(
                     wait_parked,
                 );
                 mark_wait_parked!(pi, resume_ip);
-                let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
+                let _ = pump_hosted_io_and_redrive_driver_starts(
+                    driver_launch::drain_hosted_driver_dpcs(),
+                    &mut nt_handler,
+                );
                 let _ = finalize_service_loop_state(&mut nt_handler);
                 let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
@@ -17550,7 +17571,10 @@ pub(crate) unsafe fn service_sec_image(
                     wait_parked,
                 );
                 mark_wait_parked!(pi, resume_ip);
-                let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
+                let _ = pump_hosted_io_and_redrive_driver_starts(
+                    driver_launch::drain_hosted_driver_dpcs(),
+                    &mut nt_handler,
+                );
                 let _ = finalize_service_loop_state(&mut nt_handler);
                 let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
@@ -17634,7 +17658,10 @@ pub(crate) unsafe fn service_sec_image(
                 mark_wait_parked!(pi, resume_ip);
                 // Cancellation can complete inside the handler's manager pump. Redrive every
                 // original owner unconditionally before testing the separate drain owner.
-                let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
+                let _ = pump_hosted_io_and_redrive_driver_starts(
+                    driver_launch::drain_hosted_driver_dpcs(),
+                    &mut nt_handler,
+                );
                 let _ = pending_file_io_redrive_all(&mut nt_handler);
                 let _ = file_cleanup_redrive_all(&mut nt_handler);
                 let _ = file_irp_drain_redrive_all(&mut nt_handler);
@@ -24584,8 +24611,11 @@ unsafe fn pending_pnp_operation_redrive_all(nt_handler: &mut ExecNtHandler) -> u
     completed
 }
 
-unsafe fn pump_hosted_io_and_redrive_driver_starts(nt_handler: &mut ExecNtHandler) -> u64 {
-    let activated = driver_launch::drain_hosted_driver_dpcs();
+// Callers execute DPCs before borrowing the handler and pass only the completed work count.
+unsafe fn pump_hosted_io_and_redrive_driver_starts(
+    activated: u64,
+    nt_handler: &mut ExecNtHandler,
+) -> u64 {
     let retired = driver_launch::drain_hosted_file_retirements();
     let video_retired = crate::video_device::drain_video_file_retirements();
     let pumped = driver_launch::pump_hosted_io_completions() as u64;
