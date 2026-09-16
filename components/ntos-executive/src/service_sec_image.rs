@@ -1884,6 +1884,20 @@ pub(crate) fn provider_wait_next_deadline(now: nt_delay_execution::TimeSnapshot)
     unsafe { (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).next_deadline(now) }
 }
 
+pub(crate) unsafe fn provider_wait_scan_timed<B: nt_user_host::provider_dispatcher_backend::ProviderEventBacking>(
+    objects: &mut nt_user_host::provider_dispatcher_backend::ProviderDispatcherObjects<'_, B>,
+    now: nt_delay_execution::TimeSnapshot,
+) -> Result<
+    nt_user_host::provider_dispatcher_backend::ProviderTimedScan,
+    nt_user_host::provider_wait_selection::ProviderWaitSelectionError<u32>,
+> {
+    objects.scan_timed(
+        &mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER),
+        now,
+        |completion| wait_selection::publish(completion),
+    ).map_err(|(_, error)| error)
+}
+
 pub(crate) unsafe fn provider_wait_select_due<B>(
     backend: &mut B,
     now: nt_delay_execution::TimeSnapshot,

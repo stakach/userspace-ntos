@@ -79,6 +79,42 @@ impl<B> ProviderDispatcherObjects<'_, B> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProviderTimedScan {
+    pub timeouts: u64,
+    pub expired_timers: u64,
+    pub ready: u64,
+}
+
+impl<B: ProviderEventBacking> ProviderDispatcherObjects<'_, B> {
+    /// Memory-only timeout/expiry/readiness pass. Publication must not enter a provider or
+    /// mutate the borrowed dispatcher. Refusal retains the unselected wait and its leases.
+    pub fn scan_timed<O, E>(
+        &mut self,
+        arbiter: &mut nt_provider_wait::ProviderDispatcherWaitArbiter<ProviderDispatcherLease>,
+        now: nt_kernel_exec::TimeSnapshot,
+        mut publish: impl FnMut(nt_provider_wait::ProviderDispatcherWaitCompletion) -> Result<O, E>,
+    ) -> Result<ProviderTimedScan, (ProviderTimedScan, E)> {
+        let mut scanned = ProviderTimedScan::default();
+        loop {
+            match arbiter.pop_due_with(self, now, &mut publish) {
+                Ok(Some(_)) => scanned.timeouts = scanned.timeouts.saturating_add(1),
+                Ok(None) => break,
+                Err(error) => return Err((scanned, error)),
+            }
+        }
+        scanned.expired_timers = self.expire_timers(now);
+        loop {
+            match arbiter.pop_ready_with(self, &mut publish) {
+                Ok(Some(_)) => scanned.ready = scanned.ready.saturating_add(1),
+                Ok(None) => break,
+                Err(error) => return Err((scanned, error)),
+            }
+        }
+        Ok(scanned)
+    }
+}
+
 pub fn dispatcher_lease_is_ready(
     event_objects: &EventObjectRegistry,
     events: &EventStore,

@@ -3097,6 +3097,12 @@ pub(crate) unsafe fn watchdog_nested_rearm() {
 /// the service loop, so it records the pending tick and uses this helper only to prevent the
 /// one-shot IRQ from starving the component's real reply.
 pub(crate) unsafe fn delay_timer_nested_ack() {
+    if DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed) != 0 {
+        // No bootstrap borrow survives into programming/ACK below. Runtime owns its own drain
+        // after the seed has transferred; invalid canonical publication fails closed.
+        dispatcher_bootstrap::scan_timer_delivery(nt_time_snapshot())
+            .expect("bootstrap timer selection lost its canonical continuation");
+    }
     if WATCHDOG_ARMED.load(Ordering::Relaxed) != 0 {
         watchdog_on_tick();
         watchdog_nested_rearm();

@@ -16,6 +16,25 @@ enum BootstrapPhase {
 
 static mut BOOTSTRAP: BootstrapPhase = BootstrapPhase::Uninitialized;
 
+/// Scan only while this phase owns the stores. The pending notification still belongs to the
+/// shared timer owner: do not consume it, reprogram the PIT or enter a provider here.
+pub(crate) unsafe fn scan_timer_delivery(
+    now: nt_delay_execution::TimeSnapshot,
+) -> Result<(), nt_user_host::provider_wait_selection::ProviderWaitSelectionError<u32>> {
+    let BootstrapPhase::Owned(seed) = &mut *core::ptr::addr_of_mut!(BOOTSTRAP) else {
+        return Ok(());
+    };
+    let _durable = allocator::enter_durable();
+    let mut objects = nt_user_host::provider_dispatcher_backend::ProviderDispatcherObjects {
+        events: &mut seed.dispatcher.events,
+        event_objects: &mut seed.dispatcher.event_objects,
+        timers: seed.dispatcher.provider_timers.as_mut(),
+        backing: crate::provider_dispatcher_backend::NativeEventBacking(&mut seed.obj_ns),
+        access: None,
+    };
+    service_sec_image::provider_wait_scan_timed(&mut objects, now).map(|_| ())
+}
+
 pub(crate) unsafe fn initialize() -> Result<(), u32> {
     if !matches!(
         &*core::ptr::addr_of!(BOOTSTRAP),

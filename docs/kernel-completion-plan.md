@@ -35483,6 +35483,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         and .tmp/build-field-expiry-io-manager-20260916.log. No boot rerun: this does not change
         the measured strict 27-export win32k frontier, and no native runtime/desktop proof is claimed.
         Bootstrap admission/signaling guards remain; shared tests do not prove bootstrap delivery.
+      - [x] Scan bootstrap timed readiness at deferred-notification boundaries (2026-09-16).
+        delay_timer_nested_ack now performs a memory-only scan while the original bootstrap
+        seed still owns dispatcher storage. ProviderDispatcherObjects::scan_timed applies the
+        existing timeout-before-expiry order, then selects all ready waits, including readiness
+        retained from an earlier scan. Shared publication refusal returns partial counts and
+        preserves the unselected wait's leases/signals. Native canonical-ownership errors retain
+        the existing fail-closed invariant panic, not an operational retry promise.
+        The scan uses access=None, does not consume DELAY_TIMER_TICKS_PENDING, does not rearm
+        the shared PIT and does not enter a provider. All seed/backend references end before
+        the existing nested acknowledgment/watchdog path runs. Transferred or uninitialized
+        storage is not accessed. The pending notification remains available to the shared owner.
+        Three shared regressions cover timeout-versus-expiry ordering, moved-store refusal/retry
+        with no second timer expiry, and an idle scan that grants no admission authority.
+        All 1,331 host tests pass across 21 suites with no failures or ignored cases
+        (.tmp/test-bootstrap-scan-20260916.log). Executive release passes in 42.65s with
+        294 warnings; I/O Manager release also passes. Evidence: .tmp/build-bootstrap-scan-20260916.log
+        and .tmp/build-bootstrap-scan-io-manager-20260916.log. No QEMU rerun; the known strict
+        27-export win32k rejection is unchanged, and no desktop or native delivery proof is claimed.
+        This installs only the bootstrap scan, not timed scheduling or native execution proof.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
@@ -35492,6 +35511,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         now uses the same field-borrowed backend needed by bootstrap. Preserve sampled-time expiry
         and distinct programming/IRQ-ack outcomes. Bootstrap SET/PULSE must keep rejecting observed Events
         until caller-aware readiness selection and receive/deadline scheduling are available.
+        The bootstrap scan now runs at the deferred timer boundary, but must not independently
+        rearm the PIT: hosted-driver timers, waiters, retry owners and watchdog work share it.
+        Compose authoritative global deadlines and service those owners outside bootstrap borrows
+        before changing rearm ownership. In particular hosted_driver_timer_wake_due can dispatch
+        DPCs; it must not run with a seed/backend reference alive. Retain notification demand until
+        the complete owner services it; LAST_REARM metadata is not a deadline authority.
         The bounded runtime publication pass above owns initial/repark admission; do not stack another
         frame over the old Resuming wait. Preserve both continuations on failed repark. Use the
         kernel-local terminal consumer above for genuine returns; preserve its exact recipient

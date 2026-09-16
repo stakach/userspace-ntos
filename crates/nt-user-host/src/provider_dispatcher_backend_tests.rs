@@ -2,6 +2,9 @@ use super::*;
 
 #[path = "provider_dispatcher_expiry_tests.rs"]
 mod expiry;
+
+#[path = "provider_dispatcher_scan_tests.rs"]
+mod scan;
 use crate::dispatcher_state::DispatcherState;
 use nt_component_suspension::{LaneHandle, SuspensionHostedClient};
 use nt_kernel_exec::{EventKind, EventObjectError, TimeSnapshot};
