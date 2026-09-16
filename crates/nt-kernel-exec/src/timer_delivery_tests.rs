@@ -1,5 +1,18 @@
 use super::*;
 use crate::{HostedDpcOwner, HostedDpcQueueResult, HostedDpcTable};
+
+#[test]
+fn finite_wait_requires_programming_not_merely_an_available_owner() {
+    for (outcome, available, programmed) in [
+        (TimerRearmOutcome::Unavailable, false, false),
+        (TimerRearmOutcome::Idle, true, false),
+        (TimerRearmOutcome::Programmed, true, true),
+        (TimerRearmOutcome::Failed, false, false),
+    ] {
+        assert_eq!(outcome.owner_available(), available);
+        assert_eq!(outcome.deadline_programmed(), programmed);
+    }
+}
 use alloc::vec;
 
 #[test]

@@ -35643,6 +35643,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         actionable issue. Native timer/pump integration and watchdog wiring remain source-reviewed,
         not host integration tests. No QEMU rerun; the strict 27-export win32k rejection is unchanged.
         No desktop proof is claimed. Bootstrap watchdog ownership and unified rearming remain open.
+      - [x] Make finite driver wait admission require confirmed timer programming (2026-09-16).
+        delay_timer_rearm and its registered adapter now report Unavailable, Idle, Programmed or
+        Failed through the shared TimerRearmOutcome contract instead of hiding programmer failure.
+        A finite wait's preflight accepts an available owner; after publishing its deadline it
+        requires Programmed before transferring the original reply capability. Collector reads
+        occur after the waiter-vector borrow ends. Refusal removes only the exact sequence,
+        instance, thread and reply record and returns the unused reply spare; parked counters
+        advance only after commit. Infinite waits retain their no-timer path.
+        The shared thread-table commit_wait step validates the live thread, performs memory-local
+        reply publication, then transitions it to Waiting. Refusal leaves its prior state intact,
+        removing the previous rollback that changed Running to Ready. Hardware failure/quiescence
+        is not rolled back. A rotation refusal after successful programming may leave one bounded
+        stale shot, handled by the existing authoritative rescan; no removed waiter is revived.
+        Three shared tests cover outcome admission, exact live-state preservation on refusal and
+        invalid/terminated threads never invoking reply publication. All 1,358 host tests pass
+        across 24 suites with no failures or ignored cases (.tmp/test-timer-admission-20260916.log).
+        Executive release passes in 37.71s with 294 warnings; I/O Manager release also passes.
+        Evidence: .tmp/build-timer-admission-20260916.log and
+        .tmp/build-timer-admission-io-manager-20260916.log. Independent review found no actionable
+        issue. Native combined programming-failure/waiter/spare rollback remains source-reviewed,
+        not host integration-tested. No QEMU rerun; the strict 27-export win32k rejection remains.
+        Review adjustment: unified nested rearm cannot query a registered whole handler merely
+        because the delivery gate is idle. Dedicated IRQ exchange can still have unrelated outer
+        handler/PM borrows. Bootstrap value-only deadline collection and runtime borrow-safe rearm
+        ownership remain prerequisites; the watchdog-only nested exception is still open.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
@@ -35673,8 +35698,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         top-of-loop pass alone strands immediate rewaits or work selected before a blocking receive;
         watchdog polling or perpetual immediate timer rearming is not a substitute. Keep its
         read-only deadline in delay_timer_next_deadline with a distinct source, without consuming
-        demand in nested timer hooks or treating rearm_registered_delay_timer's boolean as proof
-        that PIT programming succeeded. Temporarily suppress the source while a physical lane is
+        demand in nested timer hooks. Preserve the explicit rearm outcome: only Programmed proves
+        a shot was programmed; Idle only establishes an available owner. Temporarily suppress the source while a physical lane is
         busy, but retain demand and guarantee reconcile/rearm after token release before receive.
         Base successful-pass pacing on acknowledged execution/repark/retirement progress, not
         merely scanning or claiming a candidate; otherwise persistent refusals evade backoff.

@@ -146,6 +146,26 @@ impl HostedDriverThreadTable {
         Ok(())
     }
 
+    /// Commit a wait only after memory-local reply publication succeeds. The callback must not
+    /// enter a driver or change reply ownership on refusal. Failure leaves the exact state intact.
+    pub fn commit_wait(
+        &mut self,
+        handle: u64,
+        publish_reply: impl FnOnce() -> bool,
+    ) -> Result<bool, HostedDriverThreadError> {
+        let thread = self
+            .get_mut(handle)
+            .ok_or(HostedDriverThreadError::InvalidHandle)?;
+        if thread.state == HostedDriverThreadState::Terminated {
+            return Err(HostedDriverThreadError::AlreadyTerminated);
+        }
+        if !publish_reply() {
+            return Ok(false);
+        }
+        thread.state = HostedDriverThreadState::Waiting;
+        Ok(true)
+    }
+
     pub fn set_ready(&mut self, handle: u64) -> Result<(), HostedDriverThreadError> {
         let thread = self
             .get_mut(handle)
@@ -440,6 +460,44 @@ impl HostedDispatcherWaitQueue {
 mod tests {
     use super::*;
     use crate::EventKind;
+
+    #[test]
+    fn refused_wait_commit_preserves_each_live_thread_state() {
+        let mut table = HostedDriverThreadTable::new();
+        let handle = table.create(1, 2).unwrap();
+        for state in [
+            HostedDriverThreadState::Ready,
+            HostedDriverThreadState::Running,
+            HostedDriverThreadState::Waiting,
+        ] {
+            table.get_mut(handle).unwrap().state = state;
+            let before = table.get(handle).unwrap();
+            assert_eq!(table.commit_wait(handle, || false), Ok(false));
+            assert_eq!(table.get(handle), Some(before));
+            assert_eq!(table.commit_wait(handle, || true), Ok(true));
+            assert_eq!(
+                table.get(handle).unwrap().state,
+                HostedDriverThreadState::Waiting
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_or_terminated_wait_never_publishes_reply_ownership() {
+        let mut table = HostedDriverThreadTable::new();
+        assert_eq!(
+            table.commit_wait(0, || panic!("invalid handle published reply")),
+            Err(HostedDriverThreadError::InvalidHandle)
+        );
+        let handle = table.create(1, 2).unwrap();
+        table.terminate(handle, -1).unwrap();
+        let before = table.get(handle);
+        assert_eq!(
+            table.commit_wait(handle, || panic!("terminated thread published reply")),
+            Err(HostedDriverThreadError::AlreadyTerminated)
+        );
+        assert_eq!(table.get(handle), before);
+    }
 
     fn stores() -> (EventStore, SemaphoreStore, MutantStore) {
         (EventStore::new(), SemaphoreStore::new(), MutantStore::new())

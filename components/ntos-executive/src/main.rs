@@ -16739,20 +16739,29 @@ unsafe fn delay_timer_program(deadline: u64, source: u64) -> bool {
     true
 }
 
-unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue, handler: &ExecNtHandler) {
+unsafe fn delay_timer_rearm(
+    queue: &nt_delay_execution::Queue,
+    handler: &ExecNtHandler,
+) -> nt_kernel_exec::TimerRearmOutcome {
+    use nt_kernel_exec::TimerRearmOutcome;
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
         || DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) != DELAY_TIMER_IRQ_ACTIVE
     {
-        return;
+        return TimerRearmOutcome::Unavailable;
     }
     if let Some((deadline, source)) = delay_timer_next_deadline(queue, handler, nt_time_snapshot()) {
-        let _ = delay_timer_program(deadline, source);
+        if delay_timer_program(deadline, source) {
+            TimerRearmOutcome::Programmed
+        } else {
+            TimerRearmOutcome::Failed
+        }
     } else {
         // Channel 0 is in hardware one-shot mode and therefore already stopped after its delivery.
         // A cancelled outstanding shot may still produce one bounded notification; the handler
         // acknowledges it without programming another shot.
         LAST_REARM_ARMED.store(0, Ordering::Relaxed);
         TIMER_IDLE_DISARMS.fetch_add(1, Ordering::Relaxed);
+        TimerRearmOutcome::Idle
     }
 }
 

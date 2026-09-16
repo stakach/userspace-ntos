@@ -12432,7 +12432,7 @@ fn park_hosted_driver_wait(
         return None;
     }
     if deadline != nt_kernel_exec::Deadline::Infinite
-        && !unsafe { crate::service_sec_image::rearm_registered_delay_timer() }
+        && !unsafe { crate::service_sec_image::rearm_registered_delay_timer() }.owner_available()
     {
         return None;
     }
@@ -12447,16 +12447,7 @@ fn park_hosted_driver_wait(
         return None;
     }
     let fresh = unsafe { take_hosted_driver_reply_spare(instance)? };
-    let set_waiting = unsafe {
-        hosted_driver_thread_table_mut(instance)
-            .and_then(|table| table.set_waiting(thread_handle).ok())
-    };
-    if set_waiting.is_none() {
-        unsafe {
-            return_hosted_driver_reply_spare(instance, fresh);
-        }
-        return None;
-    }
+    let sequence = crate::next_dispatcher_wait_sequence();
     waiters.push(HostedDriverRawWaiter {
         instance,
         thread_handle,
@@ -12465,25 +12456,38 @@ fn park_hosted_driver_wait(
         wait_all,
         api_multiple,
         deadline,
-        sequence: crate::next_dispatcher_wait_sequence(),
+        sequence,
     });
-    if !rotate_hosted_driver_active_reply(instance, active_reply_cap, fresh) {
-        let _ = waiters.pop();
+    // End the vector borrow before the collector reads the newly published deadline. The
+    // original reply capability stays active until programming and rotation both succeed.
+    let timer_ready = deadline == nt_kernel_exec::Deadline::Infinite
+        || unsafe { crate::service_sec_image::rearm_registered_delay_timer() }.deadline_programmed();
+    let committed = timer_ready
+        && unsafe {
+            hosted_driver_thread_table_mut(instance).and_then(|table| {
+                table.commit_wait(thread_handle, || {
+                    rotate_hosted_driver_active_reply(instance, active_reply_cap, fresh)
+                }).ok()
+            }) == Some(true)
+        };
+    if !committed {
         unsafe {
-            let _ = hosted_driver_thread_table_mut(instance)
-                .and_then(|table| table.set_ready(thread_handle).ok());
+            let waiters = hosted_driver_waiters_mut();
+            let index = waiters.iter().position(|waiter| {
+                waiter.instance == instance
+                    && waiter.sequence == sequence
+                    && waiter.reply_cap == active_reply_cap
+                    && waiter.thread_handle == thread_handle
+            }).expect("uncommitted driver wait disappeared");
+            waiters.remove(index);
             return_hosted_driver_reply_spare(instance, fresh);
         }
         return None;
     }
-    let waiter = waiters.last().unwrap();
-    if waiter.api_multiple {
+    if api_multiple {
         HOSTED_DRIVER_WAIT_MULTIPLE_PARKED.fetch_add(1, Ordering::Relaxed);
     } else {
         HOSTED_DRIVER_WAIT_SINGLE_PARKED.fetch_add(1, Ordering::Relaxed);
-    }
-    if deadline != nt_kernel_exec::Deadline::Infinite {
-        let _ = unsafe { crate::service_sec_image::rearm_registered_delay_timer() };
     }
     Some(fresh)
 }

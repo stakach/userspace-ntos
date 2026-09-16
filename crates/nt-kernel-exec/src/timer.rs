@@ -11,6 +11,25 @@ pub const PIT_INPUT_HZ: u64 = 1_193_182;
 const HUNDRED_NS_PER_SECOND: u64 = 10_000_000;
 const PIT_MAX_TICKS: u64 = 65_536;
 
+/// A timer owner being available is not proof that a newly published deadline was programmed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimerRearmOutcome {
+    Unavailable,
+    Idle,
+    Programmed,
+    Failed,
+}
+
+impl TimerRearmOutcome {
+    pub const fn owner_available(self) -> bool {
+        matches!(self, Self::Idle | Self::Programmed)
+    }
+
+    pub const fn deadline_programmed(self) -> bool {
+        matches!(self, Self::Programmed)
+    }
+}
+
 /// One bounded channel-0 one-shot. A zero reload is the 8254 encoding of 65,536 ticks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PitOneShot {

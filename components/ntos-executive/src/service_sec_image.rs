@@ -3975,15 +3975,14 @@ fn service_watchdog_record_crash_parked(mask: u64) {
     SERVICE_CRASH_PARKED_MASK.store(mask, Ordering::Relaxed);
 }
 
-pub(crate) unsafe fn rearm_registered_delay_timer() -> bool {
+pub(crate) unsafe fn rearm_registered_delay_timer() -> nt_kernel_exec::TimerRearmOutcome {
     let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     let queue_ptr =
         SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) as *mut nt_delay_execution::Queue;
     if handler_ptr.is_null() || queue_ptr.is_null() || !delay_timer_init() {
-        return false;
+        return nt_kernel_exec::TimerRearmOutcome::Unavailable;
     }
-    delay_timer_rearm(&*queue_ptr, &*handler_ptr);
-    true
+    delay_timer_rearm(&*queue_ptr, &*handler_ptr)
 }
 
 /// Scheduler completion may rearm the live owner, but cannot initialize a bootstrap timer.
