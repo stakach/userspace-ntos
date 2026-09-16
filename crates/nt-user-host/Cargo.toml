@@ -29,6 +29,7 @@ nt-user-callback = { workspace = true }
 undocumented_unsafe_blocks = "deny"
 
 [dev-dependencies]
+nt-time = { workspace = true }
 nt-config-manager = { workspace = true }
 nt-fs = { workspace = true }
 nt-syscall = { workspace = true }

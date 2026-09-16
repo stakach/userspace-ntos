@@ -42,9 +42,12 @@ pub(crate) unsafe fn service_hosted_timer_work() -> u64 {
     let Some(pending) = pending_timer_snapshot() else {
         return 0;
     };
-    let work = timer_hosted_driver_wake_due(nt_time_snapshot());
+    let now = nt_time_snapshot();
+    let work = timer_hosted_driver_wake_due(now);
+    let provider_work = scan_owned_timer_work(now)
+        .expect("bootstrap timer selection lost its canonical continuation");
     (&mut *core::ptr::addr_of_mut!(HOSTED_TIMER_PROGRESS)).record_scan(pending);
-    work
+    work.saturating_add(provider_work)
 }
 
 /// Scan only while this phase owns the stores. The pending notification still belongs to the
@@ -56,10 +59,18 @@ pub(crate) unsafe fn scan_timer_delivery(
         // The owner retains the pending notification; nested ACK/watchdog handling still runs.
         return Ok(());
     };
+    scan_owned_timer_work(now).map(|_| ())
+}
+
+/// Both delivery paths hold the gate. Keep all dispatcher references inside this memory-only
+/// scan so the retained scheduler can call it after hosted timer IPC has returned.
+unsafe fn scan_owned_timer_work(
+    now: nt_delay_execution::TimeSnapshot,
+) -> Result<u64, nt_user_host::provider_wait_selection::ProviderWaitSelectionError<u32>> {
     let _durable = allocator::enter_durable();
-    {
+    let scanned = {
         let BootstrapPhase::Owned(seed) = &mut *core::ptr::addr_of_mut!(BOOTSTRAP) else {
-            return Ok(());
+            return Ok(0);
         };
         let mut objects = nt_user_host::provider_dispatcher_backend::ProviderDispatcherObjects {
             events: &mut seed.dispatcher.events,
@@ -68,10 +79,13 @@ pub(crate) unsafe fn scan_timer_delivery(
             backing: crate::provider_dispatcher_backend::NativeEventBacking(&mut seed.obj_ns),
             access: None,
         };
-        service_sec_image::provider_wait_scan_timed(&mut objects, now)?;
-    }
-    timer_retry_wake_due(now.monotonic_100ns);
-    Ok(())
+        service_sec_image::provider_wait_scan_timed(&mut objects, now)?
+    };
+    Ok(scanned
+        .timeouts
+        .saturating_add(scanned.expired_timers)
+        .saturating_add(scanned.ready)
+        .saturating_add(timer_retry_wake_due(now.monotonic_100ns)))
 }
 
 pub(crate) unsafe fn initialize() -> Result<(), u32> {

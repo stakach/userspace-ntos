@@ -35668,6 +35668,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         because the delivery gate is idle. Dedicated IRQ exchange can still have unrelated outer
         handler/PM borrows. Bootstrap value-only deadline collection and runtime borrow-safe rearm
         ownership remain prerequisites; the watchdog-only nested exception is still open.
+      - [x] Redrive bootstrap provider scans deferred by hosted timer IPC (2026-09-16).
+        The retained scheduler now scans provider timers, waits and retry readiness after hosted
+        timer publication, under the same delivery guard and sampled time. Previously, a tick
+        arriving during hosted IPC was refused by the nested provider scanner, and the later
+        scheduler pass could record it without ever servicing providers. Both paths now share
+        one memory-only owned-store scanner; no dispatcher reference crosses hosted IPC.
+        Progress records only the pre-IPC notification count after successful scanning. A newer
+        tick therefore forces another pre-receive pass; shared pending notifications remain
+        untouched. This does not rearm hardware or enable blocking provider admission.
+        A shared composition regression expires a provider timer on that second pass, selects
+        its wait exactly once and releases its lease without requiring a third hardware tick.
+        All 1,359 host tests pass across 24 suites (.tmp/test-bootstrap-provider-redrive-20260916.log).
+        Executive release passes in 40.96s with 294 warnings; I/O Manager release also passes.
+        Build evidence: .tmp/build-bootstrap-provider-redrive-20260916.log and
+        .tmp/build-bootstrap-provider-redrive-io-manager-20260916.log. No QEMU rerun; the strict
+        27-export win32k rejection remains the recorded boot boundary.
+        This is shared dispatcher/gate/progress coverage, not native IPC or desktop proof.
+        Independent audit confirmed the gap and scan ordering. Review adjustment: retain the
+        bootstrap deadline collection, complete global service/rearm and borrow-safe runtime
+        rearm prerequisites below; this closes delivery loss, not full timer ownership.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

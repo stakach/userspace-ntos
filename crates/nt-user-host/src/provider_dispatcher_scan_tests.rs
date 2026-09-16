@@ -1,5 +1,76 @@
 use super::*;
 
+#[test]
+fn delivery_deferred_during_hosted_work_gets_a_provider_scan_before_receive() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use nt_time::{DeferredTimerProgress, TimerDeliveryGate};
+
+    let (mut state, object, timer) = timed_state();
+    let mut arbiter = ProviderDispatcherWaitArbiter::new();
+    {
+        let mut objects = backend(
+            &mut state,
+            Some(ProviderDispatcherAccess::hosted(owner(), 42).unwrap()),
+        );
+        arbiter
+            .admit(
+                &mut objects,
+                &wait(&[object, timer.wait_object()]),
+                owner(),
+                1,
+                now(),
+            )
+            .unwrap();
+    }
+    let gate = TimerDeliveryGate::new();
+    let pending = AtomicU64::new(1);
+    let mut progress = DeferredTimerProgress::new();
+    let outer = gate.try_enter().unwrap();
+    let sampled = pending.load(Ordering::Relaxed);
+    // Hosted IPC receives another tick. The nested ACK path cannot borrow dispatcher state.
+    pending.fetch_add(1, Ordering::Relaxed);
+    assert!(gate.try_enter().is_none());
+    {
+        let mut objects = backend(&mut state, None);
+        assert_eq!(
+            objects.scan_timed(&mut arbiter, now(), |_| Ok::<_, ()>(())),
+            Ok(ProviderTimedScan::default())
+        );
+    }
+    progress.record_scan(sampled);
+    drop(outer);
+    assert!(progress.needs_scan(pending.load(Ordering::Relaxed)));
+
+    // The pre-receive pass services providers too, without requiring another hardware tick.
+    let _next = gate.try_enter().unwrap();
+    let sampled = pending.load(Ordering::Relaxed);
+    let due = TimeSnapshot {
+        monotonic_100ns: 110,
+        ..now()
+    };
+    let mut completions = 0;
+    {
+        let mut objects = backend(&mut state, None);
+        assert_eq!(
+            objects.scan_timed(&mut arbiter, due, |_| {
+                completions += 1;
+                Ok::<_, ()>(())
+            }),
+            Ok(ProviderTimedScan {
+                timeouts: 0,
+                expired_timers: 1,
+                ready: 1
+            })
+        );
+        assert_eq!(objects.event_objects.live_lease_count(), 0);
+    }
+    progress.record_scan(sampled);
+    assert_eq!(completions, 1);
+    assert!(arbiter.is_empty());
+    assert_eq!(pending.load(Ordering::Relaxed), 2);
+    assert!(!progress.needs_scan(pending.load(Ordering::Relaxed)));
+}
+
 fn timed_state() -> (
     DispatcherState,
     ProviderWaitObject,
