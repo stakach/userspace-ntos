@@ -35545,6 +35545,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         work or arbitrary non-yielding channels. Complete that ownership before bootstrap blocking
         admission. Queueing can still perform an IRQ-lane startup handshake; this is not a no-IPC
         expiry boundary. Other hosted-I/O/retirement execution borrows still need their own audit.
+      - [x] Retain and schedule queued DPC demand across bounded runtime passes (2026-09-16).
+        hosted_dpc_scheduler.rs reuses the shared ResumeWake contract for the generic driver DPC
+        drain: claim one exact pass before execution, release every wake/table borrow, dispatch
+        the existing bounded snapshot, then finish from a fresh canonical queued-work scan.
+        Nested attempts cannot claim the active pass. Remaining work retains a 1ms yield;
+        no-progress retries back off to 16ms. Busy lanes do not erase demand. Existing owner-specific
+        broker drains and uncertain-dispatch completion semantics are unchanged; this does not
+        fabricate retries for callbacks that may already have executed.
+        The shared deadline collector appends source 19 after all existing sources, preserving
+        their tie precedence. Timer delivery counts due DPC demand without claiming it. Runtime
+        finalization and all three receive barriers include DPC demand even when component-resume
+        work is absent. After a generic drain, an active-runtime-only rearm also covers retained
+        component receive continuations; it neither initializes the timer nor enables bootstrap
+        admission. Canonical demand survives failed programming. No component-busy suppression is
+        applied: DPC dispatch retains its separate IRQ-arena authority.
+        Four shared integration tests exercise busy/no-progress retention, recursive claim
+        exclusion, self-requeue pacing, cancellation, fresh demand and exact pre-dispatch abort
+        retention through backoff. All 1,350 host tests pass across 24 suites, no failures or
+        ignored cases (.tmp/test-dpc-wake-20260916.log). Executive release passes in 37.17s
+        with 294 warnings; I/O Manager release also passes. Evidence:
+        .tmp/build-dpc-wake-20260916.log and .tmp/build-dpc-wake-io-manager-20260916.log.
+        Independent source review found no concrete recursion/barrier issue. No QEMU rerun;
+        the strict 27-export win32k rejection is unchanged, and no desktop proof is claimed.
+        Review adjustment: bootstrap global servicing/rearm, pre-handler scheduling and native
+        desktop delivery remain open. Native receive/rearm wiring needs boot proof beyond the
+        unchanged strict win32k import wall; arbitrary non-yielding channels gain no new authority.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

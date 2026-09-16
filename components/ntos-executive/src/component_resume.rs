@@ -95,7 +95,11 @@ pub(super) unsafe fn reconcile(handler: &mut ExecNtHandler) {
         let has_work = stopped_wait || next_ready(handler).is_some();
         (&mut *core::ptr::addr_of_mut!(WAKE)).reconcile(has_work, monotonic_time_100ns());
     }
-    if previous.is_none() && (&*core::ptr::addr_of!(WAKE)).next_deadline().is_none() {
+    let dpc_deadline = driver_launch::hosted_dpc_next_deadline(monotonic_time_100ns());
+    if previous.is_none()
+        && (&*core::ptr::addr_of!(WAKE)).next_deadline().is_none()
+        && dpc_deadline.is_none()
+    {
         return;
     }
     let queue =

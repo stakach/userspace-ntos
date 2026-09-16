@@ -3142,6 +3142,7 @@ const DELAY_TIMER_SOURCE_CM_KEY_CLEANUP: u64 = 15;
 const DELAY_TIMER_SOURCE_CM_SNAPSHOT_CLEANUP: u64 = 16;
 const DELAY_TIMER_SOURCE_HOSTED_FILE_RETRY: u64 = 17;
 const DELAY_TIMER_SOURCE_COMPONENT_RESUME: u64 = 18;
+const DELAY_TIMER_SOURCE_HOSTED_DPC: u64 = 19;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -16906,6 +16907,7 @@ unsafe fn delay_timer_drain_due_work(
         + subdrain!(15, cm_snapshot_ownership::wake_due(now_100ns))
         + subdrain!(16, driver_launch::hosted_file_retry_wake_due(now_100ns))
         + service_sec_image::component_resume::wake_due(handler, now_100ns)
+        + driver_launch::hosted_dpc_wake_due(now_100ns)
         + watchdog_tick
 }
 

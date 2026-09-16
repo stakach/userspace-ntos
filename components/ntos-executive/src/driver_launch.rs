@@ -26,6 +26,11 @@ mod hosted_irq_broker;
 
 #[path = "component_scheduler.rs"]
 mod component_scheduler;
+#[path = "hosted_dpc_scheduler.rs"]
+mod hosted_dpc_scheduler;
+pub(crate) use hosted_dpc_scheduler::{
+    next_deadline as hosted_dpc_next_deadline, wake_due as hosted_dpc_wake_due,
+};
 use component_scheduler::hosted_component_pump;
 pub(crate) use component_scheduler::ComponentSchedulerScope;
 
@@ -12620,9 +12625,13 @@ pub(crate) fn hosted_driver_dpc_activation_pending() -> bool {
     unsafe { (*core::ptr::addr_of!(HOSTED_DPCS)).as_ref().is_some_and(HostedDpcTable::has_queued) }
 }
 
-/// Drain one queue snapshot per exact hosted lane. A DPC that requeues itself is left for the next
-/// scheduler boundary, matching the bounded dispatch behavior of the native DPC software interrupt.
+/// Run a due, paced DPC pass. Self-requeued work retains its wake for a later scheduler boundary.
 pub(crate) unsafe fn drain_hosted_driver_dpcs() -> u64 {
+    hosted_dpc_scheduler::run()
+}
+
+/// Drain one queue snapshot per exact hosted lane, without recursively exhausting requeued work.
+unsafe fn drain_hosted_driver_dpc_snapshot() -> u64 {
     let budget = hosted_irq_lanes().map(Vec::len).unwrap_or(0);
     let mut delivered = 0u64;
     for index in 0..budget {

@@ -3986,6 +3986,20 @@ pub(crate) unsafe fn rearm_registered_delay_timer() -> bool {
     true
 }
 
+/// Scheduler completion may rearm the live owner, but cannot initialize a bootstrap timer.
+pub(crate) unsafe fn rearm_registered_active_delay_timer() {
+    if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
+        || DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) != DELAY_TIMER_IRQ_ACTIVE
+    {
+        return;
+    }
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *const ExecNtHandler;
+    let queue = SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) as *const nt_delay_execution::Queue;
+    if !handler.is_null() && !queue.is_null() {
+        delay_timer_rearm(&*queue, &*handler);
+    }
+}
+
 /// Route kernel Event requests through their retained activation; hosted requests use the live handler.
 /// The nested component pump is serialized with native dispatch, so no second handler pointer or
 /// lock domain is introduced. GUI redrive remains deferred until the outer dispatch can resume.
