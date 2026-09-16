@@ -3,9 +3,8 @@
 use super::*;
 
 pub(super) struct OwnerDeadlines {
-    pub delay: Option<u64>,
+    pub dispatcher: nt_user_host::dispatcher_deadlines::DispatcherDeadlines,
     pub user_timer: Option<u64>,
-    pub provider_timer: Option<u64>,
     pub job_time: Option<u64>,
     pub component_resume: Option<u64>,
 }
@@ -15,7 +14,7 @@ pub(super) struct OwnerDeadlines {
 /// Candidate order preserves the established equal-deadline source precedence.
 pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> Option<(u64, u64)> {
     nt_time::earliest_deadline([
-        (owner.delay, DELAY_TIMER_SOURCE_DELAY_QUEUE),
+        (owner.dispatcher.delay, DELAY_TIMER_SOURCE_DELAY_QUEUE),
         (
             object_waiter_next_deadline(now),
             DELAY_TIMER_SOURCE_EVENT_WAIT,
@@ -37,7 +36,10 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             service_sec_image::provider_wait_next_deadline(now),
             DELAY_TIMER_SOURCE_PROVIDER_WAIT,
         ),
-        (owner.provider_timer, DELAY_TIMER_SOURCE_PROVIDER_TIMER),
+        (
+            owner.dispatcher.provider_timer,
+            DELAY_TIMER_SOURCE_PROVIDER_TIMER,
+        ),
         (
             driver_launch::hosted_driver_timer_next_deadline(now),
             DELAY_TIMER_SOURCE_HOSTED_KERNEL_TIMER,

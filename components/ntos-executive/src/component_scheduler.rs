@@ -32,6 +32,8 @@ impl ComponentSchedulerScope {
         let irq_lines = drain_pending_hosted_irqs_snapshot();
         let dpcs = drain_hosted_driver_dpcs();
         if yield_number <= 16 {
+            // Diagnostic collection only until bootstrap owns complete servicing and rearm.
+            let deadline = crate::dispatcher_bootstrap::next_deadline(crate::nt_time_snapshot());
             print_str(b"[component-scheduler] receive continuation bank=0x");
             print_hex64(shared_va);
             print_str(b" yield=");
@@ -42,6 +44,19 @@ impl ComponentSchedulerScope {
             print_u64(irq_lines);
             print_str(b" dpcs=");
             print_u64(dpcs);
+            match deadline {
+                Ok(Some((target, source))) => {
+                    print_str(b" bootstrap-deadline=");
+                    print_u64(target);
+                    print_str(b" source=");
+                    print_u64(source);
+                }
+                Ok(None) => print_str(b" bootstrap-deadline=none"),
+                Err(status) => {
+                    print_str(b" bootstrap-deadline-status=0x");
+                    print_hex64(status as u64);
+                }
+            }
             print_str(b"\n");
         }
     }

@@ -88,6 +88,29 @@ unsafe fn scan_owned_timer_work(
         .saturating_add(timer_retry_wake_due(now.monotonic_100ns)))
 }
 
+/// Collect at a retained scheduler boundary, not the dedicated IRQ ACK hook. The global
+/// collector can reconcile retry demand but neither services it nor authorizes hardware rearm.
+pub(crate) unsafe fn next_deadline(now: nt_time::TimeSnapshot) -> Result<Option<(u64, u64)>, u32> {
+    const STATUS_DEVICE_BUSY: u32 = 0x8000_0011;
+    let _delivery = TIMER_DELIVERY_GATE.try_enter().ok_or(STATUS_DEVICE_BUSY)?;
+    let owner = {
+        let BootstrapPhase::Owned(seed) = &*core::ptr::addr_of!(BOOTSTRAP) else {
+            return Err(0xC000_00A3); // STATUS_DEVICE_NOT_READY, not an empty deadline set.
+        };
+        timer_deadline::OwnerDeadlines {
+            dispatcher: service_sec_image::bootstrap_dispatcher_deadlines(
+                seed.dispatcher.provider_timers.as_ref(),
+                now,
+            )?,
+            // These stores are created only after take() transfers the dispatcher to runtime.
+            user_timer: None,
+            job_time: None,
+            component_resume: service_sec_image::component_resume::retained_deadline(),
+        }
+    };
+    Ok(timer_deadline::next(now, owner))
+}
+
 pub(crate) unsafe fn initialize() -> Result<(), u32> {
     if !matches!(
         &*core::ptr::addr_of!(BOOTSTRAP),

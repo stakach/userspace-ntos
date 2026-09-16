@@ -25174,15 +25174,6 @@ impl ExecNtHandler {
             .map_err(|_| STATUS_INVALID_PARAMETER)
     }
 
-    pub(crate) fn provider_timer_next_deadline(
-        &self,
-        now: nt_delay_execution::TimeSnapshot,
-    ) -> Option<u64> {
-        self.provider_timers
-            .as_ref()
-            .and_then(|timers| timers.next_deadline(now))
-    }
-
     fn provider_event_identity(
         &self,
         body: u64,

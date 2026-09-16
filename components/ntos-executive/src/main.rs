@@ -16681,9 +16681,10 @@ unsafe fn delay_timer_next_deadline(
     now: nt_time::TimeSnapshot,
 ) -> Option<(u64, u64)> {
     timer_deadline::next(now, timer_deadline::OwnerDeadlines {
-        delay: queue.next_deadline(now),
+        dispatcher: nt_user_host::dispatcher_deadlines::DispatcherDeadlines::collect(
+            queue, handler.provider_timers.as_ref(), now,
+        ),
         user_timer: handler.user_timer_next_deadline(now),
-        provider_timer: handler.provider_timer_next_deadline(now),
         job_time: handler.job_time_sample_next_deadline(),
         component_resume: service_sec_image::component_resume::next_deadline(handler),
     })

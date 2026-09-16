@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+nt-delay-execution = { workspace = true }
 nt-syscall = { workspace = true }
 nt-ntdll-layout = { workspace = true }
 nt-pe-loader = { workspace = true }

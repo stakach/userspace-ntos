@@ -35688,6 +35688,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Independent audit confirmed the gap and scan ordering. Review adjustment: retain the
         bootstrap deadline collection, complete global service/rearm and borrow-safe runtime
         rearm prerequisites below; this closes delivery loss, not full timer ownership.
+      - [x] Collect bootstrap deadlines from canonical stores without a live handler (2026-09-16).
+        Shared DispatcherDeadlines copies delay-queue and provider-timer targets at one supplied
+        clock snapshot. Runtime and bootstrap use the same implementation; the replaced runtime
+        provider-timer wrapper is removed. Collection neither expires timers nor removes waiters.
+        The bootstrap adapter claims the delivery guard and requires Owned storage. Busy or
+        transferred/uninitialized ownership is an explicit status, not an empty deadline set;
+        a missing initialized delay queue is an invariant error. All store borrows end before
+        the common global collector runs. User timers and job sampling are genuinely absent
+        until runtime construction; component-resume demand is read from its retained global
+        owner without querying a handler/PM or assuming that demand is absent.
+        The first 16 retained scheduler traces now report the collected bootstrap deadline/source
+        or explicit status after hosted IPC, IRQ and DPC work has returned. This is diagnostic
+        integration only: no hardware programming, pending-tick consumption, new admission or
+        selected-continuation execution is enabled. The dedicated IRQ ACK hook is unchanged.
+        Three shared regressions cover nonconsuming collection across ownership handoff,
+        absolute targets following one clock snapshot, and infinite/cancelled/absent demand.
+        All 1,362 host tests pass across 24 suites with no failures or ignored cases
+        (.tmp/test-bootstrap-deadlines-20260916.log).
+        Executive release passes in 38.92s with 294 warnings; I/O Manager release also passes.
+        Evidence: .tmp/build-bootstrap-deadlines-20260916.log and
+        .tmp/build-bootstrap-deadlines-io-manager-20260916.log. No QEMU rerun or new desktop
+        proof; the strict 27-export win32k rejection remains the recorded boot boundary.
+        Independent review found no ownership, dependency or source-precedence issues.
+        Review adjustment: bootstrap collection is now available; complete applicable global
+        servicing and borrow-safe rearm ownership still must precede blocking admission.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
@@ -35700,7 +35725,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         The bootstrap scan now runs at the deferred timer boundary, but must not independently
         rearm the PIT: hosted-driver timers, waiters, retry owners and watchdog work share it.
         The shared deadline collector now accepts explicit owner deadlines without a live handler.
-        Supply bootstrap-owned deadlines and service all global owners outside bootstrap borrows
+        Use the bootstrap-owned collector above and service all global owners outside bootstrap borrows
         before changing rearm ownership. Timer expiry no longer dispatches DPCs inline; scheduler
         DPC drains must still run outside seed/backend references. Retain notification demand until
         the complete owner services it; LAST_REARM metadata is not a deadline authority.

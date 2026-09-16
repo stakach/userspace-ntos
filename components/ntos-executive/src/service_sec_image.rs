@@ -3912,6 +3912,17 @@ pub(crate) unsafe fn initialize_service_delay_queue_work() -> Result<(), u32> {
     Ok(())
 }
 
+/// Bootstrap callers must prove phase ownership before borrowing this preallocated queue.
+pub(crate) unsafe fn bootstrap_dispatcher_deadlines(
+    timers: Option<&nt_provider_wait::ProviderTimerTable>,
+    now: nt_time::TimeSnapshot,
+) -> Result<nt_user_host::dispatcher_deadlines::DispatcherDeadlines, u32> {
+    let queue = (&*core::ptr::addr_of!(SERVICE_DELAY_QUEUE_WORK))
+        .as_ref()
+        .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+    Ok(nt_user_host::dispatcher_deadlines::DispatcherDeadlines::collect(queue, timers, now))
+}
+
 pub(crate) fn service_delay_queue_stats() -> (usize, usize, usize, u64, u64) {
     unsafe {
         let Some(queue) = &*core::ptr::addr_of!(SERVICE_DELAY_QUEUE_WORK) else {

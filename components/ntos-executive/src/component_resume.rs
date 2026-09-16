@@ -75,6 +75,11 @@ pub(crate) unsafe fn next_deadline(handler: &ExecNtHandler) -> Option<u64> {
     {
         return None;
     }
+    retained_deadline()
+}
+
+/// Copy retained demand without runtime eligibility checks or claiming a continuation.
+pub(crate) unsafe fn retained_deadline() -> Option<u64> {
     (&*core::ptr::addr_of!(WAKE)).next_deadline()
 }
 
