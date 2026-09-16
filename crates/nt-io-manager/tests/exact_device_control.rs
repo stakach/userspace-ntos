@@ -16,6 +16,42 @@ const WRITTEN: &[u8] = b"OUT";
 const CAPACITY: usize = 8;
 const BUFFER_OVERFLOW: NtStatus = NtStatus(0x8000_0005u32 as i32);
 
+#[test]
+fn observing_retained_completion_does_not_acknowledge_or_replay_the_request() {
+    let mut f = Fixture::new();
+    f.lower_state.borrow_mut().pending = true;
+    let mut output = [0xa5; CAPACITY];
+    let ExternalDispatchResult::Pending { irp_id } = f
+        .dispatch(false, true, f.lower, ioctl::METHOD_BUFFERED, &mut output)
+        .unwrap()
+    else {
+        panic!("expected retained control request");
+    };
+    assert_eq!(f.io.pump(), 1);
+    for _ in 0..4 {
+        assert_eq!(f.io.completed_irp(irp_id).unwrap().id, irp_id);
+        assert_eq!(f.io.next_completed_irp().unwrap().id, irp_id);
+        assert!(f.io.irp(irp_id).is_some());
+        assert_eq!(f.lower_state.borrow().acknowledgements, 0);
+    }
+    f.lower_state.borrow_mut().refuse_ack = true;
+    assert_eq!(
+        f.io.acknowledge_completed_irp_strict(irp_id).unwrap_err(),
+        NtStatus::UNSUCCESSFUL
+    );
+    for _ in 0..4 {
+        assert_eq!(f.io.completed_irp(irp_id).unwrap().id, irp_id);
+        assert_eq!(f.lower_state.borrow().acknowledgements, 1);
+        assert_eq!(f.lower_state.borrow().calls.len(), 1);
+    }
+    f.lower_state.borrow_mut().refuse_ack = false;
+    f.io.acknowledge_completed_irp_strict(irp_id).unwrap();
+    assert_eq!(f.lower_state.borrow().acknowledgements, 2);
+    assert_eq!(f.lower_state.borrow().calls.len(), 1);
+    assert!(f.io.completed_irp(irp_id).is_none());
+    assert!(f.io.irp(irp_id).is_none());
+}
+
 struct Observation {
     irp: IrpProjection,
     system: Vec<u8>,

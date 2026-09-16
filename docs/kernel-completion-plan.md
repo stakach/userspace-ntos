@@ -35621,6 +35621,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         bootstrap rearm or blocking admission is enabled. ACPI recovery, watchdog ownership and
         unified deadline/rearm remain open, as does broader runtime handler-borrow cleanup. Native
         receive/IPC delivery still needs boot proof beyond the strict win32k import wall.
+      - [x] Separate ACPI recovery observation from acknowledgement effects (2026-09-16).
+        hosted_acpi_pci_route_recovery_wake_due now only observes whether the canonical recovery
+        deadline is due. It cannot acknowledge an IRP, remove a retained record, change retry state
+        or program a timer. The existing hosted-I/O completion pump owns the original bounded
+        one-record recovery operation, preserving strict backend acknowledgement, topology fences,
+        failure status/count and exponential backoff. Failure rearming uses only an already-active
+        registered runtime timer, without initializing bootstrap ownership. Runtime timer-badge,
+        absorbed-tick and overdue paths already drive this completion pump after due observation.
+        Also split watchdog receipt from its sampled-time effect: watchdog_take_timer_work uses
+        the supplied monotonic sample instead of reading the clock again mid-service. The unarmed
+        receipt fast path remains clock-read-free. Pending-watchdog consumption and trip semantics
+        are unchanged; this does not assign watchdog work to bootstrap.
+        Added a shared I/O regression proving repeated completion observation does not acknowledge
+        or replay the request, including between failed and successful strict acknowledgement.
+        All 2,212 host tests pass across 56 suites, including nt-io-manager, with no failures or
+        ignored cases (.tmp/test-acpi-timer-boundary-20260916.log). Executive release passes in
+        35.90s with 294 warnings; I/O Manager release also passes. Evidence:
+        .tmp/build-acpi-timer-boundary-20260916.log and
+        .tmp/build-acpi-timer-boundary-io-manager-20260916.log. Independent source review found no
+        actionable issue. Native timer/pump integration and watchdog wiring remain source-reviewed,
+        not host integration tests. No QEMU rerun; the strict 27-export win32k rejection is unchanged.
+        No desktop proof is claimed. Bootstrap watchdog ownership and unified rearming remain open.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

@@ -2903,8 +2903,14 @@ pub(crate) unsafe fn watchdog_on_tick() {
     if WATCHDOG_ARMED.load(Ordering::Relaxed) == 0 {
         return;
     }
+    watchdog_on_tick_at(monotonic_time_100ns());
+}
+
+unsafe fn watchdog_on_tick_at(now: u64) {
+    if WATCHDOG_ARMED.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     WATCHDOG_TICKS.fetch_add(1, Ordering::Relaxed);
-    let now = monotonic_time_100ns();
     if now < WATCHDOG_DEADLINE.load(Ordering::Relaxed) {
         return; // an ordinary delay/wait tick; not our deadline
     }
@@ -2962,7 +2968,7 @@ unsafe fn watchdog_take_timer_work(now_100ns: u64) -> u64 {
     let deadline = WATCHDOG_DEADLINE.load(Ordering::Relaxed);
     if deadline != u64::MAX && now_100ns >= deadline {
         unsafe {
-            watchdog_on_tick();
+            watchdog_on_tick_at(now_100ns);
         }
         ticks = ticks.saturating_add(WATCHDOG_TICK_IS_OURS.swap(0, Ordering::Relaxed));
     }

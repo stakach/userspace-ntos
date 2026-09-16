@@ -374,7 +374,13 @@ pub(crate) fn hosted_acpi_pci_route_recovery_next_deadline() -> Option<u64> {
     }
 }
 
-pub(crate) unsafe fn hosted_acpi_pci_route_recovery_wake_due(now_100ns: u64) -> u64 {
+/// Timer scans observe retained recovery demand; only the hosted-I/O pump acknowledges IRPs.
+pub(crate) fn hosted_acpi_pci_route_recovery_wake_due(now_100ns: u64) -> u64 {
+    u64::from(hosted_acpi_pci_route_recovery_next_deadline().is_some_and(|due| due <= now_100ns))
+}
+
+unsafe fn drain_hosted_acpi_pci_route_indeterminate_irps() -> usize {
+    let now_100ns = crate::monotonic_time_100ns();
     let due = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
         .as_ref()
         .and_then(|records| {
@@ -415,14 +421,10 @@ pub(crate) unsafe fn hosted_acpi_pci_route_recovery_wake_due(now_100ns: u64) -> 
             record.failure_count = record.failure_count.saturating_add(1);
             let delay_100ns = 10_000u64 << u32::from(record.failure_count.min(10));
             record.next_retry_deadline = now_100ns.saturating_add(delay_100ns);
-            let _ = crate::service_sec_image::rearm_registered_delay_timer();
+            crate::service_sec_image::rearm_registered_active_delay_timer();
         }
     }
     1
-}
-
-unsafe fn drain_hosted_acpi_pci_route_indeterminate_irps() -> usize {
-    hosted_acpi_pci_route_recovery_wake_due(crate::monotonic_time_100ns()) as usize
 }
 
 unsafe fn cancel_stale_hosted_acpi_pci_route_query() -> Result<bool, nt_status::NtStatus> {
