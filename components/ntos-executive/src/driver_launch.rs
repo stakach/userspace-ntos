@@ -12566,8 +12566,7 @@ pub(crate) fn hosted_driver_timer_next_deadline(now: nt_time::TimeSnapshot) -> O
 }
 
 /// Publish expirations and queue DPCs; driver execution belongs to a scheduler boundary.
-pub(crate) unsafe fn hosted_driver_timer_wake_due(now_100ns: u64) -> u64 {
-    let now = crate::nt_time_snapshot_at(now_100ns);
+pub(crate) unsafe fn hosted_driver_timer_wake_due(now: nt_time::TimeSnapshot) -> u64 {
     let queue_count = (*core::ptr::addr_of!(HOSTED_DRIVER_TIMERS))
         .as_ref()
         .map(Vec::len)
@@ -12664,8 +12663,7 @@ unsafe fn drain_hosted_driver_dpc_snapshot() -> u64 {
     delivered
 }
 
-pub(crate) unsafe fn hosted_driver_wait_wake_due(now_100ns: u64) -> u64 {
-    let now = crate::nt_time_snapshot_at(now_100ns);
+pub(crate) unsafe fn hosted_driver_wait_wake_due(now: nt_time::TimeSnapshot) -> u64 {
     let mut woken = 0u64;
     loop {
         let due_index = {

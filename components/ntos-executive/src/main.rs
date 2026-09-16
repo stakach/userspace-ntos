@@ -16881,6 +16881,12 @@ unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
         + subdrain!(16, driver_launch::hosted_file_retry_wake_due(now_100ns))
 }
 
+/// May reply to driver waiters and establish DPC lanes; never use from ACK-only paths.
+unsafe fn timer_hosted_driver_wake_due(now: nt_time::TimeSnapshot) -> u64 {
+    subdrain!(6, driver_launch::hosted_driver_timer_wake_due(now))
+        + subdrain!(7, driver_launch::hosted_driver_wait_wake_due(now))
+}
+
 unsafe fn delay_timer_drain_due_work(
     queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
@@ -16893,8 +16899,7 @@ unsafe fn delay_timer_drain_due_work(
         + subdrain!(3, keyed_release_wait_wake_due(handler, now_100ns))
         + subdrain!(4, io_completion_wake_due(handler, now_100ns))
         + subdrain!(5, user_timer_wake_due(handler, now_100ns))
-        + subdrain!(6, driver_launch::hosted_driver_timer_wake_due(now_100ns))
-        + subdrain!(7, driver_launch::hosted_driver_wait_wake_due(now_100ns))
+        + timer_hosted_driver_wake_due(nt_time_snapshot_at(now_100ns))
         + subdrain!(9, handler.job_time_sample_due(now_100ns))
         + subdrain!(
             10,

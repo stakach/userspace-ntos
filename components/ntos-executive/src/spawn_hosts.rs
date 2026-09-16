@@ -1520,6 +1520,13 @@ unsafe fn pump_handle_executive_event_badge(badge: u64) -> (bool, bool, bool) {
     (event, timer, irq)
 }
 
+unsafe fn pump_scheduler_work_pending(ch: &PumpChannel, irq: bool) -> bool {
+    (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
+        && (irq
+            || crate::driver_launch::hosted_driver_dpc_activation_pending()
+            || crate::dispatcher_bootstrap::timer_work_pending())
+}
+
 /// After a bound HPET notification interrupts a component endpoint receive, probe that endpoint
 /// once without blocking. This prevents a ready component Call from sitting behind a stream of timer
 /// badges on the root TCB's bound notification while preserving normal blocking behavior when the
@@ -1552,9 +1559,7 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel, reply_cap: u64) -> Option<
         if pump_deadman_tripped() {
             return Some(PumpMessage::deadman_wall());
         }
-        if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
-            && (irq || crate::driver_launch::hosted_driver_dpc_activation_pending())
-        {
+        if pump_scheduler_work_pending(ch, irq) {
             return Some(PumpMessage::scheduler_yield());
         }
         return None;
@@ -1757,6 +1762,12 @@ impl PumpLoopOutcome {
 #[inline(never)]
 unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
     loop {
+        // Dedicated IRQ/DPC exchanges may have latched a fresh bootstrap tick since the yield.
+        if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
+            && crate::dispatcher_bootstrap::timer_work_pending()
+        {
+            return PumpMessage::scheduler_yield();
+        }
         // (This recv pairs a component `Call`, so the kernel writes `executive.reply_to = component`.
         // Harmless since Phase 3: no executive reply reads `reply_to` any more.)
         let badge: u64;
@@ -1784,9 +1795,7 @@ unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
             if pump_deadman_tripped() {
                 return PumpMessage::deadman_wall();
             }
-            if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
-                && (irq || crate::driver_launch::hosted_driver_dpc_activation_pending())
-            {
+            if pump_scheduler_work_pending(ch, irq) {
                 return PumpMessage::scheduler_yield();
             }
             if timer {
@@ -1868,9 +1877,7 @@ unsafe fn pump_reply_recv4(
         if pump_deadman_tripped() {
             return PumpMessage::deadman_wall();
         }
-        if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
-            && (irq || crate::driver_launch::hosted_driver_dpc_activation_pending())
-        {
+        if pump_scheduler_work_pending(ch, irq) {
             return PumpMessage::scheduler_yield();
         }
         if timer {

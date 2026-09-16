@@ -15,6 +15,37 @@ enum BootstrapPhase {
 }
 
 static mut BOOTSTRAP: BootstrapPhase = BootstrapPhase::Uninitialized;
+static mut HOSTED_TIMER_PROGRESS: nt_time::DeferredTimerProgress =
+    nt_time::DeferredTimerProgress::new();
+
+unsafe fn pending_timer_snapshot() -> Option<u64> {
+    if !matches!(&*core::ptr::addr_of!(BOOTSTRAP), BootstrapPhase::Owned(_)) {
+        return None;
+    }
+    let pending = DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed);
+    (&*core::ptr::addr_of!(HOSTED_TIMER_PROGRESS))
+        .needs_scan(pending)
+        .then_some(pending)
+}
+
+/// Eligibility only: observing retained ticks neither consumes them nor authorizes rearming.
+pub(crate) unsafe fn timer_work_pending() -> bool {
+    !TIMER_DELIVERY_GATE.is_active() && pending_timer_snapshot().is_some()
+}
+
+/// Called from the retained component scheduler, never the IRQ-lane ACK hook. Driver timer
+/// publication can perform IPC, so no bootstrap store reference may cross this call.
+pub(crate) unsafe fn service_hosted_timer_work() -> u64 {
+    let Some(_delivery) = TIMER_DELIVERY_GATE.try_enter() else {
+        return 0;
+    };
+    let Some(pending) = pending_timer_snapshot() else {
+        return 0;
+    };
+    let work = timer_hosted_driver_wake_due(nt_time_snapshot());
+    (&mut *core::ptr::addr_of_mut!(HOSTED_TIMER_PROGRESS)).record_scan(pending);
+    work
+}
 
 /// Scan only while this phase owns the stores. The pending notification still belongs to the
 /// shared timer owner: do not consume it, reprogram the PIT or enter a provider here.

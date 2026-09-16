@@ -35597,6 +35597,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Review adjustment: hosted-driver timer/wait expiration can reply through native IPC; ACPI
         recovery can acknowledge IRPs and rearm. Those global paths, watchdog delivery ownership,
         bootstrap deadline collection and unified rearm remain open before blocking admission.
+      - [x] Service bootstrap hosted timer work at the retained scheduler boundary (2026-09-16).
+        The component scheduler now services bootstrap-owned hosted driver timer/wait expiration
+        before IRQ/DPC dispatch, under the shared delivery gate and with no seed/backend reference
+        alive. The gate ends before IRQ/DPC execution. Extracted subdrains 6/7 retain their runtime
+        order and telemetry; both now use one supplied TimeSnapshot, including across reply IPC.
+        The dedicated IRQ exchange and nested ACK scan remain free of these reply/queue effects.
+        Eligibility remains IRP or authenticated kernel receive-yield only.
+        DeferredTimerProgress records the pending count sampled before that subset scan, without
+        decrementing or swapping the shared counter. A tick arriving during the scan or subsequent
+        IRQ/DPC exchange stays distinguishable. Eligible pump_recv paths check this fresh demand
+        before blocking, while unchanged counts do not cause repeated yields. Active delivery
+        suppresses recursive scheduling; uninitialized/transferred phases have no bootstrap demand.
+        Two shared regressions cover fresh delivery retention, unchanged-count suppression, phase
+        marker freshness and active-scan exclusion. All 1,355 host tests pass across 24 suites
+        with no failures or ignored cases (.tmp/test-bootstrap-hosted-timer-20260916.log).
+        Executive release passes in 38.53s with 294 warnings; I/O Manager release passes in 3.08s.
+        Evidence: .tmp/build-bootstrap-hosted-timer-20260916.log and
+        .tmp/build-bootstrap-hosted-timer-io-manager-20260916.log. Independent source review found
+        no concrete correctness issue. These tests cover shared marker/gate semantics, not native
+        IPC or phase-transfer wiring. No QEMU rerun; no desktop proof is claimed.
+        Review adjustment: this is delivered-work servicing, not complete timer liveness. No
+        bootstrap rearm or blocking admission is enabled. ACPI recovery, watchdog ownership and
+        unified deadline/rearm remain open, as does broader runtime handler-borrow cleanup. Native
+        receive/IPC delivery still needs boot proof beyond the strict win32k import wall.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

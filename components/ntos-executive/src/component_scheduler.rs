@@ -28,6 +28,7 @@ impl ComponentSchedulerScope {
         let _message = crate::ipc_message::SavedMessageBuffer::capture();
         let _durable = crate::allocator::enter_durable();
         let yield_number = YIELDS.fetch_add(1, Ordering::Relaxed) + 1;
+        let timer_work = crate::dispatcher_bootstrap::service_hosted_timer_work();
         let irq_lines = drain_pending_hosted_irqs_snapshot();
         let dpcs = drain_hosted_driver_dpcs();
         if yield_number <= 16 {
@@ -35,6 +36,8 @@ impl ComponentSchedulerScope {
             print_hex64(shared_va);
             print_str(b" yield=");
             print_u64(yield_number);
+            print_str(b" timer-work=");
+            print_u64(timer_work);
             print_str(b" irq-lines=");
             print_u64(irq_lines);
             print_str(b" dpcs=");

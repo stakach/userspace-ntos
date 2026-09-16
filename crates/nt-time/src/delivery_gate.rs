@@ -13,6 +13,11 @@ impl TimerDeliveryGate {
         }
     }
 
+    /// Advisory suppression for nested scheduler yields, not a replacement for try_enter.
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
     /// Claim before borrowing dispatcher state or taking pending notifications. Refusal changes
     /// neither the current owner nor notification demand; callers must leave that demand pending.
     pub fn try_enter(&self) -> Option<TimerDeliveryGuard<'_>> {
@@ -20,6 +25,34 @@ impl TimerDeliveryGate {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .ok()
             .map(|_| TimerDeliveryGuard { gate: self })
+    }
+}
+
+/// A subset consumer's observation of a still-pending notification counter. The complete timer
+/// owner retains the counter; this marker must be discarded when that ownership phase ends.
+pub struct DeferredTimerProgress {
+    observed: u64,
+}
+
+impl DeferredTimerProgress {
+    pub const fn new() -> Self {
+        Self { observed: 0 }
+    }
+
+    pub fn needs_scan(&self, pending: u64) -> bool {
+        pending != 0 && pending != self.observed
+    }
+
+    /// Record the count sampled BEFORE a guarded scan, never a fresh count after IPC. A delivery
+    /// arriving during the scan must remain distinguishable at the next receive barrier.
+    pub fn record_scan(&mut self, sampled_pending: u64) {
+        self.observed = sampled_pending;
+    }
+}
+
+impl Default for DeferredTimerProgress {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -44,6 +77,36 @@ impl Drop for TimerDeliveryGuard<'_> {
 mod tests {
     use super::*;
     use core::sync::atomic::AtomicU64;
+
+    #[test]
+    fn subset_scan_retains_new_deliveries_without_consuming_shared_count() {
+        let pending = AtomicU64::new(2);
+        let mut progress = DeferredTimerProgress::new();
+        let sampled = pending.load(Ordering::Relaxed);
+        assert!(progress.needs_scan(sampled));
+        pending.fetch_add(1, Ordering::Relaxed);
+        progress.record_scan(sampled);
+        assert_eq!(pending.load(Ordering::Relaxed), 3);
+        assert!(progress.needs_scan(3));
+        progress.record_scan(3);
+        assert!(!progress.needs_scan(3));
+        assert!(!progress.needs_scan(0));
+        // A new phase gets a fresh marker even if its first counter value is the same.
+        assert!(DeferredTimerProgress::new().needs_scan(3));
+    }
+
+    #[test]
+    fn active_delivery_suppresses_nested_yields_without_acknowledging_progress() {
+        let gate = TimerDeliveryGate::new();
+        let progress = DeferredTimerProgress::new();
+        let outer = gate.try_enter().unwrap();
+        assert!(gate.is_active());
+        assert!(progress.needs_scan(1));
+        assert!(gate.try_enter().is_none());
+        drop(outer);
+        assert!(!gate.is_active());
+        assert!(progress.needs_scan(1));
+    }
 
     #[test]
     fn refusal_preserves_coalesced_notifications_for_the_next_owner() {
