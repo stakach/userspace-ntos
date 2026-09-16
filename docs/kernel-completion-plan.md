@@ -35502,6 +35502,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         and .tmp/build-bootstrap-scan-io-manager-20260916.log. No QEMU rerun; the known strict
         27-export win32k rejection is unchanged, and no desktop or native delivery proof is claimed.
         This installs only the bootstrap scan, not timed scheduling or native execution proof.
+      - [x] Collect shared timer deadlines independently of the live handler (2026-09-16).
+        timer_deadline.rs now combines canonical global sources with explicit owner-supplied
+        deadline values. The live adapter supplies its delay queue, user/provider timers, job
+        sampling and eligible component-resume deadline; no handler borrow enters the collector.
+        Removed the duplicated minimum chain and source-identification branch ladder. One ordered
+        candidate list selects deadline and source together through nt_time::earliest_deadline,
+        preserving all 18 sources and their original equal-deadline precedence. No queue is copied.
+        Interrupt and overdue scans pass their sampled TimeSnapshot through deadline conversion,
+        including hosted-driver timer/wait queues. The two lazy file/video retirement retry getters
+        retain their demand-reconciliation behavior but use the supplied monotonic timestamp,
+        including when invoked from wake_due. Collection does not ACK, select waits, program the
+        PIT or execute providers; those retry getters still reconcile memory-local retry state.
+        Four shared tests cover absent candidates, exact source/deadline pairing, tie precedence,
+        zero/MAX deadlines and absolute/relative conversion at a shared clock snapshot. Focused
+        nt-time tests pass (13 tests). All 1,344 host tests pass across 23 suites with no failures
+        or ignored cases (.tmp/test-deadline-query-20260916.log). Executive release passes in
+        44.17s with 294 warnings; I/O Manager release passes in 3.61s. Evidence:
+        .tmp/build-deadline-query-20260916.log and .tmp/build-deadline-query-io-manager-20260916.log.
+        Native source precedence was manually reviewed; shared tests cover the generic selector.
+        No boot rerun: the known strict 27-export win32k rejection is unchanged. No desktop proof.
+        This replaces the runtime collector; bootstrap rearm/global servicing is not enabled.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
@@ -35513,7 +35534,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         until caller-aware readiness selection and receive/deadline scheduling are available.
         The bootstrap scan now runs at the deferred timer boundary, but must not independently
         rearm the PIT: hosted-driver timers, waiters, retry owners and watchdog work share it.
-        Compose authoritative global deadlines and service those owners outside bootstrap borrows
+        The shared deadline collector now accepts explicit owner deadlines without a live handler.
+        Supply bootstrap-owned deadlines and service all global owners outside bootstrap borrows
         before changing rearm ownership. In particular hosted_driver_timer_wake_due can dispatch
         DPCs; it must not run with a seed/backend reference alive. Retain notification demand until
         the complete owner services it; LAST_REARM metadata is not a deadline authority.

@@ -42,7 +42,7 @@ fn postpone(now: u64) {
     NEXT_RETRY.store(now.saturating_add(RETRY_INTERVAL_100NS), Ordering::Release);
 }
 
-pub(super) fn retry_deadline() -> Option<u64> {
+pub(super) fn retry_deadline(now: u64) -> Option<u64> {
     if !unsafe { any_pending() } {
         NEXT_RETRY.store(0, Ordering::Release);
         RETRY_READY.store(0, Ordering::Release);
@@ -52,7 +52,7 @@ pub(super) fn retry_deadline() -> Option<u64> {
     if next != 0 {
         return Some(next);
     }
-    let next = monotonic_time_100ns().saturating_add(RETRY_INTERVAL_100NS);
+    let next = now.saturating_add(RETRY_INTERVAL_100NS);
     match NEXT_RETRY.compare_exchange(0, next, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => Some(next),
         Err(existing) => Some(existing),
@@ -60,7 +60,7 @@ pub(super) fn retry_deadline() -> Option<u64> {
 }
 
 pub(super) fn retry_wake_due(now: u64) -> u64 {
-    if retry_deadline().is_some_and(|deadline| deadline <= now) {
+    if retry_deadline(now).is_some_and(|deadline| deadline <= now) {
         // Keep a future wake even if this timer fired inside a nested hosted pump.
         postpone(now);
         return u64::from(RETRY_READY.swap(1, Ordering::AcqRel) == 0);

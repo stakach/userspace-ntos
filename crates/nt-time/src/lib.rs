@@ -1,5 +1,8 @@
 #![no_std]
 
+mod wake_deadline;
+pub use wake_deadline::earliest_deadline;
+
 /// Largest system time accepted by NT's clock-setting path.
 ///
 /// The native kernel requires the high nibble of the signed `LARGE_INTEGER`

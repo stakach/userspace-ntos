@@ -12540,8 +12540,7 @@ pub(crate) fn hosted_driver_wait_census() -> (u64, u64, u64, u64, u64) {
     )
 }
 
-pub(crate) fn hosted_driver_wait_next_deadline() -> Option<u64> {
-    let now = crate::nt_time_snapshot();
+pub(crate) fn hosted_driver_wait_next_deadline(now: nt_time::TimeSnapshot) -> Option<u64> {
     unsafe {
         (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS))
             .as_ref()?
@@ -12551,8 +12550,7 @@ pub(crate) fn hosted_driver_wait_next_deadline() -> Option<u64> {
     }
 }
 
-pub(crate) fn hosted_driver_timer_next_deadline() -> Option<u64> {
-    let now = crate::nt_time_snapshot();
+pub(crate) fn hosted_driver_timer_next_deadline(now: nt_time::TimeSnapshot) -> Option<u64> {
     unsafe {
         (*core::ptr::addr_of!(HOSTED_DRIVER_TIMERS))
             .as_ref()?
@@ -41513,11 +41511,11 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
         .saturating_add(unsafe { start_hosted_acpi_pci_route_query() })
 }
 
-pub(crate) fn hosted_file_retry_deadline() -> Option<u64> {
+pub(crate) fn hosted_file_retry_deadline(now: u64) -> Option<u64> {
     hosted_file_owners::retry_deadline()
         .into_iter()
-        .chain(hosted_file_retirements::retry_deadline())
-        .chain(crate::video_device::video_file_retirement_deadline())
+        .chain(hosted_file_retirements::retry_deadline(now))
+        .chain(crate::video_device::video_file_retirement_deadline(now))
         .min()
 }
 

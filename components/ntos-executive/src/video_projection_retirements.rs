@@ -35,7 +35,7 @@ fn postpone(now: u64) {
     NEXT_RETRY.store(now.saturating_add(RETRY_INTERVAL_100NS), Ordering::Release);
 }
 
-pub(crate) fn deadline() -> Option<u64> {
+pub(crate) fn deadline(now: u64) -> Option<u64> {
     if !unsafe { video_projection_owners::has_pending() } {
         clear_retry();
         return None;
@@ -44,7 +44,7 @@ pub(crate) fn deadline() -> Option<u64> {
     if next != 0 {
         return Some(next);
     }
-    let next = crate::monotonic_time_100ns().saturating_add(RETRY_INTERVAL_100NS);
+    let next = now.saturating_add(RETRY_INTERVAL_100NS);
     match NEXT_RETRY.compare_exchange(0, next, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => Some(next),
         Err(existing) => Some(existing),
@@ -53,7 +53,7 @@ pub(crate) fn deadline() -> Option<u64> {
 
 /// Latch scheduler work only: a timer can arrive while a hosted component still owns dispatch.
 pub(crate) fn wake_due(now: u64) -> u64 {
-    if deadline().is_some_and(|deadline| deadline <= now) {
+    if deadline(now).is_some_and(|deadline| deadline <= now) {
         postpone(now);
         return u64::from(RETRY_READY.swap(1, Ordering::AcqRel) == 0);
     }

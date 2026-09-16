@@ -72,6 +72,7 @@ pub(crate) use hosted_process_runtime::*;
 mod process_vm_retirement;
 mod ps_bootstrap;
 mod dispatcher_bootstrap;
+mod timer_deadline;
 mod provider_local_event;
 mod provider_dispatcher_backend;
 mod ps_object_retirement;
@@ -16669,87 +16670,15 @@ unsafe fn delay_timer_init() -> bool {
 unsafe fn delay_timer_next_deadline(
     queue: &nt_delay_execution::Queue,
     handler: &ExecNtHandler,
+    now: nt_time::TimeSnapshot,
 ) -> Option<(u64, u64)> {
-    let now = nt_time_snapshot();
-    let delay_deadline = queue.next_deadline(now);
-    let event_deadline = object_waiter_next_deadline(now);
-    let keyed_deadline = unsafe { (&*core::ptr::addr_of!(KEYED_WAITERS)).next_deadline(now) };
-    let keyed_release_deadline =
-        unsafe { (&*core::ptr::addr_of!(KEYED_RELEASE_WAITERS)).next_deadline(now) };
-    let io_completion_deadline =
-        unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline(now) };
-    let user_timer_deadline = handler.user_timer_next_deadline(now);
-    let provider_wait_deadline = crate::service_sec_image::provider_wait_next_deadline(now);
-    let provider_timer_deadline = handler.provider_timer_next_deadline(now);
-    let hosted_kernel_timer_deadline = driver_launch::hosted_driver_timer_next_deadline();
-    let hosted_driver_deadline = driver_launch::hosted_driver_wait_next_deadline();
-    let acpi_pci_route_recovery_deadline =
-        driver_launch::hosted_acpi_pci_route_recovery_next_deadline();
-    let job_time_deadline = handler.job_time_sample_next_deadline();
-    let registry_close_deadline = driver_launch::driver_registry_close_retry_deadline();
-    let cm_key_cleanup_deadline = cm_key_ownership::next_deadline();
-    let cm_snapshot_cleanup_deadline = cm_snapshot_ownership::next_deadline();
-    let hosted_file_retry_deadline = driver_launch::hosted_file_retry_deadline();
-    let component_resume_deadline = service_sec_image::component_resume::next_deadline(handler);
-    let deadman_deadline = watchdog_deadline();
-    let deadline = delay_deadline
-        .into_iter()
-        .chain(event_deadline)
-        .chain(keyed_deadline)
-        .chain(keyed_release_deadline)
-        .chain(io_completion_deadline)
-        .chain(user_timer_deadline)
-        .chain(provider_wait_deadline)
-        .chain(provider_timer_deadline)
-        .chain(hosted_kernel_timer_deadline)
-        .chain(hosted_driver_deadline)
-        .chain(acpi_pci_route_recovery_deadline)
-        .chain(job_time_deadline)
-        .chain(registry_close_deadline)
-        .chain(cm_key_cleanup_deadline)
-        .chain(cm_snapshot_cleanup_deadline)
-        .chain(hosted_file_retry_deadline)
-        .chain(component_resume_deadline)
-        .chain(deadman_deadline)
-        .min()?;
-    let source = if delay_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_DELAY_QUEUE
-    } else if event_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_EVENT_WAIT
-    } else if keyed_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_KEYED_WAIT
-    } else if keyed_release_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_KEYED_RELEASE
-    } else if io_completion_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_IO_COMPLETION
-    } else if user_timer_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_USER_TIMER
-    } else if provider_wait_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_PROVIDER_WAIT
-    } else if provider_timer_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_PROVIDER_TIMER
-    } else if hosted_kernel_timer_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_HOSTED_KERNEL_TIMER
-    } else if hosted_driver_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_HOSTED_DRIVER
-    } else if acpi_pci_route_recovery_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_ACPI_PCI_ROUTE_RECOVERY
-    } else if job_time_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_JOB_TIME
-    } else if registry_close_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_REGISTRY_CLOSE
-    } else if cm_key_cleanup_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_CM_KEY_CLEANUP
-    } else if cm_snapshot_cleanup_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_CM_SNAPSHOT_CLEANUP
-    } else if hosted_file_retry_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_HOSTED_FILE_RETRY
-    } else if component_resume_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_COMPONENT_RESUME
-    } else {
-        DELAY_TIMER_SOURCE_WATCHDOG
-    };
-    Some((deadline, source))
+    timer_deadline::next(now, timer_deadline::OwnerDeadlines {
+        delay: queue.next_deadline(now),
+        user_timer: handler.user_timer_next_deadline(now),
+        provider_timer: handler.provider_timer_next_deadline(now),
+        job_time: handler.job_time_sample_next_deadline(),
+        component_resume: service_sec_image::component_resume::next_deadline(handler),
+    })
 }
 
 /// Program the shared source without borrowing runtime dispatcher state. IRQ acknowledgment is
@@ -16808,7 +16737,7 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue, handler: &ExecNtH
     {
         return;
     }
-    if let Some((deadline, source)) = delay_timer_next_deadline(queue, handler) {
+    if let Some((deadline, source)) = delay_timer_next_deadline(queue, handler, nt_time_snapshot()) {
         let _ = delay_timer_program(deadline, source);
     } else {
         // Channel 0 is in hardware one-shot mode and therefore already stopped after its delivery.
@@ -16989,8 +16918,9 @@ pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(
     }
     DRAIN_CALLS.fetch_add(1, Ordering::Relaxed);
     let scan_started = disk_census_ticks();
-    let next = delay_timer_next_deadline(queue, handler);
-    let now_100ns = monotonic_time_100ns();
+    let now = nt_time_snapshot();
+    let next = delay_timer_next_deadline(queue, handler, now);
+    let now_100ns = now.monotonic_100ns;
     DRAIN_SCAN_TICKS.fetch_add(
         disk_census_ticks().wrapping_sub(scan_started),
         Ordering::Relaxed,
@@ -17252,8 +17182,9 @@ unsafe fn delay_timer_interrupt(
 ) {
     // Notifications may be coalesced, cancelled or deferred past another rearm. They request
     // a scan, never advance the clock or consume metadata belonging to a newer shot.
-    let now_100ns = monotonic_time_100ns();
-    let early_or_stale = delay_timer_next_deadline(queue, handler)
+    let now = nt_time_snapshot();
+    let now_100ns = now.monotonic_100ns;
+    let early_or_stale = delay_timer_next_deadline(queue, handler, now)
         .is_none_or(|(deadline, _)| deadline > now_100ns);
     let woken = delay_timer_drain_due_work(queue, handler, now_100ns);
     teardown_pending_job_time_terminations(queue, handler);
@@ -17292,7 +17223,7 @@ unsafe fn delay_timer_interrupt(
 
 unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue, handler: &ExecNtHandler) {
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
-        || delay_timer_next_deadline(queue, handler).is_some()
+        || delay_timer_next_deadline(queue, handler, nt_time_snapshot()).is_some()
     {
         return;
     }
