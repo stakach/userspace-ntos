@@ -4508,12 +4508,16 @@ pub(crate) unsafe fn drain_nested_pump_timer_delivery() -> bool {
     if handler_ptr.is_null() || queue_ptr.is_null() {
         return false;
     }
+    // Claim before consuming notifications or constructing references from published pointers.
+    let Some(delivery) = TIMER_DELIVERY_GATE.try_enter() else {
+        return false;
+    };
     let ticks = DELAY_TIMER_TICKS_PENDING.swap(0, Ordering::Relaxed);
     if ticks == 0 {
         return false;
     }
     PUMP_TIMER_TICKS_DRAINED.fetch_add(ticks, Ordering::Relaxed);
-    delay_timer_interrupt(&mut *queue_ptr, &mut *handler_ptr);
+    delay_timer_interrupt_claimed(&mut *queue_ptr, &mut *handler_ptr, &delivery);
     let n = SERVICE_DELAY_NESTED_DRAINS.fetch_add(1, Ordering::Relaxed);
     if n < 8 {
         print_str(b"[delay] nested pump drained timer ticks=");

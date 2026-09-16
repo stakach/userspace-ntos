@@ -3121,6 +3121,7 @@ pub(crate) unsafe fn delay_timer_nested_ack() {
 }
 
 const DELAY_TIMER_IRQ: u64 = 2;
+static TIMER_DELIVERY_GATE: nt_time::TimerDeliveryGate = nt_time::TimerDeliveryGate::new();
 /// Minimum scheduling interval for the PIT one-shot, in 100ns units (1 ms).
 /// A cancelled/deferred notification is not evidence that this interval should grow.
 const DELAY_TIMER_MIN_ARM_100NS: u64 = 10_000;
@@ -16872,6 +16873,14 @@ unsafe fn user_timer_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     }
 }
 
+/// Publish retry readiness only; cleanup and native execution stay at their outer boundaries.
+unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
+    subdrain!(13, driver_launch::driver_registry_close_retry_wake_due(now_100ns))
+        + subdrain!(14, cm_key_ownership::wake_due(now_100ns))
+        + subdrain!(15, cm_snapshot_ownership::wake_due(now_100ns))
+        + subdrain!(16, driver_launch::hosted_file_retry_wake_due(now_100ns))
+}
+
 unsafe fn delay_timer_drain_due_work(
     queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
@@ -16902,10 +16911,7 @@ unsafe fn delay_timer_drain_due_work(
             handler,
             nt_time_snapshot_at(now_100ns),
         ))
-        + subdrain!(13, driver_launch::driver_registry_close_retry_wake_due(now_100ns))
-        + subdrain!(14, cm_key_ownership::wake_due(now_100ns))
-        + subdrain!(15, cm_snapshot_ownership::wake_due(now_100ns))
-        + subdrain!(16, driver_launch::hosted_file_retry_wake_due(now_100ns))
+        + timer_retry_wake_due(now_100ns)
         + service_sec_image::component_resume::wake_due(handler, now_100ns)
         + driver_launch::hosted_dpc_wake_due(now_100ns)
         + watchdog_tick
@@ -16915,6 +16921,9 @@ pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(
     queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) -> u64 {
+    let Some(_delivery) = TIMER_DELIVERY_GATE.try_enter() else {
+        return 0;
+    };
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0 {
         return 0;
     }
@@ -17181,6 +17190,17 @@ unsafe fn teardown_pending_job_time_terminations(
 unsafe fn delay_timer_interrupt(
     queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
+) {
+    let delivery = TIMER_DELIVERY_GATE
+        .try_enter()
+        .expect("outer timer delivery reentered an active scan");
+    delay_timer_interrupt_claimed(queue, handler, &delivery);
+}
+
+unsafe fn delay_timer_interrupt_claimed(
+    queue: &mut nt_delay_execution::Queue,
+    handler: &mut ExecNtHandler,
+    _delivery: &nt_time::TimerDeliveryGuard<'_>,
 ) {
     // Notifications may be coalesced, cancelled or deferred past another rearm. They request
     // a scan, never advance the clock or consume metadata belonging to a newer shot.

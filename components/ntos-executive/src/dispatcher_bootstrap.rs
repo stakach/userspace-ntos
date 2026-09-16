@@ -21,18 +21,26 @@ static mut BOOTSTRAP: BootstrapPhase = BootstrapPhase::Uninitialized;
 pub(crate) unsafe fn scan_timer_delivery(
     now: nt_delay_execution::TimeSnapshot,
 ) -> Result<(), nt_user_host::provider_wait_selection::ProviderWaitSelectionError<u32>> {
-    let BootstrapPhase::Owned(seed) = &mut *core::ptr::addr_of_mut!(BOOTSTRAP) else {
+    let Some(_delivery) = TIMER_DELIVERY_GATE.try_enter() else {
+        // The owner retains the pending notification; nested ACK/watchdog handling still runs.
         return Ok(());
     };
     let _durable = allocator::enter_durable();
-    let mut objects = nt_user_host::provider_dispatcher_backend::ProviderDispatcherObjects {
-        events: &mut seed.dispatcher.events,
-        event_objects: &mut seed.dispatcher.event_objects,
-        timers: seed.dispatcher.provider_timers.as_mut(),
-        backing: crate::provider_dispatcher_backend::NativeEventBacking(&mut seed.obj_ns),
-        access: None,
-    };
-    service_sec_image::provider_wait_scan_timed(&mut objects, now).map(|_| ())
+    {
+        let BootstrapPhase::Owned(seed) = &mut *core::ptr::addr_of_mut!(BOOTSTRAP) else {
+            return Ok(());
+        };
+        let mut objects = nt_user_host::provider_dispatcher_backend::ProviderDispatcherObjects {
+            events: &mut seed.dispatcher.events,
+            event_objects: &mut seed.dispatcher.event_objects,
+            timers: seed.dispatcher.provider_timers.as_mut(),
+            backing: crate::provider_dispatcher_backend::NativeEventBacking(&mut seed.obj_ns),
+            access: None,
+        };
+        service_sec_image::provider_wait_scan_timed(&mut objects, now)?;
+    }
+    timer_retry_wake_due(now.monotonic_100ns);
+    Ok(())
 }
 
 pub(crate) unsafe fn initialize() -> Result<(), u32> {

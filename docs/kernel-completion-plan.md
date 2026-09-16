@@ -35571,6 +35571,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Review adjustment: bootstrap global servicing/rearm, pre-handler scheduling and native
         desktop delivery remain open. Native receive/rearm wiring needs boot proof beyond the
         unchanged strict win32k import wall; arbitrary non-yielding channels gain no new authority.
+      - [x] Exclude recursive timer scans and share bootstrap retry readiness (2026-09-16).
+        The shared nt_time::TimerDeliveryGate grants a non-clone scoped delivery guard. Native
+        nested delivery claims it before taking pending ticks or creating handler/queue references
+        from published pointers. Refused nested scans leave all ticks pending and retain the
+        existing nested ACK/watchdog path. The already-claimed interrupt core holds the guard
+        through due work, job teardown, rearm and IRQ ACK; the two outer-loop interrupt callers
+        require their own claim as an invariant. Overdue scans defer while another scan owns it.
+        Bootstrap scanning uses the same guard and defers benignly on contention, with no seed
+        borrow surviving its scan. This excludes recursive timer scans, not arbitrary executive
+        reentry, and does not turn nested ACK into a complete global timer service.
+        Extracted the contiguous retry subdrains 13..16 without changing runtime order or telemetry:
+        registry-handle close, CM key, CM snapshot and hosted-file retirement readiness. Bootstrap
+        calls the same latch-only helper after successful provider scanning and after releasing
+        seed/backend borrows. Uninitialized/transferred bootstrap phases do not run it. No cleanup
+        execution, notification consumption, watchdog ownership or hardware programming moved.
+        Three shared tests cover retained coalesced ticks under refusal, scoped early release and
+        independent gate ownership. All 1,353 host tests pass across 24 suites with no failures
+        or ignored cases (.tmp/test-timer-delivery-gate-20260916.log). Executive release passes
+        in 39.12s with 294 warnings; I/O Manager release passes in 3.29s. Evidence:
+        .tmp/build-timer-delivery-gate-20260916.log and
+        .tmp/build-timer-delivery-gate-io-manager-20260916.log. Independent source review found
+        no actionable issue. Shared tests cover the primitive, not native wiring. No QEMU rerun;
+        the strict 27-export win32k rejection is unchanged, and no desktop proof is claimed.
+        Review adjustment: hosted-driver timer/wait expiration can reply through native IPC; ACPI
+        recovery can acknowledge IRPs and rearm. Those global paths, watchdog delivery ownership,
+        bootstrap deadline collection and unified rearm remain open before blocking admission.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
