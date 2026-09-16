@@ -718,6 +718,24 @@ impl ProviderTimerTable {
             .filter(|(_, timer)| timer.live && !timer.delete_pending && timer.deadline.is_due(now))
             .min_by_key(|(_, timer)| timer.deadline.ordering_key(now))
             .map(|(slot, _)| slot)?;
+        self.expire_slot(slot, now)
+    }
+
+    /// Publish readiness once per due timer, without allocating or running callbacks. A periodic
+    /// deadline saturated at the clock limit must not be selected repeatedly within one scan.
+    pub fn expire_due(&mut self, now: TimeSnapshot) -> u64 {
+        let mut expired = 0u64;
+        for slot in 0..self.timers.len() {
+            let timer = &self.timers[slot];
+            if timer.live && !timer.delete_pending && timer.deadline.is_due(now) {
+                self.expire_slot(slot, now).expect("live timer lost its identity");
+                expired = expired.saturating_add(1);
+            }
+        }
+        expired
+    }
+
+    fn expire_slot(&mut self, slot: usize, now: TimeSnapshot) -> Option<ProviderTimerExpiration> {
         let id = ProviderTimerId::new(slot, self.timers[slot].generation).ok()?;
         let timer = &mut self.timers[slot];
         timer.signaled = true;

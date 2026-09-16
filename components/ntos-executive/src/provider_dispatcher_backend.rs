@@ -60,7 +60,7 @@ pub(crate) fn finalize_retired_event(
 }
 
 impl ExecNtHandler {
-    fn dispatcher_objects(
+    pub(crate) fn dispatcher_objects(
         &mut self,
         access: Option<ProviderDispatcherAccess>,
     ) -> ProviderDispatcherObjects<'_, NativeEventBacking<'_>> {

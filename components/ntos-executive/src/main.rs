@@ -16958,7 +16958,7 @@ unsafe fn delay_timer_drain_due_work(
         + subdrain!(
             11,
             crate::service_sec_image::provider_wait_select_due(
-                handler,
+                &mut handler.dispatcher_objects(None),
                 nt_time_snapshot_at(now_100ns),
             )
         )

@@ -68,6 +68,17 @@ pub struct ProviderDispatcherObjects<'a, B> {
     pub access: Option<ProviderDispatcherAccess>,
 }
 
+impl<B> ProviderDispatcherObjects<'_, B> {
+    /// Publish timer readiness at the caller's sampled time without selecting a waiter or
+    /// entering a provider. Existing wait leases remain owned by the canonical arbiter.
+    pub fn expire_timers(&mut self, now: nt_kernel_exec::TimeSnapshot) -> u64 {
+        let Some(timers) = self.timers.as_mut() else {
+            return 0;
+        };
+        timers.expire_due(now)
+    }
+}
+
 pub fn dispatcher_lease_is_ready(
     event_objects: &EventObjectRegistry,
     events: &EventStore,

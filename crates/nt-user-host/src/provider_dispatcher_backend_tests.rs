@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "provider_dispatcher_expiry_tests.rs"]
+mod expiry;
 use crate::dispatcher_state::DispatcherState;
 use nt_component_suspension::{LaneHandle, SuspensionHostedClient};
 use nt_kernel_exec::{EventKind, EventObjectError, TimeSnapshot};
@@ -363,12 +366,9 @@ fn mixed_timer_wait_all_preserves_event_until_timer_is_ready() {
         .unwrap()
         .set_local(301, 0, 0, now())
         .unwrap();
-    assert!(objects
-        .timers
-        .as_mut()
-        .unwrap()
-        .expire_next_due(now())
-        .is_some());
+    objects.access = None;
+    assert_eq!(objects.expire_timers(now()), 1);
+    assert_eq!(objects.expire_timers(now()), 0);
     assert_eq!(arbiter.pop_ready(&mut objects).unwrap().status, 0);
     assert!(!objects.events.read_state(101));
     assert_eq!(

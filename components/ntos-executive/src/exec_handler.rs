@@ -25183,20 +25183,6 @@ impl ExecNtHandler {
             .and_then(|timers| timers.next_deadline(now))
     }
 
-    pub(crate) fn provider_timer_expire_due(
-        &mut self,
-        now: nt_delay_execution::TimeSnapshot,
-    ) -> u64 {
-        let mut expired = 0u64;
-        let Some(timers) = self.provider_timers.as_mut() else {
-            return 0;
-        };
-        while timers.expire_next_due(now).is_some() {
-            expired = expired.saturating_add(1);
-        }
-        expired
-    }
-
     fn provider_event_identity(
         &self,
         body: u64,

@@ -1577,9 +1577,7 @@ pub(crate) unsafe fn service_provider_wait_poll(
                 let _durable = allocator::enter_durable();
                 // Select older waiters before a new poll can consume a just-expired synchronization
                 // timer. Selection only records completions; it cannot resume another provider lane.
-                if (*handler).provider_timer_expire_due(nt_time_snapshot()) != 0 {
-                    provider_wait_select_ready(&mut *handler);
-                }
+                let _ = provider_timer_wake_due(&mut *handler, nt_time_snapshot());
                 match (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).poll(
                     &mut *handler, &request, owner,
                 ) {
@@ -1908,11 +1906,12 @@ pub(crate) unsafe fn provider_timer_wake_due(
     nt_handler: &mut ExecNtHandler,
     now: nt_delay_execution::TimeSnapshot,
 ) -> u64 {
-    let expired = nt_handler.provider_timer_expire_due(now);
+    let mut objects = nt_handler.dispatcher_objects(None);
+    let expired = objects.expire_timers(now);
     if expired == 0 {
         return 0;
     }
-    expired.saturating_add(provider_wait_select_ready(nt_handler))
+    expired.saturating_add(provider_wait_select_ready(&mut objects))
 }
 
 unsafe fn provider_wait_admit_retained(

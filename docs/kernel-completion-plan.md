@@ -35464,12 +35464,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/run-timer-delivery-20260916.log and .tmp/boot-timer-delivery-20260916.log.
         This boot does not prove native interrupt execution or desktop readiness.
         This is a bootstrap scheduling prerequisite, not admission or endpoint fan-in.
+      - [x] Remove live-handler ownership from provider timed-work selection (2026-09-16).
+        ProviderDispatcherObjects now expires canonical timers using only its original borrowed
+        fields. Runtime timer wake, inline poll's older-waiter readiness pass and timer-interrupt
+        wait-timeout selection use dispatcher_objects(None), which allows existing-lease work
+        but grants no new admission authority. Removed ExecNtHandler::provider_timer_expire_due.
+        The field borrow ends before inline poll reacquires authenticated handler access; native
+        timeout-before-timer ordering and expiry-before-ready/poll ordering are unchanged.
+        Expiry is a bounded ProviderTimerTable pass, processing each due timer once. This fixes
+        the old drain's infinite loop at the monotonic clock limit, where a periodic deadline
+        saturates to the same instant; later timers cannot be starved by repeated selection of
+        the first timer. Existing periodic saturation semantics remain unchanged between scans.
+        Added real Event+Timer WaitAll coverage for moved storage, refused publication/retry,
+        retained leases/signals, scope-free selection, missing timer storage and clock-limit
+        periodic timers. All 1,328 host tests pass across 21 suites, with no failures or ignored
+        cases (.tmp/test-field-expiry-20260916.log). Executive release passes in 40.36s with
+        294 warnings; I/O Manager release also passes. Evidence: .tmp/build-field-expiry-20260916.log
+        and .tmp/build-field-expiry-io-manager-20260916.log. No boot rerun: this does not change
+        the measured strict 27-export win32k frontier, and no native runtime/desktop proof is claimed.
+        Bootstrap admission/signaling guards remain; shared tests do not prove bootstrap delivery.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
         selected-resume scheduling now exists, but cannot service early initialization by itself.
         The delay queue now survives that ownership transition without reset, and the shared PIT
-        programming path no longer depends on live dispatcher state. Preserve sampled-time expiry
+        programming path no longer depends on live dispatcher state. Provider timed-work selection
+        now uses the same field-borrowed backend needed by bootstrap. Preserve sampled-time expiry
         and distinct programming/IRQ-ack outcomes. Bootstrap SET/PULSE must keep rejecting observed Events
         until caller-aware readiness selection and receive/deadline scheduling are available.
         The bounded runtime publication pass above owns initial/repark admission; do not stack another
