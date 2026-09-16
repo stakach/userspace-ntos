@@ -20,6 +20,16 @@ pub struct PitOneShot {
     pub chunked: bool,
 }
 
+impl PitOneShot {
+    /// Program channel 0 in mode 0, low byte then high byte. Failure leaves the hardware
+    /// state uncertain; the caller must disable the source rather than publish an armed shot.
+    pub fn program<E>(&self, mut write: impl FnMut(u16, u8) -> Result<(), E>) -> Result<(), E> {
+        write(0x43, 0x30)?;
+        write(0x40, self.reload as u8)?;
+        write(0x40, (self.reload >> 8) as u8)
+    }
+}
+
 /// Convert an NT monotonic deadline into one PC timer channel-0 one-shot.
 ///
 /// The PIT cannot represent more than 65,536 input clocks. Longer waits are deliberately split into
@@ -312,6 +322,10 @@ impl TimerQueue {
             .collect()
     }
 }
+
+#[cfg(test)]
+#[path = "timer_delivery_tests.rs"]
+mod delivery_tests;
 
 #[cfg(test)]
 mod tests {

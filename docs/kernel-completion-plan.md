@@ -35441,19 +35441,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Evidence: .tmp/run-bootstrap-delay-20260916.log and
         .tmp/boot-bootstrap-delay-20260916.log. No native handoff or desktop proof is claimed.
         This removes reset debt; it does not enable pre-loop wait admission or receive fan-in.
+      - [x] Make timer delivery a clock-sampled scan and share checked PIT programming (2026-09-16).
+        delay_timer_interrupt now expires waits only at sampled monotonic time. An old,
+        coalesced or cancelled notification cannot advance time to a later programmed shot.
+        Removed LAST_REARM_WAKE_DEADLINE and LAST_REARM_CHUNKED; delivery no longer consumes
+        metadata belonging to another arm. Early/stale accounting queries canonical pending
+        deadlines instead. Removed the historical HPET comparator guard-growth machinery:
+        an empty PIT wake does not prove an interrupt storm or justify permanent 500ms latency.
+        Runtime and nested watchdog arms share delay_timer_program, with no ExecNtHandler
+        dependency. PitOneShot::program owns the tested mode/low/high write sequence and stops
+        on the first failed write. Armed metadata and programming counters publish only after
+        all writes succeed; IRQ acknowledgment remains a separate caller-owned operation.
+        Five host regressions cover exact writes, all failure positions, zero reload encoding,
+        rearm before old notification drain, cancellation and long-wait chunking. Focused tests:
+        all 300 nt-kernel-exec tests pass. Serialized broader validation passes 1,325 tests
+        across 21 suites, with no failures or ignored tests; executive release passes in 42.44s
+        with 294 warnings. Evidence: .tmp/test-timer-delivery-20260916.log and
+        .tmp/build-timer-delivery-20260916.log. These are shared clock/queue contract tests, not
+        execution coverage of the native interrupt adapter. Headless boot with a 120s ceiling
+        reaches the unchanged strict 27-export win32k rejection before DriverEntry. The halted
+        guest was explicitly stopped; run.sh exits 1 without shell proof. Evidence:
+        .tmp/run-timer-delivery-20260916.log and .tmp/boot-timer-delivery-20260916.log.
+        This boot does not prove native interrupt execution or desktop readiness.
+        This is a bootstrap scheduling prerequisite, not admission or endpoint fan-in.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
-        selected-resume scheduling now exists, but cannot service early initialization by itself. The
-        delay queue now survives that ownership transition without reset. Before sharing PIT
-        programming with bootstrap, separate delivered-shot time from newly programmed-shot
-        metadata: deferred nested ticks currently pass through delay_timer_interrupt, whose
-        LAST_REARM_WAKE_DEADLINE can describe a later rearm. Do not advance old deliveries to
-        a new future deadline. Cover rearm-before-deferred-delivery and failed programming in
-        host tests; publish armed metadata only after successful programming and retain distinct
-        programming/IRQ-ack outcomes. Bootstrap SET/PULSE must continue rejecting observed Events
+        selected-resume scheduling now exists, but cannot service early initialization by itself.
+        The delay queue now survives that ownership transition without reset, and the shared PIT
+        programming path no longer depends on live dispatcher state. Preserve sampled-time expiry
+        and distinct programming/IRQ-ack outcomes. Bootstrap SET/PULSE must keep rejecting observed Events
         until caller-aware readiness selection and receive/deadline scheduling are available.
-        bounded runtime publication pass above owns initial/repark admission; do not stack another
+        The bounded runtime publication pass above owns initial/repark admission; do not stack another
         frame over the old Resuming wait. Preserve both continuations on failed repark. Use the
         kernel-local terminal consumer above for genuine returns; preserve its exact recipient
         delivery and retirement/ACK rather than frame-free record_completion or a hosted reply.

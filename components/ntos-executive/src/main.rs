@@ -2152,7 +2152,6 @@ const HPET_MAIN_COUNTER: u64 = 0xF0;
 // remains the monotonic clocksource only; none of its globally routed interrupt pins are claimed.
 const PIT_CHANNEL0_PORT: u16 = 0x40;
 const PIT_COMMAND_PORT: u16 = 0x43;
-const PIT_CHANNEL0_ONE_SHOT_LO_HI: u8 = 0x30;
 /// The executive's own IPC buffer VA (from BootInfo) — stages reply message registers 4+.
 static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
 /// The executive stack-mirror base for the process whose fault/syscall is currently being serviced.
@@ -3081,11 +3080,6 @@ pub(crate) unsafe fn watchdog_nested_rearm() {
     {
         return;
     }
-    let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
-    let ioport = DELAY_TIMER_IOPORT.load(Ordering::Relaxed);
-    if handler == 0 || ioport == 0 {
-        return;
-    }
     let now = monotonic_time_100ns();
     let deadline = WATCHDOG_DEADLINE.load(Ordering::Relaxed);
     let target = if deadline == u64::MAX {
@@ -3093,19 +3087,8 @@ pub(crate) unsafe fn watchdog_nested_rearm() {
     } else {
         deadline
     };
-    let shot = nt_kernel_exec::pit_oneshot_for_deadline(
-        now,
-        target,
-        DELAY_TIMER_ARM_GUARD_100NS.load(Ordering::Relaxed),
-    );
-    let programmed = io_out8(ioport, PIT_COMMAND_PORT, PIT_CHANNEL0_ONE_SHOT_LO_HI) == 0
-        && io_out8(ioport, PIT_CHANNEL0_PORT, shot.reload as u8) == 0
-        && io_out8(ioport, PIT_CHANNEL0_PORT, (shot.reload >> 8) as u8) == 0;
-    if programmed && delay_timer_ack_irq().is_ok() {
-        TIMER_SHOTS_PROGRAMMED.fetch_add(1, Ordering::Relaxed);
+    if delay_timer_program(target, DELAY_TIMER_SOURCE_WATCHDOG) && delay_timer_ack_irq().is_ok() {
         WATCHDOG_NESTED_REARMS.fetch_add(1, Ordering::Relaxed);
-    } else if !programmed {
-        delay_timer_irq_fault(handler, u64::MAX - 1);
     }
 }
 
@@ -3131,15 +3114,8 @@ pub(crate) unsafe fn delay_timer_nested_ack() {
 }
 
 const DELAY_TIMER_IRQ: u64 = 2;
-/// Floor for how far ahead the userspace PIT one-shot may be armed, in 100ns units (1 ms).
-///
-/// This is a FLOOR, not the value used — see `DELAY_TIMER_ROUND_TRIP_100NS`. Arming the comparator
-/// closer than the system can actually service the resulting interrupt is a self-sustaining storm:
-/// the comparator is already passed by the time the handler acks, the level-triggered line
-/// re-asserts immediately, and the executive never reaches userspace to make progress. Measured
-/// with a TCG instruction-count plugin during such a storm: the kernel retired 169M instructions
-/// per second in `irq12_entry` -> `irq_dispatch` -> `notification::signal` while the guest retired
-/// ZERO. 1 ms is far below one service round trip under emulation.
+/// Minimum scheduling interval for the PIT one-shot, in 100ns units (1 ms).
+/// A cancelled/deferred notification is not evidence that this interval should grow.
 const DELAY_TIMER_MIN_ARM_100NS: u64 = 10_000;
 const DELAY_TIMER_SOURCE_DELAY_QUEUE: u64 = 1;
 const DELAY_TIMER_SOURCE_EVENT_WAIT: u64 = 2;
@@ -3174,49 +3150,6 @@ static mut NT_PERSISTENT_CLOCKS: nt_persistent_clock::ClockProviderRegistry =
 /// Like NT's KeBootTime, this moves by the same delta as a system-time adjustment so reported
 /// uptime remains invariant.
 static NT_SYSTEM_BOOT_TIME_100NS: AtomicI64 = AtomicI64::new(0);
-
-/// ADAPTIVE minimum arm distance, in 100ns units.
-///
-/// A fixed 1 ms was an assumption about how fast the machine services a timer interrupt, and it is
-/// wrong under emulation. When the comparator is armed closer than one service cycle, it has
-/// already been passed by the time the handler acks; the level-triggered line re-asserts
-/// immediately and the one-shot becomes a self-sustaining storm in which the executive never
-/// reaches userspace. A TCG instruction-count plugin measured exactly that: 169M kernel
-/// instructions per second in `irq12_entry` -> `irq_dispatch` -> `notification::signal`, with the
-/// guest retiring ZERO instructions for minutes at a time.
-///
-/// Rather than guess a bigger constant, grow the guard on the storm's own signature — a delivery
-/// that wakes NOTHING means the comparator was already passed — and never shrink it, because
-/// shrinking re-enters the storm. Geometric growth converges in a handful of deliveries.
-static DELAY_TIMER_ARM_GUARD_100NS: AtomicU64 = AtomicU64::new(DELAY_TIMER_MIN_ARM_100NS);
-/// Ceiling for the adaptive guard (500 ms): beyond this the timer is too coarse to be useful, and
-/// a guard this large already means something other than arm distance is wrong.
-const DELAY_TIMER_ARM_GUARD_CAP_100NS: u64 = 5_000_000;
-/// How many times the guard has been grown — reported in the census as boot evidence.
-static DELAY_TIMER_ARM_GUARD_GROWTHS: AtomicU64 = AtomicU64::new(0);
-
-/// A delivery that woke nothing: the comparator was passed before the handler could ack. Back off.
-fn delay_timer_widen_arm_guard() {
-    let mut seen = DELAY_TIMER_ARM_GUARD_100NS.load(Ordering::Relaxed);
-    loop {
-        if seen >= DELAY_TIMER_ARM_GUARD_CAP_100NS {
-            return;
-        }
-        let wider = seen.saturating_mul(2).min(DELAY_TIMER_ARM_GUARD_CAP_100NS);
-        match DELAY_TIMER_ARM_GUARD_100NS.compare_exchange_weak(
-            seen,
-            wider,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {
-                DELAY_TIMER_ARM_GUARD_GROWTHS.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            Err(observed) => seen = observed,
-        }
-    }
-}
 
 static HPET_PERIOD_FS: AtomicU64 = AtomicU64::new(0);
 static PLATFORM_TSC_FREQUENCY_HZ: AtomicU64 = AtomicU64::new(0);
@@ -6803,7 +6736,7 @@ fn delay_timer_disarm_spec(passed: &mut u64) {
     print_u64(idle_disarms);
     print_str(b" woke-nothing=");
     print_u64(spurious);
-    print_str(b" chunk-wakes=");
+    print_str(b" early/stale-wakes=");
     print_u64(TIMER_TICKS_EARLY_STALE.load(Ordering::Relaxed));
     print_str(b" past-deadline-rearms=");
     print_u64(past);
@@ -7376,8 +7309,6 @@ pub(crate) static LAST_REARM_SOURCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAST_REARM_TARGET: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAST_REARM_NOW: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAST_REARM_ARMED: AtomicU64 = AtomicU64::new(0);
-static LAST_REARM_WAKE_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
-static LAST_REARM_CHUNKED: AtomicBool = AtomicBool::new(false);
 /// ═══ PERIODIC CENSUS (batch 58) ══════════════════════════════════════════════════════════════
 ///
 /// [`print_progress_census`] only ever ran AFTER the loop quiesced — which is exactly the boot that
@@ -7570,9 +7501,7 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
         print_u64(outstanding);
     }
     print_str(b" armguard_us=");
-    print_u64(DELAY_TIMER_ARM_GUARD_100NS.load(Ordering::Relaxed) / 10);
-    print_str(b"/");
-    print_u64(DELAY_TIMER_ARM_GUARD_GROWTHS.load(Ordering::Relaxed));
+    print_u64(DELAY_TIMER_MIN_ARM_100NS / 10);
     print_str(b" delaywake=");
     print_u64(DELAY_WAKE_REPLY_TICKS.load(Ordering::Relaxed) / 1_000_000);
     print_str(b"reply/");
@@ -16817,65 +16746,69 @@ unsafe fn delay_timer_next_deadline(
     Some((deadline, source))
 }
 
-unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue, handler: &ExecNtHandler) {
+/// Program the shared source without borrowing runtime dispatcher state. IRQ acknowledgment is
+/// separate: initial programming has no delivered IRQ to acknowledge.
+unsafe fn delay_timer_program(deadline: u64, source: u64) -> bool {
     let timer_handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
     if timer_handler == 0
+        || DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) != DELAY_TIMER_IRQ_ACTIVE
+    {
+        return false;
+    }
+    let now = monotonic_time_100ns();
+    if deadline <= now {
+        TIMER_PAST_DEADLINE_REARMS.fetch_add(1, Ordering::Relaxed);
+        TIMER_PAST_DEADLINE_SOURCE.store(source, Ordering::Relaxed);
+    }
+    let shot = nt_kernel_exec::pit_oneshot_for_deadline(now, deadline, DELAY_TIMER_MIN_ARM_100NS);
+    let ioport = DELAY_TIMER_IOPORT.load(Ordering::Relaxed);
+    if ioport == 0
+        || shot.program(|port, value| {
+            let error = io_out8(ioport, port, value);
+            if error == 0 { Ok(()) } else { Err(error) }
+        }).is_err()
+    {
+        delay_timer_irq_fault(timer_handler, u64::MAX - 1);
+        return false;
+    }
+    LAST_REARM_DEADLINE.store(deadline, Ordering::Relaxed);
+    LAST_REARM_SOURCE.store(source, Ordering::Relaxed);
+    LAST_REARM_TARGET.store(shot.wake_deadline_100ns, Ordering::Relaxed);
+    LAST_REARM_NOW.store(now, Ordering::Relaxed);
+    LAST_REARM_ARMED.store(1, Ordering::Release);
+    TIMER_SHOTS_PROGRAMMED.fetch_add(1, Ordering::Relaxed);
+    if source == DELAY_TIMER_SOURCE_IO_COMPLETION
+        && DELAY_TIMER_REARM_TRACE_N.fetch_add(1, Ordering::Relaxed) < 16
+    {
+        let completion_waiters = &*core::ptr::addr_of!(IO_COMPLETION_WAITERS);
+        print_str(b"[delay-rearm] source=iocp deadline=");
+        print_u64(deadline);
+        print_str(b" now100=");
+        print_u64(now);
+        print_str(b" pit-wake=");
+        print_u64(shot.wake_deadline_100ns);
+        print_str(b" ticks=");
+        print_u64(shot.ticks as u64);
+        print_str(b" waiters=");
+        print_u64(completion_waiters.len() as u64);
+        print_str(b"\n");
+    }
+    true
+}
+
+unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue, handler: &ExecNtHandler) {
+    if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
         || DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) != DELAY_TIMER_IRQ_ACTIVE
     {
         return;
     }
     if let Some((deadline, source)) = delay_timer_next_deadline(queue, handler) {
-        let now = monotonic_time_100ns();
-        if deadline <= now {
-            TIMER_PAST_DEADLINE_REARMS.fetch_add(1, Ordering::Relaxed);
-            TIMER_PAST_DEADLINE_SOURCE.store(source, Ordering::Relaxed);
-        }
-        let shot = nt_kernel_exec::pit_oneshot_for_deadline(
-            now,
-            deadline,
-            DELAY_TIMER_ARM_GUARD_100NS.load(Ordering::Relaxed),
-        );
-        LAST_REARM_DEADLINE.store(deadline, Ordering::Relaxed);
-        LAST_REARM_SOURCE.store(source, Ordering::Relaxed);
-        LAST_REARM_TARGET.store(shot.wake_deadline_100ns, Ordering::Relaxed);
-        LAST_REARM_NOW.store(now, Ordering::Relaxed);
-        LAST_REARM_ARMED.store(1, Ordering::Relaxed);
-        LAST_REARM_WAKE_DEADLINE.store(shot.wake_deadline_100ns, Ordering::Relaxed);
-        LAST_REARM_CHUNKED.store(shot.chunked, Ordering::Relaxed);
-        if source == DELAY_TIMER_SOURCE_IO_COMPLETION {
-            let trace = DELAY_TIMER_REARM_TRACE_N.fetch_add(1, Ordering::Relaxed);
-            if trace < 16 {
-                let completion_waiters = &*core::ptr::addr_of!(IO_COMPLETION_WAITERS);
-                print_str(b"[delay-rearm] source=iocp deadline=");
-                print_u64(deadline);
-                print_str(b" now100=");
-                print_u64(now);
-                print_str(b" pit-wake=");
-                print_u64(shot.wake_deadline_100ns);
-                print_str(b" ticks=");
-                print_u64(shot.ticks as u64);
-                print_str(b" waiters=");
-                print_u64(completion_waiters.len() as u64);
-                print_str(b"\n");
-            }
-        }
-        let ioport = DELAY_TIMER_IOPORT.load(Ordering::Relaxed);
-        if ioport == 0
-            || io_out8(ioport, PIT_COMMAND_PORT, PIT_CHANNEL0_ONE_SHOT_LO_HI) != 0
-            || io_out8(ioport, PIT_CHANNEL0_PORT, shot.reload as u8) != 0
-            || io_out8(ioport, PIT_CHANNEL0_PORT, (shot.reload >> 8) as u8) != 0
-        {
-            delay_timer_irq_fault(timer_handler, u64::MAX - 1);
-        } else {
-            TIMER_SHOTS_PROGRAMMED.fetch_add(1, Ordering::Relaxed);
-        }
+        let _ = delay_timer_program(deadline, source);
     } else {
         // Channel 0 is in hardware one-shot mode and therefore already stopped after its delivery.
         // A cancelled outstanding shot may still produce one bounded notification; the handler
         // acknowledges it without programming another shot.
         LAST_REARM_ARMED.store(0, Ordering::Relaxed);
-        LAST_REARM_WAKE_DEADLINE.store(u64::MAX, Ordering::Relaxed);
-        LAST_REARM_CHUNKED.store(false, Ordering::Relaxed);
         TIMER_IDLE_DISARMS.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -17311,24 +17244,17 @@ unsafe fn delay_timer_interrupt(
     queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) {
-    // The PIT is a hardware one-shot, so every notification corresponds to at most one programmed
-    // interval. Long NT waits are split into representable chunks; only the final chunk may advance
-    // the effective time to the original deadline.
-    let wake_deadline = LAST_REARM_WAKE_DEADLINE.load(Ordering::Relaxed);
-    let chunked = LAST_REARM_CHUNKED.swap(false, Ordering::Relaxed);
-    let sampled_now = monotonic_time_100ns();
-    let now_100ns = if wake_deadline == u64::MAX {
-        sampled_now
-    } else {
-        sampled_now.max(wake_deadline)
-    };
+    // Notifications may be coalesced, cancelled or deferred past another rearm. They request
+    // a scan, never advance the clock or consume metadata belonging to a newer shot.
+    let now_100ns = monotonic_time_100ns();
+    let early_or_stale = delay_timer_next_deadline(queue, handler)
+        .is_none_or(|(deadline, _)| deadline > now_100ns);
     let woken = delay_timer_drain_due_work(queue, handler, now_100ns);
     teardown_pending_job_time_terminations(queue, handler);
     TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
-    if chunked {
+    if woken == 0 && early_or_stale {
         TIMER_TICKS_EARLY_STALE.fetch_add(1, Ordering::Relaxed);
     } else if woken == 0 {
-        delay_timer_widen_arm_guard();
         let n = TIMER_TICKS_SPURIOUS.fetch_add(1, Ordering::Relaxed);
         if n < 10 {
             print_str(b"[timer-spurious] #");
