@@ -35713,6 +35713,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Independent review found no ownership, dependency or source-precedence issues.
         Review adjustment: bootstrap collection is now available; complete applicable global
         servicing and borrow-safe rearm ownership still must precede blocking admission.
+      - [x] Preserve the complete clock snapshot through runtime timer servicing (2026-09-17).
+        Runtime delivery and overdue scans now pass their original TimeSnapshot through delay,
+        object, keyed-wait/release, IOCP, user-timer, hosted-driver and provider scans. The immediate
+        delay-admission scan also retains its already-sampled clock. Removed helper-local clock
+        reconstruction; monotonic-only watchdog/job/retry/resume/DPC owners use the snapshot's
+        monotonic field. Work ordering, IRQ ownership and fresh post-pass rearming are unchanged.
+        Previously, a reentrant system-time adjustment could project the old monotonic sample
+        against a new system-time anchor partway through a pass. Elapsed IPC alone does not
+        cause this mismatch. This is a consistency correction, not an established boot cause.
+        A shared delay/provider-timer composition regression changes AdjustableClock forward and
+        backward between source scans, verifies both use the saved generation, then services
+        remaining work using the next fresh snapshot without duplicate completion.
+        All 1,363 host tests pass across 24 suites (.tmp/test-timer-pass-snapshot-20260917.log).
+        Executive release passes in 36.54s with 294 warnings; I/O Manager release also passes.
+        Evidence: .tmp/build-timer-pass-snapshot-20260917.log and
+        .tmp/build-timer-pass-snapshot-io-manager-20260917.log. No QEMU rerun; the recorded
+        strict 27-export win32k rejection remains unresolved.
+        Independent review found no missed callers or changed work ordering. Shared composition
+        coverage does not exercise native IPC or prove desktop boot.
+        Review adjustment: keep this snapshot contract when extending bootstrap global servicing;
+        the collection-only bootstrap adapter still does not authorize full rearm or admission.
+        Remaining ownership audit: delay/object/keyed/IOCP admission currently requires runtime;
+        leave their canonical collector entries intact rather than assuming permanent absence.
+        Bootstrap still needs ACPI/DPC due observations, watchdog accounting and a genuine
+        selected-continuation wake owner. ACPI acknowledgement belongs to its outer I/O pump,
+        DPC execution to the retained scheduler, and runtime-only resume demand is not a
+        replacement for bootstrap execution ownership. Do not consume shared ticks yet.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

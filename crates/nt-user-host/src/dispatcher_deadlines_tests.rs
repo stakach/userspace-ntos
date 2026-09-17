@@ -98,6 +98,38 @@ fn absolute_targets_share_the_supplied_clock_snapshot() {
 }
 
 #[test]
+fn a_timer_pass_keeps_its_snapshot_when_the_system_clock_changes_between_sources() {
+    for (initial, changed, due) in [(1_000, 4_000, false), (4_000, 1_000, true)] {
+        let mut clock = nt_time::AdjustableClock::new(10, initial);
+        let sampled = clock.snapshot(10);
+        let mut queue = queue(Deadline::from_nt_timeout(Some(2_000), sampled));
+        let mut timers = timers(2_000);
+        let collected = DispatcherDeadlines::collect(&queue, Some(&timers), sampled);
+        let delay = queue.pop_due(sampled);
+
+        // A nested service adjusts system time after one source has already been scanned.
+        clock.set_system_time(20, changed).unwrap();
+        let expiry = timers.expire_next_due(sampled);
+        assert_eq!(delay.is_some(), due);
+        assert_eq!(expiry.is_some(), due);
+        assert_eq!(collected.delay.is_some_and(|target| target <= 10), due);
+        assert_eq!(
+            collected.provider_timer.is_some_and(|target| target <= 10),
+            due
+        );
+
+        let fresh = clock.snapshot(20);
+        assert_ne!(fresh.clock_generation, sampled.clock_generation);
+        if !due {
+            assert!(queue.pop_due(fresh).is_some());
+            assert!(timers.expire_next_due(fresh).is_some());
+        }
+        assert!(queue.pop_due(fresh).is_none());
+        assert!(timers.expire_next_due(fresh).is_none());
+    }
+}
+
+#[test]
 fn infinite_wait_and_absent_or_cancelled_timer_have_no_target() {
     let queue = queue(Deadline::Infinite);
     let expected = DispatcherDeadlines {

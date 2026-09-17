@@ -16804,7 +16804,7 @@ unsafe fn delay_park(
     thread_wait_state_mark_badge_waiting(handler, badge);
     let now = nt_time_snapshot();
     if deadline.is_due(now) {
-        let _ = delay_wake_due(handler, queue, now.monotonic_100ns);
+        let _ = delay_wake_due(handler, queue, now);
     }
     let _ = delay_timer_rearm_and_drain_overdue(queue, handler);
     true
@@ -16813,10 +16813,9 @@ unsafe fn delay_park(
 unsafe fn delay_wake_due(
     handler: &mut ExecNtHandler,
     queue: &mut nt_delay_execution::Queue,
-    now: u64,
+    now: nt_time::TimeSnapshot,
 ) -> u64 {
     let mut woken = 0;
-    let now = nt_time_snapshot_at(now);
     while let Some(waiter) = queue.pop_due(now) {
         let other_started = disk_census_ticks();
         DELAY_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -16838,11 +16837,10 @@ unsafe fn delay_wake_due(
     woken
 }
 
-unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
+unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler, now: nt_time::TimeSnapshot) -> u64 {
     let mut woken = 0;
-    let now_snapshot = nt_time_snapshot_at(now);
     while let Some(waiter) =
-        unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_due(now_snapshot) }
+        unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_due(now) }
     {
         let trace = IO_COMPLETION_TIMEOUT_TRACE_N.fetch_add(1, Ordering::Relaxed);
         if trace < 32 {
@@ -16858,11 +16856,11 @@ unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
             print_u64(
                 waiter
                     .deadline
-                    .monotonic_target(now_snapshot)
+                    .monotonic_target(now)
                     .unwrap_or(u64::MAX),
             );
             print_str(b" now=");
-            print_u64(now);
+            print_u64(now.monotonic_100ns);
             print_str(b"\n");
         }
         reply_parked_syscall(
@@ -16878,8 +16876,8 @@ unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     woken
 }
 
-unsafe fn user_timer_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
-    let fired = handler.user_timer_fire_due(nt_time_snapshot_at(now));
+unsafe fn user_timer_wake_due(handler: &mut ExecNtHandler, now: nt_time::TimeSnapshot) -> u64 {
+    let fired = handler.user_timer_fire_due(now);
     if fired != 0 {
         let woken = wait_wake_dispatcher_set(handler);
         USER_TIMER_FIRED_COUNT.fetch_add(fired, Ordering::Relaxed);
@@ -16903,19 +16901,22 @@ unsafe fn timer_hosted_driver_wake_due(now: nt_time::TimeSnapshot) -> u64 {
         + subdrain!(7, driver_launch::hosted_driver_wait_wake_due(now))
 }
 
+/// Every source uses the scan's clock generation, even if hosted IPC adjusts system time.
+/// A subsequent scan/rearm samples the new clock rather than mixing anchors within this pass.
 unsafe fn delay_timer_drain_due_work(
     queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
-    now_100ns: u64,
+    now: nt_time::TimeSnapshot,
 ) -> u64 {
+    let now_100ns = now.monotonic_100ns;
     let watchdog_tick = subdrain!(8, watchdog_take_timer_work(now_100ns));
-    subdrain!(0, delay_wake_due(handler, queue, now_100ns))
-        + subdrain!(1, wait_wake_due(handler, now_100ns))
-        + subdrain!(2, keyed_wait_wake_due(handler, now_100ns))
-        + subdrain!(3, keyed_release_wait_wake_due(handler, now_100ns))
-        + subdrain!(4, io_completion_wake_due(handler, now_100ns))
-        + subdrain!(5, user_timer_wake_due(handler, now_100ns))
-        + timer_hosted_driver_wake_due(nt_time_snapshot_at(now_100ns))
+    subdrain!(0, delay_wake_due(handler, queue, now))
+        + subdrain!(1, wait_wake_due(handler, now))
+        + subdrain!(2, keyed_wait_wake_due(handler, now))
+        + subdrain!(3, keyed_release_wait_wake_due(handler, now))
+        + subdrain!(4, io_completion_wake_due(handler, now))
+        + subdrain!(5, user_timer_wake_due(handler, now))
+        + timer_hosted_driver_wake_due(now)
         + subdrain!(9, handler.job_time_sample_due(now_100ns))
         + subdrain!(
             10,
@@ -16925,12 +16926,12 @@ unsafe fn delay_timer_drain_due_work(
             11,
             crate::service_sec_image::provider_wait_select_due(
                 &mut handler.dispatcher_objects(None),
-                nt_time_snapshot_at(now_100ns),
+                now,
             )
         )
         + subdrain!(12, crate::service_sec_image::provider_timer_wake_due(
             handler,
-            nt_time_snapshot_at(now_100ns),
+            now,
         ))
         + timer_retry_wake_due(now_100ns)
         + service_sec_image::component_resume::wake_due(handler, now_100ns)
@@ -16971,7 +16972,7 @@ pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(
         before[slot] = SUBDRAIN_TICKS[slot].load(Ordering::Relaxed);
     }
     let work_started = disk_census_ticks();
-    let woken = delay_timer_drain_due_work(queue, handler, now_100ns);
+    let woken = delay_timer_drain_due_work(queue, handler, now);
     teardown_pending_job_time_terminations(queue, handler);
     let work_ticks = disk_census_ticks().wrapping_sub(work_started);
     DRAIN_WORK_TICKS.fetch_add(work_ticks, Ordering::Relaxed);
@@ -17229,7 +17230,7 @@ unsafe fn delay_timer_interrupt_claimed(
     let now_100ns = now.monotonic_100ns;
     let early_or_stale = delay_timer_next_deadline(queue, handler, now)
         .is_none_or(|(deadline, _)| deadline > now_100ns);
-    let woken = delay_timer_drain_due_work(queue, handler, now_100ns);
+    let woken = delay_timer_drain_due_work(queue, handler, now);
     teardown_pending_job_time_terminations(queue, handler);
     TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
     if woken == 0 && early_or_stale {
@@ -17653,9 +17654,8 @@ unsafe fn keyed_release_wake_one(handler: &mut ExecNtHandler, key: u64, status: 
     true
 }
 
-unsafe fn keyed_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
+unsafe fn keyed_wait_wake_due(handler: &mut ExecNtHandler, now: nt_time::TimeSnapshot) -> u64 {
     let mut woken = 0;
-    let now = nt_time_snapshot_at(now);
     for slot in 0..keyed_waiter_len() {
         let Some(record) = keyed_waiter_record(slot) else {
             continue;
@@ -17675,9 +17675,8 @@ unsafe fn keyed_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     woken
 }
 
-unsafe fn keyed_release_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
+unsafe fn keyed_release_wait_wake_due(handler: &mut ExecNtHandler, now: nt_time::TimeSnapshot) -> u64 {
     let mut woken = 0;
-    let now = nt_time_snapshot_at(now);
     for slot in 0..keyed_release_waiter_len() {
         let Some(record) = keyed_release_waiter_record(slot) else {
             continue;
@@ -18660,8 +18659,7 @@ unsafe fn object_waiter_select_event_consumer(
     record.sequence == expected_sequence && object_waiter_select_ready(handler, identity, record)
 }
 
-unsafe fn wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
-    let now = nt_time_snapshot_at(now);
+unsafe fn wait_wake_due(handler: &mut ExecNtHandler, now: nt_time::TimeSnapshot) -> u64 {
     for slot in 0..object_waiter_len() {
         let Some((identity, record)) = object_waiter_record(slot) else {
             continue;
