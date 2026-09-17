@@ -35740,6 +35740,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         selected-continuation wake owner. ACPI acknowledgement belongs to its outer I/O pump,
         DPC execution to the retained scheduler, and runtime-only resume demand is not a
         replacement for bootstrap execution ownership. Do not consume shared ticks yet.
+      - [x] Observe deferred ACPI and DPC demand in bootstrap timer scans (2026-09-17).
+        The retained scheduler now includes ACPI recovery and DPC due observations after hosted
+        timer IPC and the provider/retry scan, using the same snapshot. Only then does it record
+        the original pending notification count. Neither observation acknowledges an IRP, claims
+        a DPC pass, executes a driver, consumes shared ticks or authorizes hardware rearming.
+        The dedicated IRQ ACK hook remains unchanged. Actual ACPI acknowledgement stays in the
+        outer hosted-I/O pump; DPC execution stays in the retained component scheduler.
+        A shared regression repeatedly observes a refused DPC's paced wake before and after its
+        deadline, then verifies the exact activation and arguments remain intact for one outer
+        completion without its retry deadline being restarted or acknowledged by observation.
+        All 2,221 host tests pass across 56 suites, including I/O Manager retained-completion
+        observation coverage (.tmp/test-bootstrap-deferred-owners-20260917.log). These are shared
+        contracts, not native timer/IPC integration or desktop proof.
+        Executive release passes in 37.17s with 294 warnings; I/O Manager release also passes.
+        Evidence: .tmp/build-bootstrap-deferred-owners-20260917.log and
+        .tmp/build-bootstrap-deferred-owners-io-manager-20260917.log. No QEMU rerun; the strict
+        27-export win32k rejection remains the recorded boot boundary.
+        Independent source review found no ownership or ordering issues.
+        Review correction: watchdog_arm is called only after runtime construction and genuine
+        desktop paint, so bootstrap currently has no watchdog work to consume. Normal delay,
+        object, keyed and IOCP waits likewise require runtime admission. Keep their canonical
+        collector entries and shared notification retention rather than hardcoding absence.
+        New rearm prerequisite: ACPI recovery retains its overdue deadline until the outer pump
+        acknowledges completion. That pump cannot run inside ComponentSchedulerScope. Repeatedly
+        programming the unchanged due target would cause minimum-interval timer churn. Establish
+        retained readiness and an owner-safe finalization boundary before full bootstrap rearm;
+        neither silently omitting that deadline nor acknowledging it in a timer scan is valid.
+        First-arm admission is also still missing: current timer initialization callers require
+        runtime registration. A bootstrap pre-receive owner must initialize and arm on canonical
+        demand with all dispatcher references released; servicing already-received ticks alone
+        cannot provide the first notification. Keep finite DriverEntry waits disabled meanwhile.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

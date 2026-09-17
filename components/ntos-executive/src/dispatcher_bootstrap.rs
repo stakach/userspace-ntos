@@ -46,8 +46,12 @@ pub(crate) unsafe fn service_hosted_timer_work() -> u64 {
     let work = timer_hosted_driver_wake_due(now);
     let provider_work = scan_owned_timer_work(now)
         .expect("bootstrap timer selection lost its canonical continuation");
+    // Observe retained demand only. ACPI acknowledgement and DPC execution have outer owners.
+    let deferred_work = driver_launch::hosted_acpi_pci_route_recovery_wake_due(now.monotonic_100ns)
+        .saturating_add(driver_launch::hosted_dpc_wake_due(now.monotonic_100ns));
     (&mut *core::ptr::addr_of_mut!(HOSTED_TIMER_PROGRESS)).record_scan(pending);
     work.saturating_add(provider_work)
+        .saturating_add(deferred_work)
 }
 
 /// Scan only while this phase owns the stores. The pending notification still belongs to the
