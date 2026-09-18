@@ -8381,6 +8381,7 @@ pub(crate) unsafe fn service_sec_image(
         }
         if pending_driver_start_redrive_needed(&nt_handler)
             || driver_launch::hosted_driver_dpc_activation_pending()
+            || driver_launch::hosted_acpi_pci_route_recovery_ready()
         {
             let _ = pump_hosted_io_and_redrive_driver_starts(
                 driver_launch::drain_hosted_driver_dpcs(),

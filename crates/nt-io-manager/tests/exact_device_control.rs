@@ -52,6 +52,48 @@ fn observing_retained_completion_does_not_acknowledge_or_replay_the_request() {
     assert!(f.io.irp(irp_id).is_none());
 }
 
+#[test]
+fn deferred_ack_readiness_retains_the_exact_irp_through_refusal() {
+    let mut f = Fixture::new();
+    f.lower_state.borrow_mut().pending = true;
+    let mut output = [0xa5; CAPACITY];
+    let ExternalDispatchResult::Pending { irp_id } = f
+        .dispatch(false, true, f.lower, ioctl::METHOD_BUFFERED, &mut output)
+        .unwrap()
+    else {
+        panic!("expected retained control request");
+    };
+    assert_eq!(f.io.pump(), 1);
+    let mut wake = nt_time::DeferredWorkWake::new(100);
+    assert!(wake.wake_due(100));
+    for now in 100..110 {
+        assert!(!wake.wake_due(now));
+        assert_eq!(wake.next_deadline(now, false), None);
+        assert_eq!(f.io.completed_irp(irp_id).unwrap().id, irp_id);
+        assert_eq!(f.lower_state.borrow().acknowledgements, 0);
+    }
+    assert_eq!(wake.next_deadline(110, true), Some(110));
+    assert!(wake.claim());
+    assert!(!wake.claim());
+    assert!(!wake.wake_due(120));
+    f.lower_state.borrow_mut().refuse_ack = true;
+    assert_eq!(
+        f.io.acknowledge_completed_irp_strict(irp_id).unwrap_err(),
+        NtStatus::UNSUCCESSFUL
+    );
+    assert!(wake.retry_at(200));
+    assert!(!wake.wake_due(199));
+    assert_eq!(wake.next_deadline(199, true), Some(200));
+    assert_eq!(f.io.completed_irp(irp_id).unwrap().id, irp_id);
+    assert!(wake.wake_due(200));
+    assert!(wake.claim());
+    f.lower_state.borrow_mut().refuse_ack = false;
+    f.io.acknowledge_completed_irp_strict(irp_id).unwrap();
+    assert!(f.io.irp(irp_id).is_none());
+    assert_eq!(f.lower_state.borrow().acknowledgements, 2);
+    assert_eq!(f.lower_state.borrow().calls.len(), 1);
+}
+
 struct Observation {
     irp: IrpProjection,
     system: Vec<u8>,

@@ -35771,6 +35771,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         runtime registration. A bootstrap pre-receive owner must initialize and arm on canonical
         demand with all dispatcher references released; servicing already-received ticks alone
         cannot provide the first notification. Keep finite DriverEntry waits disabled meanwhile.
+      - [x] Retain ACPI recovery readiness without repeatedly arming blocked work (2026-09-19).
+        Shared DeferredWorkWake tracks Waiting, Ready and Running scheduling state. Timer scans
+        publish Ready once without acknowledging the IRP. Waiting contributes its retry deadline;
+        Ready contributes an immediate scheduler wake only when the outer owner can run; Running
+        cannot be relatched or claimed again. The enclosing record retains exact IRP/topology
+        ownership throughout. This replaces the ACPI record's always-overdue raw deadline.
+        Native timer accounting counts newly published readiness or eligible retained Ready
+        demand, not completed ACKs; a rescheduled Ready wake is not mislabeled spurious.
+        Recovery now uses a non-reentrant outer drain and a reverse initial-count pass. Claims
+        precede ACK IPC, no table reference crosses IPC, and return processing re-finds the exact
+        IRP. Successful ACK alone removes the record and releases its topology barrier. Refusal
+        retains ownership and sets exponential backoff from completion time. Newly appended rows
+        survive for a later pass; reverse traversal keeps unvisited original indices stable.
+        The runtime outer-pump condition includes Ready recovery records. All three pre-receive
+        barriers already call component_resume::reconcile, which now includes ACPI demand before
+        its no-work return. This covers readiness created during ACK or later hosted-I/O stages.
+        Removed both ACPI-specific registered-handler rearm calls: those could alias a caller's
+        live mutable handler. Scheduling instead occurs at the canonical outer barrier using
+        the live handler. Recovery cannot run inside an active component scheduler or drain.
+        Four shared state tests cover blocked-owner retention, exact claim exclusion, refusal
+        backoff, new demand during execution and saturated deadlines. An I/O Manager composition
+        test verifies strict ACK refusal retains the exact IRP and does not replay dispatch.
+        All 1,377 host tests pass across 25 suites (.tmp/test-acpi-ready-core-20260919.log and
+        .tmp/test-acpi-ready-io-20260919.log). Native reverse-pass and reentrant IPC behavior
+        remain source-reviewed rather than host-integration-tested.
+        Executive release passes in 35.37s with 294 warnings; I/O Manager release passes in
+        3.14s. Evidence: .tmp/build-acpi-ready-20260919.log and
+        .tmp/build-acpi-ready-io-manager-20260919.log. Independent review found no blocking
+        issue. No QEMU rerun; the strict 27-export win32k rejection remains the recorded boundary.
+        Review adjustment: the runtime guarantee begins when control returns to the outer loop;
+        it does not unblock nonreturning nested IPC. Bootstrap first-arm, full rearm and selected
+        continuation execution remain open. No new DriverEntry wait admission is enabled.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

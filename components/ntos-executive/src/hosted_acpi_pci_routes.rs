@@ -159,12 +159,34 @@ struct HostedAcpiPciRouteIndeterminateIrp {
     inventory_generation: u64,
     route_owner_generation: u64,
     failure_count: u8,
-    next_retry_deadline: u64,
+    wake: nt_time::DeferredWorkWake,
 }
 
 static mut HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS: Option<
     Vec<HostedAcpiPciRouteIndeterminateIrp>,
 > = None;
+
+static ACPI_RECOVERY_DRAIN_ACTIVE: AtomicU64 = AtomicU64::new(0);
+
+struct AcpiRecoveryDrainGuard;
+
+impl AcpiRecoveryDrainGuard {
+    fn enter() -> Option<Self> {
+        if component_scheduler::is_active() {
+            return None;
+        }
+        ACPI_RECOVERY_DRAIN_ACTIVE
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for AcpiRecoveryDrainGuard {
+    fn drop(&mut self) {
+        ACPI_RECOVERY_DRAIN_ACTIVE.store(0, Ordering::Release);
+    }
+}
 
 unsafe fn hosted_acpi_route_request_input_is(irp_id: IrpId, input: &[u8]) -> bool {
     io_manager_mut()
@@ -318,14 +340,14 @@ unsafe fn retain_hosted_acpi_pci_route_indeterminate_irp(
         inventory_generation: query.inventory_generation,
         route_owner_generation: query.route_owner_generation,
         failure_count: 1,
-        next_retry_deadline: crate::monotonic_time_100ns(),
+        wake: nt_time::DeferredWorkWake::new(crate::monotonic_time_100ns()),
     };
     let records = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
         .as_mut()
         .expect("ACPI PCI route indeterminate storage was not reserved");
     assert!(records.len() < records.capacity());
     records.push(retained);
-    let _ = crate::service_sec_image::rearm_registered_delay_timer();
+    // The outer receive barrier schedules this demand using its live handler borrow.
     print_str(b"[pci-route] indeterminate irp/status=");
     print_u64(retained.irp_id.raw());
     print_str(b"/");
@@ -364,67 +386,115 @@ unsafe fn hosted_acpi_pci_route_transport_is_indeterminate() -> bool {
         .is_some_and(|records| !records.is_empty())
 }
 
-pub(crate) fn hosted_acpi_pci_route_recovery_next_deadline() -> Option<u64> {
+pub(crate) fn hosted_acpi_pci_route_recovery_next_deadline(now: u64) -> Option<u64> {
+    let eligible = !component_scheduler::is_active()
+        && ACPI_RECOVERY_DRAIN_ACTIVE.load(Ordering::Acquire) == 0;
     unsafe {
         (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
             .as_ref()?
             .iter()
-            .map(|record| record.next_retry_deadline)
+            .filter_map(|record| record.wake.next_deadline(now, eligible))
             .min()
     }
 }
 
-/// Timer scans observe retained recovery demand; only the hosted-I/O pump acknowledges IRPs.
+pub(crate) fn hosted_acpi_pci_route_recovery_ready() -> bool {
+    unsafe {
+        (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
+            .as_ref()
+            .is_some_and(|records| records.iter().any(|record| record.wake.is_ready()))
+    }
+}
+
+/// Timer scans latch readiness; only the outer hosted-I/O pump claims and acknowledges IRPs.
 pub(crate) fn hosted_acpi_pci_route_recovery_wake_due(now_100ns: u64) -> u64 {
-    u64::from(hosted_acpi_pci_route_recovery_next_deadline().is_some_and(|due| due <= now_100ns))
+    let eligible = !component_scheduler::is_active()
+        && ACPI_RECOVERY_DRAIN_ACTIVE.load(Ordering::Acquire) == 0;
+    unsafe {
+        let Some(records) =
+            (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS)).as_mut()
+        else {
+            return 0;
+        };
+        records
+            .iter_mut()
+            .map(|record| {
+                let published = record.wake.wake_due(now_100ns);
+                // An eligible retained Ready wake is scheduler demand, not a spurious IRQ.
+                u64::from(published || (eligible && record.wake.is_ready()))
+            })
+            .sum()
+    }
 }
 
 unsafe fn drain_hosted_acpi_pci_route_indeterminate_irps() -> usize {
-    let now_100ns = crate::monotonic_time_100ns();
-    let due = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
-        .as_ref()
-        .and_then(|records| {
-            records
-                .iter()
-                .enumerate()
-                .filter(|(_, record)| record.next_retry_deadline <= now_100ns)
-                .min_by_key(|(_, record)| record.next_retry_deadline)
-                .map(|(index, record)| (index, *record))
-        });
-    let Some((index, retained)) = due else {
+    let Some(drain) = AcpiRecoveryDrainGuard::enter() else {
         return 0;
     };
-    match io_manager_mut().acknowledge_completed_irp_strict(retained.irp_id) {
-        Ok(_) => {
-            let records = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
-                .as_mut()
-                .expect("ACPI PCI route recovery storage disappeared");
-            assert_eq!(records[index].irp_id, retained.irp_id);
-            records.remove(index);
-            print_str(b"[pci-route] recovered completion acknowledgement irp=");
-            print_u64(retained.irp_id.raw());
-            print_str(b"\n");
-            crate::hosted_pci_topology::recover_hosted_pci_route_reconciliation_block(
-                retained.catalog_generation,
-                retained.inventory_generation,
-                retained.route_owner_generation,
-            )
-            .expect("recovered ACPI PCI route completion lost its topology authority");
-        }
-        Err(status) => {
+    let count = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
+        .as_ref()
+        .map_or(0, Vec::len);
+    hosted_acpi_pci_route_recovery_wake_due(crate::monotonic_time_100ns());
+    let mut attempted = 0;
+    // Nested ACK IPC may append records but cannot reenter this drain. Reverse traversal keeps
+    // original lower indices stable after removal and attempts each original row at most once.
+    for index in (0..count).rev() {
+        let retained = {
             let record = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
                 .as_mut()
                 .and_then(|records| records.get_mut(index))
-                .expect("ACPI PCI route recovery record disappeared");
-            assert_eq!(record.irp_id, retained.irp_id);
-            record.status = status;
-            record.failure_count = record.failure_count.saturating_add(1);
-            let delay_100ns = 10_000u64 << u32::from(record.failure_count.min(10));
-            record.next_retry_deadline = now_100ns.saturating_add(delay_100ns);
-            crate::service_sec_image::rearm_registered_active_delay_timer();
+                .expect("ACPI recovery snapshot lost its record");
+            if !record.wake.claim() {
+                continue;
+            }
+            *record
+        };
+        let outcome = io_manager_mut().acknowledge_completed_irp_strict(retained.irp_id);
+        let index = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
+            .as_ref()
+            .and_then(|records| {
+                records
+                    .iter()
+                    .position(|record| record.irp_id == retained.irp_id)
+            })
+            .expect("ACPI recovery attempt lost its exact IRP");
+        match outcome {
+            Ok(_) => {
+                let records = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
+                    .as_mut()
+                    .expect("ACPI PCI route recovery storage disappeared");
+                assert_eq!(records[index].irp_id, retained.irp_id);
+                records.remove(index);
+                print_str(b"[pci-route] recovered completion acknowledgement irp=");
+                print_u64(retained.irp_id.raw());
+                print_str(b"\n");
+                crate::hosted_pci_topology::recover_hosted_pci_route_reconciliation_block(
+                    retained.catalog_generation,
+                    retained.inventory_generation,
+                    retained.route_owner_generation,
+                )
+                .expect("recovered ACPI PCI route completion lost its topology authority");
+            }
+            Err(status) => {
+                let record = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
+                    .as_mut()
+                    .and_then(|records| records.get_mut(index))
+                    .expect("ACPI PCI route recovery record disappeared");
+                assert_eq!(record.irp_id, retained.irp_id);
+                record.status = status;
+                record.failure_count = record.failure_count.saturating_add(1);
+                let delay_100ns = 10_000u64 << u32::from(record.failure_count.min(10));
+                assert!(record
+                    .wake
+                    .retry_at(crate::monotonic_time_100ns().saturating_add(delay_100ns)));
+            }
         }
+        attempted += 1;
     }
-    1
+    drop(drain);
+    // Outer canonical reconcile includes rows appended or made ready during ACK IPC. Do not
+    // reacquire the registered handler here: the caller may still hold its live mutable borrow.
+    attempted
 }
 
 unsafe fn cancel_stale_hosted_acpi_pci_route_query() -> Result<bool, nt_status::NtStatus> {

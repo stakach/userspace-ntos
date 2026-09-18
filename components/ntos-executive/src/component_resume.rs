@@ -101,9 +101,11 @@ pub(super) unsafe fn reconcile(handler: &mut ExecNtHandler) {
         (&mut *core::ptr::addr_of_mut!(WAKE)).reconcile(has_work, monotonic_time_100ns());
     }
     let dpc_deadline = driver_launch::hosted_dpc_next_deadline(monotonic_time_100ns());
+    let acpi_deadline = driver_launch::hosted_acpi_pci_route_recovery_next_deadline(monotonic_time_100ns());
     if previous.is_none()
         && (&*core::ptr::addr_of!(WAKE)).next_deadline().is_none()
         && dpc_deadline.is_none()
+        && acpi_deadline.is_none()
     {
         return;
     }
