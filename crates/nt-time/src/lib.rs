@@ -6,6 +6,8 @@ mod delivery_gate;
 pub use delivery_gate::{DeferredTimerProgress, TimerDeliveryGate, TimerDeliveryGuard};
 mod deferred_work;
 pub use deferred_work::DeferredWorkWake;
+mod rearm_request;
+pub use rearm_request::{DeferredRearm, RearmRequest};
 
 /// Largest system time accepted by NT's clock-setting path.
 ///

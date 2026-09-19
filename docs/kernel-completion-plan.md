@@ -35803,6 +35803,42 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Review adjustment: the runtime guarantee begins when control returns to the outer loop;
         it does not unblock nonreturning nested IPC. Bootstrap first-arm, full rearm and selected
         continuation execution remain open. No new DriverEntry wait admission is enabled.
+      - [x] Admit bootstrap timer programming at retained receive checkpoints (2026-09-20).
+        Eligible bootstrap pumps publish a reconciliation request on initial entry and each
+        completed service reply, covering shared-page demand as well as explicit timer APIs.
+        Reply/Recv splits only in bootstrap: the exact reply is sent once and checked before a
+        scheduler yield; continuation remains receive-only. Send failure returns the existing
+        transport wall. Runtime-owned pumps keep their combined Reply/Recv behavior.
+        The retained scheduler scans applicable due work even without a prior IRQ, drains IRQ/DPC
+        effects, then requests a fresh reconciliation before receiving. The shared DeferredRearm
+        generation latch preserves requests published during nested effects; only a captured
+        successful-program/no-demand request is acknowledged. Shared timer ticks are not consumed.
+        Canonical collection precedes demand-driven IRQ initialization; a fresh post-init clock
+        snapshot and collection supply the actual target. No dispatcher or PM reference crosses
+        initialization/programming. Setup/programming failure fails closed rather than repeatedly
+        yielding or reporting successful admission. No LAST_REARM value becomes deadline authority.
+        All bootstrap entry points explicitly require Owned phase, including scans with a retained
+        rearm generation after transfer. Independent review caught and corrected that phase check.
+        The existing retained kernel receive path revalidates execution after scheduler effects.
+        Two shared tests cover generation publication during programming, duplicate completion,
+        refusal retention and exhaustion without wrap. All 1,370 host tests pass across 24 suites
+        (.tmp/test-bootstrap-first-arm-20260920.log). Executive release passes in 41.08s with
+        294 warnings; I/O Manager release passes in 4.28s. Build evidence:
+        .tmp/build-bootstrap-first-arm-20260920.log and
+        .tmp/build-bootstrap-first-arm-io-manager-20260920.log.
+        A fresh 120s-bounded QEMU run reaches the same strict 27-export win32k rejection, before
+        any component-scheduler checkpoint trace or timer initialization. The stopped VM was
+        terminated; run.sh exits 1. Evidence: .tmp/boot-bootstrap-first-arm-20260920.log and
+        .tmp/run-bootstrap-first-arm-20260920.log. This checks the earlier startup boundary,
+        not native first-arm execution, reply-split behavior, performance or desktop rendering.
+        Those native paths remain source-reviewed/build-checked, not transport-integration-tested.
+        Review adjustment: bootstrap first-arm is now connected for the existing IRQ-yield-capable
+        channels. Finite DriverEntry waits still require the missing selected-continuation/fan-in
+        owner; their registered-runtime admission is unchanged. Delivery consumption and the
+        runtime watchdog-only nested rearm exception remain open. This broad bootstrap checkpoint
+        adds scans and possible PIT writes per reply; measure its boot cost rather than assuming
+        it is performance-neutral. A future optimization needs canonical change/shot ownership,
+        not a last-programmed diagnostic cache or a hardcoded service/image allowlist.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

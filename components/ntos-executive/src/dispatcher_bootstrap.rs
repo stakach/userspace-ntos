@@ -17,6 +17,23 @@ enum BootstrapPhase {
 static mut BOOTSTRAP: BootstrapPhase = BootstrapPhase::Uninitialized;
 static mut HOSTED_TIMER_PROGRESS: nt_time::DeferredTimerProgress =
     nt_time::DeferredTimerProgress::new();
+static mut REARM: nt_time::DeferredRearm = nt_time::DeferredRearm::new();
+
+/// A completed service reply may publish demand through a shared page, not just a timer API.
+pub(crate) unsafe fn request_receive_checkpoint() -> bool {
+    if !matches!(&*core::ptr::addr_of!(BOOTSTRAP), BootstrapPhase::Owned(_)) {
+        return false;
+    }
+    assert!(
+        (&mut *core::ptr::addr_of_mut!(REARM)).request(),
+        "bootstrap rearm generation exhausted"
+    );
+    true
+}
+
+unsafe fn rearm_pending() -> bool {
+    (&*core::ptr::addr_of!(REARM)).pending().is_some()
+}
 
 unsafe fn pending_timer_snapshot() -> Option<u64> {
     if !matches!(&*core::ptr::addr_of!(BOOTSTRAP), BootstrapPhase::Owned(_)) {
@@ -30,18 +47,24 @@ unsafe fn pending_timer_snapshot() -> Option<u64> {
 
 /// Eligibility only: observing retained ticks neither consumes them nor authorizes rearming.
 pub(crate) unsafe fn timer_work_pending() -> bool {
-    !TIMER_DELIVERY_GATE.is_active() && pending_timer_snapshot().is_some()
+    !TIMER_DELIVERY_GATE.is_active()
+        && matches!(&*core::ptr::addr_of!(BOOTSTRAP), BootstrapPhase::Owned(_))
+        && (pending_timer_snapshot().is_some() || rearm_pending())
 }
 
 /// Called from the retained component scheduler, never the IRQ-lane ACK hook. Driver timer
 /// publication can perform IPC, so no bootstrap store reference may cross this call.
 pub(crate) unsafe fn service_hosted_timer_work() -> u64 {
+    if !matches!(&*core::ptr::addr_of!(BOOTSTRAP), BootstrapPhase::Owned(_)) {
+        return 0;
+    }
     let Some(_delivery) = TIMER_DELIVERY_GATE.try_enter() else {
         return 0;
     };
-    let Some(pending) = pending_timer_snapshot() else {
+    let pending = pending_timer_snapshot();
+    if pending.is_none() && !rearm_pending() {
         return 0;
-    };
+    }
     let now = nt_time_snapshot();
     let work = timer_hosted_driver_wake_due(now);
     let provider_work = scan_owned_timer_work(now)
@@ -49,7 +72,9 @@ pub(crate) unsafe fn service_hosted_timer_work() -> u64 {
     // Observe retained demand only. ACPI acknowledgement and DPC execution have outer owners.
     let deferred_work = driver_launch::hosted_acpi_pci_route_recovery_wake_due(now.monotonic_100ns)
         .saturating_add(driver_launch::hosted_dpc_wake_due(now.monotonic_100ns));
-    (&mut *core::ptr::addr_of_mut!(HOSTED_TIMER_PROGRESS)).record_scan(pending);
+    if let Some(pending) = pending {
+        (&mut *core::ptr::addr_of_mut!(HOSTED_TIMER_PROGRESS)).record_scan(pending);
+    }
     work.saturating_add(provider_work)
         .saturating_add(deferred_work)
 }
@@ -97,6 +122,10 @@ unsafe fn scan_owned_timer_work(
 pub(crate) unsafe fn next_deadline(now: nt_time::TimeSnapshot) -> Result<Option<(u64, u64)>, u32> {
     const STATUS_DEVICE_BUSY: u32 = 0x8000_0011;
     let _delivery = TIMER_DELIVERY_GATE.try_enter().ok_or(STATUS_DEVICE_BUSY)?;
+    collect_owned_deadline(now)
+}
+
+unsafe fn collect_owned_deadline(now: nt_time::TimeSnapshot) -> Result<Option<(u64, u64)>, u32> {
     let owner = {
         let BootstrapPhase::Owned(seed) = &*core::ptr::addr_of!(BOOTSTRAP) else {
             return Err(0xC000_00A3); // STATUS_DEVICE_NOT_READY, not an empty deadline set.
@@ -113,6 +142,36 @@ pub(crate) unsafe fn next_deadline(now: nt_time::TimeSnapshot) -> Result<Option<
         }
     };
     Ok(timer_deadline::next(now, owner))
+}
+
+/// Called only after the retained scheduler's effects, with no dispatcher/PM references alive.
+/// Pending ticks remain owned by the complete delivery owner; programming is not acknowledgment.
+pub(crate) unsafe fn prepare_receive() -> Result<(), u32> {
+    if !matches!(&*core::ptr::addr_of!(BOOTSTRAP), BootstrapPhase::Owned(_)) {
+        return Ok(());
+    }
+    let Some(_delivery) = TIMER_DELIVERY_GATE.try_enter() else {
+        return Ok(());
+    };
+    let Some(request) = (&*core::ptr::addr_of!(REARM)).pending() else {
+        return Ok(());
+    };
+    if collect_owned_deadline(nt_time_snapshot())?.is_some() {
+        if !delay_timer_init() {
+            return Err(0xC000_00A3);
+        }
+        // Initialization may switch clock sources or perform IPC. Do not reuse the old sample.
+        if let Some((deadline, source)) = collect_owned_deadline(nt_time_snapshot())? {
+            if !delay_timer_program(deadline, source) {
+                return Err(0xC000_0001);
+            }
+        }
+    }
+    assert!(
+        (&mut *core::ptr::addr_of_mut!(REARM)).complete(request),
+        "bootstrap rearm lost its request"
+    );
+    Ok(())
 }
 
 pub(crate) unsafe fn initialize() -> Result<(), u32> {

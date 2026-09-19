@@ -1852,6 +1852,16 @@ unsafe fn pump_reply_recv4(
     reply_r2: u64,
     reply_r3: u64,
 ) -> PumpMessage {
+    if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
+        && crate::dispatcher_bootstrap::request_receive_checkpoint()
+        && crate::dispatcher_bootstrap::timer_work_pending()
+    {
+        // The continuation is receive-only: publish the exact reply once before yielding.
+        if !pump_reply_on(reply_cap, reply_msginfo, reply_r0, reply_r1, reply_r2, reply_r3) {
+            return PumpMessage::transport_wall();
+        }
+        return PumpMessage::scheduler_yield();
+    }
     let badge: u64;
     let mi: u64;
     let m0: u64;
@@ -2295,6 +2305,9 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
 /// On a COMPLETED dispatch (server re-parked) the pump bumps [`HARNESS_IRP_DISPATCHES`] /
 /// [`HARNESS_SYSCALL_DISPATCHES`] per `caps.kind` — the durable proof the traffic is on the harness.
 pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
+    if ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield {
+        crate::dispatcher_bootstrap::request_receive_checkpoint();
+    }
     component_pump_inner(ch, PumpResume::None)
 }
 

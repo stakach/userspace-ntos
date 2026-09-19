@@ -28,11 +28,16 @@ impl ComponentSchedulerScope {
         let _message = crate::ipc_message::SavedMessageBuffer::capture();
         let _durable = crate::allocator::enter_durable();
         let yield_number = YIELDS.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::dispatcher_bootstrap::request_receive_checkpoint();
         let timer_work = crate::dispatcher_bootstrap::service_hosted_timer_work();
         let irq_lines = drain_pending_hosted_irqs_snapshot();
         let dpcs = drain_hosted_driver_dpcs();
+        // Nested exchanges may reconcile earlier requests before these effects publish new demand.
+        crate::dispatcher_bootstrap::request_receive_checkpoint();
+        crate::dispatcher_bootstrap::prepare_receive()
+            .expect("bootstrap timer admission failed before retained receive");
         if yield_number <= 16 {
-            // Diagnostic collection only until bootstrap owns complete servicing and rearm.
+            // Report canonical demand after the actual receive checkpoint.
             let deadline = crate::dispatcher_bootstrap::next_deadline(crate::nt_time_snapshot());
             print_str(b"[component-scheduler] receive continuation bank=0x");
             print_hex64(shared_va);
