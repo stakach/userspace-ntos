@@ -678,9 +678,9 @@ pub(crate) unsafe fn spawn_component_worker_suspended(
         tcb,
         tcb_write_registers_r(tcb, d.entry as u64, stack_top, d.entry_arg),
     );
-    let _ = tcb_set_priority(tcb, d.prio);
+    component_expect(b"worker-tcb-set-priority", tcb, tcb_set_priority_r(tcb, d.prio));
     if let Some(gs_base) = d.gs_base {
-        let _ = tcb_set_gs_base(tcb, gs_base);
+        component_expect(b"worker-tcb-set-gs-base", tcb, tcb_set_gs_base_r(tcb, gs_base));
     }
     let sched_context = match attach_sched_context(tcb) {
         Ok(sched_context) => sched_context,
@@ -810,9 +810,9 @@ unsafe fn spawn_component_inner(d: &ComponentDescriptor, resume: bool) -> Spawne
     let stack_top = d.stack_base + d.stack_frames * 0x1000 - 16;
     let error = tcb_write_registers_r(tcb, d.entry as u64, stack_top, heap_frames);
     component_expect(b"tcb-write-registers", tcb, error);
-    let _ = tcb_set_priority(tcb, d.prio);
+    component_expect(b"tcb-set-priority", tcb, tcb_set_priority_r(tcb, d.prio));
     if let Some(gs) = d.gs_base {
-        let _ = tcb_set_gs_base(tcb, gs);
+        component_expect(b"tcb-set-gs-base", tcb, tcb_set_gs_base_r(tcb, gs));
     }
     trace_component_spawn_stage(b"tcb-ready", tcb, d.prio);
     let sched_context = match attach_sched_context(tcb) {

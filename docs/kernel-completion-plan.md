@@ -36419,6 +36419,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         and IO-manager release builds pass (.tmp/build-lane-peer-executive-20260920.log and
         .tmp/build-lane-peer-io-manager-20260920.log). No new QEMU run or desktop proof is claimed;
         the last measured strict 27-export boot barrier remains unchanged by this crate-only slice.
+        Native construction acknowledgement checkpoint (2026-09-20): both primary and secondary
+        component spawners now use acknowledged TCB priority and optional GS-base invocations.
+        The former sel4-rt helpers used SYS_SEND and returned literal zero, so checking those
+        return values would not establish success. Existing SYS_CALL adapters return the kernel
+        error label; component_expect stops construction on failure before scheduling-context
+        attachment, ready publication or resume. The other allocation, mapping, capability and
+        TCB construction prerequisites were already checked. This removes all four unchecked
+        successful-construction operations without changing the private endpoint topology or
+        admitting bootstrap waits. Failure cleanup remains distinct from successful publication.
+        Focused validation passes 150 unit tests and six compile-fail checks
+        (.tmp/test-component-publication-focused-20260920.log); serialized executive and IO-manager
+        release builds pass (.tmp/build-component-publication-executive-20260920.log and
+        .tmp/build-component-publication-io-manager-20260920.log). Native failure injection and
+        secondary-worker execution are not established by these checks. A fresh bounded normal
+        boot reaches the same strict 27-export win32k import barrier without an earlier construction
+        failure (.tmp/boot-component-publication-20260920.log); QEMU was stopped at that deterministic
+        blocker. No DriverEntry or desktop rendering is claimed. Shared peer capability
+        publication and retained unrelated-arrival routing remain the next native ownership slice.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
