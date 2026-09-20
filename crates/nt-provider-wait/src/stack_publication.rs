@@ -1,7 +1,8 @@
-//! Durable one-shot ownership of a provider stack's catalog publication.
+//! One-shot ownership of a provider stack's catalog publication and retirement.
 
 use crate::{
-    ProviderStackActivationCatalog, ProviderStackActivationError, ProviderStackLaneHandle,
+    ProviderStackActivationCatalog, ProviderStackActivationError, ProviderStackLaneBinding,
+    ProviderStackLaneHandle,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10,12 +11,16 @@ pub enum ProviderStackLanePublicationPhase {
     Publishing,
     Published(ProviderStackLaneHandle),
     Failed(ProviderStackActivationError),
+    Unregistering(ProviderStackLaneHandle),
+    Retired(ProviderStackLaneBinding),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderStackLanePublicationError {
     InvalidPhase,
     Registration(ProviderStackActivationError),
+    Catalog(ProviderStackActivationError),
+    BindingMismatch,
 }
 
 /// Retain alongside the physical stack owner before calling register. This receipt never retries
@@ -48,6 +53,47 @@ impl ProviderStackLanePublication {
         self.phase
     }
 
+    /// Resolve only the retained generation in the original catalog lifetime.
+    /// The adapter must independently authenticate that lifetime; table-local handles are not
+    /// cross-provider identities. Missing/stale publication is an error, never proof of absence.
+    pub fn binding(
+        &self,
+        catalog: &ProviderStackActivationCatalog,
+    ) -> Result<ProviderStackLaneBinding, ProviderStackLanePublicationError> {
+        let ProviderStackLanePublicationPhase::Published(handle) = self.phase else {
+            return Err(ProviderStackLanePublicationError::InvalidPhase);
+        };
+        catalog
+            .binding(handle)
+            .map_err(ProviderStackLanePublicationError::Catalog)
+    }
+
+    /// Retire an exact, previously observed binding within the same authenticated catalog.
+    /// Catalog refusal is side-effect-free and permits retry after activations drain. Interrupted
+    /// mutation remains Unregistering and cannot be replayed. Success retires only the catalog
+    /// reference; it does not release a physical stack, capability, or execution fence.
+    pub fn retire(
+        &mut self,
+        catalog: &mut ProviderStackActivationCatalog,
+        expected: ProviderStackLaneBinding,
+    ) -> Result<ProviderStackLaneBinding, ProviderStackLanePublicationError> {
+        let binding = self.binding(catalog)?;
+        if binding != expected {
+            return Err(ProviderStackLanePublicationError::BindingMismatch);
+        }
+        self.phase = ProviderStackLanePublicationPhase::Unregistering(binding.handle);
+        match catalog.unregister_lane(binding.handle) {
+            Ok(()) => {
+                self.phase = ProviderStackLanePublicationPhase::Retired(binding);
+                Ok(binding)
+            }
+            Err(error) => {
+                self.phase = ProviderStackLanePublicationPhase::Published(binding.handle);
+                Err(ProviderStackLanePublicationError::Catalog(error))
+            }
+        }
+    }
+
     pub fn register(
         &mut self,
         catalog: &mut ProviderStackActivationCatalog,
@@ -75,6 +121,133 @@ impl ProviderStackLanePublication {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retirement_checks_every_expected_binding_field_before_mutation() {
+        let mut catalog = ProviderStackActivationCatalog::new(2, 1).unwrap();
+        let mut owner = ProviderStackLanePublication::new();
+        let handle = owner.register(&mut catalog, 7, 0x1000, 0x1000).unwrap();
+        let other = catalog.register_lane(8, 0x3000, 0x1000).unwrap();
+        let binding = owner.binding(&catalog).unwrap();
+        assert_eq!(binding, catalog.binding(handle).unwrap());
+        for changed in [
+            ProviderStackLaneBinding {
+                handle: other,
+                ..binding
+            },
+            ProviderStackLaneBinding {
+                lane_id: 9,
+                ..binding
+            },
+            ProviderStackLaneBinding {
+                stack_base: 0x2000,
+                ..binding
+            },
+            ProviderStackLaneBinding {
+                stack_bytes: 0x2000,
+                ..binding
+            },
+        ] {
+            assert_eq!(
+                owner.retire(&mut catalog, changed),
+                Err(ProviderStackLanePublicationError::BindingMismatch)
+            );
+            assert_eq!(
+                owner.phase(),
+                ProviderStackLanePublicationPhase::Published(handle)
+            );
+            assert_eq!(owner.binding(&catalog), Ok(binding));
+        }
+    }
+
+    #[test]
+    fn active_lane_refusal_retains_publication_then_retirement_succeeds_once() {
+        let mut catalog = ProviderStackActivationCatalog::new(1, 2).unwrap();
+        let mut owner = ProviderStackLanePublication::new();
+        let handle = owner.register(&mut catalog, 7, 0x1000, 0x1000).unwrap();
+        let binding = owner.binding(&catalog).unwrap();
+        let activation = catalog.begin(handle, 1).unwrap();
+        assert_eq!(
+            owner.retire(&mut catalog, binding),
+            Err(ProviderStackLanePublicationError::Catalog(
+                ProviderStackActivationError::LaneActive
+            ))
+        );
+        assert_eq!(
+            owner.phase(),
+            ProviderStackLanePublicationPhase::Published(handle)
+        );
+        assert_eq!(owner.binding(&catalog), Ok(binding));
+        catalog.finish(activation).unwrap();
+        assert_eq!(owner.retire(&mut catalog, binding), Ok(binding));
+        assert_eq!(
+            owner.phase(),
+            ProviderStackLanePublicationPhase::Retired(binding)
+        );
+        assert_eq!(
+            catalog.binding(handle),
+            Err(ProviderStackActivationError::StaleLane)
+        );
+        assert_eq!(
+            owner.binding(&catalog),
+            Err(ProviderStackLanePublicationError::InvalidPhase)
+        );
+        assert_eq!(
+            owner.retire(&mut catalog, binding),
+            Err(ProviderStackLanePublicationError::InvalidPhase)
+        );
+        assert_eq!(
+            owner.register(&mut catalog, 7, 0x1000, 0x1000),
+            Err(ProviderStackLanePublicationError::InvalidPhase)
+        );
+    }
+
+    #[test]
+    fn stale_generation_cannot_query_or_retire_replacement_publication() {
+        let mut catalog = ProviderStackActivationCatalog::new(1, 1).unwrap();
+        let mut owner = ProviderStackLanePublication::new();
+        let handle = owner.register(&mut catalog, 7, 0x1000, 0x1000).unwrap();
+        let binding = owner.binding(&catalog).unwrap();
+        catalog.unregister_lane(handle).unwrap();
+        let replacement = catalog.register_lane(7, 0x1000, 0x1000).unwrap();
+        let expected = catalog.binding(replacement).unwrap();
+        let stale = Err(ProviderStackLanePublicationError::Catalog(
+            ProviderStackActivationError::StaleLane,
+        ));
+        assert_eq!(owner.binding(&catalog), stale);
+        assert_eq!(owner.retire(&mut catalog, binding), stale);
+        assert_eq!(owner.retire(&mut catalog, expected), stale);
+        assert_eq!(
+            owner.phase(),
+            ProviderStackLanePublicationPhase::Published(handle)
+        );
+        assert_eq!(catalog.binding(replacement), Ok(expected));
+    }
+
+    #[test]
+    fn nonpublished_and_entered_retirement_states_refuse_query_or_replay() {
+        let mut catalog = ProviderStackActivationCatalog::new(1, 1).unwrap();
+        let handle = catalog.register_lane(7, 0x1000, 0x1000).unwrap();
+        let binding = catalog.binding(handle).unwrap();
+        for phase in [
+            ProviderStackLanePublicationPhase::Unpublished,
+            ProviderStackLanePublicationPhase::Publishing,
+            ProviderStackLanePublicationPhase::Failed(ProviderStackActivationError::NoCapacity),
+            ProviderStackLanePublicationPhase::Unregistering(handle),
+        ] {
+            let mut owner = ProviderStackLanePublication { phase };
+            assert_eq!(
+                owner.binding(&catalog),
+                Err(ProviderStackLanePublicationError::InvalidPhase)
+            );
+            assert_eq!(
+                owner.retire(&mut catalog, binding),
+                Err(ProviderStackLanePublicationError::InvalidPhase)
+            );
+            assert_eq!(owner.phase(), phase);
+            assert_eq!(catalog.binding(handle), Ok(binding));
+        }
+    }
 
     #[test]
     fn publication_retains_exact_generation_binding_and_cannot_repeat() {

@@ -36793,6 +36793,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         (.tmp/build-stack-publication-executive-20260921.log and
         .tmp/build-stack-publication-io-manager-20260921.log). No fresh QEMU result is claimed;
         secondary startup remains beyond the measured strict 27-export win32k boot barrier.
+        Exact stack publication retirement contract checkpoint (2026-09-21): retained publications
+        can resolve their exact generation-bearing binding and retire only a matching handle,
+        lane identity, stack base, and stack length. Missing, failed, entered, stale, and retired
+        publications are errors, not evidence that the stack was never registered. Retirement
+        records Unregistering before catalog mutation and retains Retired(binding) only after
+        success. The catalog rejects active activations before mutation; that no-effects refusal
+        preserves Published ownership for retry after drain. Interrupted retirement remains entered
+        and cannot replay. No operation resets the publication owner for reuse.
+
+        This is the host contract, not an authenticated native query/retirement transport. Handles
+        remain scoped to the original catalog lifetime, which the native adapter must validate
+        independently. Neither a copied binding nor catalog unregister success releases worker
+        capabilities, stack frames, root slots, or the canonical execution fence. Native retirement
+        remains disabled until provider lifetime and receipt delivery are authenticated; uncertain
+        failed-startup catalog state must continue to quarantine the entire retained arena.
+        Validation passes 103 tests across six provider-wait suites, including four new exact
+        retirement tests and the non-clone compile-fail check
+        (.tmp/test-stack-retirement-20260921.log). Both serialized native release builds pass
+        (.tmp/build-stack-retirement-executive-20260921.log and
+        .tmp/build-stack-retirement-io-manager-20260921.log). No new QEMU result is claimed for
+        this host-contract change; the last measured boot barrier remains before DriverEntry.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
