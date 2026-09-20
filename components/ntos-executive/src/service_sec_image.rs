@@ -339,25 +339,36 @@ pub(crate) unsafe fn stop_component_execution_lane_startup(
     (suspend_status, verified)
 }
 
-/// Detach the scheduling context from its exclusive physical allocation receipt.
-pub(crate) unsafe fn detach_component_execution_lane_startup(
+/// Detach and delete the private scheduling context, retaining its empty CSpace slot.
+pub(crate) unsafe fn retire_component_startup_scheduler(
     lane: nt_component_suspension::LaneHandle,
     executor: u64,
     sched_context: u64,
-) -> Option<u64> {
+) -> (Option<u64>, Option<u64>) {
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
     let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let binding = lanes.binding(lane).ok()?;
+    let Ok(binding) = lanes.binding(lane) else {
+        return (None, None);
+    };
     if binding.executor_id != executor || sched_context == 0 {
-        return None;
+        return (None, None);
     }
     let mut status = None;
-    let _ = lanes.detach_startup_scheduler(lane, binding.reply_object, |_| {
+    let detached = lanes.detach_startup_scheduler(lane, binding.reply_object, |_| {
         let error = sel4_rt::sched_context_unbind(sched_context);
         status = Some(error);
         if error == 0 { Ok(()) } else { Err(error) }
     });
-    status
+    let mut delete_status = None;
+    if detached.is_ok() {
+        let _ = lanes.delete_startup_scheduler(lane, binding.reply_object, |_| {
+            let error = crate::cnode_delete_r(sched_context);
+            delete_status = Some(error);
+            if error == 0 { Ok(()) } else { Err(error) }
+        });
+    }
+    // No allocator publication: the historical physical receipt still names this slot.
+    (status, delete_status)
 }
 
 /// The caller must first validate the authenticated ready protocol completion.

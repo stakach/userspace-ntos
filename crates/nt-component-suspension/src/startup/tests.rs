@@ -513,3 +513,131 @@ fn detach_rejects_stale_and_wrong_reply_without_changing_verified_owner() {
     assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupStopped));
     assert_eq!(lanes.running(), Some(lane));
 }
+
+fn detached_lane() -> (Lanes, LaneHandle) {
+    let mut lanes = Lanes::new(2, 2);
+    let lane = lanes.allocate_staged(binding(0)).unwrap();
+    lanes
+        .stop_startup(lane, 30, |_| Ok::<_, u8>(()), free)
+        .unwrap();
+    lanes
+        .detach_startup_scheduler(lane, 30, |_| Ok::<_, u8>(()))
+        .unwrap();
+    (lanes, lane)
+}
+
+#[test]
+fn scheduler_delete_ack_keeps_lane_fence_binding_and_allocation() {
+    let (mut lanes, lane) = detached_lane();
+    let other = lanes.allocate(binding(1)).unwrap();
+    lanes
+        .delete_startup_scheduler(lane, 30, |executor| {
+            assert_eq!(executor, 10);
+            Ok::<_, u8>(())
+        })
+        .unwrap();
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupSchedulerDeleted));
+    assert_eq!(lanes.binding(lane), Ok(binding(0)));
+    assert_eq!(lanes.running(), Some(lane));
+    assert_eq!(lanes.len(), 2);
+    assert!(lanes.execution_busy());
+    assert_eq!(lanes.release(lane, 30), Err(LaneError::Busy));
+    assert_eq!(lanes.begin_dispatch(other, 31), Err(LaneError::Busy));
+    assert_eq!(lanes.next_idle(), None);
+    assert!(!lanes.needs_idle_lane());
+    assert!(lanes.complete_startup(lane, 30, bound).is_err());
+    assert!(lanes.finish_dispatch(lane, 30).is_err());
+    assert_eq!(
+        lanes.delete_startup_scheduler(lane, 30, |_| -> Result<(), u8> {
+            panic!("duplicate delete")
+        }),
+        Err(StartupDeleteError::Lane(LaneError::InvalidPhase))
+    );
+}
+
+#[test]
+fn scheduler_delete_error_retains_entered_authority_without_replay() {
+    let (mut lanes, lane) = detached_lane();
+    assert_eq!(
+        lanes.delete_startup_scheduler(lane, 30, |executor| {
+            assert_eq!(executor, 10);
+            Err(11u8)
+        }),
+        Err(StartupDeleteError::Invoke(11))
+    );
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupSchedulerDeleting));
+    assert_eq!(lanes.running(), Some(lane));
+    assert_eq!(
+        lanes.delete_startup_scheduler(lane, 30, |_| -> Result<(), u8> {
+            panic!("ambiguous delete replay")
+        }),
+        Err(StartupDeleteError::Lane(LaneError::InvalidPhase))
+    );
+    assert!(lanes
+        .detach_startup_scheduler(lane, 30, |_| Ok::<_, u8>(()))
+        .is_err());
+    assert_eq!(lanes.release(lane, 30), Err(LaneError::Busy));
+}
+
+#[test]
+fn scheduler_delete_rejects_missing_detach_ack_before_effects() {
+    let refused = |_| -> Result<(), u8> { panic!("unacknowledged detach delete") };
+    let mut lanes = Lanes::new(1, 2);
+    let lane = lanes.allocate_staged(binding(0)).unwrap();
+    assert_eq!(
+        lanes.delete_startup_scheduler(lane, 30, refused),
+        Err(StartupDeleteError::Lane(LaneError::InvalidPhase))
+    );
+    lanes.begin_startup(lane, 30, free).unwrap();
+    assert_eq!(
+        lanes.delete_startup_scheduler(lane, 30, refused),
+        Err(StartupDeleteError::Lane(LaneError::InvalidPhase))
+    );
+    assert!(lanes
+        .stop_startup(lane, 30, |_| Ok::<_, u8>(()), bound)
+        .is_err());
+    assert_eq!(
+        lanes.delete_startup_scheduler(lane, 30, refused),
+        Err(StartupDeleteError::Lane(LaneError::InvalidPhase))
+    );
+    lanes
+        .verify_startup_stopped::<u8, u8>(lane, 30, free)
+        .unwrap();
+    assert_eq!(
+        lanes.delete_startup_scheduler(lane, 30, refused),
+        Err(StartupDeleteError::Lane(LaneError::InvalidPhase))
+    );
+    assert!(lanes
+        .detach_startup_scheduler(lane, 30, |_| Err(12u8))
+        .is_err());
+    assert_eq!(
+        lanes.delete_startup_scheduler(lane, 30, refused),
+        Err(StartupDeleteError::Lane(LaneError::InvalidPhase))
+    );
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupDetaching));
+}
+
+#[test]
+fn scheduler_delete_rejects_wrong_reply_and_stale_lane_without_effects() {
+    let mut lanes = Lanes::new(1, 2);
+    let old = lanes.allocate(binding(0)).unwrap();
+    lanes.release(old, 30).unwrap();
+    let lane = lanes.allocate_staged(binding(0)).unwrap();
+    lanes
+        .stop_startup(lane, 30, |_| Ok::<_, u8>(()), free)
+        .unwrap();
+    lanes
+        .detach_startup_scheduler(lane, 30, |_| Ok::<_, u8>(()))
+        .unwrap();
+    let refused = |_| -> Result<(), u8> { panic!("foreign scheduler delete") };
+    assert_eq!(
+        lanes.delete_startup_scheduler(old, 30, refused),
+        Err(StartupDeleteError::Lane(LaneError::StaleGeneration))
+    );
+    assert_eq!(
+        lanes.delete_startup_scheduler(lane, 99, refused),
+        Err(StartupDeleteError::Lane(LaneError::WrongBinding))
+    );
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupDetached));
+    assert_eq!(lanes.running(), Some(lane));
+}

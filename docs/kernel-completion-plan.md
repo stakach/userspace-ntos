@@ -36746,6 +36746,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         rust-micro 7b9907a; the kernel mechanism itself is unchanged. No fresh boot or native
         failure-injection success is claimed; the last measured boot frontier remains the strict
         27-export win32k rejection before DriverEntry.
+        Failed-startup scheduling-context deletion checkpoint (2026-09-21): private SC retirement
+        now follows acknowledged detachment with checked CNodeDelete. The canonical owner enters
+        StartupSchedulerDeleting before the call and StartupSchedulerDeleted only after ACK.
+        Failure retains entered authority without replay; success retains the execution fence,
+        physical worker receipt, and allocated-empty root slot. No allocator publication or slot
+        reuse occurs while the historical receipt still names the capability slot.
+
+        The scoped alias audit found only the root SC capability: worker construction installs
+        PML4 and endpoint aliases in the worker CSpace, not the SC. Verified suspension and unbind
+        remove scheduler/Reply ownership before final deletion. Do not apply this proof to an
+        arbitrary worker or donated context. Native diagnostics report separate detach/delete
+        results. TCB, endpoint, CNode, stack/IPC frames, published references, and final lane/arena
+        retirement remain open; this step does not claim full teardown or startup fault injection.
+        Validation passes 200 unit tests and nine compile-fail checks, including four new deletion
+        tests (.tmp/test-startup-scheduler-delete-20260921.log). Both serialized native release
+        builds pass (.tmp/build-startup-scheduler-delete-executive-20260921.log and
+        .tmp/build-startup-scheduler-delete-io-manager-20260921.log). No new QEMU result is claimed
+        for this failure-only path; the last measured boot still stops before DriverEntry at the
+        strict 27-export win32k barrier.
+        Next reference-drain prerequisite: secondary entry publishes its stack range into
+        WIN32K_STACK_EVENT_ACTIVATIONS before the first ready Call, but currently discards the
+        generation-bearing register_lane handle. The catalog supports unregister_lane and refuses
+        nonempty activations. Preserve and authenticate that publication receipt before removing
+        the worker's stack registration; ordinal or address matching alone must not retire a later
+        generation. No event activation is begun before this initial ready Call, but a failed
+        startup still cannot assume the registration was absent or safely reclaim its stack range.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

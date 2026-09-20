@@ -23,7 +23,41 @@ pub enum StartupDetachError<E> {
     Invoke(E),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupDeleteError<E> {
+    Lane(LaneError),
+    Invoke(E),
+}
+
 impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
+    /// Delete only the privately owned scheduler capability whose detach was acknowledged.
+    /// The adapter must revalidate the exact live capability and executor before invocation,
+    /// and must not reenter scheduling or recycle the resulting empty slot. Any invocation
+    /// error retains entered authority without replay; success keeps every other resource and
+    /// the component execution fence intact.
+    pub fn delete_startup_scheduler<E>(
+        &mut self,
+        handle: LaneHandle,
+        reply: u64,
+        delete: impl FnOnce(u64) -> Result<(), E>,
+    ) -> Result<(), StartupDeleteError<E>> {
+        self.validate(handle, reply)
+            .map_err(StartupDeleteError::Lane)?;
+        let lane = self.lane(handle).map_err(StartupDeleteError::Lane)?;
+        if lane.phase != LanePhase::StartupDetached || self.running != Some(handle) {
+            return Err(StartupDeleteError::Lane(LaneError::InvalidPhase));
+        }
+        let executor = lane.binding.executor_id;
+        self.lane_mut(handle)
+            .map_err(StartupDeleteError::Lane)?
+            .phase = LanePhase::StartupSchedulerDeleting;
+        delete(executor).map_err(StartupDeleteError::Invoke)?;
+        self.lane_mut(handle)
+            .map_err(StartupDeleteError::Lane)?
+            .phase = LanePhase::StartupSchedulerDeleted;
+        Ok(())
+    }
+
     /// Detach only the stopped worker's privately owned scheduling context.
     /// The adapter must prove the capability belongs to this executor and remains live, and
     /// invoke synchronously without reentering scheduling. Failure retains entered authority;
@@ -34,15 +68,20 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         reply: u64,
         detach: impl FnOnce(u64) -> Result<(), E>,
     ) -> Result<(), StartupDetachError<E>> {
-        self.validate(handle, reply).map_err(StartupDetachError::Lane)?;
+        self.validate(handle, reply)
+            .map_err(StartupDetachError::Lane)?;
         let lane = self.lane(handle).map_err(StartupDetachError::Lane)?;
         if lane.phase != LanePhase::StartupStopped || self.running != Some(handle) {
             return Err(StartupDetachError::Lane(LaneError::InvalidPhase));
         }
         let executor = lane.binding.executor_id;
-        self.lane_mut(handle).map_err(StartupDetachError::Lane)?.phase = LanePhase::StartupDetaching;
+        self.lane_mut(handle)
+            .map_err(StartupDetachError::Lane)?
+            .phase = LanePhase::StartupDetaching;
         detach(executor).map_err(StartupDetachError::Invoke)?;
-        self.lane_mut(handle).map_err(StartupDetachError::Lane)?.phase = LanePhase::StartupDetached;
+        self.lane_mut(handle)
+            .map_err(StartupDetachError::Lane)?
+            .phase = LanePhase::StartupDetached;
         Ok(())
     }
 
@@ -57,7 +96,8 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         suspend: impl FnOnce(u64) -> Result<(), S>,
         query: impl FnOnce(u64, u64) -> Result<ReplyBindingObservation, Q>,
     ) -> Result<(), StartupStopError<S, Q>> {
-        self.validate(handle, reply).map_err(StartupStopError::Lane)?;
+        self.validate(handle, reply)
+            .map_err(StartupStopError::Lane)?;
         let lane = self.lane(handle).map_err(StartupStopError::Lane)?;
         match lane.phase {
             LanePhase::Staged => {
@@ -85,7 +125,8 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         reply: u64,
         query: impl FnOnce(u64, u64) -> Result<ReplyBindingObservation, Q>,
     ) -> Result<(), StartupStopError<S, Q>> {
-        self.validate(handle, reply).map_err(StartupStopError::Lane)?;
+        self.validate(handle, reply)
+            .map_err(StartupStopError::Lane)?;
         let lane = self.lane(handle).map_err(StartupStopError::Lane)?;
         if lane.phase != LanePhase::StartupStopAcknowledged || self.running != Some(handle) {
             return Err(StartupStopError::Lane(LaneError::InvalidPhase));

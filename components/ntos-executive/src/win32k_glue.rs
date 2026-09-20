@@ -63,7 +63,7 @@ struct Win32kPhysicalLane {
     stack_base: u64,
     stack_frames: u64,
     ipc_buffer_va: u64,
-    // Allocation receipt only; its original Reply is not current transport authority.
+    // Allocation receipt only; canonical state owns live transport and mechanism retirement.
     worker: Option<crate::spawn_hosts::SpawnedComponentWorker>,
 }
 
@@ -378,7 +378,7 @@ unsafe fn retain_failed_win32k_lane(tcb: u64, stage: &[u8], error: u64) {
         // Canonical allocation failed; retain the physical owner without claiming cancellation.
         (Some(crate::tcb_suspend_r(tcb)), false)
     };
-    let detach_status = if verified {
+    let (detach_status, delete_status) = if verified {
         // Each worker owns a freshly allocated SC; never detach a global or donated SC.
         let scheduler = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
             .as_ref()
@@ -388,12 +388,12 @@ unsafe fn retain_failed_win32k_lane(tcb: u64, stage: &[u8], error: u64) {
             .map(|worker| worker.sched_context);
         match (handle, scheduler) {
             (Some(handle), Some(sc)) => {
-                crate::service_sec_image::detach_component_execution_lane_startup(handle, tcb, sc)
+                crate::service_sec_image::retire_component_startup_scheduler(handle, tcb, sc)
             }
-            _ => None,
+            _ => (None, None),
         }
     } else {
-        None
+        (None, None)
     };
     print_str(b"[win32k-lane] retained failed startup tcb=0x");
     crate::print_hex_u64(tcb);
@@ -411,6 +411,12 @@ unsafe fn retain_failed_win32k_lane(tcb: u64, stage: &[u8], error: u64) {
     print_u64(verified as u64);
     print_str(b" sc-detach=");
     if let Some(status) = detach_status {
+        print_u64(status);
+    } else {
+        print_str(b"not-attempted");
+    }
+    print_str(b" sc-delete=");
+    if let Some(status) = delete_status {
         print_u64(status);
     } else {
         print_str(b"not-attempted");

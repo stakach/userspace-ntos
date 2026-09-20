@@ -27,6 +27,7 @@ mod startup;
 pub use startup::StartupError;
 pub use startup::StartupStopError;
 pub use startup::StartupDetachError;
+pub use startup::StartupDeleteError;
 pub use retained_work::{RetainedWork, RetainedWorkCheckout, RetainedWorkError, RetainedWorkFinishError, RetainedWorkReservation};
 pub use retained_dispatch::{RetainedDispatch, RetainedDispatchError};
 pub use retained_ingress::{RetainedIngress, RetainedIngressError};
@@ -227,6 +228,10 @@ pub enum LanePhase {
     StartupDetaching,
     /// Scheduling context detached; resources and the execution fence remain owned.
     StartupDetached,
+    /// Scheduler capability deletion entered; absence of ACK does not authorize replay.
+    StartupSchedulerDeleting,
+    /// Scheduler capability deletion acknowledged; empty slot and all other resources retained.
+    StartupSchedulerDeleted,
     Idle,
     Running,
     Suspended,
