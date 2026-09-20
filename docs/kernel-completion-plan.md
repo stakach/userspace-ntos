@@ -36624,6 +36624,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/build-canonical-native-binding-io-manager-20260920.log). No endpoint topology or startup
         eligibility change is made here. No new desktop or QEMU result is claimed; the last measured
         boot frontier remains the strict 27-export win32k barrier above.
+        Native failed-startup ownership checkpoint (2026-09-20): secondary win32k allocations
+        are now inserted into the physical resource ledger before resume, with no canonical handle
+        until the authenticated ready handshake and registration succeed. Routing excludes these
+        unregistered records; physical quiescence refuses them, while bugcheck suspension still
+        visits their TCBs. Arena accounting includes all retained allocations, not only published
+        workers. A scoped startup guard prevents recursive provisioning during pump re-entry.
+        Resume uses copied TCB/scheduling-context values, avoiding a resource-ledger borrow across
+        IPC. Resume, readiness, or registration failure retires the provider, attempts acknowledged
+        TCB suspension, logs the actual result, and keeps the resource owner. Failed suspension is
+        not treated as cancellation or permission to reuse resources. Retired providers cannot
+        acquire or provision another lane, and readiness cannot publish after provider retirement.
+
+        This closes descriptor loss after worker allocation, not the entire startup lifecycle.
+        Staged canonical registration, exclusive startup execution ownership, and acknowledged
+        drain/unmap/capability deletion remain required before shared-endpoint publication. The
+        construction helper's fatal partial-allocation paths are unchanged. Native failure injection
+        and runtime startup verification remain open; the last boot barrier precedes this path.
+        Focused validation passes 181 unit tests and nine compile-fail checks
+        (.tmp/test-worker-startup-retention-20260920.log). Serialized executive and IO-manager
+        release builds pass (.tmp/build-worker-startup-retention-executive-20260920.log and
+        .tmp/build-worker-startup-retention-io-manager-20260920.log). No new QEMU or desktop
+        result is claimed for this checkpoint.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

@@ -58,7 +58,7 @@ static PROVIDER_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 static LPC_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 #[allow(dead_code)] // The routing cutover consumes the full retained resource description.
 struct Win32kPhysicalLane {
-    handle: nt_component_suspension::LaneHandle,
+    handle: Option<nt_component_suspension::LaneHandle>,
     tcb: u64,
     stack_base: u64,
     stack_frames: u64,
@@ -68,6 +68,15 @@ struct Win32kPhysicalLane {
 }
 
 static mut WIN32K_PHYSICAL_LANES: Option<Vec<Win32kPhysicalLane>> = None;
+static WIN32K_LANE_STARTUP_ACTIVE: AtomicU64 = AtomicU64::new(0);
+
+struct Win32kLaneStartupGuard;
+
+impl Drop for Win32kLaneStartupGuard {
+    fn drop(&mut self) {
+        WIN32K_LANE_STARTUP_ACTIVE.store(0, Ordering::Release);
+    }
+}
 static USER_CALLBACK_CANCEL_CHAINED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_WM_PAINT_RETURNS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_REAL_WM_PAINT_HWND: AtomicU64 = AtomicU64::new(0);
@@ -109,7 +118,7 @@ pub(crate) unsafe fn register_primary_win32k_physical_lane(
         return false;
     };
     lanes.push(Win32kPhysicalLane {
-        handle,
+        handle: Some(handle),
         tcb,
         stack_base: win32k_subsystem::WIN32K_STACK_VADDR,
         stack_frames: 32,
@@ -125,7 +134,7 @@ pub(crate) unsafe fn win32k_physical_lane_binding(
     let tcb = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
         .as_ref()?
         .iter()
-        .find(|lane| lane.handle == handle)
+        .find(|lane| lane.handle == Some(handle))
         .map(|lane| lane.tcb)?;
     let binding = crate::service_sec_image::component_execution_lane_binding(handle)?;
     (binding.executor_id == tcb).then_some(binding)
@@ -139,14 +148,14 @@ pub(crate) unsafe fn win32k_physical_lane_for_channel(
     (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
         .as_ref()?
         .iter()
-        .find(|lane| {
-            win32k_physical_lane_binding(lane.handle).is_some_and(|binding| {
+        .filter_map(|lane| lane.handle)
+        .find(|handle| {
+            win32k_physical_lane_binding(*handle).is_some_and(|binding| {
                 binding.executor_id == tcb
                     && binding.receive_endpoint == endpoint
                     && binding.reply_object == reply_object
             })
         })
-        .map(|lane| lane.handle)
 }
 
 /// Execution quiescence only; callers must separately retire published pointers and mappings.
@@ -154,7 +163,9 @@ pub(crate) unsafe fn win32k_physical_lanes_quiescent() -> bool {
     (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
         .as_ref()
         .is_some_and(|lanes| !lanes.is_empty() && lanes.iter().all(|lane| {
-            crate::service_sec_image::component_execution_lane_is_idle(lane.handle)
+            lane.handle.is_some_and(|handle| {
+                crate::service_sec_image::component_execution_lane_is_idle(handle)
+            })
         }))
 }
 
@@ -218,6 +229,16 @@ unsafe fn win32k_lane_channel(
 /// This is deliberately separate from dispatch routing: the lane is not eligible until its initial
 /// ready `Call` has been received and bound to its own reply object.
 pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
+    if WIN32K_RETIRED.load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    if WIN32K_LANE_STARTUP_ACTIVE
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    let _startup = Win32kLaneStartupGuard;
     let worker_index = {
         let lanes = win32k_physical_lanes_mut();
         if lanes.is_empty() {
@@ -280,8 +301,27 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let resume = crate::spawn_hosts::resume_spawned_component_worker(&worker);
+    let tcb = worker.tcb;
+    let sched_context = worker.sched_context;
+    let endpoint = worker.endpoint;
+    let reply_cap = worker.reply_cap;
+    // Retain every allocated arena and capability before any worker can run or fail startup.
+    let physical_index = {
+        let lanes = win32k_physical_lanes_mut();
+        let index = lanes.len();
+        lanes.push(Win32kPhysicalLane {
+            handle: None,
+            tcb,
+            stack_base,
+            stack_frames: win32k_subsystem::WIN32K_LANE_STACK_FRAMES,
+            ipc_buffer_va,
+            worker: Some(worker),
+        });
+        index
+    };
+    let resume = crate::spawn_hosts::resume_spawned_component_worker(tcb, sched_context);
     if resume != 0 {
+        retain_failed_win32k_lane(tcb, b"resume", resume);
         return false;
     }
     let pump = crate::spawn_hosts::component_pump(&channel);
@@ -292,37 +332,49 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     print_str(b"[win32k-lane] physical lane=");
     print_u64(worker_index as u64 + 1);
     print_str(b" tcb=0x");
-    print_hex(worker.tcb as u32);
+    print_hex(tcb as u32);
     print_str(b" endpoint=0x");
-    print_hex(worker.endpoint as u32);
+    print_hex(endpoint as u32);
     print_str(b" reply=0x");
-    print_hex(worker.reply_cap as u32);
+    print_hex(reply_cap as u32);
     print_str(if ready { b" ready=1\n" } else { b" ready=0\n" });
-    if !ready {
+    if !ready || WIN32K_RETIRED.load(Ordering::Acquire) != 0 {
+        retain_failed_win32k_lane(tcb, b"ready", pump.wall_label);
         return false;
     }
     let binding = nt_component_suspension::LaneBinding {
-        executor_id: worker.tcb,
-        receive_endpoint: worker.endpoint,
-        reply_object: worker.reply_cap,
+        executor_id: tcb,
+        receive_endpoint: endpoint,
+        reply_object: reply_cap,
     };
     let Some(handle) = crate::service_sec_image::register_component_execution_lane(binding) else {
+        retain_failed_win32k_lane(tcb, b"registration", 0);
         return false;
     };
-    let lanes = win32k_physical_lanes_mut();
-    lanes.push(Win32kPhysicalLane {
-        handle,
-        tcb: worker.tcb,
-        stack_base,
-        stack_frames: win32k_subsystem::WIN32K_LANE_STACK_FRAMES,
-        ipc_buffer_va,
-        worker: Some(worker),
-    });
+    win32k_physical_lanes_mut()[physical_index].handle = Some(handle);
     true
+}
+
+unsafe fn retain_failed_win32k_lane(tcb: u64, stage: &[u8], error: u64) {
+    // Startup may have changed shared state or retained continuations before its failure.
+    WIN32K_RETIRED.store(1, Ordering::Release);
+    let suspend_error = crate::tcb_suspend_r(tcb);
+    print_str(b"[win32k-lane] retained failed startup tcb=0x");
+    crate::print_hex_u64(tcb);
+    print_str(b" stage=");
+    print_str(stage);
+    print_str(b" error=");
+    print_u64(error);
+    print_str(b" suspend=");
+    print_u64(suspend_error);
+    print_str(b" provider-retired=1\n");
 }
 
 unsafe fn acquire_or_provision_win32k_execution_lane(
 ) -> Option<nt_component_suspension::LaneHandle> {
+    if WIN32K_RETIRED.load(Ordering::Acquire) != 0 {
+        return None;
+    }
     if let Some(lane) = crate::service_sec_image::acquire_idle_component_execution_lane() {
         return Some(lane);
     }

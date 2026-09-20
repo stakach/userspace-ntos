@@ -586,10 +586,10 @@ pub(crate) unsafe fn resume_spawned_component(component: &SpawnedComponent) -> u
     error
 }
 
-pub(crate) unsafe fn resume_spawned_component_worker(worker: &SpawnedComponentWorker) -> u64 {
-    trace_component_spawn_stage(b"worker-resume-begin", worker.tcb, worker.sched_context);
-    let error = tcb_resume_r(worker.tcb);
-    trace_component_spawn_stage(b"worker-resume-end", worker.tcb, error);
+pub(crate) unsafe fn resume_spawned_component_worker(tcb: u64, sched_context: u64) -> u64 {
+    trace_component_spawn_stage(b"worker-resume-begin", tcb, sched_context);
+    let error = tcb_resume_r(tcb);
+    trace_component_spawn_stage(b"worker-resume-end", tcb, error);
     error
 }
 
