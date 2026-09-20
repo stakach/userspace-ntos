@@ -36308,6 +36308,58 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         establish desktop rendering; native failure-injection acceptance remains open.
         Bootstrap outer receive ownership and blocking wait admission remain open; this integration
         alone does not remove their guards or the 27-export boot wall.
+      - [x] Authenticate blocking private-pump receives as well as fairness probes (2026-09-20).
+        pump_recv now proves its active Reply is Free before each blocking receive, then checks
+        the returned binding against the live badge-resolved peer before dispatching any message.
+        This includes receive-only IRQ continuations and fresh Reply rotation after worker waits
+        or termination. pump_reply_recv4 deliberately skips the Free preflight on its bound send
+        half and authenticates the newly received Call immediately after the combined syscall.
+        A plain Send has no continuation in this private Call protocol: it returns to receive
+        without dispatching its payload or replaying the already-completed reply half. Notification
+        handling and MR4+ reads follow inspection with the original IPC buffer restored.
+        Removed the stale one-TCB-per-component claim; workers retain their parked Replies while
+        the active receive object rotates. Dedicated IRQ worker exchanges and generic outer ingress
+        remain separate paths, not implicitly validated by this change.
+
+        Independent caller audit confirmed that every direct receive entry owns a free/fresh Reply;
+        all bound entries use reply-and-receive. The existing 123 component-suspension unit tests pass,
+        including all binding states, preflight rejection and exact worker matching. Serialized
+        executive and IO-manager release builds pass. Logs: .tmp/test-blocking-receive-20260920.log,
+        .tmp/build-blocking-receive-executive-20260920.log and
+        .tmp/build-blocking-receive-io-manager-20260920.log. No new QEMU run: the fresh preceding boot
+        stopped at the strict 27-export barrier before these paths. Native traffic/failure-injection
+        validation and desktop rendering remain unproven; blocking DriverEntry guards stay in place.
+      - [ ] Implement shared component endpoint fan-in before the bootstrap receive loop.
+        Architecture review (2026-09-20): drivers and win32k physical lanes currently allocate
+        private endpoints; FSD workers share only their own instance endpoint. The microkernel
+        waits on one endpoint plus a bound notification, with no endpoint wait-set or automatic
+        endpoint-ready notification. A distinct outer Reply prevents cancellation but cannot wake
+        the root for traffic on other private endpoints. Poll-then-sleep and signal-before-Call
+        are not substitutes: both leave an enqueue/wakeup race without a complete handshake.
+
+        Use one shared component ingress endpoint with root-issued globally unique live peer
+        badges. Keep routing/lifetime policy in the executive, not the microkernel. Implement in
+        this order, retaining the old private topology until the replacement owns all arrivals:
+        1. Add a host-testable peer registration contract tying a badge to exact physical domain,
+           generation, TCB and lane. Replace lane endpoint uniqueness with exact peer uniqueness;
+           do not merely allow duplicate endpoints without authenticated routing.
+        2. Allocate and publish shared-endpoint peer capabilities transactionally at thread/lane
+           creation. Retire badge routes only after retained Calls and continuations are drained.
+           Do not reuse a badge while an old endpoint-cap alias can still send under that identity.
+        3. Route every received Call to its retained owner before selecting work. Nested pumps
+           must retain unrelated arrivals with distinct Replies, never interpret them using the
+           currently executing channel or re-offer a bound Reply. Preserve non-Call snapshots for
+           their separate notification/Send handling; the private-pump Send discard is not generic.
+        4. Migrate creation, normal dispatch, callbacks, waits, faults and dedicated IRQ exchanges;
+           delete superseded private receive/routing machinery after ownership parity is tested.
+        5. Wire the bounded bootstrap pass to this ingress owner, retain exact target ACK across
+           passes, and only then remove the three non-poll DriverEntry admission guards. Test two
+           providers plus multiple workers, unrelated arrivals while a callback is parked, timer
+           wakeups, peer retirement and failure after receive before attempting desktop acceptance.
+
+        Per-endpoint receiver TCBs are an alternative, but would require another retained-message,
+        Reply-chain, handoff and acknowledgement protocol. Do not introduce that parallel design
+        or an NT-specific endpoint readiness mechanism in rust-micro alongside shared ingress.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

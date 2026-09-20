@@ -1,4 +1,4 @@
-//! Reply evidence for the private component pump's advisory nonblocking receive.
+//! Reply evidence for private component pump receives.
 
 use super::{PumpChannel, ReqKind};
 use nt_component_suspension::{
@@ -38,13 +38,13 @@ unsafe fn query(
 
 pub(super) unsafe fn before_receive(channel: &PumpChannel, reply: u64) {
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
-    let tcb = peer(channel, reply, 0).expect("component poll has no live channel peer");
-    require_free_reply(query(tcb, reply)).expect("component poll would reuse an owned Reply");
+    let tcb = peer(channel, reply, 0).expect("component receive has no live channel peer");
+    require_free_reply(query(tcb, reply)).expect("component receive would reuse an owned Reply");
 }
 
 pub(super) unsafe fn received_call(channel: &PumpChannel, reply: u64, badge: u64) -> bool {
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
-    let tcb = peer(channel, reply, 0).expect("component poll lost its channel peer");
+    let tcb = peer(channel, reply, 0).expect("component receive lost its channel peer");
     // Unknown ownership cannot become an empty poll or a wall that suspends the wrong main TCB.
     // Stop before any further receive/reply; the kernel still retains the original binding.
     classify_received_call(
@@ -52,5 +52,5 @@ pub(super) unsafe fn received_call(channel: &PumpChannel, reply: u64, badge: u64
         |target| query(target, reply),
         || peer(channel, reply, badge),
     )
-    .expect("component poll Reply does not authenticate its received caller")
+    .expect("component Reply does not authenticate its received caller")
 }

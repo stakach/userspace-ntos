@@ -1729,6 +1729,7 @@ unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
         {
             return PumpMessage::scheduler_yield();
         }
+        receive_probe::before_receive(ch, reply_cap);
         // (This recv pairs a component `Call`, so the kernel writes `executive.reply_to = component`.
         // Harmless since Phase 3: no executive reply reads `reply_to` any more.)
         let badge: u64;
@@ -1751,6 +1752,7 @@ unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
             lateout("rax") _, lateout("rcx") _, lateout("r11") _,
             options(nostack),
         );
+        let received_call = receive_probe::received_call(ch, reply_cap, badge);
         let (executive_event, timer, irq) = pump_handle_executive_event_badge(badge);
         if executive_event {
             if pump_deadman_tripped() {
@@ -1771,6 +1773,10 @@ unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
                     );
                 }
             }
+            continue;
+        }
+        if !received_call {
+            // An ordinary Send has no response continuation in the private Call protocol.
             continue;
         }
         let m4 = if (mi & 0x7F) > 4 {
@@ -1843,6 +1849,7 @@ unsafe fn pump_reply_recv4(
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
+    let received_call = receive_probe::received_call(ch, reply_cap, badge);
     let (executive_event, timer, irq) = pump_handle_executive_event_badge(badge);
     if executive_event {
         if pump_deadman_tripped() {
@@ -1863,6 +1870,10 @@ unsafe fn pump_reply_recv4(
                 );
             }
         }
+        return pump_recv(ch, reply_cap);
+    }
+    if !received_call {
+        // The send half already consumed the old Call; never retransmit it after a plain Send.
         return pump_recv(ch, reply_cap);
     }
     let m4 = if (mi & 0x7F) > 4 {
@@ -2377,10 +2388,9 @@ unsafe fn component_pump_enter(
 
     // ★ THE `Call` TRANSPORT — now the ONLY one. The component is blocked in a `Call` bound to
     // `reply_cap`; we ANSWER it with the request (`InitialAction::ReplyRequest`) or, mid-DriverEntry,
-    // start by RECEIVING its ready/fault Call (`RecvFirst`). Every recv re-registers `reply_cap`, so
-    // the kernel — not us — is what binds a completion to the request that provoked it. ONE reply
-    // object per component suffices at ANY nesting depth: the component host has ONE TCB, so it is
-    // blocked in at most one Call, and the "stack" of suspended levels is its own C stack.
+    // start by RECEIVING its ready/fault Call (`RecvFirst`). Receive requires a free Reply, and
+    // the returned binding authenticates the physical caller before dispatch. Workers sharing a
+    // driver endpoint rotate the active Reply when parking; their old bound objects stay retained.
     //
     // The request TAG rides in MR0, NOT in the message label. A fresh dispatch hands over
     // `dispatch_label`; the callback-RESUME pump hands over `W32_USER_CALLBACK_RESUME_LABEL` on the
