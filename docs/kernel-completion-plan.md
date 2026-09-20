@@ -35839,6 +35839,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         adds scans and possible PIT writes per reply; measure its boot cost rather than assuming
         it is performance-neutral. A future optimization needs canonical change/shot ownership,
         not a last-programmed diagnostic cache or a hardcoded service/image allowlist.
+      - [x] Exercise bootstrap receive rearm orchestration in the shared implementation (2026-09-20).
+        The native receive checkpoint now calls nt-time::reconcile_rearm for canonical collection,
+        demand-driven initialization, fresh post-initialization collection and checked programming.
+        The old inline sequence is removed. Phase/gate admission and captured-generation completion
+        remain native; no dispatcher, PM or latch reference crosses the injected effects. Errors
+        return before completing a request. Tests cover empty/withdrawn demand, changed clock and
+        source, effect ordering, every failure boundary and nested request retention.
+        Focused nt-time validation passes 29 tests, including newer demand retained after both
+        successful programming and an idle post-initialization result. All 1,375 host tests pass
+        across 24 suites (.tmp/test-rearm-checkpoint-20260920.log); the focused suite was rerun
+        after strengthening the idle case (.tmp/test-rearm-checkpoint-focused-20260920.log).
+        Executive release passes in 39.13s with 294 warnings; I/O Manager release passes in 3.13s.
+        Evidence: .tmp/build-rearm-checkpoint-20260920.log and
+        .tmp/build-rearm-checkpoint-io-manager-20260920.log. Independent review found no blocking
+        issue. No QEMU rerun: the unchanged strict import wall precedes this native path.
+        This is executable orchestration coverage, not native IPC, IRQ acknowledgment, performance
+        or desktop proof. Bootstrap selected-continuation/fan-in ownership is still required before
+        blocking DriverEntry admission; the retained invocation's IRQ/DPC scope is not that owner.
+        Import review also confirms the five Ke process-attachment exports cannot be restored as
+        isolated bindings: per-thread APC attachment state, effective address-space switching and
+        lane/callback restoration must be implemented together. The current thread-activation
+        validator assumes an unattached APC environment. The strict 27-export wall stays enforced.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

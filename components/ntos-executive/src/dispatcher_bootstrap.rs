@@ -156,17 +156,15 @@ pub(crate) unsafe fn prepare_receive() -> Result<(), u32> {
     let Some(request) = (&*core::ptr::addr_of!(REARM)).pending() else {
         return Ok(());
     };
-    if collect_owned_deadline(nt_time_snapshot())?.is_some() {
-        if !delay_timer_init() {
-            return Err(0xC000_00A3);
-        }
-        // Initialization may switch clock sources or perform IPC. Do not reuse the old sample.
-        if let Some((deadline, source)) = collect_owned_deadline(nt_time_snapshot())? {
-            if !delay_timer_program(deadline, source) {
-                return Err(0xC000_0001);
-            }
-        }
-    }
+    nt_time::reconcile_rearm(
+        || collect_owned_deadline(nt_time_snapshot()),
+        || delay_timer_init().then_some(()).ok_or(0xC000_00A3),
+        |(deadline, source)| {
+            delay_timer_program(deadline, source)
+                .then_some(())
+                .ok_or(0xC000_0001)
+        },
+    )?;
     assert!(
         (&mut *core::ptr::addr_of_mut!(REARM)).complete(request),
         "bootstrap rearm lost its request"

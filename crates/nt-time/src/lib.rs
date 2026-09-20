@@ -8,6 +8,8 @@ mod deferred_work;
 pub use deferred_work::DeferredWorkWake;
 mod rearm_request;
 pub use rearm_request::{DeferredRearm, RearmRequest};
+mod rearm_checkpoint;
+pub use rearm_checkpoint::{reconcile_rearm, RearmCheckpoint};
 
 /// Largest system time accepted by NT's clock-setting path.
 ///
