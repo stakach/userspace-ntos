@@ -107,10 +107,10 @@ impl DriverEntryRecipient {
         self.wait.progress()
     }
 
-    pub(super) fn captured_wait(
+    pub(super) fn stopped_outcome(
         &self,
-    ) -> Option<nt_user_host::provider_kernel_activation::KernelProviderWaitCapture> {
-        self.wait.captured_wait()
+    ) -> Result<nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome, u32> {
+        self.wait.stopped_outcome()
     }
 
     pub(super) fn observation(&self) -> Option<spawn_hosts::PumpResult> {

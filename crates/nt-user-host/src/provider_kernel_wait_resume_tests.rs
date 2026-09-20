@@ -20,6 +20,8 @@ mod eligibility;
 mod local_delivery;
 #[path = "provider_kernel_wait_admission_tests.rs"]
 mod admission;
+#[path = "provider_kernel_stopped_outcome_tests.rs"]
+mod stopped_outcome;
 
 struct Recipient {
     state: KernelProviderWaitState,

@@ -18,6 +18,16 @@ enum WaitObservation {
     },
 }
 
+/// A retained physical stop, not authority to publish, resume, or release its activation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelProviderStoppedOutcome {
+    Returned(u32),
+    WaitCaptured(KernelProviderWaitCapture),
+    Walled,
+    CallbackSuspended,
+    LpcWaitSuspended,
+}
+
 /// The native recipient retains this state alongside its physical channel and pump result.
 #[derive(Debug)]
 pub struct KernelProviderWaitState {
@@ -60,6 +70,31 @@ impl KernelProviderWaitState {
 
     pub fn progress(&self) -> &KernelProviderPumpProgress {
         &self.progress
+    }
+
+    /// Classify only a fully observed stop, preserving failed wait capture ownership.
+    pub fn stopped_outcome(&self) -> Result<KernelProviderStoppedOutcome, u32> {
+        use KernelProviderPumpDisposition as Pump;
+        use KernelProviderStoppedOutcome as Stop;
+        match self.progress.disposition() {
+            Some(Pump::ProviderWaitSuspended) => match self.wait {
+                Some(WaitObservation::Captured(capture))
+                    if self
+                        .progress
+                        .provider_wait_observation(capture.caller().binding().reply_object)
+                        == Some(capture.observation()) =>
+                {
+                    Ok(Stop::WaitCaptured(capture))
+                }
+                Some(WaitObservation::Rejected { status, .. }) => Err(status),
+                _ => Err(STATUS_INVALID_PARAMETER),
+            },
+            Some(Pump::Returned(status)) => Ok(Stop::Returned(status)),
+            Some(Pump::Walled) => Ok(Stop::Walled),
+            Some(Pump::CallbackSuspended) => Ok(Stop::CallbackSuspended),
+            Some(Pump::LpcWaitSuspended) => Ok(Stop::LpcWaitSuspended),
+            _ => Err(STATUS_INVALID_PARAMETER),
+        }
     }
 
     pub fn begin_initial(&mut self) -> Result<KernelProviderPumpAttempt, PumpProgressError> {

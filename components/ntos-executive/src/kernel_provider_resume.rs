@@ -59,8 +59,8 @@ pub(crate) enum DriverEntryWaitOutcome {
     Stopped(spawn_hosts::PumpResult),
 }
 
-/// Readiness must select the real typed frame before this entry. Admission remains disabled
-/// until dispatcher leases, readiness and repeated-wait admission are wired.
+/// Readiness must select the real typed frame before this entry. Blocking DriverEntry admission
+/// remains disabled until bootstrap owns the complete scheduling and receive path.
 pub(crate) unsafe fn run_driver_entry_wait_resume(
     caller: KernelProviderCaller,
     capture: KernelProviderWaitCapture,
@@ -96,14 +96,21 @@ unsafe fn finish_stopped_wait(
     previous: KernelProviderWaitCapture,
     result: spawn_hosts::PumpResult,
 ) -> Result<DriverEntryWaitOutcome, u32> {
-    let recipient = (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?;
-    if let Some(next) = recipient.captured_wait() {
-        // The next physical wait stays in the recipient while the old Resuming frame remains.
-        // Its readiness owner must acquire leases before replacing that frame, never stack it.
-        return Ok(DriverEntryWaitOutcome::WaitCaptured(next));
-    }
-    let Some(status) = recipient.observed_return() else {
-        return Ok(DriverEntryWaitOutcome::Stopped(result));
+    use nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome;
+    let stop = (&*core::ptr::addr_of!(ACTIVATIONS))
+        .recipient(caller)?
+        .stopped_outcome()?;
+    let status = match stop {
+        KernelProviderStoppedOutcome::WaitCaptured(next) => {
+            // The old Resuming frame remains until the next wait acquires dispatcher leases.
+            return Ok(DriverEntryWaitOutcome::WaitCaptured(next));
+        }
+        KernelProviderStoppedOutcome::Returned(status) => status,
+        KernelProviderStoppedOutcome::Walled
+        | KernelProviderStoppedOutcome::CallbackSuspended
+        | KernelProviderStoppedOutcome::LpcWaitSuspended => {
+            return Ok(DriverEntryWaitOutcome::Stopped(result));
+        }
     };
     let terminal = with_provider_process_manager(|pm| {
         (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))

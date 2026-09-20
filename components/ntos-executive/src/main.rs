@@ -30140,11 +30140,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 ps_bootstrap::initial_system_projection()
                     .expect("DriverEntry requires the canonical initial System objects").identity,
             ).expect("DriverEntry must retain its canonical caller before pumping requests");
-            let (init_pr, init_receipt) = service_sec_image::kernel_provider_activation::run_initial_driver_entry(init_caller)
+            let init_outcome = service_sec_image::kernel_provider_activation::run_initial_driver_entry(init_caller)
                 .expect("DriverEntry must retain its exact entered pump and outcome");
+            use nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome;
+            let init_pr = init_outcome.observation;
+            let init_receipt = init_outcome.receipt;
             let faults = init_pr.faults;
             let demand = init_pr.demand;
-            let finished = init_pr.completed;
+            let fault_wall = matches!(init_outcome.stop, KernelProviderStoppedOutcome::Walled);
             let (wall_ip, wall_addr, wall_label) =
                 (init_pr.wall_ip, init_pr.wall_addr, init_pr.wall_label);
             let de_status = init_receipt.map(|receipt| receipt.status() as i32);
@@ -30183,6 +30186,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             if let Some(de_status) = de_status {
                 print_str(b"RETURNED status=0x");
                 print_hex(de_status as u32);
+            } else if matches!(init_outcome.stop, KernelProviderStoppedOutcome::WaitCaptured(_)) {
+                print_str(b"PROVIDER WAIT CAPTURED");
+            } else if matches!(init_outcome.stop, KernelProviderStoppedOutcome::CallbackSuspended) {
+                print_str(b"CALLBACK SUSPENDED");
+            } else if matches!(init_outcome.stop, KernelProviderStoppedOutcome::LpcWaitSuspended) {
+                print_str(b"LPC WAIT SUSPENDED");
             } else {
                 print_str(b"STOPPED label=");
                 print_u64(wall_label);
@@ -30222,7 +30231,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 if (verdict & win32k_subsystem::V_CALLOUT_RETURNED) != 0 {
                     print_str(b"RETURNED");
                 } else {
-                    print_str(b"ran then faulted (see backtrace)");
+                    print_str(b"entered without an observed return");
                 }
                 print_str(b"\n");
             }
@@ -30235,7 +30244,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             );
             // On a fault wall, backtrace: map the component's stack into the executive and print
             // every return address that lands in the win32k image, as an RVA — the call chain.
-            if !finished {
+            if fault_wall {
                 let ss = WIN32K_STACK_SLOT.load(Ordering::Relaxed);
                 let sf = WIN32K_STACK_FRAMES.load(Ordering::Relaxed);
                 if ss != 0 && sf != 0 {

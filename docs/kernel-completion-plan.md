@@ -35949,10 +35949,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         rejection occurs before this path. This is fail-closed initialization, not hardware recovery.
         Review adjustment: live component-resume rearm failure still needs an explicit servicing or
         failure boundary; startup validation alone does not cover subsequent hardware failure.
-        Before bootstrap selected execution, also replace the initial DriverEntry tuple with typed
-        stopped/wait/return classification shared with resumed execution. Captured waits must not
-        be diagnosed as fault walls, and initial completion receipts must remain distinct from
-        resumed terminal identities. Blocking admission remains disabled until outer ownership works.
+        The typed DriverEntry stop checkpoint below addresses the initial tuple's ambiguity;
+        blocking admission remains disabled until outer ownership works.
+      - [x] Classify retained DriverEntry stops before handing them to an outer owner (2026-09-20).
+        Shared KernelProviderWaitState now reports exact captured waits, observed returns, walls,
+        callback suspension and LPC suspension without mutating ownership. Ready/invoking states,
+        IRQ yields, malformed observations and uncaptured provider waits are rejected; rejected
+        capture retains its original status, and a capture must match the current pump observation.
+        Initial DriverEntry now returns a named outcome carrying its observation and typed stop;
+        only an observed return records an initial completion receipt. Resumed DriverEntry uses
+        the same classifier but preserves its previous wait's terminal identity and local delivery.
+        Removed the native captured-wait shortcut replaced by this classification. Root diagnostics
+        now distinguish suspension from a fault wall and only backtrace the latter; readiness still
+        requires the original successful completion acknowledgement. Three focused tests cover all
+        32 pump flag combinations, ready/invoking states, stale capture after entry, repeated read-only
+        classification and exact rejected-status retention. All three focused tests and 1,387
+        tests across 24 serialized host suites pass. Executive release passes (final run 35.59s,
+        294 warnings); I/O Manager release also passes. Evidence:
+        .tmp/test-driver-entry-stop-focused-20260920.log, .tmp/test-driver-entry-stop-20260920.log,
+        .tmp/build-driver-entry-stop-final-20260920.log and
+        .tmp/build-driver-entry-stop-io-manager-20260920.log. No QEMU rerun: the unchanged strict
+        27-export rejection precedes this path. Review found no ownership regression. This does not enable blocking
+        admission, publish dispatcher leases or supply the missing bootstrap outer scheduling/fan-in.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

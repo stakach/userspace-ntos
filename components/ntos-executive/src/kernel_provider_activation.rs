@@ -155,17 +155,18 @@ pub(crate) unsafe fn capture_win32k_initial_system(
     })
 }
 
+#[must_use = "a stopped activation retains its readiness or completion owner"]
+pub(crate) struct InitialDriverEntryOutcome {
+    pub observation: spawn_hosts::PumpResult,
+    pub stop: nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome,
+    pub receipt: Option<KernelProviderCompletionReceipt>,
+}
+
 /// Claim the first pump once, then only genuine IRQ-yield receive continuations. The provider
 /// retains its Running lane throughout; walls and typed waits do not enter this scheduler path.
 pub(crate) unsafe fn run_initial_driver_entry(
     caller: KernelProviderCaller,
-) -> Result<
-    (
-        spawn_hosts::PumpResult,
-        Option<KernelProviderCompletionReceipt>,
-    ),
-    u32,
-> {
+) -> Result<InitialDriverEntryOutcome, u32> {
     let scope = driver_launch::ComponentSchedulerScope::enter();
     let (channel, mut attempt) = with_provider_process_manager(|pm| {
         let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
@@ -180,8 +181,23 @@ pub(crate) unsafe fn run_initial_driver_entry(
     let result = spawn_hosts::component_pump(&channel);
     observe_driver_entry_pump(&channel, &mut attempt, &result)?;
     let result = receive_driver_entry_yields(&scope, caller, None, result)?;
-    let receipt = finish_observed_driver_entry_return(caller)?;
-    Ok((result, receipt))
+    use nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome;
+    let stop = (&*core::ptr::addr_of!(ACTIVATIONS))
+        .recipient(caller)?
+        .stopped_outcome()?;
+    let receipt = if matches!(stop, KernelProviderStoppedOutcome::Returned(_)) {
+        Some(
+            finish_observed_driver_entry_return(caller)?
+                .ok_or(nt_process::STATUS_INVALID_PARAMETER)?,
+        )
+    } else {
+        None
+    };
+    Ok(InitialDriverEntryOutcome {
+        observation: result,
+        stop,
+        receipt,
+    })
 }
 
 unsafe fn validate_driver_entry_execution(
