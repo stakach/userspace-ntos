@@ -30,6 +30,52 @@ impl TimerRearmOutcome {
     }
 }
 
+/// Outer receive preconditions, sampled from the current timer and scheduler owners.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimerReceiveState {
+    pub registered: bool,
+    pub active: bool,
+    pub delivery_running: bool,
+    pub continuation_running: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimerReceiveError {
+    UnregisteredOwner,
+    UnavailableOwner,
+    ActiveDelivery,
+    ActiveContinuation,
+    Rearm(TimerRearmOutcome),
+}
+
+impl TimerReceiveState {
+    /// Refuse blocking ingress before effects if ownership is unavailable or still executing.
+    /// `None` means memory-only reconciliation needed no new shot, not an unavailable owner.
+    /// The callback must report every programming attempt and must not replace the sampled owner.
+    /// Neither success nor failure acknowledges retained scheduling demand.
+    pub fn prepare(
+        self,
+        rearm: impl FnOnce() -> Option<TimerRearmOutcome>,
+    ) -> Result<(), TimerReceiveError> {
+        if !self.registered {
+            return Err(TimerReceiveError::UnregisteredOwner);
+        }
+        if !self.active {
+            return Err(TimerReceiveError::UnavailableOwner);
+        }
+        if self.delivery_running {
+            return Err(TimerReceiveError::ActiveDelivery);
+        }
+        if self.continuation_running {
+            return Err(TimerReceiveError::ActiveContinuation);
+        }
+        match rearm() {
+            Some(outcome) if !outcome.owner_available() => Err(TimerReceiveError::Rearm(outcome)),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// One bounded channel-0 one-shot. A zero reload is the 8254 encoding of 65,536 ticks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PitOneShot {

@@ -109,8 +109,30 @@ unsafe fn reconcile_demand(pm: &nt_process::ProcessManager, now: u64) {
 /// Every finalization barrier rechecks work before receiving. Physical exclusion suppresses
 /// programming, not retained demand. Timer programming failure cannot acknowledge that demand.
 pub(super) unsafe fn reconcile(handler: &mut ExecNtHandler) {
+    // Nested finalization may defer; the outer receive boundary checks the live owner again.
+    let _ = reconcile_runtime(handler);
+}
+
+/// A failed source may not silently strand deadlines in a blocking receive. Do not initialize
+/// or replace hardware here: the existing fault path owns disabling and retiring that source.
+pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) {
+    let state = nt_kernel_exec::TimerReceiveState {
+        registered: SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire)
+            == core::ptr::from_ref(handler) as u64
+            && SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) != 0,
+        active: DELAY_TIMER_HANDLER.load(Ordering::Relaxed) != 0
+            && DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) == DELAY_TIMER_IRQ_ACTIVE,
+        delivery_running: TIMER_DELIVERY_GATE.is_active(),
+        continuation_running: is_running(),
+    };
+    state
+        .prepare(|| reconcile_runtime(handler))
+        .expect("runtime timer ownership must permit blocking receive");
+}
+
+unsafe fn reconcile_runtime(handler: &mut ExecNtHandler) -> Option<nt_kernel_exec::TimerRearmOutcome> {
     if !runtime_ready(core::ptr::from_ref(handler)) || is_running() {
-        return;
+        return None;
     }
     let previous = (&*core::ptr::addr_of!(WAKE)).next_deadline();
     let now = monotonic_time_100ns();
@@ -122,12 +144,12 @@ pub(super) unsafe fn reconcile(handler: &mut ExecNtHandler) {
         && dpc_deadline.is_none()
         && acpi_deadline.is_none()
     {
-        return;
+        return None;
     }
     let queue =
         SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) as *const nt_delay_execution::Queue;
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
-    delay_timer_rearm(&*queue, handler);
+    Some(delay_timer_rearm(&*queue, handler))
 }
 
 unsafe fn drain_terminals(handler: *mut ExecNtHandler) -> bool {

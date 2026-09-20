@@ -16,6 +16,129 @@ fn finite_wait_requires_programming_not_merely_an_available_owner() {
 use alloc::vec;
 
 #[test]
+fn receive_preflight_checks_every_owner_state_before_rearm_effects() {
+    for registered in [false, true] {
+        for active in [false, true] {
+            for delivery_running in [false, true] {
+                for continuation_running in [false, true] {
+                    let state = TimerReceiveState {
+                        registered,
+                        active,
+                        delivery_running,
+                        continuation_running,
+                    };
+                    let expected = if !registered {
+                        Err(TimerReceiveError::UnregisteredOwner)
+                    } else if !active {
+                        Err(TimerReceiveError::UnavailableOwner)
+                    } else if delivery_running {
+                        Err(TimerReceiveError::ActiveDelivery)
+                    } else if continuation_running {
+                        Err(TimerReceiveError::ActiveContinuation)
+                    } else {
+                        Ok(())
+                    };
+                    let mut effects = 0;
+                    assert_eq!(
+                        state.prepare(|| {
+                            effects += 1;
+                            Some(TimerRearmOutcome::Programmed)
+                        }),
+                        expected,
+                    );
+                    assert_eq!(effects, usize::from(expected.is_ok()));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn receive_accepts_only_successful_or_unnecessary_rearm() {
+    for (outcome, expected) in [
+        (None, Ok(())),
+        (Some(TimerRearmOutcome::Idle), Ok(())),
+        (Some(TimerRearmOutcome::Programmed), Ok(())),
+        (
+            Some(TimerRearmOutcome::Unavailable),
+            Err(TimerReceiveError::Rearm(TimerRearmOutcome::Unavailable)),
+        ),
+        (
+            Some(TimerRearmOutcome::Failed),
+            Err(TimerReceiveError::Rearm(TimerRearmOutcome::Failed)),
+        ),
+    ] {
+        let mut effects = 0;
+        let state = TimerReceiveState {
+            registered: true,
+            active: true,
+            delivery_running: false,
+            continuation_running: false,
+        };
+        assert_eq!(
+            state.prepare(|| {
+                effects += 1;
+                outcome
+            }),
+            expected,
+        );
+        assert_eq!(effects, 1);
+    }
+}
+
+#[test]
+fn receive_preparation_never_acknowledges_retained_continuation_demand() {
+    use nt_component_suspension::{ResumeDemand, ResumeWake};
+
+    let mut wake = ResumeWake::new(10, 80).unwrap();
+    wake.reconcile_demand(ResumeDemand::Pending, 100);
+    let mut pass = wake.begin_pass(100).unwrap().unwrap();
+    wake.finish_pass(&mut pass, 100, true, false).unwrap();
+    assert_eq!(wake.next_deadline(), Some(110));
+
+    let mut effects = 0;
+    for outcome in [TimerRearmOutcome::Failed, TimerRearmOutcome::Programmed] {
+        let state = TimerReceiveState {
+            registered: true,
+            active: true,
+            delivery_running: false,
+            continuation_running: wake.is_running(),
+        };
+        let result = state.prepare(|| {
+            effects += 1;
+            assert_eq!(wake.next_deadline(), Some(110));
+            Some(outcome)
+        });
+        assert_eq!(result.is_ok(), outcome == TimerRearmOutcome::Programmed);
+        assert_eq!(wake.next_deadline(), Some(110));
+        assert!(!wake.is_running());
+    }
+    assert_eq!(effects, 2);
+
+    let mut pass = wake.begin_pass(110).unwrap().unwrap();
+    let state = TimerReceiveState {
+        registered: true,
+        active: true,
+        delivery_running: false,
+        continuation_running: wake.is_running(),
+    };
+    assert_eq!(
+        state.prepare(|| {
+            effects += 1;
+            Some(TimerRearmOutcome::Programmed)
+        }),
+        Err(TimerReceiveError::ActiveContinuation),
+    );
+    assert_eq!(effects, 2);
+    assert!(wake.is_running());
+    assert_eq!(wake.next_deadline(), None);
+
+    // Only the exact outer pass may acknowledge work; receive preparation preserves backoff.
+    wake.finish_pass(&mut pass, 110, true, false).unwrap();
+    assert_eq!(wake.next_deadline(), Some(130));
+}
+
+#[test]
 fn expired_timer_dpc_survives_until_a_separate_scheduler_claim() {
     let mut clock = FakeClock::new();
     let mut timers = TimerQueue::new();

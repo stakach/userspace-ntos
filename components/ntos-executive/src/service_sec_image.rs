@@ -7984,19 +7984,19 @@ pub(crate) unsafe fn service_sec_image(
     // This barrier only programs wake demand; provider execution stays at the outer loop top.
     macro_rules! component_recv {
         ($($arg:expr),* $(,)?) => {{
-            component_resume::reconcile(&mut nt_handler);
+            component_resume::prepare_receive(&mut nt_handler);
             recv_full_r12($($arg),*)
         }};
     }
     macro_rules! component_reply_recv {
         ($($arg:expr),* $(,)?) => {{
-            component_resume::reconcile(&mut nt_handler);
+            component_resume::prepare_receive(&mut nt_handler);
             reply_recv_badge($($arg),*)
         }};
     }
     macro_rules! component_client_reply_recv {
         ($($arg:expr),* $(,)?) => {{
-            component_resume::reconcile(&mut nt_handler);
+            component_resume::prepare_receive(&mut nt_handler);
             client_reply_recv_badge($($arg),*)
         }};
     }

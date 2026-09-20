@@ -116,7 +116,7 @@ pub use semaphore::{
 pub use spin::{SpinError, SpinLockTable};
 pub use timer::{
     map_timer_access, pit_oneshot_for_deadline, Clock, FakeClock, PitOneShot, TimerExpiry,
-    TimerQueue, TimerRearmOutcome, PIT_INPUT_HZ,
+    TimerQueue, TimerRearmOutcome, TimerReceiveError, TimerReceiveState, PIT_INPUT_HZ,
 };
 pub use work_item::WorkQueue;
 

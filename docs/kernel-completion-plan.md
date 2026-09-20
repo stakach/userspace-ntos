@@ -35947,8 +35947,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Evidence: .tmp/test-runtime-timer-handoff-20260920.log and
         .tmp/build-runtime-timer-handoff-20260920.log. No QEMU rerun: the unchanged 27-export
         rejection occurs before this path. This is fail-closed initialization, not hardware recovery.
-        Review adjustment: live component-resume rearm failure still needs an explicit servicing or
-        failure boundary; startup validation alone does not cover subsequent hardware failure.
+        Review adjustment: startup validation alone does not cover subsequent hardware failure;
+        the live receive-boundary checkpoint below now closes silent blocking ingress on failure.
         The typed DriverEntry stop checkpoint below addresses the initial tuple's ambiguity;
         blocking admission remains disabled until outer ownership works.
       - [x] Classify retained DriverEntry stops before handing them to an outer owner (2026-09-20).
@@ -35971,6 +35971,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/build-driver-entry-stop-io-manager-20260920.log. No QEMU rerun: the unchanged strict
         27-export rejection precedes this path. Review found no ownership regression. This does not enable blocking
         admission, publish dispatcher leases or supply the missing bootstrap outer scheduling/fan-in.
+      - [x] Refuse outer blocking ingress after live timer ownership failure (2026-09-20).
+        All three runtime receive macros now use an explicit prepare_receive boundary. Shared
+        TimerReceiveState checks registered owner, active source, timer-delivery exclusion and
+        continuation-pass exclusion before reconciliation effects. An earlier source failure is
+        therefore detected even when the ordinary nested reconciliation would skip hardware work.
+        Actual scheduler-demand rearm returns its outcome; Failed/Unavailable refuse receive,
+        while Idle/Programmed and memory-only no-shot reconciliation are valid. Native refusal
+        reports the precise error and fails closed rather than blocking indefinitely. Existing
+        source masking/retirement and watchdog quiesce remain unchanged; no recovery, second
+        source, forged wake or retained-demand acknowledgement is introduced. Generic nested
+        finalization still permits deferred reconciliation, with the outer boundary rechecking it.
+        Tests cover all 16 preflight states and effect ordering, all five optional rearm outcomes,
+        and real ResumeWake deadline/backoff/exact-pass retention. Three focused tests and 1,390
+        tests across 24 serialized host suites pass. Executive release passes in 38.35s with
+        294 warnings; I/O Manager release also passes. Evidence:
+        .tmp/test-runtime-receive-guard-focused-20260920.log,
+        .tmp/test-runtime-receive-guard-20260920.log,
+        .tmp/build-runtime-receive-guard-20260920.log and
+        .tmp/build-runtime-receive-guard-io-manager-20260920.log.
+        Independent review found no issue. No QEMU rerun: the unchanged 27-export rejection
+        precedes this path, so no native failure-injection or desktop proof is claimed.
+        This checks ownership and the existing scheduler-demand rearm, not unconditional
+        programming of unrelated timer sources on every receive. Bootstrap outer scheduling,
+        receive fan-in, blocking DriverEntry admission and the strict import frontier remain open.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
