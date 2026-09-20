@@ -1,6 +1,57 @@
 use super::*;
 
 #[test]
+fn demand_distinguishes_physical_exclusion_from_stopped_publication() {
+    for busy in [false, true] {
+        for stopped in [false, true] {
+            for ready in [false, true] {
+                let inspected = core::cell::Cell::new(false);
+                let demand = ResumeDemand::observe(busy, stopped, || {
+                    inspected.set(true);
+                    ready
+                });
+                let expected = if busy && !stopped {
+                    ResumeDemand::ExecutionBlocked
+                } else if stopped || ready {
+                    ResumeDemand::Pending
+                } else {
+                    ResumeDemand::Empty
+                };
+                assert_eq!(demand, expected);
+                assert_eq!(inspected.get(), !busy && !stopped);
+                assert_eq!(demand.can_schedule(), !busy || stopped);
+                assert_eq!(demand.retains_work(), busy || stopped || ready);
+            }
+        }
+    }
+}
+
+#[test]
+fn excluded_observations_preserve_backoff_and_running_pass_ownership() {
+    let mut wake = ResumeWake::new(10, 40).unwrap();
+    wake.reconcile_demand(ResumeDemand::Pending, 100);
+    let mut pass = wake.begin_pass(100).unwrap().unwrap();
+    wake.reconcile_demand(ResumeDemand::Empty, 105);
+    assert!(wake.is_running());
+    wake.finish_pass(
+        &mut pass,
+        110,
+        ResumeDemand::ExecutionBlocked.retains_work(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(wake.next_deadline(), Some(120));
+    wake.reconcile_demand(ResumeDemand::ExecutionBlocked, 200);
+    assert_eq!(wake.next_deadline(), Some(120));
+    wake.reconcile_demand(ResumeDemand::Pending, 200);
+    let mut pass = wake.begin_pass(200).unwrap().unwrap();
+    wake.finish_pass(&mut pass, 200, true, false).unwrap();
+    assert_eq!(wake.next_deadline(), Some(220));
+    wake.reconcile_demand(ResumeDemand::Empty, 210);
+    assert_eq!(wake.next_deadline(), None);
+}
+
+#[test]
 fn intervals_require_a_positive_bounded_yield() {
     for (minimum, maximum) in [(0, 0), (0, 10), (20, 10)] {
         assert!(matches!(

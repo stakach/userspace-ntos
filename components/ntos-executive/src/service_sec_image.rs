@@ -1815,7 +1815,7 @@ unsafe fn component_suspension_resume_top(
         return None;
     }
     loop {
-        let candidate = component_resume::next_ready(nt_handler)?;
+        let candidate = component_resume::next_ready(&nt_handler.pm)?;
         if matches!(candidate.continuation, ComponentNativeContinuation::Kernel(_)) {
             return None;
         }

@@ -7,6 +7,41 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_PASS: AtomicU64 = AtomicU64::new(1);
 
+/// A scheduling observation, never authority to execute a lane or consume a wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResumeDemand {
+    ExecutionBlocked,
+    Empty,
+    Pending,
+}
+
+impl ResumeDemand {
+    /// A captured but unpublished wait can release its physical owner through publication.
+    /// Otherwise physical exclusion makes a negative readiness observation inconclusive.
+    /// Readiness is inspected lazily and must be memory-local, without provider execution.
+    pub fn observe(
+        execution_busy: bool,
+        stopped_publication: bool,
+        ready: impl FnOnce() -> bool,
+    ) -> Self {
+        if execution_busy && !stopped_publication {
+            Self::ExecutionBlocked
+        } else if stopped_publication || ready() {
+            Self::Pending
+        } else {
+            Self::Empty
+        }
+    }
+
+    pub const fn can_schedule(self) -> bool {
+        !matches!(self, Self::ExecutionBlocked)
+    }
+
+    pub const fn retains_work(self) -> bool {
+        !matches!(self, Self::Empty)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResumeWakeError {
     InvalidIntervals,
@@ -70,6 +105,13 @@ impl ResumeWake {
                 self.retry_delay = self.minimum_delay;
             }
             _ => {}
+        }
+    }
+
+    /// Physical exclusion suppresses scheduling, not the original deadline or retry backoff.
+    pub fn reconcile_demand(&mut self, demand: ResumeDemand, now: u64) {
+        if demand.can_schedule() {
+            self.reconcile(demand.retains_work(), now);
         }
     }
 

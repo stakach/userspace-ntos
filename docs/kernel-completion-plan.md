@@ -35914,6 +35914,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         ignores its initial rearm outcome; inactive/faulted hardware recovery remains unresolved,
         not permission to restore direct unpaced delivery. Native IRQ/receive routing is reviewed,
         not host-executed. Bootstrap selected execution/fan-in and the strict import wall remain open.
+      - [x] Make continuation selection and wake-demand reconciliation handler-independent (2026-09-20).
+        Selection/eligibility, deadline observation and wake observation now take the canonical PM,
+        not a whole ExecNtHandler. Runtime registration checks and hardware rearm stay in the
+        runtime adapter; memory-only demand reconciliation is separate and uses one sampled time.
+        Shared ResumeDemand distinguishes blocked execution, empty work and pending work. A stopped
+        unpublished wait can authorize scheduling its publication, never execution by itself.
+        Busy execution without that publication suppresses readiness inspection and preserves the
+        original deadline/backoff. Post-pass blocked execution retains demand. Idle selected or
+        terminal/completion-only work remains schedulable; idle empty work clears the wake.
+        Native readiness scans remain lazy and no PM reference crosses a pump. The existing exact
+        lane/caller/continuation claims are unchanged. Adapted real lane and kernel wait/completion
+        fixtures to use the production policy; added its complete boolean matrix and blocked/running
+        wake retention tests. Focused validation passes 841 tests across two library suites
+        (.tmp/test-scheduler-demand-focused-20260920.log). The serialized host run passes 1,384
+        tests across 24 suites (.tmp/test-scheduler-demand-20260920.log). Executive release passes
+        in 38.14s with 294 warnings; I/O Manager passes cached in 0.06s. Evidence:
+        .tmp/build-scheduler-demand-20260920.log and .tmp/build-scheduler-demand-io-manager-20260920.log.
+        No QEMU rerun; the unchanged strict import rejection precedes this native path.
+        Independent review found no blocking issue. The post-pass busy short-circuit is retained
+        to avoid an unnecessary stopped-work scan; no runtime performance claim is made without boot proof.
+        This removes a bootstrap ownership prerequisite, not the need for an outer selected-job
+        runner and receive fan-in. Blocking DriverEntry admission and the 27-export wall remain unchanged.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

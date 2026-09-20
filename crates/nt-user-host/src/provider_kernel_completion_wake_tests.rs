@@ -1,5 +1,5 @@
 use super::*;
-use nt_component_suspension::ResumeWake;
+use nt_component_suspension::{ResumeDemand, ResumeWake};
 
 fn has_work(f: &Fixture) -> bool {
     f.activations.has_ready_completion() || f.lanes.next_terminal().is_some()
@@ -15,7 +15,9 @@ fn terminal_only_refusal_keeps_retry_until_exact_retirement_and_ack() {
     assert!(has_work(&f));
     assert!(f.lanes.next_resumable().is_none());
     assert!(!f.lanes.execution_busy());
-    wake.reconcile(has_work(&f), 100);
+    let demand = ResumeDemand::observe(f.lanes.execution_busy(), false, || has_work(&f));
+    assert_eq!(demand, ResumeDemand::Pending);
+    wake.reconcile_demand(demand, 100);
 
     for (now, next) in [(100, 110), (110, 130)] {
         let mut pass = wake.begin_pass(now).unwrap().unwrap();

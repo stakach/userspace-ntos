@@ -1,7 +1,7 @@
 //! Outer-only execution and coalesced wake demand for selected component continuations.
 
 use super::*;
-use nt_component_suspension::{LaneResume, ResumePass, ResumeWake, SuspensionOwner};
+use nt_component_suspension::{LaneResume, ResumeDemand, ResumePass, ResumeWake, SuspensionOwner};
 
 #[path = "component_resume_execute.rs"]
 mod execute;
@@ -21,14 +21,17 @@ pub(super) struct Candidate {
     pub(super) continuation: ComponentNativeContinuation,
 }
 
-unsafe fn eligible(handler: &ExecNtHandler, continuation: ComponentNativeContinuation) -> bool {
+unsafe fn eligible(
+    pm: &nt_process::ProcessManager,
+    continuation: ComponentNativeContinuation,
+) -> bool {
     match continuation {
         ComponentNativeContinuation::Hosted(hosted) => {
             hosted.return_target.can_resume()
                 && win32k_glue::win32k_client_context_is_admitted(hosted.pending.client())
         }
         ComponentNativeContinuation::Kernel(capture) => {
-            kernel_provider_activation::wait_resume_is_eligible(&handler.pm, capture)
+            kernel_provider_activation::wait_resume_is_eligible(pm, capture)
         }
     }
 }
@@ -45,15 +48,15 @@ unsafe fn candidate(resume: LaneResume<ComponentSuspensionCompletion>) -> Option
     })
 }
 
-pub(super) unsafe fn next_ready(handler: &ExecNtHandler) -> Option<Candidate> {
+pub(super) unsafe fn next_ready(pm: &nt_process::ProcessManager) -> Option<Candidate> {
     let resume = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
-        .next_resumable_if(|frame| eligible(handler, frame.continuation))?;
+        .next_resumable_if(|frame| eligible(pm, frame.continuation))?;
     candidate(resume)
 }
 
-unsafe fn next_in_pass(handler: &ExecNtHandler, pass: &mut ResumePass) -> Option<Candidate> {
+unsafe fn next_in_pass(pm: &nt_process::ProcessManager, pass: &mut ResumePass) -> Option<Candidate> {
     let resume = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
-        .next_resumable_in_pass(pass, |frame| eligible(handler, frame.continuation))?;
+        .next_resumable_in_pass(pass, |frame| eligible(pm, frame.continuation))?;
     candidate(resume)
 }
 
@@ -69,9 +72,9 @@ fn runtime_ready(handler: *const ExecNtHandler) -> bool {
 }
 
 /// Timer callbacks only query this demand; they never claim or execute a selected continuation.
-pub(crate) unsafe fn next_deadline(handler: &ExecNtHandler) -> Option<u64> {
+pub(crate) unsafe fn next_deadline(pm: &nt_process::ProcessManager) -> Option<u64> {
     if component_execution_is_busy()
-        && !kernel_provider_activation::has_stopped_wait_work(&handler.pm)
+        && !kernel_provider_activation::has_stopped_wait_work(pm)
     {
         return None;
     }
@@ -84,8 +87,23 @@ pub(crate) unsafe fn retained_deadline() -> Option<u64> {
 }
 
 /// Count a scheduler wake as timer work without acknowledging demand or entering a provider.
-pub(crate) unsafe fn wake_due(handler: &ExecNtHandler, now: u64) -> u64 {
-    u64::from(next_deadline(handler).is_some_and(|deadline| deadline <= now))
+pub(crate) unsafe fn wake_due(pm: &nt_process::ProcessManager, now: u64) -> u64 {
+    u64::from(next_deadline(pm).is_some_and(|deadline| deadline <= now))
+}
+
+/// Memory-only observation. Do not run readiness validation while physical exclusion makes
+/// its absence inconclusive; a stopped publication is distinct from an executing provider.
+unsafe fn observe_demand(pm: &nt_process::ProcessManager) -> ResumeDemand {
+    ResumeDemand::observe(
+        component_execution_is_busy(),
+        kernel_provider_activation::has_stopped_wait_work(pm),
+        || next_ready(pm).is_some() || kernel_provider_activation::has_ready_completions(),
+    )
+}
+
+unsafe fn reconcile_demand(pm: &nt_process::ProcessManager, now: u64) {
+    let demand = observe_demand(pm);
+    (&mut *core::ptr::addr_of_mut!(WAKE)).reconcile_demand(demand, now);
 }
 
 /// Every finalization barrier rechecks work before receiving. Physical exclusion suppresses
@@ -95,15 +113,10 @@ pub(super) unsafe fn reconcile(handler: &mut ExecNtHandler) {
         return;
     }
     let previous = (&*core::ptr::addr_of!(WAKE)).next_deadline();
-    let stopped_wait = kernel_provider_activation::has_stopped_wait_work(&handler.pm);
-    if !component_execution_is_busy() || stopped_wait {
-        let has_work = stopped_wait
-            || next_ready(handler).is_some()
-            || kernel_provider_activation::has_ready_completions();
-        (&mut *core::ptr::addr_of_mut!(WAKE)).reconcile(has_work, monotonic_time_100ns());
-    }
-    let dpc_deadline = driver_launch::hosted_dpc_next_deadline(monotonic_time_100ns());
-    let acpi_deadline = driver_launch::hosted_acpi_pci_route_recovery_next_deadline(monotonic_time_100ns());
+    let now = monotonic_time_100ns();
+    reconcile_demand(&handler.pm, now);
+    let dpc_deadline = driver_launch::hosted_dpc_next_deadline(now);
+    let acpi_deadline = driver_launch::hosted_acpi_pci_route_recovery_next_deadline(now);
     if previous.is_none()
         && (&*core::ptr::addr_of!(WAKE)).next_deadline().is_none()
         && dpc_deadline.is_none()
@@ -163,7 +176,7 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     kernel_provider_activation::publish_runtime_waits(&mut *handler);
     let mut pass = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).resume_pass();
     let mut progressed = drain_terminals(handler);
-    while let Some(candidate) = next_in_pass(&*handler, &mut pass) {
+    while let Some(candidate) = next_in_pass(&(*handler).pm, &mut pass) {
         match candidate.continuation {
             ComponentNativeContinuation::Hosted(_) => {
                 progressed |= run_hosted(handler, candidate).is_some();
@@ -194,10 +207,7 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
         let _ = lpc_endpoint_redrive_all(&mut *handler);
     }
     // A still-running physical owner is not evidence that its retained work disappeared.
-    let has_work = component_execution_is_busy()
-        || kernel_provider_activation::has_stopped_wait_work(&(*handler).pm)
-        || next_ready(&*handler).is_some()
-        || kernel_provider_activation::has_ready_completions();
+    let has_work = component_execution_is_busy() || observe_demand(&(*handler).pm).retains_work();
     if (&mut *core::ptr::addr_of_mut!(WAKE))
         .finish_pass(&mut ticket, monotonic_time_100ns(), has_work, progressed)
         .is_err()

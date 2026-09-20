@@ -4,7 +4,7 @@ type CursorLanes = ComponentSuspensionLanes<u64, i32, u64>;
 
 #[test]
 fn failed_driver_status_ack_is_progress_with_sibling_work_retained() {
-    use nt_component_suspension::ResumeWake;
+    use nt_component_suspension::{ResumeDemand, ResumeWake};
 
     let mut f = Fixture::new();
     assert!(!f.activations.has_ready_completion());
@@ -16,7 +16,12 @@ fn failed_driver_status_ack_is_progress_with_sibling_work_retained() {
         .unwrap();
     let second = f.ready(2);
     let mut wake = ResumeWake::new(10, 40).unwrap();
-    wake.reconcile(f.activations.has_ready_completion(), 100);
+    assert!(f.lanes.next_resumable().is_none());
+    let demand = ResumeDemand::observe(f.lanes.execution_busy(), false, || {
+        f.activations.has_ready_completion()
+    });
+    assert_eq!(demand, ResumeDemand::Pending);
+    wake.reconcile_demand(demand, 100);
     let mut foreign = bootstrap().into_parts().pm;
     for (now, next) in [(100, 110), (110, 130)] {
         let mut pass = wake.begin_pass(now).unwrap().unwrap();

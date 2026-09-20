@@ -16686,7 +16686,7 @@ unsafe fn delay_timer_next_deadline(
         ),
         user_timer: handler.user_timer_next_deadline(now),
         job_time: handler.job_time_sample_next_deadline(),
-        component_resume: service_sec_image::component_resume::next_deadline(handler),
+        component_resume: service_sec_image::component_resume::next_deadline(&handler.pm),
     })
 }
 
@@ -16934,7 +16934,7 @@ unsafe fn delay_timer_drain_due_work(
             now,
         ))
         + timer_retry_wake_due(now_100ns)
-        + service_sec_image::component_resume::wake_due(handler, now_100ns)
+        + service_sec_image::component_resume::wake_due(&handler.pm, now_100ns)
         + driver_launch::hosted_dpc_wake_due(now_100ns)
         + watchdog_tick
 }

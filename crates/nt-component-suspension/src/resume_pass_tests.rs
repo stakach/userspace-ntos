@@ -376,21 +376,31 @@ fn physical_busy_suppression_retains_wake_until_token_release() {
     };
     let running = lanes.allocate(binding).unwrap();
     let mut wake = ResumeWake::new(10, 40).unwrap();
-    wake.reconcile(lanes.next_resumable().is_some(), 100);
+    wake.reconcile_demand(
+        ResumeDemand::observe(lanes.execution_busy(), false, || lanes.next_resumable().is_some()),
+        100,
+    );
     lanes.begin_dispatch(running, binding.reply_object).unwrap();
     // The native timer masks demand while physical execution is occupied; it must not
     // reconcile a temporarily unselectable lane as absent work or acknowledge a timer query.
-    let timer_deadline = if lanes.execution_busy() {
-        None
-    } else {
+    let blocked = ResumeDemand::observe(lanes.execution_busy(), false, || {
+        panic!("physical exclusion must not scan readiness")
+    });
+    wake.reconcile_demand(blocked, 200);
+    let timer_deadline = if blocked.can_schedule() {
         wake.next_deadline()
+    } else {
+        None
     };
     assert_eq!(timer_deadline, None);
     assert_eq!(wake.next_deadline(), Some(100));
     lanes
         .finish_dispatch(running, binding.reply_object)
         .unwrap();
-    wake.reconcile(lanes.next_resumable().is_some(), 200);
+    wake.reconcile_demand(
+        ResumeDemand::observe(lanes.execution_busy(), false, || lanes.next_resumable().is_some()),
+        200,
+    );
     assert_eq!(wake.next_deadline(), Some(100));
     let mut ticket = wake.begin_pass(200).unwrap().unwrap();
     let candidate = lanes.next_resumable().unwrap();
