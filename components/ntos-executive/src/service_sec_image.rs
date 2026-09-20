@@ -289,6 +289,41 @@ pub(crate) unsafe fn register_component_execution_lane(
         .ok()
 }
 
+pub(crate) unsafe fn stage_component_execution_lane(
+    binding: nt_component_suspension::LaneBinding,
+) -> Option<nt_component_suspension::LaneHandle> {
+    (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+        .allocate_staged(binding)
+        .ok()
+}
+
+pub(crate) unsafe fn begin_component_execution_lane_startup(
+    lane: nt_component_suspension::LaneHandle,
+) -> bool {
+    let _message = crate::ipc_message::SavedMessageBuffer::capture();
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let Some(reply) = component_execution_lane_reply(lanes, lane) else {
+        return false;
+    };
+    lanes.begin_startup(lane, reply, |tcb, reply| {
+        crate::spawn_hosts::query_component_reply_binding(tcb, reply)
+    }).is_ok()
+}
+
+/// The caller must first validate the authenticated ready protocol completion.
+pub(crate) unsafe fn complete_component_execution_lane_startup(
+    lane: nt_component_suspension::LaneHandle,
+) -> bool {
+    let _message = crate::ipc_message::SavedMessageBuffer::capture();
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let Some(reply) = component_execution_lane_reply(lanes, lane) else {
+        return false;
+    };
+    lanes.complete_startup(lane, reply, |tcb, reply| {
+        crate::spawn_hosts::query_component_reply_binding(tcb, reply)
+    }).is_ok()
+}
+
 pub(crate) unsafe fn component_execution_lane_binding(
     lane: nt_component_suspension::LaneHandle,
 ) -> Option<nt_component_suspension::LaneBinding> {

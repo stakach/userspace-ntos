@@ -15,6 +15,7 @@ use nt_io_manager::{write_wdm_driver_object, WdmDriverObjectInit};
 
 #[path = "pump_receive_probe.rs"]
 mod receive_probe;
+pub(crate) use receive_probe::query as query_component_reply_binding;
 
 const SEL4_RETYPE_FAN_OUT_LIMIT: u64 = 256;
 
@@ -2484,11 +2485,12 @@ unsafe fn component_pump_loop(
                 }
             }
         } else if label == ch.dispatch_label {
-            // ★ There is nothing to check. This message is the return half of the component's OWN
-            // `Call`, the kernel bound our reply object to that exact caller when it paired, and the
-            // component could not have spoken at all without first being replied to. A stale or
-            // misdirected completion is UNREPRESENTABLE — which is why the sequence handshake and
-            // the per-dispatch token stack are gone.
+            // The receive path authenticated the caller. Ready/completion Calls also require
+            // the exact zero-word, no-capability protocol shape emitted by component_dispatch_loop.
+            if msg.mi != ch.dispatch_label << 12 {
+                outcome.wall(msg);
+                break;
+            }
             PUMP_CALL_DISPATCHES[ch.caps.kind as usize].fetch_add(1, Ordering::Relaxed);
             outcome.completed = true;
             break;

@@ -319,6 +319,20 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
         });
         index
     };
+    let binding = nt_component_suspension::LaneBinding {
+        executor_id: tcb,
+        receive_endpoint: endpoint,
+        reply_object: reply_cap,
+    };
+    let Some(handle) = crate::service_sec_image::stage_component_execution_lane(binding) else {
+        retain_failed_win32k_lane(tcb, b"staging", 0);
+        return false;
+    };
+    win32k_physical_lanes_mut()[physical_index].handle = Some(handle);
+    if !crate::service_sec_image::begin_component_execution_lane_startup(handle) {
+        retain_failed_win32k_lane(tcb, b"startup-admission", 0);
+        return false;
+    }
     let resume = crate::spawn_hosts::resume_spawned_component_worker(tcb, sched_context);
     if resume != 0 {
         retain_failed_win32k_lane(tcb, b"resume", resume);
@@ -328,7 +342,9 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     let ready = pump.completed
         && !pump.callback_suspended
         && !pump.provider_wait_suspended
-        && !pump.lpc_wait_suspended;
+        && !pump.lpc_wait_suspended
+        && !pump.scheduler_yielded
+        && pump.reply_cap == reply_cap;
     print_str(b"[win32k-lane] physical lane=");
     print_u64(worker_index as u64 + 1);
     print_str(b" tcb=0x");
@@ -342,16 +358,10 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
         retain_failed_win32k_lane(tcb, b"ready", pump.wall_label);
         return false;
     }
-    let binding = nt_component_suspension::LaneBinding {
-        executor_id: tcb,
-        receive_endpoint: endpoint,
-        reply_object: reply_cap,
-    };
-    let Some(handle) = crate::service_sec_image::register_component_execution_lane(binding) else {
-        retain_failed_win32k_lane(tcb, b"registration", 0);
+    if !crate::service_sec_image::complete_component_execution_lane_startup(handle) {
+        retain_failed_win32k_lane(tcb, b"startup-completion", 0);
         return false;
-    };
-    win32k_physical_lanes_mut()[physical_index].handle = Some(handle);
+    }
     true
 }
 

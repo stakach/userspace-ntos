@@ -36667,6 +36667,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         release builds pass (.tmp/build-staged-startup-executive-20260920.log and
         .tmp/build-staged-startup-io-manager-20260920.log). A separate code review found no
         existing admission, completion, release, or resume API that bypasses startup exclusion.
+        Native staged startup checkpoint (2026-09-20): secondary win32k workers now enter the
+        canonical table as Staged after physical resource retention but before resume. Startup
+        admission acquires the existing execution fence only after a kernel Free-Reply query;
+        timer re-entry cannot dispatch another lane while the worker initializes shared state.
+        The pump authenticates each physical caller and now requires exact zero-word/no-capability
+        framing for dispatch completion, matching component_dispatch_loop's ready/return Call.
+        The initializer rejects suspension, scheduler yield, provider retirement, or Reply rotation,
+        then re-queries BoundToTarget before changing Starting to Idle. Query IPC preserves the
+        message buffer. Failure retires the provider and retains the canonical state, fence, and
+        physical allocation; attempted suspension does not publish readiness or release ownership.
+        Late ordinary registration has been removed. Primary bootstrap registration is unchanged.
+
+        Staged secondary publication and exclusive startup ownership are now wired; acknowledged
+        failed-worker teardown and shared-endpoint routing remain open. Review found no scheduling
+        bypass through the private startup pump. Runtime failure injection is still required.
+        Teardown audit: acknowledged TCB suspension, CNode delete/revoke, page unmap, and Reply
+        binding queries exist. The substrate also supports scheduling-context unbind, but the
+        executive lacks its wrapper. Worker receipts retain stack/IPC frames, endpoint, initial
+        Reply, TCB, CNode aliases, and scheduling context; shared paging structures are not
+        exclusively worker-owned and must not be reclaimed from that receipt. Before releasing a
+        failed startup fence, track exact cancellation/deletion acknowledgments and outstanding
+        callback/provider/LPC references. Revoking descendants alone does not delete the owned
+        Reply, and an allocation receipt's initial Reply is not general live transport authority.
+        Validation passes 188 unit tests and nine compile-fail checks
+        (.tmp/test-native-staged-startup-20260920.log), plus both serialized native release builds
+        (.tmp/build-native-staged-startup-executive-20260920.log and
+        .tmp/build-native-staged-startup-io-manager-20260920.log). A fresh bounded QEMU run passes
+        isolated storage, real image loading, hive composition, and disk-section paging, then
+        reaches the unchanged strict 27-export win32k rejection before DriverEntry. QEMU PID 37260
+        was explicitly stopped at that deterministic barrier; runner exit 1 is not a successful
+        boot verdict (.tmp/run-native-staged-startup-20260920.log and
+        .tmp/boot-native-staged-startup-20260920.log). This validates earlier completion traffic,
+        not runtime secondary startup or desktop rendering.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

@@ -10,8 +10,8 @@ fn peer(channel: &PumpChannel, reply: u64, badge: u64) -> Option<u64> {
         ReqKind::Irp => crate::driver_launch::hosted_driver_pump_caller_tcb(channel, reply, badge),
         ReqKind::Syscall => {
             // Each win32k physical lane has a private endpoint and an unbadged peer. A newly
-            // spawned lane also pumps its ready Call before joining the eligible lane registry;
-            // the spawning scope retains these exact capabilities throughout that exchange.
+            // spawned lane pumps its ready Call while staged and ineligible for dispatch;
+            // its physical resource owner retains these capabilities throughout that exchange.
             (channel.physical_domain.is_none()
                 && badge == 0
                 && channel.tcb != 0
@@ -23,7 +23,7 @@ fn peer(channel: &PumpChannel, reply: u64, badge: u64) -> Option<u64> {
     }
 }
 
-unsafe fn query(
+pub(crate) unsafe fn query(
     tcb: u64,
     reply: u64,
 ) -> Result<ReplyBindingObservation, sel4_rt::reply_binding::Error> {
