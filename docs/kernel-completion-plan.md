@@ -36350,6 +36350,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
            must retain unrelated arrivals with distinct Replies, never interpret them using the
            currently executing channel or re-offer a bound Reply. Preserve non-Call snapshots for
            their separate notification/Send handling; the private-pump Send discard is not generic.
+           Before native storage/router cutover, define retained-Reply admission into a canonical
+           lane: begin_peer_dispatch currently requires the lane's existing Reply, whereas
+           RetainedIngress owns the distinct outer receive Reply. Admission must explicitly account
+           for the displaced Reply, physical execution/continuation state, alias exclusion and
+           return ownership on every failure. Do not merely substitute the new cptr or relax
+           duplicate-endpoint checks. Reserve retained storage before receiving, and keep checked-out
+           capacity/Reply identities reserved so nested traffic cannot prevent failure restoration.
         4. Migrate creation, normal dispatch, callbacks, waits, faults and dedicated IRQ exchanges;
            delete superseded private receive/routing machinery after ownership parity is tested.
            Combined reply-and-receive must account for the old reply effect independently from
@@ -36496,6 +36503,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         states and exact caller mismatch, not native IRQ registry failure injection. No new QEMU
         run or IRQ execution proof is claimed: the last measured boot stops at the strict 27-export
         win32k barrier before these exchanges. Shared topology and bootstrap admission are unchanged.
+        Native owned-receive checkpoint (2026-09-20): all five private pump receive paths
+        (ordinary receive, combined reply/receive, timer-fair nonblocking receive, IRQ receive and
+        IRQ reply/receive) now capture ReceivedMessage immediately after the syscall, before Reply
+        queries, event hooks or diagnostics. PumpMessage owns that full snapshot without Clone/Copy
+        until dispatch completes. MR4 is projected from the snapshot; all late get_recv_mr reads in
+        spawn_hosts are removed. Both normal and dedicated IRQ dispatch loops restore the saved bank
+        before legacy handlers read tail words. Fast MRs retain their authoritative register values,
+        independently from potentially stale fast-word slots in the exact saved IPC bank.
+        Malformed authenticated lengths beyond the 120-word ABI fail closed before dispatch; local
+        scheduler/wall markers carry no receive snapshot. Private non-Call handling remains unchanged.
+
+        This wires existing tested message ownership into live native paths, not shared routing or
+        a demonstrated historical corruption fix. It adds approximately one KiB per active message,
+        plus transient query snapshots/compiler temporaries. The external root stack is currently
+        256 KiB; maximum nested stack usage and runtime overhead still require measurement after
+        the strict import barrier is removed. Retained-Reply canonical admission, bounded storage,
+        transactional shared badge publication and the topology cutover remain open as described above.
+        Focused validation passes 161 unit tests and seven compile-fail checks, including existing
+        full-buffer restore, stale fast-word, malformed-length and retained-message IPC-reuse coverage
+        (.tmp/test-pump-owned-receive-20260920.log). Serialized executive and IO-manager release
+        builds pass (.tmp/build-pump-owned-receive-executive-20260920.log and
+        .tmp/build-pump-owned-receive-io-manager-20260920.log). Emitted prologues reserve 0x2908
+        bytes for component_pump_loop and 0x458..0x8b8 for the receive helpers, excluding saved
+        registers and callees (.tmp/disasm-pump-owned-receive-20260920.log); these are static frame
+        observations, not a bound on recursive stack usage.
+        A fresh bounded normal boot passes the preceding storage/loader/hive/disk-paging checks
+        and reaches the unchanged strict 27-export win32k import rejection without an earlier
+        snapshot/authentication failure (.tmp/boot-pump-owned-receive-20260920.log). QEMU was stopped
+        at that deterministic blocker. This is not a deep-callback, IRQ execution or desktop proof.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

@@ -43,3 +43,11 @@ pub(crate) unsafe fn capture_received(
         IpcBufferSnapshot::capture(|index| core::ptr::read_volatile(base.add(index))),
     )
 }
+
+/// Materialize a retained receive for legacy handlers that still read the root IPC bank.
+/// Fast MRs remain in ReceivedMessage::registers; this restores the exact original buffer.
+pub(crate) unsafe fn restore_received(message: &ReceivedMessage) {
+    let base = IPC_BUFFER.load(Ordering::Relaxed) as *mut u64;
+    assert!(!base.is_null(), "received message has no root IPC buffer");
+    message.restore_buffer(|index, word| core::ptr::write_volatile(base.add(index), word));
+}

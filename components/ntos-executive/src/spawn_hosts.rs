@@ -1515,6 +1515,7 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel, reply_cap: u64) -> Option<
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
+    let received = crate::ipc_message::capture_received(badge, mi, [m0, m1, m2, m3]);
     let received_call = receive_probe::received_call(ch, reply_cap, badge);
     let (executive_event, _timer, irq) = pump_handle_executive_event_badge(badge);
     if executive_event {
@@ -1538,25 +1539,11 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel, reply_cap: u64) -> Option<
         crate::print_u64(label);
         crate::print_str(b"\n");
     }
-    let m4 = if (mi & 0x7F) > 4 {
-        crate::get_recv_mr(4)
-    } else {
-        0
-    };
-    Some(PumpMessage {
-        badge,
-        mi,
-        m0,
-        m1,
-        m2,
-        m3,
-        m4,
-        scheduler_yield: false,
-    })
+    Some(PumpMessage::from_received(received))
 }
 
-#[derive(Clone, Copy)]
 struct PumpMessage {
+    received: Option<nt_component_suspension::ReceivedMessage>,
     badge: u64,
     mi: u64,
     m0: u64,
@@ -1568,14 +1555,41 @@ struct PumpMessage {
 }
 
 impl PumpMessage {
+    fn from_received(received: nt_component_suspension::ReceivedMessage) -> Self {
+        assert!(
+            received.message_len().is_some(),
+            "malformed component Call length"
+        );
+        let [m0, m1, m2, m3] = received.registers();
+        Self {
+            badge: received.badge(),
+            mi: received.info(),
+            m0,
+            m1,
+            m2,
+            m3,
+            m4: received.word(4).unwrap_or(0),
+            received: Some(received),
+            scheduler_yield: false,
+        }
+    }
+
+    unsafe fn restore_received(&self) {
+        // Legacy wide-message service decoders read the root IPC bank during this dispatch.
+        if let Some(received) = &self.received {
+            crate::ipc_message::restore_received(received);
+        }
+    }
+
     #[inline]
-    fn label(self) -> u64 {
+    fn label(&self) -> u64 {
         self.mi >> 12
     }
 
     #[inline]
     const fn deadman_wall() -> Self {
         Self {
+            received: None,
             badge: 0,
             mi: 0,
             m0: 0,
@@ -1590,6 +1604,7 @@ impl PumpMessage {
     #[inline]
     const fn transport_wall() -> Self {
         Self {
+            received: None,
             badge: 0,
             mi: 0xfff << 12,
             m0: 0,
@@ -1604,6 +1619,7 @@ impl PumpMessage {
     #[inline]
     const fn scheduler_yield() -> Self {
         Self {
+            received: None,
             badge: 0,
             mi: 0,
             m0: 0,
@@ -1752,6 +1768,7 @@ unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
             lateout("rax") _, lateout("rcx") _, lateout("r11") _,
             options(nostack),
         );
+        let received = crate::ipc_message::capture_received(badge, mi, [m0, m1, m2, m3]);
         let received_call = receive_probe::received_call(ch, reply_cap, badge);
         let (executive_event, timer, irq) = pump_handle_executive_event_badge(badge);
         if executive_event {
@@ -1779,21 +1796,7 @@ unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
             // An ordinary Send has no response continuation in the private Call protocol.
             continue;
         }
-        let m4 = if (mi & 0x7F) > 4 {
-            crate::get_recv_mr(4)
-        } else {
-            0
-        };
-        return PumpMessage {
-            badge,
-            mi,
-            m0,
-            m1,
-            m2,
-            m3,
-            m4,
-            scheduler_yield: false,
-        };
+        return PumpMessage::from_received(received);
     }
 }
 
@@ -1849,6 +1852,7 @@ unsafe fn pump_reply_recv4(
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
+    let received = crate::ipc_message::capture_received(badge, mi, [m0, m1, m2, m3]);
     let received_call = receive_probe::received_call(ch, reply_cap, badge);
     let (executive_event, timer, irq) = pump_handle_executive_event_badge(badge);
     if executive_event {
@@ -1876,21 +1880,7 @@ unsafe fn pump_reply_recv4(
         // The send half already consumed the old Call; never retransmit it after a plain Send.
         return pump_recv(ch, reply_cap);
     }
-    let m4 = if (mi & 0x7F) > 4 {
-        crate::get_recv_mr(4)
-    } else {
-        0
-    };
-    PumpMessage {
-        badge,
-        mi,
-        m0,
-        m1,
-        m2,
-        m3,
-        m4,
-        scheduler_yield: false,
-    }
+    PumpMessage::from_received(received)
 }
 
 /// Reply to a component `Call` that was deliberately parked outside the immediate pump
@@ -2087,6 +2077,7 @@ unsafe fn hosted_irq_recv(
             lateout("rax") _, lateout("rcx") _, lateout("r11") _,
             options(nostack),
         );
+        let received = crate::ipc_message::capture_received(badge, mi, [m0, m1, m2, m3]);
         let received_call =
             receive_probe::irq_received_call(ch, reply_cap, identity, expected_badge, badge);
         if hosted_irq_exchange_event(badge) {
@@ -2098,21 +2089,7 @@ unsafe fn hosted_irq_recv(
         if !received_call {
             continue;
         }
-        let m4 = if (mi & 0x7f) > 4 {
-            crate::get_recv_mr(4)
-        } else {
-            0
-        };
-        return PumpMessage {
-            badge,
-            mi,
-            m0,
-            m1,
-            m2,
-            m3,
-            m4,
-            scheduler_yield: false,
-        };
+        return PumpMessage::from_received(received);
     }
 }
 
@@ -2133,6 +2110,7 @@ unsafe fn hosted_irq_reply_recv(
         let m1: u64;
         let m2: u64;
         let m3: u64;
+        let received;
         if send_reply {
             let send_mi = reply_len;
             let send_m0 = reply[0];
@@ -2153,6 +2131,7 @@ unsafe fn hosted_irq_reply_recv(
                 lateout("rax") _, lateout("rcx") _, lateout("r11") _,
                 options(nostack),
             );
+            received = crate::ipc_message::capture_received(badge, mi, [m0, m1, m2, m3]);
             if badge == crate::COMPOSITE_SEND_ERROR_BADGE {
                 return PumpMessage::transport_wall();
             }
@@ -2172,21 +2151,7 @@ unsafe fn hosted_irq_reply_recv(
             // The reply half already ran; continue receive-only after a plain Send.
             continue;
         }
-        let m4 = if (mi & 0x7f) > 4 {
-            crate::get_recv_mr(4)
-        } else {
-            0
-        };
-        return PumpMessage {
-            badge,
-            mi,
-            m0,
-            m1,
-            m2,
-            m3,
-            m4,
-            scheduler_yield: false,
-        };
+        return PumpMessage::from_received(received);
     }
 }
 
@@ -2217,6 +2182,7 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
     let mut outcome = PumpLoopOutcome::new();
     let mut message = HostedIrqExchangeMessage::Wall;
     loop {
+        msg.restore_received();
         let label = msg.label();
         let length = msg.mi & 0x7f;
         if msg.badge != expected_badge {
@@ -2496,6 +2462,7 @@ unsafe fn component_pump_loop(
     let mut outcome = PumpLoopOutcome::new();
     outcome.accounting = accounting;
     loop {
+        msg.restore_received();
         if msg.scheduler_yield {
             outcome.scheduler_yielded = true;
             break;
