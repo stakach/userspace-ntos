@@ -310,6 +310,35 @@ pub(crate) unsafe fn begin_component_execution_lane_startup(
     }).is_ok()
 }
 
+/// Identify the startup owner before the generic pump attempts terminal suspension.
+pub(crate) unsafe fn component_execution_lane_is_starting(
+    lane: nt_component_suspension::LaneHandle,
+) -> bool {
+    let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+    lanes.running() == Some(lane)
+        && lanes.phase(lane) == Ok(nt_component_suspension::LanePhase::Starting)
+}
+
+/// Retain stop acknowledgment and cancellation evidence without releasing startup ownership.
+pub(crate) unsafe fn stop_component_execution_lane_startup(
+    lane: nt_component_suspension::LaneHandle,
+) -> (Option<u64>, bool) {
+    let _message = crate::ipc_message::SavedMessageBuffer::capture();
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let Some(reply) = component_execution_lane_reply(lanes, lane) else {
+        return (None, false);
+    };
+    let mut suspend_status = None;
+    let verified = lanes.stop_startup(lane, reply, |tcb| {
+        let status = crate::tcb_suspend_r(tcb);
+        suspend_status = Some(status);
+        if status == 0 { Ok(()) } else { Err(status) }
+    }, |tcb, reply| {
+        crate::spawn_hosts::query_component_reply_binding(tcb, reply)
+    }).is_ok();
+    (suspend_status, verified)
+}
+
 /// The caller must first validate the authenticated ready protocol completion.
 pub(crate) unsafe fn complete_component_execution_lane_startup(
     lane: nt_component_suspension::LaneHandle,

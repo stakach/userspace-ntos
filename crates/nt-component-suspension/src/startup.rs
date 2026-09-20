@@ -9,7 +9,68 @@ pub enum StartupError<E> {
     Query(E),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupStopError<S, Q> {
+    Lane(LaneError),
+    Suspend(S),
+    Query(Q),
+    ReplyNotFree,
+}
+
 impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
+    /// Enter a synchronous, acknowledged stop while retaining all startup authority.
+    /// Callbacks must address the exact live worker and must not reenter component scheduling.
+    /// Any suspension error leaves StartupStopping fenced: it is not proof of no effects and
+    /// cannot authorize replay. A query failure after acknowledgment permits observation only.
+    pub fn stop_startup<S, Q>(
+        &mut self,
+        handle: LaneHandle,
+        reply: u64,
+        suspend: impl FnOnce(u64) -> Result<(), S>,
+        query: impl FnOnce(u64, u64) -> Result<ReplyBindingObservation, Q>,
+    ) -> Result<(), StartupStopError<S, Q>> {
+        self.validate(handle, reply).map_err(StartupStopError::Lane)?;
+        let lane = self.lane(handle).map_err(StartupStopError::Lane)?;
+        match lane.phase {
+            LanePhase::Staged => {
+                if self.execution_busy() {
+                    return Err(StartupStopError::Lane(LaneError::Busy));
+                }
+            }
+            LanePhase::Starting if self.running == Some(handle) => {}
+            _ => return Err(StartupStopError::Lane(LaneError::InvalidPhase)),
+        }
+        let executor = lane.binding.executor_id;
+        self.lane_mut(handle).map_err(StartupStopError::Lane)?.phase = LanePhase::StartupStopping;
+        self.running = Some(handle);
+        suspend(executor).map_err(StartupStopError::Suspend)?;
+        self.lane_mut(handle).map_err(StartupStopError::Lane)?.phase =
+            LanePhase::StartupStopAcknowledged;
+        self.verify_startup_stopped(handle, reply, query)
+    }
+
+    /// Retry only cancellation observation, never the already acknowledged suspension.
+    /// Success does not release the execution fence, capability ownership, or arena reservation.
+    pub fn verify_startup_stopped<S, Q>(
+        &mut self,
+        handle: LaneHandle,
+        reply: u64,
+        query: impl FnOnce(u64, u64) -> Result<ReplyBindingObservation, Q>,
+    ) -> Result<(), StartupStopError<S, Q>> {
+        self.validate(handle, reply).map_err(StartupStopError::Lane)?;
+        let lane = self.lane(handle).map_err(StartupStopError::Lane)?;
+        if lane.phase != LanePhase::StartupStopAcknowledged || self.running != Some(handle) {
+            return Err(StartupStopError::Lane(LaneError::InvalidPhase));
+        }
+        if query(lane.binding.executor_id, reply).map_err(StartupStopError::Query)?
+            != ReplyBindingObservation::Free
+        {
+            return Err(StartupStopError::ReplyNotFree);
+        }
+        self.lane_mut(handle).map_err(StartupStopError::Lane)?.phase = LanePhase::StartupStopped;
+        Ok(())
+    }
+
     /// Acquire the component execution fence before resuming a newly staged worker.
     /// The adapter must validate physical/domain lifetime and query the exact pair without
     /// dispatching unrelated work. A failed native resume must retain this fence until a future

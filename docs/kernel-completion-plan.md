@@ -36700,6 +36700,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         boot verdict (.tmp/run-native-staged-startup-20260920.log and
         .tmp/boot-native-staged-startup-20260920.log). This validates earlier completion traffic,
         not runtime secondary startup or desktop rendering.
+        Failed-startup stop evidence checkpoint (2026-09-20): canonical startup now records
+        StartupStopping before invoking suspension, StartupStopAcknowledged immediately on ACK,
+        and StartupStopped only after a fresh exact-TCB/Reply Free query. All three states retain
+        the execution fence and reject dispatch, readiness publication, and generic release.
+        Suspension errors remain locked with no replay authorization; after an ACK, only the
+        read-only cancellation query may be retried. Synchronous non-reentrant kernel callbacks
+        keep effect entry and acknowledgment in one exclusive canonical borrow.
+
+        Native failed-startup handling uses this owner and reports whether suspension was actually
+        attempted and cancellation verified. The generic pump no longer independently suspends an
+        exact Starting worker on a wall; it returns the fault to the startup stop owner, preventing
+        an unrecorded first suspension followed by a duplicate attempt. Pre-canonical allocation
+        failure still retains the unresumed physical worker and never claims verified cancellation.
+        Verified stop is not teardown: callback/reference drainage, SC/capability deletion, frame
+        unmapping, and final identity/arena release remain open. Native failure injection remains
+        unverified beyond host state-machine coverage.
+        Validation passes 192 unit tests and nine compile-fail checks, including four new tests
+        covering both Staged/Starting stop, non-replayable suspension errors, query-only retries,
+        exact identities, and retained exclusion (.tmp/test-startup-stop-20260920.log). Serialized
+        native release builds pass (.tmp/build-startup-stop-executive-20260920.log and
+        .tmp/build-startup-stop-io-manager-20260920.log). No fresh QEMU result is claimed for this
+        failure-path change; the preceding run stopped before DriverEntry at the strict 27-export
+        barrier and cannot validate startup fault injection.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

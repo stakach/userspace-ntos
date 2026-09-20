@@ -25,6 +25,7 @@ mod retained_dispatch;
 mod retained_work;
 mod startup;
 pub use startup::StartupError;
+pub use startup::StartupStopError;
 pub use retained_work::{RetainedWork, RetainedWorkCheckout, RetainedWorkError, RetainedWorkFinishError, RetainedWorkReservation};
 pub use retained_dispatch::{RetainedDispatch, RetainedDispatchError};
 pub use retained_ingress::{RetainedIngress, RetainedIngressError};
@@ -215,6 +216,12 @@ pub enum LanePhase {
     Staged,
     /// Startup owns the component execution fence but has no ordinary dispatch epoch.
     Starting,
+    /// Stop entered; an absent or failed acknowledgment must not be replayed.
+    StartupStopping,
+    /// Suspension acknowledged; the exact Reply still needs cancellation verification.
+    StartupStopAcknowledged,
+    /// Suspension and Reply cancellation verified; resources and execution fence remain owned.
+    StartupStopped,
     Idle,
     Running,
     Suspended,

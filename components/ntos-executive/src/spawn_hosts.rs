@@ -3733,8 +3733,19 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
         && !outcome.lpc_wait_suspended
         && !outcome.scheduler_yielded
     {
-        PUMP_WALL_SUSPENDS.fetch_add(1, Ordering::Relaxed);
         pump_wall_state_diag(ch, outcome);
+        if matches!(ch.caps.kind, ReqKind::Syscall)
+            && crate::win32k_glue::win32k_physical_lane_for_channel(
+                ch.tcb, ch.fault_ep, ch.reply_cap,
+            ).is_some_and(|lane| {
+                crate::service_sec_image::component_execution_lane_is_starting(lane)
+            })
+        {
+            // The startup owner records the sole stop invocation and cancellation evidence.
+            crate::print_str(b"[pump] startup WALL -> retained startup stop owner\n");
+            return;
+        }
+        PUMP_WALL_SUSPENDS.fetch_add(1, Ordering::Relaxed);
         let e = if ch.tcb != 0 {
             crate::tcb_suspend_r(ch.tcb)
         } else {

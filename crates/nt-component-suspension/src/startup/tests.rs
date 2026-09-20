@@ -232,3 +232,164 @@ fn reused_slot_does_not_accept_old_startup_handle() {
     assert_eq!(lanes.phase(staged), Ok(LanePhase::Starting));
     assert_eq!(lanes.running(), Some(staged));
 }
+
+#[test]
+fn stopped_staged_and_starting_workers_remain_fenced_and_owned() {
+    for started in [false, true] {
+        let mut lanes = Lanes::new(2, 2);
+        let lane = lanes.allocate_staged(binding(0)).unwrap();
+        let other = lanes.allocate(binding(1)).unwrap();
+        if started {
+            lanes.begin_startup(lane, 30, free).unwrap();
+        }
+        lanes
+            .stop_startup(
+                lane,
+                30,
+                |executor| {
+                    assert_eq!(executor, 10);
+                    Ok::<_, u8>(())
+                },
+                free,
+            )
+            .unwrap();
+        assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupStopped));
+        assert_eq!(lanes.binding(lane), Ok(binding(0)));
+        assert_eq!(lanes.running(), Some(lane));
+        assert!(lanes.execution_busy());
+        assert_eq!(lanes.next_idle(), None);
+        assert!(!lanes.needs_idle_lane());
+        assert_eq!(lanes.release(lane, 30), Err(LaneError::Busy));
+        assert_eq!(lanes.begin_dispatch(other, 31), Err(LaneError::Busy));
+        assert!(lanes.finish_dispatch(lane, 30).is_err());
+        assert!(lanes.complete_startup(lane, 30, bound).is_err());
+        assert_eq!(
+            lanes.verify_startup_stopped::<u8, u8>(lane, 30, |_, _| panic!("already verified")),
+            Err(StartupStopError::Lane(LaneError::InvalidPhase))
+        );
+    }
+}
+
+#[test]
+fn suspension_error_locks_stop_without_query_or_replay() {
+    let mut lanes = Lanes::new(1, 2);
+    let lane = lanes.allocate_staged(binding(0)).unwrap();
+    lanes.begin_startup(lane, 30, free).unwrap();
+    assert_eq!(
+        lanes.stop_startup(
+            lane,
+            30,
+            |executor| {
+                assert_eq!(executor, 10);
+                Err(7u8)
+            },
+            |_, _| -> Result<_, u8> { panic!("unacknowledged stop query") }
+        ),
+        Err(StartupStopError::Suspend(7))
+    );
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupStopping));
+    assert_eq!(lanes.running(), Some(lane));
+    assert_eq!(
+        lanes.stop_startup(
+            lane,
+            30,
+            |_| -> Result<(), u8> { panic!("stop replay") },
+            free
+        ),
+        Err(StartupStopError::Lane(LaneError::InvalidPhase))
+    );
+    assert_eq!(
+        lanes.verify_startup_stopped::<u8, u8>(lane, 30, |_, _| panic!("unacknowledged verify")),
+        Err(StartupStopError::Lane(LaneError::InvalidPhase))
+    );
+    assert_eq!(lanes.release(lane, 30), Err(LaneError::Busy));
+}
+
+#[test]
+fn acknowledged_stop_retries_only_observation_until_exact_reply_is_free() {
+    let mut lanes = Lanes::new(1, 2);
+    let lane = lanes.allocate_staged(binding(0)).unwrap();
+    assert_eq!(
+        lanes.stop_startup(
+            lane,
+            30,
+            |_| Ok::<_, u8>(()),
+            |executor, reply| {
+                assert_eq!((executor, reply), (10, 30));
+                Err(8u8)
+            }
+        ),
+        Err(StartupStopError::Query(8))
+    );
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupStopAcknowledged));
+    assert_eq!(
+        lanes.stop_startup(
+            lane,
+            30,
+            |_| -> Result<(), u8> { panic!("acknowledged suspend replay") },
+            free
+        ),
+        Err(StartupStopError::Lane(LaneError::InvalidPhase))
+    );
+    for observation in [
+        ReplyBindingObservation::Offered,
+        ReplyBindingObservation::BoundToTarget,
+        ReplyBindingObservation::BoundElsewhere,
+    ] {
+        assert_eq!(
+            lanes.verify_startup_stopped::<u8, u8>(lane, 30, |executor, reply| {
+                assert_eq!((executor, reply), (10, 30));
+                Ok(observation)
+            }),
+            Err(StartupStopError::ReplyNotFree)
+        );
+        assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupStopAcknowledged));
+        assert_eq!(lanes.running(), Some(lane));
+    }
+    lanes
+        .verify_startup_stopped::<u8, u8>(lane, 30, free)
+        .unwrap();
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupStopped));
+    assert!(lanes.execution_busy());
+}
+
+#[test]
+fn stop_rejects_wrong_binding_stale_handle_and_other_execution_without_effects() {
+    let mut lanes = Lanes::new(2, 2);
+    let old = lanes.allocate(binding(0)).unwrap();
+    lanes.release(old, 30).unwrap();
+    let lane = lanes.allocate_staged(binding(0)).unwrap();
+    let other = lanes.allocate(binding(1)).unwrap();
+    let suspend = |_| -> Result<(), u8> { panic!("invalid stop side effect") };
+    let query = |_, _| -> Result<ReplyBindingObservation, u8> { panic!("invalid stop query") };
+    assert_eq!(
+        lanes.stop_startup(old, 30, suspend, query),
+        Err(StartupStopError::Lane(LaneError::StaleGeneration))
+    );
+    assert_eq!(
+        lanes.stop_startup(lane, 99, suspend, query),
+        Err(StartupStopError::Lane(LaneError::WrongBinding))
+    );
+    lanes.begin_dispatch(other, 31).unwrap();
+    assert_eq!(
+        lanes.stop_startup(lane, 30, suspend, query),
+        Err(StartupStopError::Lane(LaneError::Busy))
+    );
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::Staged));
+    assert_eq!(lanes.running(), Some(other));
+    lanes.finish_dispatch(other, 31).unwrap();
+    assert_eq!(
+        lanes.stop_startup(lane, 30, |_| Ok::<_, u8>(()), bound),
+        Err(StartupStopError::ReplyNotFree)
+    );
+    assert_eq!(
+        lanes.verify_startup_stopped::<u8, u8>(old, 30, query),
+        Err(StartupStopError::Lane(LaneError::StaleGeneration))
+    );
+    assert_eq!(
+        lanes.verify_startup_stopped::<u8, u8>(lane, 99, query),
+        Err(StartupStopError::Lane(LaneError::WrongBinding))
+    );
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupStopAcknowledged));
+    assert_eq!(lanes.running(), Some(lane));
+}
