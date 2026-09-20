@@ -92,19 +92,24 @@ fn admit(
         KernelProviderWaitCapture,
     ),
 > {
-    f.activations.admit_dispatcher_wait(
-        f.caller,
-        &f.pm,
-        &f.catalog,
-        &mut f.lanes,
-        arbiter,
-        &mut backend(state, Some(f.caller.owner())),
-        f.capture,
-        sequence,
-        now(),
-        f.capture,
-        |status| status,
-    )
+    f.activations
+        .publish_wait_work(
+            f.caller,
+            &f.pm,
+            &f.catalog,
+            &mut f.lanes,
+            arbiter,
+            &mut backend(state, Some(f.caller.owner())),
+            KernelProviderWaitWork::Initial(f.capture),
+            sequence,
+            now(),
+            f.capture,
+            |status| status,
+        )
+        .map(|(admission, previous)| {
+            assert_eq!(previous, None);
+            admission
+        })
 }
 
 fn next_capture(f: &mut Fixture, id: u64) -> KernelProviderWaitCapture {
@@ -177,20 +182,24 @@ fn repark(
         KernelProviderWaitCapture,
     ),
 > {
-    f.activations.repark_dispatcher_wait(
-        f.caller,
-        &f.pm,
-        &f.catalog,
-        &mut f.lanes,
-        arbiter,
-        &mut backend(state, Some(f.caller.owner())),
-        f.capture,
-        next,
-        sequence,
-        now(),
-        next,
-        |status| status,
-    )
+    f.activations
+        .publish_wait_work(
+            f.caller,
+            &f.pm,
+            &f.catalog,
+            &mut f.lanes,
+            arbiter,
+            &mut backend(state, Some(f.caller.owner())),
+            KernelProviderWaitWork::Repark {
+                previous: f.capture,
+                next,
+            },
+            sequence,
+            now(),
+            next,
+            |status| status,
+        )
+        .map(|(admission, previous)| (admission, previous.unwrap()))
 }
 
 #[test]
@@ -433,14 +442,14 @@ fn foreign_manager_or_offered_continuation_cannot_publish_the_captured_wait() {
         };
         let error = f
             .activations
-            .admit_dispatcher_wait(
+            .publish_wait_work(
                 f.caller,
                 pm,
                 &f.catalog,
                 &mut f.lanes,
                 &mut arbiter,
                 &mut backend(&mut state, Some(f.caller.owner())),
-                f.capture,
+                KernelProviderWaitWork::Initial(f.capture),
                 1,
                 now(),
                 offered,

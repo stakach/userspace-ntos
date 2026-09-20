@@ -1,4 +1,4 @@
-//! Bounded, memory-local admission of stopped kernel jobs into the live dispatcher.
+//! Bounded, memory-local admission of stopped kernel jobs using canonical dispatcher fields.
 
 use super::*;
 use crate::provider_dispatcher_backend::NativeEventBacking;
@@ -40,52 +40,84 @@ pub(crate) unsafe fn publish_runtime_waits(handler: &mut ExecNtHandler) {
         return;
     }
     let _durable = allocator::enter_durable();
+    let now = nt_time_snapshot();
+    let published = publish_waits(
+        &handler.pm,
+        ProviderDispatcherObjects {
+            events: &mut handler.events,
+            event_objects: &mut handler.event_objects,
+            timers: None,
+            backing: NativeEventBacking(&mut handler.obj_ns),
+            access: None,
+        },
+        now,
+    );
+    if published {
+        // The field-only publication transaction has ended before hardware rearm.
+        let _message = crate::ipc_message::SavedMessageBuffer::capture();
+        delay_timer_rearm(&*queue, handler);
+    }
+}
+
+/// Does not initialize/program a timer, receive, execute a provider or borrow a live handler.
+/// Bootstrap may use this only once its outer readiness/receive owner can service the waits.
+unsafe fn publish_waits(
+    pm: &nt_process::ProcessManager,
+    mut backend: ProviderDispatcherObjects<'_, NativeEventBacking<'_>>,
+    now: nt_time::TimeSnapshot,
+) -> bool {
     let mut published = false;
     let mut cursor = (&*core::ptr::addr_of!(ACTIVATIONS)).wait_work_cursor();
     loop {
         let next = (&mut *core::ptr::addr_of_mut!(ACTIVATIONS)).next_wait_work(
             &mut cursor,
-            &handler.pm,
+            pm,
             &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
             &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
         );
         let Some((caller, work)) = next else { break };
         let result = work.and_then(|work| {
             let sequence = next_dispatcher_wait_sequence();
-            let mut backend = ProviderDispatcherObjects {
-                events: &mut handler.events,
-                event_objects: &mut handler.event_objects,
-                timers: None,
-                backing: NativeEventBacking(&mut handler.obj_ns),
-                access: Some(ProviderDispatcherAccess::kernel_events(caller.owner())?),
-            };
+            backend.access = Some(ProviderDispatcherAccess::kernel_events(caller.owner())?);
             let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
             let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
             let arbiter = &mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER);
             let catalog = &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS);
-            match work {
-                KernelProviderWaitWork::Initial(capture) => activations.admit_dispatcher_wait(
-                    caller, &handler.pm, catalog, lanes, arbiter, &mut backend, capture,
-                    sequence, nt_time_snapshot(), ComponentNativeContinuation::Kernel(capture),
+            let (previous, capture) = match work {
+                KernelProviderWaitWork::Initial(capture) => (None, capture),
+                KernelProviderWaitWork::Repark { previous, next } => (Some(previous), next),
+            };
+            activations
+                .publish_wait_work(
+                    caller,
+                    pm,
+                    catalog,
+                    lanes,
+                    arbiter,
+                    &mut backend,
+                    work,
+                    sequence,
+                    now,
+                    ComponentNativeContinuation::Kernel(capture),
                     ComponentSuspensionCompletion::provider,
-                ).map_err(|(error, offered)| {
+                )
+                .map(|(admission, replaced)| {
+                    // Only capture metadata retires; the activation keeps its bank/Ps roots.
+                    assert_eq!(
+                        replaced.map(|continuation| match continuation {
+                            ComponentNativeContinuation::Kernel(capture) => capture,
+                            ComponentNativeContinuation::Hosted(_) => {
+                                panic!("kernel wait replaced hosted continuation")
+                            }
+                        }),
+                        previous,
+                    );
+                    admission
+                })
+                .map_err(|(error, offered)| {
                     assert!(matches!(offered, ComponentNativeContinuation::Kernel(retained) if retained == capture));
                     admission_status(error)
-                }),
-                KernelProviderWaitWork::Repark { previous, next } => activations.repark_dispatcher_wait(
-                    caller, &handler.pm, catalog, lanes, arbiter, &mut backend, previous, next,
-                    sequence, nt_time_snapshot(), ComponentNativeContinuation::Kernel(next),
-                    ComponentSuspensionCompletion::provider,
-                ).map(|(admission, replaced)| {
-                    // Only copied capture metadata is retired here. The activation continues
-                    // to own its original channel, bank and canonical Ps references.
-                    assert!(matches!(replaced, ComponentNativeContinuation::Kernel(retained) if retained == previous));
-                    admission
-                }).map_err(|(error, offered)| {
-                    assert!(matches!(offered, ComponentNativeContinuation::Kernel(retained) if retained == next));
-                    admission_status(error)
-                }),
-            }
+                })
         });
         match result {
             Ok(admission) => {
@@ -107,10 +139,5 @@ pub(crate) unsafe fn publish_runtime_waits(handler: &mut ExecNtHandler) {
             }
         }
     }
-    if published {
-        // Publication may add the earliest deadline after the previous timer programming.
-        // All activation/lane/dispatcher borrows have ended before touching the timer source.
-        let _message = crate::ipc_message::SavedMessageBuffer::capture();
-        delay_timer_rearm(&*queue, handler);
-    }
+    published
 }

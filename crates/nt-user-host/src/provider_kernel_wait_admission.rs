@@ -15,92 +15,6 @@ pub enum KernelProviderWaitAdmissionError<E> {
 }
 
 impl<D: KernelProviderWaitRecipient> KernelProviderActivations<D> {
-    /// Admit the first captured wait only after acquiring every canonical dispatcher lease.
-    /// The native scheduler must already own the stopped Reply/bank and readiness/deadlines.
-    /// All supplied backend and completion operations must be memory-local; no IPC or scheduling
-    /// may cross these canonical borrows. This method does not itself authorize native blocking.
-    pub fn admit_dispatcher_wait<C, R: Clone, T, B>(
-        &mut self,
-        caller: KernelProviderCaller,
-        pm: &ProcessManager,
-        catalog: &ProviderDomainCatalog,
-        lanes: &mut ComponentSuspensionLanes<C, R, T>,
-        arbiter: &mut ProviderDispatcherWaitArbiter<B::Lease>,
-        backend: &mut B,
-        capture: KernelProviderWaitCapture,
-        sequence: u64,
-        now: TimeSnapshot,
-        continuation: C,
-        completion: impl FnOnce(i32) -> R,
-    ) -> Result<ProviderDispatcherWaitAdmission, (KernelProviderWaitAdmissionError<B::Error>, C)>
-    where
-        C: KernelProviderWaitContinuation,
-        B: ProviderDispatcherWaitBackend,
-    {
-        self.publish_dispatcher_wait(
-            caller,
-            pm,
-            catalog,
-            lanes,
-            arbiter,
-            backend,
-            None,
-            capture,
-            sequence,
-            now,
-            continuation,
-            completion,
-        )
-        .map(|(admission, previous)| {
-            assert!(previous.is_none());
-            admission
-        })
-    }
-
-    /// Replace, never stack over, the exact Resuming kernel frame. Every failure returns the
-    /// offered continuation and leaves its predecessor/capture owned; success returns the
-    /// replaced continuation to its original retirement owner. Readiness is selected atomically.
-    pub fn repark_dispatcher_wait<C, R: Clone, T, B>(
-        &mut self,
-        caller: KernelProviderCaller,
-        pm: &ProcessManager,
-        catalog: &ProviderDomainCatalog,
-        lanes: &mut ComponentSuspensionLanes<C, R, T>,
-        arbiter: &mut ProviderDispatcherWaitArbiter<B::Lease>,
-        backend: &mut B,
-        previous: KernelProviderWaitCapture,
-        next: KernelProviderWaitCapture,
-        sequence: u64,
-        now: TimeSnapshot,
-        continuation: C,
-        completion: impl FnOnce(i32) -> R,
-    ) -> Result<(ProviderDispatcherWaitAdmission, C), (KernelProviderWaitAdmissionError<B::Error>, C)>
-    where
-        C: KernelProviderWaitContinuation,
-        B: ProviderDispatcherWaitBackend,
-    {
-        self.publish_dispatcher_wait(
-            caller,
-            pm,
-            catalog,
-            lanes,
-            arbiter,
-            backend,
-            Some(previous),
-            next,
-            sequence,
-            now,
-            continuation,
-            completion,
-        )
-        .map(|(admission, previous)| {
-            (
-                admission,
-                previous.expect("repark must return its replaced continuation"),
-            )
-        })
-    }
-
     fn validate_wait_publication<C: KernelProviderWaitContinuation, R, T>(
         &mut self,
         caller: KernelProviderCaller,
@@ -166,7 +80,14 @@ impl<D: KernelProviderWaitRecipient> KernelProviderActivations<D> {
         }
     }
 
-    fn publish_dispatcher_wait<C, R: Clone, T, B>(
+    /// Publish initial or repeated work only after acquiring every canonical dispatcher lease.
+    /// Discovery is not authority: the retained capture and predecessor are revalidated.
+    /// Success returns the replaced continuation, if any, to its retirement owner; failure
+    /// returns the offered continuation without removing its predecessor. All operations are
+    /// memory-local, and `now` is the outer publication pass's sampled time. No IPC or scheduling
+    /// may cross these borrows. The scheduler must own stopped Reply/bank and readiness/deadlines;
+    /// this transaction does not itself authorize native blocking.
+    pub fn publish_wait_work<C, R: Clone, T, B>(
         &mut self,
         caller: KernelProviderCaller,
         pm: &ProcessManager,
@@ -174,8 +95,7 @@ impl<D: KernelProviderWaitRecipient> KernelProviderActivations<D> {
         lanes: &mut ComponentSuspensionLanes<C, R, T>,
         arbiter: &mut ProviderDispatcherWaitArbiter<B::Lease>,
         backend: &mut B,
-        previous: Option<KernelProviderWaitCapture>,
-        capture: KernelProviderWaitCapture,
+        work: KernelProviderWaitWork,
         sequence: u64,
         now: TimeSnapshot,
         continuation: C,
@@ -188,6 +108,10 @@ impl<D: KernelProviderWaitRecipient> KernelProviderActivations<D> {
         C: KernelProviderWaitContinuation,
         B: ProviderDispatcherWaitBackend,
     {
+        let (previous, capture) = match work {
+            KernelProviderWaitWork::Initial(capture) => (None, capture),
+            KernelProviderWaitWork::Repark { previous, next } => (Some(previous), next),
+        };
         if let Err(status) = self.validate_wait_publication(
             caller,
             pm,

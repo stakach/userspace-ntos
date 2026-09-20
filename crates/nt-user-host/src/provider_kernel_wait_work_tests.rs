@@ -2,6 +2,8 @@ use super::*;
 
 #[path = "provider_kernel_wait_runtime_tests.rs"]
 mod runtime;
+#[path = "provider_kernel_wait_publication_tests.rs"]
+mod publication;
 
 fn next_work(
     f: &mut Fixture,
@@ -179,6 +181,13 @@ fn stale_same_id_frame_cannot_substitute_for_the_active_resume_origin() {
 }
 
 fn append_waiting_activation(f: &mut Fixture) -> KernelProviderWaitCapture {
+    append_waiting_activation_with(f, |_| {})
+}
+
+fn append_waiting_activation_with(
+    f: &mut Fixture,
+    update: impl FnOnce(&mut ProviderWaitRequest),
+) -> KernelProviderWaitCapture {
     let native = requestor(&mut f.pm, 0x6000);
     let lane = f.lanes.allocate(binding(2)).unwrap();
     let reply = binding(2).reply_object;
@@ -203,7 +212,8 @@ fn append_waiting_activation(f: &mut Fixture) -> KernelProviderWaitCapture {
             },
         )
         .unwrap_or_else(|(status, _)| panic!("capture failed: {status:x}"));
-    let request = request(caller.owner(), 81);
+    let mut request = request(caller.owner(), 81);
+    update(&mut request);
     let capture = f
         .activations
         .capture_provider_wait(

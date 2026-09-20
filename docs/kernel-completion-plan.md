@@ -35861,6 +35861,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         isolated bindings: per-thread APC attachment state, effective address-space switching and
         lane/callback restoration must be implemented together. The current thread-activation
         validator assumes an unattached APC environment. The strict 27-export wall stays enforced.
+      - [x] Separate kernel wait publication from runtime handler ownership (2026-09-20).
+        The native bounded publication pass now takes canonical PM and dispatcher fields rather
+        than a whole ExecNtHandler. Its runtime wrapper retains availability checks and hardware
+        rearm after the field-only transaction returns. It samples time once before field borrows;
+        all candidates use that sample while each wait retains its original observed timeout origin.
+        Shared publish_wait_work now owns initial/repark dispatch and exact continuation return.
+        Removed the replaced initial/repark wrappers and migrated every caller/test to the single
+        transaction. The bounded cursor, global sequence allocation point, kernel Event-only access,
+        exact predecessor checks, rollback and real lease accounting are preserved.
+        Added real dispatcher composition tests for ready/parked/expired admission, stale authority
+        after discovery, mislabeled repark retention, a rejected row followed by valid publication,
+        and supplied-clock-snapshot behavior. The mixed-row fixture respects physical execution
+        exclusion: the first invocation must be stopped before another can begin.
+        Focused validation passes 52 kernel wait/resume tests. The serialized host run passes
+        1,380 tests across 24 suites (.tmp/test-kernel-wait-publication-20260920.log); focused
+        evidence is .tmp/test-kernel-wait-publication-focused-20260920.log. Independent review
+        found no lost ownership checks. Executive release passes in 40.51s with 294 warnings;
+        I/O Manager release passes cached in 0.07s. Evidence:
+        .tmp/build-kernel-wait-publication-20260920.log and
+        .tmp/build-kernel-wait-publication-io-manager-20260920.log. Native loop orchestration
+        and global sequence allocation remain source-reviewed rather than host-executed;
+        no bootstrap blocking is enabled. No QEMU rerun: the unchanged 27-export rejection
+        remains ahead of this native path, and this slice provides no desktop proof.
+        Review adjustment: the existing ps_bootstrap PM accessor and field-local Event adapter
+        suffice for bootstrap publication; do not add a second manager or raw pointer authority.
+        Next connect a genuine outer owner after a stopped DriverEntry returns, with bounded
+        selection, retained wake demand and receive fan-in. The active retained IRQ/DPC scope must
+        not execute selected jobs. Resumed returns must retain their TerminalIdentity through the
+        existing local terminal consumer and exact completion ACK, not frame-free completion.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
