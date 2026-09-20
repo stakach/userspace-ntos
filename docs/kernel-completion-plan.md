@@ -36387,9 +36387,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         This is the crate-first registration contract, not native publication or endpoint migration.
         The current lane table's duplicate-endpoint rejection is deliberately unchanged: allowing
         shared endpoints before the authenticated router exists would weaken today's isolation.
-        The next slice must integrate exact peer ownership with canonical lane admission, then
-        wire transactional capability publication and retained unrelated-arrival routing. Existing
+        The checked lane admission checkpoint below connects these identities to canonical lanes;
+        next wire transactional capability publication and retained unrelated-arrival routing. Existing
         private endpoints and all blocking-bootstrap admission guards remain in place.
+
+        Canonical lane admission checkpoint (2026-09-20): stage_lane derives
+        the executor from the canonical lane and requires the registry endpoint to match its receive
+        endpoint. publish_lane revalidates the captured domain, generation, lane handle, executor and
+        endpoint after capability setup, before consuming the registration ticket. Failed publication
+        leaves the staged reservation owned for explicit abort/cleanup. resolve_lane accepts active
+        routes only and repeats these checks against the current canonical table. Domain generation
+        must cover replacement of that table: a table-local handle cannot distinguish replacement
+        tables that deliberately reuse every numeric identity.
+
+        begin_peer_dispatch requires the existing non-clone received-work retention ticket and
+        combines checked resolution with the existing exact-Reply, physical exclusion and
+        dispatch-epoch admission path without an intervening native effect. Admission borrows rather
+        than consumes the ticket; completion/cancellation still owns its release. Consumed and
+        foreign-registry tickets cannot claim a lane. The required Reply is the canonical lane's
+        object, not merely an authenticated outer-ingress Reply. This is not
+        a kernel Reply query or an execution bypass; native code must still prove the received binding
+        and maintain physical lifetime ownership. Metadata resolution itself does not require an idle
+        lane, since retained traffic can belong to suspended lanes. Actual dispatch keeps the ordinary
+        lane eligibility checks. Neither shared endpoint topology nor duplicate-endpoint relaxation is
+        enabled by these APIs; native migration and multi-peer unrelated-arrival retention stay open.
+        Focused validation passes 150 unit tests and six compile-fail checks, including 13 new lane
+        integration tests for stale publication/resolution, wrong physical identities, consumed or
+        foreign tickets, exact Reply rejection, retirement, suspension, physical exclusion and fresh
+        dispatch epochs (.tmp/test-lane-peer-focused-20260920.log). The broader serialized run
+        passes 1,457 tests across 24 suites (.tmp/test-lane-peer-20260920.log). Serialized executive
+        and IO-manager release builds pass (.tmp/build-lane-peer-executive-20260920.log and
+        .tmp/build-lane-peer-io-manager-20260920.log). No new QEMU run or desktop proof is claimed;
+        the last measured strict 27-export boot barrier remains unchanged by this crate-only slice.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

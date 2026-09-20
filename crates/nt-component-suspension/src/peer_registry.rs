@@ -123,6 +123,10 @@ pub struct PeerRegistry {
 }
 
 impl PeerRegistry {
+    pub const fn endpoint(&self) -> u64 {
+        self.endpoint
+    }
+
     pub const fn new(endpoint: u64, capacity: usize) -> Self {
         Self {
             endpoint,
