@@ -35936,6 +35936,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         to avoid an unnecessary stopped-work scan; no runtime performance claim is made without boot proof.
         This removes a bootstrap ownership prerequisite, not the need for an outer selected-job
         runner and receive fan-in. Blocking DriverEntry admission and the 27-export wall remain unchanged.
+      - [x] Reject unavailable runtime timer ownership at bootstrap handoff (2026-09-20).
+        Service-loop initialization now checks the first registered rearm outcome instead of
+        discarding it after dispatcher-store transfer. Idle and Programmed are valid owners;
+        Unavailable and Failed abort initialization with the exact outcome, before receive.
+        Retained work must not silently lose its servicing owner. Corrected the obsolete first-arm
+        comment: bootstrap can already arm the PIT through the canonical deadline collector.
+        Validation: all 305 nt-kernel-exec library tests pass, including the exhaustive four-outcome
+        availability/programming policy; executive release passes in 35.97s with 294 warnings.
+        Evidence: .tmp/test-runtime-timer-handoff-20260920.log and
+        .tmp/build-runtime-timer-handoff-20260920.log. No QEMU rerun: the unchanged 27-export
+        rejection occurs before this path. This is fail-closed initialization, not hardware recovery.
+        Review adjustment: live component-resume rearm failure still needs an explicit servicing or
+        failure boundary; startup validation alone does not cover subsequent hardware failure.
+        Before bootstrap selected execution, also replace the initial DriverEntry tuple with typed
+        stopped/wait/return classification shared with resumed execution. Captured waits must not
+        be diagnosed as fault walls, and initial completion receipts must remain distinct from
+        resumed terminal identities. Blocking admission remains disabled until outer ownership works.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

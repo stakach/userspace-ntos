@@ -7870,10 +7870,14 @@ pub(crate) unsafe fn service_sec_image(
         .as_mut()
         .expect("delay wait queue must be initialized before providers");
     register_service_delay_drain_context(&mut nt_handler, delay_queue);
-    // Boot drivers can publish timer deadlines before the service loop owns its
-    // delay queue. Registration is the first point at which those deadlines can
-    // be armed on HPET, so do not wait for an unrelated later timer operation.
-    let _ = rearm_registered_delay_timer();
+    // Bootstrap may already have armed the PIT. Reconcile the transferred deadlines
+    // with the runtime owner before receiving; failed handoff must not strand work.
+    let timer_handoff = rearm_registered_delay_timer();
+    assert!(
+        timer_handoff.owner_available(),
+        "runtime timer ownership handoff failed: {:?}",
+        timer_handoff,
+    );
     publish_kuser_clocks();
     let alias = kuser_page_alias_get(0);
     if alias != 0 {
