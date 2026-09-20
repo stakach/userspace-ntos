@@ -20,7 +20,8 @@ pub(super) unsafe fn has_ready() -> bool {
 
 /// Called only inside the outer completion-delivery pass, never from nested pump IRQ hooks.
 /// Failed local attempts advance the cursor without losing their retained result or Ps pair.
-pub(super) unsafe fn drain() {
+pub(super) unsafe fn drain() -> bool {
+    let mut progressed = false;
     let mut cursor = None;
     loop {
         let next = {
@@ -65,8 +66,11 @@ pub(super) unsafe fn drain() {
                 print_hex(status);
                 print_str(b"\n");
             }
+        } else {
+            progressed = true;
         }
     }
+    progressed
 }
 
 unsafe fn deliver_and_retire(

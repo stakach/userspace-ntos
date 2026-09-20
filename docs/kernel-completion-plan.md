@@ -35890,6 +35890,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         selection, retained wake demand and receive fan-in. The active retained IRQ/DPC scope must
         not execute selected jobs. Resumed returns must retain their TerminalIdentity through the
         existing local terminal consumer and exact completion ACK, not frame-free completion.
+      - [x] Retain kernel terminal/completion retry demand in the outer scheduler (2026-09-20).
+        Audit found that wake reconciliation omitted terminal-only and Ready-receipt-only work,
+        and kernel retirement/ACK progress was discarded. The outer scheduler now observes both
+        canonical sources alongside stopped publication/selected work, including its final scan.
+        Kernel drains report successful ownership progress; refusals do not reset backoff, while
+        Ok(false) after a failed DriverEntry status still counts as an acknowledged result and Ps
+        reference release. Partial local delivery without successful terminal retirement does not
+        report retirement progress. Receipt cursors remain bounded and start after terminal drain.
+        Removed the independent completion redrive from borrowed service-loop finalization: it
+        bypassed pacing and could carry a whole handler borrow across initialization IPC. Runtime
+        retries now execute only from the genuine outer owner. Eager bootstrap delivery is unchanged.
+        Two shared composition regressions use real terminals/receipts, exact ACK refusal and
+        ResumeWake to cover retained deadlines, retirement progress, failed-status ACK with sibling
+        work, backoff reset, final demand removal and preserved/released Ps pairs. All 116 focused
+        activation tests pass (.tmp/test-kernel-completion-wake-focused-20260920.log). The serialized
+        host run passes 1,382 tests across 24 suites (.tmp/test-kernel-completion-wake-20260920.log).
+        Executive release passes in 37.84s with 294 warnings; I/O Manager passes cached in 0.06s.
+        Evidence: .tmp/build-kernel-completion-wake-20260920.log and
+        .tmp/build-kernel-completion-wake-io-manager-20260920.log. Independent review found no
+        blocking issue. No QEMU rerun: the unchanged 27-export rejection precedes this native path.
+        Scope: runtime scheduling requires its registered, initialized timer. Startup currently
+        ignores its initial rearm outcome; inactive/faulted hardware recovery remains unresolved,
+        not permission to restore direct unpaced delivery. Native IRQ/receive routing is reviewed,
+        not host-executed. Bootstrap selected execution/fan-in and the strict import wall remain open.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

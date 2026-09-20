@@ -97,7 +97,9 @@ pub(super) unsafe fn reconcile(handler: &mut ExecNtHandler) {
     let previous = (&*core::ptr::addr_of!(WAKE)).next_deadline();
     let stopped_wait = kernel_provider_activation::has_stopped_wait_work(&handler.pm);
     if !component_execution_is_busy() || stopped_wait {
-        let has_work = stopped_wait || next_ready(handler).is_some();
+        let has_work = stopped_wait
+            || next_ready(handler).is_some()
+            || kernel_provider_activation::has_ready_completions();
         (&mut *core::ptr::addr_of_mut!(WAKE)).reconcile(has_work, monotonic_time_100ns());
     }
     let dpc_deadline = driver_launch::hosted_dpc_next_deadline(monotonic_time_100ns());
@@ -115,15 +117,15 @@ pub(super) unsafe fn reconcile(handler: &mut ExecNtHandler) {
     delay_timer_rearm(&*queue, handler);
 }
 
-unsafe fn drain_terminals(handler: *mut ExecNtHandler) -> u64 {
+unsafe fn drain_terminals(handler: *mut ExecNtHandler) -> bool {
     let ctx = (*handler).loop_ctx;
     let retired = if let Some(ctx) = ctx {
         component_terminal::drain(&mut *handler, &mut *ctx.procs, &mut *ctx.pfilled)
     } else {
         0
     };
-    kernel_provider_activation::redrive_ready_completions();
-    retired
+    let kernel_progress = kernel_provider_activation::redrive_ready_completions();
+    retired != 0 || kernel_progress
 }
 
 fn report_retained(status: u32) {
@@ -160,7 +162,7 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     };
     kernel_provider_activation::publish_runtime_waits(&mut *handler);
     let mut pass = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).resume_pass();
-    let mut progressed = drain_terminals(handler) != 0;
+    let mut progressed = drain_terminals(handler);
     while let Some(candidate) = next_in_pass(&*handler, &mut pass) {
         match candidate.continuation {
             ComponentNativeContinuation::Hosted(_) => {
@@ -185,7 +187,7 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
                 kernel_provider_activation::publish_runtime_waits(&mut *handler);
             }
         }
-        progressed |= drain_terminals(handler) != 0;
+        progressed |= drain_terminals(handler);
     }
     if (*handler).lpc_endpoint_progress {
         // Component-originated LPC work bypasses the ordinary syscall post-action.
@@ -194,7 +196,8 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     // A still-running physical owner is not evidence that its retained work disappeared.
     let has_work = component_execution_is_busy()
         || kernel_provider_activation::has_stopped_wait_work(&(*handler).pm)
-        || next_ready(&*handler).is_some();
+        || next_ready(&*handler).is_some()
+        || kernel_provider_activation::has_ready_completions();
     if (&mut *core::ptr::addr_of_mut!(WAKE))
         .finish_pass(&mut ticket, monotonic_time_100ns(), has_work, progressed)
         .is_err()

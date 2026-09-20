@@ -477,29 +477,35 @@ pub(crate) unsafe fn deliver_driver_entry_completion(
     }
 }
 
+/// Observe canonical retry demand without acquiring a delivery attempt or releasing references.
+pub(super) unsafe fn has_ready_completions() -> bool {
+    (&*core::ptr::addr_of!(ACTIVATIONS)).has_ready_completion() || terminal::has_ready()
+}
+
 /// Deliver retained kernel terminals and genuine Ready receipts, once per bounded pass.
-/// Never invoke from a nested pump timer hook: initialization belongs to the outer scheduler.
-pub(super) unsafe fn redrive_ready_completions() {
-    let mut cursor = (&*core::ptr::addr_of!(ACTIVATIONS)).completion_cursor();
-    if (&*core::ptr::addr_of!(ACTIVATIONS)).next_ready_completion(&mut cursor).is_none()
-        && !terminal::has_ready()
-    {
-        return;
+/// Return acknowledged ownership progress, not DriverEntry success. Never invoke from a nested
+/// pump timer hook or with handler/PM borrows alive: initialization belongs to the outer scheduler.
+pub(super) unsafe fn redrive_ready_completions() -> bool {
+    if !has_ready_completions() {
+        return false;
     }
     let Ok(pass) = CompletionDeliveryPass::enter() else {
-        return;
+        return false;
     };
     let _durable = allocator::enter_durable();
-    terminal::drain();
+    let mut progressed = terminal::drain();
     // Terminal retirement can publish an older activation than the initial readiness probe.
-    cursor = (&*core::ptr::addr_of!(ACTIVATIONS)).completion_cursor();
+    let mut cursor = (&*core::ptr::addr_of!(ACTIVATIONS)).completion_cursor();
     let Some(mut receipt) = (&*core::ptr::addr_of!(ACTIVATIONS)).next_ready_completion(&mut cursor)
     else {
-        return;
+        return progressed;
     };
     loop {
         if let Err(status) = pass.deliver(receipt) {
             report_deferred(receipt, status);
+        } else {
+            // Ok(false) still acknowledged the result and released the canonical Ps pair.
+            progressed = true;
         }
         let Some(next) = (&*core::ptr::addr_of!(ACTIVATIONS)).next_ready_completion(&mut cursor)
         else {
@@ -507,4 +513,5 @@ pub(super) unsafe fn redrive_ready_completions() {
         };
         receipt = next;
     }
+    progressed
 }

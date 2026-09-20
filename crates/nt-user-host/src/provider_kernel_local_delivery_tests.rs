@@ -3,6 +3,9 @@ use nt_component_suspension::{TerminalAttempt, TerminalIdentity, TerminalPhase};
 
 const RETURNED: u32 = 0xc000_0001;
 
+#[path = "provider_kernel_completion_wake_tests.rs"]
+mod wake;
+
 fn pending(f: &mut Fixture, observed: bool) -> TerminalIdentity {
     f.lanes.select(f.capture.key(), 258).unwrap();
     let (_, mut attempt, _) = f.resume().unwrap().into_parts();

@@ -764,6 +764,14 @@ impl<D> KernelProviderActivations<D> {
         Ok(KernelProviderCompletionReceipt { caller, status })
     }
 
+    /// Scheduling demand only. Terminal-pending or uncertain delivery still belongs to the
+    /// lane's terminal owner and cannot produce an acknowledgment receipt here.
+    pub fn has_ready_completion(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|row| matches!(row.completion, Some(Completion::Ready(_))))
+    }
+
     pub fn completion_cursor(&self) -> KernelProviderCompletionCursor {
         KernelProviderCompletionCursor {
             after: 0,

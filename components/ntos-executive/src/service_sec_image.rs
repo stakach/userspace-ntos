@@ -3272,7 +3272,6 @@ fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
 
 fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
     unsafe { kernel_provider_activation::publish_runtime_waits(nt_handler) };
-    unsafe { kernel_provider_activation::redrive_ready_completions() };
     unsafe { inline_file_retirement::redrive(nt_handler) };
     unsafe { crate::object_wait_apc::redrive(nt_handler) };
     unsafe { crate::object_wait_reply::redrive(nt_handler) };

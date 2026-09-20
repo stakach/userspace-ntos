@@ -2,6 +2,60 @@ use super::*;
 
 type CursorLanes = ComponentSuspensionLanes<u64, i32, u64>;
 
+#[test]
+fn failed_driver_status_ack_is_progress_with_sibling_work_retained() {
+    use nt_component_suspension::ResumeWake;
+
+    let mut f = Fixture::new();
+    assert!(!f.activations.has_ready_completion());
+    let (_, caller) = f.running(1);
+    assert!(!f.activations.has_ready_completion());
+    let first = f
+        .activations
+        .record_completion(caller, &f.pm, &f.catalog, &mut f.lanes, 0xc000_0001)
+        .unwrap();
+    let second = f.ready(2);
+    let mut wake = ResumeWake::new(10, 40).unwrap();
+    wake.reconcile(f.activations.has_ready_completion(), 100);
+    let mut foreign = bootstrap().into_parts().pm;
+    for (now, next) in [(100, 110), (110, 130)] {
+        let mut pass = wake.begin_pass(now).unwrap().unwrap();
+        let refused = f.activations.acknowledge_completion(first, &mut foreign);
+        assert!(refused.is_err());
+        wake.finish_pass(
+            &mut pass,
+            now,
+            f.activations.has_ready_completion(),
+            refused.is_ok(),
+        )
+        .unwrap();
+        assert_eq!(wake.next_deadline(), Some(next));
+        assert_eq!(references(&f.pm, caller.thread()), (2, 2));
+    }
+    let mut pass = wake.begin_pass(130).unwrap().unwrap();
+    let delivered = f
+        .activations
+        .acknowledge_completion(first, &mut f.pm)
+        .map(|status| (status as i32) >= 0);
+    assert_eq!(delivered, Ok(false));
+    assert_eq!(f.activations.completion(second.caller()), Ok(second));
+    wake.finish_pass(
+        &mut pass,
+        130,
+        f.activations.has_ready_completion(),
+        delivered.is_ok(),
+    )
+    .unwrap();
+    assert_eq!(wake.next_deadline(), Some(140));
+    assert_eq!(references(&f.pm, caller.thread()), (1, 1));
+    f.activations
+        .acknowledge_completion(second, &mut f.pm)
+        .unwrap();
+    wake.reconcile(f.activations.has_ready_completion(), 140);
+    assert_eq!(wake.next_deadline(), None);
+    assert_eq!(references(&f.pm, caller.thread()), (0, 0));
+}
+
 struct Fixture {
     pm: ProcessManager,
     native: NativeHandleCaller,
