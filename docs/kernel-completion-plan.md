@@ -36646,6 +36646,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         release builds pass (.tmp/build-worker-startup-retention-executive-20260920.log and
         .tmp/build-worker-startup-retention-io-manager-20260920.log). No new QEMU or desktop
         result is claimed for this checkpoint.
+        Staged startup contract checkpoint (2026-09-20): the host-testable canonical lane table
+        now reserves Staged lanes through the same identity, duplicate-binding, generation, and
+        capacity checks as ordinary allocation. Staged lanes cannot be selected, dispatched, or
+        generically released. begin_startup requires the exact canonical Reply to be observed Free
+        and claims the existing component-wide execution fence in a distinct Starting phase, without
+        manufacturing a dispatch epoch. complete_startup requires the exact Starting owner and a
+        fresh BoundToTarget observation before publishing Idle. The native adapter must additionally
+        authenticate the ready protocol message: a bound fault or service Call is not readiness.
+        Query errors and mismatches preserve phase and exclusion. Ordinary completion cannot release
+        startup ownership. No failure recovery or staged-release shortcut is provided; failed or
+        ambiguous startup remains fenced until a future acknowledged teardown transition.
+
+        Native integration remains open: move registration before resume only together with these
+        transitions, lifetime validation, exact ready-message validation, and provider retirement.
+        This checkpoint does not change endpoint topology or claim a new desktop result.
+        Validation passes 188 unit tests and nine compile-fail checks, including seven startup
+        tests (.tmp/test-staged-startup-focused-20260920.log). The serialized regression run
+        passes 1,498 tests across 24 suites (.tmp/test-staged-startup-20260920.log). Both native
+        release builds pass (.tmp/build-staged-startup-executive-20260920.log and
+        .tmp/build-staged-startup-io-manager-20260920.log). A separate code review found no
+        existing admission, completion, release, or resume API that bypasses startup exclusion.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

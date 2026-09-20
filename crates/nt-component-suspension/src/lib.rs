@@ -23,6 +23,8 @@ mod lane_peer;
 mod retained_ingress;
 mod retained_dispatch;
 mod retained_work;
+mod startup;
+pub use startup::StartupError;
 pub use retained_work::{RetainedWork, RetainedWorkCheckout, RetainedWorkError, RetainedWorkFinishError, RetainedWorkReservation};
 pub use retained_dispatch::{RetainedDispatch, RetainedDispatchError};
 pub use retained_ingress::{RetainedIngress, RetainedIngressError};
@@ -209,6 +211,10 @@ impl LaneBinding {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LanePhase {
+    /// Canonical resources reserved; no physical execution has been admitted.
+    Staged,
+    /// Startup owns the component execution fence but has no ordinary dispatch epoch.
+    Starting,
     Idle,
     Running,
     Suspended,
@@ -589,6 +595,19 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
     }
 
     pub fn allocate(&mut self, binding: LaneBinding) -> Result<LaneHandle, LaneError> {
+        self.allocate_with_phase(binding, LanePhase::Idle)
+    }
+
+    /// Reserve canonical identity without making the worker eligible for dispatch.
+    pub fn allocate_staged(&mut self, binding: LaneBinding) -> Result<LaneHandle, LaneError> {
+        self.allocate_with_phase(binding, LanePhase::Staged)
+    }
+
+    fn allocate_with_phase(
+        &mut self,
+        binding: LaneBinding,
+        phase: LanePhase,
+    ) -> Result<LaneHandle, LaneError> {
         if !binding.is_valid() || self.max_depth_per_lane == 0 {
             return Err(LaneError::InvalidIdentity);
         }
@@ -614,7 +633,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
                 .ok_or(LaneError::NoCapacity)?;
             slot.lane = Some(Lane {
                 binding,
-                phase: LanePhase::Idle,
+                phase,
                 dispatch: None,
                 external_tokens: Vec::new(),
                 suspensions: ComponentSuspensionStack::new(self.max_depth_per_lane),
@@ -641,7 +660,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             generation: handle.generation,
             lane: Some(Lane {
                 binding,
-                phase: LanePhase::Idle,
+                phase,
                 dispatch: None,
                 external_tokens: Vec::new(),
                 suspensions: ComponentSuspensionStack::new(self.max_depth_per_lane),
@@ -679,7 +698,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
     }
 
     /// Return the current job in either its running or suspended phase. Idle lanes have no job;
-    /// stale lane generations never recover the identity of a replacement lane.
+    /// staged/startup lanes reject job lookup, and stale generations never recover a replacement.
     pub fn active_dispatch_identity(
         &self,
         handle: LaneHandle,
