@@ -2059,8 +2059,14 @@ unsafe fn hosted_irq_exchange_event(badge: u64) -> bool {
 }
 
 #[inline(never)]
-unsafe fn hosted_irq_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
+unsafe fn hosted_irq_recv(
+    ch: &PumpChannel,
+    reply_cap: u64,
+    identity: nt_hosted_runtime::HostedIrqLaneIdentity,
+    expected_badge: u64,
+) -> PumpMessage {
     loop {
+        receive_probe::irq_before_receive(ch, reply_cap, identity, expected_badge);
         let badge: u64;
         let mi: u64;
         let m0: u64;
@@ -2081,10 +2087,15 @@ unsafe fn hosted_irq_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
             lateout("rax") _, lateout("rcx") _, lateout("r11") _,
             options(nostack),
         );
+        let received_call =
+            receive_probe::irq_received_call(ch, reply_cap, identity, expected_badge, badge);
         if hosted_irq_exchange_event(badge) {
             if pump_deadman_tripped() {
                 return PumpMessage::deadman_wall();
             }
+            continue;
+        }
+        if !received_call {
             continue;
         }
         let m4 = if (mi & 0x7f) > 4 {
@@ -2111,6 +2122,8 @@ unsafe fn hosted_irq_reply_recv(
     reply_cap: u64,
     reply_len: u64,
     reply: [u64; 4],
+    identity: nt_hosted_runtime::HostedIrqLaneIdentity,
+    expected_badge: u64,
 ) -> PumpMessage {
     let mut send_reply = true;
     loop {
@@ -2145,12 +2158,18 @@ unsafe fn hosted_irq_reply_recv(
             }
             send_reply = false;
         } else {
-            return hosted_irq_recv(ch, reply_cap);
+            return hosted_irq_recv(ch, reply_cap, identity, expected_badge);
         }
+        let received_call =
+            receive_probe::irq_received_call(ch, reply_cap, identity, expected_badge, badge);
         if hosted_irq_exchange_event(badge) {
             if pump_deadman_tripped() {
                 return PumpMessage::deadman_wall();
             }
+            continue;
+        }
+        if !received_call {
+            // The reply half already ran; continue receive-only after a plain Send.
             continue;
         }
         let m4 = if (mi & 0x7f) > 4 {
@@ -2186,9 +2205,13 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
         HostedIrqExchangeAction::ReplyToken { identity, token } => (identity, Some(token)),
     };
     let mut msg = match action {
-        HostedIrqExchangeAction::ReceiveReady { .. } => hosted_irq_recv(ch, ch.reply_cap),
+        HostedIrqExchangeAction::ReceiveReady { .. } => {
+            hosted_irq_recv(ch, ch.reply_cap, identity, expected_badge)
+        }
         HostedIrqExchangeAction::ReplyToken { token, .. } => {
-            hosted_irq_reply_recv(ch, ch.reply_cap, 4, token.transport_words())
+            hosted_irq_reply_recv(
+                ch, ch.reply_cap, 4, token.transport_words(), identity, expected_badge,
+            )
         }
     };
     let mut outcome = PumpLoopOutcome::new();
@@ -2238,12 +2261,14 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
                 break;
             }
             outcome.accounting.record_demand();
-            msg = hosted_irq_reply_recv(ch, ch.reply_cap, 0, [0; 4]);
+            msg = hosted_irq_reply_recv(ch, ch.reply_cap, 0, [0; 4], identity, expected_badge);
             continue;
         }
         if label == 3 && ch.caps.io_port_faults {
             if let Some(next_ip) = pump_service_io_port_fault(ch, msg.m0, msg.m3) {
-                msg = hosted_irq_reply_recv(ch, ch.reply_cap, 1, [next_ip, 0, 0, 0]);
+                msg = hosted_irq_reply_recv(
+                    ch, ch.reply_cap, 1, [next_ip, 0, 0, 0], identity, expected_badge,
+                );
                 continue;
             }
         }

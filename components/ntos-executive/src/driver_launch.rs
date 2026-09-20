@@ -47020,7 +47020,8 @@ unsafe fn build_hosted_irq_lane(
         if tcb_write_registers_r(lane.tcb, tramp_va, stack_top, 0) != 0 {
             return None;
         }
-        if tcb_set_gs_base(lane.tcb, component_kpcr_va) != 0 || tcb_set_priority(lane.tcb, 101) != 0
+        if tcb_set_gs_base_r(lane.tcb, component_kpcr_va) != 0
+            || tcb_set_priority_r(lane.tcb, 101) != 0
         {
             return None;
         }
@@ -47068,6 +47069,66 @@ unsafe fn hosted_irq_lane_channel(
             ..crate::spawn_hosts::HostCaps::default()
         },
     })
+}
+
+/// Snapshot the dedicated IRQ peer without holding canonical lane state across the Reply query.
+pub(crate) fn hosted_irq_pump_caller_tcb(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    identity: nt_hosted_runtime::HostedIrqLaneIdentity,
+    badge: u64,
+) -> Option<u64> {
+    if badge == 0 || !nt_component_suspension::badge::valid_endpoint_badge(badge) {
+        return None;
+    }
+    let lane = unsafe { hosted_irq_lanes()? }
+        .iter()
+        .find(|lane| lane.identity == identity)?;
+    let inst = instance(lane.projection_instance)?;
+    if !matches!(lane.state, HostedIrqLaneState::Booting | HostedIrqLaneState::Ready)
+        || !lane.tcb_resumed
+        || lane.tcb == 0
+        || lane.endpoint == 0
+        || lane.reply_cap == 0
+        || lane.pml4 == 0
+        || lane.badge != badge
+        || lane.domain.domain_id.raw() != identity.domain_id
+        || lane.domain.cookie != identity.domain_cookie
+        || identity.lane_generation == 0
+        || instance_domain_identity(inst) != Some(lane.domain)
+        || inst.pml4 != lane.pml4
+        || inst.exec_shared_va == 0
+        || channel.physical_domain != Some(lane.domain)
+        || channel.tcb != lane.tcb
+        || channel.fault_ep != lane.endpoint
+        || channel.reply_cap != lane.reply_cap
+        || reply_cap != lane.reply_cap
+        || channel.pml4 != lane.pml4
+        || channel.shared_va != inst.exec_shared_va
+        || channel.code_va != FSD_CODE_VA
+        || channel.image_frames != inst.image_frames
+        || channel.exec_code_va != ExecVaWindow::try_for_instance(lane.projection_instance)?.code_va
+        || channel.root_image_rights != 3
+        || channel.root_image_map_owner != inst.map_cap_bank.owner
+        || channel.dispatch_label != FSD_IRQ_LANE_COMPLETION_LABEL
+        || channel.client_pi != 0
+        || channel.client_generation != 0
+        || channel.logical_caller.is_some()
+        || channel.kernel_caller.is_some()
+        || !channel.caps.dispatch_server
+        || channel.caps.kind != crate::spawn_hosts::ReqKind::Irp
+        || channel.caps.client_attach
+        || channel.caps.usermode_callback
+        || channel.caps.provider_wait
+        || channel.caps.kernel_irq_yield
+        || channel.caps.wide_arg_marshal
+        || channel.caps.assert_skip
+        || channel.caps.sparse_vspace
+        || channel.caps.io_port_faults != unsafe { shared_has_port_resources(inst.exec_shared_va) }
+    {
+        return None;
+    }
+    Some(lane.tcb)
 }
 
 unsafe fn hosted_irq_lane_is_referenced(lane: &HostedIrqLaneRuntime) -> bool {
@@ -47211,7 +47272,7 @@ unsafe fn ensure_hosted_irq_lane(
         let _ = retire_hosted_irq_lane_if_unreferenced(projection_instance, domain);
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     };
-    if tcb_resume(tcb) != 0 {
+    if tcb_resume_r(tcb) != 0 {
         hosted_irq_lanes_mut()[lane_index].state = HostedIrqLaneState::Quarantined;
         let _ = retire_hosted_irq_lane_if_unreferenced(projection_instance, domain);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);

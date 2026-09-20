@@ -54,3 +54,43 @@ pub(super) unsafe fn received_call(channel: &PumpChannel, reply: u64, badge: u64
     )
     .expect("component Reply does not authenticate its received caller")
 }
+
+pub(super) unsafe fn irq_before_receive(
+    channel: &PumpChannel,
+    reply: u64,
+    identity: nt_hosted_runtime::HostedIrqLaneIdentity,
+    expected_badge: u64,
+) {
+    let _message = crate::ipc_message::SavedMessageBuffer::capture();
+    let tcb =
+        crate::driver_launch::hosted_irq_pump_caller_tcb(channel, reply, identity, expected_badge)
+            .expect("IRQ receive has no live lane peer");
+    require_free_reply(query(tcb, reply)).expect("IRQ receive would reuse an owned Reply");
+}
+
+pub(super) unsafe fn irq_received_call(
+    channel: &PumpChannel,
+    reply: u64,
+    identity: nt_hosted_runtime::HostedIrqLaneIdentity,
+    expected_badge: u64,
+    badge: u64,
+) -> bool {
+    let _message = crate::ipc_message::SavedMessageBuffer::capture();
+    let tcb =
+        crate::driver_launch::hosted_irq_pump_caller_tcb(channel, reply, identity, expected_badge)
+            .expect("IRQ receive lost its lane peer");
+    classify_received_call(
+        tcb,
+        |target| query(target, reply),
+        || {
+            (badge == expected_badge)
+                .then(|| {
+                    crate::driver_launch::hosted_irq_pump_caller_tcb(
+                        channel, reply, identity, badge,
+                    )
+                })
+                .flatten()
+        },
+    )
+    .expect("IRQ Reply does not authenticate its received caller")
+}

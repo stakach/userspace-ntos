@@ -36357,8 +36357,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
            previous reply failed. Capture the complete received message before any query/event
            IPC. Dedicated hosted IRQ lanes require their own canonical lane/domain/badge lookup;
            the ordinary driver resolver deliberately requires the instance main TCB and cannot
-           authenticate these separate TCBs. Do not migrate their badge/label-only completion
-           checks as if they established Reply ownership.
+           authenticate these separate TCBs. Preserve the dedicated Reply authentication checkpoint
+           below during migration; badge/label completion checks alone never establish ownership.
         5. Wire the bounded bootstrap pass to this ingress owner, retain exact target ACK across
            passes, and only then remove the three non-poll DriverEntry admission guards. Test two
            providers plus multiple workers, unrelated arrivals while a callback is parked, timer
@@ -36472,6 +36472,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         (.tmp/build-retained-ingress-executive-20260920.log and
         .tmp/build-retained-ingress-io-manager-20260920.log). No new QEMU run is claimed for this
         crate-only slice; the preceding measured boot still stops at the strict 27-export barrier.
+        Native dedicated-IRQ authentication checkpoint (2026-09-20): the private IRQ receive and
+        reply/receive paths now query exact kernel Reply binding before notification hooks, demand
+        faults or completion decoding. Receive-only calls require a Free Reply; the combined send
+        half is not incorrectly subjected to that preflight. A proven plain Send continues
+        receive-only without retransmitting the previous reply. Offered/unknown/wrong-owner
+        bindings fail closed rather than becoming protocol traffic or a wall against an unrelated
+        TCB. The complete IPC bank is preserved across the query, with fast message registers held
+        separately. Existing timer/IRQ notification handling remains distinct from Call dispatch.
+
+        hosted_irq_pump_caller_tcb resolves only the exact canonical IRQ lane identity, domain
+        cookie/generation, badge, TCB, endpoint, Reply and live projection mapping/channel context.
+        It accepts resumed Booting lanes for the initial ready handshake and Ready lanes for normal
+        exchanges, rejecting quarantined/shutting-down owners. No canonical borrow crosses IPC.
+        IRQ-worker GS-base, priority and resume now use acknowledged kernel calls; the old SYS_SEND
+        helpers returned literal zero and could falsely mark an unsuccessfully configured lane
+        resumed. This is native prerequisite hardening, not shared endpoint migration. Transactional
+        shared peer capability publication and retained-arrival routing/storage remain open.
+        Serialized validation passes 275 tests across four suites for nt-component-suspension and
+        nt-hosted-runtime (.tmp/test-irq-reply-auth-20260920.log). Executive and IO-manager release
+        builds pass (.tmp/build-irq-reply-auth-executive-20260920.log and
+        .tmp/build-irq-reply-auth-io-manager-20260920.log). The existing probe tests cover binding
+        states and exact caller mismatch, not native IRQ registry failure injection. No new QEMU
+        run or IRQ execution proof is claimed: the last measured boot stops at the strict 27-export
+        win32k barrier before these exchanges. Shared topology and bootstrap admission are unchanged.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
