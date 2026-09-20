@@ -15,6 +15,7 @@ pub enum RetainedIngressError<E> {
     Peer(PeerError),
     Ingress(IngressError),
     NotAcknowledged,
+    DispatchActive,
 }
 
 /// Keeps the exact Reply, complete payload and peer lifetime reservation together. This grants
@@ -30,9 +31,14 @@ pub struct RetainedIngress<M> {
     ingress: ComponentIngress<M>,
     retention: PeerRetention,
     completed: Option<M>,
+    pub(crate) admitted: Option<crate::LaneDispatchIdentity>,
 }
 
 impl<M> RetainedIngress<M> {
+    pub(crate) fn is_held(&self) -> bool {
+        self.admitted.is_none() && self.completed.is_none() && self.ingress.is_held()
+    }
+
     pub fn route(&self) -> PeerRoute {
         self.retention.route().expect("owned peer retention")
     }
@@ -77,6 +83,9 @@ impl<M> RetainedIngress<M> {
         peers: &mut PeerRegistry,
     ) -> Result<(ComponentIngress<M>, M), (RetainedIngressError<core::convert::Infallible>, Self)>
     {
+        if self.admitted.is_some() {
+            return Err((RetainedIngressError::DispatchActive, self));
+        }
         if self.completed.is_none() {
             return Err((RetainedIngressError::NotAcknowledged, self));
         }
@@ -134,6 +143,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
                 ingress,
                 retention,
                 completed: None,
+                admitted: None,
             }),
             Err((error, replacement)) => {
                 // No external effects or registry mutation intervened since retain succeeded.

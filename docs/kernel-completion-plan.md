@@ -36350,8 +36350,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
            must retain unrelated arrivals with distinct Replies, never interpret them using the
            currently executing channel or re-offer a bound Reply. Preserve non-Call snapshots for
            their separate notification/Send handling; the private-pump Send discard is not generic.
-           Before native storage/router cutover, define retained-Reply admission into a canonical
-           lane: begin_peer_dispatch currently requires the lane's existing Reply, whereas
+           Before native storage/router cutover, wire the retained-Reply admission checkpoint below
+           into a canonical lane: begin_peer_dispatch requires the lane's existing Reply, whereas
            RetainedIngress owns the distinct outer receive Reply. Admission must explicitly account
            for the displaced Reply, physical execution/continuation state, alias exclusion and
            return ownership on every failure. Do not merely substitute the new cptr or relax
@@ -36532,6 +36532,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         and reaches the unchanged strict 27-export win32k import rejection without an earlier
         snapshot/authentication failure (.tmp/boot-pump-owned-receive-20260920.log). QEMU was stopped
         at that deterministic blocker. This is not a deep-callback, IRQ execution or desktop proof.
+        Canonical retained-Reply admission checkpoint (2026-09-20): begin_retained_dispatch accepts
+        only a held, unadmitted Call from the exact active peer/domain generation and idle canonical
+        lane. It rejects physical execution, suspended/external continuations and incoming Reply
+        aliases in the lane table before querying native binding evidence. The displaced Reply must
+        be Free and the incoming Reply BoundToTarget for the exact canonical executor. After these
+        non-mutating queries, existing checked dispatch-epoch allocation runs before the infallible
+        binding update. Every refusal leaves the binding, phase, epoch and retained Call unchanged.
+        The returned receipt identifies the displaced free Reply for native ownership accounting;
+        it does not create a capability or waive other-domain/non-component alias checks.
+
+        The retained owner records the admitted dispatch identity. Reply ACK alone cannot release
+        its peer reservation: finish refuses DispatchActive until finish_retained_dispatch validates
+        that exact epoch/Reply and completes the ordinary canonical dispatch. Suspended/external or
+        mismatched dispatches cannot clear this marker. Resumed external continuations must use
+        retire_external_running before finish_retained_dispatch; generic complete_external or
+        finish_dispatch would discard the epoch and leave retention fail-closed. The incoming Reply
+        remains canonical after completion, so even an acknowledged returned ingress is excluded
+        from receive until a later checked transition displaces the Reply or releases its lane. This closes the host-testable
+        admission/return contract, not native routing. Native lifetime validation, bounded retained
+        storage, transactional capability publication and endpoint topology migration remain open;
+        private endpoint uniqueness and bootstrap blocking guards are unchanged.
+        Validation passes 171 unit tests and seven compile-fail checks, including ten new tests for
+        both Reply proof failures, alias/stale/retiring rejection, epoch exhaustion, two successive
+        rotations, ACK-before-completion protection, dispatch mismatch and successful external
+        continuation retirement (.tmp/test-retained-dispatch-focused-20260920.log). The broader
+        serialized run passes 1,479 tests across 24 suites (.tmp/test-retained-dispatch-20260920.log).
+        Executive and IO-manager release builds pass (.tmp/build-retained-dispatch-executive-20260920.log
+        and .tmp/build-retained-dispatch-io-manager-20260920.log). No new QEMU run for this crate-only
+        transition: the preceding measured native boot still stops at the strict 27-export win32k
+        barrier. Native adoption/cancellation/teardown and desktop rendering remain unproven.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

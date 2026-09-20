@@ -113,6 +113,9 @@ impl<M> ComponentIngress<M> {
     pub const fn reply(&self) -> u64 {
         self.reply
     }
+    pub(crate) fn is_held(&self) -> bool {
+        self.phase == Phase::Held
+    }
     /// Inspect retained data, including unresolved receives. Presence does not prove Call or Reply
     /// binding authority; classification requires separately established transport provenance.
     pub fn message(&self) -> Option<&M> {
