@@ -197,5 +197,197 @@ fn exhausted_identities_fail_before_receive_or_reply_state_changes() {
     }
 }
 
-// Bound-Reply transfer and replacement are deliberately not modeled here. Native fan-in must
-// preserve this ingress owner until exact reply acknowledgement, or add a tested transfer owner.
+fn ingress_in_phase(lanes: &Lanes, reply: u64, phase: usize) -> ComponentIngress<u64> {
+    let mut ingress = ComponentIngress::new(10, reply).unwrap();
+    if phase == 1 {
+        let _attempt = lanes.begin_ingress_receive(&mut ingress).unwrap();
+    } else if phase >= 2 {
+        receive(lanes, &mut ingress, reply + 100);
+        if phase >= 3 {
+            let mut attempt = ingress.begin_reply().unwrap();
+            if phase == 4 {
+                assert_eq!(
+                    ingress.observe_reply(&mut attempt, IngressReplyObservation::Indeterminate),
+                    Ok(None)
+                );
+            }
+        }
+    }
+    ingress
+}
+
+#[test]
+fn handoff_rejects_every_nonheld_current_or_nonready_replacement_without_changes() {
+    let lanes = Lanes::new(0, 1);
+    for current_phase in 0..5 {
+        for replacement_phase in 0..5 {
+            if current_phase == 2 && replacement_phase == 0 {
+                continue;
+            }
+            let mut current = ingress_in_phase(&lanes, 20, current_phase);
+            let replacement = ingress_in_phase(&lanes, 30, replacement_phase);
+            let before_current = (current.phase, current.message);
+            let before_replacement = (replacement.phase, replacement.message);
+            let (error, replacement) = lanes
+                .handoff_ingress_call(&mut current, replacement)
+                .err()
+                .unwrap();
+            assert_eq!(error, IngressError::NotReady);
+            assert_eq!((current.phase, current.message), before_current);
+            assert_eq!((replacement.phase, replacement.message), before_replacement);
+            assert_eq!((current.endpoint(), current.reply()), (10, 20));
+            assert_eq!((replacement.endpoint(), replacement.reply()), (10, 30));
+        }
+    }
+}
+
+#[test]
+fn handoff_rejects_different_endpoint_or_same_reply_and_retains_both_owners() {
+    let lanes = Lanes::new(0, 1);
+    for (endpoint, reply) in [(11, 30), (10, 20)] {
+        let mut current = ingress_in_phase(&lanes, 20, 2);
+        let replacement = ComponentIngress::new(endpoint, reply).unwrap();
+        let (error, replacement) = lanes
+            .handoff_ingress_call(&mut current, replacement)
+            .err()
+            .unwrap();
+        assert_eq!(error, IngressError::InvalidBinding);
+        assert_eq!(current.phase, Phase::Held);
+        assert_eq!(current.message(), Some(&120));
+        assert_eq!(replacement.phase, Phase::Ready);
+        assert!(replacement.message().is_none());
+        assert_eq!(
+            (replacement.endpoint(), replacement.reply()),
+            (endpoint, reply)
+        );
+        let mut attempt = current.begin_reply().unwrap();
+        assert_eq!(
+            current.observe_reply(&mut attempt, IngressReplyObservation::Acknowledged),
+            Ok(Some(120))
+        );
+    }
+}
+
+#[test]
+fn handoff_checks_both_canonical_replies_and_physical_execution_before_moving() {
+    for bound_reply in [20, 30, 40] {
+        for lane_phase in 0..3 {
+            let mut lanes = Lanes::new(1, 1);
+            let mut current = ingress_in_phase(&lanes, 20, 2);
+            let replacement = ComponentIngress::new(10, 30).unwrap();
+            let lane = lanes
+                .allocate(LaneBinding {
+                    executor_id: 50,
+                    receive_endpoint: 60,
+                    reply_object: bound_reply,
+                })
+                .unwrap();
+            if lane_phase > 0 {
+                lanes.begin_dispatch(lane, bound_reply).unwrap();
+                if lane_phase == 2 {
+                    lanes.suspend_running(lane, bound_reply, 1).unwrap();
+                }
+            }
+            let result = lanes.handoff_ingress_call(&mut current, replacement);
+            if bound_reply == 40 && lane_phase != 1 {
+                let retained = result.ok().unwrap();
+                assert_eq!(retained.message(), Some(&120));
+                assert_eq!(current.reply(), 30);
+            } else {
+                let (error, replacement) = result.err().unwrap();
+                assert_eq!(
+                    error,
+                    if lane_phase == 1 {
+                        IngressError::ExecutionBusy
+                    } else {
+                        IngressError::ReplyInUse
+                    }
+                );
+                assert_eq!(current.phase, Phase::Held);
+                assert_eq!(current.message(), Some(&120));
+                assert_eq!(current.reply(), 20);
+                assert_eq!(replacement.phase, Phase::Ready);
+                assert_eq!(replacement.reply(), 30);
+                assert!(replacement.message().is_none());
+            }
+            assert_eq!(
+                lanes.phase(lane),
+                Ok(match lane_phase {
+                    0 => LanePhase::Idle,
+                    1 => LanePhase::Running,
+                    _ => LanePhase::Suspended,
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn handoff_retains_nonclone_payload_while_replacement_receives_and_replies_independently() {
+    #[derive(Debug, PartialEq)]
+    struct Payload(alloc::boxed::Box<u64>);
+    let lanes = Lanes::new(0, 1);
+    let mut current = ComponentIngress::new(10, 20).unwrap();
+    let payload = Payload(alloc::boxed::Box::new(123));
+    let address = &*payload.0 as *const u64;
+    let mut old_receive = lanes.begin_ingress_receive(&mut current).unwrap();
+    assert!(current
+        .observe_receive(&mut old_receive, IngressObservation::Call(payload))
+        .is_ok());
+    let replacement = ComponentIngress::new(10, 30).unwrap();
+    let mut retained = lanes
+        .handoff_ingress_call(&mut current, replacement)
+        .ok()
+        .unwrap();
+    assert_eq!(retained.phase, Phase::Held);
+    assert_eq!(retained.reply(), 20);
+    assert_eq!(&*retained.message().unwrap().0 as *const u64, address);
+    assert_eq!(current.phase, Phase::Ready);
+    assert!(current.message().is_none());
+    let mut new_receive = lanes.begin_ingress_receive(&mut current).unwrap();
+    assert!(matches!(
+        current.observe_receive(&mut old_receive, IngressObservation::NoCall),
+        Err((IngressError::WrongAttempt, IngressObservation::NoCall))
+    ));
+    assert!(matches!(
+        retained.observe_receive(&mut new_receive, IngressObservation::NoCall),
+        Err((IngressError::WrongAttempt, IngressObservation::NoCall))
+    ));
+    let mut old_reply = retained.begin_reply().unwrap();
+    assert_eq!(
+        retained.observe_reply(&mut old_reply, IngressReplyObservation::Indeterminate),
+        Ok(None)
+    );
+    assert!(current
+        .observe_receive(
+            &mut new_receive,
+            IngressObservation::Call(Payload(alloc::boxed::Box::new(456)))
+        )
+        .is_ok());
+    let mut new_reply = current.begin_reply().unwrap();
+    assert_eq!(
+        current.observe_reply(&mut old_reply, IngressReplyObservation::Acknowledged),
+        Err(IngressError::WrongAttempt)
+    );
+    assert_eq!(
+        retained.observe_reply(&mut new_reply, IngressReplyObservation::Acknowledged),
+        Err(IngressError::WrongAttempt)
+    );
+    assert_eq!(
+        current.observe_reply(&mut new_reply, IngressReplyObservation::Acknowledged),
+        Ok(Some(Payload(alloc::boxed::Box::new(456))))
+    );
+    assert_eq!(&*retained.message().unwrap().0 as *const u64, address);
+    assert_eq!(retained.begin_reply().unwrap_err(), IngressError::NotReady);
+    let _next_receive = lanes.begin_ingress_receive(&mut current).unwrap();
+    let released = retained
+        .observe_reply(&mut old_reply, IngressReplyObservation::Acknowledged)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*released.0 as *const u64, address);
+    assert_eq!(retained.phase, Phase::Ready);
+    assert!(retained.message().is_none());
+    assert!(lanes.begin_ingress_receive(&mut retained).is_ok());
+}
+
+// Native fan-in must still prove capability provenance and retain returned owners while routing.

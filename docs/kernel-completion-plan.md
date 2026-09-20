@@ -36092,6 +36092,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/test-bootstrap-ingress-20260920.log, .tmp/build-bootstrap-ingress-20260920.log and
         .tmp/build-bootstrap-ingress-io-manager-20260920.log. No native receive or blocking-wait
         guard is changed by this slice. No QEMU rerun; the strict 27-export frontier is unchanged.
+      - [x] Preserve held ingress ownership while installing a replacement receive Reply (2026-09-20).
+        Added a memory-only handoff using the existing ComponentIngress owner, not a second payload
+        or synthetic reply result. It requires an original Held call and a Ready replacement for
+        the same endpoint with a different Reply. Both Replies are checked against every canonical
+        component binding, including aliases introduced after initial receive; physical execution
+        excludes handoff. All checks precede mutation. Failure returns the offered replacement
+        intact; success installs it and returns the entire original Held owner with its payload and
+        bound Reply unchanged. The returned owner still requires its exact reply attempt/ACK and
+        cannot receive again merely because another ingress owner is ready. Marked ingress owners
+        must-use. This transfers Rust ownership, not a capability binding or an acknowledged call.
+        Native allocation must prove a genuinely unbound, exclusive replacement object: different
+        cptr numbers alone do not prove distinct capability objects. Four handoff tests cover all
+        invalid phase pairs, binding mismatches, canonical aliases, physical execution, non-clone
+        payload identity, independent receives/replies and uncertain reply retention with exact ACK.
+        Validation: 11 focused ingress tests; 1,408 tests across 24 suites; native executive and
+        IO-manager release builds pass, serialized. Logs:
+        .tmp/test-bootstrap-ingress-handoff-focused-20260920.log,
+        .tmp/test-bootstrap-ingress-handoff-20260920.log,
+        .tmp/build-bootstrap-ingress-handoff-20260920.log and
+        .tmp/build-bootstrap-ingress-handoff-io-manager-20260920.log.
+        No QEMU rerun: the strict 27-export frontier is unchanged; no desktop proof is claimed.
+        Native message capture/provenance, lane routing, retention of transferred owners and repeated
+        outer receive remain open. No native receive or blocking admission guard is enabled here.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

@@ -40,6 +40,7 @@ enum Phase {
 /// Root must supply a genuinely unbound, exclusively owned Reply object, not just a free cptr.
 /// This object retains payload ownership across failed or uncertain effects. It does not route
 /// requests, allocate capabilities, or authorize execution of any provider lane.
+#[must_use = "retain the ingress owner until its received call is acknowledged or transferred"]
 pub struct ComponentIngress<M> {
     endpoint: u64,
     reply: u64,
@@ -182,23 +183,54 @@ impl<M> ComponentIngress<M> {
 }
 
 impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
-    /// Consult canonical bindings on every receive claim, including idle and suspended lanes.
-    /// Native code must also exclude replies retained by non-component owners.
-    pub fn begin_ingress_receive<M>(
-        &self,
-        ingress: &mut ComponentIngress<M>,
-    ) -> Result<IngressReceiveAttempt, IngressError> {
+    fn validate_ingress_reply(&self, reply: u64) -> Result<(), IngressError> {
         if self.execution_busy() {
             return Err(IngressError::ExecutionBusy);
         }
         if self.slots.iter().any(|slot| {
             slot.lane
                 .as_ref()
-                .is_some_and(|lane| lane.binding.reply_object == ingress.reply)
+                .is_some_and(|lane| lane.binding.reply_object == reply)
         }) {
             return Err(IngressError::ReplyInUse);
         }
+        Ok(())
+    }
+
+    /// Consult canonical bindings on every receive claim, including idle and suspended lanes.
+    /// Native code must also exclude replies retained by non-component owners.
+    pub fn begin_ingress_receive<M>(
+        &self,
+        ingress: &mut ComponentIngress<M>,
+    ) -> Result<IngressReceiveAttempt, IngressError> {
+        self.validate_ingress_reply(ingress.reply)?;
         ingress.begin_receive(&NEXT_ATTEMPT)
+    }
+
+    /// Install a separately owned, genuinely unbound replacement for the same endpoint and move
+    /// the original held call to its next owner. This is memory-only: no reply is sent and neither
+    /// the payload nor the old bound Reply is released. Retain the returned owner before any IPC.
+    /// Failures return the offered replacement intact and leave the original owner untouched.
+    /// Root must also exclude replacement capabilities retained by non-component owners.
+    pub fn handoff_ingress_call<M>(
+        &self,
+        ingress: &mut ComponentIngress<M>,
+        replacement: ComponentIngress<M>,
+    ) -> Result<ComponentIngress<M>, (IngressError, ComponentIngress<M>)> {
+        let check = (|| {
+            if ingress.phase != Phase::Held || replacement.phase != Phase::Ready {
+                return Err(IngressError::NotReady);
+            }
+            if replacement.endpoint != ingress.endpoint || replacement.reply == ingress.reply {
+                return Err(IngressError::InvalidBinding);
+            }
+            self.validate_ingress_reply(ingress.reply)?;
+            self.validate_ingress_reply(replacement.reply)
+        })();
+        if let Err(error) = check {
+            return Err((error, replacement));
+        }
+        Ok(core::mem::replace(ingress, replacement))
     }
 }
 
