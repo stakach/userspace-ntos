@@ -3,6 +3,29 @@
 use super::*;
 use nt_user_host::provider_kernel_activation::KernelProviderCaller;
 
+/// Scheduling observations only. None of these grants authority to receive on a parked Reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BootstrapPassOutcome {
+    TargetAcknowledged {
+        initialized: bool,
+    },
+    OwnershipUnavailable,
+    InvocationActive,
+    TimerDeliveryActive,
+    PassActive,
+    PhysicalExecutionBlocked,
+    /// The original pacing deadline is retained; no continuation was executed by this call.
+    Deferred {
+        deadline: u64,
+    },
+    /// No schedulable demand was observed. Parked jobs may still await external signals.
+    NoReadyWork,
+    /// A bounded pass ended. Its next scheduling deadline is not the complete timer deadline set.
+    PassFinished {
+        next_deadline: Option<u64>,
+    },
+}
+
 unsafe fn observe_kernel_demand(pm: &nt_process::ProcessManager) -> ResumeDemand {
     ResumeDemand::observe(
         component_execution_is_busy(),
@@ -43,14 +66,19 @@ unsafe fn next_kernel_in_pass(pass: &mut ResumePass) -> Option<Candidate> {
 /// scheduling pass, not a receive loop, and does not admit otherwise unsupported blocking waits.
 pub(crate) unsafe fn run_bootstrap_outer(
     target: KernelProviderCaller,
-) -> Result<Option<bool>, u32> {
-    if SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) != 0
-        || !dispatcher_bootstrap::is_owned()
-        || driver_launch::hosted_component_dispatch_active()
-        || TIMER_DELIVERY_GATE.is_active()
-        || is_running()
+) -> Result<BootstrapPassOutcome, u32> {
+    if SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) != 0 || !dispatcher_bootstrap::is_owned()
     {
-        return Ok(None);
+        return Ok(BootstrapPassOutcome::OwnershipUnavailable);
+    }
+    if driver_launch::hosted_component_dispatch_active() {
+        return Ok(BootstrapPassOutcome::InvocationActive);
+    }
+    if TIMER_DELIVERY_GATE.is_active() {
+        return Ok(BootstrapPassOutcome::TimerDeliveryActive);
+    }
+    if is_running() {
+        return Ok(BootstrapPassOutcome::PassActive);
     }
     let can_schedule = ps_bootstrap::with_process_manager(|pm| {
         let demand = observe_kernel_demand(pm);
@@ -58,15 +86,17 @@ pub(crate) unsafe fn run_bootstrap_outer(
         Ok(demand.can_schedule())
     })?;
     if !can_schedule {
-        return Ok(None);
+        return Ok(BootstrapPassOutcome::PhysicalExecutionBlocked);
     }
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
     let _durable = allocator::enter_durable();
     let mut acknowledged = None;
+    let mut ran_pass = false;
     if let Some(mut ticket) = (&mut *core::ptr::addr_of_mut!(WAKE))
         .begin_pass(monotonic_time_100ns())
         .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?
     {
+        ran_pass = true;
         let mut progressed = kernel_provider_activation::publish_bootstrap_waits()
             .expect("bootstrap continuation pass must retain its dispatcher owner");
         let mut pass = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).resume_pass();
@@ -102,5 +132,18 @@ pub(crate) unsafe fn run_bootstrap_outer(
     }
     assert!(dispatcher_bootstrap::request_receive_checkpoint());
     dispatcher_bootstrap::prepare_receive()?;
-    Ok(acknowledged)
+    if let Some(initialized) = acknowledged {
+        return Ok(BootstrapPassOutcome::TargetAcknowledged { initialized });
+    }
+    if component_execution_is_busy() {
+        return Ok(BootstrapPassOutcome::PhysicalExecutionBlocked);
+    }
+    let next_deadline = retained_deadline();
+    if !ran_pass {
+        return Ok(match next_deadline {
+            Some(deadline) => BootstrapPassOutcome::Deferred { deadline },
+            None => BootstrapPassOutcome::NoReadyWork,
+        });
+    }
+    Ok(BootstrapPassOutcome::PassFinished { next_deadline })
 }

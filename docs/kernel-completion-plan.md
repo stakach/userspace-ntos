@@ -36047,6 +36047,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         loop is claimed: all three kernel non-poll guards remain. Next provide distinct outer ingress
         without rebinding a parked reply, preserve target completion ownership across multiple passes,
         and only then enable blocking admission. The strict import frontier remains unchanged.
+      - [x] Distinguish bootstrap pass outcomes before adding blocking ingress (2026-09-20).
+        Replaced Option<bool>, which conflated missing ownership, nested execution, pacing and
+        a serviced pass without target ACK, with explicit scheduling observations. Results now
+        distinguish exact target acknowledgement, unavailable ownership, active physical invocation,
+        timer delivery, continuation pass, blocked physical execution, retained backoff deadline,
+        no ready work and a finished bounded pass. Recheck physical exclusion after execution so a
+        newly stopped invocation cannot be mistaken for an idle receive owner. Only an exact target
+        ACK updates the initial caller's readiness. NoReadyWork is not absence of parked jobs, and
+        reported continuation pacing is not the complete timer deadline set. No outcome grants
+        permission to receive or rebind a parked Reply. All 1,395 tests across 24 serialized host
+        suites pass; executive release passes in 35.49s with 294 warnings and I/O Manager release
+        passes. Evidence: .tmp/test-bootstrap-pass-outcomes-20260920.log,
+        .tmp/build-bootstrap-pass-outcomes-20260920.log and
+        .tmp/build-bootstrap-pass-outcomes-io-manager-20260920.log. Independent review found no
+        correctness issue. Host tests cover underlying demand/ownership/pacing, not the native
+        early-return branches. No QEMU rerun; the unchanged 27-export rejection precedes this path.
+        Receive audit: rust-micro endpoint Recv offers r12 to the next Call, including a queued
+        unrelated sender. Notification-only Recv with r12 zero avoids this but cannot service
+        arbitrary endpoint traffic; it is not a replacement for generic fan-in. The next ingress
+        step requires its own unbound Reply, retained received-message ownership and authenticated
+        lane routing before any repeated receive. Keep non-poll admission disabled until complete.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

@@ -30164,7 +30164,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
             // The physical invocation's scheduler scope has ended. Only an exact acknowledged
             // target completion may update readiness; receipt disappearance is not success.
-            if let Some(completed) = service_sec_image::component_resume::run_bootstrap_outer(init_caller)
+            if let service_sec_image::component_resume::BootstrapPassOutcome::TargetAcknowledged {
+                initialized: completed,
+            } = service_sec_image::component_resume::run_bootstrap_outer(init_caller)
                 .expect("bootstrap continuation pass must retain its original owners")
             {
                 initialized = completed;

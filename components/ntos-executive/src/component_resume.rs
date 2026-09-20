@@ -9,7 +9,7 @@ pub(super) use execute::run_hosted;
 
 #[path = "component_resume_bootstrap.rs"]
 mod bootstrap;
-pub(crate) use bootstrap::run_bootstrap_outer;
+pub(crate) use bootstrap::{run_bootstrap_outer, BootstrapPassOutcome};
 
 // Scheduling latency/backoff, independent of the original NT wait's retained deadline.
 static mut WAKE: ResumeWake = match ResumeWake::new(10_000, 160_000) {
