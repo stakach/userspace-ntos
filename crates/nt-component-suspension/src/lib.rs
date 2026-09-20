@@ -14,6 +14,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 static NEXT_DISPATCH_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 mod terminal;
+mod ingress;
+pub use ingress::{
+    ComponentIngress, IngressError, IngressObservation, IngressReceiveAttempt, IngressReplyAttempt,
+    IngressReplyObservation,
+};
 mod resume_pass;
 pub use resume_pass::ResumePass;
 mod resume_wake;

@@ -36068,6 +36068,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         arbitrary endpoint traffic; it is not a replacement for generic fan-in. The next ingress
         step requires its own unbound Reply, retained received-message ownership and authenticated
         lane routing before any repeated receive. Keep non-poll admission disabled until complete.
+      - [x] Add host-testable outer ingress receive/reply ownership (2026-09-20).
+        ComponentIngress is separate from every parked lane binding. Receive claims consult the
+        canonical lane table, reject active physical execution and any registered component Reply
+        collision (including idle lanes), and commit a non-copyable attempt before transport entry.
+        Only an exact observed NoCall returns to ready; an endpoint Call retains its owned payload
+        and excludes another receive. Explicit reply attempts retain the message: NoEffects permits
+        a new attempt, Acknowledged retires the payload and permits reuse of the now-unbound Reply,
+        and Indeterminate retains the original attempt without allowing replay. Dropped/wrong
+        attempts cannot reopen ownership. Checked global attempt identities refuse exhaustion
+        before mutation. Native root allocation must still guarantee exclusive unbound ownership
+        and exclude non-component reply owners; copied cptrs are not ownership proof.
+        This is a shared contract, not native receive integration. Generic fan-in still needs a
+        complete owned message snapshot, reliable notification/Call provenance (zero badge or
+        length does not prove an empty receive), authenticated lane routing, and bound-reply
+        transfer with a separately validated replacement Reply when dispatch itself parks.
+        Seven focused tests cover invalid bindings, idle/running/suspended lane exclusion, dropped
+        and foreign attempts, zero-word unbadged Call retention, exact non-clone payload retention,
+        uncertain effects/later acknowledgement and identity exhaustion before mutation. All 1,404
+        tests across 24 serialized host suites pass, including two non-clone compile-fail checks.
+        Executive release passes in 37.70s with 294 warnings; I/O Manager release also passes.
+        Evidence: .tmp/test-bootstrap-ingress-focused-20260920.log,
+        .tmp/test-bootstrap-ingress-20260920.log, .tmp/build-bootstrap-ingress-20260920.log and
+        .tmp/build-bootstrap-ingress-io-manager-20260920.log. No native receive or blocking-wait
+        guard is changed by this slice. No QEMU rerun; the strict 27-export frontier is unchanged.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
