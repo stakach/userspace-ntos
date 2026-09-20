@@ -36562,6 +36562,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         and .tmp/build-retained-dispatch-io-manager-20260920.log). No new QEMU run for this crate-only
         transition: the preceding measured native boot still stops at the strict 27-export win32k
         barrier. Native adoption/cancellation/teardown and desktop rendering remain unproven.
+        Bounded retained-work storage checkpoint (2026-09-20): RetainedWork preallocates its fixed
+        slot capacity before any receive. A non-clone reservation records the exact incoming Reply
+        and a globally non-reused identity; reserved, stored and checked-out entries all exclude
+        their Replies from new admission. Commit binds the retained Call to that exact reservation
+        without allocation. Selection uses the complete PeerRoute, not merely a badge, domain or
+        table-local lane handle. Checkout keeps the slot and Reply charged while forwarding
+        canonical admission/completion and reply operations to its owned RetainedIngress. Only
+        read-only inspection is exposed: a mutable whole-Call borrow would allow mem::replace to
+        detach the Call from its reservation.
+
+        Restore does not allocate, so nested arrivals cannot consume the capacity needed to retain
+        a failed or uncertain dispatch. Checkout completion validates exact ownership before
+        invoking RetainedIngress::finish; only successful ACK/dispatch/registry release vacates a
+        committed slot. Errors return the Call/ticket intact. Dropped tickets leave their metadata
+        reservations outstanding rather than permitting capability reuse. Releasing an unused
+        reservation requires a never-started receive, proven NoCall, or completed native cancellation;
+        an uncommitted slot alone is not evidence that no Call is outstanding.
+
+        This is the bounded storage contract for the native router, not a topology cutover. Native
+        creation must reserve storage and a fresh Reply before receive, preserve ambiguous ingress
+        ownership, and integrate canonical dispatch admission and exact completion. Cross-domain
+        capability exclusion, transactional peer publication, non-Call routing and cancellation
+        evidence remain native obligations. Existing private endpoints and bootstrap guards stay.
+        Native integration review: the current COMPONENT_SUSPENSIONS table is registered only by
+        win32k_glue; driver workers and dedicated IRQ lanes retain different canonical runtime
+        owners. The router must bind each route to its actual physical owner before using lane
+        admission, not manufacture LaneHandles from worker badges or insert all providers into
+        the win32k table. Establish that ownership mapping together with the native consumer.
+        Validation passes 181 unit tests and nine compile-fail checks, including ten new storage
+        tests and non-clone checks for reservation/checkout tickets. Coverage includes capacity and
+        identity exhaustion, foreign/stale ownership, failed commit/restore/finish, admitted dispatch
+        completion, ambiguous replies, distinct peers and nested arrival during failed dispatch
+        (.tmp/test-retained-work-focused-20260920.log). The broader serialized run passes 1,491 tests
+        across 24 suites (.tmp/test-retained-work-20260920.log). Executive and IO-manager release
+        builds pass (.tmp/build-retained-work-executive-20260920.log and
+        .tmp/build-retained-work-io-manager-20260920.log). No new QEMU run is claimed for this
+        crate-only storage step; native receive routing and desktop remain unproven beyond the
+        preceding measured strict 27-export win32k barrier.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

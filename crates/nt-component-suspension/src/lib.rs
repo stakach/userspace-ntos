@@ -22,6 +22,8 @@ pub mod peer_registry;
 mod lane_peer;
 mod retained_ingress;
 mod retained_dispatch;
+mod retained_work;
+pub use retained_work::{RetainedWork, RetainedWorkCheckout, RetainedWorkError, RetainedWorkFinishError, RetainedWorkReservation};
 pub use retained_dispatch::{RetainedDispatch, RetainedDispatchError};
 pub use retained_ingress::{RetainedIngress, RetainedIngressError};
 pub use lane_peer::PeerLaneError;
