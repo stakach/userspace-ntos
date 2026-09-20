@@ -15,6 +15,8 @@ static NEXT_DISPATCH_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 mod terminal;
 mod ingress;
+mod message;
+pub use message::{IpcBufferSnapshot, ReceivedMessage, IPC_BUFFER_WORDS};
 pub use ingress::{
     ComponentIngress, IngressError, IngressObservation, IngressReceiveAttempt, IngressReplyAttempt,
     IngressReplyObservation,

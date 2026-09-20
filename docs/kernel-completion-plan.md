@@ -36115,6 +36115,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         No QEMU rerun: the strict 27-export frontier is unchanged; no desktop proof is claimed.
         Native message capture/provenance, lane routing, retention of transferred owners and repeated
         outer receive remain open. No native receive or blocking admission guard is enabled here.
+      - [x] Capture owned native receive data before deferred IPC (2026-09-20).
+        Added a host-testable ReceivedMessage with the returned badge, MessageInfo, four register
+        MRs and exact 128-word IPC-buffer snapshot. The returned tag/registers are authoritative:
+        rust-micro may leave their buffer slots stale. Message access validates the encoded length
+        against the 120-word ABI maximum and never exposes tail words beyond that length. Raw
+        restoration preserves all words, including user data, cap/badge metadata and receive path;
+        it does not normalize stale slots or imply ownership of transferred capabilities.
+        The native recv_owned_r12 captures immediately after the syscall, before bookkeeping.
+        Existing tuple callers use that boundary without an unnecessary volatile writeback because
+        the bookkeeping remains memory-only. SavedMessageBuffer now uses the same tested snapshot
+        beneath its scoped restore guard. ReceivedMessage itself has no Drop-side effects and does
+        not classify Calls, Sends, notifications or empty receives from badge/tag values.
+        Tests cover every encoded length, exact restoration with surrounding sentinels, and retained
+        ingress handoff while the source buffer is overwritten. Validation: 1,411 tests across
+        24 suites and serialized native executive/IO-manager release builds pass. Logs:
+        .tmp/test-received-message-20260920.log, .tmp/build-received-message-20260920.log and
+        .tmp/build-received-message-io-manager-20260920.log. No QEMU rerun or desktop claim.
+        This closes message-data capture only: exclusive Reply allocation, receive provenance,
+        authenticated lane routing, retained owner storage and repeated outer receive remain open.
+        Blocking-wait guards stay disabled; the strict 27-export boot frontier is unchanged.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

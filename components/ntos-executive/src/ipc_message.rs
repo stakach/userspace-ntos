@@ -2,25 +2,20 @@
 
 use crate::IPC_BUFFER;
 use core::sync::atomic::Ordering;
-
-// seL4_IPCBuffer: tag, 120 message words, userData, three cap/badge words and receive CNode/index/
-// depth. This is the ABI extent in rust-micro/src/ipc_buffer.rs, not the whole backing page.
-const BUFFER_WORDS: usize = 128;
+use nt_component_suspension::{IpcBufferSnapshot, ReceivedMessage};
 
 pub(crate) struct SavedMessageBuffer {
     base: *mut u64,
-    words: [u64; BUFFER_WORDS],
+    snapshot: IpcBufferSnapshot,
 }
 
 impl SavedMessageBuffer {
     pub(crate) unsafe fn capture() -> Self {
         let base = IPC_BUFFER.load(Ordering::Relaxed) as *mut u64;
         assert!(!base.is_null(), "deferred IPC has no root message buffer");
-        let mut words = [0; BUFFER_WORDS];
-        for (index, word) in words.iter_mut().enumerate() {
-            *word = core::ptr::read_volatile(base.add(index));
-        }
-        Self { base, words }
+        let snapshot =
+            IpcBufferSnapshot::capture(|index| core::ptr::read_volatile(base.add(index)));
+        Self { base, snapshot }
     }
 }
 
@@ -28,8 +23,23 @@ impl Drop for SavedMessageBuffer {
     fn drop(&mut self) {
         // The root TCB and its IPC mapping outlive the entire service loop. Nested snapshots
         // restore in stack order; deferred capability replies are consumed before this restore.
-        for (index, word) in self.words.iter().enumerate() {
-            unsafe { core::ptr::write_volatile(self.base.add(index), *word) };
-        }
+        self.snapshot.restore(|index, word| unsafe {
+            core::ptr::write_volatile(self.base.add(index), word)
+        });
     }
+}
+
+pub(crate) unsafe fn capture_received(
+    badge: u64,
+    info: u64,
+    registers: [u64; 4],
+) -> ReceivedMessage {
+    let base = IPC_BUFFER.load(Ordering::Relaxed) as *const u64;
+    assert!(!base.is_null(), "receive has no root message buffer");
+    ReceivedMessage::new(
+        badge,
+        info,
+        registers,
+        IpcBufferSnapshot::capture(|index| core::ptr::read_volatile(base.add(index))),
+    )
 }

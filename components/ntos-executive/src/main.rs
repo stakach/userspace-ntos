@@ -15942,6 +15942,15 @@ unsafe fn reply_recv_badge(
 /// faulting dispatch can't orphan an outer caller's pending reply. The kernel preserves the user's
 /// r12 across the syscall (it reads it, never writes it), so `in` is sufficient.
 unsafe fn recv_full_r12(ep: u64, reply_cptr: u64) -> (u64, u64, u64, u64, u64, u64) {
+    let message = recv_owned_r12(ep, reply_cptr);
+    // recv_owned_r12's bookkeeping is memory-only; the live buffer remains this receive's buffer.
+    let [mr0, mr1, mr2, mr3] = message.registers();
+    (message.badge(), message.info(), mr0, mr1, mr2, mr3)
+}
+
+/// Capture the whole receive before any deferred work can reuse the root IPC buffer. This carries
+/// no transport classification or reply authority; the caller must retain those independently.
+unsafe fn recv_owned_r12(ep: u64, reply_cptr: u64) -> nt_component_suspension::ReceivedMessage {
     let recv_started = disk_census_ticks();
     let badge: u64;
     let msginfo: u64;
@@ -15963,6 +15972,7 @@ unsafe fn recv_full_r12(ep: u64, reply_cptr: u64) -> (u64, u64, u64, u64, u64, u
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
+    let message = ipc_message::capture_received(badge, msginfo, [mr0, mr1, mr2, mr3]);
     RECV_BLOCKED_TICKS.fetch_add(
         disk_census_ticks().wrapping_sub(recv_started),
         Ordering::Relaxed,
@@ -15978,7 +15988,7 @@ unsafe fn recv_full_r12(ep: u64, reply_cptr: u64) -> (u64, u64, u64, u64, u64, u
             WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
         }
     }
-    (badge, msginfo, mr0, mr1, mr2, mr3)
+    message
 }
 
 /// Reply through a caller-bound Reply cap and receive the next executive event in one kernel entry.
