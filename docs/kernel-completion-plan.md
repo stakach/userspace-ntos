@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-09-14
+Last updated: 2026-09-20
 
 ## Objective
 
@@ -36248,6 +36248,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Native review found no other post-acquisition early return in runtime run_outer. This is an
         ownership-failure fix, not native receive-provenance integration. Reply-binding evidence and
         bootstrap fan-in remain open; the strict 27-export boot frontier remains unchanged.
+      - [x] Provide a production capability-scoped Reply-binding query (2026-09-20).
+        rust-micro now exposes the append-only private TCBQueryReplyBinding invocation (x86-64
+        label 73). The target is the expected caller's TCB capability and the exact one-word
+        request names a Reply capability in the invoker's CSpace. The result distinguishes Free,
+        Offered, BoundToTarget and BoundElsewhere without exposing internal TCB identifiers.
+        Invalid capabilities, malformed requests and inconsistent reciprocal ownership fail closed.
+        The query does not reply, cancel, wake, donate, reserve or alter execution holds. It is a
+        serialized observation, not a reservation: exclusive Reply ownership and caller/domain
+        lifetime validation remain prerequisites for subsequent use. A query label on Reply itself
+        would conflict with ordinary message payload; ordinary Reply invocation is unchanged.
+        sel4-rt supplies a typed wrapper and strict response decoder; malformed responses and kernel
+        errors cannot become a Free classification. Capture the received IPC buffer before querying,
+        since the query itself writes the syscall response into that buffer.
+
+        Validation: three host response-decoder tests pass. The rebuilt four-CPU microkernel reaches
+        "All specs passed!", including new invocation coverage for copied Reply caps, all four states,
+        malformed requests, invalid cap types, inconsistent ownership, unchanged caller/receiver,
+        scheduling-context and execution-hold state, and ordinary replies carrying label 73. QEMU
+        then entered the standalone scheduling demo and was explicitly terminated; this is not an
+        NT desktop run or a successful guest-exit verdict. Logs:
+        .tmp/test-reply-binding-wire-20260920.log, .tmp/build-reply-binding-kernel-20260920.log and
+        .tmp/spec-reply-binding-kernel-20260920.log.
+        Serialized executive and IO-manager release builds also pass; logs are
+        .tmp/build-reply-binding-executive-20260920.log and
+        .tmp/build-reply-binding-io-manager-20260920.log.
+
+        Review adjustment: production binding observation is now available; native retained-ingress
+        integration remains open. Authenticate endpoint/badge, live caller and physical domain before
+        accepting BoundToTarget. Do not turn Offered, BoundElsewhere or an error into NoCall, or
+        infer Call-versus-Send from message shape. Preserve unresolved snapshots on refusal. Bootstrap
+        fan-in and blocking-wait admission remain disabled pending that complete ownership path;
+        the strict 27-export desktop boot frontier is unchanged.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
