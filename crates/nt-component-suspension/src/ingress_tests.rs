@@ -199,7 +199,10 @@ fn exhausted_identities_fail_before_receive_or_reply_state_changes() {
 
 fn ingress_in_phase(lanes: &Lanes, reply: u64, phase: usize) -> ComponentIngress<u64> {
     let mut ingress = ComponentIngress::new(10, reply).unwrap();
-    if phase == 1 {
+    if phase == 5 {
+        let mut attempt = lanes.begin_ingress_receive(&mut ingress).unwrap();
+        ingress.capture_receive(&mut attempt, reply + 100).unwrap();
+    } else if phase == 1 {
         let _attempt = lanes.begin_ingress_receive(&mut ingress).unwrap();
     } else if phase >= 2 {
         receive(lanes, &mut ingress, reply + 100);
@@ -219,8 +222,8 @@ fn ingress_in_phase(lanes: &Lanes, reply: u64, phase: usize) -> ComponentIngress
 #[test]
 fn handoff_rejects_every_nonheld_current_or_nonready_replacement_without_changes() {
     let lanes = Lanes::new(0, 1);
-    for current_phase in 0..5 {
-        for replacement_phase in 0..5 {
+    for current_phase in 0..6 {
+        for replacement_phase in 0..6 {
             if current_phase == 2 && replacement_phase == 0 {
                 continue;
             }
@@ -388,6 +391,147 @@ fn handoff_retains_nonclone_payload_while_replacement_receives_and_replies_indep
     assert_eq!(retained.phase, Phase::Ready);
     assert!(retained.message().is_none());
     assert!(lanes.begin_ingress_receive(&mut retained).is_ok());
+}
+
+#[test]
+fn unresolved_nonclone_payload_requires_exact_classification_before_reply() {
+    #[derive(Debug, PartialEq)]
+    struct Payload(alloc::boxed::Box<u64>);
+    let lanes = Lanes::new(0, 1);
+    let mut ingress = ComponentIngress::new(10, 20).unwrap();
+    let mut other = ComponentIngress::new(10, 30).unwrap();
+    let mut attempt = lanes.begin_ingress_receive(&mut ingress).unwrap();
+    let mut other_attempt = lanes.begin_ingress_receive(&mut other).unwrap();
+    let payload = Payload(alloc::boxed::Box::new(123));
+    let address = &*payload.0 as *const u64;
+    let (error, payload) = other.capture_receive(&mut attempt, payload).unwrap_err();
+    assert_eq!(error, IngressError::WrongAttempt);
+    assert_eq!(&*payload.0 as *const u64, address);
+    assert_eq!(
+        ingress.resolve_receive(&mut attempt, IngressReceiveDisposition::Call),
+        Err(IngressError::WrongAttempt)
+    );
+    ingress.capture_receive(&mut attempt, payload).unwrap();
+    assert_eq!(&*ingress.message().unwrap().0 as *const u64, address);
+    assert_eq!(ingress.begin_reply().unwrap_err(), IngressError::NotReady);
+    assert_eq!(
+        lanes.begin_ingress_receive(&mut ingress).unwrap_err(),
+        IngressError::NotReady
+    );
+    let replacement = ComponentIngress::new(10, 40).unwrap();
+    let (error, replacement) = lanes
+        .handoff_ingress_call(&mut ingress, replacement)
+        .err()
+        .unwrap();
+    assert_eq!(error, IngressError::NotReady);
+    assert_eq!(replacement.phase, Phase::Ready);
+    let duplicate = Payload(alloc::boxed::Box::new(456));
+    let duplicate_address = &*duplicate.0 as *const u64;
+    let (error, duplicate) = ingress
+        .capture_receive(&mut attempt, duplicate)
+        .unwrap_err();
+    assert_eq!(error, IngressError::WrongAttempt);
+    assert_eq!(&*duplicate.0 as *const u64, duplicate_address);
+    assert!(matches!(
+        ingress.observe_receive(&mut attempt, IngressObservation::NoCall),
+        Err((IngressError::WrongAttempt, IngressObservation::NoCall))
+    ));
+    for disposition in [
+        IngressReceiveDisposition::Call,
+        IngressReceiveDisposition::NoCall,
+    ] {
+        assert_eq!(
+            ingress.resolve_receive(&mut other_attempt, disposition),
+            Err(IngressError::WrongAttempt)
+        );
+        assert_eq!(
+            other.resolve_receive(&mut attempt, disposition),
+            Err(IngressError::WrongAttempt)
+        );
+    }
+    assert_eq!(&*ingress.message().unwrap().0 as *const u64, address);
+    assert_eq!(
+        ingress.resolve_receive(&mut attempt, IngressReceiveDisposition::Call),
+        Ok(None)
+    );
+    assert_eq!(ingress.phase, Phase::Held);
+    for disposition in [
+        IngressReceiveDisposition::Call,
+        IngressReceiveDisposition::NoCall,
+    ] {
+        assert_eq!(
+            ingress.resolve_receive(&mut attempt, disposition),
+            Err(IngressError::WrongAttempt)
+        );
+    }
+    assert_eq!(
+        lanes.begin_ingress_receive(&mut ingress).unwrap_err(),
+        IngressError::NotReady
+    );
+    let mut reply = ingress.begin_reply().unwrap();
+    let released = ingress
+        .observe_reply(&mut reply, IngressReplyObservation::Acknowledged)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*released.0 as *const u64, address);
+    assert!(lanes.begin_ingress_receive(&mut ingress).is_ok());
+}
+
+#[test]
+fn resolved_no_call_returns_original_snapshot_and_old_ticket_cannot_resolve_next_receive() {
+    #[derive(Debug, PartialEq)]
+    struct Payload(alloc::boxed::Box<u64>);
+    let lanes = Lanes::new(0, 1);
+    let mut ingress = ComponentIngress::new(10, 20).unwrap();
+    let mut attempt = lanes.begin_ingress_receive(&mut ingress).unwrap();
+    let payload = Payload(alloc::boxed::Box::new(123));
+    let address = &*payload.0 as *const u64;
+    ingress.capture_receive(&mut attempt, payload).unwrap();
+    let returned = ingress
+        .resolve_receive(&mut attempt, IngressReceiveDisposition::NoCall)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*returned.0 as *const u64, address);
+    assert!(ingress.message().is_none());
+    assert_eq!(ingress.phase, Phase::Ready);
+    assert_eq!(ingress.begin_reply().unwrap_err(), IngressError::NotReady);
+    let mut next = lanes.begin_ingress_receive(&mut ingress).unwrap();
+    ingress.capture_receive(&mut next, returned).unwrap();
+    assert_eq!(
+        ingress.resolve_receive(&mut attempt, IngressReceiveDisposition::NoCall),
+        Err(IngressError::WrongAttempt)
+    );
+    assert_eq!(&*ingress.message().unwrap().0 as *const u64, address);
+    let returned = ingress
+        .resolve_receive(&mut next, IngressReceiveDisposition::NoCall)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*returned.0 as *const u64, address);
+}
+
+#[test]
+fn dropped_unresolved_ticket_retains_snapshot_without_any_new_authority() {
+    let lanes = Lanes::new(0, 1);
+    let mut ingress = ComponentIngress::new(10, 20).unwrap();
+    let mut attempt = lanes.begin_ingress_receive(&mut ingress).unwrap();
+    ingress.capture_receive(&mut attempt, 123).unwrap();
+    let phase = ingress.phase;
+    drop(attempt);
+    assert_eq!(ingress.message(), Some(&123));
+    assert_eq!(ingress.begin_reply().unwrap_err(), IngressError::NotReady);
+    assert_eq!(
+        lanes.begin_ingress_receive(&mut ingress).unwrap_err(),
+        IngressError::NotReady
+    );
+    let replacement = ComponentIngress::new(10, 30).unwrap();
+    let (error, replacement) = lanes
+        .handoff_ingress_call(&mut ingress, replacement)
+        .err()
+        .unwrap();
+    assert_eq!(error, IngressError::NotReady);
+    assert_eq!(replacement.phase, Phase::Ready);
+    assert_eq!(ingress.phase, phase);
+    assert_eq!(ingress.message(), Some(&123));
 }
 
 // Native fan-in must still prove capability provenance and retain returned owners while routing.

@@ -22,6 +22,14 @@ pub enum IngressObservation<M> {
     Call(M),
 }
 
+/// Evidence supplied by the native adapter after an owned snapshot has been captured. Neither
+/// message contents nor badge/tag shape alone establish this classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngressReceiveDisposition {
+    Call,
+    NoCall,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IngressReplyObservation {
     Acknowledged,
@@ -33,6 +41,7 @@ pub enum IngressReplyObservation {
 enum Phase {
     Ready,
     Receiving(u64),
+    Unresolved(u64),
     Held,
     Replying(u64),
 }
@@ -48,7 +57,8 @@ pub struct ComponentIngress<M> {
     message: Option<M>,
 }
 
-/// Dropping a receive attempt leaves Receiving intact and cannot authorize a second receive.
+/// Dropping a receive attempt leaves Receiving or Unresolved intact, including any captured
+/// payload, and cannot authorize a second receive.
 ///
 /// ```compile_fail
 /// use nt_component_suspension::IngressReceiveAttempt;
@@ -103,6 +113,8 @@ impl<M> ComponentIngress<M> {
     pub const fn reply(&self) -> u64 {
         self.reply
     }
+    /// Inspect retained data, including unresolved receives. Presence does not prove Call or Reply
+    /// binding authority; classification requires separately established transport provenance.
     pub fn message(&self) -> Option<&M> {
         self.message.as_ref()
     }
@@ -119,8 +131,49 @@ impl<M> ComponentIngress<M> {
         Ok(IngressReceiveAttempt { identity })
     }
 
+    /// Retain a raw receive before doing anything that can reuse its source IPC buffer. Keep the
+    /// exact ticket until provenance is established. Dropping it leaves this owner unresolved;
+    /// it does not release the payload or permit reply, handoff or another receive.
+    pub fn capture_receive(
+        &mut self,
+        attempt: &mut IngressReceiveAttempt,
+        message: M,
+    ) -> Result<(), (IngressError, M)> {
+        if attempt.identity == 0 || self.phase != Phase::Receiving(attempt.identity) {
+            return Err((IngressError::WrongAttempt, message));
+        }
+        self.message = Some(message);
+        self.phase = Phase::Unresolved(attempt.identity);
+        Ok(())
+    }
+
+    /// Complete classification of the exact captured receive. Call retains the payload under the
+    /// existing reply contract; NoCall transfers the snapshot back for notification processing.
+    /// Neither result acknowledges a reply. On refusal, both the ticket and snapshot stay intact.
+    pub fn resolve_receive(
+        &mut self,
+        attempt: &mut IngressReceiveAttempt,
+        disposition: IngressReceiveDisposition,
+    ) -> Result<Option<M>, IngressError> {
+        if attempt.identity == 0 || self.phase != Phase::Unresolved(attempt.identity) {
+            return Err(IngressError::WrongAttempt);
+        }
+        attempt.identity = 0;
+        match disposition {
+            IngressReceiveDisposition::Call => {
+                self.phase = Phase::Held;
+                Ok(None)
+            }
+            IngressReceiveDisposition::NoCall => {
+                self.phase = Phase::Ready;
+                Ok(self.message.take())
+            }
+        }
+    }
+
     /// NoCall includes authenticated notification wakes and proven empty nonblocking receives.
-    /// Ambiguous transport results must not call this method; retain the entered attempt instead.
+    /// For an ambiguous result, use capture_receive and retain its ticket until resolve_receive
+    /// can establish provenance. This combined path accepts only already-classified observations.
     pub fn observe_receive(
         &mut self,
         attempt: &mut IngressReceiveAttempt,

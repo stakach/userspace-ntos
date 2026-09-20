@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn ingress_retains_received_message_across_buffer_reuse_and_handoff() {
-        use crate::{ComponentIngress, ComponentSuspensionLanes, IngressObservation};
+        use crate::{ComponentIngress, ComponentSuspensionLanes, IngressReceiveDisposition};
         let lanes = ComponentSuspensionLanes::<u64, u64, u64>::new(0, 1);
         let mut ingress = ComponentIngress::new(10, 20).unwrap();
         let mut attempt = lanes.begin_ingress_receive(&mut ingress).unwrap();
@@ -96,10 +96,13 @@ mod tests {
             [1, 2, 3, 4],
             IpcBufferSnapshot::capture(|index| buffer[index]),
         );
-        assert!(ingress
-            .observe_receive(&mut attempt, IngressObservation::Call(message))
-            .is_ok());
+        assert!(ingress.capture_receive(&mut attempt, message).is_ok());
         buffer.fill(42);
+        assert_eq!(ingress.message().unwrap().word(4), Some(91));
+        assert!(matches!(
+            ingress.resolve_receive(&mut attempt, IngressReceiveDisposition::Call),
+            Ok(None)
+        ));
         let replacement = ComponentIngress::new(10, 30).unwrap();
         let retained = lanes
             .handoff_ingress_call(&mut ingress, replacement)

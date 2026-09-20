@@ -20,7 +20,7 @@ mod message;
 pub use message::{IpcBufferSnapshot, ReceivedMessage, IPC_BUFFER_WORDS};
 pub use ingress::{
     ComponentIngress, IngressError, IngressObservation, IngressReceiveAttempt, IngressReplyAttempt,
-    IngressReplyObservation,
+    IngressReplyObservation, IngressReceiveDisposition,
 };
 mod resume_pass;
 pub use resume_pass::ResumePass;

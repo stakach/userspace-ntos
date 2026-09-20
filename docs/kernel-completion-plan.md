@@ -36207,6 +36207,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         checks, not generic retained ingress dispatch or Call-versus-Send provenance. Bootstrap fan-in
         and exact Reply-binding evidence remain open; blocking-wait guards stay disabled.
         The strict 27-export boot frontier remains unchanged.
+      - [x] Retain unclassified receive snapshots under their exact ingress attempt (2026-09-20).
+        Added an explicit Unresolved phase to ComponentIngress. capture_receive moves the owned
+        snapshot into the existing receive owner without consuming its ticket or claiming that a
+        Reply was bound. resolve_receive accepts only that exact attempt after native provenance
+        is established: Call retains the snapshot under the existing reply/ACK contract; NoCall
+        returns the original snapshot for routing and makes the receive owner ready. It never
+        silently discards a notification payload. Refused operations preserve both ticket and data.
+        An unresolved owner cannot reply, receive again, hand off or replace its captured payload;
+        dropping the ticket does not release it. message() permits inspection but explicitly grants
+        no Call authority. The existing combined observe_receive path is for already-classified
+        results only. The full IPC-message test now holds an unresolved snapshot across source-buffer
+        overwrite before classification and handoff. Three new tests cover wrong-owner tickets,
+        premature classification, replay, non-clone payload identity, NoCall payload return and
+        dropped tickets. The full handoff rejection matrix includes Unresolved on either side.
+        Validation: all 116 component-suspension unit tests; 1,421 tests across 24 broader suites;
+        serialized native executive and IO-manager release builds pass. Logs:
+        .tmp/test-unresolved-ingress-focused-20260920.log, .tmp/test-unresolved-ingress-20260920.log,
+        .tmp/build-unresolved-ingress-20260920.log and .tmp/build-unresolved-ingress-io-manager-20260920.log.
+        No QEMU rerun or desktop proof.
+        Native review confirmed that endpoint badge authentication alone cannot distinguish Call
+        from Send, and the receive ABI has no such discriminator. No opcode/length/badge heuristic,
+        debug-state inference or synthetic reply result is introduced. Native provenance, exact
+        Reply-binding evidence, retained routing and bootstrap fan-in remain open. No wait guard
+        is enabled and the strict 27-export boot frontier is unchanged.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
