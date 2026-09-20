@@ -158,6 +158,10 @@ static mut WIN32K_LOCAL_EVENTS: Option<nt_provider_wait::ProviderLocalEventCatal
 static mut WIN32K_LOCAL_TIMERS: Option<nt_provider_wait::ProviderLocalTimerCatalog> = None;
 static mut WIN32K_STACK_EVENT_ACTIVATIONS:
     Option<nt_provider_wait::ProviderStackActivationCatalog> = None;
+// Provider-local receipts survive a stopped secondary stack without inferring absence from it.
+static mut WIN32K_SECONDARY_STACK_PUBLICATIONS:
+    [nt_provider_wait::ProviderStackLanePublication; WIN32K_LANE_CAPACITY] =
+    [const { nt_provider_wait::ProviderStackLanePublication::new() }; WIN32K_LANE_CAPACITY];
 static mut WIN32K_DRIVER_STACK_EVENT_ACTIVATION: Option<ProviderStackEventActivation> = None;
 static WIN32K_DRIVER_OBJECT: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_LOCAL_EVENT_INITIALIZATIONS: AtomicU64 = AtomicU64::new(0);
@@ -15378,11 +15382,13 @@ pub unsafe extern "C" fn win32k_dispatch_lane_entry(lane_ordinal: u64) -> ! {
         print_str(b"[win32k-host] ERROR: secondary lane stack range overflow\n");
         park();
     };
+    let publications = &mut *core::ptr::addr_of_mut!(WIN32K_SECONDARY_STACK_PUBLICATIONS);
     let registered = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
         .as_mut()
         .is_some_and(|activations| {
-            activations
-                .register_lane(
+            publications[worker_index as usize]
+                .register(
+                    activations,
                     WIN32K_PRIMARY_STACK_LANE_ID + lane_ordinal,
                     stack_base,
                     WIN32K_LANE_STACK_FRAMES * 0x1000,

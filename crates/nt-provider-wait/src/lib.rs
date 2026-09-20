@@ -15,6 +15,7 @@ mod kernel_activation;
 mod local_event;
 mod local_timer;
 mod stack_activation;
+mod stack_publication;
 
 pub use abi::*;
 pub use allocation::*;
@@ -27,3 +28,4 @@ pub use nt_component_suspension::{
     LaneHandle, SuspensionCaller, SuspensionHostedClient, SuspensionOwner as ProviderWaitOwner,
 };
 pub use stack_activation::*;
+pub use stack_publication::{ProviderStackLanePublication, ProviderStackLanePublicationError, ProviderStackLanePublicationPhase};

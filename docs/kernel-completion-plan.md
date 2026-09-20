@@ -36772,6 +36772,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         the worker's stack registration; ordinal or address matching alone must not retire a later
         generation. No event activation is begun before this initial ready Call, but a failed
         startup still cannot assume the registration was absent or safely reclaim its stack range.
+        Secondary stack publication receipt checkpoint (2026-09-21): ProviderStackLanePublication
+        now owns one-shot Unpublished/Publishing/Published(exact generation handle)/Failed state.
+        Publication marks entry before catalog registration and retains its exact returned handle
+        instead of reducing it to a boolean. Failed, entered, and published owners reject another
+        registration; dropping the non-clone owner does not unregister or release the stack.
+        Native secondary entry uses a statically preallocated provider-local receipt per retained
+        worker ordinal, under the existing startup execution fence. The array is not independently
+        reset; its lifetime follows the one-shot provider catalog initialization.
+
+        This is ownership bookkeeping, not a crash-consistent journal. A fault inside registration
+        may leave uncertain catalog state, and neither missing nor Publishing evidence proves clean
+        absence. Root must not access its own copy of provider globals or infer retirement from
+        ordinal/address matching. An authenticated provider-lifetime/worker/handle query and exact
+        unregister acknowledgment remain required before stack reclamation. No unregister, frame
+        unmap, arena reuse, or canonical fence release is enabled by this checkpoint.
+        Validation passes 99 tests across six provider-wait suites (98 unit/integration tests and
+        one compile-fail check), including four new receipt tests
+        (.tmp/test-stack-publication-20260921.log). Both serialized native release builds pass
+        (.tmp/build-stack-publication-executive-20260921.log and
+        .tmp/build-stack-publication-io-manager-20260921.log). No fresh QEMU result is claimed;
+        secondary startup remains beyond the measured strict 27-export win32k boot barrier.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
