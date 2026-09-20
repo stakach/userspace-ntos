@@ -289,6 +289,14 @@ pub(crate) unsafe fn register_component_execution_lane(
         .ok()
 }
 
+pub(crate) unsafe fn component_execution_lane_binding(
+    lane: nt_component_suspension::LaneHandle,
+) -> Option<nt_component_suspension::LaneBinding> {
+    (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+        .binding(lane)
+        .ok()
+}
+
 fn component_execution_lane_reply(
     lanes: &nt_component_suspension::ComponentSuspensionLanes<
         ComponentNativeContinuation,

@@ -59,10 +59,11 @@ static LPC_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 #[allow(dead_code)] // The routing cutover consumes the full retained resource description.
 struct Win32kPhysicalLane {
     handle: nt_component_suspension::LaneHandle,
-    binding: nt_component_suspension::LaneBinding,
+    tcb: u64,
     stack_base: u64,
     stack_frames: u64,
     ipc_buffer_va: u64,
+    // Allocation receipt only; its original Reply is not current transport authority.
     worker: Option<crate::spawn_hosts::SpawnedComponentWorker>,
 }
 
@@ -109,7 +110,7 @@ pub(crate) unsafe fn register_primary_win32k_physical_lane(
     };
     lanes.push(Win32kPhysicalLane {
         handle,
-        binding,
+        tcb,
         stack_base: win32k_subsystem::WIN32K_STACK_VADDR,
         stack_frames: 32,
         ipc_buffer_va: crate::IPCBUF_VADDR,
@@ -118,15 +119,16 @@ pub(crate) unsafe fn register_primary_win32k_physical_lane(
     true
 }
 
-#[allow(dead_code)]
 pub(crate) unsafe fn win32k_physical_lane_binding(
     handle: nt_component_suspension::LaneHandle,
 ) -> Option<nt_component_suspension::LaneBinding> {
-    (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
+    let tcb = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
         .as_ref()?
         .iter()
         .find(|lane| lane.handle == handle)
-        .map(|lane| lane.binding)
+        .map(|lane| lane.tcb)?;
+    let binding = crate::service_sec_image::component_execution_lane_binding(handle)?;
+    (binding.executor_id == tcb).then_some(binding)
 }
 
 pub(crate) unsafe fn win32k_physical_lane_for_channel(
@@ -138,9 +140,11 @@ pub(crate) unsafe fn win32k_physical_lane_for_channel(
         .as_ref()?
         .iter()
         .find(|lane| {
-            lane.binding.executor_id == tcb
-                && lane.binding.receive_endpoint == endpoint
-                && lane.binding.reply_object == reply_object
+            win32k_physical_lane_binding(lane.handle).is_some_and(|binding| {
+                binding.executor_id == tcb
+                    && binding.receive_endpoint == endpoint
+                    && binding.reply_object == reply_object
+            })
         })
         .map(|lane| lane.handle)
 }
@@ -173,12 +177,9 @@ unsafe fn win32k_lane_channel(
     if !win32k_client_context_is_admitted(client) {
         return None;
     }
-    let lane = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
-        .as_ref()?
-        .iter()
-        .find(|lane| lane.handle == handle)?;
+    let binding = win32k_physical_lane_binding(handle)?;
     Some(crate::spawn_hosts::PumpChannel {
-        fault_ep: lane.binding.receive_endpoint,
+        fault_ep: binding.receive_endpoint,
         physical_domain: None,
         pml4: WIN32K_HOST_PML4.load(Ordering::Relaxed),
         code_va: win32k_subsystem::WIN32K_CODE_VA,
@@ -191,8 +192,8 @@ unsafe fn win32k_lane_channel(
         demand_cap: 8192,
         trace_faults: false,
         initial,
-        tcb: lane.binding.executor_id,
-        reply_cap: lane.binding.reply_object,
+        tcb: binding.executor_id,
+        reply_cap: binding.reply_object,
         client_pi: client.pi as u64,
         client_generation: client.generation,
         logical_caller: client.logical_caller,
@@ -311,7 +312,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     let lanes = win32k_physical_lanes_mut();
     lanes.push(Win32kPhysicalLane {
         handle,
-        binding,
+        tcb: worker.tcb,
         stack_base,
         stack_frames: win32k_subsystem::WIN32K_LANE_STACK_FRAMES,
         ipc_buffer_va,
@@ -3177,20 +3178,21 @@ pub(crate) unsafe fn retire_bugchecked_vspace(vspace: u64, reporting_tcb: u64) {
     WIN32K_RETIRED.store(1, Ordering::Release);
     let mut index = 0;
     loop {
-        let binding = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
+        // Suspend retained physical resources even if their transport registration is damaged.
+        let tcb = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
             .as_ref()
             .and_then(|lanes| lanes.get(index))
-            .map(|lane| lane.binding);
-        let Some(binding) = binding else {
+            .map(|lane| lane.tcb);
+        let Some(tcb) = tcb else {
             break;
         };
         index += 1;
-        if binding.executor_id == reporting_tcb {
+        if tcb == reporting_tcb {
             continue;
         }
-        let error = crate::tcb_suspend_r(binding.executor_id);
+        let error = crate::tcb_suspend_r(tcb);
         print_str(b"[provider-bugcheck] sibling-tcb=0x");
-        crate::print_hex_u64(binding.executor_id);
+        crate::print_hex_u64(tcb);
         print_str(b" suspend=");
         print_u64(error);
         print_str(b"\n");

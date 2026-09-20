@@ -36600,6 +36600,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/build-retained-work-io-manager-20260920.log). No new QEMU run is claimed for this
         crate-only storage step; native receive routing and desktop remain unproven beyond the
         preceding measured strict 27-export win32k barrier.
+        Native canonical binding checkpoint (2026-09-20): win32k physical resource records no
+        longer cache LaneBinding. Channel construction and exact channel-to-lane lookup read the
+        current canonical suspension-table binding and validate its executor against the retained
+        physical TCB. Retained-call Reply rotation therefore cannot leave a second native Reply
+        authority stale. Physical TCB ownership remains independent of transport registration so
+        bugcheck sibling suspension visits every allocated worker even if canonical lookup fails.
+        Worker allocation receipts and historical parked-call channels retain their original
+        identities; they are not authorities for constructing new transport channels.
+
+        Startup publication audit: do not move secondary registration before resume unchanged.
+        Allocation currently makes a lane immediately Idle and dispatchable; timer-driven re-entry
+        during the ready handshake could select it before readiness. The next lifecycle slice needs
+        staged, noneligible canonical registration, exclusive startup execution ownership, and
+        activation only after an authenticated ready Call. Failed startup workers must remain owned
+        and quarantined until acknowledged stop/drain/unmap/delete. Current failed-handshake paths
+        drop the descriptor without resource teardown, and retries derive their arena index from
+        published workers; prevent arena reuse before enabling earlier publication.
+
+        Validation: 181 unit tests and nine compile-fail checks pass
+        (.tmp/test-canonical-native-binding-20260920.log); executive and IO-manager release builds
+        pass (.tmp/build-canonical-native-binding-executive-20260920.log and
+        .tmp/build-canonical-native-binding-io-manager-20260920.log). No endpoint topology or startup
+        eligibility change is made here. No new desktop or QEMU result is claimed; the last measured
+        boot frontier remains the strict 27-export win32k barrier above.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
