@@ -14,6 +14,10 @@ static mut HOSTED_TIMER_PROGRESS: nt_time::DeferredTimerProgress =
     nt_time::DeferredTimerProgress::new();
 static mut REARM: nt_time::DeferredRearm = nt_time::DeferredRearm::new();
 
+pub(crate) unsafe fn is_owned() -> bool {
+    (&*core::ptr::addr_of!(BOOTSTRAP)).is_owned()
+}
+
 /// A completed service reply may publish demand through a shared page, not just a timer API.
 pub(crate) unsafe fn request_receive_checkpoint() -> bool {
     if !(&*core::ptr::addr_of!(BOOTSTRAP)).is_owned() {

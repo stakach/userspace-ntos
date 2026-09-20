@@ -36015,10 +36015,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/build-bootstrap-store-io-manager-20260920.log. Independent review found no issue.
         No QEMU rerun; the unchanged strict 27-export rejection precedes this path.
         Review adjustment: field publication cannot be enabled just because this accessor exists:
-        publication releases a stopped physical lane. Next implement the outer kernel-only pass
-        and its completion result ownership, then distinct receive fan-in using an unbound reply
+        publication releases a stopped physical lane. The bounded outer pass checkpoint below
+        provides execution and completion-result ownership; next add receive fan-in using an unbound reply
         capability. Never receive on the parked job's captured Reply or reuse its executing-pump
         continuation. All three kernel non-poll admission guards remain until that owner is complete.
+      - [x] Wire a bounded bootstrap kernel continuation pass (2026-09-20).
+        The initial DriverEntry caller now invokes a kernel-only outer pass after its physical
+        scheduler scope has ended and after eager completion acknowledgement. It shares the runtime
+        WAKE and bounded ResumePass rather than introducing another queue or coordinator. Demand
+        and candidate selection exclude hosted continuations. Publication uses the original Ps
+        manager and scoped dispatcher fields; every store borrow ends before a provider pump,
+        completion initialization or timer programming. Initial/repark publication preserves the
+        existing exact-capture transactions. A fresh cursor is retained before completion effects;
+        newly admitted work cannot cause an unbounded same-pass loop. Refusals retain paced demand.
+        Kernel completion delivery now optionally reports copied, acknowledged receipt/result
+        pairs. The bootstrap caller updates readiness only for its exact target receipt, including
+        a genuine failed result; absence of a receipt is never interpreted as success. Runtime
+        completion draining uses the same delivery implementation with no observer. The pass finishes
+        its exact wake ticket before requesting the canonical bootstrap deadline checkpoint.
+        Two focused shared-contract tests pass: satisfied repark waits for the next paced pass
+        before exact terminal ACK, and a refused claim preserves capture/Ps state for a later pass.
+        The terminal test performs authenticated recipient delivery before recording local ACK.
+        All 1,395 tests across 24 serialized host suites pass; executive release passes in 35.38s
+        with 294 warnings and I/O Manager release passes. Evidence:
+        .tmp/test-bootstrap-outer-focused-20260920.log, .tmp/test-bootstrap-outer-20260920.log,
+        .tmp/build-bootstrap-outer-20260920.log and .tmp/build-bootstrap-outer-io-manager-20260920.log.
+        Independent review found no ownership issue; labelled the DriverEntry diagnostic as the
+        initial invocation so later completion cannot be confused with its earlier stop snapshot.
+        No QEMU rerun: the unchanged 27-export rejection precedes this path.
+        The native pass is wired, but no receive
+        loop is claimed: all three kernel non-poll guards remain. Next provide distinct outer ingress
+        without rebinding a parked reply, preserve target completion ownership across multiple passes,
+        and only then enable blocking admission. The strict import frontier remains unchanged.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

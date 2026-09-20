@@ -12,6 +12,17 @@ use nt_user_host::provider_kernel_activation::{
 
 static PUBLICATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 
+/// Only the bootstrap outer pass may publish a stopped physical invocation. Store borrows end
+/// before deadline programming or selected execution; non-poll rendezvous admission stays gated.
+pub(crate) unsafe fn publish_bootstrap_waits() -> Result<bool, u32> {
+    let _durable = allocator::enter_durable();
+    let now = nt_time_snapshot();
+    ps_bootstrap::with_process_manager(|pm| {
+        dispatcher_bootstrap::with_provider_objects(|objects| publish_waits(pm, objects, now))
+            .ok_or(nt_status::NtStatus::DEVICE_NOT_READY.raw() as u32)
+    })
+}
+
 fn admission_status(error: KernelProviderWaitAdmissionError<u32>) -> u32 {
     match error {
         KernelProviderWaitAdmissionError::Authority(status)
@@ -26,9 +37,9 @@ fn admission_status(error: KernelProviderWaitAdmissionError<u32>) -> u32 {
     }
 }
 
-/// Only the live service-loop boundary owns this pass. Bootstrap cannot acquire observed Event
-/// waits before it has receive/deadline scheduling. This does not enter the pump or claim a
-/// selected resume; the rendezvous blocking guard remains in place until that owner exists.
+/// The live service-loop boundary owns this runtime pass. Bootstrap uses its separate outer
+/// adapter. Neither publication adapter enters a pump or claims a selected resume;
+/// bootstrap blocking admission still requires the complete receive/deadline owner.
 pub(crate) unsafe fn publish_runtime_waits(handler: &mut ExecNtHandler) {
     let queue =
         SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) as *const nt_delay_execution::Queue;
@@ -60,7 +71,7 @@ pub(crate) unsafe fn publish_runtime_waits(handler: &mut ExecNtHandler) {
 }
 
 /// Does not initialize/program a timer, receive, execute a provider or borrow a live handler.
-/// Bootstrap may use this only once its outer readiness/receive owner can service the waits.
+/// Both outer adapters share this transaction; bootstrap blocking admission remains gated.
 unsafe fn publish_waits(
     pm: &nt_process::ProcessManager,
     mut backend: ProviderDispatcherObjects<'_, NativeEventBacking<'_>>,

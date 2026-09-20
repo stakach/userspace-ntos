@@ -17,7 +17,7 @@ pub(super) mod resume;
 mod terminal;
 #[path = "kernel_provider_wait_work.rs"]
 mod wait_work;
-pub(super) use wait_work::publish_runtime_waits;
+pub(super) use wait_work::{publish_bootstrap_waits, publish_runtime_waits};
 use bootstrap::{DriverEntryCompletion, DriverEntryRecipient};
 
 static mut ACTIVATIONS: KernelProviderActivations<DriverEntryRecipient> =
@@ -502,6 +502,14 @@ pub(super) unsafe fn has_ready_completions() -> bool {
 /// Return acknowledged ownership progress, not DriverEntry success. Never invoke from a nested
 /// pump timer hook or with handler/PM borrows alive: initialization belongs to the outer scheduler.
 pub(super) unsafe fn redrive_ready_completions() -> bool {
+    redrive_ready_completions_observed(|_, _| {})
+}
+
+/// Report only acknowledged deliveries, after initialization effects have returned. The observer
+/// receives copied identity/result data, never a borrowed recipient or permission to replay it.
+pub(super) unsafe fn redrive_ready_completions_observed(
+    mut acknowledged: impl FnMut(KernelProviderCompletionReceipt, bool),
+) -> bool {
     if !has_ready_completions() {
         return false;
     }
@@ -517,11 +525,13 @@ pub(super) unsafe fn redrive_ready_completions() -> bool {
         return progressed;
     };
     loop {
-        if let Err(status) = pass.deliver(receipt) {
-            report_deferred(receipt, status);
-        } else {
-            // Ok(false) still acknowledged the result and released the canonical Ps pair.
-            progressed = true;
+        match pass.deliver(receipt) {
+            Err(status) => report_deferred(receipt, status),
+            Ok(initialized) => {
+                // Ok(false) still acknowledged the result and released the canonical Ps pair.
+                progressed = true;
+                acknowledged(receipt, initialized);
+            }
         }
         let Some(next) = (&*core::ptr::addr_of!(ACTIVATIONS)).next_ready_completion(&mut cursor)
         else {

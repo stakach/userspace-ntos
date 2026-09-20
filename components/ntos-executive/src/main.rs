@@ -30154,13 +30154,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
             // Readiness follows an acknowledged successful initialization result, not merely a
             // return to the component loop. A failed DriverEntry must not receive client dispatches.
-            let initialized = init_receipt.is_some_and(|receipt| {
+            let mut initialized = init_receipt.is_some_and(|receipt| {
                 match service_sec_image::kernel_provider_activation::deliver_driver_entry_completion(receipt) {
                     Ok(initialized) => initialized,
                     // Deferred acknowledgment is retained for the outer loop, not boot success.
                     Err(_) => false,
                 }
             });
+
+            // The physical invocation's scheduler scope has ended. Only an exact acknowledged
+            // target completion may update readiness; receipt disappearance is not success.
+            if let Some(completed) = service_sec_image::component_resume::run_bootstrap_outer(init_caller)
+                .expect("bootstrap continuation pass must retain its original owners")
+            {
+                initialized = completed;
+            }
 
             let verdict = core::ptr::read_volatile(
                 (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_VERDICT)
@@ -30182,7 +30190,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_POOL_USED)
                     as *const u64,
             );
-            print_str(b"[win32k-svc] DriverEntry ");
+            print_str(b"[win32k-svc] DriverEntry initial invocation ");
             if let Some(de_status) = de_status {
                 print_str(b"RETURNED status=0x");
                 print_hex(de_status as u32);

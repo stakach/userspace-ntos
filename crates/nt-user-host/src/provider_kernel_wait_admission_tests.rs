@@ -13,6 +13,8 @@ use nt_provider_wait::{
 mod work;
 #[path = "provider_kernel_wait_origin_tests.rs"]
 mod origin;
+#[path = "provider_kernel_bootstrap_pass_tests.rs"]
+mod bootstrap_pass;
 
 struct Backing;
 impl ProviderEventBacking for Backing {
