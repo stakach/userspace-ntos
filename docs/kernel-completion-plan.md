@@ -36329,7 +36329,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/build-blocking-receive-io-manager-20260920.log. No new QEMU run: the fresh preceding boot
         stopped at the strict 27-export barrier before these paths. Native traffic/failure-injection
         validation and desktop rendering remain unproven; blocking DriverEntry guards stay in place.
-      - [ ] Implement shared component endpoint fan-in before the bootstrap receive loop.
+      - [~] Implement shared component endpoint fan-in before the bootstrap receive loop.
         Architecture review (2026-09-20): drivers and win32k physical lanes currently allocate
         private endpoints; FSD workers share only their own instance endpoint. The microkernel
         waits on one endpoint plus a bound notification, with no endpoint wait-set or automatic
@@ -36360,6 +36360,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Per-endpoint receiver TCBs are an alternative, but would require another retained-message,
         Reply-chain, handoff and acknowledgement protocol. Do not introduce that parallel design
         or an NT-specific endpoint readiness mechanism in rust-micro alongside shared ingress.
+
+        Peer registration implementation checkpoint (2026-09-20): the
+        dependency-free nt-component-suspension registry now stages exact physical domain/generation,
+        root-owned TCB and domain-scoped lane identities before native capability installation.
+        Nonzero endpoint badges are globally allocated with a checked ceiling below notification
+        bits and are never reused after abort, retirement or registry replacement. Staged peers
+        remain invisible until explicit publication; duplicate TCBs and duplicate domain/lane
+        identities are rejected. Equal table-local lane handles in different domains are valid.
+        Non-clone registration and retention tickets preserve ownership on errors or drops.
+        Retirement first removes a peer from new route lookup, then requires retained work to drain
+        before removal. Retiring peers may retain already-known arrivals for cancellation, never
+        execution. A separate retiring-peer lookup routes late arrivals from the same canonical
+        registry without making them active or requiring a duplicate teardown identity map.
+        Native stop/revoke, queued-arrival drainage and canonical domain/TCB lifetime
+        checks remain required; a zero count is not proof of those external conditions.
+
+        Validation: 137 component-suspension unit tests and six compile-fail checks pass, including
+        14 registry lifecycle tests and non-clone checks for both ticket types. The full serialized
+        host run passes 1,444 tests across 24 suites (.tmp/test-peer-registry-20260920.log).
+        Serialized executive and IO-manager release builds pass; logs are
+        .tmp/build-peer-registry-executive-20260920.log and
+        .tmp/build-peer-registry-io-manager-20260920.log. No new QEMU run or desktop proof is claimed;
+        the previously measured strict 27-export boot barrier is unchanged by this crate-only slice.
+
+        This is the crate-first registration contract, not native publication or endpoint migration.
+        The current lane table's duplicate-endpoint rejection is deliberately unchanged: allowing
+        shared endpoints before the authenticated router exists would weaken today's isolation.
+        The next slice must integrate exact peer ownership with canonical lane admission, then
+        wire transactional capability publication and retained unrelated-arrival routing. Existing
+        private endpoints and all blocking-bootstrap admission guards remain in place.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

@@ -18,6 +18,7 @@ mod ingress;
 pub mod badge;
 mod message;
 mod receive_probe;
+pub mod peer_registry;
 pub use receive_probe::{
     classify_received_call, require_free_reply, ReceiveProbeError, ReplyBindingObservation,
 };
