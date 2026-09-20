@@ -36159,6 +36159,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/build-ingress-badge-namespace-20260920.log and
         .tmp/build-ingress-badge-namespace-io-manager-20260920.log. No blocking guard or receive
         classification is changed. No QEMU rerun; the strict 27-export frontier remains unchanged.
+      - [x] Resolve live driver callers before dispatcher and broker effects (2026-09-20).
+        Audit found single/multiple driver waits checked the caller only on the blocking branch:
+        an unknown or stale worker badge could consume an already-ready dispatcher object. Other
+        dispatcher mutations treated a missing worker runtime as main-instance pointer translation.
+        Added HostedDriverThreadTable::live_caller to require a nonzero exact handle/attached TCB,
+        nonterminal state and absent exit status. Native resolution now produces one copied caller
+        snapshot containing its validated handle and optional worker runtime. Only badge zero selects
+        the main thread; an unknown nonzero badge never falls back to it. Lookup reads existing
+        tables without allocating a missing table and retains no table borrow across effects.
+        Single/multiple waits resolve before array/object translation, readiness or consumption.
+        Event set/pulse, timer set/cancel, semaphore release, PCI/MDL and system-thread create,
+        current-ID and terminate services now use the same resolver before their effects. Removed
+        the old duplicate current-thread lookup and late blocking-only checks. Existing broker
+        rejection conventions remain; invalid identities do not mutate dispatcher objects.
+        Tests cover missing/zero/mismatched identities, exact lookup without mutation, waiting
+        membership, TCB replacement, termination and inconsistent terminal metadata. Validation:
+        1,418 tests across 24 suites; serialized executive and IO-manager native release builds pass.
+        Native review verified main membership precedes DriverEntry and worker publication precedes
+        resume. Logs: .tmp/test-driver-caller-routing-20260920.log,
+        .tmp/build-driver-caller-routing-20260920.log and
+        .tmp/build-driver-caller-routing-io-manager-20260920.log. No QEMU rerun: the strict 27-export
+        boot frontier is unchanged; no desktop proof is claimed.
+        This verifies membership in the currently resolved instance, not a retained generation claim:
+        PumpChannel still lacks a captured physical domain generation. Authenticated retained routing,
+        Call-versus-Send/Reply-binding evidence and bootstrap fan-in remain open. No wait guard enabled.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

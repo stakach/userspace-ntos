@@ -114,6 +114,20 @@ impl HostedDriverThreadTable {
             .find(|thread| thread.handle == handle)
     }
 
+    /// Resolve a received caller against its owning table and exact attached TCB. The caller must
+    /// first authenticate the table's domain and the transport-to-handle mapping. This is a copied
+    /// identity snapshot, not permission to resume a thread or retain a borrow across execution.
+    pub fn live_caller(&self, handle: u64, tcb: u64) -> Option<HostedDriverThread> {
+        if handle == 0 || tcb == 0 {
+            return None;
+        }
+        let thread = self.get(handle)?;
+        (thread.tcb == tcb
+            && thread.state != HostedDriverThreadState::Terminated
+            && thread.exit_status.is_none())
+        .then_some(thread)
+    }
+
     fn get_mut(&mut self, handle: u64) -> Option<&mut HostedDriverThread> {
         self.threads
             .iter_mut()
@@ -460,6 +474,47 @@ impl HostedDispatcherWaitQueue {
 mod tests {
     use super::*;
     use crate::EventKind;
+
+    #[test]
+    fn caller_lookup_requires_exact_nonzero_handle_and_attached_tcb() {
+        let mut table = HostedDriverThreadTable::new();
+        let handle = table.create(1, 2).unwrap();
+        assert_eq!(table.live_caller(handle, 0), None);
+        assert_eq!(table.live_caller(handle, 91), None);
+        table.attach_tcb(handle, 91).unwrap();
+        let before = table.clone();
+        for (candidate, tcb) in [(0, 91), (handle + 1, 91), (handle, 0), (handle, 92)] {
+            assert_eq!(table.live_caller(candidate, tcb), None);
+        }
+        assert_eq!(table.live_caller(handle, 91), table.get(handle));
+        assert_eq!(table, before);
+    }
+
+    #[test]
+    fn caller_lookup_tracks_tcb_replacement_and_thread_termination() {
+        let mut table = HostedDriverThreadTable::new();
+        let handle = table.create(1, 2).unwrap();
+        table.attach_tcb(handle, 91).unwrap();
+        table.set_waiting(handle).unwrap();
+        assert_eq!(table.live_caller(handle, 91), table.get(handle));
+        table.attach_tcb(handle, 92).unwrap();
+        assert_eq!(table.live_caller(handle, 91), None);
+        assert_eq!(table.live_caller(handle, 92), table.get(handle));
+        table.terminate(handle, 0).unwrap();
+        assert_eq!(table.live_caller(handle, 92), None);
+    }
+
+    #[test]
+    fn inconsistent_terminal_state_never_authenticates_a_caller() {
+        let mut table = HostedDriverThreadTable::new();
+        let handle = table.create(1, 2).unwrap();
+        table.attach_tcb(handle, 91).unwrap();
+        table.get_mut(handle).unwrap().state = HostedDriverThreadState::Terminated;
+        assert_eq!(table.live_caller(handle, 91), None);
+        table.get_mut(handle).unwrap().state = HostedDriverThreadState::Running;
+        table.get_mut(handle).unwrap().exit_status = Some(0);
+        assert_eq!(table.live_caller(handle, 91), None);
+    }
 
     #[test]
     fn refused_wait_commit_preserves_each_live_thread_state() {

@@ -51294,22 +51294,38 @@ fn hosted_driver_runtime_by_badge(
     }
 }
 
-fn hosted_driver_current_thread_id(
+struct HostedDriverCaller {
+    thread_handle: u64,
+    runtime: Option<HostedDriverThreadRuntime>,
+}
+
+/// Resolve once before reading or consuming caller-supplied dispatcher objects. The pump channel
+/// has already selected the live instance; badge zero denotes its main thread, never a fallback.
+fn hosted_driver_caller(
     instance: usize,
     inst: DriverInstance,
     badge: u64,
-) -> Option<u64> {
-    let (handle, tcb) = if badge == 0 {
-        (inst.main_thread_id, inst.tcb)
-    } else {
-        let runtime = hosted_driver_runtime_by_badge(instance, badge)?;
-        (runtime.handle, runtime.tcb)
-    };
-    if handle == 0 || tcb == 0 {
+) -> Option<HostedDriverCaller> {
+    if !nt_component_suspension::badge::valid_endpoint_badge(badge) {
         return None;
     }
-    let thread = unsafe { hosted_driver_thread_table_mut(instance)?.get(handle)? };
-    (thread.tcb == tcb && thread.exit_status.is_none()).then_some(handle)
+    let runtime = if badge == 0 {
+        None
+    } else {
+        Some(hosted_driver_runtime_by_badge(instance, badge)?)
+    };
+    let (handle, tcb) = runtime.map_or((inst.main_thread_id, inst.tcb), |rt| (rt.handle, rt.tcb));
+    // Authentication must not create a missing table or allocate state on behalf of an unknown peer.
+    let thread = unsafe {
+        (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_TABLES))
+            .as_ref()?
+            .get(instance)?
+            .live_caller(handle, tcb)?
+    };
+    Some(HostedDriverCaller {
+        thread_handle: thread.handle,
+        runtime,
+    })
 }
 
 unsafe fn remove_hosted_driver_thread_runtime(
@@ -52611,10 +52627,10 @@ pub(crate) fn service_hosted_driver_pci_config(
         Ok(access) if access.length != 0 => access,
         _ => return (STATUS_INVALID_PARAMETER, 0),
     };
-    let runtime = hosted_driver_runtime_by_badge(instance, caller_badge);
-    if caller_badge != 0 && runtime.is_none() {
+    let Some(caller) = hosted_driver_caller(instance, inst, caller_badge) else {
         return (STATUS_ACCESS_DENIED, 0);
-    }
+    };
+    let runtime = caller.runtime;
     let Some(exec_buffer) =
         component_to_exec_va_for_instance(instance, inst, component_buffer, access.length as u64)
             .or_else(|| {
@@ -53019,7 +53035,7 @@ pub(crate) fn service_hosted_driver_mdl(
     let Some((instance_index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         return STATUS_ACCESS_DENIED;
     };
-    if caller_badge != 0 && hosted_driver_runtime_by_badge(instance_index, caller_badge).is_none() {
+    if hosted_driver_caller(instance_index, inst, caller_badge).is_none() {
         return STATUS_ACCESS_DENIED;
     }
     let Some(caller_domain) = instance_domain_identity(inst) else {
@@ -53976,8 +53992,12 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
         HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
     };
-    let runtime = hosted_driver_runtime_by_badge(instance, caller_badge);
-    let current_thread_id = hosted_driver_current_thread_id(instance, inst, caller_badge);
+    let Some(caller) = hosted_driver_caller(instance, inst, caller_badge) else {
+        HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
+    };
+    let runtime = caller.runtime;
+    let thread_handle = caller.thread_handle;
     let Some(exec_object) = hosted_driver_wait_object_exec_va(instance, inst, runtime, object)
     else {
         HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
@@ -54016,10 +54036,6 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
                     }
                 };
                 HOSTED_DRIVER_WAIT_SINGLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
-                let Some(thread_handle) = current_thread_id else {
-                    HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
-                    return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
-                };
                 let mut objects = Vec::new();
                 if objects.try_reserve_exact(1).is_err() {
                     HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
@@ -54104,8 +54120,12 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
         HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
     };
-    let runtime = hosted_driver_runtime_by_badge(instance, caller_badge);
-    let current_thread_id = hosted_driver_current_thread_id(instance, inst, caller_badge);
+    let Some(caller) = hosted_driver_caller(instance, inst, caller_badge) else {
+        HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
+    };
+    let runtime = caller.runtime;
+    let thread_handle = caller.thread_handle;
     let Some(exec_array) =
         hosted_driver_wait_array_exec_va(instance, inst, runtime, object_array, bytes)
     else {
@@ -54190,10 +54210,6 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
                     }
                 };
                 HOSTED_DRIVER_WAIT_MULTIPLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
-                let Some(thread_handle) = current_thread_id else {
-                    HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
-                    return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
-                };
                 let Some(fresh_reply_cap) = park_hosted_driver_wait(
                     instance,
                     thread_handle,
@@ -54250,7 +54266,10 @@ pub(crate) fn service_hosted_driver_ke_set_event(
     let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         return 0;
     };
-    let runtime = hosted_driver_runtime_by_badge(instance, caller_badge);
+    let Some(caller) = hosted_driver_caller(instance, inst, caller_badge) else {
+        return 0;
+    };
+    let runtime = caller.runtime;
     let Some(exec_event) = hosted_driver_wait_object_exec_va(instance, inst, runtime, event) else {
         if request <= 8 {
             print_str(b"[driver-wait] KeSetEvent unmapped event inst=");
@@ -54293,7 +54312,10 @@ pub(crate) fn service_hosted_driver_ke_set_timer(
     let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         return 0;
     };
-    let runtime = hosted_driver_runtime_by_badge(instance, caller_badge);
+    let Some(caller) = hosted_driver_caller(instance, inst, caller_badge) else {
+        return 0;
+    };
+    let runtime = caller.runtime;
     let Some(exec_timer) = hosted_driver_wait_object_exec_va(instance, inst, runtime, timer) else {
         return 0;
     };
@@ -54486,7 +54508,10 @@ pub(crate) fn service_hosted_driver_ke_cancel_timer(
     let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         return 0;
     };
-    let runtime = hosted_driver_runtime_by_badge(instance, caller_badge);
+    let Some(caller) = hosted_driver_caller(instance, inst, caller_badge) else {
+        return 0;
+    };
+    let runtime = caller.runtime;
     if hosted_driver_wait_object_exec_va(instance, inst, runtime, timer).is_none() {
         return 0;
     }
@@ -54511,7 +54536,10 @@ pub(crate) fn service_hosted_driver_ke_pulse_event(
     let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         return 0;
     };
-    let runtime = hosted_driver_runtime_by_badge(instance, caller_badge);
+    let Some(caller) = hosted_driver_caller(instance, inst, caller_badge) else {
+        return 0;
+    };
+    let runtime = caller.runtime;
     let Some(exec_event) = hosted_driver_wait_object_exec_va(instance, inst, runtime, event) else {
         if request <= 8 {
             print_str(b"[driver-wait] KePulseEvent unmapped event inst=");
@@ -54559,7 +54587,10 @@ pub(crate) fn service_hosted_driver_ke_release_semaphore(
     let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         return STATUS_INVALID_PARAMETER;
     };
-    let runtime = hosted_driver_runtime_by_badge(instance, caller_badge);
+    let Some(caller) = hosted_driver_caller(instance, inst, caller_badge) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let runtime = caller.runtime;
     let Some(exec_semaphore) =
         hosted_driver_wait_object_exec_va(instance, inst, runtime, semaphore)
     else {
@@ -54607,6 +54638,10 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return (STATUS_INVALID_PARAMETER, 0);
     };
+    if hosted_driver_caller(instance, inst, caller_badge).is_none() {
+        HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return (STATUS_INVALID_HANDLE, 0);
+    }
     if start_routine == 0 {
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return (STATUS_INVALID_PARAMETER, 0);
@@ -54768,8 +54803,8 @@ pub(crate) fn service_hosted_driver_ps_get_current_thread_id(
     let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         return (STATUS_INVALID_PARAMETER, 0);
     };
-    match hosted_driver_current_thread_id(instance, inst, caller_badge) {
-        Some(thread_id) => (STATUS_SUCCESS, thread_id),
+    match hosted_driver_caller(instance, inst, caller_badge) {
+        Some(caller) => (STATUS_SUCCESS, caller.thread_handle),
         None => (STATUS_INVALID_HANDLE, 0),
     }
 }
@@ -54782,11 +54817,13 @@ pub(crate) fn service_hosted_driver_ps_terminate_system_thread(
 ) -> HostedDriverThreadTerminateServiceResult {
     let request =
         HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
-    let Some((instance, _inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+    let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return HostedDriverThreadTerminateServiceResult::Reply(STATUS_INVALID_PARAMETER);
     };
-    let Some(runtime) = hosted_driver_runtime_by_badge(instance, caller_badge) else {
+    let Some(runtime) = hosted_driver_caller(instance, inst, caller_badge)
+        .and_then(|caller| caller.runtime)
+    else {
         HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         if request <= 8 {
             print_str(b"[driver-thread] PsTerminateSystemThread unknown caller inst=");
@@ -54797,17 +54834,6 @@ pub(crate) fn service_hosted_driver_ps_terminate_system_thread(
         }
         return HostedDriverThreadTerminateServiceResult::Reply(STATUS_INVALID_PARAMETER);
     };
-    let Some(thread) = (unsafe {
-        hosted_driver_thread_table_mut(instance).and_then(|table| table.get(runtime.handle))
-    }) else {
-        HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS.fetch_add(1, Ordering::Relaxed);
-        return HostedDriverThreadTerminateServiceResult::Reply(STATUS_INVALID_HANDLE);
-    };
-    if thread.tcb != runtime.tcb || thread.exit_status.is_some() {
-        HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS.fetch_add(1, Ordering::Relaxed);
-        return HostedDriverThreadTerminateServiceResult::Reply(STATUS_INVALID_HANDLE);
-    }
-
     let Some(fresh_reply_cap) = (unsafe { take_hosted_driver_reply_spare(instance) }) else {
         HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return HostedDriverThreadTerminateServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
