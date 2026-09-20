@@ -36856,6 +36856,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         there; runner exit 1 is not a successful boot verdict (.tmp/run-stack-ready-20260921.log and
         .tmp/boot-stack-ready-20260921.log). Runtime secondary ready receipt and desktop rendering
         remain unverified beyond that barrier.
+        Root peer capability installation checkpoint (2026-09-21): the shared
+        PeerInstallation owner seals the staged registration ticket together with an exclusively
+        reserved, initially empty root-CSpace slot. Installation enters a non-replayable phase
+        before its synchronous native effect; only an acknowledged install can publish through
+        exact canonical lane, domain, and generation revalidation. Failed publication preserves
+        the installed capability and staged route. Failed or interrupted installation/deletion
+        retains ownership rather than authorizing retry, route removal, or slot recycling.
+
+        Staged abort requires acknowledged deletion of the sole unpublished root alias before
+        consuming the exact registry ticket. Foreign-registry rejection preserves the deletion
+        receipt for the correct owner. The empty slot still requires independent checked recycling;
+        badges remain permanently burned. Published routes cannot use staged abort. Child-CSpace
+        copies must not escape this owner before publication: deleting a root alias alone does not
+        prove descendants or in-flight Calls have drained. Native mint/copy installation, exported
+        alias ownership, active-peer retirement, and shared-endpoint cutover remain open.
+
+        Validation passes 206 component-suspension unit tests and nine documentation tests,
+        including six new installation/publication/abort tests
+        (.tmp/test-peer-installation-20260921.log). Both serialized native release builds pass
+        (.tmp/build-peer-installation-executive-20260921.log and
+        .tmp/build-peer-installation-io-manager-20260921.log).
+        No fresh boot or desktop claim is made for this contract-only change; the last measured
+        boot remains at the strict 27-export win32k barrier described above.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
