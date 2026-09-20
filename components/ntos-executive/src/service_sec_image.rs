@@ -339,6 +339,27 @@ pub(crate) unsafe fn stop_component_execution_lane_startup(
     (suspend_status, verified)
 }
 
+/// Detach the scheduling context from its exclusive physical allocation receipt.
+pub(crate) unsafe fn detach_component_execution_lane_startup(
+    lane: nt_component_suspension::LaneHandle,
+    executor: u64,
+    sched_context: u64,
+) -> Option<u64> {
+    let _message = crate::ipc_message::SavedMessageBuffer::capture();
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let binding = lanes.binding(lane).ok()?;
+    if binding.executor_id != executor || sched_context == 0 {
+        return None;
+    }
+    let mut status = None;
+    let _ = lanes.detach_startup_scheduler(lane, binding.reply_object, |_| {
+        let error = sel4_rt::sched_context_unbind(sched_context);
+        status = Some(error);
+        if error == 0 { Ok(()) } else { Err(error) }
+    });
+    status
+}
+
 /// The caller must first validate the authenticated ready protocol completion.
 pub(crate) unsafe fn complete_component_execution_lane_startup(
     lane: nt_component_suspension::LaneHandle,

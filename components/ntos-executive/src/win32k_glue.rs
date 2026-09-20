@@ -378,6 +378,23 @@ unsafe fn retain_failed_win32k_lane(tcb: u64, stage: &[u8], error: u64) {
         // Canonical allocation failed; retain the physical owner without claiming cancellation.
         (Some(crate::tcb_suspend_r(tcb)), false)
     };
+    let detach_status = if verified {
+        // Each worker owns a freshly allocated SC; never detach a global or donated SC.
+        let scheduler = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
+            .as_ref()
+            .and_then(|lanes| lanes.iter().find(|lane| lane.tcb == tcb && lane.handle == handle))
+            .and_then(|lane| lane.worker.as_ref())
+            .filter(|worker| worker.tcb == tcb)
+            .map(|worker| worker.sched_context);
+        match (handle, scheduler) {
+            (Some(handle), Some(sc)) => {
+                crate::service_sec_image::detach_component_execution_lane_startup(handle, tcb, sc)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     print_str(b"[win32k-lane] retained failed startup tcb=0x");
     crate::print_hex_u64(tcb);
     print_str(b" stage=");
@@ -392,6 +409,12 @@ unsafe fn retain_failed_win32k_lane(tcb: u64, stage: &[u8], error: u64) {
     }
     print_str(b" stop-verified=");
     print_u64(verified as u64);
+    print_str(b" sc-detach=");
+    if let Some(status) = detach_status {
+        print_u64(status);
+    } else {
+        print_str(b"not-attempted");
+    }
     print_str(b" provider-retired=1\n");
 }
 

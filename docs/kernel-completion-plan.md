@@ -36723,6 +36723,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/build-startup-stop-io-manager-20260920.log). No fresh QEMU result is claimed for this
         failure-path change; the preceding run stopped before DriverEntry at the strict 27-export
         barrier and cannot validate startup fault injection.
+        Failed-startup scheduling-context detach checkpoint (2026-09-21): sel4-rt now exposes
+        acknowledged SchedContextUnbind using the existing kernel ABI (label 39) and SYS_CALL,
+        returning the actual kernel error. After StartupStopped, canonical startup enters
+        StartupDetaching before invoking the native operation and StartupDetached only on ACK.
+        Failure is non-replayable; success retains the execution fence and every resource owner.
+        Neither state permits ordinary dispatch, readiness publication, or generic release.
+
+        Native failure handling selects the SC only from the exact physical worker receipt whose
+        TCB and canonical handle match. That SC was privately allocated for this worker and is not
+        supplied from a global or currently donated context. Suspension ACK and exact Reply-Free
+        evidence precede detachment; the query and detach invocation preserve the IPC message bank.
+        This is scoped to secondary startup, whose private SC is not executing a downstream donated
+        continuation. Do not generalize Reply-Free evidence to arbitrary hosted-worker SC teardown.
+        Detaching does not delete caps, unmap frames, drain published references, or permit arena
+        reuse. Those remaining retirement stages stay open; runtime failure injection is pending.
+        Validation passes 196 unit tests and nine compile-fail checks, including four new detach
+        tests for exact-executor invocation, retained exclusion, premature/stale/wrong-owner
+        rejection, and non-replayable invocation failure (.tmp/test-startup-detach-20260921.log).
+        Both serialized native release builds pass (.tmp/build-startup-detach-executive-20260921.log
+        and .tmp/build-startup-detach-io-manager-20260921.log). The ABI wrapper is committed in
+        rust-micro 7b9907a; the kernel mechanism itself is unchanged. No fresh boot or native
+        failure-injection success is claimed; the last measured boot frontier remains the strict
+        27-export win32k rejection before DriverEntry.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

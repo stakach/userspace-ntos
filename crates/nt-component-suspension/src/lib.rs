@@ -26,6 +26,7 @@ mod retained_work;
 mod startup;
 pub use startup::StartupError;
 pub use startup::StartupStopError;
+pub use startup::StartupDetachError;
 pub use retained_work::{RetainedWork, RetainedWorkCheckout, RetainedWorkError, RetainedWorkFinishError, RetainedWorkReservation};
 pub use retained_dispatch::{RetainedDispatch, RetainedDispatchError};
 pub use retained_ingress::{RetainedIngress, RetainedIngressError};
@@ -222,6 +223,10 @@ pub enum LanePhase {
     StartupStopAcknowledged,
     /// Suspension and Reply cancellation verified; resources and execution fence remain owned.
     StartupStopped,
+    /// Scheduling-context detachment entered; no replay is authorized without acknowledgment.
+    StartupDetaching,
+    /// Scheduling context detached; resources and the execution fence remain owned.
+    StartupDetached,
     Idle,
     Running,
     Suspended,

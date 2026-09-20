@@ -393,3 +393,123 @@ fn stop_rejects_wrong_binding_stale_handle_and_other_execution_without_effects()
     assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupStopAcknowledged));
     assert_eq!(lanes.running(), Some(lane));
 }
+
+#[test]
+fn scheduler_detach_ack_retains_stopped_worker_fence_and_resources() {
+    let mut lanes = Lanes::new(2, 2);
+    let lane = lanes.allocate_staged(binding(0)).unwrap();
+    let other = lanes.allocate(binding(1)).unwrap();
+    lanes
+        .stop_startup(lane, 30, |_| Ok::<_, u8>(()), free)
+        .unwrap();
+    lanes
+        .detach_startup_scheduler(lane, 30, |executor| {
+            assert_eq!(executor, 10);
+            Ok::<_, u8>(())
+        })
+        .unwrap();
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupDetached));
+    assert_eq!(lanes.binding(lane), Ok(binding(0)));
+    assert_eq!(lanes.running(), Some(lane));
+    assert!(lanes.execution_busy());
+    assert_eq!(lanes.next_idle(), None);
+    assert_eq!(lanes.release(lane, 30), Err(LaneError::Busy));
+    assert_eq!(lanes.begin_dispatch(other, 31), Err(LaneError::Busy));
+    assert!(lanes.complete_startup(lane, 30, bound).is_err());
+    assert!(lanes.finish_dispatch(lane, 30).is_err());
+    assert_eq!(
+        lanes.detach_startup_scheduler(lane, 30, |_| -> Result<(), u8> {
+            panic!("duplicate detach")
+        }),
+        Err(StartupDetachError::Lane(LaneError::InvalidPhase))
+    );
+}
+
+#[test]
+fn detach_refuses_each_unverified_startup_phase_before_invocation() {
+    let refused = |_| -> Result<(), u8> { panic!("unverified detach") };
+    let mut lanes = Lanes::new(2, 2);
+    let lane = lanes.allocate_staged(binding(0)).unwrap();
+    let idle = lanes.allocate(binding(1)).unwrap();
+    assert_eq!(
+        lanes.detach_startup_scheduler(idle, 31, refused),
+        Err(StartupDetachError::Lane(LaneError::InvalidPhase))
+    );
+    assert_eq!(
+        lanes.detach_startup_scheduler(lane, 30, refused),
+        Err(StartupDetachError::Lane(LaneError::InvalidPhase))
+    );
+    lanes.begin_startup(lane, 30, free).unwrap();
+    assert_eq!(
+        lanes.detach_startup_scheduler(lane, 30, refused),
+        Err(StartupDetachError::Lane(LaneError::InvalidPhase))
+    );
+    assert!(lanes
+        .stop_startup(lane, 30, |_| Ok::<_, u8>(()), bound)
+        .is_err());
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupStopAcknowledged));
+    assert_eq!(
+        lanes.detach_startup_scheduler(lane, 30, refused),
+        Err(StartupDetachError::Lane(LaneError::InvalidPhase))
+    );
+    let mut failed = Lanes::new(1, 2);
+    let failed_lane = failed.allocate_staged(binding(0)).unwrap();
+    assert!(failed
+        .stop_startup(failed_lane, 30, |_| Err(7u8), free)
+        .is_err());
+    assert_eq!(failed.phase(failed_lane), Ok(LanePhase::StartupStopping));
+    assert_eq!(
+        failed.detach_startup_scheduler(failed_lane, 30, refused),
+        Err(StartupDetachError::Lane(LaneError::InvalidPhase))
+    );
+}
+
+#[test]
+fn scheduler_detach_error_locks_entered_operation_without_replay() {
+    let mut lanes = Lanes::new(1, 2);
+    let lane = lanes.allocate_staged(binding(0)).unwrap();
+    lanes
+        .stop_startup(lane, 30, |_| Ok::<_, u8>(()), free)
+        .unwrap();
+    assert_eq!(
+        lanes.detach_startup_scheduler(lane, 30, |executor| {
+            assert_eq!(executor, 10);
+            Err(9u8)
+        }),
+        Err(StartupDetachError::Invoke(9))
+    );
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupDetaching));
+    assert_eq!(lanes.running(), Some(lane));
+    assert_eq!(
+        lanes.detach_startup_scheduler(lane, 30, |_| -> Result<(), u8> {
+            panic!("ambiguous replay")
+        }),
+        Err(StartupDetachError::Lane(LaneError::InvalidPhase))
+    );
+    assert_eq!(lanes.release(lane, 30), Err(LaneError::Busy));
+    assert!(lanes
+        .verify_startup_stopped::<u8, u8>(lane, 30, free)
+        .is_err());
+}
+
+#[test]
+fn detach_rejects_stale_and_wrong_reply_without_changing_verified_owner() {
+    let mut lanes = Lanes::new(1, 2);
+    let old = lanes.allocate(binding(0)).unwrap();
+    lanes.release(old, 30).unwrap();
+    let lane = lanes.allocate_staged(binding(0)).unwrap();
+    lanes
+        .stop_startup(lane, 30, |_| Ok::<_, u8>(()), free)
+        .unwrap();
+    let refused = |_| -> Result<(), u8> { panic!("foreign detach") };
+    assert_eq!(
+        lanes.detach_startup_scheduler(old, 30, refused),
+        Err(StartupDetachError::Lane(LaneError::StaleGeneration))
+    );
+    assert_eq!(
+        lanes.detach_startup_scheduler(lane, 99, refused),
+        Err(StartupDetachError::Lane(LaneError::WrongBinding))
+    );
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::StartupStopped));
+    assert_eq!(lanes.running(), Some(lane));
+}

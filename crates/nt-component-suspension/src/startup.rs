@@ -17,7 +17,35 @@ pub enum StartupStopError<S, Q> {
     ReplyNotFree,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupDetachError<E> {
+    Lane(LaneError),
+    Invoke(E),
+}
+
 impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
+    /// Detach only the stopped worker's privately owned scheduling context.
+    /// The adapter must prove the capability belongs to this executor and remains live, and
+    /// invoke synchronously without reentering scheduling. Failure retains entered authority;
+    /// success records the ACK but does not permit release of any capability or memory.
+    pub fn detach_startup_scheduler<E>(
+        &mut self,
+        handle: LaneHandle,
+        reply: u64,
+        detach: impl FnOnce(u64) -> Result<(), E>,
+    ) -> Result<(), StartupDetachError<E>> {
+        self.validate(handle, reply).map_err(StartupDetachError::Lane)?;
+        let lane = self.lane(handle).map_err(StartupDetachError::Lane)?;
+        if lane.phase != LanePhase::StartupStopped || self.running != Some(handle) {
+            return Err(StartupDetachError::Lane(LaneError::InvalidPhase));
+        }
+        let executor = lane.binding.executor_id;
+        self.lane_mut(handle).map_err(StartupDetachError::Lane)?.phase = LanePhase::StartupDetaching;
+        detach(executor).map_err(StartupDetachError::Invoke)?;
+        self.lane_mut(handle).map_err(StartupDetachError::Lane)?.phase = LanePhase::StartupDetached;
+        Ok(())
+    }
+
     /// Enter a synchronous, acknowledged stop while retaining all startup authority.
     /// Callbacks must address the exact live worker and must not reenter component scheduling.
     /// Any suspension error leaves StartupStopping fenced: it is not proof of no effects and
