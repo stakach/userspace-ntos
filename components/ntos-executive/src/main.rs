@@ -2770,13 +2770,13 @@ pub(crate) fn pipe_fid_name_hash(fid: u64) -> u64 {
     }
 }
 const DELAY_WAITER_INITIAL_RESERVE: usize = HOSTED_THREAD_WAIT_INITIAL_RESERVE;
-pub(crate) const DELAY_TIMER_BADGE: u64 = 0x4000_0000_0000_0000;
+pub(crate) const DELAY_TIMER_BADGE: u64 = nt_component_suspension::badge::TIMER_BADGE;
 /// Bound-notification namespace for genuine hosted hardware IRQs. Payload bits identify dynamic
 /// live route slots rather than physical GSIs, so sparse/high firmware interrupt numbers do not
 /// constrain the transport.
-pub(crate) const HOSTED_IRQ_EVENT_BADGE: u64 = 0x2000_0000_0000_0000;
-pub(crate) const HOSTED_IRQ_EVENT_SLOT_COUNT: u8 = 61;
-pub(crate) const HOSTED_IRQ_EVENT_BADGE_MASK: u64 = HOSTED_IRQ_EVENT_BADGE - 1;
+pub(crate) const HOSTED_IRQ_EVENT_BADGE: u64 = nt_component_suspension::badge::IRQ_BADGE;
+pub(crate) const HOSTED_IRQ_EVENT_SLOT_COUNT: u8 = nt_component_suspension::badge::IRQ_SLOT_COUNT;
+pub(crate) const HOSTED_IRQ_EVENT_BADGE_MASK: u64 = nt_component_suspension::badge::ENDPOINT_BADGE_MAX;
 
 #[inline]
 pub(crate) const fn hosted_irq_lines_from_badge(badge: u64) -> u64 {
@@ -13063,20 +13063,18 @@ unsafe fn copy_cap(src: u64) -> u64 {
     );
     d
 }
-/// Mint a copy of `src` carrying `badge`. For an endpoint cap, the badge is delivered to the
-/// receiver on every message/fault sent through it — the 2-process service loop mints each hosted
-/// thread's fault cap with a distinct badge so it can tell whose fault this is.
-unsafe fn mint_badged(src: u64, badge: u64) -> u64 {
-    let d = alloc_slot();
-    let _ = syscall5(
-        SYS_SEND,
-        CAP_INIT_THREAD_CNODE,
-        LBL_CNODE_MINT << 12,
-        d,
-        src,
-        badge,
-    );
-    d
+/// Mint an endpoint capability with a badge outside the bound-notification namespace.
+/// The caller supplies a known endpoint source; failed minting never publishes a destination.
+unsafe fn mint_badged(src: u64, badge: u64) -> Result<u64, u32> {
+    if src <= 1 || !nt_component_suspension::badge::valid_endpoint_badge(badge) {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    let d = try_alloc_slot().ok_or(nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
+    if cnode_mint_r(CAP_INIT_THREAD_CNODE, d, src, badge) != 0 {
+        recycle_deleted_root_slot(d);
+        return Err(nt_process::STATUS_UNSUCCESSFUL);
+    }
+    Ok(d)
 }
 
 // --- SYS_CALL variants that RETURN the invocation error label (0 = success) ---
@@ -16588,7 +16586,7 @@ unsafe fn issue_generic_irq_handler_checked(irq: u64) -> Result<u64, nt_status::
 }
 
 pub(crate) unsafe fn mint_executive_event_badge(badge: u64) -> Result<u64, nt_status::NtStatus> {
-    if badge == 0 {
+    if !nt_component_suspension::badge::valid_notification_badge(badge) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     let notification = executive_event_notification()?;
@@ -28467,7 +28465,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             image_root: nt_exe_image::HostedImageRoot::System32,
             probe_fragment: b"secimgtest",
         };
-        let si_fault_c = mint_badged(si_fault, sec_image_test_image.top_badge);
+        let si_fault_c = mint_badged(si_fault, sec_image_test_image.top_badge)
+            .expect("initial hosted image requires a valid fault endpoint capability");
         reset_hosted_process_runtimes();
         register_hosted_process_runtime_for_image(sec_image_test_image)
             .expect("SEC_IMAGE demo runtime layout must register before spawn");
@@ -31849,7 +31848,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     reset_hosted_process_runtimes();
                     register_hosted_process_runtime_for_image(smss_image)
                         .expect("SMSS runtime layout must register before live SEC_IMAGE spawn");
-                    let smss_fault_c = mint_badged(si_fault, smss_image.top_badge);
+                    let smss_fault_c = mint_badged(si_fault, smss_image.top_badge)
+                        .expect("session manager requires a valid fault endpoint capability");
                     let smss_client_id = ps_bootstrap::hosted_main_client_id(smss_image.pi)
                         .expect("SMSS must own its canonical ClientId before spawn");
                     let spawn = spawn_hosted_sec_image_for_image(

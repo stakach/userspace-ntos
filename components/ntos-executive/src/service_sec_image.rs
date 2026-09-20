@@ -5648,7 +5648,7 @@ unsafe fn spawn_requested_hosted_exe(
     let child_spawn = spawn_hosted_sec_image_for_image(
         spec.image,
         spec.pe,
-        mint_badged(fault_ep, spec.image.top_badge),
+        mint_badged(fault_ep, spec.image.top_badge)?,
         Some(ntdll),
         true,
         false,
@@ -19835,6 +19835,9 @@ pub(crate) unsafe fn service_sec_image(
             const EFLAGS_TF: u32 = 0x0000_0100;
             const BLK_TEST_RUNTIME_BADGE: u64 = 0xDB6B_0001;
             const BLK_DEBUGGER_RUNTIME_BADGE: u64 = 0xDB6B_0002;
+            const _: () = assert!(nt_component_suspension::badge::valid_endpoint_badge(
+                BLK_DEBUGGER_RUNTIME_BADGE
+            ));
             // Executive scratch VAs inside the SAME proven-resident 2 MiB page table the ALPC
             // cross-VSpace self-test uses (see its comment): base + 3000*0x1000, PT index 5.
             let write_scratch_t = SMSS_SCRATCH_BASE + 3010 * 0x1000;

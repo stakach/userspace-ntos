@@ -2,8 +2,12 @@
 
 /// A construction request, not capability ownership. Copy preserves an existing badge; mint
 /// supplies a new badge without allocating an intermediate root capability.
+/// A borrowed source's endpoint kind and badge provenance remain the caller's responsibility;
+/// numeric source validation cannot inspect the capability or authenticate an incoming message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadFaultEndpoint {
+    /// Caller must establish an endpoint source with an already-valid endpoint-namespace badge.
+    /// `is_valid` cannot inspect the source capability's kind or badge.
     Borrowed(u64),
     Badged { source: u64, badge: u64 },
 }
@@ -11,6 +15,7 @@ pub enum ThreadFaultEndpoint {
 #[derive(Debug, PartialEq, Eq)]
 pub enum EndpointInstallError<E> {
     InvalidSource,
+    InvalidBadge,
     Backend(E),
 }
 
@@ -30,6 +35,12 @@ impl ThreadFaultEndpoint {
 
     pub const fn is_valid(self) -> bool {
         self.source() > 1
+            && match self {
+                Self::Borrowed(_) => true,
+                Self::Badged { badge, .. } => {
+                    nt_component_suspension::badge::valid_endpoint_badge(badge)
+                }
+            }
     }
 
     /// Install once into the caller-owned empty destination slot. Backend errors are returned
@@ -40,8 +51,11 @@ impl ThreadFaultEndpoint {
         cnode: u64,
         slot: u64,
     ) -> Result<(), EndpointInstallError<B::Error>> {
-        if !self.is_valid() {
+        if self.source() <= 1 {
             return Err(EndpointInstallError::InvalidSource);
+        }
+        if !self.is_valid() {
+            return Err(EndpointInstallError::InvalidBadge);
         }
         match self {
             Self::Borrowed(source) => backend.copy(cnode, slot, source),
@@ -85,7 +99,12 @@ mod tests {
 
     #[test]
     fn badge_is_minted_directly_into_the_destination() {
-        for badge in [0, 1, 526, u64::MAX] {
+        for badge in [
+            0,
+            1,
+            526,
+            nt_component_suspension::badge::ENDPOINT_BADGE_MAX,
+        ] {
             let mut backend = Backend::default();
             ThreadFaultEndpoint::Badged { source: 42, badge }
                 .install(&mut backend, 100, 3)
@@ -108,6 +127,28 @@ mod tests {
                 );
                 assert!(backend.calls.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn reserved_badges_fail_before_any_capability_effect() {
+        use nt_component_suspension::badge::{IRQ_BADGE, TIMER_BADGE};
+        for badge in [
+            IRQ_BADGE,
+            IRQ_BADGE | 1,
+            TIMER_BADGE,
+            TIMER_BADGE | 526,
+            1 << 63,
+            u64::MAX,
+        ] {
+            let mut backend = Backend::default();
+            let endpoint = ThreadFaultEndpoint::Badged { source: 42, badge };
+            assert!(!endpoint.is_valid());
+            assert_eq!(
+                endpoint.install(&mut backend, 100, 3),
+                Err(EndpointInstallError::InvalidBadge)
+            );
+            assert!(backend.calls.is_empty());
         }
     }
 

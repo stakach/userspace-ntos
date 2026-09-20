@@ -46882,6 +46882,7 @@ unsafe fn build_hosted_irq_lane(
     let badge =
         FSD_WORKER_BADGE_BASE
             .checked_add(exec_alias_slot)
+            .filter(|badge| nt_component_suspension::badge::valid_endpoint_badge(*badge))
             .ok_or(HostedIrqLaneBuildError {
                 status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
                 partial: None,
@@ -53818,7 +53819,9 @@ unsafe fn spawn_hosted_driver_worker_thread(
     let exec_base = hosted_worker_exec_base_for_alias(exec_alias_slot)?;
     let tramp_exec_va = exec_base.checked_add(FSD_WORKER_TRAMP_OFFSET)?;
     let scratch_exec_va = exec_base.checked_add(FSD_WORKER_SCRATCH_OFFSET)?;
-    let badge = FSD_WORKER_BADGE_BASE.checked_add(exec_alias_slot)?;
+    let badge = FSD_WORKER_BADGE_BASE
+        .checked_add(exec_alias_slot)
+        .filter(|badge| nt_component_suspension::badge::valid_endpoint_badge(*badge))?;
 
     let domain = instance_domain_identity(inst)?;
     if !ensure_paging(stack_base, inst.pml4, domain) || !crate::ensure_executive_paging(exec_base) {

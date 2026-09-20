@@ -36135,6 +36135,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         This closes message-data capture only: exclusive Reply allocation, receive provenance,
         authenticated lane routing, retained owner storage and repeated outer receive remain open.
         Blocking-wait guards stay disabled; the strict 27-export boot frontier is unchanged.
+      - [x] Enforce disjoint endpoint and executive-notification badge construction (2026-09-20).
+        Added shared namespace validation: endpoint identities occupy bits 0..60 (zero remains a
+        valid unbadged endpoint); timer and IRQ markers use bits 62 and 61; bit 63 is reserved.
+        Notification construction rejects unknown bits, empty IRQ markers and payloads without an
+        IRQ marker, while allowing dynamically selected IRQ slots and OR-coalesced timer/IRQ badges.
+        Hosted-thread endpoint installation rejects reserved badges before backend effects. Driver
+        worker and private IRQ-lane badge generation checks the same namespace before allocating
+        their resources. Executive notification minting validates before touching notification state.
+        Replaced the root endpoint mint helper's unchecked SYS_SEND with checked cnode_mint_r,
+        propagating allocation/mint errors and recycling the uninstalled slot on refusal. Dynamic
+        process launch propagates failure; initial bootstrap consumers fail closed. No copy fallback.
+        Borrowed endpoint copies still require source capability provenance; these numeric checks
+        cannot certify the source object or distinguish Call from Send. Audit confirmed native
+        workers can share an endpoint with distinct badges, so routing must resolve endpoint plus
+        badge to the live TCB/domain/generation, not assume endpoint identifies one physical lane.
+        rust-micro exposes the same receive metadata for Call and Send; do not infer bound Reply
+        ownership from message labels or lengths. That authority remains an explicit integration gap.
+        Validation: 1,415 tests across 24 suites; serialized native executive and IO-manager release
+        builds pass. Tests cover every dynamic IRQ-slot pair, coalescing, namespace boundaries and
+        rejected hosted endpoint badges with zero backend effects. The direct debugger-test mint
+        also has a compile-time namespace assertion. Logs: .tmp/test-ingress-badge-namespace-20260920.log,
+        .tmp/build-ingress-badge-namespace-20260920.log and
+        .tmp/build-ingress-badge-namespace-io-manager-20260920.log. No blocking guard or receive
+        classification is changed. No QEMU rerun; the strict 27-export frontier remains unchanged.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
