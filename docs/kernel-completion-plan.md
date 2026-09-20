@@ -35995,6 +35995,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         This checks ownership and the existing scheduler-demand rearm, not unconditional
         programming of unrelated timer sources on every receive. Bootstrap outer scheduling,
         receive fan-in, blocking DriverEntry admission and the strict import frontier remain open.
+      - [x] Centralize bootstrap store ownership and scoped dispatcher access (2026-09-20).
+        Shared BootstrapStore now owns the Uninitialized/Owned/Transferred lifecycle used by both
+        native Ps and dispatcher bootstrap. Removed their duplicate phase enums and destructive
+        take implementations. Failed access/transfer does not change phase; rejected initialization
+        returns the offered value without replacing the original; a successful transfer moves the
+        original allocation once and never reopens bootstrap access. Native initialization still
+        checks phase before constructing stores or publishing initial System projections.
+        Bootstrap provider-object access is now one memory-only callback over the original Event
+        stores, provider timers and namespace backing. Timed selection uses this boundary; absence
+        denotes non-ownership, never replacement/empty stores. Local Event and deadline access use
+        the same shared lifecycle. Added allocation/mutation/invalid-transition tests and a
+        compile-fail borrowed-reference escape check. Existing real dispatcher handoff fixtures now
+        exercise the production lifecycle instead of a test-only field move. Both focused tests
+        and 1,393 tests across 24 serialized host suites pass, including the compile-fail check.
+        Executive release passes in 36.74s with 294 warnings; I/O Manager release also passes.
+        Evidence: .tmp/test-bootstrap-store-focused-20260920.log,
+        .tmp/test-bootstrap-store-20260920.log, .tmp/build-bootstrap-store-20260920.log and
+        .tmp/build-bootstrap-store-io-manager-20260920.log. Independent review found no issue.
+        No QEMU rerun; the unchanged strict 27-export rejection precedes this path.
+        Review adjustment: field publication cannot be enabled just because this accessor exists:
+        publication releases a stopped physical lane. Next implement the outer kernel-only pass
+        and its completion result ownership, then distinct receive fan-in using an unbound reply
+        capability. Never receive on the parked job's captured Reply or reuse its executing-pump
+        continuation. All three kernel non-poll admission guards remain until that owner is complete.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

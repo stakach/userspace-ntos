@@ -8,20 +8,15 @@ pub(crate) struct DispatcherBootstrapSeed {
     pub dispatcher: nt_user_host::dispatcher_state::DispatcherState,
 }
 
-enum BootstrapPhase {
-    Uninitialized,
-    Owned(DispatcherBootstrapSeed),
-    Transferred,
-}
-
-static mut BOOTSTRAP: BootstrapPhase = BootstrapPhase::Uninitialized;
+static mut BOOTSTRAP: nt_user_host::bootstrap_store::BootstrapStore<DispatcherBootstrapSeed> =
+    nt_user_host::bootstrap_store::BootstrapStore::new();
 static mut HOSTED_TIMER_PROGRESS: nt_time::DeferredTimerProgress =
     nt_time::DeferredTimerProgress::new();
 static mut REARM: nt_time::DeferredRearm = nt_time::DeferredRearm::new();
 
 /// A completed service reply may publish demand through a shared page, not just a timer API.
 pub(crate) unsafe fn request_receive_checkpoint() -> bool {
-    if !matches!(&*core::ptr::addr_of!(BOOTSTRAP), BootstrapPhase::Owned(_)) {
+    if !(&*core::ptr::addr_of!(BOOTSTRAP)).is_owned() {
         return false;
     }
     assert!(
@@ -36,7 +31,7 @@ unsafe fn rearm_pending() -> bool {
 }
 
 unsafe fn pending_timer_snapshot() -> Option<u64> {
-    if !matches!(&*core::ptr::addr_of!(BOOTSTRAP), BootstrapPhase::Owned(_)) {
+    if !(&*core::ptr::addr_of!(BOOTSTRAP)).is_owned() {
         return None;
     }
     let pending = DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed);
@@ -48,14 +43,14 @@ unsafe fn pending_timer_snapshot() -> Option<u64> {
 /// Eligibility only: observing retained ticks neither consumes them nor authorizes rearming.
 pub(crate) unsafe fn timer_work_pending() -> bool {
     !TIMER_DELIVERY_GATE.is_active()
-        && matches!(&*core::ptr::addr_of!(BOOTSTRAP), BootstrapPhase::Owned(_))
+        && (&*core::ptr::addr_of!(BOOTSTRAP)).is_owned()
         && (pending_timer_snapshot().is_some() || rearm_pending())
 }
 
 /// Called from the retained component scheduler, never the IRQ-lane ACK hook. Driver timer
 /// publication can perform IPC, so no bootstrap store reference may cross this call.
 pub(crate) unsafe fn service_hosted_timer_work() -> u64 {
-    if !matches!(&*core::ptr::addr_of!(BOOTSTRAP), BootstrapPhase::Owned(_)) {
+    if !(&*core::ptr::addr_of!(BOOTSTRAP)).is_owned() {
         return 0;
     }
     let Some(_delivery) = TIMER_DELIVERY_GATE.try_enter() else {
@@ -97,19 +92,12 @@ unsafe fn scan_owned_timer_work(
     now: nt_delay_execution::TimeSnapshot,
 ) -> Result<u64, nt_user_host::provider_wait_selection::ProviderWaitSelectionError<u32>> {
     let _durable = allocator::enter_durable();
-    let scanned = {
-        let BootstrapPhase::Owned(seed) = &mut *core::ptr::addr_of_mut!(BOOTSTRAP) else {
-            return Ok(0);
-        };
-        let mut objects = nt_user_host::provider_dispatcher_backend::ProviderDispatcherObjects {
-            events: &mut seed.dispatcher.events,
-            event_objects: &mut seed.dispatcher.event_objects,
-            timers: seed.dispatcher.provider_timers.as_mut(),
-            backing: crate::provider_dispatcher_backend::NativeEventBacking(&mut seed.obj_ns),
-            access: None,
-        };
-        service_sec_image::provider_wait_scan_timed(&mut objects, now)?
+    let Some(scanned) = with_provider_objects(|mut objects| {
+        service_sec_image::provider_wait_scan_timed(&mut objects, now)
+    }) else {
+        return Ok(0);
     };
+    let scanned = scanned?;
     Ok(scanned
         .timeouts
         .saturating_add(scanned.expired_timers)
@@ -126,28 +114,27 @@ pub(crate) unsafe fn next_deadline(now: nt_time::TimeSnapshot) -> Result<Option<
 }
 
 unsafe fn collect_owned_deadline(now: nt_time::TimeSnapshot) -> Result<Option<(u64, u64)>, u32> {
-    let owner = {
-        let BootstrapPhase::Owned(seed) = &*core::ptr::addr_of!(BOOTSTRAP) else {
-            return Err(0xC000_00A3); // STATUS_DEVICE_NOT_READY, not an empty deadline set.
-        };
-        timer_deadline::OwnerDeadlines {
-            dispatcher: service_sec_image::bootstrap_dispatcher_deadlines(
-                seed.dispatcher.provider_timers.as_ref(),
-                now,
-            )?,
-            // These stores are created only after take() transfers the dispatcher to runtime.
-            user_timer: None,
-            job_time: None,
-            component_resume: service_sec_image::component_resume::retained_deadline(),
-        }
-    };
+    let owner = (&*core::ptr::addr_of!(BOOTSTRAP))
+        .with_ref(|seed| {
+            Ok::<_, u32>(timer_deadline::OwnerDeadlines {
+                dispatcher: service_sec_image::bootstrap_dispatcher_deadlines(
+                    seed.dispatcher.provider_timers.as_ref(),
+                    now,
+                )?,
+                // These stores are created only after take() transfers the dispatcher to runtime.
+                user_timer: None,
+                job_time: None,
+                component_resume: service_sec_image::component_resume::retained_deadline(),
+            })
+        })
+        .map_err(|_| 0xC000_00A3u32)??;
     Ok(timer_deadline::next(now, owner))
 }
 
 /// Called only after the retained scheduler's effects, with no dispatcher/PM references alive.
 /// Pending ticks remain owned by the complete delivery owner; programming is not acknowledgment.
 pub(crate) unsafe fn prepare_receive() -> Result<(), u32> {
-    if !matches!(&*core::ptr::addr_of!(BOOTSTRAP), BootstrapPhase::Owned(_)) {
+    if !(&*core::ptr::addr_of!(BOOTSTRAP)).is_owned() {
         return Ok(());
     }
     let Some(_delivery) = TIMER_DELIVERY_GATE.try_enter() else {
@@ -173,10 +160,7 @@ pub(crate) unsafe fn prepare_receive() -> Result<(), u32> {
 }
 
 pub(crate) unsafe fn initialize() -> Result<(), u32> {
-    if !matches!(
-        &*core::ptr::addr_of!(BOOTSTRAP),
-        BootstrapPhase::Uninitialized
-    ) {
+    if !(&*core::ptr::addr_of!(BOOTSTRAP)).is_uninitialized() {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
     let _durable = allocator::enter_durable();
@@ -186,23 +170,42 @@ pub(crate) unsafe fn initialize() -> Result<(), u32> {
         anon_event_seq: 0,
         dispatcher: nt_user_host::dispatcher_state::DispatcherState::new(192, 192),
     };
-    core::ptr::addr_of_mut!(BOOTSTRAP).write(BootstrapPhase::Owned(seed));
-    Ok(())
+    (&mut *core::ptr::addr_of_mut!(BOOTSTRAP))
+        .initialize(seed)
+        .map_err(|_| nt_process::STATUS_INVALID_PARAMETER)
 }
 
 pub(crate) unsafe fn take() -> DispatcherBootstrapSeed {
-    match core::mem::replace(
-        &mut *core::ptr::addr_of_mut!(BOOTSTRAP),
-        BootstrapPhase::Transferred,
-    ) {
-        BootstrapPhase::Owned(seed) => seed,
-        BootstrapPhase::Uninitialized => {
-            panic!("dispatcher bootstrap must precede handler initialization")
-        }
-        BootstrapPhase::Transferred => {
-            panic!("dispatcher bootstrap storage was already transferred")
-        }
-    }
+    (&mut *core::ptr::addr_of_mut!(BOOTSTRAP))
+        .take()
+        .expect("dispatcher bootstrap must transfer its original stores exactly once")
+}
+
+/// Memory-only field access. Absence means bootstrap does not own these stores, not empty stores.
+/// No dispatcher reference may survive the callback or cross a provider/hardware effect.
+pub(crate) unsafe fn with_provider_objects<R>(
+    operation: impl FnOnce(
+        nt_user_host::provider_dispatcher_backend::ProviderDispatcherObjects<
+            '_,
+            crate::provider_dispatcher_backend::NativeEventBacking<'_>,
+        >,
+    ) -> R,
+) -> Option<R> {
+    (&mut *core::ptr::addr_of_mut!(BOOTSTRAP))
+        .with_mut(|seed| {
+            operation(
+                nt_user_host::provider_dispatcher_backend::ProviderDispatcherObjects {
+                    events: &mut seed.dispatcher.events,
+                    event_objects: &mut seed.dispatcher.event_objects,
+                    timers: seed.dispatcher.provider_timers.as_mut(),
+                    backing: crate::provider_dispatcher_backend::NativeEventBacking(
+                        &mut seed.obj_ns,
+                    ),
+                    access: None,
+                },
+            )
+        })
+        .ok()
 }
 
 /// Memory-only access while bootstrap owns the original stores. No borrow may escape into IPC.
@@ -210,14 +213,15 @@ pub(crate) unsafe fn take() -> DispatcherBootstrapSeed {
 pub(crate) unsafe fn with_local_events<R>(
     operation: impl FnOnce(&mut crate::provider_local_event::LocalEventState<'_>) -> Result<R, u32>,
 ) -> Result<R, u32> {
-    let BootstrapPhase::Owned(seed) = &mut *core::ptr::addr_of_mut!(BOOTSTRAP) else {
-        return Err(0xC000_00A3);
-    };
-    let mut state = crate::provider_local_event::LocalEventState::new(
-        &mut seed.obj_ns,
-        &mut seed.anon_event_seq,
-        &mut seed.dispatcher.events,
-        &mut seed.dispatcher.event_objects,
-    );
-    operation(&mut state)
+    (&mut *core::ptr::addr_of_mut!(BOOTSTRAP))
+        .with_mut(|seed| {
+            let mut state = crate::provider_local_event::LocalEventState::new(
+                &mut seed.obj_ns,
+                &mut seed.anon_event_seq,
+                &mut seed.dispatcher.events,
+                &mut seed.dispatcher.event_objects,
+            );
+            operation(&mut state)
+        })
+        .map_err(|_| 0xC000_00A3u32)?
 }

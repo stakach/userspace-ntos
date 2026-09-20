@@ -56,16 +56,15 @@ impl OwnedDispatcher {
 }
 
 fn handoff(source: OwnedDispatcher) -> OwnedDispatcher {
-    let OwnedDispatcher {
-        state,
-        namespace,
-        next_native,
-    } = source;
-    OwnedDispatcher {
-        state,
-        namespace,
-        next_native,
-    }
+    let mut bootstrap = crate::bootstrap_store::BootstrapStore::new();
+    assert!(bootstrap.initialize(source).is_ok());
+    let live = bootstrap.take().unwrap();
+    assert!(!bootstrap.is_owned());
+    assert_eq!(
+        bootstrap.with_mut(|_| panic!("transferred dispatcher access")),
+        Err::<(), _>(crate::bootstrap_store::BootstrapStoreError::Transferred),
+    );
+    live
 }
 
 fn now(monotonic_100ns: u64) -> TimeSnapshot {

@@ -1,6 +1,7 @@
 //! Early ownership of the canonical Ps and token stores, transferred once to the live handler.
 
 use super::*;
+use nt_user_host::bootstrap_store::BootstrapStore;
 
 pub(crate) struct PsBootstrapSeed {
     pub ps: nt_user_host::ps_bootstrap::PsBootstrapState,
@@ -10,13 +11,7 @@ pub(crate) struct PsBootstrapSeed {
         [[nt_process::ThreadId; PM_RUNTIME_THREAD_SLOTS]; HOSTED_PROCESS_MANAGER_SEED_COUNT],
 }
 
-enum BootstrapPhase {
-    Uninitialized,
-    Owned(PsBootstrapSeed),
-    Transferred,
-}
-
-static mut BOOTSTRAP: BootstrapPhase = BootstrapPhase::Uninitialized;
+static mut BOOTSTRAP: BootstrapStore<PsBootstrapSeed> = BootstrapStore::new();
 
 // These two initial objects live as long as the executive image. Providers alias its retained
 // image frames; using the executive's private heap here would expose unrelated provider memory.
@@ -94,48 +89,44 @@ unsafe fn publish_initial_objects(
 
 /// Root bootstrap is serialized. No borrowed store reference may escape into provider IPC.
 pub(crate) unsafe fn initialize(entry: u64, parameter: u64) -> Result<(), u32> {
-    if !matches!(
-        &*core::ptr::addr_of!(BOOTSTRAP),
-        BootstrapPhase::Uninitialized
-    ) {
+    if !(&*core::ptr::addr_of!(BOOTSTRAP)).is_uninitialized() {
         return Err(0xc000_000d);
     }
     let mut seed = seed_processes(entry, parameter)?;
     publish_initial_objects(&mut seed.ps)?;
-    core::ptr::addr_of_mut!(BOOTSTRAP).write(BootstrapPhase::Owned(seed));
-    Ok(())
+    (&mut *core::ptr::addr_of_mut!(BOOTSTRAP))
+        .initialize(seed)
+        .map_err(|_| 0xc000_000d)
 }
 
 pub(crate) unsafe fn take() -> PsBootstrapSeed {
-    match core::mem::replace(
-        &mut *core::ptr::addr_of_mut!(BOOTSTRAP),
-        BootstrapPhase::Transferred,
-    ) {
-        BootstrapPhase::Owned(seed) => seed,
-        BootstrapPhase::Uninitialized => panic!("Ps bootstrap must precede handler initialization"),
-        BootstrapPhase::Transferred => panic!("Ps bootstrap stores were already transferred"),
-    }
+    (&mut *core::ptr::addr_of_mut!(BOOTSTRAP))
+        .take()
+        .expect("Ps bootstrap must be initialized and transferred only once")
 }
 
 pub(crate) unsafe fn hosted_main_client_id(pi: usize) -> Option<nt_process::ClientId> {
-    let BootstrapPhase::Owned(seed) = &*core::ptr::addr_of!(BOOTSTRAP) else {
-        return None;
-    };
-    let &pid = seed.pids.get(pi)?;
-    let &tid = seed.main_tids.get(pi)?;
-    let client_id = seed.ps.process_manager().client_id(tid)?;
-    (client_id.unique_process == pid).then_some(client_id)
+    (&*core::ptr::addr_of!(BOOTSTRAP))
+        .with_ref(|seed| {
+            let &pid = seed.pids.get(pi)?;
+            let &tid = seed.main_tids.get(pi)?;
+            let client_id = seed.ps.process_manager().client_id(tid)?;
+            (client_id.unique_process == pid).then_some(client_id)
+        })
+        .ok()
+        .flatten()
 }
 
 /// Memory-only operation; the callback must not enter provider IPC or retain a manager borrow.
 pub(crate) unsafe fn with_process_manager<R>(
     operation: impl FnOnce(&mut nt_process::ProcessManager) -> Result<R, u32>,
 ) -> Result<R, u32> {
-    let BootstrapPhase::Owned(seed) = &mut *core::ptr::addr_of_mut!(BOOTSTRAP) else {
-        return Err(0xc000_00a3);
-    };
-    let (pm, _) = seed.ps.managers_mut();
-    operation(pm)
+    (&mut *core::ptr::addr_of_mut!(BOOTSTRAP))
+        .with_mut(|seed| {
+            let (pm, _) = seed.ps.managers_mut();
+            operation(pm)
+        })
+        .map_err(|_| 0xc000_00a3u32)?
 }
 
 #[inline(never)]
