@@ -17,6 +17,10 @@ mod terminal;
 mod ingress;
 pub mod badge;
 mod message;
+mod receive_probe;
+pub use receive_probe::{
+    classify_received_call, require_free_reply, ReceiveProbeError, ReplyBindingObservation,
+};
 pub use message::{IpcBufferSnapshot, ReceivedMessage, IPC_BUFFER_WORDS};
 pub use ingress::{
     ComponentIngress, IngressError, IngressObservation, IngressReceiveAttempt, IngressReplyAttempt,

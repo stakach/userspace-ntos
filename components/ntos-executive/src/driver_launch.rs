@@ -753,38 +753,6 @@ pub const FSD_DISPATCH_CREATE_PDO_PROJECTION: u64 = u64::MAX - 0x77F;
 pub const FSD_DISPATCH_ROLLBACK_ADD_DEVICE: u64 = u64::MAX - 0x780;
 pub const FSD_DISPATCH_DRAIN_FILE_RETIREMENTS: u64 = u64::MAX - 0x781;
 
-pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
-    matches!(
-        label,
-        FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL
-            | FSD_SERVICE_KE_WAIT_SINGLE_LABEL
-            | FSD_SERVICE_KE_SET_EVENT_LABEL
-            | FSD_SERVICE_KE_PULSE_EVENT_LABEL
-            | FSD_SERVICE_KE_RELEASE_SEMAPHORE_LABEL
-            | FSD_SERVICE_KE_WAIT_MULTIPLE_LABEL
-            | FSD_SERVICE_PS_TERMINATE_SYSTEM_THREAD_LABEL
-            | FSD_SERVICE_REGISTRY_LABEL
-            | FSD_SERVICE_PROVIDER_EXPORT_LABEL
-            | FSD_SERVICE_PROVIDER_CALLBACK_LABEL
-            | FSD_SERVICE_KE_SET_TIMER_LABEL
-            | FSD_SERVICE_KE_CANCEL_TIMER_LABEL
-            | FSD_SERVICE_PULL_IRP_INPUT_LABEL
-            | FSD_SERVICE_PULL_IRP_OUTPUT_LABEL
-            | FSD_SERVICE_PUSH_IRP_OUTPUT_LABEL
-            | FSD_SERVICE_ROOT_PDO_PNP_LABEL
-            | FSD_SERVICE_DEVICE_LABEL
-            | FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL
-            | FSD_SERVICE_PCI_CONFIG_LABEL
-            | FSD_SERVICE_INTERRUPT_LABEL
-            | FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL
-            | FSD_SERVICE_QUEUE_DPC_LABEL
-            | FSD_SERVICE_FLUSH_DPCS_LABEL
-            | FSD_SERVICE_DMA_ADAPTER_LABEL
-            | FSD_SERVICE_MDL_LABEL
-            | FSD_SERVICE_FILE_LABEL
-    )
-}
-
 const HOSTED_INTERRUPT_OP_CONNECT: u64 = 1;
 const HOSTED_INTERRUPT_OP_DISCONNECT: u64 = 2;
 const HOSTED_MDL_OP_REGISTER: u64 = 1;
@@ -51302,6 +51270,20 @@ fn hosted_driver_runtime_by_badge(
 struct HostedDriverCaller {
     thread_handle: u64,
     runtime: Option<HostedDriverThreadRuntime>,
+}
+
+/// Resolve a physical pump peer without borrowing driver state across a capability invocation.
+pub(crate) fn hosted_driver_pump_caller_tcb(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+) -> Option<u64> {
+    let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
+    if channel.tcb != inst.tcb {
+        return None;
+    }
+    let caller = hosted_driver_caller(instance, inst, badge)?;
+    Some(caller.runtime.map_or(inst.tcb, |runtime| runtime.tcb))
 }
 
 /// Resolve once before reading or consuming caller-supplied dispatcher objects. The pump channel

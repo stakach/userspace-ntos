@@ -38,7 +38,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Latest measured NT boot (2026-09-15): a fresh normal headless build/boot reaches strict win32k
+Latest measured NT boot (2026-09-20): a fresh normal headless build/boot reaches strict win32k
 admission with exactly 27 unresolved-import diagnostics and an explicit incomplete-registry
 rejection. MmMapViewInSystemSpace no longer appears as a spurious extra miss from global catalog
 failure. The executive stops before DriverEntry or desktop rendering;
@@ -36280,6 +36280,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         infer Call-versus-Send from message shape. Preserve unresolved snapshots on refusal. Bootstrap
         fan-in and blocking-wait admission remain disabled pending that complete ownership path;
         the strict 27-export desktop boot frontier is unchanged.
+      - [x] Replace private pump poll heuristics with actual Reply evidence (2026-09-20).
+        The timer-fair nonblocking receive now requires a Free Reply before offering it. After
+        receive it queries the binding, resolves the live badge peer, and accepts only an exact
+        BoundToTarget observation. FSD peers are resolved through physical domain, endpoint,
+        VSpace, shared mapping, active Reply and live main/worker TCB identity. Win32k uses its
+        private lane endpoint and exact creation-owned TCB capability, including the ready exchange
+        before a new lane enters the eligible registry. No driver-table borrow crosses a query.
+        The complete IPC buffer is saved/restored around queries, preserving MR4+ and metadata;
+        fast message registers remain local receive values. Both protocol-label allowlists are
+        deleted, and the obsolete claim that Reply labels cannot carry arbitrary payload is removed.
+
+        Offered, unknown caller, wrong binding or query error stops before further receive/reply;
+        it cannot become an empty poll or a wall that cancels an unrelated main-thread Call.
+        Free means no retained Call, not necessarily an empty endpoint: ordinary Sends are ignored
+        only by this private advisory Call protocol. Generic outer ingress still needs separate
+        routing for non-Call snapshots. Host-testable classification covers preflight, all binding
+        states, worker calls, missing peers, changed binding and query failures without retries.
+        Validation: 123 component-suspension unit tests and 1,428 tests across 24 broader suites
+        pass, as do serialized executive and IO-manager release builds. Logs:
+        .tmp/test-reply-probe-focused-20260920.log, .tmp/test-reply-probe-20260920.log,
+        .tmp/build-reply-probe-executive-20260920.log and
+        .tmp/build-reply-probe-io-manager-20260920.log. A fresh normal build/boot with a 120-second
+        boot deadline reaches exactly 27 unresolved win32k imports and explicit registry rejection;
+        QEMU was terminated at that deterministic barrier. Logs: .tmp/run-reply-probe-20260920.log
+        and .tmp/boot-reply-probe-20260920.log. This does not exercise the native timer-poll path or
+        establish desktop rendering; native failure-injection acceptance remains open.
+        Bootstrap outer receive ownership and blocking wait admission remain open; this integration
+        alone does not remove their guards or the 27-export boot wall.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

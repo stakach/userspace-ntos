@@ -13,6 +13,9 @@ use crate::*;
 use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use nt_io_manager::{write_wdm_driver_object, WdmDriverObjectInit};
 
+#[path = "pump_receive_probe.rs"]
+mod receive_probe;
+
 const SEL4_RETYPE_FAN_OUT_LIMIT: u64 = 256;
 
 /// Where a region's frame caps come from.
@@ -1449,58 +1452,12 @@ fn dispatch_depth_leave() {
 /// `client_reply_on` + `recv_full_r12`), so a clobbered `reply_to` cannot mis-address anything: the
 /// executive simply has no consumer for it left. Nothing here needs to announce the clobber.
 
-/// ★ PLAN CORRECTION (`docs/transport-migration.md` §3.5 was WRONG about this).
-///
-/// A reply issued on a `Cap::Reply` **cannot carry an arbitrary message LABEL**. `reply_on` is a
-/// `SYS_CALL` on a non-endpoint cap, so the kernel routes it through
-/// `invocation.rs::decode_invocation`, which parses the msginfo label as an `InvocationLabel`
-/// *before* dispatching on the cap type — `InvocationLabel::from_u64(0x771)` is `None`, so the
-/// reply fails `seL4_InvalidArgument` (1) and never reaches `decode_reply`. Only label **0**
-/// (`InvalidInvocation`) survives that gate. (The COMPONENT→executive direction is unaffected: the
-/// component's `Call` targets an Endpoint cap, so its `dispatch_label` rides in the label as before,
-/// which is what the pump's DONE arm matches on.)
-///
-/// So the executive's request rides as a length-1 message with the tag in **MR0**. Phase 2 needs
-/// exactly this to tell a nested DISPATCH from a callback RESUME.
+/// The component protocol carries the request tag in MR0 to distinguish nested dispatch from
+/// callback resume. Reply-cap message labels are payload, not kernel invocation selectors.
 const REQUEST_TAG_LEN: u64 = 1;
 static PUMP_TIMER_FAIR_POLLS: AtomicU64 = AtomicU64::new(0);
 static PUMP_TIMER_FAIR_HITS: AtomicU64 = AtomicU64::new(0);
 static PUMP_DEADMAN_UNWINDS: AtomicU64 = AtomicU64::new(0);
-
-#[inline]
-fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
-    label == ch.dispatch_label
-        || label == crate::provider_bugcheck::BUGCHECK_LABEL
-        || (crate::driver_launch::is_fsd_component_service_label(label)
-            && ch.caps.kind == ReqKind::Irp)
-        || (label == crate::win32k_subsystem::W32_USER_CALLBACK_LABEL && ch.caps.usermode_callback)
-        || (label == crate::win32k_subsystem::W32_PROVIDER_WAIT_LABEL
-            && ch.caps.kind == ReqKind::Syscall
-            && (ch.caps.provider_wait || ch.kernel_caller.is_some()))
-        || (label == crate::win32k_subsystem::W32_LPC_WAIT_LABEL
-            && ch.caps.kind == ReqKind::Syscall)
-        || (label == crate::win32k_subsystem::W32_GDI_LOAD_LABEL
-            && ch.caps.kind == ReqKind::Syscall)
-        || (label == crate::win32k_subsystem::W32_VIDEO_IOCTL_LABEL
-            && ch.caps.kind == ReqKind::Syscall)
-        || (label == crate::win32k_subsystem::W32_LPC_LABEL && ch.caps.kind == ReqKind::Syscall)
-        || (label == crate::win32k_subsystem::W32_REGISTRY_LABEL
-            && ch.caps.kind == ReqKind::Syscall)
-        || (label == crate::win32k_subsystem::W32_EVENT_LABEL && ch.caps.kind == ReqKind::Syscall)
-        || (label == crate::win32k_subsystem::W32_PS_LABEL && ch.caps.kind == ReqKind::Syscall)
-        || (label == crate::win32k_subsystem::W32_KERNEL_ACTIVATION_LABEL
-            && ch.caps.kind == ReqKind::Syscall)
-        || (label == crate::win32k_subsystem::W32_ATOM_LABEL
-            && ch.caps.kind == ReqKind::Syscall)
-        || (label == crate::win32k_subsystem::W32_MM_SECURE_LABEL
-            && ch.caps.kind == ReqKind::Syscall)
-        || (label == crate::win32k_subsystem::W32_DEVICE_PROPERTY_LABEL
-            && ch.caps.kind == ReqKind::Syscall)
-        || (label == crate::win32k_subsystem::W32_DEVICE_POINTER_LABEL
-            && ch.caps.kind == ReqKind::Syscall)
-        || label == 6
-        || (label == 3 && (ch.caps.io_port_faults || ch.caps.assert_skip))
-}
 
 unsafe fn pump_handle_executive_event_badge(badge: u64) -> (bool, bool, bool) {
     let timer = crate::badge_has_delay_timer(badge);
@@ -1536,6 +1493,7 @@ unsafe fn pump_scheduler_work_pending(ch: &PumpChannel, irq: bool) -> bool {
 /// endpoint is still idle.
 #[inline(never)]
 unsafe fn pump_try_recv_after_timer(ch: &PumpChannel, reply_cap: u64) -> Option<PumpMessage> {
+    receive_probe::before_receive(ch, reply_cap);
     PUMP_TIMER_FAIR_POLLS.fetch_add(1, Ordering::Relaxed);
     let badge: u64;
     let mi: u64;
@@ -1557,6 +1515,7 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel, reply_cap: u64) -> Option<
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
+    let received_call = receive_probe::received_call(ch, reply_cap, badge);
     let (executive_event, _timer, irq) = pump_handle_executive_event_badge(badge);
     if executive_event {
         if pump_deadman_tripped() {
@@ -1567,13 +1526,12 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel, reply_cap: u64) -> Option<
         }
         return None;
     }
-    let label = mi >> 12;
-    // A timer drain can leave non-endpoint msginfo in the volatile receive registers (for example
-    // the executive's IRQ-ack label). This fairness probe is advisory, so only protocol labels that
-    // the component pump already knows how to service are allowed to short-circuit the next Recv.
-    if !pump_label_can_arrive_after_timer(ch, label) {
+    if !received_call {
+        // This private protocol consumes Calls only. Free can also mean an ordinary Send was
+        // received; it authorizes another poll but is not evidence that the endpoint was empty.
         return None;
     }
+    let label = mi >> 12;
     let hit = PUMP_TIMER_FAIR_HITS.fetch_add(1, Ordering::Relaxed);
     if hit < 8 {
         crate::print_str(b"[pump] timer-fair NBRecv accepted component message label=");
