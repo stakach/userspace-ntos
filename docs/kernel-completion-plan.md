@@ -36814,6 +36814,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         (.tmp/build-stack-retirement-executive-20260921.log and
         .tmp/build-stack-retirement-io-manager-20260921.log). No new QEMU result is claimed for
         this host-contract change; the last measured boot barrier remains before DriverEntry.
+        Stack catalog instance fencing checkpoint (2026-09-21): publication receipts now capture
+        the exact catalog instance, not only its table-local lane handle. Catalog construction
+        allocates a checked nonzero identity that survives moves and lane-slot reuse, never wraps,
+        and fails closed on exhaustion. Query and retirement reject a foreign catalog before
+        looking up the handle, even if both catalogs contain identical generations, lane IDs,
+        stack bases, and lengths. Failed or entered receipts retain their original catalog owner.
+        This closes a local ownership hole previously delegated to the adapter's lifetime contract.
+        These IDs remain address-space-local bookkeeping, not credentials: native transport must
+        still authenticate the provider lifetime and physical worker. No root-side provider-memory
+        access or native unregister transport is enabled by this checkpoint.
+        Validation passes 108 tests across six provider-wait suites, including five new identity
+        tests and the non-clone compile-fail check (.tmp/test-stack-catalog-identity-20260921.log).
+        Both serialized native release builds pass
+        (.tmp/build-stack-catalog-identity-executive-20260921.log and
+        .tmp/build-stack-catalog-identity-io-manager-20260921.log). No fresh QEMU result is claimed;
+        the last measured boot remains blocked by the 27 unresolved win32k exports.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

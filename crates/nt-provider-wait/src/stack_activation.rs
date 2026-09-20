@@ -1,4 +1,11 @@
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_STACK_CATALOG: AtomicU64 = AtomicU64::new(1);
+
+/// Exact catalog lifetime, independent of reusable lane handles or memory addresses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StackCatalogIdentity(u64);
 
 use crate::{
     KernelProviderActivationDescriptor, KernelProviderActivationError, ProviderDomainIdentity,
@@ -120,6 +127,7 @@ impl ProviderStackLaneRecord {
 ///
 /// Activations are LIFO within one physical lane. Independent lanes may finish in any order.
 pub struct ProviderStackActivationCatalog {
+    identity: StackCatalogIdentity,
     lanes: Vec<ProviderStackLaneRecord>,
     max_lanes: usize,
     max_depth_per_lane: usize,
@@ -131,15 +139,37 @@ impl ProviderStackActivationCatalog {
         max_lanes: usize,
         max_depth_per_lane: usize,
     ) -> Result<Self, ProviderStackActivationError> {
+        Self::new_with_counter(max_lanes, max_depth_per_lane, &NEXT_STACK_CATALOG)
+    }
+
+    fn new_with_counter(
+        max_lanes: usize,
+        max_depth_per_lane: usize,
+        counter: &AtomicU64,
+    ) -> Result<Self, ProviderStackActivationError> {
         if max_lanes == 0 || max_depth_per_lane == 0 || max_lanes > u32::MAX as usize {
             return Err(ProviderStackActivationError::InvalidCapacity);
         }
+        let identity = counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                if next == 0 {
+                    None
+                } else {
+                    next.checked_add(1)
+                }
+            })
+            .map_err(|_| ProviderStackActivationError::IdentityExhausted)?;
         Ok(Self {
+            identity: StackCatalogIdentity(identity),
             lanes: Vec::new(),
             max_lanes,
             max_depth_per_lane,
             next_activation_generation: 1,
         })
+    }
+
+    pub(crate) const fn identity(&self) -> StackCatalogIdentity {
+        self.identity
     }
 
     pub fn register_lane(
@@ -490,6 +520,67 @@ mod irql_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_identity_distinguishes_equal_lane_bindings() {
+        let mut first = catalog();
+        let mut second = catalog();
+        let a = first.register_lane(7, 0x1000, 0x1000).unwrap();
+        let b = second.register_lane(7, 0x1000, 0x1000).unwrap();
+        assert_eq!(first.binding(a), second.binding(b));
+        assert_ne!(first.identity(), second.identity());
+    }
+
+    #[test]
+    fn catalog_identity_survives_move_and_lane_generation_reuse() {
+        let mut original = catalog();
+        let identity = original.identity();
+        let handle = original.register_lane(7, 0x1000, 0x1000).unwrap();
+        let mut moved = original;
+        assert_eq!(moved.identity(), identity);
+        moved.unregister_lane(handle).unwrap();
+        let replacement = moved.register_lane(7, 0x1000, 0x1000).unwrap();
+        assert_ne!(handle, replacement);
+        assert_eq!(moved.identity(), identity);
+    }
+
+    #[test]
+    fn catalog_identity_exhaustion_never_wraps_or_issues_zero() {
+        for value in [0, u64::MAX] {
+            let counter = AtomicU64::new(value);
+            assert_eq!(
+                ProviderStackActivationCatalog::new_with_counter(1, 1, &counter).err(),
+                Some(ProviderStackActivationError::IdentityExhausted)
+            );
+            assert_eq!(counter.load(Ordering::Relaxed), value);
+        }
+        let counter = AtomicU64::new(u64::MAX - 1);
+        let last = ProviderStackActivationCatalog::new_with_counter(1, 1, &counter).unwrap();
+        assert_eq!(last.identity(), StackCatalogIdentity(u64::MAX - 1));
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(
+            ProviderStackActivationCatalog::new_with_counter(1, 1, &counter).err(),
+            Some(ProviderStackActivationError::IdentityExhausted)
+        );
+    }
+
+    #[test]
+    fn invalid_catalog_capacity_does_not_consume_identity() {
+        let counter = AtomicU64::new(8);
+        for (lanes, depth) in [(0, 1), (1, 0), (u32::MAX as usize + 1, 1)] {
+            assert_eq!(
+                ProviderStackActivationCatalog::new_with_counter(lanes, depth, &counter).err(),
+                Some(ProviderStackActivationError::InvalidCapacity)
+            );
+            assert_eq!(counter.load(Ordering::Relaxed), 8);
+        }
+        assert_eq!(
+            ProviderStackActivationCatalog::new_with_counter(1, 1, &counter)
+                .unwrap()
+                .identity(),
+            StackCatalogIdentity(8)
+        );
+    }
 
     fn catalog() -> ProviderStackActivationCatalog {
         ProviderStackActivationCatalog::new(3, 4).unwrap()
