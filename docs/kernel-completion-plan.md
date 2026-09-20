@@ -36352,6 +36352,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
            their separate notification/Send handling; the private-pump Send discard is not generic.
         4. Migrate creation, normal dispatch, callbacks, waits, faults and dedicated IRQ exchanges;
            delete superseded private receive/routing machinery after ownership parity is tested.
+           Combined reply-and-receive must account for the old reply effect independently from
+           authentication of the next arrival: a newly bound unrelated peer does not prove the
+           previous reply failed. Capture the complete received message before any query/event
+           IPC. Dedicated hosted IRQ lanes require their own canonical lane/domain/badge lookup;
+           the ordinary driver resolver deliberately requires the instance main TCB and cannot
+           authenticate these separate TCBs. Do not migrate their badge/label-only completion
+           checks as if they established Reply ownership.
         5. Wire the bounded bootstrap pass to this ingress owner, retain exact target ACK across
            passes, and only then remove the three non-poll DriverEntry admission guards. Test two
            providers plus multiple workers, unrelated arrivals while a callback is parked, timer
@@ -36437,6 +36444,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         failure (.tmp/boot-component-publication-20260920.log); QEMU was stopped at that deterministic
         blocker. No DriverEntry or desktop rendering is claimed. Shared peer capability
         publication and retained unrelated-arrival routing remain the next native ownership slice.
+        Retained unrelated-Call checkpoint (2026-09-20): RetainedIngress composes an owned
+        ComponentIngress snapshot and its exact bound Reply with the registry's non-clone peer
+        retention ticket. retain_peer_ingress resolves active or retiring routes, requires native
+        BoundToTarget evidence for the exact executor/Reply, and performs canonical held-call
+        handoff to a separately owned fresh receive Reply. Failed admission preserves the old
+        ingress and returns the replacement; failed handoff rolls back only its new reservation.
+        NoEffects and Indeterminate replies retain the peer and payload. Acknowledgement keeps the
+        payload inside the owner until exact registry release succeeds; refusal returns that owner
+        intact. Retiring arrivals are drain/cancellation candidates, not permission to execute.
+        Final release currently requires reply acknowledgement; native cancellation completion
+        still needs equivalent explicit evidence rather than a generic drop/unlock operation.
+
+        This is the host-testable retention contract, not a native endpoint migration. The adapter
+        must authenticate the badge from that same captured message, validate live physical domain
+        and generation, and exclude replacement Reply aliases across all domains and other owners.
+        A registry route is metadata, not proof of physical liveness. The read-only retention borrow
+        composes with canonical lane admission without exposing mutable lifetime ownership. Private
+        endpoints, duplicate-endpoint exclusion and blocking-bootstrap guards remain unchanged;
+        native shared capability publication, routing/storage and topology cutover stay open.
+        Validation passes 161 unit tests and seven compile-fail checks, including 11 new retained
+        ingress tests for distinct-domain peers on one endpoint, out-of-order ACK, retirement,
+        failed query/handoff, staged rejection, physical exclusion, exact reply attempts and full
+        message preservation across IPC-buffer reuse (.tmp/test-retained-ingress-focused-20260920.log).
+        The broader serialized run passes 1,469 tests across 24 suites
+        (.tmp/test-retained-ingress-20260920.log). Executive and IO-manager release builds pass
+        (.tmp/build-retained-ingress-executive-20260920.log and
+        .tmp/build-retained-ingress-io-manager-20260920.log). No new QEMU run is claimed for this
+        crate-only slice; the preceding measured boot still stops at the strict 27-export barrier.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
