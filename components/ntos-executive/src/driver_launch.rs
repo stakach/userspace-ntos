@@ -28705,6 +28705,7 @@ unsafe fn dispatch_hosted_provider_export_legacy(
 
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: provider_inst.fault_ep,
+        physical_domain: instance_domain_identity(provider_inst),
         pml4: provider_inst.pml4,
         code_va: 0,
         image_frames: 0,
@@ -29148,6 +29149,7 @@ unsafe fn dispatch_hosted_component_target(
 
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: inst.fault_ep,
+        physical_domain: instance_domain_identity(inst),
         pml4: inst.pml4,
         code_va: 0,
         image_frames: 0,
@@ -36669,6 +36671,7 @@ unsafe fn load_driver_reserved(
     // to issue its ready `Call`), so the pump must start by RECEIVING. Trace on for observability.
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep,
+        physical_domain: instance_domain_identity(domain),
         pml4,
         code_va: run_va,
         image_frames: img_frames,
@@ -47072,6 +47075,7 @@ unsafe fn hosted_irq_lane_channel(
 ) -> Option<crate::spawn_hosts::PumpChannel> {
     Some(crate::spawn_hosts::PumpChannel {
         fault_ep: lane.endpoint,
+        physical_domain: Some(lane.domain),
         pml4: lane.pml4,
         code_va: FSD_CODE_VA,
         image_frames: inst.image_frames,
@@ -51067,6 +51071,7 @@ unsafe fn active_hosted_irp_transfer_mut(
 #[derive(Clone, Copy)]
 struct HostedDriverThreadRuntime {
     instance: usize,
+    domain: HostedDomainIdentity,
     handle: u64,
     tcb: u64,
     badge: u64,
@@ -51312,7 +51317,11 @@ fn hosted_driver_caller(
     let runtime = if badge == 0 {
         None
     } else {
-        Some(hosted_driver_runtime_by_badge(instance, badge)?)
+        let runtime = hosted_driver_runtime_by_badge(instance, badge)?;
+        if runtime.domain != instance_domain_identity(inst)? {
+            return None;
+        }
+        Some(runtime)
     };
     let (handle, tcb) = runtime.map_or((inst.main_thread_id, inst.tcb), |rt| (rt.handle, rt.tcb));
     // Authentication must not create a missing table or allocate state on behalf of an unknown peer.
@@ -52510,7 +52519,19 @@ fn instance_for_pump_channel(
     active_reply_cap: u64,
 ) -> Option<(usize, DriverInstance)> {
     let (instance, inst) = instance_by_shared_va(ch.shared_va)?;
-    if inst.fault_ep != ch.fault_ep || inst.pml4 != ch.pml4 || inst.reply_cap != active_reply_cap {
+    let captured = nt_io_manager::HostedTransportIdentity {
+        domain: ch.physical_domain?,
+        endpoint: ch.fault_ep,
+        vspace: ch.pml4,
+        shared: ch.shared_va,
+    };
+    let live = nt_io_manager::HostedTransportIdentity {
+        domain: instance_domain_identity(inst)?,
+        endpoint: inst.fault_ep,
+        vspace: inst.pml4,
+        shared: inst.exec_shared_va,
+    };
+    if !captured.matches_live(live) || active_reply_cap == 0 || inst.reply_cap != active_reply_cap {
         return None;
     }
     Some((instance, inst))
@@ -54642,6 +54663,10 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return (STATUS_INVALID_HANDLE, 0);
     }
+    let Some(domain) = instance_domain_identity(inst) else {
+        HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return (STATUS_INVALID_HANDLE, 0);
+    };
     if start_routine == 0 {
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return (STATUS_INVALID_PARAMETER, 0);
@@ -54727,6 +54752,7 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
     unsafe {
         hosted_driver_thread_runtimes_mut().push(HostedDriverThreadRuntime {
             instance,
+            domain,
             handle,
             tcb: spawn.tcb,
             badge: spawn.badge,
@@ -54917,6 +54943,7 @@ unsafe fn dispatch_driver_unload_for_instance(
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
+        physical_domain: instance_domain_identity(inst),
         code_va: 0,
         image_frames: 0,
         exec_code_va: ExecVaWindow::try_for_instance(index)
@@ -54975,6 +55002,7 @@ unsafe fn dispatch_device_projection_control_for_instance(
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
+        physical_domain: instance_domain_identity(inst),
         code_va: 0,
         image_frames: 0,
         exec_code_va: ExecVaWindow::try_for_instance(index)
@@ -55107,6 +55135,7 @@ unsafe fn dispatch_video_add_device_for_instance(
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
+        physical_domain: instance_domain_identity(inst),
         code_va: 0,
         image_frames: 0,
         exec_code_va: ExecVaWindow::try_for_instance(index)
@@ -55182,6 +55211,7 @@ unsafe fn dispatch_provider_add_device_for_instance(
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: provider_inst.fault_ep,
         pml4: provider_inst.pml4,
+        physical_domain: instance_domain_identity(provider_inst),
         code_va: 0,
         image_frames: 0,
         exec_code_va: ExecVaWindow::try_for_instance(route.provider_instance)
@@ -55263,6 +55293,7 @@ unsafe fn dispatch_add_device_for_instance(
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
+        physical_domain: instance_domain_identity(inst),
         code_va: 0,
         image_frames: 0,
         exec_code_va: ExecVaWindow::try_for_instance(index)
@@ -56908,6 +56939,7 @@ unsafe fn dispatch_video_find_adapter_pnp_for_instance(
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
+        physical_domain: instance_domain_identity(inst),
         code_va: 0,
         image_frames: 0,
         exec_code_va: exec_window.code_va,
@@ -58255,6 +58287,7 @@ unsafe fn dispatch_irp_for_instance_exact(
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: ep,
         pml4,
+        physical_domain: instance_domain_identity(d),
         code_va: 0,
         image_frames: 0, // per-IRP loop: no in-image wall (matches the old `addr < 0x10000` guard)
         exec_code_va: ExecVaWindow::try_for_instance(dispatch_index)?.code_va,

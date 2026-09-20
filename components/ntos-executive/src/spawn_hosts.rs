@@ -1137,6 +1137,9 @@ pub(crate) enum InitialAction {
 /// `npfs_dispatch_irp`/`load_driver` inner loop EXACTLY.
 #[derive(Clone, Copy)]
 pub(crate) struct PumpChannel {
+    /// Captured physical address-space lifetime. Driver broker routing requires this exact domain;
+    /// logical dependent-driver attribution never substitutes for it. Win32k uses its lane owner.
+    pub physical_domain: Option<nt_io_manager::HostedDomainIdentity>,
     /// Dispatch + fault channel (the `CT_FAULT` peer cap for this component).
     pub fault_ep: u64,
     /// Component VSpace root, for demand-mapping its page faults.

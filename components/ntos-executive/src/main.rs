@@ -30084,6 +30084,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let code_va = win32k_subsystem::WIN32K_CODE_VA;
             let init_ch = spawn_hosts::PumpChannel {
                 fault_ep: w_fault,
+                physical_domain: None,
                 pml4: host_pml4,
                 code_va,
                 image_frames: win32k_subsystem::WIN32K_IMAGE_FRAMES,

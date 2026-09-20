@@ -47,6 +47,8 @@ mod file_reference;
 pub mod file_io_capture;
 mod file_information;
 mod hosted_domain;
+mod hosted_transport;
+pub use hosted_transport::HostedTransportIdentity;
 mod hosted_file;
 #[cfg(test)]
 mod hosted_file_lifetime_tests;

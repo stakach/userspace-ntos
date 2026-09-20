@@ -179,6 +179,7 @@ unsafe fn win32k_lane_channel(
         .find(|lane| lane.handle == handle)?;
     Some(crate::spawn_hosts::PumpChannel {
         fault_ep: lane.binding.receive_endpoint,
+        physical_domain: None,
         pml4: WIN32K_HOST_PML4.load(Ordering::Relaxed),
         code_va: win32k_subsystem::WIN32K_CODE_VA,
         image_frames: win32k_subsystem::WIN32K_IMAGE_FRAMES,
@@ -253,6 +254,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     );
     let channel = crate::spawn_hosts::PumpChannel {
         fault_ep: worker.endpoint,
+        physical_domain: None,
         pml4,
         code_va: win32k_subsystem::WIN32K_CODE_VA,
         image_frames: win32k_subsystem::WIN32K_IMAGE_FRAMES,

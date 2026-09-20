@@ -36181,9 +36181,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/build-driver-caller-routing-20260920.log and
         .tmp/build-driver-caller-routing-io-manager-20260920.log. No QEMU rerun: the strict 27-export
         boot frontier is unchanged; no desktop proof is claimed.
-        This verifies membership in the currently resolved instance, not a retained generation claim:
-        PumpChannel still lacks a captured physical domain generation. Authenticated retained routing,
-        Call-versus-Send/Reply-binding evidence and bootstrap fan-in remain open. No wait guard enabled.
+        This checkpoint verifies membership in the currently resolved instance; the transport-lifetime
+        checkpoint below adds the captured physical generation. Call-versus-Send/Reply-binding
+        evidence and bootstrap fan-in remain open. No wait guard enabled.
+      - [x] Retain physical driver transport generations through pump routing (2026-09-20).
+        PumpChannel now captures the physical HostedDomainIdentity at construction. All eleven
+        driver/FSD channel constructors use the actual VSpace owner, including provider-routed IRPs,
+        dependent-driver exports, AddDevice, teardown and the private IRQ lane. The three win32k
+        constructors explicitly carry no driver-instance identity and keep their existing lane owner.
+        Added the host-testable HostedTransportIdentity comparison for exact nonzero domain id,
+        cookie, endpoint, VSpace and shared address. instance_for_pump_channel checks this captured
+        identity against the current instance before any broker routing and still requires the exact
+        current nonzero Reply cap independently, allowing legitimate reply rotation. Neither a
+        dependent attribution domain nor address reuse grants access to a replacement instance.
+        Worker runtime mappings also retain their creation domain and reject a mismatch with the
+        current instance before live handle/TCB resolution. No source identity is inferred on absence.
+        Tests cover reused addresses with changed domain/cookie, every transport-field mismatch and
+        equal-but-invalid zero fields. Validation: three focused transport tests and all 721 I/O-manager
+        unit tests pass; serialized native executive and IO-manager release builds pass. Logs:
+        .tmp/test-driver-transport-generation-focused-20260920.log,
+        .tmp/test-driver-transport-generation-io-20260920.log,
+        .tmp/build-driver-transport-generation-20260920.log and
+        .tmp/build-driver-transport-generation-io-manager-20260920.log. Native stale-worker and
+        rotated-Reply integration remain unverified; no QEMU rerun. This closes current driver broker lifetime
+        checks, not generic retained ingress dispatch or Call-versus-Send provenance. Bootstrap fan-in
+        and exact Reply-binding evidence remain open; blocking-wait guards stay disabled.
+        The strict 27-export boot frontier remains unchanged.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
