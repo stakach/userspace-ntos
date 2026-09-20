@@ -36830,6 +36830,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         (.tmp/build-stack-catalog-identity-executive-20260921.log and
         .tmp/build-stack-catalog-identity-io-manager-20260921.log). No fresh QEMU result is claimed;
         the last measured boot remains blocked by the 27 unresolved win32k exports.
+        Native secondary ready receipt checkpoint (2026-09-21): secondary entry sends its
+        completed stack publication binding in the initial Call as five words (lane identity,
+        catalog slot, generation, stack base, stack length). The lane-private IPC buffer carries
+        the fifth word, captured by the existing owned receive snapshot before kernel probes.
+        The pump accepts this shape only for RecvFirst on an exact canonical Starting lane whose
+        TCB/endpoint/Reply match; kernel Reply authentication proves the sender. Primary readiness
+        and every ordinary completion remain exact zero-word messages. Replying to the initial
+        Call executes the first request in the same dispatch-loop iteration, without an extra Call.
+
+        Host-tested decoding rejects truncation, zero generation, invalid/overflowing ranges, and
+        mismatched allocated lane/range. Native admission additionally bounds the catalog slot,
+        retains the receipt in the exact physical worker row, and re-queries the Reply before Idle.
+        Receipt scalars cannot manufacture a catalog handle or authorize retirement. A failed
+        startup with no valid delivered receipt remains uncertain and quarantined; no provider is
+        resumed solely to inspect possibly interrupted catalog mutation. Native exact unregister
+        acknowledgment and physical teardown remain open. This replaces discarded secondary ready
+        publication evidence without relaxing ordinary completion framing.
+        Validation passes 111 tests across six provider-wait suites, including three new wire
+        receipt tests (.tmp/test-stack-ready-20260921.log). Both serialized native release builds
+        pass (.tmp/build-stack-ready-executive-20260921.log and
+        .tmp/build-stack-ready-io-manager-20260921.log). Fresh bounded boot passes isolated storage,
+        generic loader, live hive composition, and disk-section paging, then reaches the unchanged
+        strict 27-export win32k rejection before DriverEntry. QEMU PID 50710 was explicitly stopped
+        there; runner exit 1 is not a successful boot verdict (.tmp/run-stack-ready-20260921.log and
+        .tmp/boot-stack-ready-20260921.log). Runtime secondary ready receipt and desktop rendering
+        remain unverified beyond that barrier.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

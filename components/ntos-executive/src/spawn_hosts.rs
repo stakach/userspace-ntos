@@ -1674,6 +1674,7 @@ macro_rules! pump_reply_recv4_into {
 #[derive(Clone, Copy)]
 struct PumpLoopOutcome {
     completed: bool,
+    startup_stack_receipt: Option<[u64; 5]>,
     callback_suspended: bool,
     provider_wait_suspended: bool,
     lpc_wait_suspended: bool,
@@ -1692,6 +1693,7 @@ impl PumpLoopOutcome {
     const fn new() -> Self {
         Self {
             completed: false,
+            startup_stack_receipt: None,
             callback_suspended: false,
             provider_wait_suspended: false,
             lpc_wait_suspended: false,
@@ -1939,6 +1941,8 @@ pub(crate) struct PumpResult {
     /// transport must retain this final active cap.
     pub reply_cap: u64,
     pub completed: bool,
+    /// Authenticated secondary-startup publication words; the startup owner validates the receipt.
+    pub startup_stack_receipt: Option<[u64; 5]>,
     pub callback_suspended: bool,
     /// The component is blocked in its provider-wait rendezvous and its reply object remains bound.
     pub provider_wait_suspended: bool,
@@ -1967,6 +1971,7 @@ impl PumpResult {
             result: status as u32 as u64,
             reply_cap,
             completed: false,
+            startup_stack_receipt: None,
             callback_suspended: false,
             provider_wait_suspended: false,
             lpc_wait_suspended: false,
@@ -2485,11 +2490,22 @@ unsafe fn component_pump_loop(
                 }
             }
         } else if label == ch.dispatch_label {
-            // The receive path authenticated the caller. Ready/completion Calls also require
-            // the exact zero-word, no-capability protocol shape emitted by component_dispatch_loop.
-            if msg.mi != ch.dispatch_label << 12 {
+            let starting = ch.caps.kind == ReqKind::Syscall
+                && ch.initial == InitialAction::RecvFirst
+                && crate::win32k_glue::win32k_physical_lane_for_channel(
+                    ch.tcb, ch.fault_ep, ch.reply_cap,
+                ).is_some_and(|lane| {
+                    crate::service_sec_image::component_execution_lane_is_starting(lane)
+                });
+            // Only an authenticated secondary startup carries publication words. Ordinary
+            // completions retain the exact zero-word, no-capability protocol shape.
+            let expected_info = (ch.dispatch_label << 12) | if starting { 5 } else { 0 };
+            if msg.mi != expected_info {
                 outcome.wall(msg);
                 break;
+            }
+            if starting {
+                outcome.startup_stack_receipt = Some([msg.m0, msg.m1, msg.m2, msg.m3, msg.m4]);
             }
             PUMP_CALL_DISPATCHES[ch.caps.kind as usize].fetch_add(1, Ordering::Relaxed);
             outcome.completed = true;
@@ -3814,6 +3830,7 @@ unsafe fn pump_result_from_outcome(
         result,
         reply_cap,
         completed: outcome.completed,
+        startup_stack_receipt: outcome.startup_stack_receipt,
         callback_suspended: outcome.callback_suspended,
         provider_wait_suspended: outcome.provider_wait_suspended,
         lpc_wait_suspended: outcome.lpc_wait_suspended,
@@ -4098,6 +4115,18 @@ pub(crate) unsafe fn component_dispatch_loop(
     dispatch_label: u64,
     dispatch: unsafe fn(&DispatchReq) -> (i32, u64),
 ) -> ! {
+    component_dispatch_loop_with_ready(shared_va, drv, status_off, dispatch_label, dispatch, None)
+}
+
+/// The first Call may carry a lane-private startup receipt; subsequent completions are empty.
+pub(crate) unsafe fn component_dispatch_loop_with_ready(
+    shared_va: u64,
+    drv: u64,
+    status_off: u64,
+    dispatch_label: u64,
+    dispatch: unsafe fn(&DispatchReq) -> (i32, u64),
+    mut ready: Option<[u64; 5]>,
+) -> ! {
     // ★ THE PERSISTENT DISPATCH LOOP — ONE syscall.
     //
     // `call_on` publishes this dispatch's completion (the status/info are already in the shared
@@ -4114,7 +4143,14 @@ pub(crate) unsafe fn component_dispatch_loop(
     // OUTER loop only ever receives `dispatch_label` — the callback-RESUME tag is answered to the
     // rendezvous loop's own Call, deeper in this same component's C stack.
     loop {
-        let (_label, _tag, _, _, _) = crate::driver_launch::call_on(dispatch_label << 12);
+        let (_label, _tag, _, _, _) = if let Some(words) = ready.take() {
+            crate::driver_launch::call_on5(
+                (dispatch_label << 12) | 5,
+                words[0], words[1], words[2], words[3], words[4],
+            )
+        } else {
+            crate::driver_launch::call_on(dispatch_label << 12)
+        };
         let sel = core::ptr::read_volatile((shared_va + SH_REQ_SEL_H) as *const u64);
         let (st, info) = dispatch(&DispatchReq { sel, drv });
         // Write info/result FIRST, then status LAST. The FSD has distinct offsets

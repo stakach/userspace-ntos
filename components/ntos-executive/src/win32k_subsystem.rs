@@ -168,7 +168,7 @@ static PROVIDER_LOCAL_EVENT_INITIALIZATIONS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_COMPONENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WIN32K_SHUTDOWN_EVENT: AtomicU64 = AtomicU64::new(0);
 const WIN32K_STACK_BYTES: u64 = 32 * 0x1000;
-const WIN32K_PRIMARY_STACK_LANE_ID: u64 = 1;
+pub(crate) const WIN32K_PRIMARY_STACK_LANE_ID: u64 = 1;
 const WIN32K_STACK_ACTIVATION_DEPTH: usize = 64;
 
 #[derive(Clone, Copy)]
@@ -15383,9 +15383,9 @@ pub unsafe extern "C" fn win32k_dispatch_lane_entry(lane_ordinal: u64) -> ! {
         park();
     };
     let publications = &mut *core::ptr::addr_of_mut!(WIN32K_SECONDARY_STACK_PUBLICATIONS);
-    let registered = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
+    let binding = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
         .as_mut()
-        .is_some_and(|activations| {
+        .and_then(|activations| {
             publications[worker_index as usize]
                 .register(
                     activations,
@@ -15393,18 +15393,20 @@ pub unsafe extern "C" fn win32k_dispatch_lane_entry(lane_ordinal: u64) -> ! {
                     stack_base,
                     WIN32K_LANE_STACK_FRAMES * 0x1000,
                 )
-                .is_ok()
+                .ok()?;
+            publications[worker_index as usize].binding(activations).ok()
         });
-    if !registered {
+    let Some(binding) = binding else {
         print_str(b"[win32k-host] ERROR: secondary stack lane registration failed\n");
         park();
-    }
-    crate::spawn_hosts::component_dispatch_loop(
+    };
+    crate::spawn_hosts::component_dispatch_loop_with_ready(
         WIN32K_SHARED_VADDR,
         drv,
         SH_REQ_STATUS,
         W32_DISPATCH_LABEL,
         win32k_dispatch,
+        Some(nt_provider_wait::ProviderStackReadyReceipt::from_binding(binding).words()),
     )
 }
 

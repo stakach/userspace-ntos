@@ -16,6 +16,8 @@ mod local_event;
 mod local_timer;
 mod stack_activation;
 mod stack_publication;
+mod stack_ready;
+pub use stack_ready::ProviderStackReadyReceipt;
 
 pub use abi::*;
 pub use allocation::*;

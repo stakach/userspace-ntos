@@ -63,6 +63,7 @@ struct Win32kPhysicalLane {
     stack_base: u64,
     stack_frames: u64,
     ipc_buffer_va: u64,
+    stack_publication: Option<nt_provider_wait::ProviderStackReadyReceipt>,
     // Allocation receipt only; canonical state owns live transport and mechanism retirement.
     worker: Option<crate::spawn_hosts::SpawnedComponentWorker>,
 }
@@ -124,6 +125,7 @@ pub(crate) unsafe fn register_primary_win32k_physical_lane(
         stack_frames: 32,
         ipc_buffer_va: crate::IPCBUF_VADDR,
         worker: None,
+        stack_publication: None,
     });
     true
 }
@@ -316,6 +318,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
             stack_frames: win32k_subsystem::WIN32K_LANE_STACK_FRAMES,
             ipc_buffer_va,
             worker: Some(worker),
+            stack_publication: None,
         });
         index
     };
@@ -339,12 +342,22 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
         return false;
     }
     let pump = crate::spawn_hosts::component_pump(&channel);
+    let stack_publication = pump.startup_stack_receipt.and_then(|words| {
+        nt_provider_wait::ProviderStackReadyReceipt::decode(
+            words,
+            win32k_subsystem::WIN32K_PRIMARY_STACK_LANE_ID + worker_index as u64 + 1,
+            stack_base,
+            win32k_subsystem::WIN32K_LANE_STACK_FRAMES * 0x1000,
+        )
+        .filter(|receipt| (receipt.slot as usize) < win32k_subsystem::WIN32K_LANE_CAPACITY + 1)
+    });
     let ready = pump.completed
         && !pump.callback_suspended
         && !pump.provider_wait_suspended
         && !pump.lpc_wait_suspended
         && !pump.scheduler_yielded
-        && pump.reply_cap == reply_cap;
+        && pump.reply_cap == reply_cap
+        && stack_publication.is_some();
     print_str(b"[win32k-lane] physical lane=");
     print_u64(worker_index as u64 + 1);
     print_str(b" tcb=0x");
@@ -358,6 +371,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
         retain_failed_win32k_lane(tcb, b"ready", pump.wall_label);
         return false;
     }
+    win32k_physical_lanes_mut()[physical_index].stack_publication = stack_publication;
     if !crate::service_sec_image::complete_component_execution_lane_startup(handle) {
         retain_failed_win32k_lane(tcb, b"startup-completion", 0);
         return false;
