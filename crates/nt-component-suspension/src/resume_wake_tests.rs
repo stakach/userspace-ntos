@@ -191,3 +191,32 @@ fn exhausted_identity_and_overflow_preserve_pending_or_running_ownership() {
     wake.finish_pass(&mut pass, u64::MAX, false, true).unwrap();
     assert!(!wake.is_running());
 }
+
+#[test]
+fn completion_overflow_retains_backoff_and_excludes_reentry() {
+    for made_progress in [false, true] {
+        let mut wake = ResumeWake::new(10, 40).unwrap();
+        wake.reconcile(true, 100);
+        let mut first = wake.begin_pass(100).unwrap().unwrap();
+        wake.finish_pass(&mut first, 100, true, false).unwrap();
+        let mut pass = wake.begin_pass(110).unwrap().unwrap();
+        let identity = pass.identity;
+        let retry_delay = wake.retry_delay;
+        assert_eq!(
+            wake.finish_pass(&mut pass, u64::MAX - 5, true, made_progress),
+            Err(ResumeWakeError::DeadlineOverflow)
+        );
+        assert_eq!(pass.identity, identity);
+        assert_eq!(wake.retry_delay, retry_delay);
+        for has_work in [false, true] {
+            wake.reconcile(has_work, u64::MAX);
+            assert!(wake.is_running());
+            assert_eq!(wake.next_deadline(), None);
+            assert!(wake.begin_pass(u64::MAX).unwrap().is_none());
+        }
+        // Only the retained ticket can acknowledge a later observation that work has drained.
+        wake.finish_pass(&mut pass, u64::MAX, false, false).unwrap();
+        assert_eq!(pass.identity, 0);
+        assert!(!wake.is_running());
+    }
+}

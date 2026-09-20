@@ -36231,6 +36231,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         debug-state inference or synthetic reply result is introduced. Native provenance, exact
         Reply-binding evidence, retained routing and bootstrap fan-in remain open. No wait guard
         is enabled and the strict 27-export boot frontier is unchanged.
+      - [x] Stop on runtime continuation-pass completion failure without losing ownership (2026-09-20).
+        Runtime run_outer previously logged any finish_pass error, reconciled and returned, dropping
+        the sole exact pass ticket while WAKE remained Running. All future outer passes would then
+        silently skip retained work. It now fails explicitly before reconciliation, matching the
+        bootstrap owner. WrongPass and deadline overflow are invariant/clock-limit failures, not
+        acknowledged completion or recoverable allocation failure; no synthetic finish or timer
+        fallback is introduced. Pre-acquisition refusal still retains Pending state without a ticket.
+        Added coverage for productive and backed-off deadline overflow, exact ticket and retry-delay
+        retention, and rejection of new passes despite demand reconciliation. Validation: 117 focused
+        component-suspension unit tests; 1,422 tests across 24 broader suites; serialized native
+        executive and IO-manager release builds pass. Logs:
+        .tmp/test-runtime-pass-finish-focused-20260920.log, .tmp/test-runtime-pass-finish-20260920.log,
+        .tmp/build-runtime-pass-finish-20260920.log and .tmp/build-runtime-pass-finish-io-manager-20260920.log.
+        No native failure injection or QEMU rerun; no desktop proof claimed.
+        Native review found no other post-acquisition early return in runtime run_outer. This is an
+        ownership-failure fix, not native receive-provenance integration. Reply-binding evidence and
+        bootstrap fan-in remain open; the strict 27-export boot frontier remains unchanged.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

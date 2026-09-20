@@ -234,11 +234,8 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     }
     // A still-running physical owner is not evidence that its retained work disappeared.
     let has_work = component_execution_is_busy() || observe_demand(&(*handler).pm).retains_work();
-    if (&mut *core::ptr::addr_of_mut!(WAKE))
+    (&mut *core::ptr::addr_of_mut!(WAKE))
         .finish_pass(&mut ticket, monotonic_time_100ns(), has_work, progressed)
-        .is_err()
-    {
-        report_retained(nt_process::STATUS_INSUFFICIENT_RESOURCES);
-    }
+        .expect("runtime continuation pass must finish with its owned wake ticket");
     reconcile(&mut *handler);
 }
