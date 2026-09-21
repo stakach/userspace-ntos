@@ -154,3 +154,149 @@ fn wrong_domain_refusal_can_publish_after_exact_revalidation() {
     assert_eq!(peers.resolve(owner.route().badge()), None);
     owner.publish(&mut peers, 7, 8, &lanes).unwrap();
 }
+
+fn published() -> (Lanes, LaneHandle, PeerRegistry, PeerInstallation) {
+    let (lanes, lane, mut peers, mut owner) = setup();
+    owner.install(|_, _| Ok::<_, u8>(())).unwrap();
+    owner.publish(&mut peers, 7, 8, &lanes).unwrap();
+    (lanes, lane, peers, owner)
+}
+
+#[test]
+fn child_export_requires_publication_and_acknowledges_exact_destination() {
+    let (lanes, _, mut peers, mut owner) = setup();
+    let destination = PeerCapabilityDestination { cnode: 55, slot: 0 };
+    assert_eq!(
+        owner.export(
+            &peers,
+            7,
+            8,
+            &lanes,
+            destination,
+            |_, _| -> Result<(), u8> { panic!("unpublished export") }
+        ),
+        Err(PeerInstallationError::InvalidPhase)
+    );
+    assert_eq!(owner.child_destination(), None);
+    owner.install(|_, _| Ok::<_, u8>(())).unwrap();
+    owner.publish(&mut peers, 7, 8, &lanes).unwrap();
+    owner
+        .export(&peers, 7, 8, &lanes, destination, |source, child| {
+            assert_eq!(source, 44);
+            assert_eq!(child, destination);
+            Ok::<_, u8>(())
+        })
+        .unwrap();
+    assert_eq!(owner.phase(), PeerInstallationPhase::Exported);
+    assert_eq!(owner.child_destination(), Some(destination));
+    assert_eq!(owner.slot(), 44);
+    assert_eq!(peers.resolve(owner.route().badge()), Some(owner.route()));
+    assert_eq!(
+        owner.export(&peers, 7, 8, &lanes, destination, |_, _| Ok::<_, u8>(())),
+        Err(PeerInstallationError::InvalidPhase)
+    );
+    assert_eq!(
+        owner.delete_staged(|_| Ok::<_, u8>(())),
+        Err(PeerInstallationError::InvalidPhase)
+    );
+    assert_eq!(
+        owner.finish_abort(&mut peers),
+        Err(PeerInstallationError::InvalidPhase)
+    );
+}
+
+#[test]
+fn uncertain_child_copy_keeps_both_aliases_and_cannot_replay() {
+    let (lanes, _, mut peers, mut owner) = published();
+    let destination = PeerCapabilityDestination {
+        cnode: 55,
+        slot: 44,
+    };
+    assert_eq!(
+        owner.export(&peers, 7, 8, &lanes, destination, |_, _| Err(9u8)),
+        Err(PeerInstallationError::Invoke(9))
+    );
+    assert_eq!(owner.phase(), PeerInstallationPhase::Exporting);
+    assert_eq!(owner.child_destination(), Some(destination));
+    assert_eq!(owner.slot(), 44);
+    assert_eq!(
+        owner.export(&peers, 7, 8, &lanes, destination, |_, _| Ok::<_, u8>(())),
+        Err(PeerInstallationError::InvalidPhase)
+    );
+    assert_eq!(
+        owner.delete_staged(|_| Ok::<_, u8>(())),
+        Err(PeerInstallationError::InvalidPhase)
+    );
+    assert_eq!(
+        owner.finish_abort(&mut peers),
+        Err(PeerInstallationError::InvalidPhase)
+    );
+    assert_eq!(peers.resolve(owner.route().badge()), Some(owner.route()));
+}
+
+#[test]
+fn invalid_child_cnode_preserves_published_owner_without_effects() {
+    let (lanes, _, peers, mut owner) = published();
+    for cnode in [0, 11, 22, 44] {
+        assert_eq!(
+            owner.export(
+                &peers,
+                7,
+                8,
+                &lanes,
+                PeerCapabilityDestination { cnode, slot: 1 },
+                |_, _| -> Result<(), u8> { panic!("invalid CNode") }
+            ),
+            Err(PeerInstallationError::InvalidDestination)
+        );
+        assert_eq!(owner.phase(), PeerInstallationPhase::Published);
+        assert_eq!(owner.child_destination(), None);
+    }
+}
+
+#[test]
+fn child_export_revalidates_domain_registry_retirement_and_lane_generation() {
+    let destination = PeerCapabilityDestination { cnode: 55, slot: 1 };
+    let (mut lanes, lane, mut peers, mut owner) = published();
+    let foreign = PeerRegistry::new(22, 1);
+    for (registry, domain, generation) in [(&foreign, 7, 8), (&peers, 9, 8), (&peers, 7, 9)] {
+        assert!(owner
+            .export(
+                registry,
+                domain,
+                generation,
+                &lanes,
+                destination,
+                |_, _| -> Result<(), u8> { panic!("stale domain") }
+            )
+            .is_err());
+        assert_eq!(owner.phase(), PeerInstallationPhase::Published);
+        assert_eq!(owner.child_destination(), None);
+    }
+    let binding = lanes.release(lane, 33).unwrap();
+    lanes.allocate(binding).unwrap();
+    assert!(owner
+        .export(
+            &peers,
+            7,
+            8,
+            &lanes,
+            destination,
+            |_, _| -> Result<(), u8> { panic!("stale lane") }
+        )
+        .is_err());
+    assert_eq!(owner.child_destination(), None);
+    peers.begin_retirement(owner.route()).unwrap();
+    assert!(owner
+        .export(
+            &peers,
+            7,
+            8,
+            &lanes,
+            destination,
+            |_, _| -> Result<(), u8> { panic!("retiring peer") }
+        )
+        .is_err());
+    assert_eq!(owner.phase(), PeerInstallationPhase::Published);
+    assert_eq!(owner.child_destination(), None);
+}

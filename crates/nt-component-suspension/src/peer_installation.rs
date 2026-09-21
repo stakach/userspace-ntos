@@ -15,6 +15,8 @@ pub enum PeerInstallationPhase {
     Installing,
     Installed,
     Published,
+    Exporting,
+    Exported,
     Deleting,
     Deleted,
     Aborted,
@@ -23,10 +25,18 @@ pub enum PeerInstallationPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerInstallationError<E> {
     InvalidSlot,
+    InvalidDestination,
     InvalidPhase,
     Peer(PeerError),
     Lane(PeerLaneError),
     Invoke(E),
+}
+
+/// Root-owned CNode capability and child-local slot attribution, not mutation authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerCapabilityDestination {
+    pub cnode: u64,
+    pub slot: u64,
 }
 
 /// Owns the registration ticket and a preallocated root-CSpace destination slot. The adapter must
@@ -35,11 +45,17 @@ pub enum PeerInstallationError<E> {
 /// reenter registration, scheduling, or capability ownership. Errors preserve all ownership;
 /// entered operations cannot replay without a future explicit reconciliation protocol.
 /// Drop does not delete a capability, release a slot, or remove a route.
+///
+/// ```compile_fail
+/// use nt_component_suspension::PeerInstallation;
+/// fn duplicate(owner: PeerInstallation) { let _ = owner.clone(); }
+/// ```
 #[must_use = "retain peer capability ownership through publication or acknowledged abort"]
 pub struct PeerInstallation {
     registration: PeerRegistration,
     route: PeerRoute,
     destination_slot: u64,
+    exported_destination: Option<PeerCapabilityDestination>,
     phase: PeerInstallationPhase,
 }
 
@@ -64,6 +80,7 @@ impl PeerInstallation {
             registration,
             route,
             destination_slot,
+            exported_destination: None,
             phase: PeerInstallationPhase::Reserved,
         })
     }
@@ -80,6 +97,50 @@ impl PeerInstallation {
     /// Slot attribution only; this does not authorize deletion or recycling.
     pub const fn slot(&self) -> u64 {
         self.destination_slot
+    }
+
+    /// Retained destination attribution, including an uncertain entered export. Not permission
+    /// to delete, overwrite or recycle the child slot.
+    pub const fn child_destination(&self) -> Option<PeerCapabilityDestination> {
+        self.exported_destination
+    }
+
+    /// Copy the published root alias into the exact peer's live child CSpace. The adapter must
+    /// prove this is not the root CNode and exclusively reserve the initially empty child slot
+    /// (child-local slot zero is valid). It must preserve both CNode and peer lifetimes, forbid
+    /// additional copies, and not resume the peer until ACK and the startup protocol permit it.
+    /// An error leaves the active route and both capability owners retained; quarantine is
+    /// required until a future reconciliation protocol, never staged abort or blind replay.
+    pub fn export<C, R, T, E>(
+        &mut self,
+        peers: &PeerRegistry,
+        domain: u64,
+        domain_generation: u64,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        destination: PeerCapabilityDestination,
+        export: impl FnOnce(u64, PeerCapabilityDestination) -> Result<(), E>,
+    ) -> Result<(), PeerInstallationError<E>> {
+        if self.phase != PeerInstallationPhase::Published {
+            return Err(PeerInstallationError::InvalidPhase);
+        }
+        if destination.cnode == 0
+            || destination.cnode == self.destination_slot
+            || destination.cnode == self.route.endpoint()
+            || destination.cnode == self.route.identity().executor
+        {
+            return Err(PeerInstallationError::InvalidDestination);
+        }
+        let route = peers
+            .resolve_lane(self.route.badge(), domain, domain_generation, lanes)
+            .map_err(PeerInstallationError::Lane)?;
+        if route != self.route {
+            return Err(PeerInstallationError::Peer(PeerError::WrongOwner));
+        }
+        self.exported_destination = Some(destination);
+        self.phase = PeerInstallationPhase::Exporting;
+        export(self.destination_slot, destination).map_err(PeerInstallationError::Invoke)?;
+        self.phase = PeerInstallationPhase::Exported;
+        Ok(())
     }
 
     /// Create only the root-owned unpublished endpoint alias at this slot. Do not copy or export

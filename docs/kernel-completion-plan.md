@@ -36879,6 +36879,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/build-peer-installation-io-manager-20260921.log).
         No fresh boot or desktop claim is made for this contract-only change; the last measured
         boot remains at the strict 27-export win32k barrier described above.
+        Child peer capability export checkpoint (2026-09-21): PeerInstallation now retains the
+        exact root-owned CNode capability and child-local destination before entering a synchronous
+        copy effect. Export requires acknowledged root installation/publication and revalidates the
+        active registry route, physical domain generation, canonical lane generation, executor,
+        and endpoint immediately before entry. Stale or retired routes perform no copy. Child slot
+        zero and equal numeric slots in different CSpaces remain valid; root capability identities
+        are not confused with child-local indices.
+
+        A copy ACK produces Exported; an uncertain result remains Exporting with the root alias,
+        child destination and active route retained. Neither state permits replay or staged abort.
+        The native adapter must prove the live peer CSpace, exclude the root CNode, reserve an empty
+        destination, forbid further aliases, and keep the peer stopped until the startup protocol
+        permits execution. This completes the single-child export contract, not active-peer
+        retirement or native wiring. Native work next needs a durable ingress owner containing the
+        shared endpoint, registry, installation rows, bounded retained work and replacement Replies;
+        current constructors cannot publish shared caps before that router exists. Private endpoint
+        uniqueness and blocking-bootstrap guards remain unchanged.
+
+        Validation passes 210 component-suspension unit tests and ten documentation tests,
+        including four child export regressions and a non-clone ownership check
+        (.tmp/test-peer-export-20260921.log). Both serialized native release builds pass
+        (.tmp/build-peer-export-executive-20260921.log and
+        .tmp/build-peer-export-io-manager-20260921.log). No fresh QEMU run is claimed for this
+        contract-only change; the last measured boot still stops at the strict 27-export barrier.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
