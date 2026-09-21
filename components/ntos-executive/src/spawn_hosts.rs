@@ -17,6 +17,9 @@ use nt_io_manager::{write_wdm_driver_object, WdmDriverObjectInit};
 mod receive_probe;
 pub(crate) use receive_probe::query as query_component_reply_binding;
 
+#[path = "component_shared_ingress.rs"]
+pub(crate) mod shared_ingress;
+
 const SEL4_RETYPE_FAN_OUT_LIMIT: u64 = 256;
 
 /// Where a region's frame caps come from.

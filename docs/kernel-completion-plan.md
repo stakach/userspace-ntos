@@ -36932,6 +36932,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         rebuilds pass after that correction (.tmp/build-reserved-receive-executive-20260921.log
         and .tmp/build-reserved-receive-io-manager-20260921.log). No QEMU or desktop result is
         claimed for this contract-only change; native receive integration remains the next step.
+        Sealed receiver and native receive adapter checkpoint (2026-09-21): IngressReceiver owns
+        the current ingress, bounded retained store and receive transaction privately. Its narrow
+        API no longer exposes mutable inner ingress or reservation tickets. NoCall returns the
+        captured snapshot; successful retention commits before enabling the replacement receiver.
+        Checkout, restoration and acknowledged completion preserve existing capacity accounting.
+        Reply exclusion includes the idle receive Reply, not only charged store entries.
+
+        component_shared_ingress.rs now provides a compiled receive-only native adapter using
+        genuine SYS_RECV/SYS_NB_RECV, an acknowledged Free-binding preflight, immediate complete
+        IPC capture, and separate exact-caller classification. Query IPC preserves the outer bank.
+        Failed classification remains captured and charged; non-Calls return their owned snapshot
+        instead of being discarded as empty polls. The adapter is not yet called by live pumps.
+        Durable endpoint/Reply allocation, registry and installation ownership, canonical physical
+        caller resolution and replacement-Reply supply remain required before enabling it.
+
+        Review clarified two cutover constraints: canonical ingress currently rejects execution_busy,
+        so this adapter is only suitable at idle scheduling boundaries. Active nested receive needs
+        an explicit executing-owner admission contract; do not relax the global exclusion check.
+        Combined ReplyRecv also requires independent old-reply ACK and fresh receive ownership.
+        Retain private pumps until both are wired with unrelated-arrival routing.
+
+        Validation passes 221 component-suspension unit tests and 12 documentation tests, including
+        four sealed-owner regressions and a non-clone check (.tmp/test-ingress-receiver-20260921.log).
+        Both serialized native release builds pass (.tmp/build-ingress-receiver-executive-20260921.log
+        and .tmp/build-ingress-receiver-io-manager-20260921.log). The adapter has compile/review
+        coverage, not runtime receive coverage; no new QEMU/desktop result is claimed.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
