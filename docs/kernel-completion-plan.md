@@ -37131,6 +37131,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         found no blocking issues. No new boot result is claimed; the preceding boot still documents
         the strict 27-export barrier. Live creation, authenticated arrival routing and retained Reply
         admission remain to be integrated before replacing private endpoints or enabling DriverEntry.
+        Retained admission/pool checkpoint (2026-09-21): IngressReplyPool::admit now keeps the
+        selected authenticated Call in its charged receiver slot while canonical admission queries
+        the old and incoming Reply bindings. It validates endpoint, receive phase, replacement
+        capacity and alias exclusions before any dispatch mutation. Successful admission transfers
+        the displaced Free Reply into already reserved pool capacity without a second fallible query
+        or insertion; failure leaves the Call, canonical lane and pool unchanged. Only the exact
+        dispatch identity escapes, not a mutable Call or a temporary checkout during native IPC.
+
+        The native ingress owner now wraps admission with saved IPC-buffer contents and physical
+        route resolution, then queries the exact executor/Reply pairs. It does not resume or reply.
+        Completion must still preserve a Ready Reply that remains canonical after acknowledgement;
+        it cannot be inserted into the replacement pool until an explicit displacement transition.
+        This admission path remains dormant pending full live routing and completion integration.
+
+        Validation: 249 unit and 14 doc tests pass (.tmp/test-retained-admission-pool-20260921.log).
+        New coverage checks successful rotation and charged storage, each binding-query failure,
+        full-pool refusal before querying, exact message retention and canonical exclusion after ACK.
+        Contract review found no blocking issues. Both serialized native release builds pass
+        (.tmp/build-retained-admission-pool-executive-20260921.log and
+        .tmp/build-retained-admission-pool-io-manager-20260921.log). No new boot or desktop
+        proof is claimed; the last measured boot retains the strict 27-export barrier.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

@@ -479,4 +479,37 @@ impl NativeSharedIngress {
             resolve_caller,
         )
     }
+
+    /// Authenticate physical lifetime before canonical retained admission. This changes metadata
+    /// ownership only: it neither replies nor resumes a TCB. The Call stays in the receiver store
+    /// through both kernel binding queries and the displaced-Reply pool transfer.
+    pub(crate) unsafe fn admit<C, R, T>(
+        &mut self,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        route: PeerRoute,
+        resolve_caller: impl FnOnce(PeerRoute) -> Option<u64>,
+    ) -> Result<nt_component_suspension::LaneDispatchIdentity, super::ReceiveError> {
+        if !self.ready {
+            return Err(super::ReceiveError::Ownership(
+                nt_component_suspension::ReservedReceiveError::InvalidPhase,
+            ));
+        }
+        let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+        // The resolver must check live physical domain generation, canonical worker capabilities
+        // and aliases outside this table; registry metadata alone is not physical authority.
+        if resolve_caller(route) != Some(route.identity().executor) {
+            return Err(super::ReceiveError::Probe(
+                nt_component_suspension::ReceiveProbeError::UnknownCaller,
+            ));
+        }
+        self.replacements.as_mut().expect("initialized replacement pool").admit(
+            self.receiver.as_mut().expect("initialized receiver"),
+            route,
+            lanes,
+            self.peers.as_ref().expect("initialized registry"),
+            route.identity().domain,
+            route.identity().domain_generation,
+            |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
+        ).map_err(super::ReceiveError::Admit)
+    }
 }

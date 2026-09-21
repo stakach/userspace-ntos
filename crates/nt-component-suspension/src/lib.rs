@@ -30,7 +30,7 @@ mod ingress_receiver;
 mod reply_pool;
 mod ingress_resources;
 pub use ingress_resources::{IngressResources, IngressResourceKind, IngressResourcePhase, IngressResourceRecord, IngressResourceError};
-pub use reply_pool::{IngressReplyPool, ReplyPoolError};
+pub use reply_pool::{IngressReplyPool, ReplyAdmissionError, ReplyPoolError};
 pub use ingress_receiver::IngressReceiver;
 pub use reserved_receive::{ReservedIngressReceive, ReservedReceiveError, ReservedReceivePhase};
 mod startup;

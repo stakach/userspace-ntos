@@ -144,6 +144,13 @@ impl<M> IngressReceiver<M> {
         self.store.checkout(route)
     }
 
+    pub(crate) fn stored_call_mut(
+        &mut self,
+        route: PeerRoute,
+    ) -> Result<&mut crate::RetainedIngress<M>, RetainedWorkError> {
+        self.store.stored_call_mut(route)
+    }
+
     pub fn restore(
         &mut self,
         checkout: RetainedWorkCheckout<M>,

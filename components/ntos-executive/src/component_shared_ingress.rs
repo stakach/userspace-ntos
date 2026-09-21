@@ -18,6 +18,7 @@ pub(crate) enum ReceiveError {
     Ownership(ReservedReceiveError<Infallible>),
     Capture(ReservedReceiveError<Infallible>, ReceivedMessage),
     Retain(ReplyPoolError<sel4_rt::reply_binding::Error>),
+    Admit(nt_component_suspension::ReplyAdmissionError<sel4_rt::reply_binding::Error>),
 }
 
 /// Retain a classified Call using a separately owned replacement Reply. The resolver validates

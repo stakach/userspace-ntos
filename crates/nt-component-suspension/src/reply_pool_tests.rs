@@ -44,6 +44,120 @@ fn call(owner: &mut IngressReceiver<u64>, lanes: &Lanes) {
 }
 
 #[test]
+fn admission_keeps_call_stored_and_recycles_only_displaced_reply() {
+    let (mut lanes, mut peers, route, mut owner, mut pool) = setup();
+    pool.insert(ComponentIngress::new(20, 41).unwrap(), &owner, &lanes, free)
+        .ok()
+        .unwrap();
+    call(&mut owner, &lanes);
+    pool.retain(&mut owner, &lanes, &mut peers, route.badge(), free, bound)
+        .unwrap();
+    let available = owner.available();
+    let dispatch = pool
+        .admit(&mut owner, route, &mut lanes, &peers, 1, 2, |tcb, reply| {
+            assert_eq!(tcb, 10);
+            Ok::<_, u8>(if reply == 30 {
+                ReplyBindingObservation::Free
+            } else {
+                assert_eq!(reply, 40);
+                ReplyBindingObservation::BoundToTarget
+            })
+        })
+        .unwrap();
+    assert_eq!(owner.available(), available);
+    assert!(owner.excludes_reply(40));
+    assert!(pool.excludes_reply(30));
+    assert!(!pool.excludes_reply(40));
+    assert_eq!(
+        lanes.binding(route.identity().lane).unwrap().reply_object,
+        40
+    );
+    assert_eq!(
+        lanes.active_dispatch_identity(dispatch.lane),
+        Ok(Some(dispatch))
+    );
+    let mut checkout = owner.checkout(route).unwrap();
+    assert_eq!(*checkout.call().message(), 123);
+    let mut attempt = checkout.begin_reply().unwrap();
+    checkout
+        .observe_reply(&mut attempt, IngressReplyObservation::Acknowledged)
+        .unwrap();
+    let (_, mut checkout) = owner.finish_checkout(checkout, &mut peers).err().unwrap();
+    checkout.finish_dispatch(&mut lanes).unwrap();
+    let (ready, message) = owner.finish_checkout(checkout, &mut peers).ok().unwrap();
+    assert_eq!(message, 123);
+    // ACK does not displace the canonical Reply, even after the execution epoch ends.
+    let (_, ready) = pool.insert(ready, &owner, &lanes, free).err().unwrap();
+    assert_eq!(ready.reply(), 40);
+    assert_eq!(peers.state(route).unwrap().1, 0);
+}
+
+#[test]
+fn admission_query_failure_preserves_stored_call_and_all_ownership() {
+    for fail_reply in [30, 40] {
+        let (mut lanes, mut peers, route, mut owner, mut pool) = setup();
+        pool.insert(ComponentIngress::new(20, 41).unwrap(), &owner, &lanes, free)
+            .ok()
+            .unwrap();
+        call(&mut owner, &lanes);
+        pool.retain(&mut owner, &lanes, &mut peers, route.badge(), free, bound)
+            .unwrap();
+        assert_eq!(
+            pool.admit(&mut owner, route, &mut lanes, &peers, 1, 2, |_, reply| {
+                if reply == fail_reply {
+                    Err(7u8)
+                } else {
+                    Ok(ReplyBindingObservation::Free)
+                }
+            }),
+            Err(ReplyAdmissionError::Dispatch(RetainedDispatchError::Query(
+                7
+            )))
+        );
+        assert!(pool.is_empty());
+        assert_eq!(
+            lanes.binding(route.identity().lane).unwrap().reply_object,
+            30
+        );
+        assert_eq!(lanes.running(), None);
+        assert_eq!(peers.state(route).unwrap().1, 1);
+        assert!(owner.excludes_reply(40));
+        let checkout = owner.checkout(route).unwrap();
+        assert_eq!(*checkout.call().message(), 123);
+        assert!(owner.restore(checkout).is_ok());
+    }
+}
+
+#[test]
+fn admission_full_pool_refuses_before_queries_or_checkout() {
+    let (mut lanes, mut peers, route, mut owner, mut pool) = setup();
+    pool.insert(ComponentIngress::new(20, 41).unwrap(), &owner, &lanes, free)
+        .ok()
+        .unwrap();
+    call(&mut owner, &lanes);
+    pool.retain(&mut owner, &lanes, &mut peers, route.badge(), free, bound)
+        .unwrap();
+    pool.insert(ComponentIngress::new(20, 42).unwrap(), &owner, &lanes, free)
+        .ok()
+        .unwrap();
+    assert_eq!(
+        pool.admit(
+            &mut owner,
+            route,
+            &mut lanes,
+            &peers,
+            1,
+            2,
+            |_, _| -> Result<ReplyBindingObservation, u8> { panic!("full pool must not query") }
+        ),
+        Err(ReplyAdmissionError::Pool(ReplyPoolError::NoCapacity))
+    );
+    assert_eq!(lanes.running(), None);
+    assert!(pool.excludes_reply(42));
+    assert_eq!(*owner.checkout(route).unwrap().call().message(), 123);
+}
+
+#[test]
 fn insert_rejects_wrong_endpoint_and_aliases_without_query() {
     let (lanes, _, _, owner, mut pool) = setup();
     for (endpoint, reply) in [(21, 41), (20, 40), (20, 30)] {

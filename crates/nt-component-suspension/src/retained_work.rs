@@ -264,6 +264,19 @@ impl<M> RetainedWork<M> {
         })
     }
 
+    pub(crate) fn stored_call_mut(
+        &mut self,
+        route: PeerRoute,
+    ) -> Result<&mut RetainedIngress<M>, RetainedWorkError> {
+        self.slots
+            .iter_mut()
+            .find_map(|slot| match slot {
+                Slot::Stored { call, .. } if call.route() == route => Some(call),
+                _ => None,
+            })
+            .ok_or(RetainedWorkError::NotFound)
+    }
+
     fn owns_checkout(&self, checkout: &RetainedWorkCheckout<M>) -> bool {
         matches!(self.slots.get(checkout.slot), Some(Slot::CheckedOut { identity, route, reply })
             if *identity == checkout.identity && *route == checkout.call.route() && *reply == checkout.call.reply())

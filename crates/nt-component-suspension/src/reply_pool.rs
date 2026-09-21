@@ -3,8 +3,17 @@
 use alloc::vec::Vec;
 use core::convert::Infallible;
 
+use crate::peer_registry::PeerRoute;
 use crate::{peer_registry::PeerRegistry, ReservedReceiveError};
 use crate::{ComponentIngress, ComponentSuspensionLanes, IngressReceiver, ReplyBindingObservation};
+use crate::{LaneDispatchIdentity, RetainedDispatchError, RetainedWorkError};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplyAdmissionError<E> {
+    Pool(ReplyPoolError<E>),
+    Store(RetainedWorkError),
+    Dispatch(RetainedDispatchError<E>),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplyPoolError<E> {
@@ -36,6 +45,53 @@ pub struct IngressReplyPool<M> {
 }
 
 impl<M> IngressReplyPool<M> {
+    /// Admit a stored Call and recycle the displaced canonical Reply in one transaction.
+    /// All fallible pool checks precede dispatch mutation; the final push uses reserved capacity
+    /// and the Free proof collected by canonical admission, not another native query.
+    /// Queries must be observational and nonreentrant. The Call stays in its charged receiver
+    /// slot throughout queries, admission and execution; no local checkout can lose ownership.
+    pub fn admit<C, R, T, E>(
+        &mut self,
+        receiver: &mut IngressReceiver<M>,
+        route: PeerRoute,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        peers: &PeerRegistry,
+        domain: u64,
+        generation: u64,
+        query: impl FnMut(u64, u64) -> Result<ReplyBindingObservation, E>,
+    ) -> Result<LaneDispatchIdentity, ReplyAdmissionError<E>> {
+        if receiver.endpoint() != self.endpoint || route.endpoint() != self.endpoint {
+            return Err(ReplyAdmissionError::Pool(ReplyPoolError::WrongEndpoint));
+        }
+        if receiver.phase().is_some() {
+            return Err(ReplyAdmissionError::Pool(ReplyPoolError::NotReady));
+        }
+        if self.entries.len() == self.capacity {
+            return Err(ReplyAdmissionError::Pool(ReplyPoolError::NoCapacity));
+        }
+        let binding = lanes
+            .binding(route.identity().lane)
+            .map_err(|error| ReplyAdmissionError::Dispatch(RetainedDispatchError::Lane(error)))?;
+        let old = binding.reply_object;
+        if receiver.excludes_reply(old) || self.excludes_reply(old) {
+            return Err(ReplyAdmissionError::Pool(ReplyPoolError::ReplyInUse));
+        }
+        let replacement = ComponentIngress::new(self.endpoint, old)
+            .map_err(|_| ReplyAdmissionError::Pool(ReplyPoolError::InvalidConfiguration))?;
+        let call = receiver
+            .stored_call_mut(route)
+            .map_err(ReplyAdmissionError::Store)?;
+        if self.excludes_reply(call.reply()) {
+            return Err(ReplyAdmissionError::Pool(ReplyPoolError::ReplyInUse));
+        }
+        let receipt = lanes
+            .begin_retained_dispatch(peers, call, domain, generation, query)
+            .map_err(ReplyAdmissionError::Dispatch)?;
+        debug_assert_eq!(receipt.displaced_reply, old);
+        self.entries.push(replacement);
+        Ok(receipt.dispatch)
+    }
+
     pub fn new(endpoint: u64, capacity: usize) -> Result<Self, ReplyPoolError<Infallible>> {
         if endpoint == 0 || capacity == 0 {
             return Err(ReplyPoolError::InvalidConfiguration);
