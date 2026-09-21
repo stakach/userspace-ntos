@@ -2,16 +2,57 @@
 //! Private pumps remain in use until native routing and ReplyRecv ownership are wired.
 
 use core::convert::Infallible;
+use nt_component_suspension::peer_registry::{PeerRegistry, PeerRoute};
 use nt_component_suspension::{
     classify_received_call, require_free_reply, ComponentSuspensionLanes, IngressExecutionOwner,
     IngressReceiveDisposition, IngressReceiver, ReceiveProbeError, ReceivedMessage,
     ReservedReceiveError, ReservedReceivePhase,
 };
+use nt_component_suspension::{IngressReplyPool, ReplyPoolError};
 
 pub(crate) enum ReceiveError {
     Probe(ReceiveProbeError<sel4_rt::reply_binding::Error>),
     Ownership(ReservedReceiveError<Infallible>),
     Capture(ReservedReceiveError<Infallible>, ReceivedMessage),
+    Retain(ReplyPoolError<sel4_rt::reply_binding::Error>),
+}
+
+/// Retain a classified Call using a separately owned replacement Reply. The resolver validates
+/// the route's exact domain generation and physical lifetime independently of registry metadata.
+/// Both pools and their capabilities must
+/// remain exclusive; queries cannot reenter root scheduling or mutate ownership in another domain.
+pub(crate) unsafe fn retain<C, R, T>(
+    owner: &mut IngressReceiver<ReceivedMessage>,
+    replacements: &mut IngressReplyPool<ReceivedMessage>,
+    lanes: &ComponentSuspensionLanes<C, R, T>,
+    peers: &mut PeerRegistry,
+    probe_tcb: u64,
+    resolve_caller: impl FnOnce(PeerRoute) -> Option<u64>,
+) -> Result<(), ReceiveError> {
+    if owner.phase() != Some(ReservedReceivePhase::Held) {
+        return Err(ReceiveError::Ownership(ReservedReceiveError::InvalidPhase));
+    }
+    let badge = owner.message().expect("held shared receive").badge();
+    let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+    let route = peers
+        .resolve(badge)
+        .or_else(|| peers.resolve_retiring(badge))
+        .ok_or(ReceiveError::Probe(ReceiveProbeError::UnknownCaller))?;
+    if route.endpoint() != owner.endpoint()
+        || resolve_caller(route) != Some(route.identity().executor)
+    {
+        return Err(ReceiveError::Probe(ReceiveProbeError::UnknownCaller));
+    }
+    replacements
+        .retain(
+            owner,
+            lanes,
+            peers,
+            badge,
+            |reply| super::query_component_reply_binding(probe_tcb, reply),
+            |tcb, reply| super::query_component_reply_binding(tcb, reply),
+        )
+        .map_err(ReceiveError::Retain)
 }
 
 /// The caller owns the endpoint and Reply exclusively, validates the live probe TCB, and

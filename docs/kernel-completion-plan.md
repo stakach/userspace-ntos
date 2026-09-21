@@ -36980,6 +36980,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         native release builds pass (.tmp/build-active-ingress-executive-20260921.log and
         .tmp/build-active-ingress-io-manager-20260921.log). No live-pump cutover or new boot result
         is claimed; the last measured strict 27-export win32k barrier remains unchanged.
+        Replacement Reply pool checkpoint (2026-09-21): IngressReplyPool now owns a bounded,
+        preallocated set of ready ingress objects rather than a list of reusable numeric cptrs.
+        Admission and every handoff check endpoint identity, Ready state, current receiver and
+        retained-store exclusions, all canonical lane Replies, and fresh kernel Free evidence.
+        Duplicate pool entries are rejected. A completed Call's Reply cannot enter the pool while
+        it remains the canonical lane Reply; acknowledgement is not a canonical ownership transfer.
+
+        Replacement selection and retained handoff form one synchronous non-reentrant operation.
+        There is no public take/return gap: a refusal restores the exact spare in its reserved
+        vector capacity without allocation, while success transfers it to the receiver. The native
+        retention helper validates the captured badge against both registry and physical caller
+        resolution, preserves the IPC bank, and supplies separate Free and exact-caller queries.
+        Other-domain alias exclusion and physical capability lifetime remain native obligations.
+        The helper is compiled but not live; durable allocation/registry ownership and full routing
+        are still required before endpoint migration.
+
+        Validation passes 232 component-suspension unit tests and 13 documentation tests,
+        including five pool regressions and a non-clone check
+        (.tmp/test-ingress-reply-pool-20260921.log). Both serialized native release builds pass
+        (.tmp/build-ingress-reply-pool-executive-20260921.log and
+        .tmp/build-ingress-reply-pool-io-manager-20260921.log). Review also moved native IPC-bank
+        preservation before physical caller resolution, and the resolver now receives the full
+        route for domain-generation validation. No new runtime receive or desktop result is claimed.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

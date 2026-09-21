@@ -27,6 +27,8 @@ mod retained_dispatch;
 mod retained_work;
 mod reserved_receive;
 mod ingress_receiver;
+mod reply_pool;
+pub use reply_pool::{IngressReplyPool, ReplyPoolError};
 pub use ingress_receiver::IngressReceiver;
 pub use reserved_receive::{ReservedIngressReceive, ReservedReceiveError, ReservedReceivePhase};
 mod startup;

@@ -133,6 +133,9 @@ impl<M> ComponentIngress<M> {
     pub(crate) fn is_held(&self) -> bool {
         self.phase == Phase::Held
     }
+    pub(crate) fn is_ready(&self) -> bool {
+        self.phase == Phase::Ready
+    }
     pub(crate) fn held_receive_matches(&self, identity: u64) -> bool {
         identity != 0 && self.phase == Phase::Held && self.held_receive == identity
     }
