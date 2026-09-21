@@ -62,8 +62,11 @@ fn transport_backend_implemented_flags() {
 
 #[test]
 fn transport_seams_return_not_implemented_on_host() {
-    // The declared seL4/SURT seams (and the trap on non-x86 hosts) return NOT_IMPLEMENTED rather
-    // than fabricating success.
+    // No NT transport is available in this unit-test process, regardless of host architecture.
+    assert_eq!(
+        transport::syscall(Backend::X86Trap, 27, &[0]),
+        STATUS_NOT_IMPLEMENTED
+    );
     assert_eq!(
         transport::syscall(Backend::Sel4Call, 27, &[0]),
         STATUS_NOT_IMPLEMENTED
