@@ -12,6 +12,10 @@ use nt_component_suspension::{
 
 static mut SHARED_INGRESS: NativeSharedIngress = NativeSharedIngress::new();
 
+#[path = "component_ingress_startup.rs"]
+mod startup;
+pub(crate) use startup::{start_worker_peer, WorkerStartError};
+
 /// Prepare the dormant global owner once, from serialized root initialization with no reentrant
 /// scheduler hooks. Failed owners stay in static storage; this does not export capabilities.
 pub(crate) unsafe fn prepare<C, R, T>(
