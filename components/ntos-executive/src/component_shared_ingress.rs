@@ -14,6 +14,8 @@ use nt_component_suspension::{
 use nt_component_suspension::{IngressReplyPool, ReplyPoolError};
 
 pub(crate) enum ReceiveError {
+    StartupFault(nt_component_suspension::StartupFaultError<sel4_rt::reply_binding::Error>),
+    PendingReplyRecovery,
     Ready(nt_component_suspension::StartupReadyError<sel4_rt::reply_binding::Error>),
     Complete(nt_component_suspension::StoredCompletionError<sel4_rt::reply_binding::Error>),
     InvalidReplyLength,
