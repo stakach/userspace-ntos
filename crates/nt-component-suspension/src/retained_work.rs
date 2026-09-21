@@ -277,7 +277,7 @@ impl<M> RetainedWork<M> {
             .ok_or(RetainedWorkError::NotFound)
     }
 
-    fn owns_checkout(&self, checkout: &RetainedWorkCheckout<M>) -> bool {
+    pub(crate) fn owns_checkout(&self, checkout: &RetainedWorkCheckout<M>) -> bool {
         matches!(self.slots.get(checkout.slot), Some(Slot::CheckedOut { identity, route, reply })
             if *identity == checkout.identity && *route == checkout.call.route() && *reply == checkout.call.reply())
     }

@@ -37152,6 +37152,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         (.tmp/build-retained-admission-pool-executive-20260921.log and
         .tmp/build-retained-admission-pool-io-manager-20260921.log). No new boot or desktop
         proof is claimed; the last measured boot retains the strict 27-export barrier.
+        Canonical completion checkpoint (2026-09-21): finish_canonical_checkout explicitly consumes
+        an acknowledged retained ingress into the shared lane's existing Reply ownership and returns
+        only its payload. It validates the exact store ticket and full canonical shared-peer route,
+        executor/endpoint/Reply binding, idle phase with no dispatch epoch, and a fresh Free binding
+        observation before releasing storage and peer retention. Missing ACK, active dispatch, wrong
+        table, query failure, non-Free binding or release failure preserves the complete checkout.
+        A matching numeric lane in a recreated/private table cannot absorb ownership. Retiring peers
+        may complete, but their canonical Reply remains excluded from receiving until displacement.
+
+        This closes the core Ready-wrapper duplication gap without recycling a still-canonical cap.
+        Native reply/completion integration remains open; no native wrapper or live receive cutover
+        is claimed. Validation: 251 unit and 14 doc tests pass
+        (.tmp/test-canonical-completion-20260921.log), including exact transfer, ACK-before-idle
+        refusal, absent ACK, query failure/non-Free observation, foreign table and retiring-peer
+        completion. Both serialized native release builds pass
+        (.tmp/build-canonical-completion-executive-20260921.log and
+        .tmp/build-canonical-completion-io-manager-20260921.log). Contract review found no blocking
+        issues. The last measured boot remains at the strict 27-export win32k barrier.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

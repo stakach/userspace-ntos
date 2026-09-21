@@ -4,6 +4,166 @@ use crate::{IngressReplyObservation, LaneBinding};
 
 type Lanes = ComponentSuspensionLanes<(), (), ()>;
 
+fn canonical_completion() -> (
+    Lanes,
+    PeerRegistry,
+    PeerRoute,
+    IngressReceiver<u64>,
+    RetainedWorkCheckout<u64>,
+) {
+    let mut lanes = Lanes::new(2, 2);
+    let mut peers = PeerRegistry::new(20, 2);
+    let (lane, mut ticket) = lanes
+        .allocate_shared_staged(
+            &mut peers,
+            1,
+            2,
+            LaneBinding {
+                executor_id: 10,
+                receive_endpoint: 20,
+                reply_object: 30,
+            },
+        )
+        .unwrap();
+    let route = peers.publish_lane(&mut ticket, 1, 2, &lanes).unwrap();
+    lanes
+        .begin_startup(lane, 30, |_, _| Ok::<_, u8>(ReplyBindingObservation::Free))
+        .unwrap();
+    lanes
+        .complete_startup(lane, 30, |_, _| {
+            Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)
+        })
+        .unwrap();
+    let mut owner = IngressReceiver::new(20, 40, 1).unwrap();
+    capture_call(&mut owner, &lanes, 123);
+    owner
+        .retain(
+            &lanes,
+            ComponentIngress::new(20, 41).unwrap(),
+            &mut peers,
+            route.badge(),
+            |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget),
+        )
+        .ok()
+        .unwrap();
+    let mut checkout = owner.checkout(route).unwrap();
+    let receipt = checkout
+        .begin_dispatch(&mut lanes, &peers, 1, 2, |_, reply| {
+            Ok::<_, u8>(if reply == 30 {
+                ReplyBindingObservation::Free
+            } else {
+                ReplyBindingObservation::BoundToTarget
+            })
+        })
+        .unwrap();
+    assert_eq!(receipt.displaced_reply, 30);
+    (lanes, peers, route, owner, checkout)
+}
+
+#[test]
+fn canonical_completion_consumes_ready_owner_but_preserves_lane_reply() {
+    let (mut lanes, mut peers, route, mut owner, mut checkout) = canonical_completion();
+    let mut attempt = checkout.begin_reply().unwrap();
+    checkout
+        .observe_reply(&mut attempt, IngressReplyObservation::Acknowledged)
+        .unwrap();
+    let (error, mut checkout) = owner
+        .finish_canonical_checkout(
+            checkout,
+            &mut peers,
+            &lanes,
+            |_, _| -> Result<ReplyBindingObservation, u8> { panic!("running lane") },
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error, CanonicalCompletionError::NotIdle);
+    checkout.finish_dispatch(&mut lanes).unwrap();
+    peers.begin_retirement(route).unwrap();
+    assert_eq!(
+        owner
+            .finish_canonical_checkout(checkout, &mut peers, &lanes, |tcb, reply| {
+                assert_eq!((tcb, reply), (10, 40));
+                Ok::<_, u8>(ReplyBindingObservation::Free)
+            })
+            .ok(),
+        Some(123)
+    );
+    assert_eq!(owner.available(), 1);
+    assert!(!owner.excludes_reply(40));
+    assert_eq!(
+        lanes.binding(route.identity().lane).unwrap().reply_object,
+        40
+    );
+    assert_eq!(peers.state(route).unwrap().1, 0);
+    let mut alias = ComponentIngress::<u64>::new(20, 40).unwrap();
+    assert_eq!(
+        lanes.begin_ingress_receive(&mut alias).unwrap_err(),
+        IngressError::ReplyInUse
+    );
+}
+
+#[test]
+fn canonical_completion_refusals_keep_checkout_payload_and_retention() {
+    let (mut lanes, mut peers, route, mut owner, mut checkout) = canonical_completion();
+    checkout.finish_dispatch(&mut lanes).unwrap();
+    let (error, mut checkout) = owner
+        .finish_canonical_checkout(checkout, &mut peers, &lanes, |_, _| {
+            Ok::<_, u8>(ReplyBindingObservation::Free)
+        })
+        .err()
+        .unwrap();
+    assert!(matches!(error, CanonicalCompletionError::Finish(_)));
+    let mut attempt = checkout.begin_reply().unwrap();
+    checkout
+        .observe_reply(&mut attempt, IngressReplyObservation::Acknowledged)
+        .unwrap();
+    for result in [Err(7u8), Ok(ReplyBindingObservation::BoundToTarget)] {
+        let (error, retained) = owner
+            .finish_canonical_checkout(checkout, &mut peers, &lanes, |_, _| result)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            if result.is_err() {
+                CanonicalCompletionError::Query(7)
+            } else {
+                CanonicalCompletionError::NotFree
+            }
+        );
+        checkout = retained;
+        assert_eq!(*checkout.call().message(), 123);
+        assert_eq!(owner.available(), 0);
+        assert_eq!(peers.state(route).unwrap().1, 1);
+    }
+    let mut foreign = Lanes::new(2, 2);
+    let lane = foreign
+        .allocate(LaneBinding {
+            executor_id: 10,
+            receive_endpoint: 20,
+            reply_object: 40,
+        })
+        .unwrap();
+    assert_eq!(lane, route.identity().lane);
+    let (error, checkout) = owner
+        .finish_canonical_checkout(
+            checkout,
+            &mut peers,
+            &foreign,
+            |_, _| -> Result<ReplyBindingObservation, u8> { panic!("foreign table") },
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error, CanonicalCompletionError::WrongOwner);
+    assert_eq!(
+        owner
+            .finish_canonical_checkout(checkout, &mut peers, &lanes, |_, _| Ok::<_, u8>(
+                ReplyBindingObservation::Free
+            ))
+            .ok(),
+        Some(123)
+    );
+}
+
 fn setup() -> (Lanes, PeerRegistry, PeerRoute, IngressReceiver<u64>) {
     let mut lanes = Lanes::new(2, 2);
     let lane = lanes

@@ -9,6 +9,15 @@ use crate::{
     RetainedWork, RetainedWorkCheckout, RetainedWorkError, RetainedWorkFinishError,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCompletionError<E> {
+    WrongOwner,
+    NotIdle,
+    NotFree,
+    Query(E),
+    Finish(RetainedWorkFinishError),
+}
+
 #[cfg(test)]
 #[path = "ingress_receiver_tests.rs"]
 mod tests;
@@ -164,5 +173,57 @@ impl<M> IngressReceiver<M> {
         peers: &mut PeerRegistry,
     ) -> Result<(ComponentIngress<M>, M), (RetainedWorkFinishError, RetainedWorkCheckout<M>)> {
         self.store.finish_checkout(checkout, peers)
+    }
+
+    /// Consume an acknowledged Ready ingress into its exact shared lane's canonical Reply
+    /// ownership. Return only the payload, never a second reusable owner for that Reply.
+    /// The adapter must validate physical domain/capability lifetimes. The binding query must be
+    /// observational and nonreentrant; every refusal returns the complete checkout unchanged.
+    pub fn finish_canonical_checkout<C, R, T, E>(
+        &mut self,
+        checkout: RetainedWorkCheckout<M>,
+        peers: &mut PeerRegistry,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        query: impl FnOnce(u64, u64) -> Result<ReplyBindingObservation, E>,
+    ) -> Result<M, (CanonicalCompletionError<E>, RetainedWorkCheckout<M>)> {
+        let validate = || {
+            if !self.store.owns_checkout(&checkout) {
+                return Err(CanonicalCompletionError::WrongOwner);
+            }
+            let call = checkout.call();
+            let route = call.route();
+            let lane = lanes
+                .lane(route.identity().lane)
+                .map_err(|_| CanonicalCompletionError::WrongOwner)?;
+            if lane.shared_peer != Some(route)
+                || lane.binding.executor_id != route.identity().executor
+                || lane.binding.receive_endpoint != route.endpoint()
+                || lane.binding.reply_object != call.reply()
+            {
+                return Err(CanonicalCompletionError::WrongOwner);
+            }
+            if lane.phase != crate::LanePhase::Idle || lane.dispatch.is_some() {
+                return Err(CanonicalCompletionError::NotIdle);
+            }
+            if query(lane.binding.executor_id, call.reply())
+                .map_err(CanonicalCompletionError::Query)?
+                != ReplyBindingObservation::Free
+            {
+                return Err(CanonicalCompletionError::NotFree);
+            }
+            Ok(())
+        };
+        if let Err(error) = validate() {
+            return Err((error, checkout));
+        }
+        match self.store.finish_checkout(checkout, peers) {
+            Ok((ready, message)) => {
+                // No native effect: canonical LaneBinding already owns this exact Reply. Consuming
+                // the Ready wrapper closes the retained-call ownership without recycling the cap.
+                drop(ready);
+                Ok(message)
+            }
+            Err((error, checkout)) => Err((CanonicalCompletionError::Finish(error), checkout)),
+        }
     }
 }
