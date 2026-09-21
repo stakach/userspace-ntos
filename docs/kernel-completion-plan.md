@@ -37040,6 +37040,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         pass (.tmp/build-ingress-registry-capacity-executive-20260921.log and
         .tmp/build-ingress-registry-capacity-io-manager-20260921.log). Live publication and endpoint
         migration remain open; no fresh boot or desktop result is claimed.
+        Native root peer publication checkpoint (2026-09-21): the durable owner now stages an
+        exact canonical lane/domain registration and stores its ticket before allocating a root
+        alias slot. Slot allocation failure keeps that pending ticket and rejects a new staging
+        attempt; constructor refusal retains both ticket and slot. Installation records are bounded
+        by the configured logical peer limit, not allocator overcapacity, and are stored before
+        issuing the acknowledged root CNode mint with the registry-issued endpoint badge.
+
+        Only successful mint acknowledgement permits canonical route publication. Failed mint
+        remains Installing and consumes its record/registry capacity; failed revalidation retains
+        the Installed root alias and staged route. There is no automatic retry, slot release or
+        child export. The whole operation preserves the root IPC bank. This is native publication
+        wiring against the existing tested ownership contract, not a live topology switch: exact
+        stopped-peer/domain lifetime is still a caller obligation, and same-endpoint canonical lane
+        topology plus receive routing must be integrated before worker constructors use this path.
+        Validation passes 238 component-suspension unit tests and 14 documentation tests,
+        including failed-mint registry-capacity retention (.tmp/test-native-peer-publication-20260921.log).
+        Both serialized native release builds pass (.tmp/build-native-peer-publication-executive-20260921.log
+        and .tmp/build-native-peer-publication-io-manager-20260921.log). Native publication remains
+        dormant; runtime mint/failure injection and desktop acceptance are not claimed.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

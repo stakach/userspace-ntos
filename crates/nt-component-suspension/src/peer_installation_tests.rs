@@ -155,6 +155,31 @@ fn wrong_domain_refusal_can_publish_after_exact_revalidation() {
     owner.publish(&mut peers, 7, 8, &lanes).unwrap();
 }
 
+#[test]
+fn failed_mint_keeps_registration_capacity_charged() {
+    let (lanes, lane, mut peers, mut owner) = setup();
+    assert_eq!(
+        owner.install(|_, _| Err(7u64)),
+        Err(PeerInstallationError::Invoke(7))
+    );
+    let mut other_lanes = Lanes::new(1, 1);
+    let other = other_lanes
+        .allocate(LaneBinding {
+            executor_id: 12,
+            receive_endpoint: 22,
+            reply_object: 34,
+        })
+        .unwrap();
+    assert_eq!(
+        peers.stage_lane(9, 8, &other_lanes, other).err(),
+        Some(PeerLaneError::Peer(PeerError::NoCapacity))
+    );
+    assert_eq!(owner.phase(), PeerInstallationPhase::Installing);
+    assert_eq!(peers.resolve(owner.route().badge()), None);
+    assert_eq!(lanes.binding(lane).unwrap().executor_id, 11);
+    assert_eq!(peers.state(owner.route()), Ok((PeerPhase::Staged, 0)));
+}
+
 fn published() -> (Lanes, LaneHandle, PeerRegistry, PeerInstallation) {
     let (lanes, lane, mut peers, mut owner) = setup();
     owner.install(|_, _| Ok::<_, u8>(())).unwrap();

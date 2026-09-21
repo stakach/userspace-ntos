@@ -1,10 +1,12 @@
 //! Durable native allocation ownership for shared ingress, including failed initialization.
 
 use alloc::vec::Vec;
-use nt_component_suspension::peer_registry::PeerRegistry;
+use core::convert::Infallible;
+use nt_component_suspension::peer_registry::{PeerRegistration, PeerRegistry, PeerRoute};
 use nt_component_suspension::{
     ComponentIngress, ComponentSuspensionLanes, IngressExecutionOwner, IngressReceiver,
-    IngressReplyPool, IngressResourceKind, IngressResources, PeerInstallation, ReceivedMessage,
+    IngressReplyPool, IngressResourceKind, IngressResources, LaneHandle, PeerInstallation,
+    PeerInstallationError, PeerLaneError, ReceivedMessage,
 };
 
 static mut SHARED_INGRESS: NativeSharedIngress = NativeSharedIngress::new();
@@ -35,6 +37,33 @@ pub(crate) enum InitializationError {
     ReplyOwnership,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicationError {
+    NotReady,
+    PendingAllocation,
+    NoCapacity,
+    NoSlots,
+    Stage(PeerLaneError),
+    Installation(PeerInstallationError<Infallible>),
+    Mint(PeerInstallationError<u64>),
+}
+
+struct PendingPeer {
+    registration: PeerRegistration,
+    slot: Option<u64>,
+}
+
+/// The physical owner must keep this exact domain generation, stopped lane and endpoint alive.
+/// This publishes only a root alias; child export and startup admission remain separate.
+pub(crate) unsafe fn publish_peer<C, R, T>(
+    lanes: &ComponentSuspensionLanes<C, R, T>,
+    domain: u64,
+    generation: u64,
+    lane: LaneHandle,
+) -> Result<PeerRoute, PublicationError> {
+    (&mut *core::ptr::addr_of_mut!(SHARED_INGRESS)).publish_peer(lanes, domain, generation, lane)
+}
+
 /// Keep this owner alive even after initialization refusal. No failure deletes capabilities,
 /// returns root slots, or permits another initialization attempt. Native callers must serialize
 /// access and retain the physical domain owners used by the receive adapter.
@@ -48,6 +77,8 @@ pub(crate) struct NativeSharedIngress {
     replacements: Option<IngressReplyPool<ReceivedMessage>>,
     peers: Option<PeerRegistry>,
     installations: Vec<PeerInstallation>,
+    peer_capacity: usize,
+    pending_peer: Option<PendingPeer>,
     pending_reply: Option<ComponentIngress<ReceivedMessage>>,
     creation_error: Option<u64>,
 }
@@ -63,6 +94,8 @@ impl NativeSharedIngress {
             replacements: None,
             peers: None,
             installations: Vec::new(),
+            peer_capacity: 0,
+            pending_peer: None,
             pending_reply: None,
             creation_error: None,
         }
@@ -89,6 +122,7 @@ impl NativeSharedIngress {
         self.installations
             .try_reserve_exact(peer_capacity)
             .map_err(|_| InitializationError::NoMemory)?;
+        self.peer_capacity = peer_capacity;
         let mut replies = Vec::new();
         replies
             .try_reserve_exact(retained_capacity + 1)
@@ -163,6 +197,79 @@ impl NativeSharedIngress {
         }
         self.ready = true;
         Ok(())
+    }
+
+    /// Callbacks into scheduling are forbidden while references into this owner are held.
+    /// Every failure after staging retains either the pending ticket/slot or an installation row.
+    unsafe fn publish_peer<C, R, T>(
+        &mut self,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        domain: u64,
+        generation: u64,
+        lane: LaneHandle,
+    ) -> Result<PeerRoute, PublicationError> {
+        if !self.ready {
+            return Err(PublicationError::NotReady);
+        }
+        if self.pending_peer.is_some() {
+            return Err(PublicationError::PendingAllocation);
+        }
+        if self.installations.len() >= self.peer_capacity {
+            return Err(PublicationError::NoCapacity);
+        }
+        let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+        let registration = self
+            .peers
+            .as_mut()
+            .expect("initialized registry")
+            .stage_lane(domain, generation, lanes, lane)
+            .map_err(PublicationError::Stage)?;
+        self.pending_peer = Some(PendingPeer {
+            registration,
+            slot: None,
+        });
+        let slot = crate::try_alloc_slot().ok_or(PublicationError::NoSlots)?;
+        self.pending_peer.as_mut().expect("staged peer").slot = Some(slot);
+        let pending = self.pending_peer.take().expect("reserved peer slot");
+        let installation = match PeerInstallation::new(pending.registration, slot) {
+            Ok(installation) => installation,
+            Err((error, registration)) => {
+                self.pending_peer = Some(PendingPeer {
+                    registration,
+                    slot: Some(slot),
+                });
+                return Err(PublicationError::Installation(error));
+            }
+        };
+        // Capacity was reserved during initialization; publish ownership before the native effect.
+        self.installations.push(installation);
+        let installation = self
+            .installations
+            .last_mut()
+            .expect("owned peer installation");
+        installation
+            .install(|route, destination| {
+                let status = crate::cnode_mint_r(
+                    crate::CAP_INIT_THREAD_CNODE,
+                    destination,
+                    route.endpoint(),
+                    route.badge(),
+                );
+                if status == 0 {
+                    Ok(())
+                } else {
+                    Err(status)
+                }
+            })
+            .map_err(PublicationError::Mint)?;
+        installation
+            .publish(
+                self.peers.as_mut().expect("initialized registry"),
+                domain,
+                generation,
+                lanes,
+            )
+            .map_err(PublicationError::Installation)
     }
 
     pub(crate) unsafe fn receive<C, R, T>(
