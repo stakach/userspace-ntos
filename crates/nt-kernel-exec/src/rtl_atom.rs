@@ -308,6 +308,14 @@ unsafe fn wstr_len(name: *const u16, cap: usize) -> usize {
     n
 }
 
+/// MAKEINTATOM occupies only the low word, across the entire native pointer width.
+fn integer_atom_pointer(raw: usize) -> Option<u16> {
+    if raw >> 16 != 0 {
+        return None;
+    }
+    Some(if raw == 0 { FIRST_DYNAMIC_ATOM } else { raw as u16 })
+}
+
 /// Classify an atom name per `RtlpCheckIntegerAtom`. Returns `Some(atom)` for an integer atom
 /// (MAKEINTATOM pointer, or `"#<decimal>"`), else `None` (a real string name).
 ///
@@ -315,11 +323,8 @@ unsafe fn wstr_len(name: *const u16, cap: usize) -> usize {
 /// `name` is either a small integer (MAKEINTATOM) reinterpreted as a pointer — NOT dereferenced —
 /// or a valid null-terminated UTF-16 string pointer.
 pub unsafe fn check_integer_atom(name: *const u16) -> Option<u16> {
-    let raw = name as u64;
-    if raw & 0xFFFF_0000 == 0 {
-        // MAKEINTATOM: the atom is the low 16 bits (0 maps to 0xC000). Do NOT dereference.
-        let lo = (raw & 0xFFFF) as u16;
-        return Some(if lo == 0 { FIRST_DYNAMIC_ATOM } else { lo });
+    if let Some(atom) = integer_atom_pointer(name as usize) {
+        return Some(atom);
     }
     // "#<decimal>" → integer atom.
     if core::ptr::read_unaligned(name) != b'#' as u16 {
@@ -873,6 +878,21 @@ mod tests {
                 add(core::ptr::null_mut(), 0usize as *const u16, &mut atom),
                 status::INVALID_PARAMETER
             );
+        }
+    }
+
+    #[test]
+    fn pointer_atom_classification_uses_all_address_bits() {
+        assert_eq!(integer_atom_pointer(0), Some(FIRST_DYNAMIC_ATOM));
+        for atom in [1, 256, 0xbfff, 0xc000, 0xffff] {
+            assert_eq!(integer_atom_pointer(atom), Some(atom as u16));
+        }
+        assert_eq!(integer_atom_pointer(0x1_0000), None);
+        assert_eq!(integer_atom_pointer(usize::MAX), None);
+        #[cfg(target_pointer_width = "64")]
+        for address in [0x1_0000_0000, 0x1_0000_0001, 0x1_0000_ffff] {
+            // Classify numeric addresses only; none of these fabricated pointers is read.
+            assert_eq!(integer_atom_pointer(address), None);
         }
     }
 
