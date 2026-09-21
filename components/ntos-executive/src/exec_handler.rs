@@ -45,6 +45,9 @@ mod virtual_memory_commit;
 #[path = "exec_thread_stack_exit.rs"]
 mod thread_stack_exit;
 
+#[path = "exec_registry_publication.rs"]
+mod registry_publication;
+
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
 pub(crate) const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
@@ -5005,30 +5008,6 @@ impl ExecNtHandler {
         mapped
     }
 
-    /// Insert a process-local registry handle and copy it to the caller transactionally.
-    unsafe fn mint_registry_key(&mut self, target: KeyRef, desired: u32, out: u64) -> u32 {
-        let Some(pid) = self.pm_pid_for_pi(self.pi) else {
-            return 0xC000_0008;
-        };
-        let handle = match self.insert_process_handle(
-            pid,
-            nt_process::HandleObject::RegistryKey(target),
-            Self::registry_map_access(desired),
-        ) {
-            Ok(handle) => handle,
-            Err(_) => {
-                self.release_registry_key_target(target);
-                return 0xC000_009A;
-            }
-        };
-        if !self.xas_write_u64(out, handle as u64) {
-            let _ = self.pm.take_handle(pid, handle);
-            self.release_registry_key_target(target);
-            return 0xC000_0005;
-        }
-        0
-    }
-
     fn install_mutable_registry_key_target(&mut self, key: ResolvedHiveKey) -> Result<KeyRef, u32> {
         if let Some(index) = self
             .mutable_key_handles
@@ -5081,60 +5060,6 @@ impl ExecNtHandler {
             .map_err(|_| 0xC000_009Au32)?;
         self.cm_system_key_handles.push(Some(target));
         Ok(CM_SYSTEM_KEY_TAG | (self.cm_system_key_handles.len() - 1) as u32)
-    }
-
-    unsafe fn mint_cm_system_registry_key(
-        &mut self,
-        full_path: &str,
-        desired: u32,
-        out: u64,
-    ) -> u32 {
-        let _durable = allocator::enter_durable();
-        let opened = match crate::config_manager_open_system_hive_key(full_path) {
-            Ok(opened) => {
-                CM_NATIVE_SYSTEM_KEY_LEASE_ACQUIRES.fetch_add(1, Ordering::Relaxed);
-                opened
-            }
-            Err(status) => {
-                if status as u32 != STATUS_OBJECT_NAME_NOT_FOUND {
-                    CM_NATIVE_SYSTEM_KEY_LEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
-                }
-                return status as u32;
-            }
-        };
-        self.mint_opened_cm_system_registry_key(opened, desired, out)
-    }
-
-    unsafe fn mint_opened_cm_system_registry_key(
-        &mut self,
-        opened: nt_config_client::OpenedSystemHiveKey,
-        desired: u32,
-        out: u64,
-    ) -> u32 {
-        let _durable = allocator::enter_durable();
-        let target = match self.install_cm_system_key_target(CmSystemKeyTarget {
-            lease: opened.lease,
-            physical_path: nt_hive_core::canon_path(&opened.physical_path),
-        }) {
-            Ok(target) => target,
-            Err(status) => {
-                match crate::config_manager_retire_system_hive_key(opened.lease) {
-                    Ok(()) => {
-                        CM_NATIVE_SYSTEM_KEY_LEASE_CLOSES.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(_) => {
-                        CM_NATIVE_SYSTEM_KEY_LEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                CM_NATIVE_SYSTEM_KEY_LEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
-                return status;
-            }
-        };
-        let status = self.mint_registry_key(target, desired, out);
-        if status != 0 {
-            CM_NATIVE_SYSTEM_KEY_LEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
-        }
-        status
     }
 
     fn install_cm_runtime_key_target(
@@ -5298,7 +5223,7 @@ impl ExecNtHandler {
     fn release_registry_key_target(&mut self, target: KeyRef) {
         if let Some(index) = cm_runtime_key_idx(target) {
             let object = nt_process::HandleObject::RegistryKey(target);
-            if self.pm.handle_object_count(object) == 0 {
+            if self.pm.handle_object_reference_count(object) == 0 {
                 if let Some(entry) = self.cm_runtime_key_handles.get_mut(index) {
                     *entry = None;
                 }
@@ -5307,7 +5232,7 @@ impl ExecNtHandler {
         }
         if let Some(index) = cm_system_key_idx(target) {
             let object = nt_process::HandleObject::RegistryKey(target);
-            if self.pm.handle_object_count(object) != 0 {
+            if self.pm.handle_object_reference_count(object) != 0 {
                 return;
             }
             if let Some(entry) = self
@@ -5330,7 +5255,7 @@ impl ExecNtHandler {
             return;
         };
         let object = nt_process::HandleObject::RegistryKey(target);
-        if self.pm.handle_object_count(object) != 0 {
+        if self.pm.handle_object_reference_count(object) != 0 {
             return;
         }
         if let Some(entry) = self.mutable_key_handles.get_mut(index) {
@@ -33691,21 +33616,8 @@ impl ExecNtHandler {
                     return 0;
                 }
                 if is_system_registry_path(&canon) {
-                    let opened = {
-                        let _durable = allocator::enter_durable();
-                        crate::config_manager_open_system_hive_key(&full)
-                    };
-                    match opened {
-                        Ok(opened) => {
-                            CM_NATIVE_SYSTEM_KEY_LEASE_ACQUIRES.fetch_add(1, Ordering::Relaxed);
-                            let status = self.mint_opened_cm_system_registry_key(
-                                opened,
-                                desired_access,
-                                args[0],
-                            );
-                            if status != 0 {
-                                return status;
-                            }
+                    match self.mint_cm_system_registry_key(&full, desired_access, args[0]) {
+                        0 => {
                             let disp_ptr = args[6];
                             if disp_ptr != 0 {
                                 self.xas_write_buf(
@@ -33715,11 +33627,8 @@ impl ExecNtHandler {
                             }
                             return 0;
                         }
-                        Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => {}
-                        Err(status) => {
-                            CM_NATIVE_SYSTEM_KEY_LEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
-                            return status as u32;
-                        }
+                        STATUS_OBJECT_NAME_NOT_FOUND => {}
+                        status => return status,
                     }
                     if !create_volatile && !root_is_overlay {
                         let canon_len = canon.len();
