@@ -1,5 +1,9 @@
 # PHASE B — Unified component-runtime harness (DESIGN APPROVED; harness-first)
 
+> Archived 2026-09-21. Historical evidence only; statuses below may be stale.
+> The [GitHub milestones](https://github.com/stakach/userspace-ntos/milestones)
+> and their issues are the authoritative plan. Do not update this progress ledger.
+
 Design note: `docs/component-harness.md`. Gate must stay **180/98** + clean qemu_exit at EVERY step.
 Each step = one commit = one rollback point. win32k migrates LAST. READ-ONLY design done; this is the
 implementation checklist. (Phase A = dead-code/diagnostic tidy — comes AFTER Phase B per user choice.)

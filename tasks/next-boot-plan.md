@@ -1,5 +1,9 @@
 # Next boot plan — loader proof, process scaling, and SURT hardening
 
+> Archived 2026-09-21. Historical evidence only; statuses below may be stale.
+> The [GitHub milestones](https://github.com/stakach/userspace-ntos/milestones)
+> and their issues are the authoritative plan. Do not update this progress ledger.
+
 Date: 2026-07-15
 
 Baseline: `main` at `0c7d677`, executive gate 170/0, winlogon stops in a repeated

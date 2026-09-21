@@ -57,6 +57,13 @@ Keep source code files focused and logically structured. Group by component and 
 5. **Document Results**: Add review section to the pull request
 6. **Capture Lessons**: Update `tasks/lessons.md` after corrections
 
+GitHub issues and their comments are the work items. Milestones describe delivery goals; Pull requests hold detailed plans, implementation and verification.
+
+Do not maintain Markdown TODOs, roadmaps, or progress ledgers. Historical plans are archived evidence only; technical design/reference documentation and reusable engineering lessons may remain in the repository.
+
+Github CI should run the crate tests.
+Once crate tests pass, merge the pull request.
+
 ## Core Principles
 
 - **Simplicity First**: Make every change as simple as possible. Impact minimal code.
@@ -83,6 +90,7 @@ Keep source code files focused and logically structured. Group by component and 
 
 ## Progress and Commits
 
-- Keep `docs/kernel-completion-plan.md` current with dependencies, validation evidence, and remaining work; reconcile it with issue tracking.
 - Commit verified increments and remove obsolete machinery when its replacement is integrated.
 - Preserve independent edits and inspect diffs before committing. Push submodule commits before parent commits that reference them; never claim a clean tree without checking.
+- no force pushing, keep commit history in pull requests
+- squash merge pull requests once they are ready

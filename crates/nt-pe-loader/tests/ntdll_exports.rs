@@ -1,6 +1,7 @@
 use nt_pe_loader::PeFile;
 
 #[test]
+#[ignore = "requires locally supplied Windows 7 references/ntdll.dll; run this test with --ignored"]
 fn ntdll_exports_and_syscall_numbers() {
     let bytes = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),

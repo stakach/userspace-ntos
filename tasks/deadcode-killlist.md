@@ -1,5 +1,9 @@
 # Dead-code / scaffold KILL-LIST — Phase A step 1 (READ-ONLY inventory)
 
+> Archived 2026-09-21. Historical evidence only; statuses below may be stale.
+> The [GitHub milestones](https://github.com/stakach/userspace-ntos/milestones)
+> and their issues are the authoritative plan. Do not update this progress ledger.
+
 Repo: `userspace-ntos` @ `aee4fab` (gate 183/98, green). Component:
 `components/ntos-executive/src/`. Produced by a read-only inventory pass (build for
 warnings + grep + read). **NOTHING deleted or edited.** A later batch deletes from the
