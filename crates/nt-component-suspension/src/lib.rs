@@ -31,7 +31,7 @@ mod reply_pool;
 mod ingress_resources;
 pub use ingress_resources::{IngressResources, IngressResourceKind, IngressResourcePhase, IngressResourceRecord, IngressResourceError};
 pub use reply_pool::{IngressReplyPool, ReplyAdmissionError, ReplyPoolError};
-pub use ingress_receiver::{CanonicalCompletionError, IngressReceiver, StoredCompletionError, StoredReplyError};
+pub use ingress_receiver::{CanonicalCompletionError, IngressReceiver, StartupReadyError, StoredCompletionError, StoredReplyError};
 pub use reserved_receive::{ReservedIngressReceive, ReservedReceiveError, ReservedReceivePhase};
 mod startup;
 pub use startup::StartupError;

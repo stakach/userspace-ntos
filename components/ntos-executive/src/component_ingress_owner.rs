@@ -59,6 +59,14 @@ struct PendingPeer {
     slot: Option<u64>,
 }
 
+pub(crate) struct WorkerReadyExpectation {
+    pub label: u64,
+    pub lane_id: u64,
+    pub stack_base: u64,
+    pub stack_bytes: u64,
+    pub slot_capacity: usize,
+}
+
 /// Finish the endpoint setup of an exact shared worker while its physical owner keeps it stopped.
 /// Success arms faults but does not admit startup or resume the TCB. All aliases remain owned.
 pub(crate) unsafe fn prepare_worker_peer<C, R, T>(
@@ -552,6 +560,38 @@ impl NativeSharedIngress {
                 }
             },
         ).map_err(super::ReceiveError::Reply)
+    }
+
+    /// Expected layout comes from the physical worker descriptor. Its receipt slot must remain
+    /// durably owned with that worker; publish it before releasing the startup execution fence.
+    pub(crate) unsafe fn ready<C, R, T>(
+        &mut self,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        route: PeerRoute,
+        ready_reply: u64,
+        expected: WorkerReadyExpectation,
+        publication: &mut Option<nt_provider_wait::ProviderStackReadyReceipt>,
+        resolve_caller: impl FnOnce(PeerRoute) -> Option<u64>,
+    ) -> Result<(), super::ReceiveError> {
+        if !self.ready {
+            return Err(super::ReceiveError::Ownership(
+                nt_component_suspension::ReservedReceiveError::InvalidPhase,
+            ));
+        }
+        let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+        if resolve_caller(route) != Some(route.identity().executor) {
+            return Err(super::ReceiveError::Probe(
+                nt_component_suspension::ReceiveProbeError::UnknownCaller,
+            ));
+        }
+        self.receiver.as_mut().expect("initialized receiver").ready_from_message(
+            route, ready_reply, expected.label, lanes,
+            self.peers.as_ref().expect("initialized registry"), publication,
+            |words| nt_provider_wait::ProviderStackReadyReceipt::decode(
+                words, expected.lane_id, expected.stack_base, expected.stack_bytes,
+            ).filter(|receipt| (receipt.slot as usize) < expected.slot_capacity),
+            |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
+        ).map_err(super::ReceiveError::Ready)
     }
 
     /// Complete only from an independently retained ordinary dispatch-completion Call. The
