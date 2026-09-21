@@ -37027,6 +37027,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         native release builds pass (.tmp/build-ingress-resources-executive-20260921.log and
         .tmp/build-ingress-resources-io-manager-20260921.log). Native preparation has compile/review
         coverage only; no live allocation, endpoint migration or fresh desktop result is claimed.
+        Preallocated peer registry checkpoint (2026-09-21): PeerRegistry::try_new validates the
+        endpoint and nonzero peer bound and reserves the complete entry allocation up front.
+        Native ingress preparation uses it after retaining the root slot run and construction
+        ledger, before any retype effect. An allocation refusal therefore leaves only reserved
+        slots in the dormant failed owner, not a partially created endpoint. Bounded stage,
+        abort and retirement operations reuse that allocation; the existing lazy const constructor
+        remains available to existing callers. This closes the registry allocation caveat above.
+        Validation passes 237 component-suspension unit tests and 14 documentation tests,
+        including invalid-capacity and full-lifecycle storage-stability regressions
+        (.tmp/test-ingress-registry-capacity-20260921.log). Both serialized native release builds
+        pass (.tmp/build-ingress-registry-capacity-executive-20260921.log and
+        .tmp/build-ingress-registry-capacity-io-manager-20260921.log). Live publication and endpoint
+        migration remain open; no fresh boot or desktop result is claimed.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

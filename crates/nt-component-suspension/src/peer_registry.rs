@@ -135,6 +135,18 @@ impl PeerRegistry {
         }
     }
 
+    /// Reserve the full table before native peer publication. Subsequent bounded staging and
+    /// retirement reuse this allocation; failures do not consume a badge during construction.
+    pub fn try_new(endpoint: u64, capacity: usize) -> Result<Self, PeerError> {
+        if endpoint == 0 || capacity == 0 {
+            return Err(PeerError::InvalidIdentity);
+        }
+        let mut registry = Self::new(endpoint, capacity);
+        registry.entries.try_reserve_exact(capacity)
+            .map_err(|_| PeerError::NoCapacity)?;
+        Ok(registry)
+    }
+
     pub fn stage(&mut self, identity: PeerIdentity) -> Result<PeerRegistration, PeerError> {
         self.stage_with_counter(identity, &NEXT_BADGE)
     }

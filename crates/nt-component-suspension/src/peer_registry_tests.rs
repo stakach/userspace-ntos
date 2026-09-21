@@ -1,5 +1,35 @@
 use super::*;
 
+#[test]
+fn preallocated_registry_rejects_invalid_or_unrepresentable_capacity() {
+    assert_eq!(PeerRegistry::try_new(0, 1).err(), Some(PeerError::InvalidIdentity));
+    assert_eq!(PeerRegistry::try_new(10, 0).err(), Some(PeerError::InvalidIdentity));
+    assert_eq!(PeerRegistry::try_new(10, usize::MAX).err(), Some(PeerError::NoCapacity));
+}
+
+#[test]
+fn preallocated_registry_reuses_storage_through_full_lifecycles() {
+    let mut peers = PeerRegistry::try_new(10, 2).unwrap();
+    let backing = peers.entries.as_ptr();
+    let capacity = peers.entries.capacity();
+    assert!(capacity >= 2);
+    for _ in 0..8 {
+        let mut first = peers.stage(identity(1)).unwrap();
+        let route = peers.publish(&mut first).unwrap();
+        let mut second = peers.stage(identity(2)).unwrap();
+        assert_eq!(peers.stage(identity(3)).err(), Some(PeerError::NoCapacity));
+        let mut retained = peers.retain(route).unwrap();
+        peers.begin_retirement(route).unwrap();
+        assert_eq!(peers.finish_retirement(route), Err(PeerError::RetainedWork));
+        peers.release(&mut retained).unwrap();
+        peers.finish_retirement(route).unwrap();
+        peers.abort(&mut second).unwrap();
+        assert!(peers.entries.is_empty());
+        assert_eq!(peers.entries.as_ptr(), backing);
+        assert_eq!(peers.entries.capacity(), capacity);
+    }
+}
+
 fn identity(executor: u64) -> PeerIdentity {
     PeerIdentity {
         domain: 1,

@@ -100,6 +100,10 @@ impl NativeSharedIngress {
         }
         self.resources =
             Some(IngressResources::new(base, replies).map_err(|_| InitializationError::NoMemory)?);
+        self.peers = Some(
+            PeerRegistry::try_new(base, peer_capacity)
+                .map_err(|_| InitializationError::NoMemory)?,
+        );
         let _saved = crate::ipc_message::SavedMessageBuffer::capture();
         let result = self
             .resources
@@ -136,7 +140,6 @@ impl NativeSharedIngress {
             IngressReplyPool::new(base, retained_capacity)
                 .map_err(|_| InitializationError::NoMemory)?,
         );
-        self.peers = Some(PeerRegistry::new(base, peer_capacity));
         for offset in 2..count {
             self.pending_reply = Some(
                 ComponentIngress::new(base, base + offset)
