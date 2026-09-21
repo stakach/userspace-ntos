@@ -1,5 +1,9 @@
 # Kernel Dynamic Tech Debt Plan
 
+> Archived 2026-09-21. Historical evidence only; statuses below may be stale.
+> The [GitHub milestones](https://github.com/stakach/userspace-ntos/milestones)
+> and their issues are the authoritative plan. Do not update this progress ledger.
+
 Last updated: 2026-08-10
 
 ## Objective

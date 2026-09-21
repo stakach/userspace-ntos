@@ -1,5 +1,9 @@
 # Boot performance: measure, then fix
 
+> Archived 2026-09-21. Historical evidence only; statuses below may be stale.
+> The [GitHub milestones](https://github.com/stakach/userspace-ntos/milestones)
+> and their issues are the authoritative plan. Do not update this progress ledger.
+
 **Problem reported:** the hosted boot takes ~30 minutes and stalls at the login screen.
 
 Everything below is **measured**, not inferred. Three hypotheses were killed by measurement

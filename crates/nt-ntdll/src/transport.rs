@@ -77,7 +77,7 @@ pub fn syscall(backend: Backend, ssn: u32, args: &[u64]) -> NtStatus {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(test)))]
 #[inline]
 fn x86_trap_dispatch(ssn: u32, args: &[u64]) -> NtStatus {
     // Marshal up to 4 register args (r10, rdx, r8, r9); >4 args need a stack thunk (follow-on).
@@ -90,11 +90,11 @@ fn x86_trap_dispatch(ssn: u32, args: &[u64]) -> NtStatus {
     unsafe { x86_trap_syscall(ssn, a0, a1, a2, a3) }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(any(not(target_arch = "x86_64"), test))]
 #[inline]
 fn x86_trap_dispatch(_ssn: u32, _args: &[u64]) -> NtStatus {
-    // Host (non-target) builds can't issue the trap; the transport policy + SSN plumbing are what
-    // we host-test. Returning NOT_IMPLEMENTED keeps the surface callable in tests.
+    // Unit tests cannot issue NT service numbers to the host OS, even on x86.
+    // Native transport execution requires kernel-backed integration tests.
     STATUS_NOT_IMPLEMENTED
 }
 

@@ -48,8 +48,25 @@ The **host-testable NT core** (`nt-status`, `nt-types`, `nt-object-abi`,
 `nt-object-manager`) is a normal cargo workspace — `cargo test` on your laptop,
 no seL4 or QEMU. The kernel-bound bins (`ntos-root`, `components/*`) are
 standalone crates built for the microkernel's bare-metal target and excluded from
-the workspace. Implementation follows the milestones in
-[`references/nt-object-manager-spec.md`](references/nt-object-manager-spec.md) §22.
+the workspace. Work is tracked in [GitHub milestones](https://github.com/stakach/userspace-ntos/milestones)
+and [issues](https://github.com/stakach/userspace-ntos/issues), not Markdown progress ledgers.
+
+## Crate specs
+
+[CI](https://github.com/stakach/userspace-ntos/actions/workflows/ci.yml) runs these
+commands sequentially on stable Rust:
+
+```sh
+RUST_TEST_THREADS=1 cargo test --workspace --locked
+RUST_TEST_THREADS=1 cargo test -p nt-ntdll --features native_transport --locked
+```
+
+A clean checkout also needs the public ReactOS source fixtures at the pinned
+revision and INF staging shown in [the CI setup steps](.github/workflows/ci.yml).
+No kernel build or proprietary Windows binaries are required. The optional
+Windows 7 export test requires a locally supplied `references/ntdll.dll`:
+`cargo test -p nt-pe-loader --test ntdll_exports -- --ignored`.
+Native builds and end-to-end CI are separate follow-ups, not covered by these specs.
 
 The kernel is a **pinned git submodule**, not vendored source: `userspace-ntos`
 depends on an exact kernel SHA (its syscall/invocation ABI is tightly coupled),
@@ -88,9 +105,10 @@ in `extern-rootserver` mode (bring your own root task).
 
 ## Running the hosted ReactOS desktop (quick start)
 
-The headline demo boots the rust-micro microkernel hosting **real, unmodified
-GPL ReactOS binaries** — `smss.exe → csrss.exe → winlogon.exe → win32k.sys` —
-all the way to a **painted Windows desktop**. One command from a fresh clone:
+The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro.
+Current restoration and genuine Explorer acceptance are tracked in
+[issue #18](https://github.com/stakach/userspace-ntos/issues/18); crate CI does not
+prove desktop boot. To attempt a boot from a fresh clone:
 
 ```sh
 git clone --recursive https://github.com/stakach/userspace-ntos.git
@@ -119,7 +137,10 @@ self-contained launcher that:
    hosts the ReactOS processes), and the kernel, then packs the FAT32/UEFI disk image.
 5. **Boots QEMU.**
 
-### What you should see
+### Historical boot output
+
+The output below records an earlier background-paint gate, not current Explorer
+shell acceptance. A painted background alone is not desktop proof.
 
 Headless (default) — the serial log streams to your terminal and ends with the
 executive's success sentinel; `run.sh` then prints a clear verdict:

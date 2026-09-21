@@ -1,6 +1,5 @@
-//! Host tests for the nt-ntdll skeleton: the stub table, the transport seam, and the Rtl proof
-//! slice. (The x86 trap asm is target-only; on the host `transport::syscall` returns
-//! STATUS_NOT_IMPLEMENTED for every backend, so we test the *wiring*, not the trap.)
+//! Host tests for the stub table, transport selection, and Rtl contracts.
+//! Never invoke NT syscall traps on the host: x86 hosts may execute unrelated OS services.
 
 use super::*;
 use crate::stubs::StubTable;
@@ -63,8 +62,11 @@ fn transport_backend_implemented_flags() {
 
 #[test]
 fn transport_seams_return_not_implemented_on_host() {
-    // The declared seL4/SURT seams (and the trap on non-x86 hosts) return NOT_IMPLEMENTED rather
-    // than fabricating success.
+    // No NT transport is available in this unit-test process, regardless of host architecture.
+    assert_eq!(
+        transport::syscall(Backend::X86Trap, 27, &[0]),
+        STATUS_NOT_IMPLEMENTED
+    );
     assert_eq!(
         transport::syscall(Backend::Sel4Call, 27, &[0]),
         STATUS_NOT_IMPLEMENTED
@@ -76,18 +78,24 @@ fn transport_seams_return_not_implemented_on_host() {
 }
 
 #[test]
-fn proof_of_pattern_stubs_resolve_and_invoke() {
+fn representative_stubs_link_and_resolve() {
     let t = StubTable::new();
-    // These prove SSN resolution + arg marshalling end-to-end. On the host the trap isn't
-    // available, so we assert they route (not that the syscall executes).
-    let _ = stubs::nt_close(&t, 0x1234);
-    let _ = stubs::nt_delay_execution(&t, true, 0);
-    let _ = stubs::nt_create_file(&t, 0, 0, 0, 0);
-    let _ = stubs::nt_protect_virtual_memory(&t, 0, 0, 0, 0);
-    let _ = stubs::nt_wait_for_single_object(&t, 0, false, 0);
-    // The proof stubs resolve to the expected SSNs.
-    assert_eq!(t.get("NtClose").unwrap().ssn, 27);
-    assert_eq!(t.get("NtDelayExecution").unwrap().ssn, 61);
+    let _: fn(&StubTable, u64) -> NtStatus = stubs::nt_close;
+    let _: fn(&StubTable, bool, u64) -> NtStatus = stubs::nt_delay_execution;
+    let _: fn(&StubTable, u64, u64, u64, u64) -> NtStatus = stubs::nt_create_file;
+    let _: fn(&StubTable, u64, u64, u64, u64) -> NtStatus = stubs::nt_protect_virtual_memory;
+    let _: fn(&StubTable, u64, bool, u64) -> NtStatus = stubs::nt_wait_for_single_object;
+    for (name, ssn) in [
+        ("NtClose", 27),
+        ("NtDelayExecution", 61),
+        ("NtCreateFile", 39),
+        ("NtProtectVirtualMemory", 143),
+        ("NtWaitForSingleObject", 281),
+    ] {
+        let stub = t.get(name).unwrap();
+        assert_eq!(stub.ssn, ssn);
+        assert_eq!(stub.backend, Backend::X86Trap);
+    }
 }
 
 #[test]
