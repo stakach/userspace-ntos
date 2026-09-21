@@ -512,4 +512,45 @@ impl NativeSharedIngress {
             |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
         ).map_err(super::ReceiveError::Admit)
     }
+
+    /// Register-only, label-zero reply. Invocation ACK consumes the Call but does not prove
+    /// provider completion; ordinary scheduling may run the provider before this function returns.
+    pub(crate) unsafe fn reply<C, R, T>(
+        &mut self,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        route: PeerRoute,
+        dispatch: nt_component_suspension::LaneDispatchIdentity,
+        words: &[u64],
+        resolve_caller: impl FnOnce(PeerRoute) -> Option<u64>,
+    ) -> Result<nt_component_suspension::IngressReplyObservation, super::ReceiveError> {
+        if !self.ready {
+            return Err(super::ReceiveError::Ownership(
+                nt_component_suspension::ReservedReceiveError::InvalidPhase,
+            ));
+        }
+        if words.len() > 4 {
+            return Err(super::ReceiveError::InvalidReplyLength);
+        }
+        let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+        if resolve_caller(route) != Some(route.identity().executor) {
+            return Err(super::ReceiveError::Probe(
+                nt_component_suspension::ReceiveProbeError::UnknownCaller,
+            ));
+        }
+        let mut registers = [0u64; 4];
+        registers[..words.len()].copy_from_slice(words);
+        self.receiver.as_mut().expect("initialized receiver").reply_stored(
+            route, dispatch, lanes,
+            |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
+            |reply| {
+                let error = crate::reply_on(reply, words.len() as u64,
+                    registers[0], registers[1], registers[2], registers[3]);
+                if error == 0 {
+                    nt_component_suspension::IngressReplyObservation::Acknowledged
+                } else {
+                    nt_component_suspension::IngressReplyObservation::Indeterminate
+                }
+            },
+        ).map_err(super::ReceiveError::Reply)
+    }
 }

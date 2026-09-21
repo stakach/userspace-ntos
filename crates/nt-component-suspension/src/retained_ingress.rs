@@ -32,9 +32,33 @@ pub struct RetainedIngress<M> {
     retention: PeerRetention,
     completed: Option<M>,
     pub(crate) admitted: Option<crate::LaneDispatchIdentity>,
+    reply_attempt: Option<IngressReplyAttempt>,
 }
 
 impl<M> RetainedIngress<M> {
+    /// Keep the attempt in the durable Call before invoking native reply. Uncertainty must never
+    /// turn into replay permission; ACK and proven NoEffects consume only this exact attempt.
+    pub(crate) fn reply_owned(
+        &mut self,
+        invoke: impl FnOnce(u64) -> IngressReplyObservation,
+    ) -> Result<IngressReplyObservation, IngressError> {
+        if self.reply_attempt.is_some() {
+            return Err(IngressError::NotReady);
+        }
+        self.reply_attempt = Some(self.ingress.begin_reply()?);
+        let observation = invoke(self.reply());
+        let message = self.ingress.observe_reply(
+            self.reply_attempt.as_mut().expect("owned reply attempt"),
+            observation,
+        )?;
+        if let Some(message) = message {
+            self.completed = Some(message);
+        }
+        if observation != IngressReplyObservation::Indeterminate {
+            self.reply_attempt = None;
+        }
+        Ok(observation)
+    }
     pub(crate) fn is_held(&self) -> bool {
         self.admitted.is_none() && self.completed.is_none() && self.ingress.is_held()
     }
@@ -166,6 +190,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
                 retention,
                 completed: None,
                 admitted: None,
+                reply_attempt: None,
             }),
             Err((error, replacement)) => {
                 // No external effects or registry mutation intervened since retain succeeded.

@@ -18,6 +18,15 @@ pub enum CanonicalCompletionError<E> {
     Finish(RetainedWorkFinishError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoredReplyError<E> {
+    Store(RetainedWorkError),
+    DispatchMismatch,
+    BindingMismatch,
+    Query(E),
+    Ingress(crate::IngressError),
+}
+
 #[cfg(test)]
 #[path = "ingress_receiver_tests.rs"]
 mod tests;
@@ -38,6 +47,46 @@ pub struct IngressReceiver<M> {
 }
 
 impl<M> IngressReceiver<M> {
+    /// Reply only for the exact admitted running dispatch. Keep its attempt and payload stored
+    /// before the native effect; ACK does not end dispatch or release peer/storage ownership.
+    /// Both callbacks must preserve physical lifetimes and must not reenter this owner.
+    pub fn reply_stored<C, R, T, E>(
+        &mut self,
+        route: PeerRoute,
+        dispatch: crate::LaneDispatchIdentity,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        query: impl FnOnce(u64, u64) -> Result<ReplyBindingObservation, E>,
+        invoke: impl FnOnce(u64) -> crate::IngressReplyObservation,
+    ) -> Result<crate::IngressReplyObservation, StoredReplyError<E>> {
+        let call = self
+            .store
+            .stored_call_mut(route)
+            .map_err(StoredReplyError::Store)?;
+        let lane = lanes
+            .lane(route.identity().lane)
+            .map_err(|_| StoredReplyError::DispatchMismatch)?;
+        if call.admitted != Some(dispatch)
+            || lanes
+                .validate_ingress_execution(IngressExecutionOwner::Dispatch(dispatch))
+                .is_err()
+            || lane.dispatch != Some(dispatch)
+            || lanes.running() != Some(route.identity().lane)
+            || lane.phase != crate::LanePhase::Running
+            || lane.shared_peer != Some(route)
+            || lane.binding.executor_id != route.identity().executor
+            || lane.binding.receive_endpoint != route.endpoint()
+            || lane.binding.reply_object != call.reply()
+        {
+            return Err(StoredReplyError::DispatchMismatch);
+        }
+        if query(route.identity().executor, call.reply()).map_err(StoredReplyError::Query)?
+            != ReplyBindingObservation::BoundToTarget
+        {
+            return Err(StoredReplyError::BindingMismatch);
+        }
+        call.reply_owned(invoke).map_err(StoredReplyError::Ingress)
+    }
+
     pub fn new(
         endpoint: u64,
         reply: u64,

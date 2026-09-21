@@ -4,6 +4,128 @@ use crate::{IngressReplyObservation, LaneBinding};
 
 type Lanes = ComponentSuspensionLanes<(), (), ()>;
 
+#[test]
+fn stored_reply_ack_keeps_execution_and_storage_until_completion() {
+    let (mut lanes, mut peers, route, mut owner, checkout) = canonical_completion();
+    let dispatch = lanes
+        .active_dispatch_identity(route.identity().lane)
+        .unwrap()
+        .unwrap();
+    assert!(owner.restore(checkout).is_ok());
+    assert_eq!(
+        owner.reply_stored(
+            route,
+            dispatch,
+            &lanes,
+            |tcb, reply| {
+                assert_eq!((tcb, reply), (10, 40));
+                Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)
+            },
+            |reply| {
+                assert_eq!(reply, 40);
+                IngressReplyObservation::Acknowledged
+            }
+        ),
+        Ok(IngressReplyObservation::Acknowledged)
+    );
+    assert_eq!(
+        lanes.active_dispatch_identity(dispatch.lane),
+        Ok(Some(dispatch))
+    );
+    assert_eq!(owner.available(), 0);
+    assert_eq!(peers.state(route).unwrap().1, 1);
+    let mut checkout = owner.checkout(route).unwrap();
+    assert_eq!(*checkout.call().message(), 123);
+    checkout.finish_dispatch(&mut lanes).unwrap();
+    assert_eq!(
+        owner
+            .finish_canonical_checkout(checkout, &mut peers, &lanes, |_, _| Ok::<_, u8>(
+                ReplyBindingObservation::Free
+            ))
+            .ok(),
+        Some(123)
+    );
+}
+
+#[test]
+fn stored_reply_uncertainty_locks_replay_without_losing_payload() {
+    let (lanes, peers, route, mut owner, checkout) = canonical_completion();
+    let dispatch = lanes
+        .active_dispatch_identity(route.identity().lane)
+        .unwrap()
+        .unwrap();
+    assert!(owner.restore(checkout).is_ok());
+    assert_eq!(
+        owner.reply_stored(
+            route,
+            dispatch,
+            &lanes,
+            |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget),
+            |_| IngressReplyObservation::Indeterminate
+        ),
+        Ok(IngressReplyObservation::Indeterminate)
+    );
+    assert_eq!(
+        owner.reply_stored(
+            route,
+            dispatch,
+            &lanes,
+            |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget),
+            |_| panic!("uncertain effect cannot replay")
+        ),
+        Err(StoredReplyError::Ingress(IngressError::NotReady))
+    );
+    let checkout = owner.checkout(route).unwrap();
+    assert_eq!(*checkout.call().message(), 123);
+    assert_eq!(owner.available(), 0);
+    assert_eq!(peers.state(route).unwrap().1, 1);
+}
+
+#[test]
+fn stored_reply_query_refusal_and_proven_no_effect_allow_safe_retry() {
+    let (lanes, _, route, mut owner, checkout) = canonical_completion();
+    let dispatch = lanes
+        .active_dispatch_identity(route.identity().lane)
+        .unwrap()
+        .unwrap();
+    assert!(owner.restore(checkout).is_ok());
+    assert_eq!(
+        owner.reply_stored(
+            route,
+            dispatch,
+            &lanes,
+            |_, _| Err(7u8),
+            |_| panic!("query failed")
+        ),
+        Err(StoredReplyError::Query(7))
+    );
+    assert_eq!(
+        owner.reply_stored(
+            route,
+            dispatch,
+            &lanes,
+            |_, _| Ok::<_, u8>(ReplyBindingObservation::Free),
+            |_| panic!("wrong binding")
+        ),
+        Err(StoredReplyError::BindingMismatch)
+    );
+    for observation in [
+        IngressReplyObservation::NoEffects,
+        IngressReplyObservation::Acknowledged,
+    ] {
+        assert_eq!(
+            owner.reply_stored(
+                route,
+                dispatch,
+                &lanes,
+                |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget),
+                |_| observation
+            ),
+            Ok(observation)
+        );
+    }
+}
+
 fn canonical_completion() -> (
     Lanes,
     PeerRegistry,

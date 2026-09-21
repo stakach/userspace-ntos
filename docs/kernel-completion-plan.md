@@ -37170,6 +37170,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         (.tmp/build-canonical-completion-executive-20260921.log and
         .tmp/build-canonical-completion-io-manager-20260921.log). Contract review found no blocking
         issues. The last measured boot remains at the strict 27-export win32k barrier.
+        Stored native reply checkpoint (2026-09-21): reply_stored validates the exact admitted
+        running dispatch, shared peer route, canonical Reply and execution/terminal fence before a
+        fresh BoundToTarget query. The retained Call stores its reply attempt before invoking native
+        code. ACK retains payload and dispatch ownership; Indeterminate retains the exact attempt
+        and blocks replay; only independently proven NoEffects permits another attempt.
+
+        The native ingress owner now has a narrow register-only reply adapter: at most four words,
+        label zero, no capability transfer flags, saved IPC bank before physical resolution/query,
+        and unmarked reply_on. Microkernel review confirms zero invocation status acknowledges Reply
+        consumption; nonzero status is conservatively Indeterminate. Ordinary scheduling may run
+        the provider before root returns, so this does not clear the dispatch fence, infer provider
+        completion, or recycle the Reply. Full live routing and native completion remain open.
+
+        Contract and native reviews found no blocking issues. Validation: 254 unit and 14 doc
+        tests pass (.tmp/test-stored-reply-20260921.log), including ACK with retained execution,
+        uncertain-effect replay refusal, query/binding failures and proven-no-effects retry.
+        Both serialized native release builds pass (.tmp/build-stored-reply-executive-20260921.log
+        and .tmp/build-stored-reply-io-manager-20260921.log). No new boot or
+        desktop proof is claimed; the last measured boot retains the strict 27-export barrier.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
