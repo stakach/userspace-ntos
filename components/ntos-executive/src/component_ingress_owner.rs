@@ -5,8 +5,9 @@ use core::convert::Infallible;
 use nt_component_suspension::peer_registry::{PeerRegistration, PeerRegistry, PeerRoute};
 use nt_component_suspension::{
     ComponentIngress, ComponentSuspensionLanes, IngressExecutionOwner, IngressReceiver,
-    IngressReplyPool, IngressResourceKind, IngressResources, LaneHandle, PeerInstallation,
-    PeerInstallationError, PeerLaneError, ReceivedMessage,
+    IngressReplyPool, IngressResourceKind, IngressResources, LaneHandle, LanePhase,
+    PeerCapabilityDestination, PeerInstallation, PeerInstallationError, PeerInstallationPhase,
+    PeerLaneError, ReceivedMessage,
 };
 
 static mut SHARED_INGRESS: NativeSharedIngress = NativeSharedIngress::new();
@@ -46,6 +47,10 @@ pub(crate) enum PublicationError {
     Stage(PeerLaneError),
     Installation(PeerInstallationError<Infallible>),
     Mint(PeerInstallationError<u64>),
+    UnknownPeer,
+    WrongPhase,
+    InvalidDestination,
+    Export(PeerInstallationError<u64>),
 }
 
 struct PendingPeer {
@@ -62,6 +67,25 @@ pub(crate) unsafe fn publish_peer<C, R, T>(
     lane: LaneHandle,
 ) -> Result<PeerRoute, PublicationError> {
     (&mut *core::ptr::addr_of_mut!(SHARED_INGRESS)).publish_peer(lanes, domain, generation, lane)
+}
+
+/// The resolver only observes an already-owned stopped worker and reserved empty child slot.
+/// It must validate the route's physical domain generation and keep the child CNode capability
+/// alive through uncertain copy and eventual teardown. No worker is resumed by this operation.
+pub(crate) unsafe fn export_peer<C, R, T>(
+    route: PeerRoute,
+    domain: u64,
+    generation: u64,
+    lanes: &ComponentSuspensionLanes<C, R, T>,
+    resolve_destination: impl FnOnce(PeerRoute) -> Option<PeerCapabilityDestination>,
+) -> Result<(), PublicationError> {
+    (&mut *core::ptr::addr_of_mut!(SHARED_INGRESS)).export_peer(
+        route,
+        domain,
+        generation,
+        lanes,
+        resolve_destination,
+    )
 }
 
 /// Keep this owner alive even after initialization refusal. No failure deletes capabilities,
@@ -217,6 +241,9 @@ impl NativeSharedIngress {
         if self.installations.len() >= self.peer_capacity {
             return Err(PublicationError::NoCapacity);
         }
+        if lanes.phase(lane) != Ok(LanePhase::Staged) {
+            return Err(PublicationError::WrongPhase);
+        }
         let _saved = crate::ipc_message::SavedMessageBuffer::capture();
         let registration = self
             .peers
@@ -270,6 +297,59 @@ impl NativeSharedIngress {
                 lanes,
             )
             .map_err(PublicationError::Installation)
+    }
+
+    unsafe fn export_peer<C, R, T>(
+        &mut self,
+        route: PeerRoute,
+        domain: u64,
+        generation: u64,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        resolve_destination: impl FnOnce(PeerRoute) -> Option<PeerCapabilityDestination>,
+    ) -> Result<(), PublicationError> {
+        if !self.ready {
+            return Err(PublicationError::NotReady);
+        }
+        let installation = self
+            .installations
+            .iter_mut()
+            .find(|installation| installation.route() == route)
+            .ok_or(PublicationError::UnknownPeer)?;
+        if installation.phase() != PeerInstallationPhase::Published
+            || lanes.phase(route.identity().lane) != Ok(LanePhase::Staged)
+        {
+            return Err(PublicationError::WrongPhase);
+        }
+        let peers = self.peers.as_ref().expect("initialized registry");
+        if peers
+            .resolve_lane(route.badge(), domain, generation, lanes)
+            .map_err(PublicationError::Stage)?
+            != route
+        {
+            return Err(PublicationError::UnknownPeer);
+        }
+        let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+        let destination = resolve_destination(route).ok_or(PublicationError::InvalidDestination)?;
+        if destination.cnode == crate::CAP_INIT_THREAD_CNODE {
+            return Err(PublicationError::InvalidDestination);
+        }
+        installation
+            .export(
+                peers,
+                domain,
+                generation,
+                lanes,
+                destination,
+                |source, child| {
+                    let status = crate::cnode_copy_at_r(child.cnode, child.slot, source);
+                    if status == 0 {
+                        Ok(())
+                    } else {
+                        Err(status)
+                    }
+                },
+            )
+            .map_err(PublicationError::Export)
     }
 
     pub(crate) unsafe fn receive<C, R, T>(

@@ -37059,6 +37059,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Both serialized native release builds pass (.tmp/build-native-peer-publication-executive-20260921.log
         and .tmp/build-native-peer-publication-io-manager-20260921.log). Native publication remains
         dormant; runtime mint/failure injection and desktop acceptance are not claimed.
+        Native child peer export checkpoint (2026-09-21): the durable owner now locates an exact
+        published installation row, requires its canonical lane to remain Staged, and revalidates
+        the active route's domain/generation before consulting the physical destination resolver.
+        The resolver is observational: the stopped worker, child CNode capability and empty child
+        slot must already have durable ownership. Canonical Staged state alone is not physical
+        stop evidence. The root CNode is explicitly forbidden as a child destination.
+
+        Export uses the acknowledged child-CNode copy primitive through PeerInstallation::export,
+        retaining root and child alias attribution before the effect. Uncertain results stay
+        Exporting and cannot invoke the resolver or copy again; ACK leaves the lane Staged without
+        resuming it or granting dispatch. The complete operation preserves the root IPC bank.
+        Existing constructors' occupied CT_FAULT slots are not changed: a shared constructor with
+        an owned empty destination and authenticated shared-lane topology remains required before
+        live use. Native root publication now also requires canonical Staged state before allocating
+        an alias. Native routing and runtime/desktop acceptance remain open.
+
+        Validation passes 239 component-suspension unit tests and 14 documentation tests,
+        including staged export without execution admission (.tmp/test-native-peer-export-20260921.log).
+        Both serialized native release builds pass (.tmp/build-native-peer-export-executive-20260921.log
+        and .tmp/build-native-peer-export-io-manager-20260921.log). Native copy/failure injection
+        remains unmeasured because the path is dormant; no new boot or desktop result is claimed.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

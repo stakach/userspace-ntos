@@ -2,6 +2,41 @@ use super::*;
 use crate::peer_registry::PeerPhase;
 use crate::{LaneBinding, LaneError, LaneHandle};
 
+#[test]
+fn staged_worker_export_does_not_start_execution_or_release_aliases() {
+    let mut lanes = Lanes::new(1, 1);
+    let lane = lanes
+        .allocate_staged(LaneBinding {
+            executor_id: 11,
+            receive_endpoint: 22,
+            reply_object: 33,
+        })
+        .unwrap();
+    let mut peers = PeerRegistry::try_new(22, 1).unwrap();
+    let registration = peers.stage_lane(7, 8, &lanes, lane).unwrap();
+    let mut owner = PeerInstallation::new(registration, 44).ok().unwrap();
+    owner.install(|_, _| Ok::<_, u64>(())).unwrap();
+    let route = owner.publish(&mut peers, 7, 8, &lanes).unwrap();
+    let destination = PeerCapabilityDestination { cnode: 55, slot: 6 };
+    owner
+        .export(&peers, 7, 8, &lanes, destination, |source, child| {
+            assert_eq!(source, 44);
+            assert_eq!(child, destination);
+            Ok::<_, u64>(())
+        })
+        .unwrap();
+    assert_eq!(owner.phase(), PeerInstallationPhase::Exported);
+    assert_eq!(owner.child_destination(), Some(destination));
+    assert_eq!(peers.resolve(route.badge()), Some(route));
+    assert_eq!(lanes.phase(lane), Ok(crate::LanePhase::Staged));
+    assert_eq!(lanes.running(), None);
+    assert_eq!(lanes.begin_dispatch(lane, 33), Err(LaneError::InvalidPhase));
+    assert_eq!(
+        owner.delete_staged(|_| Ok::<_, u64>(())),
+        Err(PeerInstallationError::InvalidPhase)
+    );
+}
+
 type Lanes = ComponentSuspensionLanes<(), ()>;
 
 fn setup() -> (Lanes, LaneHandle, PeerRegistry, PeerInstallation) {
