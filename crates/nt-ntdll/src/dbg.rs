@@ -814,9 +814,35 @@ mod tests {
         assert_eq!(read_u32(&event, 0x10), 0xc000_0001);
     }
 
+    #[cfg(not(target_arch = "x86_64"))]
     #[test]
-    fn breakpoint_is_callable_on_host() {
-        // On the host this is a no-op; the assertion is that it links + returns.
+    fn breakpoint_is_callable_on_non_x86_host() {
+        breakpoint();
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn breakpoint_raises_sigtrap_on_x86_host() {
+        use std::os::unix::process::ExitStatusExt;
+
+        const CHILD_MARKER: &str = "NTDLL_BREAKPOINT_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            breakpoint();
+            panic!("breakpoint returned without a debugger");
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "dbg::tests::breakpoint_raises_sigtrap_on_x86_host"])
+            .env(CHILD_MARKER, "1")
+            .status()
+            .expect("launch isolated breakpoint test");
+        assert_eq!(status.signal(), Some(5), "expected SIGTRAP, got {status}");
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    #[test]
+    #[ignore = "requires a native debugger to handle and resume the breakpoint"]
+    fn native_breakpoint_resumes_after_debugger_continuation() {
         breakpoint();
     }
 
