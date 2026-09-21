@@ -311,6 +311,22 @@ impl<M> RetainedWork<M> {
             .ok_or(RetainedWorkError::NotFound)
     }
 
+    pub(crate) fn stored_reply(
+        &self,
+        route: PeerRoute,
+        reply: u64,
+    ) -> Result<&RetainedIngress<M>, RetainedWorkError> {
+        self.slots
+            .iter()
+            .find_map(|slot| match slot {
+                Slot::Stored { call, .. } if call.route() == route && call.reply() == reply => {
+                    Some(call)
+                }
+                _ => None,
+            })
+            .ok_or(RetainedWorkError::NotFound)
+    }
+
     pub(crate) fn owns_checkout(&self, checkout: &RetainedWorkCheckout<M>) -> bool {
         matches!(self.slots.get(checkout.slot), Some(Slot::CheckedOut { identity, route, reply })
             if *identity == checkout.identity && *route == checkout.call.route() && *reply == checkout.call.reply())

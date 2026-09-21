@@ -553,4 +553,34 @@ impl NativeSharedIngress {
             },
         ).map_err(super::ReceiveError::Reply)
     }
+
+    /// Complete only from an independently retained ordinary dispatch-completion Call. The
+    /// configured label must come from the physical provider descriptor, never incoming data.
+    /// The resolver authenticates the live domain generation and worker capability lifetime.
+    pub(crate) unsafe fn complete<C, R, T>(
+        &mut self,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        route: PeerRoute,
+        dispatch: nt_component_suspension::LaneDispatchIdentity,
+        completion_reply: u64,
+        completion_label: u64,
+        resolve_caller: impl FnOnce(PeerRoute) -> Option<u64>,
+    ) -> Result<ReceivedMessage, super::ReceiveError> {
+        if !self.ready {
+            return Err(super::ReceiveError::Ownership(
+                nt_component_suspension::ReservedReceiveError::InvalidPhase,
+            ));
+        }
+        let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+        if resolve_caller(route) != Some(route.identity().executor) {
+            return Err(super::ReceiveError::Probe(
+                nt_component_suspension::ReceiveProbeError::UnknownCaller,
+            ));
+        }
+        self.receiver.as_mut().expect("initialized receiver").complete_from_message(
+            route, dispatch, completion_reply, completion_label, lanes,
+            self.peers.as_mut().expect("initialized registry"),
+            |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
+        ).map_err(super::ReceiveError::Complete)
+    }
 }

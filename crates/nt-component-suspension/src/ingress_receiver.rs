@@ -32,15 +32,64 @@ pub enum StoredCompletionError<E> {
     Store(RetainedWorkError),
     NotAcknowledged,
     WrongOwner,
+    InvalidCompletionMessage,
+    CompletionNotBound,
     NotFree,
     Query(E),
     Dispatch(crate::RetainedDispatchError<Infallible>),
     Finish(RetainedWorkFinishError),
 }
 
+impl IngressReceiver<crate::ReceivedMessage> {
+    /// Authenticate a separately retained final Call before ending the old dispatch. The native
+    /// adapter supplies the provider's configured ordinary completion label, not a label inferred
+    /// from this message, and validates physical lifetimes. Startup, callback and wait messages
+    /// are not ordinary completion. The new Call remains stored and bound after success.
+    pub fn complete_from_message<C, R, T, E>(
+        &mut self,
+        route: PeerRoute,
+        dispatch: crate::LaneDispatchIdentity,
+        completion_reply: u64,
+        completion_label: u64,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        peers: &mut PeerRegistry,
+        mut query: impl FnMut(u64, u64) -> Result<ReplyBindingObservation, E>,
+    ) -> Result<crate::ReceivedMessage, StoredCompletionError<E>> {
+        let lane = lanes
+            .lane(route.identity().lane)
+            .map_err(|_| StoredCompletionError::WrongOwner)?;
+        if lane.shared_peer != Some(route) || lane.binding.reply_object == completion_reply {
+            return Err(StoredCompletionError::WrongOwner);
+        }
+        let completion = self
+            .store
+            .stored_reply(route, completion_reply)
+            .map_err(StoredCompletionError::Store)?;
+        if !completion.is_held()
+            || completion_label == 0
+            || completion_label > (u64::MAX >> 12)
+            || completion.message().badge() != route.badge()
+            || completion.message().info() != completion_label << 12
+        {
+            return Err(StoredCompletionError::InvalidCompletionMessage);
+        }
+        if query(route.identity().executor, completion_reply)
+            .map_err(StoredCompletionError::Query)?
+            != ReplyBindingObservation::BoundToTarget
+        {
+            return Err(StoredCompletionError::CompletionNotBound);
+        }
+        self.complete_stored(route, dispatch, lanes, peers, query)
+    }
+}
+
 #[cfg(test)]
 #[path = "ingress_receiver_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "completion_message_tests.rs"]
+mod completion_message_tests;
 
 /// Native adapters must capture the full received message before issuing binding-query IPC.
 /// This owns ingress and storage exclusively; Call provenance, exact physical lifetime and

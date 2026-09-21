@@ -37209,6 +37209,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         (.tmp/build-stored-completion-executive-20260921.log and
         .tmp/build-stored-completion-io-manager-20260921.log). No new boot result is claimed; the last
         measured boot remains blocked by the strict 27-export win32k barrier.
+        Native completion-message checkpoint (2026-09-21): complete_from_message authenticates
+        the separately retained final Call before ending the old dispatch. It requires an exact
+        shared route, a distinct stored held/unadmitted Reply, matching badge, and the provider's
+        configured ordinary zero-word/no-capability completion tag. Labels are nonzero and checked
+        for shift overflow. Startup publication, callbacks and waits cannot masquerade as ordinary
+        completion. A fresh BoundToTarget proof for the final Call precedes the old Reply's Free
+        proof; both Calls remain durably stored through those queries.
+
+        Native ingress complete saves the IPC bank before physical lifetime resolution and delegates
+        to this checked path. Its configured label must come from the physical provider descriptor,
+        never the received message. Success returns only the old payload and preserves the final
+        Call's message, bound Reply and retention for subsequent admission. It neither replies to
+        that continuation nor resumes a worker. This completes the dormant native completion adapter,
+        not live receive-loop integration or desktop acceptance.
+
+        Contract/native review found no blocking issues. Validation: 261 unit and 14 doc tests pass
+        (.tmp/test-completion-message-20260921.log), including exact success, malformed framing and
+        badges, invalid labels, unbound completion and failures in either binding query. Both
+        serialized native release builds pass (.tmp/build-completion-message-executive-20260921.log
+        and .tmp/build-completion-message-io-manager-20260921.log). The last measured boot
+        remains at the strict 27-export win32k barrier; no new boot result is claimed.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
