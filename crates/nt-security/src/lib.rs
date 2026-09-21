@@ -56,6 +56,8 @@ pub use job_token::{
 };
 pub use native_acl::{NativeAcl, NativeAclError, STATUS_INVALID_ACL};
 mod key_creation;
+mod key_open;
+pub use key_open::{authorize_key_open, authorize_key_backup_restore, prepare_key_backup_restore_creation_security, KeyBackupRestoreAudit, KeyBackupRestoreCreationAudit};
 pub use key_creation::{prepare_key_creation_security, KeyCreationAudit, KeyHandleSecurityAudit, PreparedKeyCreationSecurity};
 pub use native_acl_inheritance::{inherit_native_acl, NativeAclInheritance};
 pub use native_sd::{

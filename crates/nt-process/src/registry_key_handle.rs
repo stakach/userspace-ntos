@@ -1,8 +1,8 @@
-//! Process-local publication of an already-authorized registry Key grant.
+//! Canonical publication of an already-authorized registry Key grant.
 
 use crate::{
-    HandleObject, HandleReservation, HandleSlot, ProcessId, ProcessManager, ProcessState,
-    STATUS_INVALID_HANDLE, STATUS_PROCESS_IS_TERMINATING,
+    HandleFlags, HandleObject, HandleReservation, HandleSlot, ProcessId, ProcessManager,
+    ProcessState, STATUS_INVALID_HANDLE, STATUS_PROCESS_IS_TERMINATING,
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,11 +18,13 @@ enum Phase {
 
 /// Owns an invisible PM slot across provider work and caller output delivery. Binding transfers
 /// cleanup responsibility for the Key target to this transaction; errors never discard it.
-/// This is not an access check and does not create an object body or a kernel handle.
+/// This is not an access check and does not create an object body.
 #[must_use = "registry publication must be explicitly published or aborted"]
 pub struct RegistryKeyHandlePublication {
     manager: u64,
     reservation: HandleReservation,
+    value: u64,
+    flags: HandleFlags,
     phase: Phase,
 }
 
@@ -51,9 +53,15 @@ impl ProcessManager {
                 })
                 .map_err(|_| crate::STATUS_INSUFFICIENT_RESOURCES)?;
         }
+        let reservation = self.try_reserve_handle_slot(pid)?;
         Ok(RegistryKeyHandlePublication {
             manager: self.registry_publication_identity,
-            reservation: self.try_reserve_handle_slot(pid)?,
+            value: reservation.handle as u64,
+            flags: HandleFlags {
+                inherit: false,
+                protect_from_close: false,
+            },
+            reservation,
             phase: Phase::Reserved,
         })
     }
@@ -69,7 +77,7 @@ impl RegistryKeyHandlePublication {
 
     /// The future handle value may be copied out while the slot remains invisible.
     pub const fn value(&self) -> u64 {
-        self.reservation.handle as u64
+        self.value
     }
 
     pub const fn process_id(&self) -> ProcessId {
@@ -93,6 +101,16 @@ impl RegistryKeyHandlePublication {
             HandleObject::RegistryKey(key),
             granted_access,
         )?;
+        let slot = crate::handle_to_slot(self.reservation.handle).expect("reserved Key handle");
+        let HandleSlot::Bound { entry, .. } = &mut pm
+            .processes
+            .get_mut(&self.reservation.process_id)
+            .expect("reserved Key owner")
+            .handles[slot]
+        else {
+            unreachable!("new Key binding remains bound")
+        };
+        entry.flags = self.flags;
         self.phase = Phase::Bound {
             key,
             granted_access,
@@ -117,7 +135,8 @@ impl RegistryKeyHandlePublication {
             Some(HandleSlot::Bound { generation, entry })
                 if *generation == self.reservation.generation
                     && entry.object == HandleObject::RegistryKey(key)
-                    && entry.granted_access == granted_access =>
+                    && entry.granted_access == granted_access
+                    && entry.flags == self.flags =>
             {
                 Ok(key)
             }
@@ -129,9 +148,9 @@ impl RegistryKeyHandlePublication {
     pub fn publish(&mut self, pm: &mut ProcessManager) -> Result<u64, u32> {
         self.validate_bound(pm)?;
         admit_owner(pm, self.reservation.process_id)?;
-        let handle = pm.publish_reserved_handle(self.reservation)?;
+        pm.publish_reserved_handle(self.reservation)?;
         self.phase = Phase::Published;
-        Ok(handle as u64)
+        Ok(self.value)
     }
 
     /// Return the bound Key for external cleanup, or cancel an empty reservation. Teardown does
@@ -157,3 +176,5 @@ impl RegistryKeyHandlePublication {
 
 #[cfg(test)]
 mod tests;
+
+mod native;
