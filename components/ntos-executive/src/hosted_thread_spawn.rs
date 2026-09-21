@@ -107,6 +107,9 @@ impl ThreadEndpointBackend for RootThreadEndpointBackend {
     }
 
     fn mint(&mut self, cnode: u64, slot: u64, source: u64, badge: u64) -> Result<(), u64> {
+        if !nt_component_suspension::badge::valid_hosted_badge(badge) {
+            return Err(u64::MAX);
+        }
         let error = unsafe { cnode_mint_r(cnode, slot, source, badge) };
         if error == 0 {
             Ok(())

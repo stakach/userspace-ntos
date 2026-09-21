@@ -20,12 +20,7 @@ pub(crate) unsafe fn start_worker_peer<C, R, T>(
     lanes: &mut ComponentSuspensionLanes<C, R, T>,
     worker: &crate::spawn_hosts::SpawnedComponentWorker,
 ) -> Result<(), WorkerStartError> {
-    let endpoint = match worker.endpoint {
-        crate::spawn_hosts::WorkerEndpoint::Shared(endpoint) => endpoint,
-        crate::spawn_hosts::WorkerEndpoint::Private(_) => {
-            return Err(WorkerStartError::InvalidWorker)
-        }
-    };
+    let endpoint = worker.endpoint;
     if worker.sched_context == 0 || endpoint != route.endpoint() {
         return Err(WorkerStartError::InvalidWorker);
     }

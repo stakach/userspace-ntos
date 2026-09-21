@@ -265,3 +265,19 @@ invisible for a batch because the process then crashed for an unrelated reason b
 deadlock. Assert the RESOURCE the caller receives, and make every "insufficient resources" refusal
 print WHICH pool and how full — a status code that several distinct causes collapse onto is a
 diagnosis-free failure.
+
+## Explicit Completion Scope
+- When asked to continue until a GitHub issue is complete, verified prerequisite commits are
+  checkpoints, not stopping points. Continue through live integration, removal of superseded
+  paths and acceptance evidence; do not substitute passing adapter tests for native completion.
+
+## Serialized Validation
+- Polling a build/test session is not proof it exited. Check `exit_code` before launching the
+  next validation command; a returned `session_id` means the exclusive validation slot is busy.
+
+## Reply Recycling Boundaries
+- A native Reply ACK does not retire the wait/APC owner that sent it. Keep the capability
+  excluded until that owner records semantic retirement; perform fallible recycling at a later
+  receive checkpoint, outside memory-only retirement transactions.
+- Nested worker startup needs the same parent execution hold as nested dispatch. Do not restore
+  the parent after failed startup until the child has acknowledged stop and completed its drain.

@@ -46,6 +46,10 @@ impl DriverEntryRecipient {
             && self.channel.dispatch_label == channel.dispatch_label
     }
 
+    pub(super) fn completion_label(&self) -> u64 {
+        self.channel.dispatch_label
+    }
+
     pub(super) unsafe fn begin_initial(
         &mut self,
         caller: KernelProviderCaller,

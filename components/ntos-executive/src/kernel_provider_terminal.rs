@@ -77,7 +77,7 @@ unsafe fn deliver_and_retire(
     caller: KernelProviderCaller,
     identity: TerminalIdentity,
 ) -> Result<(), u32> {
-    let retired = with_provider_process_manager(|pm| {
+    let completion = with_provider_process_manager(|pm| {
         let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
         let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
         activations.validate_terminal_completion(caller, pm, lanes, identity)?;
@@ -140,11 +140,21 @@ unsafe fn deliver_and_retire(
         } else {
             Err(nt_process::STATUS_INVALID_HANDLE)
         };
-        activations.finish_terminal_completion(caller, pm, lanes, identity, local)
+        if lanes.peer_route(caller.dispatch().lane())
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?.is_some()
+        {
+            let label = activations.recipient(caller)?.completion_label();
+            let retired = activations.finish_shared_terminal_completion(
+                caller, pm, lanes, identity, local,
+            )?;
+            Ok(retired.map(|(attempt, _retired)| Some((attempt, label))))
+        } else {
+            activations.finish_terminal_completion(caller, pm, lanes, identity, local)
+                .map(|retired| retired.map(|_| None))
+        }
     })?;
-    if retired.is_none() {
-        return Err(nt_process::STATUS_INVALID_HANDLE);
-    }
+    let Some(shared) = completion else { return Err(nt_process::STATUS_INVALID_HANDLE); };
+    if let Some((attempt, label)) = shared { finish_shared_return(attempt, label)?; }
     // The original recipient and Ps references now belong to the Ready completion row.
     // Its existing outer delivery, not this local terminal, owns initialization and final ACK.
     crate::driver_launch::win32k_device_properties::retire_completed_transfers();

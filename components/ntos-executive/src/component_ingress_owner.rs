@@ -12,28 +12,15 @@ use nt_component_suspension::{
 
 static mut SHARED_INGRESS: NativeSharedIngress = NativeSharedIngress::new();
 
+#[path = "component_ingress_runtime.rs"]
+pub(crate) mod runtime;
+
 #[path = "component_ingress_startup.rs"]
 mod startup;
-pub(crate) use startup::{start_worker_peer, WorkerStartError};
+pub(crate) use startup::start_worker_peer;
 
 #[path = "component_ingress_fault.rs"]
 mod fault;
-
-/// Prepare the dormant global owner once, from serialized root initialization with no reentrant
-/// scheduler hooks. Failed owners stay in static storage; this does not export capabilities.
-pub(crate) unsafe fn prepare<C, R, T>(
-    retained_capacity: usize,
-    peer_capacity: usize,
-    lanes: &ComponentSuspensionLanes<C, R, T>,
-    probe_tcb: u64,
-) -> Result<(), InitializationError> {
-    (&mut *core::ptr::addr_of_mut!(SHARED_INGRESS)).initialize(
-        retained_capacity,
-        peer_capacity,
-        lanes,
-        probe_tcb,
-    )
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InitializationError {
@@ -58,7 +45,6 @@ pub(crate) enum PublicationError {
     WrongPhase,
     InvalidDestination,
     Export(PeerInstallationError<u64>),
-    FaultSpace(PeerInstallationError<u64>),
 }
 
 struct PendingPeer {
@@ -72,103 +58,6 @@ pub(crate) struct WorkerReadyExpectation {
     pub stack_base: u64,
     pub stack_bytes: u64,
     pub slot_capacity: usize,
-}
-
-/// Finish the endpoint setup of an exact shared worker while its physical owner keeps it stopped.
-/// Success arms faults but does not admit startup or resume the TCB. All aliases remain owned.
-pub(crate) unsafe fn prepare_worker_peer<C, R, T>(
-    route: PeerRoute,
-    domain: u64,
-    generation: u64,
-    lanes: &ComponentSuspensionLanes<C, R, T>,
-    worker: &crate::spawn_hosts::SpawnedComponentWorker,
-) -> Result<(), PublicationError> {
-    let endpoint = match &worker.endpoint {
-        crate::spawn_hosts::WorkerEndpoint::Shared(endpoint) => *endpoint,
-        crate::spawn_hosts::WorkerEndpoint::Private(_) => {
-            return Err(PublicationError::InvalidDestination)
-        }
-    };
-    if endpoint != route.endpoint()
-        || worker.tcb != route.identity().executor
-        || lanes.binding(route.identity().lane)
-            != Ok(nt_component_suspension::LaneBinding {
-                executor_id: worker.tcb,
-                receive_endpoint: endpoint,
-                reply_object: worker.reply_cap,
-            })
-    {
-        return Err(PublicationError::InvalidDestination);
-    }
-    let owner = &mut *core::ptr::addr_of_mut!(SHARED_INGRESS);
-    let _saved = crate::ipc_message::SavedMessageBuffer::capture();
-    owner.export_peer(route, domain, generation, lanes, |_| {
-        Some(PeerCapabilityDestination {
-            cnode: worker.cnode,
-            slot: crate::CT_FAULT,
-        })
-    })?;
-    // Export's copy is synchronous and cannot run root scheduling. Revalidate before SetSpace.
-    let peers = owner.peers.as_ref().expect("initialized registry");
-    if peers
-        .resolve_lane(route.badge(), domain, generation, lanes)
-        .map_err(PublicationError::Stage)?
-        != route
-        || lanes.phase(route.identity().lane) != Ok(LanePhase::Staged)
-    {
-        return Err(PublicationError::WrongPhase);
-    }
-    let installation = owner
-        .installations
-        .iter_mut()
-        .find(|installation| installation.route() == route)
-        .ok_or(PublicationError::UnknownPeer)?;
-    installation
-        .bind_space(worker.pml4, |binding| {
-            let status = crate::tcb_set_space_r(
-                binding.executor,
-                binding.fault_slot,
-                binding.cnode,
-                binding.vspace,
-            );
-            if status == 0 {
-                Ok(())
-            } else {
-                Err(status)
-            }
-        })
-        .map_err(PublicationError::FaultSpace)
-}
-
-/// The physical owner must keep this exact domain generation, stopped worker and endpoint alive.
-/// Reserve its canonical shared lane and publish only a root alias; child export and startup
-/// admission remain separate. On failure after staging, the owner retains the lane registration.
-pub(crate) unsafe fn allocate_publish_peer<C, R, T>(
-    lanes: &mut ComponentSuspensionLanes<C, R, T>,
-    domain: u64,
-    generation: u64,
-    binding: LaneBinding,
-) -> Result<PeerRoute, PublicationError> {
-    (&mut *core::ptr::addr_of_mut!(SHARED_INGRESS)).allocate_publish_peer(lanes, domain, generation, binding)
-}
-
-/// The resolver only observes an already-owned stopped worker and reserved empty child slot.
-/// It must validate the route's physical domain generation and keep the child CNode capability
-/// alive through uncertain copy and eventual teardown. No worker is resumed by this operation.
-pub(crate) unsafe fn export_peer<C, R, T>(
-    route: PeerRoute,
-    domain: u64,
-    generation: u64,
-    lanes: &ComponentSuspensionLanes<C, R, T>,
-    resolve_destination: impl FnOnce(PeerRoute) -> Option<PeerCapabilityDestination>,
-) -> Result<(), PublicationError> {
-    (&mut *core::ptr::addr_of_mut!(SHARED_INGRESS)).export_peer(
-        route,
-        domain,
-        generation,
-        lanes,
-        resolve_destination,
-    )
 }
 
 /// Keep this owner alive even after initialization refusal. No failure deletes capabilities,
@@ -455,23 +344,6 @@ impl NativeSharedIngress {
         )
     }
 
-    pub(crate) unsafe fn classify(
-        &mut self,
-        probe_tcb: u64,
-        resolve_caller: impl FnOnce(u64) -> Option<u64>,
-    ) -> Result<Option<ReceivedMessage>, super::ReceiveError> {
-        if !self.ready {
-            return Err(super::ReceiveError::Ownership(
-                nt_component_suspension::ReservedReceiveError::InvalidPhase,
-            ));
-        }
-        super::classify(
-            self.receiver.as_mut().expect("initialized receiver"),
-            probe_tcb,
-            resolve_caller,
-        )
-    }
-
     pub(crate) unsafe fn retain<C, R, T>(
         &mut self,
         lanes: &ComponentSuspensionLanes<C, R, T>,
@@ -528,7 +400,7 @@ impl NativeSharedIngress {
         ).map_err(super::ReceiveError::Admit)
     }
 
-    /// Register-only, label-zero reply. Invocation ACK consumes the Call but does not prove
+    /// Captured label-zero reply. Invocation ACK consumes the Call but does not prove
     /// provider completion; ordinary scheduling may run the provider before this function returns.
     pub(crate) unsafe fn reply<C, R, T>(
         &mut self,
@@ -543,7 +415,7 @@ impl NativeSharedIngress {
                 nt_component_suspension::ReservedReceiveError::InvalidPhase,
             ));
         }
-        if words.len() > 4 {
+        if words.len() > 120 {
             return Err(super::ReceiveError::InvalidReplyLength);
         }
         let _saved = crate::ipc_message::SavedMessageBuffer::capture();
@@ -553,11 +425,18 @@ impl NativeSharedIngress {
             ));
         }
         let mut registers = [0u64; 4];
-        registers[..words.len()].copy_from_slice(words);
+        let fast_len = words.len().min(registers.len());
+        registers[..fast_len].copy_from_slice(&words[..fast_len]);
         self.receiver.as_mut().expect("initialized receiver").reply_stored(
             route, dispatch, lanes,
             |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
             |reply| {
+                // Binding queries use the same IPC bank. Materialize extended words only after
+                // all ownership probes, immediately before the one-shot retained Reply effect.
+                let base = crate::IPC_BUFFER.load(core::sync::atomic::Ordering::Relaxed) as *mut u64;
+                for (index, word) in words.iter().enumerate().skip(4) {
+                    core::ptr::write_volatile(base.add(index + 1), *word);
+                }
                 let error = crate::reply_on(reply, words.len() as u64,
                     registers[0], registers[1], registers[2], registers[3]);
                 if error == 0 {

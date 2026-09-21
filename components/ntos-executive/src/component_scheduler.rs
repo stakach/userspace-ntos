@@ -27,6 +27,8 @@ impl ComponentSchedulerScope {
     pub(crate) unsafe fn service_irq_yield(&self, shared_va: u64) {
         let _message = crate::ipc_message::SavedMessageBuffer::capture();
         let _durable = crate::allocator::enter_durable();
+        let parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
+            .expect("IRQ scheduling must preserve its exact parent invocation");
         let yield_number = YIELDS.fetch_add(1, Ordering::Relaxed) + 1;
         crate::dispatcher_bootstrap::request_receive_checkpoint();
         let timer_work = crate::dispatcher_bootstrap::service_hosted_timer_work();
@@ -64,6 +66,8 @@ impl ComponentSchedulerScope {
             }
             print_str(b"\n");
         }
+        crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(parent)
+            .expect("IRQ scheduling must restore its retained parent invocation");
     }
 }
 
@@ -80,12 +84,33 @@ impl Drop for ComponentSchedulerScope {
 pub(super) unsafe fn hosted_component_pump(
     channel: &crate::spawn_hosts::PumpChannel,
 ) -> crate::spawn_hosts::PumpResult {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let mut channel = *channel;
+    let route = runtime::channel_route(&channel).expect("physical hosted ingress identity");
+    let parent = if channel.initial == crate::spawn_hosts::InitialAction::ReplyRequest {
+        let parent = runtime::nested::park_current().expect("retain nested hosted parent");
+        let route = route.expect("hosted dispatch requires enrolled source");
+        runtime::admit(route).expect("admit exact hosted dispatch Call");
+        channel.reply_cap = runtime::current_reply(route).expect("admitted canonical Reply");
+        parent
+    } else { None };
+    let channel = &mut channel;
     let scope = ComponentSchedulerScope::enter();
     let mut result = crate::spawn_hosts::component_pump(channel);
     while result.scheduler_yielded {
         scope.service_irq_yield(channel.shared_va);
+        if let Some(route) = route {
+            channel.reply_cap = runtime::current_reply(route).expect("retained canonical Reply");
+        }
         result = crate::spawn_hosts::component_pump_continue_receive(channel, &result)
             .expect("hosted IRQ yield must retain its exact receive continuation");
     }
+    if result.completed {
+        let route = route.expect("hosted completion requires enrolled source");
+        let dispatch = runtime::dispatch(route).expect("retained hosted dispatch epoch");
+        runtime::complete(route, dispatch, result.reply_cap, channel.dispatch_label)
+            .expect("authenticate hosted final completion Call");
+    }
+    runtime::nested::restore(parent).expect("restore nested hosted parent");
     result
 }

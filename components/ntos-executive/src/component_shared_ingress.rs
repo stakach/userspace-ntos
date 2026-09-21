@@ -1,5 +1,5 @@
 //! Receive-only adapter for shared ingress with exact execution-owner admission.
-//! Private pumps remain in use until native routing and ReplyRecv ownership are wired.
+//! Live provider pumps retain arrivals here and acknowledge Replies independently of receive.
 
 #[path = "component_ingress_owner.rs"]
 pub(crate) mod owner;

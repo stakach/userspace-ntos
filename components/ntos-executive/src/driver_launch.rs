@@ -24,6 +24,15 @@
 #[allow(dead_code)]// Activated only by the atomic ISR/DPC/provider cutover tracked in the plan.
 mod hosted_irq_broker;
 
+#[path = "hosted_ingress_sources.rs"]
+pub(crate) mod hosted_ingress_sources;
+
+#[path = "hosted_thread_resources.rs"]
+mod hosted_thread_resources;
+
+#[path = "hosted_primary_retirement.rs"]
+mod hosted_primary_retirement;
+
 #[path = "component_scheduler.rs"]
 mod component_scheduler;
 #[path = "hosted_dpc_scheduler.rs"]
@@ -247,15 +256,10 @@ const FSD_WORKER_SCRATCH_OFFSET: u64 = 0x0004_2000;
 const FSD_IRQ_LANE_ARENA_OFFSET: u64 = 0x0004_3000;
 const FSD_IRQ_LANE_COMPONENT_SLOT: usize = 0;
 const FSD_WORKER_EXEC_ALIAS_BASE: u64 = 0x0000_0102_0000_0000;
-const FSD_WORKER_BADGE_BASE: u64 = 0x0000_0000_0001_0000;
 const HOSTED_DRIVER_WAIT_OBJECT_MAX: u32 = 64;
 const _: () = assert!(FSD_WORKER_VADDR > crate::WORK_CLUSTER_BASE + 0x20_0000);
 const _: () = assert!(FSD_WORKER_VADDR & (FSD_WORKER_STRIDE - 1) == 0);
 const _: () = assert!(FSD_WORKER_STRIDE & 0x1f_ffff == 0);
-const _: () = assert!(
-    FSD_WORKER_BADGE_BASE
-        > crate::TP_WORKER_AUX_BADGE_BASE + (crate::MAX_PI * crate::TP_WORKER_SLOT_COUNT) as u64
-);
 const _: () = assert!(
     FSD_IRQ_LANE_ARENA_OFFSET + nt_hosted_runtime::HOSTED_IRQ_ARENA_BYTES <= FSD_WORKER_STRIDE
         && FSD_WORKER_SCRATCH_OFFSET + 0x1000 <= FSD_IRQ_LANE_ARENA_OFFSET
@@ -12379,23 +12383,29 @@ fn hosted_driver_component_object_exec_va(
 
 pub(crate) enum HostedDriverWaitServiceResult {
     Reply(i32),
-    Parked { fresh_reply_cap: u64 },
+    SharedParked {
+        route: nt_component_suspension::peer_registry::PeerRoute,
+        dispatch: nt_component_suspension::LaneDispatchIdentity,
+        reply: u64,
+        token: u64,
+    },
 }
 
 pub(crate) enum HostedDriverThreadTerminateServiceResult {
     Reply(i32),
-    Terminated { fresh_reply_cap: u64 },
+    SharedTerminated { route: nt_component_suspension::peer_registry::PeerRoute },
 }
 
 fn park_hosted_driver_wait(
     instance: usize,
     thread_handle: u64,
+    route: nt_component_suspension::peer_registry::PeerRoute,
     active_reply_cap: u64,
     objects: Vec<u64>,
     wait_all: bool,
     api_multiple: bool,
     deadline: nt_kernel_exec::Deadline,
-) -> Option<u64> {
+) -> Option<HostedDriverWaitServiceResult> {
     if objects.is_empty() || objects.len() > HOSTED_DRIVER_WAIT_OBJECT_MAX as usize {
         return None;
     }
@@ -12404,6 +12414,9 @@ fn park_hosted_driver_wait(
     {
         return None;
     }
+    let dispatch = unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::dispatch(route).ok()? };
+    if unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::current_reply(route).ok()? }
+        != active_reply_cap { return None; }
     let waiters = unsafe { hosted_driver_waiters_mut() };
     if waiters.iter().any(|waiter| {
         waiter.instance == instance
@@ -12414,8 +12427,8 @@ fn park_hosted_driver_wait(
     if waiters.len() == waiters.capacity() && waiters.try_reserve(4).is_err() {
         return None;
     }
-    let fresh = unsafe { take_hosted_driver_reply_spare(instance)? };
     let sequence = crate::next_dispatcher_wait_sequence();
+    let shared = HostedDriverSharedWait { route, dispatch, token: sequence };
     waiters.push(HostedDriverRawWaiter {
         instance,
         thread_handle,
@@ -12425,19 +12438,28 @@ fn park_hosted_driver_wait(
         api_multiple,
         deadline,
         sequence,
+        shared,
+        wake_status: None,
     });
     // End the vector borrow before the collector reads the newly published deadline. The
-    // original reply capability stays active until programming and rotation both succeed.
+    // original Reply remains canonical until programming and external suspension both succeed.
     let timer_ready = deadline == nt_kernel_exec::Deadline::Infinite
         || unsafe { crate::service_sec_image::rearm_registered_delay_timer() }.deadline_programmed();
-    let committed = timer_ready
-        && unsafe {
-            hosted_driver_thread_table_mut(instance).and_then(|table| {
-                table.commit_wait(thread_handle, || {
-                    rotate_hosted_driver_active_reply(instance, active_reply_cap, fresh)
-                }).ok()
-            }) == Some(true)
-        };
+    let committed = if !timer_ready { false } else {
+        // Validate before entering the memory-only suspension transition. No thread-table borrow
+        // crosses shared ingress; after success the same serialized owner commits Waiting.
+        let live = unsafe { (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_TABLES)).as_ref()
+            .and_then(|tables| tables.get(instance)).and_then(|table| table.get(thread_handle)) }
+            .is_some_and(|thread| thread.exit_status.is_none());
+        if !live || unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::park_service(shared.route, shared.token) }.is_err() {
+            false
+        } else {
+            unsafe { hosted_driver_thread_table_mut(instance)
+                .and_then(|table| table.set_waiting(thread_handle).ok()) }
+                .expect("validated shared wait thread disappeared without native effects");
+            true
+        }
+    };
     if !committed {
         unsafe {
             let waiters = hosted_driver_waiters_mut();
@@ -12448,7 +12470,6 @@ fn park_hosted_driver_wait(
                     && waiter.thread_handle == thread_handle
             }).expect("uncommitted driver wait disappeared");
             waiters.remove(index);
-            return_hosted_driver_reply_spare(instance, fresh);
         }
         return None;
     }
@@ -12457,21 +12478,32 @@ fn park_hosted_driver_wait(
     } else {
         HOSTED_DRIVER_WAIT_SINGLE_PARKED.fetch_add(1, Ordering::Relaxed);
     }
-    Some(fresh)
+    Some(HostedDriverWaitServiceResult::SharedParked {
+        route: shared.route, dispatch: shared.dispatch, reply: active_reply_cap, token: shared.token,
+    })
 }
 
-unsafe fn reply_hosted_driver_waiter(waiter: HostedDriverRawWaiter, status: i32) -> bool {
+unsafe fn reply_hosted_driver_waiter(mut waiter: HostedDriverRawWaiter, status: i32) -> bool {
+    let shared = waiter.shared;
     let instance = waiter.instance;
-    let replied =
-        crate::spawn_hosts::pump_reply_on(waiter.reply_cap, 1, status as u32 as u64, 0, 0, 0);
-    let _ = hosted_driver_thread_table_mut(instance)
-        .and_then(|table| table.set_ready(waiter.thread_handle).ok());
-    if replied {
-        return_hosted_driver_reply_spare(instance, waiter.reply_cap);
-    } else {
-        let _ = cnode_delete_recycle_r(waiter.reply_cap);
-    }
-    replied
+    let thread_handle = waiter.thread_handle;
+    let sequence = waiter.sequence;
+    let reply = waiter.reply_cap;
+    waiter.wake_status = Some(status);
+    // Retain the consumed selection and continuation before a native Reply/query can enter.
+    // Failure never puts the object selection back into the ready/timeout scan.
+    hosted_driver_waiters_mut().push(waiter);
+    let result = crate::spawn_hosts::shared_ingress::owner::runtime::wake_service(
+        shared.route, shared.dispatch, reply, shared.token, status,
+    );
+    if result.is_err() { return false; }
+    let waiters = hosted_driver_waiters_mut();
+    let index = waiters.iter().position(|row| row.instance == instance
+        && row.thread_handle == thread_handle && row.sequence == sequence
+        && row.reply_cap == reply).expect("shared wake lost its retained waiter");
+    waiters.remove(index);
+    let _ = hosted_driver_thread_table_mut(instance).and_then(|table| table.set_ready(thread_handle).ok());
+    true
 }
 
 fn record_hosted_driver_wait_wake_error(api_multiple: bool) {
@@ -12522,6 +12554,7 @@ pub(crate) fn hosted_driver_wait_next_deadline(now: nt_time::TimeSnapshot) -> Op
         (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS))
             .as_ref()?
             .iter()
+            .filter(|waiter| waiter.wake_status.is_none())
             .filter_map(|waiter| waiter.deadline.monotonic_target(now))
             .min()
     }
@@ -12645,7 +12678,7 @@ pub(crate) unsafe fn hosted_driver_wait_wake_due(now: nt_time::TimeSnapshot) -> 
             waiters
                 .iter()
                 .enumerate()
-                .filter(|(_, waiter)| waiter.deadline.is_due(now))
+                .filter(|(_, waiter)| waiter.wake_status.is_none() && waiter.deadline.is_due(now))
                 .min_by_key(|(_, waiter)| (waiter.deadline.ordering_key(now), waiter.sequence))
                 .map(|(index, _)| index)
         };
@@ -12676,6 +12709,7 @@ fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
                 .enumerate()
                 .filter(|(_, waiter)| {
                     waiter.instance == instance
+                        && waiter.wake_status.is_none()
                         && matches!(
                             hosted_dispatcher_wait_ready(&waiter.objects, waiter.wait_all),
                             Ok(Some(_))
@@ -28674,6 +28708,7 @@ unsafe fn dispatch_hosted_provider_export_legacy(
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: provider_inst.fault_ep,
         physical_domain: instance_domain_identity(provider_inst),
+        ingress_route: hosted_ingress_sources::primary_route(singleton.instance),
         pml4: provider_inst.pml4,
         code_va: 0,
         image_frames: 0,
@@ -29118,6 +29153,7 @@ unsafe fn dispatch_hosted_component_target(
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: inst.fault_ep,
         physical_domain: instance_domain_identity(inst),
+        ingress_route: hosted_ingress_sources::primary_route(instance_index),
         pml4: inst.pml4,
         code_va: 0,
         image_frames: 0,
@@ -36507,7 +36543,6 @@ unsafe fn load_driver_reserved(
     driver_instances_mut()[instance].driver_id = driver_id;
 
     // 4. Build the FSD-class descriptor + spawn the isolated component.
-    let fault_ep = make_object(OBJ_ENDPOINT);
     print_str(b"[driver-launch] spawn-fsd begin inst=");
     print_u64(instance as u64);
     print_str(b" image-frames=");
@@ -36521,7 +36556,6 @@ unsafe fn load_driver_reserved(
         data_base,
         shared_base,
         arg_base,
-        fault_ep,
         img_frames,
         &rights[..img_frames as usize],
     );
@@ -36541,6 +36575,8 @@ unsafe fn load_driver_reserved(
     let sched_context = sc.sched_context;
     let map_cap_bank = sc.map_cap_bank;
     let stack_frame_base = sc.stack_frame_base;
+    let fault_ep = crate::spawn_hosts::shared_ingress::owner::runtime::prepare(tcb)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     if unsafe { map_fsd_main_stack_exec_alias(instance, stack_frame_base, win.stack_va) }.is_none()
     {
         print_str(b"[driver-launch] stack alias map failed inst=");
@@ -36564,15 +36600,8 @@ unsafe fn load_driver_reserved(
         print_str(b"\n");
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
-    // ★ This instance's DEDICATED MCS reply object — the server-side binding of the `Call`
-    // transport. One per component is enough at any depth (one TCB ⇒ at most one outstanding Call).
-    let reply_cap = crate::ensure_fsd_reply_slot(instance);
-    if reply_cap == 0 {
-        print_str(b"[driver-launch] reply cap allocation failed inst=");
-        print_u64(instance as u64);
-        print_str(b"\n");
-        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
-    }
+    let reply_cap = crate::spawn_hosts::shared_ingress::owner::runtime::allocate_reply(tcb)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let main_thread_id = {
         let table = hosted_driver_thread_table_mut(instance)
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
@@ -36622,15 +36651,12 @@ unsafe fn load_driver_reserved(
             ..EMPTY_INSTANCE
         },
     );
-    let resume_error = crate::spawn_hosts::resume_spawned_component(&sc);
-    if resume_error != 0 {
-        print_str(b"[driver-launch] component resume failed inst=");
-        print_u64(instance as u64);
-        print_str(b" label=");
-        print_u64(resume_error);
-        print_str(b"\n");
-        return Err(nt_status::NtStatus::UNSUCCESSFUL);
-    }
+    let route = hosted_ingress_sources::enroll_primary(instance)
+        .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
+    let parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
+        .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
+    crate::spawn_hosts::shared_ingress::owner::runtime::start_bootstrap(route, cnode, sched_context)
+        .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
     // 5. Drive the DriverEntry init fault-recv loop THROUGH THE SHARED HARNESS PUMP: demand-map
     //    benign pages, wall on a low/in-image fault or the 512 demand cap, wait for the dispatch-ready
     //    signal (FSD_DISPATCH_LABEL). Faults report addresses in the COMPONENT's VSpace (image runs at
@@ -36639,6 +36665,7 @@ unsafe fn load_driver_reserved(
     // to issue its ready `Call`), so the pump must start by RECEIVING. Trace on for observability.
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep,
+        ingress_route: Some(route),
         physical_domain: instance_domain_identity(domain),
         pml4,
         code_va: run_va,
@@ -36668,6 +36695,8 @@ unsafe fn load_driver_reserved(
         },
     };
     let pr = hosted_component_pump(&ch);
+    crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(parent)
+        .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
     let faults = pr.faults;
     let demand = pr.demand;
     let finished = pr.completed;
@@ -36832,7 +36861,6 @@ unsafe fn spawn_fsd_component(
     data_base: u64,
     shared: u64,
     arg_base: u64,
-    fault_ep: u64,
     image_frames: u64,
     rights: &[u64],
 ) -> crate::spawn_hosts::SpawnedComponent {
@@ -36899,7 +36927,7 @@ unsafe fn spawn_fsd_component(
         regions: &regions,
         granted: GrantedCaps {
             result_ntfn: None,
-            fault_ep: Some(fault_ep),
+            fault_ep: None,
         },
         prio: 100,
         gs_base: Some(FSD_KPCR_VA),
@@ -43448,6 +43476,10 @@ struct HostedIrqLaneRuntime {
     state: HostedIrqLaneState,
     pml4: u64,
     endpoint: u64,
+    route: Option<nt_component_suspension::peer_registry::PeerRoute>,
+    ingress_entered: bool,
+    ingress_retired: bool,
+    cleanup_entered: bool,
     reply_cap: u64,
     tcb: u64,
     tcb_resumed: bool,
@@ -43486,6 +43518,10 @@ impl HostedIrqLaneRuntime {
             state: HostedIrqLaneState::Booting,
             pml4,
             endpoint: 0,
+            route: None,
+            ingress_entered: false,
+            ingress_retired: false,
+            cleanup_entered: false,
             reply_cap: 0,
             tcb: 0,
             tcb_resumed: false,
@@ -46613,10 +46649,29 @@ unsafe fn release_hosted_irq_lane_cap(cap: &mut u64) -> u64 {
 
 unsafe fn release_hosted_irq_lane_mechanism(lane: &mut HostedIrqLaneRuntime) -> u64 {
     lane.state = HostedIrqLaneState::ShuttingDown;
+    if lane.ingress_entered && !lane.ingress_retired {
+        // Shared ingress owns the peer aliases and all rotated Replies. Native drain/retirement
+        // must acknowledge those obligations before this physical allocation can be released.
+        return 1;
+    }
+    if lane.cleanup_entered {
+        return 1;
+    }
+    if !lane.ingress_entered && lane.reply_cap != 0 {
+        let Some(inst) = instance(lane.projection_instance) else { return 1; };
+        if instance_domain_identity(inst) != Some(lane.domain) || inst.pml4 != lane.pml4 {
+            return 1;
+        }
+        if crate::spawn_hosts::shared_ingress::owner::runtime::return_initial_reply(
+            lane.reply_cap, inst.tcb).is_err() { return 1; }
+        lane.reply_cap = 0;
+    }
+    // Retain the complete allocation after any uncertain native cleanup result. Restarting this
+    // sequence would replay a deletion or unmap whose acknowledgement may have been lost.
+    lane.cleanup_entered = true;
     let mut failures = 0u64;
     if lane.tcb != 0 && lane.tcb_resumed && tcb_suspend_r(lane.tcb) != 0 {
-        // The TCB may still execute from every mapping below. Retain the complete tombstone and
-        // retry suspension before releasing even one subordinate capability.
+        // The TCB may still execute from every mapping below; retain the complete tombstone.
         return 1;
     }
     lane.tcb_resumed = false;
@@ -46658,18 +46713,14 @@ unsafe fn release_hosted_irq_lane_mechanism(lane: &mut HostedIrqLaneRuntime) -> 
     for leaf in lane.stack.iter_mut().rev() {
         failures += release_hosted_irq_lane_leaf(leaf);
     }
-    failures += release_hosted_irq_lane_cap(&mut lane.reply_cap);
-    failures += release_hosted_irq_lane_cap(&mut lane.endpoint);
-    failures
-}
-
-unsafe fn allocate_hosted_irq_endpoint() -> Option<u64> {
-    let cap = try_alloc_slot()?;
-    if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_ENDPOINT, 0, 1, cap) != 0 {
-        recycle_deleted_root_slot(cap);
-        return None;
+    // Shared ingress owns every Reply, including failed constructors' unpublished initials.
+    // Successful ingress retirement already cleared this snapshot; it is never a delete target.
+    if lane.reply_cap != 0 { failures += 1; }
+    // The shared endpoint is borrowed from the ingress owner, even for failed construction.
+    if failures == 0 {
+        lane.cleanup_entered = false;
     }
-    Some(cap)
+    failures
 }
 
 unsafe fn attach_hosted_irq_lane_sched_context(lane: &mut HostedIrqLaneRuntime) -> Result<(), u64> {
@@ -46850,14 +46901,6 @@ unsafe fn build_hosted_irq_lane(
             status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
             partial: None,
         })?;
-    let badge =
-        FSD_WORKER_BADGE_BASE
-            .checked_add(exec_alias_slot)
-            .filter(|badge| nt_component_suspension::badge::valid_endpoint_badge(*badge))
-            .ok_or(HostedIrqLaneBuildError {
-                status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
-                partial: None,
-            })?;
     let component_kpcr_va = component_base
         .checked_add(FSD_WORKER_SCRATCH_OFFSET)
         .ok_or(HostedIrqLaneBuildError {
@@ -46883,7 +46926,7 @@ unsafe fn build_hosted_irq_lane(
         identity,
         inst.pml4,
         exec_arena_va,
-        badge,
+        0,
     );
 
     let built = (|| -> Option<()> {
@@ -46976,8 +47019,8 @@ unsafe fn build_hosted_irq_lane(
         )
         .ok()?;
 
-        lane.endpoint = allocate_hosted_irq_endpoint()?;
-        lane.reply_cap = allocate_hosted_driver_reply_cap()?;
+        lane.endpoint = crate::spawn_hosts::shared_ingress::owner::runtime::prepare(inst.tcb).ok()?;
+        lane.reply_cap = crate::spawn_hosts::shared_ingress::owner::runtime::allocate_reply(inst.tcb).ok()?;
         lane.raw_cnode = try_alloc_slot()?;
         if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, lane.raw_cnode) != 0 {
             recycle_deleted_root_slot(lane.raw_cnode);
@@ -47000,10 +47043,6 @@ unsafe fn build_hosted_irq_lane(
             return None;
         }
         lane.cspace_pml4 = true;
-        if cnode_mint_r(lane.cnode, CT_FAULT, lane.endpoint, badge) != 0 {
-            return None;
-        }
-        lane.cspace_fault = true;
 
         lane.tcb = try_alloc_slot()?;
         if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, lane.tcb) != 0 {
@@ -47011,7 +47050,7 @@ unsafe fn build_hosted_irq_lane(
             lane.tcb = 0;
             return None;
         }
-        if tcb_set_space_r(lane.tcb, CT_FAULT, lane.cnode, inst.pml4) != 0
+        if tcb_set_space_r(lane.tcb, 0, lane.cnode, inst.pml4) != 0
             || tcb_set_ipc_buffer_r(lane.tcb, ipcbuf_va, lane.ipc_buffer.cap) != 0
         {
             return None;
@@ -47042,8 +47081,14 @@ unsafe fn hosted_irq_lane_channel(
     lane: &HostedIrqLaneRuntime,
     inst: DriverInstance,
 ) -> Option<crate::spawn_hosts::PumpChannel> {
+    let route = lane.route?;
+    let binding = crate::service_sec_image::component_execution_lane_binding(route.identity().lane)?;
+    if binding.executor_id != lane.tcb || binding.receive_endpoint != lane.endpoint {
+        return None;
+    }
     Some(crate::spawn_hosts::PumpChannel {
         fault_ep: lane.endpoint,
+        ingress_route: Some(route),
         physical_domain: Some(lane.domain),
         pml4: lane.pml4,
         code_va: FSD_CODE_VA,
@@ -47057,7 +47102,7 @@ unsafe fn hosted_irq_lane_channel(
         trace_faults: false,
         initial: crate::spawn_hosts::InitialAction::RecvFirst,
         tcb: lane.tcb,
-        reply_cap: lane.reply_cap,
+        reply_cap: binding.reply_object,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
@@ -47084,6 +47129,10 @@ pub(crate) fn hosted_irq_pump_caller_tcb(
     let lane = unsafe { hosted_irq_lanes()? }
         .iter()
         .find(|lane| lane.identity == identity)?;
+    let route = lane.route?;
+    let binding = unsafe {
+        crate::service_sec_image::component_execution_lane_binding(route.identity().lane)?
+    };
     let inst = instance(lane.projection_instance)?;
     if !matches!(lane.state, HostedIrqLaneState::Booting | HostedIrqLaneState::Ready)
         || !lane.tcb_resumed
@@ -47101,8 +47150,10 @@ pub(crate) fn hosted_irq_pump_caller_tcb(
         || channel.physical_domain != Some(lane.domain)
         || channel.tcb != lane.tcb
         || channel.fault_ep != lane.endpoint
-        || channel.reply_cap != lane.reply_cap
-        || reply_cap != lane.reply_cap
+        || binding.executor_id != lane.tcb
+        || binding.receive_endpoint != lane.endpoint
+        || channel.reply_cap != binding.reply_object
+        || reply_cap != binding.reply_object
         || channel.pml4 != lane.pml4
         || channel.shared_va != inst.exec_shared_va
         || channel.code_va != FSD_CODE_VA
@@ -47194,6 +47245,22 @@ unsafe fn retire_hosted_irq_lane_if_unreferenced(
     if hosted_irq_lane_is_referenced(&hosted_irq_lanes_mut()[index]) {
         return Ok(());
     }
+    if hosted_irq_lanes().unwrap()[index].ingress_entered
+        && !hosted_irq_lanes().unwrap()[index].ingress_retired
+    {
+        let route = hosted_irq_lanes().unwrap()[index].route
+            .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+        crate::spawn_hosts::shared_ingress::owner::runtime::retire(route)
+            .map_err(|_| nt_status::NtStatus::DEVICE_BUSY)?;
+        let lane = &mut hosted_irq_lanes_mut()[index];
+        lane.ingress_retired = true;
+        lane.tcb_resumed = false;
+        lane.cspace_fault = false;
+        // The initial Reply may now belong to another peer or the global replacement pool.
+        // Retirement retained its owner there; physical lane cleanup never deletes it.
+        lane.reply_cap = 0;
+        lane.state = HostedIrqLaneState::ShuttingDown;
+    }
     let state = hosted_irq_lanes_mut()[index].state;
     match state {
         HostedIrqLaneState::Ready => {
@@ -47262,51 +47329,77 @@ unsafe fn ensure_hosted_irq_lane(
             return Err(error.status);
         }
     };
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
     let generation = lane.identity.lane_generation;
-    let badge = lane.badge;
-    let tcb = lane.tcb;
+    let identity = lane.identity;
+    let cnode = lane.cnode;
+    let sched_context = lane.sched_context;
     hosted_irq_lanes_mut().push(lane);
     let lane_index = hosted_irq_lanes_mut().len() - 1;
-    let Some(channel) = hosted_irq_lane_channel(&hosted_irq_lanes_mut()[lane_index], inst) else {
-        hosted_irq_lanes_mut()[lane_index].state = HostedIrqLaneState::Quarantined;
-        let _ = retire_hosted_irq_lane_if_unreferenced(projection_instance, domain);
-        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    hosted_irq_lanes_mut()[lane_index].ingress_entered = true;
+    let route = match hosted_ingress_sources::enroll_interrupt(identity) {
+        Ok(route) => route,
+        Err(_) => {
+            quarantine_shared_hosted_irq_lane(lane_index);
+            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        }
     };
-    if tcb_resume_r(tcb) != 0 {
-        hosted_irq_lanes_mut()[lane_index].state = HostedIrqLaneState::Quarantined;
-        let _ = retire_hosted_irq_lane_if_unreferenced(projection_instance, domain);
-        return Err(nt_status::NtStatus::UNSUCCESSFUL);
-    }
-    hosted_irq_lanes_mut()[lane_index].tcb_resumed = true;
-    let exchange = crate::spawn_hosts::component_hosted_irq_exchange(
-        &channel,
-        crate::spawn_hosts::HostedIrqExchangeAction::ReceiveReady {
-            identity: hosted_irq_lanes_mut()[lane_index].identity,
-        },
-        badge,
-        FSD_IRQ_LANE_COMPLETION_LABEL,
-    );
-    if exchange.message != crate::spawn_hosts::HostedIrqExchangeMessage::Ready
-        || exchange.reply_cap != channel.reply_cap
     {
-        hosted_irq_lanes_mut()[lane_index].state = HostedIrqLaneState::Quarantined;
-        let _ = retire_hosted_irq_lane_if_unreferenced(projection_instance, domain);
-        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        let lane = &mut hosted_irq_lanes_mut()[lane_index];
+        lane.route = Some(route);
+        lane.endpoint = route.endpoint();
+        lane.badge = route.badge();
     }
-    let lane = &mut hosted_irq_lanes_mut()[lane_index];
-    if lane.exec_arena_va == 0
-        || !lane.arena.iter().all(|leaf| leaf.exec_mapped)
-        || (&*(lane.exec_arena_va as *const nt_hosted_runtime::HostedIrqArena))
-            .control
-            .root_activate(lane.identity)
-            .is_err()
-    {
-        lane.state = HostedIrqLaneState::Quarantined;
-        let _ = retire_hosted_irq_lane_if_unreferenced(projection_instance, domain);
+    let Some(channel) = hosted_irq_lane_channel(&hosted_irq_lanes().unwrap()[lane_index], inst) else {
+        quarantine_shared_hosted_irq_lane(lane_index);
+        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    };
+    let parent = runtime::nested::park_current().expect("retain parent before IRQ startup");
+    let started = (|| {
+        // Mark possible execution before entering the one-shot native resume owner.
+        hosted_irq_lanes_mut()[lane_index].tcb_resumed = true;
+        runtime::start_protocol(route, cnode, sched_context)?;
+        hosted_irq_lanes_mut()[lane_index].cspace_fault = true;
+        runtime::ready_protocol(
+            route, &channel, FSD_IRQ_LANE_COMPLETION_LABEL, identity.ready_transport_words(),
+        )?;
+        let activated = {
+            let lane = &hosted_irq_lanes().unwrap()[lane_index];
+            lane.exec_arena_va != 0
+                && lane.arena.iter().all(|leaf| leaf.exec_mapped)
+                && (&*(lane.exec_arena_va as *const nt_hosted_runtime::HostedIrqArena))
+                    .control.root_activate(lane.identity).is_ok()
+        };
+        if activated { Ok(()) } else { Err(runtime::Error::Startup) }
+    })();
+    if started.is_err() {
+        quarantine_shared_hosted_irq_lane(lane_index);
+        // No interrupt connection, arena transaction or dependency is published before Ready.
+        // This exact unreferenced startup can be canceled; an uncertain stop/drain cannot unwind
+        // into the caller's service reply or release its retained execution hold.
+        assert!(!hosted_irq_lane_is_referenced(&hosted_irq_lanes().unwrap()[lane_index]),
+            "failed IRQ startup retains semantic owner and parent");
+        retire_hosted_irq_lane_if_unreferenced(projection_instance, domain)
+            .expect("failed IRQ startup retains uncertain drain and parent");
+        runtime::nested::restore(parent).expect("restore parent after canceled IRQ startup");
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     hosted_irq_lanes_mut()[lane_index].state = HostedIrqLaneState::Ready;
+    runtime::nested::restore(parent).expect("restore parent after acknowledged IRQ readiness");
     Ok(generation)
+}
+
+unsafe fn quarantine_shared_hosted_irq_lane(index: usize) {
+    let route = {
+        let lane = &mut hosted_irq_lanes_mut()[index];
+        lane.state = HostedIrqLaneState::Quarantined;
+        lane.route
+    };
+    if let Some(route) = route {
+        if crate::spawn_hosts::shared_ingress::owner::runtime::quarantine(route).is_err() {
+            print_str(b"[hosted-irq] quarantine retained without stop acknowledgement\n");
+        }
+    }
 }
 
 pub(crate) fn latch_hosted_irq_badge(badge: u64) -> u64 {
@@ -51103,7 +51196,10 @@ struct HostedDriverThreadRuntime {
     domain: HostedDomainIdentity,
     handle: u64,
     tcb: u64,
-    badge: u64,
+    pml4: u64,
+    reply_cap: u64,
+    ingress_route: Option<nt_component_suspension::peer_registry::PeerRoute>,
+    construction: usize,
     component_slot: usize,
     exec_alias_slot: u64,
     component_scratch_va: u64,
@@ -51116,7 +51212,8 @@ struct HostedDriverThreadRuntime {
 #[derive(Clone, Copy)]
 struct HostedDriverThreadSpawn {
     tcb: u64,
-    badge: u64,
+    reply_cap: u64,
+    construction: usize,
     component_slot: usize,
     exec_alias_slot: u64,
     component_scratch_va: u64,
@@ -51135,17 +51232,20 @@ struct HostedDriverRawWaiter {
     api_multiple: bool,
     deadline: nt_kernel_exec::Deadline,
     sequence: u64,
+    shared: HostedDriverSharedWait,
+    wake_status: Option<i32>,
 }
 
-#[derive(Default)]
-struct HostedDriverReplyPool {
-    spares: Vec<u64>,
+#[derive(Clone, Copy)]
+struct HostedDriverSharedWait {
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    token: u64,
 }
 
 static mut HOSTED_DRIVER_THREAD_TABLES: Option<Vec<HostedDriverThreadTable>> = None;
 static mut HOSTED_DRIVER_THREAD_RUNTIMES: Option<Vec<HostedDriverThreadRuntime>> = None;
 static mut HOSTED_DRIVER_WAITERS: Option<Vec<HostedDriverRawWaiter>> = None;
-static mut HOSTED_DRIVER_REPLY_POOLS: Option<Vec<HostedDriverReplyPool>> = None;
 static mut HOSTED_DRIVER_TIMERS: Option<Vec<nt_kernel_exec::TimerQueue>> = None;
 
 struct ExecutiveClock;
@@ -51270,67 +51370,10 @@ unsafe fn hosted_driver_timer_queue_mut(
     &mut queues[instance]
 }
 
-unsafe fn hosted_driver_reply_pools_mut() -> &'static mut Vec<HostedDriverReplyPool> {
-    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DRIVER_REPLY_POOLS);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    slot.as_mut().unwrap()
-}
-
-unsafe fn hosted_driver_reply_pool_mut(instance: usize) -> &'static mut HostedDriverReplyPool {
-    let pools = hosted_driver_reply_pools_mut();
-    while pools.len() <= instance {
-        pools.push(HostedDriverReplyPool::default());
-    }
-    &mut pools[instance]
-}
-
-unsafe fn allocate_hosted_driver_reply_cap() -> Option<u64> {
-    let cap = try_alloc_slot()?;
-    if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap) != 0 {
-        recycle_deleted_root_slot(cap);
-        return None;
-    }
-    Some(cap)
-}
-
-unsafe fn take_hosted_driver_reply_spare(instance: usize) -> Option<u64> {
-    if let Some(cap) = hosted_driver_reply_pool_mut(instance).spares.pop() {
-        return Some(cap);
-    }
-    allocate_hosted_driver_reply_cap()
-}
-
-unsafe fn return_hosted_driver_reply_spare(instance: usize, cap: u64) {
-    if cap == 0 {
-        return;
-    }
-    let pool = hosted_driver_reply_pool_mut(instance);
-    if !pool.spares.contains(&cap) {
-        pool.spares.push(cap);
-    }
-}
-
-fn hosted_driver_runtime_by_badge(
-    instance: usize,
-    badge: u64,
-) -> Option<HostedDriverThreadRuntime> {
-    if badge == 0 {
-        return None;
-    }
-    unsafe {
-        (*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES))
-            .as_ref()?
-            .iter()
-            .copied()
-            .find(|rt| rt.instance == instance && rt.badge == badge)
-    }
-}
-
 struct HostedDriverCaller {
     thread_handle: u64,
     runtime: Option<HostedDriverThreadRuntime>,
+    route: nt_component_suspension::peer_registry::PeerRoute,
 }
 
 /// Resolve a physical pump peer without borrowing driver state across a capability invocation.
@@ -51340,31 +51383,32 @@ pub(crate) fn hosted_driver_pump_caller_tcb(
     badge: u64,
 ) -> Option<u64> {
     let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
-    if channel.tcb != inst.tcb {
-        return None;
-    }
     let caller = hosted_driver_caller(instance, inst, badge)?;
-    Some(caller.runtime.map_or(inst.tcb, |runtime| runtime.tcb))
+    let tcb = caller.runtime.map_or(inst.tcb, |runtime| runtime.tcb);
+    (channel.tcb == tcb && channel.fault_ep == caller.route.endpoint()).then_some(tcb)
 }
 
 /// Resolve once before reading or consuming caller-supplied dispatcher objects. The pump channel
-/// has already selected the live instance; badge zero denotes its main thread, never a fallback.
+/// has selected the live physical instance; only a retained generational peer identifies a thread.
 fn hosted_driver_caller(
     instance: usize,
     inst: DriverInstance,
     badge: u64,
 ) -> Option<HostedDriverCaller> {
-    if !nt_component_suspension::badge::valid_endpoint_badge(badge) {
-        return None;
-    }
-    let runtime = if badge == 0 {
-        None
-    } else {
-        let runtime = hosted_driver_runtime_by_badge(instance, badge)?;
-        if runtime.domain != instance_domain_identity(inst)? {
-            return None;
+    use crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalSourceKind;
+    let (source, route) = hosted_ingress_sources::caller_route(instance, badge)?;
+    let domain = instance_domain_identity(inst)?;
+    let runtime = match source.kind {
+        PhysicalSourceKind::Primary => None,
+        PhysicalSourceKind::SystemThread { handle } => {
+            let runtime = unsafe { (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES)).as_ref()? }
+                .iter().copied().find(|row| row.instance == instance && row.handle == handle
+                    && row.domain == domain
+                    && row.tcb == source.tcb && row.pml4 == source.pml4
+                    && row.ingress_route == Some(route))?;
+            Some(runtime)
         }
-        Some(runtime)
+        _ => return None,
     };
     let (handle, tcb) = runtime.map_or((inst.main_thread_id, inst.tcb), |rt| (rt.handle, rt.tcb));
     // Authentication must not create a missing table or allocate state on behalf of an unknown peer.
@@ -51377,129 +51421,57 @@ fn hosted_driver_caller(
     Some(HostedDriverCaller {
         thread_handle: thread.handle,
         runtime,
+        route,
     })
 }
 
-unsafe fn remove_hosted_driver_thread_runtime(
-    instance: usize,
-    handle: u64,
-) -> Option<HostedDriverThreadRuntime> {
-    let runtimes = hosted_driver_thread_runtimes_mut();
-    let index = runtimes
-        .iter()
-        .position(|rt| rt.instance == instance && rt.handle == handle)?;
-    Some(runtimes.remove(index))
-}
-
-fn rotate_hosted_driver_active_reply(instance: usize, expected_active: u64, fresh: u64) -> bool {
-    if expected_active == 0 || fresh == 0 {
-        return false;
-    }
-    let table = unsafe { driver_instances_mut() };
-    if instance >= table.len()
-        || !table[instance].used
-        || table[instance].reply_cap != expected_active
-    {
-        return false;
-    }
-    table[instance].reply_cap = fresh;
-    crate::replace_fsd_reply_slot(instance, fresh);
-    true
-}
-
 unsafe fn cancel_hosted_driver_waits_for_thread(instance: usize, thread_handle: u64) -> u64 {
-    let mut removed = 0u64;
-    let mut removed_timed = false;
+    let mut canceled = 0u64;
     if let Some(waiters) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_WAITERS)).as_mut() {
-        let mut index = 0usize;
-        while index < waiters.len() {
-            if waiters[index].instance == instance && waiters[index].thread_handle == thread_handle
-            {
-                let waiter = waiters.remove(index);
-                removed += 1;
-                removed_timed |= waiter.deadline != nt_kernel_exec::Deadline::Infinite;
-                if waiter.reply_cap != 0 {
-                    let _ = cnode_delete_recycle_r(waiter.reply_cap);
-                }
-            } else {
-                index += 1;
+        for waiter in waiters.iter_mut().filter(|waiter|
+            waiter.instance == instance && waiter.thread_handle == thread_handle)
+        {
+            if waiter.wake_status.is_none() {
+                waiter.wake_status = Some(nt_status::NtStatus::CANCELLED.raw() as i32);
+                canceled += 1;
             }
         }
     }
-    if removed_timed {
+    if canceled != 0 {
         let _ = crate::service_sec_image::rearm_registered_delay_timer();
     }
-    removed
-}
-
-unsafe fn delete_hosted_driver_thread_mechanism(
-    tcb: u64,
-    sched_context: u64,
-    cnode: u64,
-    raw_cnode: u64,
-) {
-    let _ = tcb_suspend_r(tcb);
-    let _ = cnode_delete_recycle_r(sched_context);
-    let _ = cnode_delete_recycle_r(tcb);
-    let _ = cnode_delete_recycle_r(cnode);
-    let _ = cnode_delete_recycle_r(raw_cnode);
+    canceled
 }
 
 fn clear_hosted_driver_threads_for_instance(instance: usize) {
     unsafe {
-        if let Some(runtimes) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_THREAD_RUNTIMES)).as_mut() {
-            let mut index = 0usize;
-            while index < runtimes.len() {
-                if runtimes[index].instance == instance {
-                    let rt = runtimes.remove(index);
-                    delete_hosted_driver_thread_mechanism(
-                        rt.tcb,
-                        rt.sched_context,
-                        rt.cnode,
-                        rt.raw_cnode,
-                    );
-                } else {
-                    index += 1;
-                }
-            }
-        }
-        if let Some(tables) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_THREAD_TABLES)).as_mut() {
-            if instance < tables.len() {
-                tables[instance] = HostedDriverThreadTable::with_first_handle(
-                    hosted_driver_thread_first_handle(instance),
-                );
-            }
+        hosted_thread_resources::retire_unpublished(instance);
+        let count = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES)).as_ref()
+            .map_or(0, Vec::len);
+        // Reverse order permits exact-row retirement without skipping a moved next row.
+        for index in (0..count).rev() {
+            let runtime = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES)).as_ref()
+                .and_then(|rows| rows.get(index)).copied();
+            let Some(runtime) = runtime.filter(|runtime| runtime.instance == instance) else { continue; };
+            let _ = hosted_driver_thread_table_mut(instance).and_then(|table|
+                table.terminate(runtime.handle, nt_status::NtStatus::CANCELLED.raw() as i32).ok());
+            let _ = hosted_thread_resources::retire_thread(instance, runtime.handle);
         }
     }
 }
 
 fn clear_hosted_driver_waits_for_instance(instance: usize) {
     unsafe {
-        let mut removed = false;
+        let mut canceled = false;
         if let Some(waiters) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_WAITERS)).as_mut() {
-            let mut index = 0usize;
-            while index < waiters.len() {
-                if waiters[index].instance == instance {
-                    let waiter = waiters.remove(index);
-                    removed |= waiter.deadline != nt_kernel_exec::Deadline::Infinite;
-                    if waiter.reply_cap != 0 {
-                        let _ = cnode_delete_recycle_r(waiter.reply_cap);
-                    }
-                } else {
-                    index += 1;
+            for waiter in waiters.iter_mut().filter(|waiter| waiter.instance == instance) {
+                if waiter.wake_status.is_none() {
+                    waiter.wake_status = Some(nt_status::NtStatus::CANCELLED.raw() as i32);
+                    canceled = true;
                 }
             }
         }
-        if let Some(pools) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_REPLY_POOLS)).as_mut() {
-            if let Some(pool) = pools.get_mut(instance) {
-                for cap in pool.spares.drain(..) {
-                    if cap != 0 {
-                        let _ = cnode_delete_recycle_r(cap);
-                    }
-                }
-            }
-        }
-        if removed {
+        if canceled {
             let _ = crate::service_sec_image::rearm_registered_delay_timer();
         }
     }
@@ -51545,6 +51517,7 @@ unsafe fn hosted_driver_runtime_quiesced(instance: usize) -> bool {
             })
     });
     threads_quiesced && waits_quiesced && timers_quiesced && dpcs_quiesced
+        && hosted_thread_resources::quiescent(instance)
 }
 
 unsafe fn hosted_driver_device_lifetime_quiesced(
@@ -51699,42 +51672,6 @@ fn clear_instance_exec_mappings(instance: usize) {
             }
         }
     }
-}
-
-unsafe fn release_driver_frame_run(base: u64, count: u64) -> (u64, u64) {
-    if base == 0 || count == 0 {
-        return (0, 0);
-    }
-    let mut released = 0u64;
-    let mut failures = 0u64;
-    let mut index = count;
-    while index != 0 {
-        index -= 1;
-        let cap = base + index;
-        if cnode_delete_recycle_r(cap) == 0 {
-            released += 1;
-        } else {
-            failures += 1;
-        }
-    }
-    (released, failures)
-}
-
-unsafe fn release_driver_source_frame_runs(inst: DriverInstance) -> (u64, u64) {
-    let mut released = 0u64;
-    let mut failures = 0u64;
-    for (base, count) in [
-        (inst.image_frame_base, inst.image_frames),
-        (inst.pool_frame_base, FSD_POOL_FRAMES),
-        (inst.data_frame_base, FSD_DATA_FRAMES),
-        (inst.shared_frame_base, FSD_SHARED_FRAMES),
-        (inst.arg_frame_base, FSD_ARG_FRAMES),
-    ] {
-        let (run_released, run_failures) = release_driver_frame_run(base, count);
-        released += run_released;
-        failures += run_failures;
-    }
-    (released, failures)
 }
 
 unsafe fn ensure_instance_exec_pd(instance: usize, vaddr: u64) -> Option<()> {
@@ -52096,6 +52033,11 @@ pub(crate) struct HostedVideoRouteInfo {
 }
 
 fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
+    if let Some(inst) = instance(i) {
+        if unsafe { hosted_primary_retirement::started(i, inst) } {
+            return finish_instance_physical_release(i, inst);
+        }
+    }
     if !hosted_file_retirements::instance_quiesced(i)
         || !hosted_file_owners::instance_quiesced(i)
         || !unsafe { hosted_add_device_rollback::instance_quiesced(i) }
@@ -52324,7 +52266,17 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
     if teardown_blocked {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
-    if let Some(domain) = retiring_domain {
+    if let Some(inst) = inst {
+        return finish_instance_physical_release(i, inst);
+    }
+    Ok(())
+}
+
+fn finish_instance_physical_release(i: usize, inst: DriverInstance) -> Result<(), nt_status::NtStatus> {
+    if !unsafe { release_driver_component_mechanism(i, inst) } {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    if let Some(domain) = instance_domain_identity(inst) {
         if let Err(status) = io_manager_mut().unregister_hosted_domain(domain) {
             print_str(b"[driver-launch] hosted domain teardown rejected id=0x");
             print_hex64(domain.domain_id.raw());
@@ -52336,19 +52288,6 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
     }
     let t = unsafe { driver_instances_mut() };
     if i < t.len() {
-        let sh = t[i].exec_shared_va;
-        if sh != 0 {
-            unsafe {
-                clear_shared_registry_identity_at(sh);
-            }
-        }
-        clear_instance_exec_mappings(i);
-        let inst = t[i];
-        if inst.used {
-            unsafe {
-                release_driver_component_mechanism(i, inst);
-            }
-        }
         t[i] = EMPTY_INSTANCE;
     } else {
         clear_instance_exec_mappings(i);
@@ -52365,75 +52304,8 @@ fn register_instance_ready(i: usize, ready: bool) {
     }
 }
 
-unsafe fn release_driver_component_mechanism(index: usize, inst: DriverInstance) {
-    let mut failures = 0u64;
-    if inst.tcb != 0 && tcb_suspend_r(inst.tcb) != 0 {
-        failures += 1;
-    }
-    let (stack_caps, stack_failures) =
-        release_driver_frame_run(inst.stack_frame_base, inst.stack_frame_count);
-    failures += stack_failures;
-    let release = crate::spawn_hosts::release_component_map_cap_bank(inst.map_cap_bank);
-    failures += release.failures;
-    if let Some(domain) = instance_domain_identity(inst) {
-        failures += clear_hosted_paging_for_domain(domain, inst.pml4);
-    } else if inst.pml4 != 0 {
-        failures += 1;
-    }
-    let (source_caps, source_failures) = release_driver_source_frame_runs(inst);
-    failures += source_failures;
-    if inst.cnode != 0 {
-        let _ = cnode_delete_in_cnode_r(inst.cnode, CT_RESULT_NTFN);
-        let mut slot = 0;
-        while slot < CT_IO_PORT_CAPACITY {
-            let _ = cnode_delete_in_cnode_r(inst.cnode, CT_IO_PORT_BASE + slot);
-            slot += 1;
-        }
-        if inst.fault_ep != 0 && cnode_delete_in_cnode_r(inst.cnode, CT_FAULT) != 0 {
-            failures += 1;
-        }
-        if inst.pml4 != 0 && cnode_delete_in_cnode_r(inst.cnode, CT_PML4) != 0 {
-            failures += 1;
-        }
-    }
-    if inst.reply_cap != 0 {
-        if cnode_delete_recycle_r(inst.reply_cap) != 0 {
-            failures += 1;
-        } else {
-            crate::replace_fsd_reply_slot(index, 0);
-        }
-    }
-    if inst.sched_context != 0 && cnode_delete_recycle_r(inst.sched_context) != 0 {
-        failures += 1;
-    }
-    if inst.tcb != 0 && cnode_delete_recycle_r(inst.tcb) != 0 {
-        failures += 1;
-    }
-    if inst.cnode != 0 && cnode_delete_recycle_r(inst.cnode) != 0 {
-        failures += 1;
-    }
-    if inst.raw_cnode != 0 && cnode_delete_recycle_r(inst.raw_cnode) != 0 {
-        failures += 1;
-    }
-    if inst.pml4 != 0 && cnode_delete_recycle_r(inst.pml4) != 0 {
-        failures += 1;
-    }
-    if inst.fault_ep != 0 && cnode_delete_recycle_r(inst.fault_ep) != 0 {
-        failures += 1;
-    }
-    if failures != 0 {
-        print_str(b"[driver-launch] component mechanism release failed inst=");
-        print_u64(index as u64);
-        print_str(b" bank-caps=");
-        print_u64(release.caps);
-        print_str(b" stack-caps=");
-        print_u64(stack_caps);
-        print_str(b" frame-caps=");
-        print_u64(source_caps);
-        print_str(b" failures=");
-        print_u64(failures);
-        print_str(b"\n");
-    }
+unsafe fn release_driver_component_mechanism(index: usize, inst: DriverInstance) -> bool {
+    hosted_primary_retirement::release(index, inst)
 }
 
 /// Mark a launched driver ready/unready for dispatch by canonical driver route id.
@@ -52574,10 +52446,60 @@ fn instance_for_pump_channel(
         vspace: inst.pml4,
         shared: inst.exec_shared_va,
     };
-    if !captured.matches_live(live) || active_reply_cap == 0 || inst.reply_cap != active_reply_cap {
+    if !captured.matches_live(live) || active_reply_cap == 0 {
         return None;
     }
+    let route = unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::channel_route(ch).ok()?? };
+    let source = unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::physical_source(route).ok()? };
+    if source.domain != crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalDomain::Hosted(captured.domain)
+        || unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::current_reply(route).ok()? } != active_reply_cap
+    { return None; }
     Some((instance, inst))
+}
+
+/// A fatal autonomous service ends the actual thread, never its unrelated parked pump parent.
+/// Retirement keeps the source and all resources until stopped transport cancellation is proved.
+pub(crate) unsafe fn terminate_failed_autonomous_service(
+    route: nt_component_suspension::peer_registry::PeerRoute,
+) -> bool {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let Ok(source) = runtime::physical_source(route) else { return false; };
+    let runtime::PhysicalDomain::Hosted(domain) = source.domain else { return false; };
+    let runtime::PhysicalSourceKind::SystemThread { handle } = source.kind else { return false; };
+    let Some(thread) = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES)).as_ref()
+        .and_then(|rows| rows.iter().find(|row| row.domain == domain && row.handle == handle
+            && row.tcb == source.tcb && row.pml4 == source.pml4 && row.ingress_route == Some(route)))
+        .copied() else { return false; };
+    let Some(table) = hosted_driver_thread_table_mut(thread.instance) else { return false; };
+    let Some(state) = table.get(handle) else { return false; };
+    if state.exit_status.is_none()
+        && table.terminate(handle, nt_status::NtStatus::UNSUCCESSFUL.raw() as i32).is_err()
+    { return false; }
+    hosted_thread_resources::retire_thread(thread.instance, handle)
+}
+
+pub(crate) unsafe fn autonomous_pump_channel(
+    route: nt_component_suspension::peer_registry::PeerRoute,
+) -> Option<crate::spawn_hosts::PumpChannel> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let source = runtime::physical_source(route).ok()?;
+    let runtime::PhysicalDomain::Hosted(domain) = source.domain else { return None; };
+    let runtime::PhysicalSourceKind::SystemThread { .. } = source.kind else { return None; };
+    let (index, inst) = driver_instances()?.iter().copied().enumerate()
+        .find(|(_, inst)| instance_domain_identity(*inst) == Some(domain) && inst.pml4 == source.pml4)?;
+    Some(crate::spawn_hosts::PumpChannel {
+        fault_ep: route.endpoint(), physical_domain: Some(domain), pml4: source.pml4,
+        ingress_route: Some(route),
+        code_va: FSD_CODE_VA, image_frames: inst.image_frames,
+        exec_code_va: ExecVaWindow::try_for_instance(index)?.code_va,
+        root_image_rights: 3, root_image_map_owner: inst.map_cap_bank.owner,
+        shared_va: inst.exec_shared_va, dispatch_label: FSD_DISPATCH_LABEL,
+        demand_cap: 512, trace_faults: true, initial: crate::spawn_hosts::InitialAction::RecvFirst,
+        tcb: source.tcb, reply_cap: runtime::current_reply(route).ok()?,
+        client_pi: 0, client_generation: 0, logical_caller: None, kernel_caller: None,
+        caps: crate::spawn_hosts::HostCaps { kind: crate::spawn_hosts::ReqKind::Irp,
+            ..crate::spawn_hosts::HostCaps::default() },
+    })
 }
 
 /// File projection services authenticate the physical address space, not a dependent driver's
@@ -53886,6 +53808,7 @@ pub(crate) fn service_hosted_driver_registry(
 unsafe fn spawn_hosted_driver_worker_thread(
     instance: usize,
     inst: DriverInstance,
+    handle: u64,
     component_slot: usize,
     start_routine: u64,
     start_context: u64,
@@ -53899,11 +53822,9 @@ unsafe fn spawn_hosted_driver_worker_thread(
     let exec_base = hosted_worker_exec_base_for_alias(exec_alias_slot)?;
     let tramp_exec_va = exec_base.checked_add(FSD_WORKER_TRAMP_OFFSET)?;
     let scratch_exec_va = exec_base.checked_add(FSD_WORKER_SCRATCH_OFFSET)?;
-    let badge = FSD_WORKER_BADGE_BASE
-        .checked_add(exec_alias_slot)
-        .filter(|badge| nt_component_suspension::badge::valid_endpoint_badge(*badge))?;
 
     let domain = instance_domain_identity(inst)?;
+    let construction = hosted_thread_resources::begin(instance, handle, domain, inst.pml4)?;
     if !ensure_paging(stack_base, inst.pml4, domain) || !crate::ensure_executive_paging(exec_base) {
         return None;
     }
@@ -53911,45 +53832,41 @@ unsafe fn spawn_hosted_driver_worker_thread(
     let mut i = 0u64;
     while i < FSD_WORKER_STACK_FRAMES {
         let target = alloc_frame();
+        hosted_thread_resources::root(construction, target);
         let exec_target = copy_cap(target);
+        hosted_thread_resources::root(construction, exec_target);
         let page = stack_base + i * 0x1000;
         let exec_page = exec_base + i * 0x1000;
-        if page_map_r(target, page, RW_NX, inst.pml4) != 0 {
-            let _ = cnode_delete_recycle_r(exec_target);
-            return None;
-        }
-        if map_instance_exec_frame(instance, exec_target, exec_page, RW_NX).is_none() {
-            let _ = page_unmap_r(target);
-            let _ = cnode_delete_recycle_r(target);
-            let _ = cnode_delete_recycle_r(exec_target);
-            return None;
-        }
+        hosted_thread_resources::mapping(construction, target);
+        if page_map_r(target, page, RW_NX, inst.pml4) != 0 { return None; }
+        hosted_thread_resources::mapping(construction, exec_target);
+        if page_map_r(exec_target, exec_page, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 { return None; }
         i += 1;
     }
 
     let scratch = alloc_frame();
+    hosted_thread_resources::root(construction, scratch);
     let scratch_exec = copy_cap(scratch);
-    if page_map_r(scratch, scratch_va, RW_NX, inst.pml4) != 0 {
-        let _ = cnode_delete_recycle_r(scratch_exec);
-        return None;
-    }
-    if map_instance_exec_frame(instance, scratch_exec, scratch_exec_va, RW_NX).is_none() {
-        let _ = page_unmap_r(scratch);
-        let _ = cnode_delete_recycle_r(scratch);
-        let _ = cnode_delete_recycle_r(scratch_exec);
-        return None;
-    }
+    hosted_thread_resources::root(construction, scratch_exec);
+    hosted_thread_resources::mapping(construction, scratch);
+    if page_map_r(scratch, scratch_va, RW_NX, inst.pml4) != 0 { return None; }
+    hosted_thread_resources::mapping(construction, scratch_exec);
+    if page_map_r(scratch_exec, scratch_exec_va, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 { return None; }
     core::ptr::write_bytes(scratch_exec_va as *mut u8, 0, 0x1000);
 
     let ipcbuf = alloc_frame();
+    hosted_thread_resources::root(construction, ipcbuf);
+    hosted_thread_resources::mapping(construction, ipcbuf);
     if page_map_r(ipcbuf, ipcbuf_va, RW_NX, inst.pml4) != 0 {
         return None;
     }
 
     let tramp = alloc_frame();
+    hosted_thread_resources::root(construction, tramp);
     let tramp_exec = copy_cap(tramp);
+    hosted_thread_resources::root(construction, tramp_exec);
+    hosted_thread_resources::mapping(construction, tramp_exec);
     if page_map_r(tramp_exec, tramp_exec_va, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
-        let _ = cnode_delete_recycle_r(tramp_exec);
         return None;
     }
     let trampoline = nt_thread_start::Amd64ThreadContext {
@@ -53963,37 +53880,35 @@ unsafe fn spawn_hosted_driver_worker_thread(
         write_volatile((tramp_exec_va + j as u64) as *mut u8, byte);
     }
     let tramp_target = copy_cap(tramp);
+    hosted_thread_resources::root(construction, tramp_target);
+    hosted_thread_resources::mapping(construction, tramp_target);
     if page_map_r(tramp_target, tramp_va, 2, inst.pml4) != 0 {
-        let _ = page_unmap_r(tramp_exec);
-        let _ = cnode_delete_recycle_r(tramp_exec);
         return None;
     }
-    let _ = page_unmap_r(tramp_exec);
-    let _ = cnode_delete_recycle_r(tramp_exec);
 
     let raw = alloc_slot();
+    hosted_thread_resources::root(construction, raw);
     if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw) != 0 {
-        recycle_deleted_root_slot(raw);
         return None;
     }
     let cnode = alloc_slot();
+    hosted_thread_resources::root(construction, cnode);
     if cnode_mint_r(CAP_INIT_THREAD_CNODE, cnode, raw, CN_GUARD_BADGE) != 0 {
-        recycle_deleted_root_slot(cnode);
-        let _ = cnode_delete_recycle_r(raw);
         return None;
     }
+    hosted_thread_resources::child(construction, cnode, CT_PML4);
     let pml4_copy = cnode_copy_at_r(cnode, CT_PML4, inst.pml4);
-    let fault_mint = cnode_mint_r(cnode, CT_FAULT, inst.fault_ep, badge);
-    if pml4_copy != 0 || fault_mint != 0 {
-        let _ = cnode_delete_recycle_r(cnode);
-        let _ = cnode_delete_recycle_r(raw);
+    // The shared ingress installation owns CT_FAULT publication after retaining this worker.
+    if pml4_copy != 0 {
         return None;
     }
 
     let tcb = alloc_slot();
+    hosted_thread_resources::root(construction, tcb);
     let tcb_retype = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    if tcb_retype == 0 { hosted_thread_resources::tcb(construction, tcb); }
     let set_space = if tcb_retype == 0 {
-        tcb_set_space_r(tcb, CT_FAULT, cnode, inst.pml4)
+        tcb_set_space_r(tcb, 0, cnode, inst.pml4)
     } else {
         u64::MAX
     };
@@ -54009,29 +53924,21 @@ unsafe fn spawn_hosted_driver_worker_thread(
         u64::MAX
     };
     if tcb_retype != 0 || set_space != 0 || set_ipc != 0 || set_regs != 0 {
-        if tcb_retype == 0 {
-            let _ = cnode_delete_recycle_r(tcb);
-        } else {
-            recycle_deleted_root_slot(tcb);
-        }
-        let _ = cnode_delete_recycle_r(cnode);
-        let _ = cnode_delete_recycle_r(raw);
         return None;
     }
-    let _ = tcb_set_gs_base(tcb, FSD_KPCR_VA);
-    let _ = tcb_set_priority(tcb, 100);
+    if tcb_set_gs_base_r(tcb, FSD_KPCR_VA) != 0 || tcb_set_priority_r(tcb, 100) != 0 { return None; }
     let sched_context = match attach_sched_context(tcb) {
         Ok(sc) => sc,
-        Err(_) => {
-            let _ = cnode_delete_recycle_r(tcb);
-            let _ = cnode_delete_recycle_r(cnode);
-            let _ = cnode_delete_recycle_r(raw);
-            return None;
-        }
+        Err(_) => return None,
     };
+    hosted_thread_resources::root(construction, sched_context);
+    let reply_cap = crate::spawn_hosts::shared_ingress::owner::runtime::allocate_reply(tcb).ok()?;
+    hosted_thread_resources::shared_reply(construction, reply_cap);
+    hosted_thread_resources::ready(construction);
     Some(HostedDriverThreadSpawn {
         tcb,
-        badge,
+        reply_cap,
+        construction,
         component_slot,
         exec_alias_slot,
         raw_cnode: raw,
@@ -54106,9 +54013,10 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
                     return HostedDriverWaitServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
                 }
                 objects.push(exec_object);
-                let Some(fresh_reply_cap) = park_hosted_driver_wait(
+                let Some(parked) = park_hosted_driver_wait(
                     instance,
                     thread_handle,
+                    caller.route,
                     active_reply_cap,
                     objects,
                     false,
@@ -54135,7 +54043,7 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
                     }
                     print_str(b"\n");
                 }
-                HostedDriverWaitServiceResult::Parked { fresh_reply_cap }
+                parked
             }
             Err(status) => {
                 HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
@@ -54274,9 +54182,10 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
                     }
                 };
                 HOSTED_DRIVER_WAIT_MULTIPLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
-                let Some(fresh_reply_cap) = park_hosted_driver_wait(
+                let Some(parked) = park_hosted_driver_wait(
                     instance,
                     thread_handle,
+                    caller.route,
                     active_reply_cap,
                     objects,
                     wait_all,
@@ -54307,7 +54216,7 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
                     }
                     print_str(b"\n");
                 }
-                HostedDriverWaitServiceResult::Parked { fresh_reply_cap }
+                parked
             }
             Err(status) => {
                 HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
@@ -54734,6 +54643,11 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
     }
 
     let (component_slot, handle) = unsafe {
+        let _durable = crate::allocator::enter_durable();
+        if hosted_driver_thread_runtimes_mut().try_reserve(1).is_err() {
+            HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return (STATUS_INSUFFICIENT_RESOURCES, 0);
+        }
         let Some(table) = hosted_driver_thread_table_mut(instance) else {
             HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
             return (STATUS_INSUFFICIENT_RESOURCES, 0);
@@ -54756,14 +54670,16 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
         spawn_hosted_driver_worker_thread(
             instance,
             inst,
+            handle,
             component_slot,
             start_routine,
             start_context,
         )
     }) else {
         unsafe {
-            if let Some(table) = hosted_driver_thread_table_mut(instance) {
-                let _ = table.remove(handle);
+            hosted_thread_resources::retire_unpublished(instance);
+            if !hosted_thread_resources::retained(instance, handle) {
+                if let Some(table) = hosted_driver_thread_table_mut(instance) { let _ = table.remove(handle); }
             }
         }
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
@@ -54778,15 +54694,9 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
     };
     if let Err(error) = attach {
         unsafe {
-            if let Some(table) = hosted_driver_thread_table_mut(instance) {
-                let _ = table.remove(handle);
+            if hosted_thread_resources::retire(spawn.construction, false) {
+                if let Some(table) = hosted_driver_thread_table_mut(instance) { let _ = table.remove(handle); }
             }
-            delete_hosted_driver_thread_mechanism(
-                spawn.tcb,
-                spawn.sched_context,
-                spawn.cnode,
-                spawn.raw_cnode,
-            );
         }
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return (hosted_driver_thread_error_status(error), 0);
@@ -54798,7 +54708,10 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
             domain,
             handle,
             tcb: spawn.tcb,
-            badge: spawn.badge,
+            pml4: inst.pml4,
+            reply_cap: spawn.reply_cap,
+            ingress_route: None,
+            construction: spawn.construction,
             component_slot: spawn.component_slot,
             exec_alias_slot: spawn.exec_alias_slot,
             component_scratch_va: spawn.component_scratch_va,
@@ -54808,32 +54721,25 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
             sched_context: spawn.sched_context,
         });
     }
-    if tcb_resume(spawn.tcb) != 0 {
-        unsafe {
-            if let Some(table) = hosted_driver_thread_table_mut(instance) {
-                let _ = table.remove(handle);
-            }
-            let runtimes = hosted_driver_thread_runtimes_mut();
-            if let Some(index) = runtimes
-                .iter()
-                .position(|rt| rt.instance == instance && rt.handle == handle)
-            {
-                let rt = runtimes.remove(index);
-                delete_hosted_driver_thread_mechanism(
-                    rt.tcb,
-                    rt.sched_context,
-                    rt.cnode,
-                    rt.raw_cnode,
-                );
-            } else {
-                delete_hosted_driver_thread_mechanism(
-                    spawn.tcb,
-                    spawn.sched_context,
-                    spawn.cnode,
-                    spawn.raw_cnode,
-                );
-            }
+    unsafe { hosted_thread_resources::enter_shared(spawn.construction, spawn.reply_cap); }
+    let route = match unsafe { hosted_ingress_sources::enroll_system_thread(instance, handle, spawn.reply_cap) } {
+        Ok(route) => route,
+        Err(_) => {
+            // Partial aliases, Reply and physical worker stay with their retained owners.
+            HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+            HOSTED_DRIVER_SYSTEM_THREAD_SPAWN_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return (STATUS_INSUFFICIENT_RESOURCES, 0);
         }
+    };
+    unsafe {
+        hosted_driver_thread_runtimes_mut().iter_mut()
+            .find(|rt| rt.instance == instance && rt.handle == handle && rt.tcb == spawn.tcb)
+            .expect("retained system thread disappeared before startup").ingress_route = Some(route);
+    }
+    if unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::start_autonomous(
+        route, spawn.cnode, spawn.sched_context,
+    ) }.is_err() {
+        // Resume may have entered. No replay, deletion or Reply reuse is permitted here.
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         HOSTED_DRIVER_SYSTEM_THREAD_SPAWN_FAILURES.fetch_add(1, Ordering::Relaxed);
         return (STATUS_INSUFFICIENT_RESOURCES, 0);
@@ -54858,7 +54764,7 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
         print_str(b" tcb=0x");
         print_hex(spawn.tcb as u32);
         print_str(b" worker-badge=");
-        print_u64(spawn.badge);
+        print_u64(route.badge());
         print_str(b"\n");
     }
     (STATUS_SUCCESS, handle)
@@ -54903,17 +54809,11 @@ pub(crate) fn service_hosted_driver_ps_terminate_system_thread(
         }
         return HostedDriverThreadTerminateServiceResult::Reply(STATUS_INVALID_PARAMETER);
     };
-    let Some(fresh_reply_cap) = (unsafe { take_hosted_driver_reply_spare(instance) }) else {
+    let Some(route) = runtime.ingress_route.filter(|route|
+        hosted_ingress_sources::system_thread_route(instance, runtime.handle) == Some(*route)) else {
         HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS.fetch_add(1, Ordering::Relaxed);
-        return HostedDriverThreadTerminateServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
+        return HostedDriverThreadTerminateServiceResult::Reply(STATUS_INVALID_HANDLE);
     };
-    if !rotate_hosted_driver_active_reply(instance, active_reply_cap, fresh_reply_cap) {
-        unsafe {
-            return_hosted_driver_reply_spare(instance, fresh_reply_cap);
-        }
-        HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS.fetch_add(1, Ordering::Relaxed);
-        return HostedDriverThreadTerminateServiceResult::Reply(STATUS_INVALID_PARAMETER);
-    }
 
     let terminated = unsafe {
         hosted_driver_thread_table_mut(instance)
@@ -54921,10 +54821,6 @@ pub(crate) fn service_hosted_driver_ps_terminate_system_thread(
             .and_then(|table| table.terminate(runtime.handle, exit_status))
     };
     if let Err(error) = terminated {
-        let _ = rotate_hosted_driver_active_reply(instance, fresh_reply_cap, active_reply_cap);
-        unsafe {
-            return_hosted_driver_reply_spare(instance, fresh_reply_cap);
-        }
         HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return HostedDriverThreadTerminateServiceResult::Reply(hosted_driver_thread_error_status(
             error,
@@ -54932,16 +54828,10 @@ pub(crate) fn service_hosted_driver_ps_terminate_system_thread(
     }
 
     let canceled_waits = unsafe { cancel_hosted_driver_waits_for_thread(instance, runtime.handle) };
-    let runtime =
-        unsafe { remove_hosted_driver_thread_runtime(instance, runtime.handle) }.unwrap_or(runtime);
     unsafe {
-        delete_hosted_driver_thread_mechanism(
-            runtime.tcb,
-            runtime.sched_context,
-            runtime.cnode,
-            runtime.raw_cnode,
-        );
-        let _ = cnode_delete_recycle_r(active_reply_cap);
+        // Stop/retirement owns the nonreturning Call and every installed alias. Even a failed
+        // stop remains retained; neither this service nor its pump deletes the active Reply.
+        let _ = hosted_thread_resources::retire_thread(instance, runtime.handle);
     }
     HOSTED_DRIVER_SYSTEM_THREAD_TERMINATIONS.fetch_add(1, Ordering::Relaxed);
     if request <= 16 {
@@ -54960,7 +54850,7 @@ pub(crate) fn service_hosted_driver_ps_terminate_system_thread(
         }
         print_str(b"\n");
     }
-    HostedDriverThreadTerminateServiceResult::Terminated { fresh_reply_cap }
+    HostedDriverThreadTerminateServiceResult::SharedTerminated { route }
 }
 
 unsafe fn dispatch_driver_unload_for_instance(
@@ -54987,6 +54877,7 @@ unsafe fn dispatch_driver_unload_for_instance(
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
         physical_domain: instance_domain_identity(inst),
+        ingress_route: hosted_ingress_sources::primary_route(index),
         code_va: 0,
         image_frames: 0,
         exec_code_va: ExecVaWindow::try_for_instance(index)
@@ -55046,6 +54937,7 @@ unsafe fn dispatch_device_projection_control_for_instance(
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
         physical_domain: instance_domain_identity(inst),
+        ingress_route: hosted_ingress_sources::primary_route(index),
         code_va: 0,
         image_frames: 0,
         exec_code_va: ExecVaWindow::try_for_instance(index)
@@ -55179,6 +55071,7 @@ unsafe fn dispatch_video_add_device_for_instance(
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
         physical_domain: instance_domain_identity(inst),
+        ingress_route: hosted_ingress_sources::primary_route(index),
         code_va: 0,
         image_frames: 0,
         exec_code_va: ExecVaWindow::try_for_instance(index)
@@ -55255,6 +55148,7 @@ unsafe fn dispatch_provider_add_device_for_instance(
         fault_ep: provider_inst.fault_ep,
         pml4: provider_inst.pml4,
         physical_domain: instance_domain_identity(provider_inst),
+        ingress_route: hosted_ingress_sources::primary_route(route.provider_instance),
         code_va: 0,
         image_frames: 0,
         exec_code_va: ExecVaWindow::try_for_instance(route.provider_instance)
@@ -55337,6 +55231,7 @@ unsafe fn dispatch_add_device_for_instance(
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
         physical_domain: instance_domain_identity(inst),
+        ingress_route: hosted_ingress_sources::primary_route(index),
         code_va: 0,
         image_frames: 0,
         exec_code_va: ExecVaWindow::try_for_instance(index)
@@ -56983,6 +56878,7 @@ unsafe fn dispatch_video_find_adapter_pnp_for_instance(
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
         physical_domain: instance_domain_identity(inst),
+        ingress_route: hosted_ingress_sources::primary_route(index),
         code_va: 0,
         image_frames: 0,
         exec_code_va: exec_window.code_va,
@@ -58329,6 +58225,7 @@ unsafe fn dispatch_irp_for_instance_exact(
     // `exec_fsd_on_shared_harness` proof). Status is read at SH_REQ_STATUS(0x70) by kind=Irp.
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: ep,
+        ingress_route: hosted_ingress_sources::primary_route(dispatch_index),
         pml4,
         physical_domain: instance_domain_identity(d),
         code_va: 0,
