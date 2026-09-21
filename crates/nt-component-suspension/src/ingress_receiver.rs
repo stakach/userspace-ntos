@@ -97,6 +97,8 @@ mod startup_receive_tests;
 
 mod startup_ready;
 pub use startup_ready::StartupReadyError;
+mod startup_fault;
+pub use startup_fault::StartupFaultError;
 
 /// Native adapters must capture the full received message before issuing binding-query IPC.
 /// This owns ingress and storage exclusively; Call provenance, exact physical lifetime and

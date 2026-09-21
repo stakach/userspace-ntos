@@ -154,16 +154,29 @@ impl<M> IngressReplyPool<M> {
         lanes: &ComponentSuspensionLanes<C, R, T>,
         query: impl FnOnce(u64) -> Result<ReplyBindingObservation, E>,
     ) -> Result<(), (ReplyPoolError<E>, ComponentIngress<M>)> {
+        let mut pending = Some(owner);
+        self.insert_pending(&mut pending, receiver, lanes, query)
+            .map_err(|error| (error, pending.take().expect("refused Reply remains owned")))
+    }
+
+    /// Keep native pending ownership published through all binding queries. Only a successful
+    /// in-memory insertion consumes the slot; every refusal leaves it unchanged.
+    pub fn insert_pending<C, R, T, E>(
+        &mut self,
+        pending: &mut Option<ComponentIngress<M>>,
+        receiver: &IngressReceiver<M>,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        query: impl FnOnce(u64) -> Result<ReplyBindingObservation, E>,
+    ) -> Result<(), ReplyPoolError<E>> {
+        let owner = pending.as_ref().ok_or(ReplyPoolError::Empty)?;
         if self.entries.len() == self.capacity {
-            return Err((ReplyPoolError::NoCapacity, owner));
+            return Err(ReplyPoolError::NoCapacity);
         }
         if self.excludes_reply(owner.reply()) {
-            return Err((ReplyPoolError::ReplyInUse, owner));
+            return Err(ReplyPoolError::ReplyInUse);
         }
-        if let Err(error) = self.validate(&owner, receiver, lanes, query) {
-            return Err((error, owner));
-        }
-        self.entries.push(owner);
+        self.validate(owner, receiver, lanes, query)?;
+        self.entries.push(pending.take().expect("validated pending Reply"));
         Ok(())
     }
 

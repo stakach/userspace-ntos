@@ -16,6 +16,9 @@ static mut SHARED_INGRESS: NativeSharedIngress = NativeSharedIngress::new();
 mod startup;
 pub(crate) use startup::{start_worker_peer, WorkerStartError};
 
+#[path = "component_ingress_fault.rs"]
+mod fault;
+
 /// Prepare the dormant global owner once, from serialized root initialization with no reentrant
 /// scheduler hooks. Failed owners stay in static storage; this does not export capabilities.
 pub(crate) unsafe fn prepare<C, R, T>(
@@ -577,6 +580,9 @@ impl NativeSharedIngress {
         publication: &mut Option<nt_provider_wait::ProviderStackReadyReceipt>,
         resolve_caller: impl FnOnce(PeerRoute) -> Option<u64>,
     ) -> Result<(), super::ReceiveError> {
+        if self.pending_reply.is_some() {
+            return Err(super::ReceiveError::PendingReplyRecovery);
+        }
         if !self.ready {
             return Err(super::ReceiveError::Ownership(
                 nt_component_suspension::ReservedReceiveError::InvalidPhase,

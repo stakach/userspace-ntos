@@ -50,6 +50,11 @@ impl IngressReceiver<crate::ReceivedMessage> {
         {
             return Err(StartupReadyError::WrongOwner);
         }
+        // An acknowledged interim fault can still own retention/recovery work. Finish it before
+        // releasing Starting; otherwise its startup-only cleanup would lose its execution owner.
+        if !matches!(peers.state(route), Ok((_, 1))) {
+            return Err(StartupReadyError::WrongOwner);
+        }
         let binding = lanes
             .binding(route.identity().lane)
             .map_err(|_| StartupReadyError::WrongOwner)?;
