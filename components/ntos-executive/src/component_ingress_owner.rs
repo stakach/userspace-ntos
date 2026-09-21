@@ -51,11 +51,78 @@ pub(crate) enum PublicationError {
     WrongPhase,
     InvalidDestination,
     Export(PeerInstallationError<u64>),
+    FaultSpace(PeerInstallationError<u64>),
 }
 
 struct PendingPeer {
     registration: PeerRegistration,
     slot: Option<u64>,
+}
+
+/// Finish the endpoint setup of an exact shared worker while its physical owner keeps it stopped.
+/// Success arms faults but does not admit startup or resume the TCB. All aliases remain owned.
+pub(crate) unsafe fn prepare_worker_peer<C, R, T>(
+    route: PeerRoute,
+    domain: u64,
+    generation: u64,
+    lanes: &ComponentSuspensionLanes<C, R, T>,
+    worker: &crate::spawn_hosts::SpawnedComponentWorker,
+) -> Result<(), PublicationError> {
+    let endpoint = match &worker.endpoint {
+        crate::spawn_hosts::WorkerEndpoint::Shared(endpoint) => *endpoint,
+        crate::spawn_hosts::WorkerEndpoint::Private(_) => {
+            return Err(PublicationError::InvalidDestination)
+        }
+    };
+    if endpoint != route.endpoint()
+        || worker.tcb != route.identity().executor
+        || lanes.binding(route.identity().lane)
+            != Ok(nt_component_suspension::LaneBinding {
+                executor_id: worker.tcb,
+                receive_endpoint: endpoint,
+                reply_object: worker.reply_cap,
+            })
+    {
+        return Err(PublicationError::InvalidDestination);
+    }
+    let owner = &mut *core::ptr::addr_of_mut!(SHARED_INGRESS);
+    let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+    owner.export_peer(route, domain, generation, lanes, |_| {
+        Some(PeerCapabilityDestination {
+            cnode: worker.cnode,
+            slot: crate::CT_FAULT,
+        })
+    })?;
+    // Export's copy is synchronous and cannot run root scheduling. Revalidate before SetSpace.
+    let peers = owner.peers.as_ref().expect("initialized registry");
+    if peers
+        .resolve_lane(route.badge(), domain, generation, lanes)
+        .map_err(PublicationError::Stage)?
+        != route
+        || lanes.phase(route.identity().lane) != Ok(LanePhase::Staged)
+    {
+        return Err(PublicationError::WrongPhase);
+    }
+    let installation = owner
+        .installations
+        .iter_mut()
+        .find(|installation| installation.route() == route)
+        .ok_or(PublicationError::UnknownPeer)?;
+    installation
+        .bind_space(worker.pml4, |binding| {
+            let status = crate::tcb_set_space_r(
+                binding.executor,
+                binding.fault_slot,
+                binding.cnode,
+                binding.vspace,
+            );
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(status)
+            }
+        })
+        .map_err(PublicationError::FaultSpace)
 }
 
 /// The physical owner must keep this exact domain generation, stopped lane and endpoint alive.

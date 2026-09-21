@@ -229,10 +229,26 @@ pub(crate) struct SharedVspaceWorkerDescriptor {
     pub ensure_paging: unsafe fn(u64, u64) -> bool,
 }
 
+/// The shared endpoint remains owned by the durable ingress owner, never by worker teardown.
+pub(crate) enum WorkerEndpoint {
+    Private(u64),
+    Shared(u64),
+}
+
+impl WorkerEndpoint {
+    pub(crate) fn cap(&self) -> u64 {
+        match *self {
+            Self::Private(cap) | Self::Shared(cap) => cap,
+        }
+    }
+}
+
 /// Root-owned capabilities which keep one shared-VSpace component worker alive.
 #[allow(dead_code)] // All fields become active when lane teardown lands with the routing cutover.
 pub(crate) struct SpawnedComponentWorker {
-    pub endpoint: u64,
+    pub endpoint: WorkerEndpoint,
+    /// Borrowed component VSpace; the worker does not own its lifetime or page tables.
+    pub pml4: u64,
     pub reply_cap: u64,
     pub tcb: u64,
     pub cnode: u64,
@@ -605,6 +621,26 @@ pub(crate) unsafe fn resume_spawned_component_worker(tcb: u64, sched_context: u6
 pub(crate) unsafe fn spawn_component_worker_suspended(
     d: &SharedVspaceWorkerDescriptor,
 ) -> SpawnedComponentWorker {
+    spawn_component_worker_with_endpoint(d, None)
+}
+
+/// Prepare a stopped worker with an empty CT_FAULT slot and a null TCB fault handler.
+/// The ingress owner must outlive the worker. Export the exact badged child cap and acknowledge
+/// a subsequent TCBSetSpace before startup; copying CT_FAULT alone does not arm fault delivery.
+pub(crate) unsafe fn spawn_shared_component_worker_suspended(
+    d: &SharedVspaceWorkerDescriptor,
+    endpoint: u64,
+) -> SpawnedComponentWorker {
+    if endpoint == 0 {
+        component_spawn_fail(b"worker-shared-endpoint", endpoint, 1);
+    }
+    spawn_component_worker_with_endpoint(d, Some(endpoint))
+}
+
+unsafe fn spawn_component_worker_with_endpoint(
+    d: &SharedVspaceWorkerDescriptor,
+    shared_endpoint: Option<u64>,
+) -> SpawnedComponentWorker {
     if d.pml4 == 0 || d.stack_frames == 0 || d.stack_base == 0 || d.ipc_buffer_va == 0 {
         print_str(b"[component-spawn] invalid shared-VSpace worker descriptor\n");
         park();
@@ -640,8 +676,14 @@ pub(crate) unsafe fn spawn_component_worker_suspended(
         page_map_r(ipc_buffer_frame, d.ipc_buffer_va, RW_NX, d.pml4),
     );
 
-    let endpoint = component_alloc_slot(b"worker-endpoint-slot");
-    component_retype(b"worker-endpoint-retype", OBJ_ENDPOINT, 0, endpoint);
+    let endpoint = match shared_endpoint {
+        Some(endpoint) => WorkerEndpoint::Shared(endpoint),
+        None => {
+            let endpoint = component_alloc_slot(b"worker-endpoint-slot");
+            component_retype(b"worker-endpoint-retype", OBJ_ENDPOINT, 0, endpoint);
+            WorkerEndpoint::Private(endpoint)
+        }
+    };
     let reply_cap = component_alloc_slot(b"worker-reply-slot");
     component_retype(b"worker-reply-retype", OBJ_REPLY, 0, reply_cap);
 
@@ -658,18 +700,25 @@ pub(crate) unsafe fn spawn_component_worker_suspended(
         d.pml4,
         cnode_copy_at_r(cnode, CT_PML4, d.pml4),
     );
-    component_expect(
-        b"worker-cnode-endpoint-copy",
-        endpoint,
-        cnode_copy_at_r(cnode, CT_FAULT, endpoint),
-    );
+    if let WorkerEndpoint::Private(endpoint) = &endpoint {
+        component_expect(
+            b"worker-cnode-endpoint-copy",
+            *endpoint,
+            cnode_copy_at_r(cnode, CT_FAULT, *endpoint),
+        );
+    }
 
     let tcb = component_alloc_slot(b"worker-tcb-slot");
     component_retype(b"worker-tcb-retype", OBJ_TCB, 0, tcb);
     component_expect(
         b"worker-tcb-set-space",
         tcb,
-        tcb_set_space_r(tcb, CT_FAULT, cnode, d.pml4),
+        tcb_set_space_r(
+            tcb,
+            if shared_endpoint.is_some() { 0 } else { CT_FAULT },
+            cnode,
+            d.pml4,
+        ),
     );
     component_expect(
         b"worker-tcb-set-ipcbuf",
@@ -698,6 +747,7 @@ pub(crate) unsafe fn spawn_component_worker_suspended(
 
     SpawnedComponentWorker {
         endpoint,
+        pml4: d.pml4,
         reply_cap,
         tcb,
         cnode,

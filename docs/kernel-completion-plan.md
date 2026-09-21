@@ -37080,6 +37080,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Both serialized native release builds pass (.tmp/build-native-peer-export-executive-20260921.log
         and .tmp/build-native-peer-export-io-manager-20260921.log). Native copy/failure injection
         remains unmeasured because the path is dormant; no new boot or desktop result is claimed.
+        Shared worker preparation checkpoint (2026-09-21): private and shared endpoint worker
+        preparation now share one constructor body. The existing private entry point still creates
+        and copies its own endpoint. The shared entry point borrows the durable ingress endpoint,
+        leaves CT_FAULT empty and installs an explicit null TCB fault handler while stopped.
+        Worker receipts distinguish owned Private from borrowed Shared endpoints and retain the
+        borrowed component VSpace identity; future teardown cannot treat a shared endpoint as a
+        private worker resource. Existing win32k creation remains on the private entry point.
+
+        Microkernel review established that TCBSetSpace captures a derived fault-handler capability
+        immediately; later filling CT_FAULT does not update it. prepare_worker_peer therefore checks
+        the shared worker receipt against the exact canonical binding, exports its badged endpoint,
+        revalidates route/Staged state, and invokes acknowledged TCBSetSpace before startup. The
+        sealed installation records BindingSpace before the effect and SpaceBound only on ACK,
+        retaining exact TCB/CNode/VSpace/child-slot attribution on uncertainty without replay.
+        Teardown must account for this TCB-owned derived alias as well as root and child aliases.
+        Neither export nor fault binding resumes the worker or releases the execution fence.
+
+        Shared construction remains dormant until shared-lane topology and routing are integrated.
+        No private endpoint cleanup or duplicate-endpoint validation has been relaxed. Validation:
+        nt-component-suspension passes 241 unit and 14 doc tests, including exact binding receipts,
+        pre-effect refusal, acknowledged binding, and uncertain binding without replay or alias loss
+        (.tmp/test-shared-worker-preparation-20260921.log). Both serialized native release builds pass
+        (.tmp/build-shared-worker-preparation-executive-20260921.log and
+        .tmp/build-shared-worker-preparation-io-manager-20260921.log). A fresh boot with a 120-second
+        deadline reaches the unchanged 27 unresolved win32k imports and explicit incomplete-registry
+        rejection before DriverEntry (.tmp/boot-shared-worker-preparation-20260921.log). QEMU was
+        deliberately stopped at that barrier; the runner correctly reports failure, not desktop
+        success. Shared-worker runtime and native failure injection remain unmeasured.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

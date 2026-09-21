@@ -37,6 +37,76 @@ fn staged_worker_export_does_not_start_execution_or_release_aliases() {
     );
 }
 
+#[test]
+fn fault_space_binding_requires_export_and_retains_exact_aliases() {
+    let (lanes, _, peers, mut owner) = published();
+    assert_eq!(
+        owner.bind_space(66, |_| Ok::<_, u8>(())),
+        Err(PeerInstallationError::InvalidPhase)
+    );
+    let child = PeerCapabilityDestination { cnode: 55, slot: 6 };
+    owner
+        .export(&peers, 7, 8, &lanes, child, |_, _| Ok::<_, u8>(()))
+        .unwrap();
+    for invalid in [0, 11, 22, 44, 55] {
+        assert_eq!(
+            owner.bind_space(invalid, |_| -> Result<(), u8> { panic!("invalid VSpace") }),
+            Err(PeerInstallationError::InvalidSpace)
+        );
+        assert_eq!(owner.space_binding(), None);
+    }
+    owner
+        .bind_space(66, |binding| {
+            assert_eq!(
+                binding,
+                crate::PeerSpaceBinding {
+                    executor: 11,
+                    cnode: 55,
+                    vspace: 66,
+                    fault_slot: 6
+                }
+            );
+            Ok::<_, u8>(())
+        })
+        .unwrap();
+    assert_eq!(owner.phase(), PeerInstallationPhase::SpaceBound);
+    assert_eq!(owner.space_binding().unwrap().vspace, 66);
+    assert_eq!(owner.child_destination(), Some(child));
+    assert_eq!(owner.slot(), 44);
+    assert_eq!(
+        owner.bind_space(66, |_| Ok::<_, u8>(())),
+        Err(PeerInstallationError::InvalidPhase)
+    );
+    assert_eq!(
+        owner.delete_staged(|_| Ok::<_, u8>(())),
+        Err(PeerInstallationError::InvalidPhase)
+    );
+}
+
+#[test]
+fn uncertain_fault_space_binding_cannot_replay_or_drop_child_alias() {
+    let (lanes, _, mut peers, mut owner) = published();
+    let child = PeerCapabilityDestination { cnode: 55, slot: 6 };
+    owner
+        .export(&peers, 7, 8, &lanes, child, |_, _| Ok::<_, u8>(()))
+        .unwrap();
+    assert_eq!(
+        owner.bind_space(66, |_| Err(7u8)),
+        Err(PeerInstallationError::Invoke(7))
+    );
+    assert_eq!(owner.phase(), PeerInstallationPhase::BindingSpace);
+    assert_eq!(owner.space_binding().unwrap().executor, 11);
+    assert_eq!(owner.child_destination(), Some(child));
+    assert_eq!(
+        owner.bind_space(66, |_| -> Result<(), u8> { panic!("SetSpace replay") }),
+        Err(PeerInstallationError::InvalidPhase)
+    );
+    assert_eq!(
+        owner.finish_abort(&mut peers),
+        Err(PeerInstallationError::InvalidPhase)
+    );
+}
+
 type Lanes = ComponentSuspensionLanes<(), ()>;
 
 fn setup() -> (Lanes, LaneHandle, PeerRegistry, PeerInstallation) {

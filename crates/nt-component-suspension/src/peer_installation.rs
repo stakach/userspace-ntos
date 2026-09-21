@@ -17,6 +17,8 @@ pub enum PeerInstallationPhase {
     Published,
     Exporting,
     Exported,
+    BindingSpace,
+    SpaceBound,
     Deleting,
     Deleted,
     Aborted,
@@ -26,6 +28,7 @@ pub enum PeerInstallationPhase {
 pub enum PeerInstallationError<E> {
     InvalidSlot,
     InvalidDestination,
+    InvalidSpace,
     InvalidPhase,
     Peer(PeerError),
     Lane(PeerLaneError),
@@ -37,6 +40,15 @@ pub enum PeerInstallationError<E> {
 pub struct PeerCapabilityDestination {
     pub cnode: u64,
     pub slot: u64,
+}
+
+/// Attribution of the exact stopped executor's address-space and fault endpoint binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerSpaceBinding {
+    pub executor: u64,
+    pub cnode: u64,
+    pub vspace: u64,
+    pub fault_slot: u64,
 }
 
 /// Owns the registration ticket and a preallocated root-CSpace destination slot. The adapter must
@@ -56,6 +68,7 @@ pub struct PeerInstallation {
     route: PeerRoute,
     destination_slot: u64,
     exported_destination: Option<PeerCapabilityDestination>,
+    space_binding: Option<PeerSpaceBinding>,
     phase: PeerInstallationPhase,
 }
 
@@ -81,6 +94,7 @@ impl PeerInstallation {
             route,
             destination_slot,
             exported_destination: None,
+            space_binding: None,
             phase: PeerInstallationPhase::Reserved,
         })
     }
@@ -103,6 +117,47 @@ impl PeerInstallation {
     /// to delete, overwrite or recycle the child slot.
     pub const fn child_destination(&self) -> Option<PeerCapabilityDestination> {
         self.exported_destination
+    }
+
+    /// Includes entered but unacknowledged bindings; metadata never permits teardown or reuse.
+    pub const fn space_binding(&self) -> Option<PeerSpaceBinding> {
+        self.space_binding
+    }
+
+    /// Bind the stopped executor to its live child CSpace/VSpace and exported fault endpoint.
+    /// The adapter must prove these are the exact owned physical objects, keep them alive, and
+    /// invoke synchronously without reentry. Root, child and TCB-derived endpoint aliases remain
+    /// owned on success or uncertainty. This grants no execution permission and never resumes.
+    pub fn bind_space<E>(
+        &mut self,
+        vspace: u64,
+        bind: impl FnOnce(PeerSpaceBinding) -> Result<(), E>,
+    ) -> Result<(), PeerInstallationError<E>> {
+        if self.phase != PeerInstallationPhase::Exported {
+            return Err(PeerInstallationError::InvalidPhase);
+        }
+        let destination = self
+            .exported_destination
+            .expect("exported peer destination");
+        if vspace == 0
+            || vspace == self.route.identity().executor
+            || vspace == self.route.endpoint()
+            || vspace == self.destination_slot
+            || vspace == destination.cnode
+        {
+            return Err(PeerInstallationError::InvalidSpace);
+        }
+        let binding = PeerSpaceBinding {
+            executor: self.route.identity().executor,
+            cnode: destination.cnode,
+            vspace,
+            fault_slot: destination.slot,
+        };
+        self.space_binding = Some(binding);
+        self.phase = PeerInstallationPhase::BindingSpace;
+        bind(binding).map_err(PeerInstallationError::Invoke)?;
+        self.phase = PeerInstallationPhase::SpaceBound;
+        Ok(())
     }
 
     /// Copy the published root alias into the exact peer's live child CSpace. The adapter must

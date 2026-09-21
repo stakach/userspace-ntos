@@ -277,7 +277,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
         },
     );
     let channel = crate::spawn_hosts::PumpChannel {
-        fault_ep: worker.endpoint,
+        fault_ep: worker.endpoint.cap(),
         physical_domain: None,
         pml4,
         code_va: win32k_subsystem::WIN32K_CODE_VA,
@@ -305,7 +305,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     };
     let tcb = worker.tcb;
     let sched_context = worker.sched_context;
-    let endpoint = worker.endpoint;
+    let endpoint = worker.endpoint.cap();
     let reply_cap = worker.reply_cap;
     // Retain every allocated arena and capability before any worker can run or fail startup.
     let physical_index = {
