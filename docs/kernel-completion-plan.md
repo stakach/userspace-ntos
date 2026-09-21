@@ -37230,6 +37230,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         serialized native release builds pass (.tmp/build-completion-message-executive-20260921.log
         and .tmp/build-completion-message-io-manager-20260921.log). The last measured boot
         remains at the strict 27-export win32k barrier; no new boot result is claimed.
+        Startup ingress-owner checkpoint (2026-09-21): live worker tracing identified a receive
+        admission gap before cutover: a resumed secondary worker is Starting, not Idle or Running
+        with a dispatch epoch. IngressExecutionOwner::Startup now carries the full shared PeerRoute,
+        not a table-local lane handle. Validation requires the exact canonical shared route, TCB,
+        endpoint, Starting phase, running fence and absence of dispatch/entered terminal ownership.
+        The non-reused peer badge excludes recreated tables with identical numeric lane handles.
+
+        Existing reserved receive and handoff machinery captures and revalidates this owner without
+        manufacturing a dispatch epoch or releasing startup exclusion. A transition out of Starting
+        before handoff refuses while retaining the complete held Call and capacity reservation.
+        Private startup remains unchanged. Shared startup readiness still needs authenticated
+        five-word publication and Reply adoption before the live worker path can replace its private
+        endpoint; do not simply change the constructor while its pump still receives privately.
+
+        Contract review found no blocking issues. Validation: 264 unit and 14 doc tests pass
+        (.tmp/test-startup-ingress-owner-20260921.log), covering exact startup retention, stale/foreign
+        table rejection, staged/completed phase refusal, and held-call preservation after transition.
+        Both serialized native release builds pass (.tmp/build-startup-ingress-owner-executive-20260921.log
+        and .tmp/build-startup-ingress-owner-io-manager-20260921.log). No new boot result is claimed.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

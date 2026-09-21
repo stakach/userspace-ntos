@@ -91,6 +91,10 @@ mod tests;
 #[path = "completion_message_tests.rs"]
 mod completion_message_tests;
 
+#[cfg(test)]
+#[path = "startup_receive_tests.rs"]
+mod startup_receive_tests;
+
 /// Native adapters must capture the full received message before issuing binding-query IPC.
 /// This owns ingress and storage exclusively; Call provenance, exact physical lifetime and
 /// capability alias exclusions outside this receiver remain native obligations.

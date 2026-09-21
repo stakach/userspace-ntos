@@ -31,12 +31,14 @@ pub enum IngressReceiveDisposition {
     NoCall,
 }
 
-/// Authority to receive while idle or on behalf of one exact currently running dispatch.
+/// Authority to receive while idle or on behalf of one exact dispatch or shared-worker startup.
 /// This does not authorize another lane to execute or change any scheduling ownership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IngressExecutionOwner {
     Idle,
     Dispatch(LaneDispatchIdentity),
+    /// Receive on behalf of one exact staged worker's startup, without a dispatch epoch.
+    Startup(peer_registry::PeerRoute),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -279,6 +281,24 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
                 return Err(IngressError::ExecutionBusy)
             }
             IngressExecutionOwner::Idle => {}
+            IngressExecutionOwner::Startup(route) => {
+                if self.terminal_execution_busy() {
+                    return Err(IngressError::ExecutionBusy);
+                }
+                let handle = route.identity().lane;
+                let lane = self
+                    .lane(handle)
+                    .map_err(|_| IngressError::ExecutionOwnerMismatch)?;
+                if self.running != Some(handle)
+                    || lane.phase != LanePhase::Starting
+                    || lane.dispatch.is_some()
+                    || lane.shared_peer != Some(route)
+                    || lane.binding.executor_id != route.identity().executor
+                    || lane.binding.receive_endpoint != route.endpoint()
+                {
+                    return Err(IngressError::ExecutionOwnerMismatch);
+                }
+            }
             IngressExecutionOwner::Dispatch(dispatch) => {
                 if self.terminal_execution_busy() {
                     return Err(IngressError::ExecutionBusy);
