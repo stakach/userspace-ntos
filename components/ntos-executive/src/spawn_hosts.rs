@@ -13,12 +13,15 @@ use crate::*;
 use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use nt_io_manager::{write_wdm_driver_object, WdmDriverObjectInit};
 
-#[path = "pump_receive_probe.rs"]
-mod receive_probe;
-pub(crate) use receive_probe::query as query_component_reply_binding;
+#[path = "component_reply_binding.rs"]
+mod reply_binding;
+pub(crate) use reply_binding::query as query_component_reply_binding;
 
 #[path = "component_shared_ingress.rs"]
 pub(crate) mod shared_ingress;
+
+#[path = "component_shared_pump.rs"]
+mod shared_pump;
 
 const SEL4_RETYPE_FAN_OUT_LIMIT: u64 = 256;
 
@@ -229,24 +232,11 @@ pub(crate) struct SharedVspaceWorkerDescriptor {
     pub ensure_paging: unsafe fn(u64, u64) -> bool,
 }
 
-/// The shared endpoint remains owned by the durable ingress owner, never by worker teardown.
-pub(crate) enum WorkerEndpoint {
-    Private(u64),
-    Shared(u64),
-}
-
-impl WorkerEndpoint {
-    pub(crate) fn cap(&self) -> u64 {
-        match *self {
-            Self::Private(cap) | Self::Shared(cap) => cap,
-        }
-    }
-}
-
 /// Root-owned capabilities which keep one shared-VSpace component worker alive.
 #[allow(dead_code)] // All fields become active when lane teardown lands with the routing cutover.
 pub(crate) struct SpawnedComponentWorker {
-    pub endpoint: WorkerEndpoint,
+    /// Borrowed from the shared ingress owner, never released by physical worker teardown.
+    pub endpoint: u64,
     /// Borrowed component VSpace; the worker does not own its lifetime or page tables.
     pub pml4: u64,
     pub reply_cap: u64,
@@ -613,17 +603,6 @@ pub(crate) unsafe fn resume_spawned_component_worker(tcb: u64, sched_context: u6
     error
 }
 
-/// Build a separate physical execution lane in an existing component VSpace.
-///
-/// Only the address space and initialized component state are shared. The worker owns a distinct
-/// stack, IPC buffer, endpoint, MCS reply object, CSpace, TCB, and scheduling context, allowing it
-/// to remain blocked without retaining another lane's physical C stack or reply binding.
-pub(crate) unsafe fn spawn_component_worker_suspended(
-    d: &SharedVspaceWorkerDescriptor,
-) -> SpawnedComponentWorker {
-    spawn_component_worker_with_endpoint(d, None)
-}
-
 /// Prepare a stopped worker with an empty CT_FAULT slot and a null TCB fault handler.
 /// The ingress owner must outlive the worker. Export the exact badged child cap and acknowledge
 /// a subsequent TCBSetSpace before startup; copying CT_FAULT alone does not arm fault delivery.
@@ -634,13 +613,6 @@ pub(crate) unsafe fn spawn_shared_component_worker_suspended(
     if endpoint == 0 {
         component_spawn_fail(b"worker-shared-endpoint", endpoint, 1);
     }
-    spawn_component_worker_with_endpoint(d, Some(endpoint))
-}
-
-unsafe fn spawn_component_worker_with_endpoint(
-    d: &SharedVspaceWorkerDescriptor,
-    shared_endpoint: Option<u64>,
-) -> SpawnedComponentWorker {
     if d.pml4 == 0 || d.stack_frames == 0 || d.stack_base == 0 || d.ipc_buffer_va == 0 {
         print_str(b"[component-spawn] invalid shared-VSpace worker descriptor\n");
         park();
@@ -676,17 +648,6 @@ unsafe fn spawn_component_worker_with_endpoint(
         page_map_r(ipc_buffer_frame, d.ipc_buffer_va, RW_NX, d.pml4),
     );
 
-    let endpoint = match shared_endpoint {
-        Some(endpoint) => WorkerEndpoint::Shared(endpoint),
-        None => {
-            let endpoint = component_alloc_slot(b"worker-endpoint-slot");
-            component_retype(b"worker-endpoint-retype", OBJ_ENDPOINT, 0, endpoint);
-            WorkerEndpoint::Private(endpoint)
-        }
-    };
-    let reply_cap = component_alloc_slot(b"worker-reply-slot");
-    component_retype(b"worker-reply-retype", OBJ_REPLY, 0, reply_cap);
-
     let raw_cnode = component_alloc_slot(b"worker-cnode-raw-slot");
     component_retype(b"worker-cnode-raw-retype", OBJ_CNODE, CN_RADIX, raw_cnode);
     let cnode = component_alloc_slot(b"worker-cnode-slot");
@@ -700,14 +661,6 @@ unsafe fn spawn_component_worker_with_endpoint(
         d.pml4,
         cnode_copy_at_r(cnode, CT_PML4, d.pml4),
     );
-    if let WorkerEndpoint::Private(endpoint) = &endpoint {
-        component_expect(
-            b"worker-cnode-endpoint-copy",
-            *endpoint,
-            cnode_copy_at_r(cnode, CT_FAULT, *endpoint),
-        );
-    }
-
     let tcb = component_alloc_slot(b"worker-tcb-slot");
     component_retype(b"worker-tcb-retype", OBJ_TCB, 0, tcb);
     component_expect(
@@ -715,7 +668,7 @@ unsafe fn spawn_component_worker_with_endpoint(
         tcb,
         tcb_set_space_r(
             tcb,
-            if shared_endpoint.is_some() { 0 } else { CT_FAULT },
+            0,
             cnode,
             d.pml4,
         ),
@@ -745,6 +698,8 @@ unsafe fn spawn_component_worker_with_endpoint(
         }
     };
 
+    let reply_cap = shared_ingress::owner::runtime::allocate_reply(tcb)
+        .expect("worker initial Reply must remain owned by shared ingress");
     SpawnedComponentWorker {
         endpoint,
         pml4: d.pml4,
@@ -1176,8 +1131,7 @@ pub(crate) unsafe fn spawn_storage_host(
 /// `Call` transport the question becomes a statement about the reply object:
 ///
 /// * [`InitialAction::ReplyRequest`] — the component is blocked in a `Call` bound to this channel's
-///   reply object, so the pump answers that Call and receives the next component message in one
-///   composite kernel entry.
+///   reply object, so the pump acknowledges that Call before receiving the next component message.
 /// * [`InitialAction::RecvFirst`] — the component is not yet blocked in a dispatch `Call` (it is
 ///   mid-DriverEntry: either blocked in a fault Call or about to issue its ready Call), so the pump
 ///   starts by RECEIVING.
@@ -1194,6 +1148,8 @@ pub(crate) enum InitialAction {
 /// `npfs_dispatch_irp`/`load_driver` inner loop EXACTLY.
 #[derive(Clone, Copy)]
 pub(crate) struct PumpChannel {
+    /// Exact generational ingress authority captured from the retained physical owner.
+    pub ingress_route: Option<nt_component_suspension::peer_registry::PeerRoute>,
     /// Captured physical address-space lifetime. Driver broker routing requires this exact domain;
     /// logical dependent-driver attribution never substitutes for it. Win32k uses its lane owner.
     pub physical_domain: Option<nt_io_manager::HostedDomainIdentity>,
@@ -1225,13 +1181,10 @@ pub(crate) struct PumpChannel {
     /// What the pump does FIRST (see [`InitialAction`]): ANSWER the component's outstanding dispatch
     /// `Call` with the request, or (mid-DriverEntry) start by RECEIVING.
     pub initial: InitialAction,
-    /// The component host's TCB. Needed ONLY to `TCB_Suspend` it on a WALL (risk R2 — see the wall
-    /// tail of [`component_pump_inner`]). 0 = cannot suspend.
+    /// Exact live physical TCB authenticated by the retained ingress route.
     pub tcb: u64,
-    /// ★ This component's active MCS reply object — the server side of the `Call` transport, and now
-    /// MANDATORY (a zero here means the channel has no transport at all). `R_win32k` (`REPLY_W32`)
-    /// and `R_fsd[inst]` (`REPLY_FSD`) are distinct from the hosted-user wait reply pool. FSD worker
-    /// parking needs driver-owned rotation around this active object.
+    /// Snapshot of the shared owner's canonical Reply; admission/adoption refreshes this value.
+    /// A parked service retains its exact Reply through the shared owner, never a private pool.
     pub reply_cap: u64,
     /// win32k only (0 for the FSD): the exact client identity captured when this dispatch was routed.
     /// Event-object broker calls consume both fields from this scoped channel rather than consulting
@@ -1425,9 +1378,8 @@ pub(crate) fn harness_dispatches(kind: ReqKind) -> u64 {
 // property in userspace are deleted.
 // =============================================================================================
 
-/// Requests answered on a component's reply object, BY KIND. Every one of them uses the composite
-/// reply+receive syscall, so the executive cannot keep running between reply delivery and the next
-/// receive boundary.
+/// Requests answered on a component's reply object, BY KIND. Reply acknowledgement and the next
+/// receive are separate boundaries; an uncertain reply stops the pump before another receive.
 static PUMP_CALL_REQUESTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// Dispatches whose completion arrived as the return value of the COMPONENT'S OWN `Call` on the
 /// bound reply object, BY KIND. Must equal [`HARNESS_IRP_DISPATCHES`] /
@@ -1442,10 +1394,7 @@ pub(crate) fn pump_call_requests(kind: ReqKind) -> u64 {
 pub(crate) fn pump_call_dispatches(kind: ReqKind) -> u64 {
     PUMP_CALL_DISPATCHES[kind as usize].load(Ordering::Relaxed)
 }
-/// Legacy counter retained for transport gates that assert no component reply-object error was
-/// observed. The component pump now uses composite reply+receive rather than the older standalone
-/// `reply_on` helper, so this remains zero unless a future explicit error-returning component reply
-/// path is added.
+/// Shared component service Reply refusals and non-ACK outcomes, including parked wait wakes.
 pub(crate) static PUMP_REPLY_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Components suspended (`TCB_Suspend`) because their pump WALLED — see risk R2 at the wall tail.
 pub(crate) static PUMP_WALL_SUSPENDS: AtomicU64 = AtomicU64::new(0);
@@ -1509,11 +1458,9 @@ fn dispatch_depth_leave() {
 /// The component protocol carries the request tag in MR0 to distinguish nested dispatch from
 /// callback resume. Reply-cap message labels are payload, not kernel invocation selectors.
 const REQUEST_TAG_LEN: u64 = 1;
-static PUMP_TIMER_FAIR_POLLS: AtomicU64 = AtomicU64::new(0);
-static PUMP_TIMER_FAIR_HITS: AtomicU64 = AtomicU64::new(0);
 static PUMP_DEADMAN_UNWINDS: AtomicU64 = AtomicU64::new(0);
 
-unsafe fn pump_handle_executive_event_badge(badge: u64) -> (bool, bool, bool) {
+pub(crate) unsafe fn pump_handle_executive_event_badge(badge: u64) -> (bool, bool, bool) {
     let timer = crate::badge_has_delay_timer(badge);
     let irq_lines = crate::driver_launch::latch_hosted_irq_badge(badge);
     let irq = irq_lines != 0;
@@ -1541,62 +1488,10 @@ unsafe fn pump_scheduler_work_pending(ch: &PumpChannel, irq: bool) -> bool {
             || crate::dispatcher_bootstrap::timer_work_pending())
 }
 
-/// After a bound HPET notification interrupts a component endpoint receive, probe that endpoint
-/// once without blocking. This prevents a ready component Call from sitting behind a stream of timer
-/// badges on the root TCB's bound notification while preserving normal blocking behavior when the
-/// endpoint is still idle.
-#[inline(never)]
-unsafe fn pump_try_recv_after_timer(ch: &PumpChannel, reply_cap: u64) -> Option<PumpMessage> {
-    receive_probe::before_receive(ch, reply_cap);
-    PUMP_TIMER_FAIR_POLLS.fetch_add(1, Ordering::Relaxed);
-    let badge: u64;
-    let mi: u64;
-    let m0: u64;
-    let m1: u64;
-    let m2: u64;
-    let m3: u64;
-    core::arch::asm!(
-        "syscall",
-        in("rdx") crate::SYS_NB_RECV as u64,
-        inout("rdi") ch.fault_ep => badge,
-        lateout("rsi") mi,
-        lateout("r10") m0,
-        lateout("r8") m1,
-        lateout("r9") m2,
-        lateout("r15") m3,
-        in("r12") reply_cap,
-        in("r13") 0u64,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-    let received = crate::ipc_message::capture_received(badge, mi, [m0, m1, m2, m3]);
-    let received_call = receive_probe::received_call(ch, reply_cap, badge);
-    let (executive_event, _timer, irq) = pump_handle_executive_event_badge(badge);
-    if executive_event {
-        if pump_deadman_tripped() {
-            return Some(PumpMessage::deadman_wall());
-        }
-        if pump_scheduler_work_pending(ch, irq) {
-            return Some(PumpMessage::scheduler_yield());
-        }
-        return None;
-    }
-    if !received_call {
-        // This private protocol consumes Calls only. Free can also mean an ordinary Send was
-        // received; it authorizes another poll but is not evidence that the endpoint was empty.
-        return None;
-    }
-    let label = mi >> 12;
-    let hit = PUMP_TIMER_FAIR_HITS.fetch_add(1, Ordering::Relaxed);
-    if hit < 8 {
-        crate::print_str(b"[pump] timer-fair NBRecv accepted component message label=");
-        crate::print_u64(label);
-        crate::print_str(b"\n");
-    }
-    Some(PumpMessage::from_received(received))
-}
 
 struct PumpMessage {
+    shared_reply: Option<u64>,
+    service_finished: bool,
     received: Option<nt_component_suspension::ReceivedMessage>,
     badge: u64,
     mi: u64,
@@ -1616,6 +1511,8 @@ impl PumpMessage {
         );
         let [m0, m1, m2, m3] = received.registers();
         Self {
+            shared_reply: None,
+            service_finished: false,
             badge: received.badge(),
             mi: received.info(),
             m0,
@@ -1643,6 +1540,8 @@ impl PumpMessage {
     #[inline]
     const fn deadman_wall() -> Self {
         Self {
+            shared_reply: None,
+            service_finished: false,
             received: None,
             badge: 0,
             mi: 0,
@@ -1658,6 +1557,8 @@ impl PumpMessage {
     #[inline]
     const fn transport_wall() -> Self {
         Self {
+            shared_reply: None,
+            service_finished: false,
             received: None,
             badge: 0,
             mi: 0xfff << 12,
@@ -1673,6 +1574,8 @@ impl PumpMessage {
     #[inline]
     const fn scheduler_yield() -> Self {
         Self {
+            shared_reply: None,
+            service_finished: false,
             received: None,
             badge: 0,
             mi: 0,
@@ -1772,93 +1675,17 @@ impl PumpLoopOutcome {
     }
 }
 
-/// Receive the component's next message. The recv REGISTERS the channel's reply object in r12, so
-/// the kernel binds it to whichever Call — dispatch completion, demand-page fault or callback —
-/// pairs with us. This is the ONLY correlation state the transport has, and it is the kernel's.
-///
-/// ★ THE BADGE IS LOAD-BEARING (Phase 4). The executive's root TCB has the HPET one-shot
-/// notification BOUND to it, so this `Recv` has a SECOND thing that can satisfy it besides a
-/// component `Call`: a timer tick. The kernel's bound-notification pre-check
-/// (`syscall_handler.rs::handle_recv`) returns `rdi = DELAY_TIMER_BADGE`, `rsi = 0` and **leaves the
-/// message registers untouched** without staging `ch.reply_cap` for IPC, so a tick absorbed here
-/// reads as `label = 0` with MR0 still holding the reply-half request tag.
-/// That is a WALL, and it is exactly what killed the LSA route's npfs READ
-/// (`[pump] WALL label=0 ip=0x771`): the route is the first thing in the boot that arms an HPET
-/// one-shot (`NtDelayExecution` from the RPC worker) WHILE a component dispatch is in flight. The
-/// main service loop has always screened this badge; the pump did not, because before the route
-/// nothing ticked during a dispatch.
-///
-/// So: recognise the tick, count it, and ask the service-loop-owned timer hook to drain the real
-/// queues immediately when that context is live. If no service context is registered (early init or
-/// post-loop tests), fall back to acknowledging the IRQ line and let the ordinary loop drain the
-/// coalesced tick later.
+/// Receive only through the shared, retained ingress owner.
 #[inline(never)]
-unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
-    loop {
-        // Dedicated IRQ/DPC exchanges may have latched a fresh bootstrap tick since the yield.
-        if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
-            && crate::dispatcher_bootstrap::timer_work_pending()
-        {
-            return PumpMessage::scheduler_yield();
-        }
-        receive_probe::before_receive(ch, reply_cap);
-        // (This recv pairs a component `Call`, so the kernel writes `executive.reply_to = component`.
-        // Harmless since Phase 3: no executive reply reads `reply_to` any more.)
-        let badge: u64;
-        let mi: u64;
-        let m0: u64;
-        let m1: u64;
-        let m2: u64;
-        let m3: u64;
-        core::arch::asm!(
-            "syscall",
-            in("rdx") crate::SYS_RECV as u64,
-            inout("rdi") ch.fault_ep => badge,
-            lateout("rsi") mi,
-            lateout("r10") m0,
-            lateout("r8") m1,
-            lateout("r9") m2,
-            lateout("r15") m3,
-            in("r12") reply_cap,
-            in("r13") 0u64,
-            lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-            options(nostack),
-        );
-        let received = crate::ipc_message::capture_received(badge, mi, [m0, m1, m2, m3]);
-        let received_call = receive_probe::received_call(ch, reply_cap, badge);
-        let (executive_event, timer, irq) = pump_handle_executive_event_badge(badge);
-        if executive_event {
-            if pump_deadman_tripped() {
-                return PumpMessage::deadman_wall();
-            }
-            if pump_scheduler_work_pending(ch, irq) {
-                return PumpMessage::scheduler_yield();
-            }
-            if timer {
-                if let Some(polled) = pump_try_recv_after_timer(ch, reply_cap) {
-                    crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
-                    return polled;
-                }
-                let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
-                if n < 8 {
-                    crate::print_str(
-                        b"[pump] HPET tick landed on a component recv -> deferred to the service loop (NOT a wall)\n",
-                    );
-                }
-            }
-            continue;
-        }
-        if !received_call {
-            // An ordinary Send has no response continuation in the private Call protocol.
-            continue;
-        }
-        return PumpMessage::from_received(received);
+unsafe fn pump_recv(ch: &PumpChannel, _reply_cap: u64) -> PumpMessage {
+    match shared_ingress::owner::runtime::channel_route(ch) {
+        Ok(Some(route)) => shared_pump::receive(ch, route),
+        Err(_) | Ok(None) => PumpMessage::transport_wall(),
     }
 }
 
-/// Reply to the component's outstanding `Call` and receive the next component message in one kernel
-/// entry. The send half targets the reply cap in r13; the receive half offers the same reply cap in
-/// r12 so the next component `Call` binds to the same kernel reply object.
+/// Acknowledge the component's outstanding Call before entering the receive-only path.
+/// An uncertain reply never permits another receive or retransmission of this request.
 #[inline(never)]
 unsafe fn pump_reply_recv(
     ch: &PumpChannel,
@@ -1878,107 +1705,24 @@ unsafe fn pump_reply_recv4(
     reply_r2: u64,
     reply_r3: u64,
 ) -> PumpMessage {
+    if !shared_pump::reply(ch, reply_cap, reply_msginfo, [reply_r0, reply_r1, reply_r2, reply_r3]) {
+        return PumpMessage::transport_wall();
+    }
+    if shared_pump::autonomous(ch) {
+        let route = shared_ingress::owner::runtime::channel_route(ch).ok().flatten()
+            .expect("authenticated autonomous source");
+        if shared_ingress::owner::runtime::finish_autonomous(route).is_err() { return PumpMessage::transport_wall(); }
+        let mut message = PumpMessage::deadman_wall();
+        message.service_finished = true;
+        return message;
+    }
     if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
         && crate::dispatcher_bootstrap::request_receive_checkpoint()
         && crate::dispatcher_bootstrap::timer_work_pending()
     {
-        // The continuation is receive-only: publish the exact reply once before yielding.
-        if !pump_reply_on(reply_cap, reply_msginfo, reply_r0, reply_r1, reply_r2, reply_r3) {
-            return PumpMessage::transport_wall();
-        }
         return PumpMessage::scheduler_yield();
     }
-    let badge: u64;
-    let mi: u64;
-    let m0: u64;
-    let m1: u64;
-    let m2: u64;
-    let m3: u64;
-    core::arch::asm!(
-        "syscall",
-        in("rdx") crate::SYS_NB_SEND_RECV as u64,
-        inout("rdi") ch.fault_ep => badge,
-        inout("rsi") reply_msginfo => mi,
-        inout("r10") reply_r0 => m0,
-        inout("r8") reply_r1 => m1,
-        inout("r9") reply_r2 => m2,
-        inout("r15") reply_r3 => m3,
-        in("r12") reply_cap,
-        in("r13") reply_cap,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-    let received = crate::ipc_message::capture_received(badge, mi, [m0, m1, m2, m3]);
-    let received_call = receive_probe::received_call(ch, reply_cap, badge);
-    let (executive_event, timer, irq) = pump_handle_executive_event_badge(badge);
-    if executive_event {
-        if pump_deadman_tripped() {
-            return PumpMessage::deadman_wall();
-        }
-        if pump_scheduler_work_pending(ch, irq) {
-            return PumpMessage::scheduler_yield();
-        }
-        if timer {
-            if let Some(polled) = pump_try_recv_after_timer(ch, reply_cap) {
-                crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
-                return polled;
-            }
-            let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
-            if n < 8 {
-                crate::print_str(
-                    b"[pump] HPET tick landed on a component replyrecv -> deferred to the service loop (NOT a wall)\n",
-                );
-            }
-        }
-        return pump_recv(ch, reply_cap);
-    }
-    if !received_call {
-        // The send half already consumed the old Call; never retransmit it after a plain Send.
-        return pump_recv(ch, reply_cap);
-    }
-    PumpMessage::from_received(received)
-}
-
-/// Reply to a component `Call` that was deliberately parked outside the immediate pump
-/// reply+receive step. Hosted-driver waits use this when an event/semaphore producer wakes a worker
-/// that the wait service previously left blocked on its bound reply object.
-pub(crate) unsafe fn pump_reply_on(
-    reply_cap: u64,
-    msginfo: u64,
-    r0: u64,
-    r1: u64,
-    r2: u64,
-    r3: u64,
-) -> bool {
-    let label: u64;
-    core::arch::asm!(
-        "syscall",
-        inout("rdx") crate::SYS_CALL as u64 => _,
-        inout("rdi") reply_cap => _,
-        inout("rsi") msginfo => label,
-        inout("r10") r0 => _,
-        inout("r8") r1 => _,
-        inout("r9") r2 => _,
-        inout("r15") r3 => _,
-        in("r12") 0u64,
-        in("r13") crate::SYS_REPLY_HANDOFF_MAGIC,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-    let error = label >> 12;
-    if error == 0 {
-        return true;
-    }
-    if PUMP_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed) < 8 {
-        crate::print_str(b"[pump-reply] UNBOUND parked component reply cptr=");
-        crate::print_u64(reply_cap);
-        crate::print_str(b" label=");
-        crate::print_u64(error);
-        crate::print_str(b" mi=");
-        crate::print_u64(msginfo);
-        crate::print_str(b"\n");
-    }
-    false
+    pump_recv(ch, reply_cap)
 }
 
 /// The outcome of one pump: `(status, completed)`. `completed=true` iff the server re-parked at its
@@ -1989,9 +1733,8 @@ pub(crate) struct PumpResult {
     /// Pointer-width dispatch return. For IRP components this mirrors `status`; for win32k it is
     /// the full handler RAX, needed by NtUser/NtGdi APIs that return handles or LONG_PTR values.
     pub result: u64,
-    /// The reply object the pump was using when it returned. Hosted driver worker waits can park
-    /// one reply object and continue receiving on a fresh one; callers that persist the dispatch
-    /// transport must retain this final active cap.
+    /// Canonical Reply snapshot after the last shared Call adoption; callers retain this snapshot
+    /// while the shared ingress owner retains capability and parked-wait ownership.
     pub reply_cap: u64,
     pub completed: bool,
     /// Authenticated secondary-startup publication words; the startup owner validates the receipt.
@@ -2056,9 +1799,6 @@ impl PumpResult {
 /// command replies to that exact parked call before receiving its completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HostedIrqExchangeAction {
-    ReceiveReady {
-        identity: nt_hosted_runtime::HostedIrqLaneIdentity,
-    },
     ReplyToken {
         identity: nt_hosted_runtime::HostedIrqLaneIdentity,
         token: nt_hosted_runtime::HostedIrqArenaToken,
@@ -2110,45 +1850,39 @@ unsafe fn hosted_irq_exchange_event(badge: u64) -> bool {
 #[inline(never)]
 unsafe fn hosted_irq_recv(
     ch: &PumpChannel,
-    reply_cap: u64,
     identity: nt_hosted_runtime::HostedIrqLaneIdentity,
     expected_badge: u64,
 ) -> PumpMessage {
+    use shared_ingress::owner::runtime;
+    let Ok(Some(route)) = runtime::channel_route(ch) else { return PumpMessage::transport_wall(); };
+    if route.badge() != expected_badge
+        || !matches!(runtime::physical_source(route), Ok(source)
+            if source.kind == runtime::PhysicalSourceKind::Interrupt(identity))
+    { return PumpMessage::transport_wall(); }
     loop {
-        receive_probe::irq_before_receive(ch, reply_cap, identity, expected_badge);
-        let badge: u64;
-        let mi: u64;
-        let m0: u64;
-        let m1: u64;
-        let m2: u64;
-        let m3: u64;
-        core::arch::asm!(
-            "syscall",
-            in("rdx") crate::SYS_RECV as u64,
-            inout("rdi") ch.fault_ep => badge,
-            lateout("rsi") mi,
-            lateout("r10") m0,
-            lateout("r8") m1,
-            lateout("r9") m2,
-            lateout("r15") m3,
-            in("r12") reply_cap,
-            in("r13") 0u64,
-            lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-            options(nostack),
-        );
-        let received = crate::ipc_message::capture_received(badge, mi, [m0, m1, m2, m3]);
-        let received_call =
-            receive_probe::irq_received_call(ch, reply_cap, identity, expected_badge, badge);
-        if hosted_irq_exchange_event(badge) {
-            if pump_deadman_tripped() {
-                return PumpMessage::deadman_wall();
+        match runtime::next_message(route) {
+            Ok(Some((reply, message))) => {
+                let completion = message.info() >> 12 == ch.dispatch_label;
+                if !completion && runtime::adopt(route, reply).is_err() {
+                    return PumpMessage::transport_wall();
+                }
+                let mut message = PumpMessage::from_received(message);
+                if !completion { message.shared_reply = Some(reply); }
+                return message;
             }
-            continue;
+            Ok(None) => {}
+            Err(_) => return PumpMessage::transport_wall(),
         }
-        if !received_call {
-            continue;
+        let Ok(dispatch) = runtime::dispatch(route) else { return PumpMessage::transport_wall(); };
+        match runtime::receive(nt_component_suspension::IngressExecutionOwner::Dispatch(dispatch), ch.tcb, true) {
+            Ok(runtime::Arrival::Hosted) => {}
+            Ok(runtime::Arrival::Call { .. }) => {}
+            Ok(runtime::Arrival::Notification(message)) => {
+                hosted_irq_exchange_event(message.badge());
+                if pump_deadman_tripped() { return PumpMessage::deadman_wall(); }
+            }
+            Err(_) => return PumpMessage::transport_wall(),
         }
-        return PumpMessage::from_received(received);
     }
 }
 
@@ -2161,60 +1895,14 @@ unsafe fn hosted_irq_reply_recv(
     identity: nt_hosted_runtime::HostedIrqLaneIdentity,
     expected_badge: u64,
 ) -> PumpMessage {
-    let mut send_reply = true;
-    loop {
-        let badge: u64;
-        let mi: u64;
-        let m0: u64;
-        let m1: u64;
-        let m2: u64;
-        let m3: u64;
-        let received;
-        if send_reply {
-            let send_mi = reply_len;
-            let send_m0 = reply[0];
-            let send_m1 = reply[1];
-            let send_m2 = reply[2];
-            let send_m3 = reply[3];
-            core::arch::asm!(
-                "syscall",
-                in("rdx") crate::SYS_NB_SEND_RECV as u64,
-                inout("rdi") ch.fault_ep => badge,
-                inout("rsi") send_mi => mi,
-                inout("r10") send_m0 => m0,
-                inout("r8") send_m1 => m1,
-                inout("r9") send_m2 => m2,
-                inout("r15") send_m3 => m3,
-                in("r12") reply_cap,
-                in("r13") reply_cap,
-                lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-                options(nostack),
-            );
-            received = crate::ipc_message::capture_received(badge, mi, [m0, m1, m2, m3]);
-            if badge == crate::COMPOSITE_SEND_ERROR_BADGE {
-                return PumpMessage::transport_wall();
-            }
-            send_reply = false;
-        } else {
-            return hosted_irq_recv(ch, reply_cap, identity, expected_badge);
-        }
-        let received_call =
-            receive_probe::irq_received_call(ch, reply_cap, identity, expected_badge, badge);
-        if hosted_irq_exchange_event(badge) {
-            if pump_deadman_tripped() {
-                return PumpMessage::deadman_wall();
-            }
-            continue;
-        }
-        if !received_call {
-            // The reply half already ran; continue receive-only after a plain Send.
-            continue;
-        }
-        return PumpMessage::from_received(received);
+    if !shared_pump::reply(ch, reply_cap, reply_len, reply) {
+        return PumpMessage::transport_wall();
     }
+    // This path only latches notifications; it must not run ordinary provider request handlers.
+    hosted_irq_recv(ch, identity, expected_badge)
 }
 
-/// Exchange one command with a private hosted-interrupt lane. This protocol deliberately has a
+/// Exchange one command with an enrolled hosted-interrupt lane. This protocol deliberately has a
 /// much smaller service surface than the normal component pump: completion, demand faults, and
 /// explicitly granted I/O faults only. An ordinary `FSD_SERVICE_*` request is a fatal protocol wall
 /// because servicing it could touch the parked component's fixed request bank.
@@ -2224,14 +1912,17 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
     expected_badge: u64,
     completion_label: u64,
 ) -> HostedIrqExchangeResult {
+    use shared_ingress::owner::runtime;
+    let parent = runtime::nested::park_current().expect("retain IRQ invocation parent");
+    let route = runtime::channel_route(ch).expect("IRQ physical source").expect("enrolled IRQ source");
+    let dispatch = runtime::admit(route).expect("admit retained IRQ completion Call");
+    let mut channel = *ch;
+    channel.reply_cap = runtime::current_reply(route).expect("IRQ canonical Reply");
+    let ch = &mut channel;
     let (identity, replying_to) = match action {
-        HostedIrqExchangeAction::ReceiveReady { identity } => (identity, None),
         HostedIrqExchangeAction::ReplyToken { identity, token } => (identity, Some(token)),
     };
     let mut msg = match action {
-        HostedIrqExchangeAction::ReceiveReady { .. } => {
-            hosted_irq_recv(ch, ch.reply_cap, identity, expected_badge)
-        }
         HostedIrqExchangeAction::ReplyToken { token, .. } => {
             hosted_irq_reply_recv(
                 ch, ch.reply_cap, 4, token.transport_words(), identity, expected_badge,
@@ -2241,6 +1932,7 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
     let mut outcome = PumpLoopOutcome::new();
     let mut message = HostedIrqExchangeMessage::Wall;
     loop {
+        if let Some(reply) = msg.shared_reply { ch.reply_cap = reply; }
         msg.restore_received();
         let label = msg.label();
         let length = msg.mi & 0x7f;
@@ -2300,7 +1992,12 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
         outcome.wall(msg);
         break;
     }
+    if let HostedIrqExchangeMessage::Token(token) = message {
+        runtime::complete_protocol(route, dispatch, ch.reply_cap, completion_label, &token.transport_words())
+            .expect("authenticate IRQ arena-token completion");
+    }
     pump_suspend_walled_component(ch, outcome);
+    runtime::nested::restore(parent).expect("restore IRQ invocation parent");
     HostedIrqExchangeResult {
         reply_cap: ch.reply_cap,
         message,
@@ -2369,7 +2066,7 @@ pub(crate) unsafe fn component_pump_resume_kernel_provider_wait(
     previous: &PumpResult,
 ) -> Result<PumpResult, u32> {
     let caller = ch.kernel_caller.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-    let binding = caller.binding();
+    let binding = crate::service_sec_image::kernel_provider_current_binding(caller)?;
     if ch.logical_caller.is_some()
         || ch.client_pi != 0
         || ch.client_generation != 0
@@ -2439,8 +2136,8 @@ unsafe fn component_pump_enter(
     // ★ THE `Call` TRANSPORT — now the ONLY one. The component is blocked in a `Call` bound to
     // `reply_cap`; we ANSWER it with the request (`InitialAction::ReplyRequest`) or, mid-DriverEntry,
     // start by RECEIVING its ready/fault Call (`RecvFirst`). Receive requires a free Reply, and
-    // the returned binding authenticates the physical caller before dispatch. Workers sharing a
-    // driver endpoint rotate the active Reply when parking; their old bound objects stay retained.
+    // the returned binding authenticates the physical caller before dispatch. The shared owner
+    // retains parked Calls and supplies the receiver's checked-free replacement Replies.
     //
     // The request TAG rides in MR0, NOT in the message label. A fresh dispatch hands over
     // `dispatch_label`; the callback-RESUME pump hands over `W32_USER_CALLBACK_RESUME_LABEL` on the
@@ -2500,7 +2197,7 @@ unsafe fn pump_deliver_initial_request(
     reply_cap: u64,
     request_tag: u64,
 ) -> Option<PumpMessage> {
-    // ★ ONE composite reply+receive hands over the request. `RecvFirst` means the component has not
+    // The reply is acknowledged before receive. `RecvFirst` means the component has not
     // yet issued the Call we would be answering (mid-DriverEntry), so the caller performs a plain
     // receive instead.
     if ch.initial != InitialAction::ReplyRequest {
@@ -2517,10 +2214,20 @@ unsafe fn component_pump_loop(
     reply_cap: &mut u64,
     accounting: nt_user_host::component_pump::ComponentPumpAccounting,
 ) -> PumpLoopOutcome {
+    let mut channel = *ch;
+    let ch = &mut channel;
     let mut msg = first;
     let mut outcome = PumpLoopOutcome::new();
     outcome.accounting = accounting;
     loop {
+        if let Some(reply) = msg.shared_reply {
+            *reply_cap = reply;
+            ch.reply_cap = reply;
+        }
+        if msg.service_finished {
+            outcome.completed = true;
+            break;
+        }
         msg.restore_received();
         if msg.scheduler_yield {
             outcome.scheduler_yielded = true;
@@ -2673,7 +2380,7 @@ unsafe fn component_pump_loop(
         } else if label == crate::win32k_subsystem::W32_KERNEL_ACTIVATION_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
-            let status = if msg.badge == 0
+            let status = if shared_pump::authenticated_badge(ch, msg.badge)
                 && *reply_cap == ch.reply_cap
                 && msg.mi == crate::win32k_subsystem::W32_KERNEL_ACTIVATION_LABEL << 12
             {
@@ -2870,11 +2577,11 @@ unsafe fn component_pump_loop(
                 crate::driver_launch::HostedDriverThreadTerminateServiceResult::Reply(status) => {
                     pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
                 }
-                crate::driver_launch::HostedDriverThreadTerminateServiceResult::Terminated {
-                    fresh_reply_cap,
-                } => {
-                    *reply_cap = fresh_reply_cap;
-                    msg = pump_recv(ch, *reply_cap);
+                crate::driver_launch::HostedDriverThreadTerminateServiceResult::SharedTerminated { route } => {
+                    shared_ingress::owner::runtime::retire(route)
+                        .expect("terminated system thread retains transport until stopped drain");
+                    outcome.provider_wait_suspended = true;
+                    break;
                 }
             }
             continue;
@@ -2979,7 +2686,7 @@ unsafe fn component_pump_loop(
         } else if label == crate::win32k_subsystem::W32_DEVICE_POINTER_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
-            let (status, count) = if msg.badge != 0
+            let (status, count) = if !shared_pump::authenticated_badge(ch, msg.badge)
                 || msg.mi != ((crate::win32k_subsystem::W32_DEVICE_POINTER_LABEL << 12) | 2)
             {
                 (0xc000_000du32 as i32, 0)
@@ -2992,7 +2699,7 @@ unsafe fn component_pump_loop(
             && ch.caps.kind == ReqKind::Syscall
         {
             let mut bytes = [0u8; crate::driver_launch::device_property::PROPERTY_CHUNK_BYTES];
-            let (status, total, token, chunk) = if msg.badge != 0
+            let (status, total, token, chunk) = if !shared_pump::authenticated_badge(ch, msg.badge)
                 || msg.mi != ((crate::win32k_subsystem::W32_DEVICE_PROPERTY_LABEL << 12) | 4)
             {
                 (0xc000_000du32 as i32, 0, 0, 0)
@@ -3083,8 +2790,11 @@ unsafe fn component_pump_loop(
                 crate::driver_launch::HostedDriverWaitServiceResult::Reply(status) => {
                     pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
                 }
-                crate::driver_launch::HostedDriverWaitServiceResult::Parked { fresh_reply_cap } => {
-                    *reply_cap = fresh_reply_cap;
+                crate::driver_launch::HostedDriverWaitServiceResult::SharedParked { .. } => {
+                    if shared_pump::autonomous(ch) {
+                        outcome.provider_wait_suspended = true;
+                        break;
+                    }
                     msg = pump_recv(ch, *reply_cap);
                 }
             }
@@ -3104,8 +2814,11 @@ unsafe fn component_pump_loop(
                 crate::driver_launch::HostedDriverWaitServiceResult::Reply(status) => {
                     pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
                 }
-                crate::driver_launch::HostedDriverWaitServiceResult::Parked { fresh_reply_cap } => {
-                    *reply_cap = fresh_reply_cap;
+                crate::driver_launch::HostedDriverWaitServiceResult::SharedParked { .. } => {
+                    if shared_pump::autonomous(ch) {
+                        outcome.provider_wait_suspended = true;
+                        break;
+                    }
                     msg = pump_recv(ch, *reply_cap);
                 }
             }
@@ -3149,11 +2862,8 @@ unsafe fn component_pump_loop(
                 break;
             }
             outcome.accounting.record_demand();
-            // Resume the server + recv the next fault/DONE with one composite reply+receive. A
-            // VMFault reply is restarted unconditionally (`fault.rs`), and the receive half
-            // re-registers `R`. A nested demand fault therefore rides the SAME reply object as the
-            // dispatch it happened inside, which is exactly Fix B's guarantee (the outer client's
-            // REPLY_MAIN binding is untouched) with no second transport to keep gated.
+            // Acknowledge the serviced fault before receiving again. The outer client's Reply
+            // remains untouched; an uncertain fault reply stops this pump without another receive.
             pump_reply_recv_into!(ch, *reply_cap, msg, 0, 0);
             continue;
         } else if label == 3 && ch.caps.io_port_faults {
@@ -3233,7 +2943,7 @@ unsafe fn pump_service_lpc_request() -> i32 {
 }
 
 #[inline(never)]
-unsafe fn pump_service_vm_fault(
+pub(crate) unsafe fn pump_service_vm_fault(
     ch: &PumpChannel,
     label: u64,
     ip: u64,
@@ -3781,21 +3491,8 @@ unsafe fn pump_finish_slice(
 
 #[inline(never)]
 unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutcome) {
-    // ★ RISK R2 — WALL HANDLING UNDER THE `Call` TRANSPORT.
-    //
-    // A wall means we received a fault we refuse to service. The component is therefore blocked in
-    // that fault Call with our reply object STILL BOUND to it. If we later did
-    // `reply_on(R, request)`, `decode_reply` would see `pending_fault != 0` and route it through
-    // `fault::apply_fault_reply`, which returns `restart = true` UNCONDITIONALLY for VMFault(6) and
-    // CapFault(1) (`fault.rs`) — the component would resume at the faulting instruction carrying a
-    // request it never asked for, and immediately re-fault. This fault is terminal, not a parked
-    // continuation that a later request may resume.
-    //
-    // TCBSuspend cancels the fault IPC and its exact Reply binding, then makes the TCB inactive.
-    // The caller retires the component so nothing pumps it a second time (`dispatch_irp` ->
-    // `register_instance_ready(inst,false)`; `win32k_dispatch_wide` -> `WIN32K_RETIRED`). Higher-level
-    // transport/resource owners remain retained for retirement; cancellation does not release them.
-    // Zero walls occur on a green boot for EITHER substrate, so this path is defensive.
+    // A fault/uncertain Reply cannot be resumed by answering its retained Call as a new request.
+    // Only the shared installation owns Stop, including startup and repeated wall observations.
     if !outcome.completed
         && !outcome.callback_suspended
         && !outcome.provider_wait_suspended
@@ -3803,23 +3500,6 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
         && !outcome.scheduler_yielded
     {
         pump_wall_state_diag(ch, outcome);
-        if matches!(ch.caps.kind, ReqKind::Syscall)
-            && crate::win32k_glue::win32k_physical_lane_for_channel(
-                ch.tcb, ch.fault_ep, ch.reply_cap,
-            ).is_some_and(|lane| {
-                crate::service_sec_image::component_execution_lane_is_starting(lane)
-            })
-        {
-            // The startup owner records the sole stop invocation and cancellation evidence.
-            crate::print_str(b"[pump] startup WALL -> retained startup stop owner\n");
-            return;
-        }
-        PUMP_WALL_SUSPENDS.fetch_add(1, Ordering::Relaxed);
-        let e = if ch.tcb != 0 {
-            crate::tcb_suspend_r(ch.tcb)
-        } else {
-            0xFFFF
-        };
         crate::print_str(b"[pump] WALL label=");
         crate::print_u64(outcome.wall_label);
         crate::print_str(b" ip=0x");
@@ -3837,9 +3517,33 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
             crate::print_str(b" flags=0x");
             crate::print_hex(outcome.wall_flags as u32);
         }
-        crate::print_str(b" -> TCB_Suspend(component) e=");
-        crate::print_u64(e);
-        crate::print_str(b" (terminal IPC cancellation; component owners retained)\n");
+        use shared_ingress::owner::runtime;
+        let route = runtime::channel_route(ch)
+            .expect("wall retains an invalid physical source without invoking Stop")
+            .expect("wall requires its exact retained ingress route");
+        crate::print_str(b" badge=");
+        crate::print_u64(route.badge());
+        crate::print_str(b" tcb=");
+        crate::print_u64(route.identity().executor);
+        PUMP_WALL_SUSPENDS.fetch_add(1, Ordering::Relaxed);
+        if matches!(runtime::physical_source(route), Ok(source)
+            if matches!(source.kind, runtime::PhysicalSourceKind::SystemThread { .. }))
+        {
+            assert!(crate::driver_launch::terminate_failed_autonomous_service(route),
+                "walled system thread retains uncertain cancellation and its parent");
+            crate::print_str(b" -> terminated and drained exact system thread\n");
+            return;
+        }
+        let stopped = runtime::quarantine(route).is_ok();
+        crate::print_str(if stopped {
+            b" -> Stop acknowledged; semantic owners and parent retained\n"
+        } else {
+            b" -> Stop unresolved; semantic owners and parent retained\n"
+        });
+        // Provider dispatches, primary driver requests and IRQ arena transactions have semantic
+        // owners outside this pump. Stop ACK is not their cancellation receipt. Do not clear the
+        // Running lane, complete their dispatch, restore a nested parent, or retry any effect.
+        panic!("component wall requires owner-specific semantic cancellation before continuation");
     }
 }
 

@@ -56,7 +56,7 @@ fn ready_repark_waits_for_next_bounded_pass_before_exact_terminal_ack() {
     let mut pass = f.lanes.resume_pass();
     assert_eq!(next_in_pass(&mut f, &mut pass), Some(next));
     let (_, mut attempt, _) = f.resume().unwrap().into_parts();
-    let reply = f.caller.binding.reply_object;
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
     f.activations
         .recipient_mut(f.caller)
         .unwrap()
@@ -138,7 +138,7 @@ fn candidate_claim_refusal_is_not_retried_inside_same_pass() {
     let mut pass = f.lanes.resume_pass();
     let capture = next_in_pass(&mut f, &mut pass).unwrap();
     let mut wrong = f.caller;
-    wrong.binding.reply_object += 1;
+    wrong.receive_endpoint += 1;
     assert!(f
         .activations
         .begin_wait_resume(wrong, &f.pm, &f.catalog, &mut f.lanes, capture)

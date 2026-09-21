@@ -9,7 +9,7 @@ fn has_work(f: &Fixture) -> bool {
 fn terminal_only_refusal_keeps_retry_until_exact_retirement_and_ack() {
     let mut f = Fixture::new();
     let terminal = pending(&mut f, true);
-    let reply = f.caller.binding.reply_object;
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
     let mut wake = ResumeWake::new(10, 40).unwrap();
     assert!(!f.activations.has_ready_completion());
     assert!(has_work(&f));

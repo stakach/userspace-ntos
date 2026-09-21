@@ -2,6 +2,8 @@
 
 use super::*;
 
+mod shared_completion;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalIdentity {
     dispatch: LaneDispatchIdentity,
@@ -465,6 +467,16 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
         reply_object: u64,
         local_retirement: Result<(), u32>,
     ) -> Result<Option<RetiredTerminal<C, R, T>>, LaneError> {
+        self.finish_terminal_with_execution(identity, reply_object, local_retirement, false)
+    }
+
+    fn finish_terminal_with_execution(
+        &mut self,
+        identity: TerminalIdentity,
+        reply_object: u64,
+        local_retirement: Result<(), u32>,
+        preserve_execution: bool,
+    ) -> Result<Option<RetiredTerminal<C, R, T>>, LaneError> {
         let record = self.terminal_record(identity, reply_object)?;
         if !matches!(record.phase, TerminalPhase::Acknowledged { .. }) {
             return Err(LaneError::InvalidPhase);
@@ -487,13 +499,18 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
             assert!(lane.external_tokens.len() < lane.external_tokens.capacity());
             lane.external_tokens.push(token);
         }
-        lane.phase = if lane.suspensions.is_empty() && lane.external_tokens.is_empty() {
+        lane.phase = if preserve_execution {
+            LanePhase::Running
+        } else if lane.suspensions.is_empty() && lane.external_tokens.is_empty() {
             LanePhase::Idle
         } else {
             LanePhase::Suspended
         };
         if lane.phase == LanePhase::Idle {
             lane.dispatch = None;
+        }
+        if preserve_execution {
+            self.running = Some(identity.lane());
         }
         Ok(Some(RetiredTerminal {
             suspension,

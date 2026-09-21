@@ -107,6 +107,10 @@ pub struct KernelProviderPumpObservation {
 }
 
 impl KernelProviderPumpObservation {
+    pub const fn reply_cap(self) -> u64 {
+        self.reply_cap
+    }
+
     pub const fn observed_at(self) -> TimeSnapshot {
         self.observed_at
     }
@@ -261,13 +265,32 @@ impl KernelProviderPumpProgress {
         facts: KernelProviderPumpFacts,
         returned_status: Option<u32>,
     ) -> Result<KernelProviderPumpDisposition, PumpProgressError> {
+        self.observe_current(attempt, facts, returned_status, self.reply_cap)
+    }
+
+    /// The native caller must authenticate this current Reply against the same live dispatch
+    /// after any interim Call handoffs. The entry ticket remains tied to its original Reply;
+    /// only a correctly claimed observation may update the next entry's transport binding.
+    pub fn observe_current(
+        &mut self,
+        attempt: &mut KernelProviderPumpAttempt,
+        facts: KernelProviderPumpFacts,
+        returned_status: Option<u32>,
+        current_reply: u64,
+    ) -> Result<KernelProviderPumpDisposition, PumpProgressError> {
         self.validate_attempt(attempt)?;
-        let disposition = facts.classify(self.reply_cap, returned_status);
+        if current_reply == 0 {
+            return Err(PumpProgressError::InvalidReplyCap);
+        }
+        let disposition = facts.classify(current_reply, returned_status);
         self.progress = Progress::Observed {
             nonce: attempt.nonce,
             disposition,
             observed_at: facts.observed_at,
         };
+        if disposition != KernelProviderPumpDisposition::Invalid {
+            self.reply_cap = current_reply;
+        }
         attempt.consumed = true;
         Ok(disposition)
     }

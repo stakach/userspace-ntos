@@ -3,11 +3,11 @@
 //! Routes are metadata, not Reply-binding, domain-liveness or execution authority. The native
 //! owner must validate canonical physical lifetimes and retain the corresponding capabilities.
 
-use crate::{badge::ENDPOINT_BADGE_MAX, LaneHandle};
+use crate::{badge::{COMPONENT_BADGE, ENDPOINT_BADGE_MAX}, LaneHandle};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-static NEXT_BADGE: AtomicU64 = AtomicU64::new(1);
+static NEXT_BADGE: AtomicU64 = AtomicU64::new(COMPONENT_BADGE | 1);
 
 /// An opaque projection of a canonical physical domain, never logical request attribution.
 /// Domain IDs must come from one namespace owned by the registry's native adapter.
@@ -175,7 +175,7 @@ impl PeerRegistry {
         // Burn identities forever, including aborted registrations and destroyed registries.
         let badge = counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-                (next != 0 && next <= ENDPOINT_BADGE_MAX).then(|| next + 1)
+                (next > COMPONENT_BADGE && next <= ENDPOINT_BADGE_MAX).then(|| next + 1)
             })
             .map_err(|_| PeerError::BadgeExhausted)?;
         let route = PeerRoute {

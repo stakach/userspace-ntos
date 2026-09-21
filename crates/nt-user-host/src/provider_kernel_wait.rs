@@ -81,7 +81,7 @@ impl KernelProviderWaitState {
                 Some(WaitObservation::Captured(capture))
                     if self
                         .progress
-                        .provider_wait_observation(capture.caller().binding().reply_object)
+                        .provider_wait_observation(capture.observation().reply_cap())
                         == Some(capture.observation()) =>
                 {
                     Ok(Stop::WaitCaptured(capture))
@@ -116,6 +116,18 @@ impl KernelProviderWaitState {
         self.progress.observe(attempt, facts, returned_status)
     }
 
+    /// `current_reply` must be resolved from the authenticated activation's live dispatch.
+    pub fn observe_current(
+        &mut self,
+        attempt: &mut KernelProviderPumpAttempt,
+        facts: KernelProviderPumpFacts,
+        returned_status: Option<u32>,
+        current_reply: u64,
+    ) -> Result<KernelProviderPumpDisposition, PumpProgressError> {
+        self.progress
+            .observe_current(attempt, facts, returned_status, current_reply)
+    }
+
     /// Preserve rejected requests too; a validation failure is not permission to reply or retry.
     pub fn retain_provider_wait(
         &mut self,
@@ -133,7 +145,7 @@ impl KernelProviderWaitState {
                 if capture.request() != &request
                     || self
                         .progress
-                        .provider_wait_observation(capture.caller().binding().reply_object)
+                        .provider_wait_observation(capture.observation().reply_cap())
                         != Some(capture.observation())
                 {
                     return Err(STATUS_INVALID_PARAMETER);

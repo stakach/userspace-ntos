@@ -11,7 +11,7 @@ enum NativeReturn {
     Incomplete,
 }
 
-pub(super) struct NativeTerminal {
+pub(crate) struct NativeTerminal {
     returned: NativeReturn,
     status: u64,
     rejected_repark: Option<PendingComponentDispatch>,

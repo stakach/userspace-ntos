@@ -91,7 +91,7 @@ impl<D: KernelProviderWaitRecipient> KernelProviderActivations<D> {
             if capture.caller() != caller
                 || state
                     .progress()
-                    .provider_wait_observation(caller.binding.reply_object)
+                    .provider_wait_observation(caller.current_binding(lanes)?.reply_object)
                     != Some(capture.observation())
             {
                 return Err(STATUS_INVALID_HANDLE);

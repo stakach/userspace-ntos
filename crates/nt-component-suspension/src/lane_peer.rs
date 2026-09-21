@@ -103,6 +103,12 @@ impl PeerRegistry {
 }
 
 impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
+    /// Canonical route metadata only; native callers must separately authenticate the physical
+    /// provider lifetime, registry admission and current Reply binding before execution.
+    pub fn peer_route(&self, lane: LaneHandle) -> Result<Option<PeerRoute>, LaneError> {
+        Ok(self.lane(lane)?.shared_peer)
+    }
+
     /// Reserve a stopped shared-endpoint lane and its exact peer identity together, before any
     /// native capability effects. The caller retains the registration through mint/publication.
     /// This grants no startup or dispatch authority and never mixes private and shared lanes on
@@ -125,7 +131,8 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             let route = lane
                 .shared_peer
                 .ok_or(PeerLaneError::Lane(LaneError::DuplicateBinding))?;
-            peers.validate_lane(route, domain, domain_generation, self)?;
+            let identity = route.identity();
+            peers.validate_lane(route, identity.domain, identity.domain_generation, self)?;
             if peers.state(route).map_err(PeerLaneError::Peer)?.0
                 == crate::peer_registry::PeerPhase::Retiring
             {

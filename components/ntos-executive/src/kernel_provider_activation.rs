@@ -75,7 +75,7 @@ fn authenticated_channel_caller(
     if !kernel_channel(channel)
         || channel.shared_va != win32k_subsystem::WIN32K_SHARED_VADDR
         || channel.dispatch_label != win32k_subsystem::W32_DISPATCH_LABEL
-        || caller.binding() != channel_binding(channel)
+        || unsafe { kernel_provider_current_binding(caller) } != Ok(channel_binding(channel))
         || !unsafe { (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller) }
             .is_ok_and(|recipient| recipient.matches(channel))
         || current_win32k_provider_domain().is_none_or(|provider| {
@@ -243,6 +243,9 @@ unsafe fn receive_driver_entry_yields(
         // Dedicated IRQ workers can perform nested IPC. Recheck authority after those effects,
         // without minting another attempt or permitting a failed entered continuation to replay.
         validate_driver_entry_execution(caller, capture, &receive_attempt)?;
+        let receiving = (&*core::ptr::addr_of!(ACTIVATIONS))
+            .recipient(caller)?
+            .execution_channel(caller)?;
         result = spawn_hosts::component_pump_continue_receive(&receiving, &previous)?;
         observe_driver_entry_pump(&receiving, &mut receive_attempt, &result)?;
     }
@@ -340,7 +343,17 @@ unsafe fn observe_driver_entry_pump(
     attempt: &mut KernelProviderPumpAttempt,
     result: &spawn_hosts::PumpResult,
 ) -> Result<(), u32> {
-    let caller = authenticated_channel_caller(channel)?;
+    let caller = channel.kernel_caller.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    // An interim Call can change the canonical Reply during this attempt. Reconstruct the
+    // transport snapshot before validating the stop; the original attempt remains unchanged.
+    let current = (&*core::ptr::addr_of!(ACTIVATIONS))
+        .recipient(caller)?
+        .execution_channel(caller)?;
+    if authenticated_channel_caller(&current)? != caller
+        || !(&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?.matches(channel)
+    {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
     let facts = KernelProviderPumpFacts {
         observed_at: nt_time_snapshot(),
         reply_cap: result.reply_cap,
@@ -350,12 +363,12 @@ unsafe fn observe_driver_entry_pump(
         lpc_wait_suspended: result.lpc_wait_suspended,
         scheduler_yielded: result.scheduler_yielded,
     };
-    let status = facts.is_return(channel.reply_cap).then(|| {
+    let status = facts.is_return(current.reply_cap).then(|| {
         core::ptr::read_volatile((channel.shared_va + win32k_subsystem::SH_DE_STATUS) as *const u32)
     });
     (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
         .recipient_mut(caller)?
-        .observe(attempt, *result, facts, status)?;
+        .observe(attempt, *result, facts, status, current.reply_cap)?;
     if result.provider_wait_suspended {
         let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
             as *const nt_provider_wait::ProviderWaitSharedPage;
@@ -395,6 +408,25 @@ pub(crate) unsafe fn finish_observed_driver_entry_return(
     else {
         return Ok(None);
     };
+    let shared = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+        .peer_route(caller.dispatch().lane())
+        .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?
+        .is_some();
+    if shared {
+        let (attempt, label) = with_provider_process_manager(|pm| {
+            let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
+            let label = activations.recipient(caller)?.completion_label();
+            let attempt = activations.begin_shared_completion(
+                caller, pm,
+                &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+                &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS), status,
+            )?;
+            Ok((attempt, label))
+        })?;
+        let receipt = finish_shared_return(attempt, label)?;
+        crate::driver_launch::win32k_device_properties::retire_completed_transfers();
+        return Ok(Some(receipt));
+    }
     let receipt = with_provider_process_manager(|pm| {
         (&mut *core::ptr::addr_of_mut!(ACTIVATIONS)).record_completion(
             caller,
@@ -406,6 +438,22 @@ pub(crate) unsafe fn finish_observed_driver_entry_return(
     })?;
     crate::driver_launch::win32k_device_properties::retire_completed_transfers();
     Ok(Some(receipt))
+}
+
+/// The retained activation owns an entered attempt before any native query. No ProcessManager,
+/// activation or lane reference crosses shared ingress's physical completion authentication.
+unsafe fn finish_shared_return(
+    attempt: nt_user_host::provider_kernel_activation::KernelProviderSharedCompletion,
+    label: u64,
+) -> Result<KernelProviderCompletionReceipt, u32> {
+    let outcome = spawn_hosts::shared_ingress::owner::runtime::complete(
+        attempt.route(), attempt.dispatch(), attempt.reply(), label,
+    ).map_err(|_| nt_process::STATUS_INVALID_HANDLE);
+    with_provider_process_manager(|pm| {
+        (&mut *core::ptr::addr_of_mut!(ACTIVATIONS)).record_shared_completion(
+            attempt, pm, &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS), outcome,
+        )
+    })
 }
 
 /// Only the initiating kernel recipient acknowledges its retained result. The exact receipt and

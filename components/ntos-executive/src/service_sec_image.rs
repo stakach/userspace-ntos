@@ -187,7 +187,7 @@ impl PendingComponentDispatch {
 }
 
 #[derive(Clone)]
-struct ComponentSuspensionCompletion {
+pub(crate) struct ComponentSuspensionCompletion {
     status: i32,
     lpc_message_id: u32,
     lpc_reply_len: u32,
@@ -230,7 +230,7 @@ struct HostedNativeContinuation {
 }
 
 #[derive(Clone, Copy)]
-enum ComponentNativeContinuation {
+pub(crate) enum ComponentNativeContinuation {
     Hosted(HostedNativeContinuation),
     // Native blocking admission still requires the stopped-job scheduler and receive ownership.
     Kernel(nt_user_host::provider_kernel_activation::KernelProviderWaitCapture),
@@ -268,49 +268,21 @@ struct ComponentCallbackTransfer {
 }
 
 const COMPONENT_SUSPENSION_MAX_DEPTH: usize = 64;
-const COMPONENT_EXECUTION_LANE_CAPACITY: usize = win32k_subsystem::WIN32K_LANE_CAPACITY + 1;
+const COMPONENT_EXECUTION_LANE_CAPACITY: usize = 256;
 static mut PROVIDER_WAIT_ARBITER: nt_provider_wait::ProviderDispatcherWaitArbiter<
     crate::exec_handler::ProviderDispatcherLease,
 > = nt_provider_wait::ProviderDispatcherWaitArbiter::new();
-static mut COMPONENT_SUSPENSIONS: nt_component_suspension::ComponentSuspensionLanes<
+pub(crate) type ComponentLanes = nt_component_suspension::ComponentSuspensionLanes<
     ComponentNativeContinuation,
     ComponentSuspensionCompletion,
     component_terminal::NativeTerminal,
-> = nt_component_suspension::ComponentSuspensionLanes::new(
+>;
+pub(crate) static mut COMPONENT_SUSPENSIONS: ComponentLanes = nt_component_suspension::ComponentSuspensionLanes::new(
     COMPONENT_EXECUTION_LANE_CAPACITY,
     COMPONENT_SUSPENSION_MAX_DEPTH,
 );
 
-pub(crate) unsafe fn register_component_execution_lane(
-    binding: nt_component_suspension::LaneBinding,
-) -> Option<nt_component_suspension::LaneHandle> {
-    (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-        .allocate(binding)
-        .ok()
-}
-
-pub(crate) unsafe fn stage_component_execution_lane(
-    binding: nt_component_suspension::LaneBinding,
-) -> Option<nt_component_suspension::LaneHandle> {
-    (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-        .allocate_staged(binding)
-        .ok()
-}
-
-pub(crate) unsafe fn begin_component_execution_lane_startup(
-    lane: nt_component_suspension::LaneHandle,
-) -> bool {
-    let _message = crate::ipc_message::SavedMessageBuffer::capture();
-    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let Some(reply) = component_execution_lane_reply(lanes, lane) else {
-        return false;
-    };
-    lanes.begin_startup(lane, reply, |tcb, reply| {
-        crate::spawn_hosts::query_component_reply_binding(tcb, reply)
-    }).is_ok()
-}
-
-/// Identify the startup owner before the generic pump attempts terminal suspension.
+/// Identify a startup completion's protocol shape without changing its retained owner.
 pub(crate) unsafe fn component_execution_lane_is_starting(
     lane: nt_component_suspension::LaneHandle,
 ) -> bool {
@@ -319,78 +291,20 @@ pub(crate) unsafe fn component_execution_lane_is_starting(
         && lanes.phase(lane) == Ok(nt_component_suspension::LanePhase::Starting)
 }
 
-/// Retain stop acknowledgment and cancellation evidence without releasing startup ownership.
-pub(crate) unsafe fn stop_component_execution_lane_startup(
-    lane: nt_component_suspension::LaneHandle,
-) -> (Option<u64>, bool) {
-    let _message = crate::ipc_message::SavedMessageBuffer::capture();
-    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let Some(reply) = component_execution_lane_reply(lanes, lane) else {
-        return (None, false);
-    };
-    let mut suspend_status = None;
-    let verified = lanes.stop_startup(lane, reply, |tcb| {
-        let status = crate::tcb_suspend_r(tcb);
-        suspend_status = Some(status);
-        if status == 0 { Ok(()) } else { Err(status) }
-    }, |tcb, reply| {
-        crate::spawn_hosts::query_component_reply_binding(tcb, reply)
-    }).is_ok();
-    (suspend_status, verified)
-}
-
-/// Detach and delete the private scheduling context, retaining its empty CSpace slot.
-pub(crate) unsafe fn retire_component_startup_scheduler(
-    lane: nt_component_suspension::LaneHandle,
-    executor: u64,
-    sched_context: u64,
-) -> (Option<u64>, Option<u64>) {
-    let _message = crate::ipc_message::SavedMessageBuffer::capture();
-    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let Ok(binding) = lanes.binding(lane) else {
-        return (None, None);
-    };
-    if binding.executor_id != executor || sched_context == 0 {
-        return (None, None);
-    }
-    let mut status = None;
-    let detached = lanes.detach_startup_scheduler(lane, binding.reply_object, |_| {
-        let error = sel4_rt::sched_context_unbind(sched_context);
-        status = Some(error);
-        if error == 0 { Ok(()) } else { Err(error) }
-    });
-    let mut delete_status = None;
-    if detached.is_ok() {
-        let _ = lanes.delete_startup_scheduler(lane, binding.reply_object, |_| {
-            let error = crate::cnode_delete_r(sched_context);
-            delete_status = Some(error);
-            if error == 0 { Ok(()) } else { Err(error) }
-        });
-    }
-    // No allocator publication: the historical physical receipt still names this slot.
-    (status, delete_status)
-}
-
-/// The caller must first validate the authenticated ready protocol completion.
-pub(crate) unsafe fn complete_component_execution_lane_startup(
-    lane: nt_component_suspension::LaneHandle,
-) -> bool {
-    let _message = crate::ipc_message::SavedMessageBuffer::capture();
-    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let Some(reply) = component_execution_lane_reply(lanes, lane) else {
-        return false;
-    };
-    lanes.complete_startup(lane, reply, |tcb, reply| {
-        crate::spawn_hosts::query_component_reply_binding(tcb, reply)
-    }).is_ok()
-}
-
 pub(crate) unsafe fn component_execution_lane_binding(
     lane: nt_component_suspension::LaneHandle,
 ) -> Option<nt_component_suspension::LaneBinding> {
     (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
         .binding(lane)
         .ok()
+}
+
+/// Current transport snapshot only. Admission still requires the retained activation, physical
+/// provider lifetime and phase-specific owner; a copied caller cannot authorize execution.
+pub(crate) unsafe fn kernel_provider_current_binding(
+    caller: nt_user_host::provider_kernel_activation::KernelProviderCaller,
+) -> Result<nt_component_suspension::LaneBinding, u32> {
+    caller.current_binding(&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
 }
 
 fn component_execution_lane_reply(
@@ -402,24 +316,6 @@ fn component_execution_lane_reply(
     lane: nt_component_suspension::LaneHandle,
 ) -> Option<u64> {
     lanes.binding(lane).ok().map(|binding| binding.reply_object)
-}
-
-pub(crate) unsafe fn acquire_idle_component_execution_lane(
-) -> Option<nt_component_suspension::LaneHandle> {
-    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let (lane, binding) = lanes.next_idle()?;
-    lanes.begin_dispatch(lane, binding.reply_object).ok()?;
-    Some(lane)
-}
-
-pub(crate) unsafe fn begin_component_execution_lane(
-    lane: nt_component_suspension::LaneHandle,
-) -> bool {
-    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let Some(reply_object) = component_execution_lane_reply(lanes, lane) else {
-        return false;
-    };
-    lanes.begin_dispatch(lane, reply_object).is_ok()
 }
 
 pub(crate) unsafe fn component_execution_dispatch_identity(
@@ -482,20 +378,6 @@ pub(crate) unsafe fn component_external_resume_ready(
     lanes.can_resume_external(lane, reply_object, token) == Ok(true)
 }
 
-pub(crate) unsafe fn finish_component_execution_lane(
-    lane: nt_component_suspension::LaneHandle,
-) -> bool {
-    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let Some(reply_object) = component_execution_lane_reply(lanes, lane) else {
-        return false;
-    };
-    let finished = lanes.finish_dispatch(lane, reply_object).is_ok();
-    if finished {
-        crate::driver_launch::win32k_device_properties::retire_completed_transfers();
-    }
-    finished
-}
-
 pub(crate) unsafe fn suspend_component_execution_lane_for_callback(
     lane: nt_component_suspension::LaneHandle,
     token: u64,
@@ -531,6 +413,30 @@ pub(crate) unsafe fn complete_external_component_execution_lane(
         crate::driver_launch::win32k_device_properties::retire_completed_transfers();
     }
     completed
+}
+
+/// Retire only a final callback token, preserving the dispatch for shared transport completion.
+/// False leaves nested ownership unchanged so the caller can adopt the returned Call before
+/// completing the token through the ordinary suspension-preserving transition.
+pub(crate) unsafe fn retire_external_component_execution_lane(
+    lane: nt_component_suspension::LaneHandle,
+    token: u64,
+) -> Result<bool, ()> {
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let reply = component_execution_lane_reply(lanes, lane).ok_or(())?;
+    if lanes.phase(lane) != Ok(nt_component_suspension::LanePhase::Running)
+        || lanes.running() != Some(lane)
+        || lanes.external_top(lane) != Ok(Some(token))
+    {
+        return Err(());
+    }
+    if lanes.external_depth(lane).map_err(|_| ())? != 1
+        || lanes.suspension_count(lane).map_err(|_| ())? != 0
+    {
+        return Ok(false);
+    }
+    lanes.retire_external_running(lane, reply, token).map_err(|_| ())?;
+    Ok(true)
 }
 
 pub(crate) unsafe fn replace_external_component_execution_lane(
@@ -1109,7 +1015,7 @@ unsafe fn lpc_receive_wait_park(
         return false;
     }
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
         return false;
     };
     if stolen == 0 {
@@ -1134,8 +1040,7 @@ unsafe fn lpc_receive_wait_park(
     {
         return false;
     }
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    reply_park.commit();
     LPC_RECEIVE_WAIT_PARKED.fetch_add(1, Ordering::Relaxed);
     if lpc_client()
         .and_then(|client| client.query_handle(pending.request.port_handle).ok())
@@ -1181,7 +1086,7 @@ unsafe fn lpc_connect_wait_park(
         return false;
     }
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
         return false;
     };
     if stolen == 0 {
@@ -1208,8 +1113,7 @@ unsafe fn lpc_connect_wait_park(
     {
         return false;
     }
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    reply_park.commit();
     LPC_CONNECT_WAIT_PARKED.fetch_add(1, Ordering::Relaxed);
     print_str(b"[lpc-connect-wait] pi=");
     print_u64(pi as u64);
@@ -1233,7 +1137,7 @@ unsafe fn lpc_request_wait_park(
         return false;
     }
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
         return false;
     };
     if stolen == 0 {
@@ -1259,8 +1163,7 @@ unsafe fn lpc_request_wait_park(
     {
         return false;
     }
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    reply_park.commit();
     LPC_REQUEST_WAIT_PARKED.fetch_add(1, Ordering::Relaxed);
     print_str(b"[lpc-request-wait] pi=");
     print_u64(pi as u64);
@@ -1403,25 +1306,33 @@ unsafe fn gui_message_waiter_cancel_slot(
     if !waiter.used || waiter.reply_cap == 0 || waiter.queue_event_lease.is_null() {
         return false;
     }
-    if !waiter.reply_deleted {
-        if cnode_delete_r(waiter.reply_cap) != 0 {
+    let shared_cancelled = crate::spawn_hosts::shared_ingress::owner::runtime::hosted_cancellation_proven(
+        waiter.badge, waiter.reply_cap,
+    );
+    if !shared_cancelled {
+        if !waiter.reply_deleted {
+            if cnode_delete_r(waiter.reply_cap) != 0 {
+                return false;
+            }
+            assert!(gui_message_waiter_mark_reply_deleted(
+                slot,
+                waiter.reply_cap,
+                waiter.queue_event_lease,
+            ));
+        }
+        if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, waiter.reply_cap) != 0 {
             return false;
         }
-        assert!(gui_message_waiter_mark_reply_deleted(
-            slot,
-            waiter.reply_cap,
-            waiter.queue_event_lease,
-        ));
+        release_reply_pool_cap(waiter.reply_cap);
     }
-    if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, waiter.reply_cap) != 0 {
-        return false;
-    }
-    release_reply_pool_cap(waiter.reply_cap);
     assert!(gui_message_waiter_clear_slot(
         slot,
         waiter.reply_cap,
         waiter.queue_event_lease
     ));
+    if shared_cancelled {
+        release_reply_pool_cap(waiter.reply_cap);
+    }
     if reconcile_signal && waiter.event_selected {
         if !gui_message_wait_has_selected(waiter.queue_event)
             && !gui_message_wait_reassign_selected(waiter.queue_event)
@@ -1578,16 +1489,15 @@ unsafe fn gui_message_wait_select_published(nt_handler: &mut ExecNtHandler, slot
     gui_message_wait_select_level(nt_handler, waiter.queue_event)
 }
 
-/// Steal the reply object bound to the caller currently being serviced and rotate a fresh pool
-/// object into `REPLY_MAIN_SLOT`, matching the common blocked-service continuation model.
+/// Transfer the current Call to its semantic continuation. Shared ingress already owns its
+/// next receive Reply; only a private root channel needs a replacement pool object.
 pub(crate) unsafe fn steal_main_reply() -> Option<u64> {
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if stolen == 0 {
         return None;
     }
-    let (index, cap) = wait_reply_pool_find_free()?;
-    wait_reply_pool_mark_used(index);
-    REPLY_MAIN_SLOT.store(cap, Ordering::Relaxed);
+    let reply_park = root_reply_park::RootReplyPark::prepare()?;
+    reply_park.commit();
     Some(stolen)
 }
 
@@ -2160,10 +2070,10 @@ unsafe fn provider_wait_admit_current(
     callback_transfer: Option<ComponentCallbackTransfer>,
 ) -> bool {
     let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    let Some((fresh_index, fresh_reply)) = wait_reply_pool_find_free() else {
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
         return false;
     };
-    if active_reply == 0 || fresh_reply == active_reply {
+    if active_reply == 0 {
         return false;
     }
     if !provider_wait_admit_retained(
@@ -2174,8 +2084,7 @@ unsafe fn provider_wait_admit_current(
     ) {
         return false;
     }
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh_reply, Ordering::Relaxed);
+    reply_park.commit();
     true
 }
 
@@ -2245,10 +2154,10 @@ unsafe fn lpc_wait_admit_current(
     callback_transfer: Option<ComponentCallbackTransfer>,
 ) -> bool {
     let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    let Some((fresh_index, fresh_reply)) = wait_reply_pool_find_free() else {
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
         return false;
     };
-    if active_reply == 0 || fresh_reply == active_reply {
+    if active_reply == 0 {
         return false;
     }
     if !lpc_wait_admit_retained(
@@ -2259,8 +2168,7 @@ unsafe fn lpc_wait_admit_current(
     ) {
         return false;
     }
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh_reply, Ordering::Relaxed);
+    reply_park.commit();
     true
 }
 
@@ -4050,6 +3958,16 @@ unsafe fn register_service_delay_drain_context(
         queue as *mut nt_delay_execution::Queue as u64,
         Ordering::Release,
     );
+}
+
+/// Resolve only a published live hosted binding. Shared ingress still queries the captured Reply
+/// against this exact TCB; neither the badge nor a construction-time runtime is authority.
+pub(crate) unsafe fn hosted_ingress_binding(
+    badge: u64,
+) -> Option<nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>> {
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *const ExecNtHandler;
+    if handler.is_null() { return None; }
+    (&*handler).admit_hosted_thread_ingress(badge).ok().map(|runtime| runtime.binding())
 }
 
 unsafe fn clear_service_delay_drain_context() {
@@ -8144,6 +8062,7 @@ pub(crate) unsafe fn service_sec_image(
     macro_rules! park_and_log {
         ($pi:expr, $label:expr, $ip:expr, $cr2:expr) => {{
             let __pi: usize = $pi;
+            assert!(drop_current_hosted_reply(), "crash containment must retire the current Call");
             let __bit = owner_bit_for_badge(&nt_handler, badge);
             // ★ THE LOG LINE IS PER *THREAD* BADGE, the crash BIT is per process. A hosted process
             // has several threads and one of them can already have milestone-parked (which sets the
@@ -9261,10 +9180,11 @@ pub(crate) unsafe fn service_sec_image(
             ) && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
                 && !win32k_glue::client_has_active_callback_frames(pi as u32)
             {
+                assert!(drop_current_hosted_reply(), "terminal CPU fault must retire its Call");
                 print_str(b"[wl-main] winlogon COMPLETED THE INTERACTIVE LOGON; its POST-LOGON path raises an unhandled CPU exception at ip=0x");
                 print_hex((fip >> 32) as u32);
                 print_hex(fip as u32);
-                print_str(b" -> MILESTONE park (holds no win32k callback frame; boot continues)\n");
+                print_str(b" -> terminal thread containment (no callback frame; other threads continue)\n");
                 crash_parked |= owner_bit_for_badge(&nt_handler, badge);
                 service_watchdog_record_crash_parked(crash_parked);
                 procs[pi].faults = faults;
@@ -9501,7 +9421,6 @@ pub(crate) unsafe fn service_sec_image(
                 {
                     continue;
                 }
-                assert!(drop_current_hosted_reply(), "cannot cancel excluded-memory fault reply");
                 park_and_log!(pi, b"pending-memory", m0, addr);
             }
             if faults == 0 {
@@ -9756,6 +9675,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"[wl-deskinfo-fixup] real client state unavailable; PARK worker\n");
                 }
                 if is_tp_worker {
+                    assert!(drop_current_hosted_reply(), "terminal worker fault must retire its Call");
                     print_str(b"[tp-worker] wall badge=");
                     print_u64(badge);
                     print_str(b" ip=0x");
@@ -9763,7 +9683,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(m0 as u32);
                     print_str(b" addr=0x");
                     print_hex(addr as u32);
-                    print_str(b" -> PARK generic worker; owner continues\n");
+                    print_str(b" -> terminal worker containment; other threads continue\n");
                     procs[pi].faults = faults;
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
@@ -9794,6 +9714,7 @@ pub(crate) unsafe fn service_sec_image(
                     || is_lsa_worker
                     || is_wl_worker
                 {
+                    assert!(drop_current_hosted_reply(), "terminal listener fault must retire its Call");
                     print_str(if is_wl_worker {
                         b"[wl-worker] wall ip=0x"
                     } else if is_scm_worker {
@@ -9809,7 +9730,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(m0 as u32);
                     print_str(b" addr=0x");
                     print_hex(addr as u32);
-                    print_str(b" -> PARK thread (its own unrecoverable fault); boot continues\n");
+                    print_str(b" -> terminal thread containment (unrecoverable fault)\n");
                     if is_wl_worker
                         && WINLOGON_MAIN_EVENT_WAIT_PARKED.load(Ordering::Relaxed) != 0
                         && !pre_user_shell_frontier_pending(
@@ -10355,7 +10276,8 @@ pub(crate) unsafe fn service_sec_image(
                     nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
                 ) && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
                 {
-                    print_str(b"[wait] lsass main unrecoverable fault POST-LSA-signal -> PARK (boot continues)\n");
+                    assert!(drop_current_hosted_reply(), "terminal service fault must retire its Call");
+                    print_str(b"[fault] lsass main unrecoverable fault POST-LSA-signal -> terminal thread containment\n");
                     // Terminal for lsass main — count toward quiesce (lsass has done its signalling job).
                     crash_parked |= owner_bit_for_badge(&nt_handler, badge);
                     service_watchdog_record_crash_parked(crash_parked);
@@ -10419,6 +10341,7 @@ pub(crate) unsafe fn service_sec_image(
                 ) && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
                     && !win32k_glue::client_has_active_callback_frames(pi as u32)
                 {
+                    assert!(drop_current_hosted_reply(), "terminal post-logon fault must retire its Call");
                     print_str(b"[wl-main] winlogon COMPLETED THE INTERACTIVE LOGON (LsaLogonUser SUCCESS + logon token received/queried); its POST-LOGON path faults at ip=0x");
                     print_hex((m0 >> 32) as u32);
                     print_hex(m0 as u32);
@@ -10426,7 +10349,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex((addr >> 32) as u32);
                     print_hex(addr as u32);
                     print_str(
-                        b" -> MILESTONE park (holds no win32k callback frame; boot continues)\n",
+                        b" -> terminal thread containment (no callback frame; other threads continue)\n",
                     );
                     crash_parked |= owner_bit_for_badge(&nt_handler, badge);
                     service_watchdog_record_crash_parked(crash_parked);
@@ -11638,7 +11561,9 @@ pub(crate) unsafe fn service_sec_image(
                         // The kernel validates before mutation, then installs state and cancels
                         // the old reply in the same restart. Never delete that reply beforehand.
                         let applied = if nt_handler.hosted_thread_tcb(tid) == Some(tcb) {
-                            crate::thread_context::continue_thread(tcb, &context)
+                            crate::spawn_hosts::shared_ingress::owner::runtime::restart_hosted(
+                                REPLY_MAIN_SLOT.load(Ordering::Relaxed), tcb, &context,
+                            ).expect("uncertain context restart retains its hosted Call owner")
                         } else {
                             Err(u64::MAX)
                         };
@@ -11675,6 +11600,8 @@ pub(crate) unsafe fn service_sec_image(
                         result = 0xC000_0001;
                     }
                     ExecPostAction::TerminateCurrentThread { tid } => {
+                        assert_eq!(tcb_suspend_r(event_runtime.tcb), 0,
+                            "self termination must retain acknowledged stop before Reply cancellation");
                         let trace_index =
                             THREAD_TERM_ROOT_TCB_TRACE.fetch_add(1, Ordering::Relaxed);
                         if trace_index < 8 {
@@ -11729,6 +11656,10 @@ pub(crate) unsafe fn service_sec_image(
                         current_tid,
                         drop_reply,
                     } => {
+                        if drop_reply {
+                            assert_eq!(tcb_suspend_r(event_runtime.tcb), 0,
+                                "process self termination must stop before Reply cancellation");
+                        }
                         let preserve_tid = if current_tid != 0 {
                             Some(current_tid)
                         } else {
@@ -11802,6 +11733,8 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                     ExecPostAction::CriticalTermination { code, object } => {
+                        assert_eq!(tcb_suspend_r(event_runtime.tcb), 0,
+                            "critical termination must stop before Reply cancellation");
                         let reply_dropped = !apc_owned_terminating_reply
                             && drop_current_hosted_reply();
                         // A critical process can bugcheck while it is running a win32k user-mode
@@ -16893,6 +16826,9 @@ pub(crate) unsafe fn service_sec_image(
                 // steady state (winlogon crossed msgina + LSA signalled). This is the win32k analogue of the
                 // listener milestone parks below.
                 if wl_milestone_park {
+                    // No typed GUI wait or provider continuation accepted this request. Keep the
+                    // frontier explicit: contain this thread rather than orphan its held Call.
+                    assert!(drop_current_hosted_reply(), "unhandled GUI frontier must retire its Call");
                     procs[pi].faults = faults;
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
@@ -16956,10 +16892,11 @@ pub(crate) unsafe fn service_sec_image(
                 ) && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
                     && !win32k_glue::client_has_active_callback_frames(pi as u32)
                 {
+                    assert!(drop_current_hosted_reply(), "unimplemented terminal syscall must retire its Call");
                     print_str(b"[wl-main] winlogon COMPLETED THE INTERACTIVE LOGON; its POST-LOGON path hit unimplemented win32k SSN=0x");
                     print_hex(m0 as u32);
                     print_str(
-                        b" -> MILESTONE park (holds no win32k callback frame; boot continues)\n",
+                        b" -> terminal thread containment (no callback frame; other threads continue)\n",
                     );
                     crash_parked |= owner_bit_for_badge(&nt_handler, badge);
                     service_watchdog_record_crash_parked(crash_parked);
@@ -16999,11 +16936,12 @@ pub(crate) unsafe fn service_sec_image(
                     continue;
                 }
                 if is_tp_worker {
-                    print_str(b"[tp-worker] blocking/unserviced syscall badge=");
+                    assert!(drop_current_hosted_reply(), "unserviced worker syscall must retire its Call");
+                    print_str(b"[tp-worker] unserviced syscall badge=");
                     print_u64(badge);
                     print_str(b" SSN=");
                     print_u64(m0);
-                    print_str(b" -> PARK generic worker; owner continues\n");
+                    print_str(b" -> terminal worker containment; other threads continue\n");
                     procs[pi].faults = faults;
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
@@ -17034,8 +16972,9 @@ pub(crate) unsafe fn service_sec_image(
                     || is_lsa_worker
                     || is_wl_worker
                 {
+                    assert!(drop_current_hosted_reply(), "unserviced listener syscall must retire its Call");
                     print_str(if is_wl_worker {
-                        b"[wl-worker] blocking/unserviced server syscall SSN="
+                        b"[wl-worker] unserviced server syscall SSN="
                     } else if is_scm_worker {
                         b"[scm-worker] blocking/unserviced server syscall SSN="
                     } else if is_lsa_worker {
@@ -17046,7 +16985,7 @@ pub(crate) unsafe fn service_sec_image(
                         b"[svc-listener] blocking server syscall SSN="
                     });
                     print_u64(m0);
-                    print_str(b" -> PARK thread (reached its RPC receive loop / unserviced); boot continues\n");
+                    print_str(b" -> terminal thread containment (no implemented wait contract)\n");
                     if is_lsa_auth_server && nt_handler.hosted_thread_lpc_client_process(badge) != 0
                     {
                         LSA_SERVER_WALL_SSN.store(m0, Ordering::Relaxed);
@@ -23700,13 +23639,8 @@ pub(crate) unsafe fn lpc_receive_wait_abandon_thread(
         }
         let removed = table.take(slot).unwrap();
         let cap = removed.continuation.reply_cap;
-        let deleted = cnode_delete_r(cap);
-        let retyped = if deleted == 0 {
-            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
-        } else {
-            u64::MAX
-        };
-        if deleted == 0 && retyped == 0 {
+        let cancelled = cancel_parked_reply_transport(cap);
+        if cancelled {
             release_reply_pool_cap(cap);
         }
         abandoned += 1;
@@ -23736,13 +23670,8 @@ pub(crate) unsafe fn lpc_connect_wait_abandon_thread(
         }
         nt_handler.abort_lpc_connection_views(removed.request.connection_id);
         let cap = removed.continuation.reply_cap;
-        let deleted = cnode_delete_r(cap);
-        let retyped = if deleted == 0 {
-            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
-        } else {
-            u64::MAX
-        };
-        if deleted == 0 && retyped == 0 {
+        let cancelled = cancel_parked_reply_transport(cap);
+        if cancelled {
             release_reply_pool_cap(cap);
         }
         abandoned += 1;
@@ -23776,13 +23705,8 @@ pub(crate) unsafe fn lpc_request_wait_abandon_thread(
             );
         }
         let cap = removed.continuation.reply_cap;
-        let deleted = cnode_delete_r(cap);
-        let retyped = if deleted == 0 {
-            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
-        } else {
-            u64::MAX
-        };
-        if deleted == 0 && retyped == 0 {
+        let cancelled = cancel_parked_reply_transport(cap);
+        if cancelled {
             release_reply_pool_cap(cap);
         }
         abandoned += 1;
@@ -23822,7 +23746,7 @@ unsafe fn gui_message_wait_park(
     if stolen == 0 {
         return false;
     }
-    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
         return false;
     };
     let pi_index = pi as usize;
@@ -23867,8 +23791,7 @@ unsafe fn gui_message_wait_park(
         };
     }
     let _ = gui_message_wait_select_published(nt_handler, slot);
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    reply_park.commit();
     let n = GUI_MESSAGE_WAIT_PARKED.fetch_add(1, Ordering::Relaxed);
     if n < 32 {
         print_str(b"[gui-msg-wait] parked pi=");
@@ -24234,7 +24157,7 @@ unsafe fn io_completion_park(
     if stolen == 0 {
         return false;
     }
-    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
         return false;
     };
     if nt_handler.io_completion_ports.retain(port_id).is_err() {
@@ -24255,8 +24178,7 @@ unsafe fn io_completion_park(
         nt_handler.release_io_completion_reference(port_id);
         return false;
     }
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    reply_park.commit();
     IO_COMPLETION_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
     thread_wait_state_mark_badge_waiting(nt_handler, nt_handler.current_badge);
     true
@@ -24317,10 +24239,11 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     nt_handler.pi = saved_pi;
     nt_handler.loop_ctx = saved_ctx;
 
-    reply_parked_syscall(
+    let delivered = reply_parked_syscall(
         waiter.reply_cap,
         if copied { 0 } else { 0xC000_0005 },
     );
+    assert!(delivered, "IO completion retains uncertain Reply completion");
     release_reply_pool_cap(waiter.reply_cap);
     thread_wait_state_clear_badge_ready(nt_handler, waiter.badge);
     nt_handler.release_io_completion_reference(waiter.port_id);
@@ -24368,7 +24291,7 @@ unsafe fn synchronous_file_wait_park(
     if stolen == 0 {
         return false;
     }
-    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
         return false;
     };
     waiter.reply_cap = stolen;
@@ -24376,8 +24299,7 @@ unsafe fn synchronous_file_wait_park(
     if table.park_reserved(reservation, waiter).is_none() {
         return false;
     }
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    reply_park.commit();
     true
 }
 
@@ -24467,7 +24389,7 @@ unsafe fn pending_driver_start_transfer(
         stolen, 0,
         "pending driver START Reply object disappeared after preflight"
     );
-    let (fresh_index, fresh) = wait_reply_pool_find_free()
+    let reply_park = root_reply_park::RootReplyPark::prepare()
         .expect("pending driver START Reply-pool claim disappeared after preflight");
     let reply = PendingPnpSyscallReply {
         tid: nt_handler.current_tid,
@@ -24482,8 +24404,7 @@ unsafe fn pending_driver_start_transfer(
         .pending_driver_starts
         .publish(reservation, PendingDriverStart { batch, owner })
         .expect("reserved driver START continuation rejected its exact batch");
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    reply_park.commit();
 }
 
 unsafe fn pending_pnp_operation_transfer(
@@ -24499,7 +24420,7 @@ unsafe fn pending_pnp_operation_transfer(
         stolen, 0,
         "pending PnP operation Reply object disappeared after preflight"
     );
-    let (fresh_index, fresh) = wait_reply_pool_find_free()
+    let reply_park = root_reply_park::RootReplyPark::prepare()
         .expect("pending PnP operation Reply-pool claim disappeared after preflight");
     let reply = Some(PendingPnpSyscallReply {
         tid: nt_handler.current_tid,
@@ -24510,8 +24431,7 @@ unsafe fn pending_pnp_operation_transfer(
         .pending_pnp_operations
         .publish(reservation, PendingPnpOperation { operation, reply })
         .expect("reserved PnP continuation rejected its exact operation");
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    reply_park.commit();
 }
 
 unsafe fn pending_driver_start_reply_owner(
@@ -24521,6 +24441,7 @@ unsafe fn pending_driver_start_reply_owner(
     status: u32,
 ) -> bool {
     let delivered = reply_parked_syscall(cap, status as u64);
+    assert!(delivered, "driver START retains uncertain Reply completion");
     release_reply_pool_cap(cap);
     thread_wait_state_clear_badge_ready(nt_handler, badge);
     delivered
@@ -24856,13 +24777,8 @@ pub(crate) unsafe fn pending_driver_start_abandon_thread(
             .abandon(request)
             .expect("abandoned StartDevice reply did not match its pending request");
         let cap = reply.reply_cap;
-        let deleted = cnode_delete_r(cap);
-        let retyped = if deleted == 0 {
-            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
-        } else {
-            u64::MAX
-        };
-        if deleted == 0 && retyped == 0 {
+        let cancelled = cancel_parked_reply_transport(cap);
+        if cancelled {
             release_reply_pool_cap(cap);
         }
         thread_wait_state_clear_badge(reply.badge);
@@ -24885,13 +24801,8 @@ pub(crate) unsafe fn pending_driver_start_abandon_thread(
             .take()
             .expect("PnP operation reply disappeared during abandonment");
         let cap = reply.reply_cap;
-        let deleted = cnode_delete_r(cap);
-        let retyped = if deleted == 0 {
-            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
-        } else {
-            u64::MAX
-        };
-        if deleted == 0 && retyped == 0 {
+        let cancelled = cancel_parked_reply_transport(cap);
+        if cancelled {
             release_reply_pool_cap(cap);
         }
         thread_wait_state_clear_badge(reply.badge);
@@ -24998,7 +24909,7 @@ unsafe fn pending_file_io_transfer(
         stolen, 0,
         "pending File reply cap disappeared after preflight"
     );
-    let (fresh_index, fresh) = wait_reply_pool_find_free()
+    let reply_park = root_reply_park::RootReplyPark::prepare()
         .expect("pending File reply-pool claim disappeared after preflight");
     pending.reply_cap = stolen;
     pending.reply_required = true;
@@ -25007,8 +24918,7 @@ unsafe fn pending_file_io_transfer(
     pending.resume_flags = flags;
     let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
     commit_or_panic(table, reservation, pending, true);
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    reply_park.commit();
 }
 
 unsafe fn file_irp_drain_transfer(
@@ -25020,14 +24930,13 @@ unsafe fn file_irp_drain_transfer(
         stolen, 0,
         "File IRP drain reply cap disappeared after preflight"
     );
-    let (fresh_index, fresh) = wait_reply_pool_find_free()
+    let reply_park = root_reply_park::RootReplyPark::prepare()
         .expect("File IRP drain reply-pool claim disappeared after preflight");
     pending.reply_cap = stolen;
     (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
         .park_reserved(reservation, pending)
         .expect("reserved File IRP drain owner rejected its exact continuation");
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    reply_park.commit();
 }
 
 /// Transfer the final-handle `NtClose` reply only when its canonical File lifecycle still exists.
@@ -25050,14 +24959,13 @@ unsafe fn file_cleanup_wait_transfer(
         stolen, 0,
         "File cleanup reply cap disappeared after preflight"
     );
-    let (fresh_index, fresh) = wait_reply_pool_find_free()
+    let reply_park = root_reply_park::RootReplyPark::prepare()
         .expect("File cleanup reply-pool claim disappeared after preflight");
     pending.reply_cap = stolen;
     table
         .park_reserved(reservation, pending)
         .expect("reserved File cleanup owner rejected its exact continuation");
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    reply_park.commit();
     true
 }
 

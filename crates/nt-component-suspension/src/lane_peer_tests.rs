@@ -32,17 +32,82 @@ fn shared_allocation_stages_distinct_authenticated_peers_without_execution() {
     }
     let ar = peers.publish_lane(&mut a, 7, 8, &lanes).unwrap();
     let br = peers.publish_lane(&mut b, 7, 8, &lanes).unwrap();
+    assert_eq!(lanes.peer_route(first), Ok(Some(ar)));
+    assert_eq!(lanes.peer_route(second), Ok(Some(br)));
+    let stale = LaneHandle { generation: first.generation + 1, ..first };
+    assert!(lanes.peer_route(stale).is_err());
     assert_eq!(peers.resolve_lane(ar.badge(), 7, 8, &lanes), Ok(ar));
     assert_eq!(peers.resolve_lane(br.badge(), 7, 8, &lanes), Ok(br));
     assert_eq!(lanes.running(), None);
 }
 
 #[test]
+fn shared_endpoint_preserves_distinct_provider_domains_and_generations() {
+    for (domain, generation) in [(9, 8), (7, 9), (9, 10)] {
+        let mut lanes = Lanes::new(2, 4);
+        let mut peers = PeerRegistry::new(22, 2);
+        let (first, mut a) = lanes
+            .allocate_shared_staged(&mut peers, 7, 8, binding())
+            .unwrap();
+        let ar = peers.publish_lane(&mut a, 7, 8, &lanes).unwrap();
+        let (second, mut b) = lanes
+            .allocate_shared_staged(&mut peers, domain, generation, second_binding())
+            .unwrap();
+        assert_eq!(
+            peers.publish_lane(&mut b, 7, 8, &lanes),
+            Err(PeerLaneError::Peer(PeerError::WrongOwner))
+        );
+        let br = peers
+            .publish_lane(&mut b, domain, generation, &lanes)
+            .unwrap();
+        assert_ne!(ar.badge(), br.badge());
+        assert_eq!(peers.resolve_lane(ar.badge(), 7, 8, &lanes), Ok(ar));
+        assert_eq!(
+            peers.resolve_lane(br.badge(), domain, generation, &lanes),
+            Ok(br)
+        );
+        assert_eq!(
+            peers.resolve_lane(ar.badge(), domain, generation, &lanes),
+            Err(PeerLaneError::Peer(PeerError::WrongOwner))
+        );
+        assert_eq!(
+            peers.resolve_lane(br.badge(), 7, 8, &lanes),
+            Err(PeerLaneError::Peer(PeerError::WrongOwner))
+        );
+        assert_eq!(lanes.phase(first), Ok(LanePhase::Staged));
+        assert_eq!(lanes.phase(second), Ok(LanePhase::Staged));
+        assert_eq!(lanes.running(), None);
+    }
+}
+
+#[test]
+fn unpublished_peers_from_different_domains_can_share_ingress() {
+    let mut lanes = Lanes::new(2, 4);
+    let mut peers = PeerRegistry::new(22, 2);
+    let (_, mut a) = lanes
+        .allocate_shared_staged(&mut peers, 7, 8, binding())
+        .unwrap();
+    let (_, mut b) = lanes
+        .allocate_shared_staged(&mut peers, 9, 10, second_binding())
+        .unwrap();
+    let ar = a.route().unwrap();
+    let br = b.route().unwrap();
+    assert_eq!(peers.state(ar), Ok((PeerPhase::Staged, 0)));
+    assert_eq!(peers.state(br), Ok((PeerPhase::Staged, 0)));
+    assert_eq!(peers.resolve(ar.badge()), None);
+    assert_eq!(peers.resolve(br.badge()), None);
+    assert_eq!(peers.publish_lane(&mut b, 9, 10, &lanes), Ok(br));
+    assert_eq!(peers.publish_lane(&mut a, 7, 8, &lanes), Ok(ar));
+    assert_eq!(lanes.running(), None);
+}
+
+#[test]
 fn private_and_shared_endpoint_ownership_cannot_mix() {
-    let (mut private, _, mut peers) = setup();
+    let (mut private, lane, mut peers) = setup();
+    assert_eq!(private.peer_route(lane), Ok(None));
     assert_eq!(
         private
-            .allocate_shared_staged(&mut peers, 7, 8, second_binding())
+            .allocate_shared_staged(&mut peers, 9, 10, second_binding())
             .unwrap_err(),
         PeerLaneError::Lane(LaneError::DuplicateBinding)
     );
@@ -63,7 +128,7 @@ fn private_and_shared_endpoint_ownership_cannot_mix() {
 }
 
 #[test]
-fn shared_allocation_rejects_foreign_registry_domain_and_retired_identity() {
+fn shared_allocation_rejects_foreign_registry_zero_identity_and_retired_identity() {
     let mut lanes = Lanes::new(2, 4);
     let mut peers = PeerRegistry::new(22, 2);
     let (_, mut ticket) = lanes
@@ -76,7 +141,7 @@ fn shared_allocation_rejects_foreign_registry_domain_and_retired_identity() {
             .unwrap_err(),
         PeerLaneError::Peer(PeerError::WrongOwner)
     );
-    for (domain, generation) in [(0, 8), (7, 0), (9, 8), (7, 9)] {
+    for (domain, generation) in [(0, 8), (7, 0)] {
         assert_eq!(
             lanes
                 .allocate_shared_staged(&mut peers, domain, generation, second_binding())
@@ -88,14 +153,14 @@ fn shared_allocation_rejects_foreign_registry_domain_and_retired_identity() {
     peers.begin_retirement(route).unwrap();
     assert_eq!(
         lanes
-            .allocate_shared_staged(&mut peers, 7, 8, second_binding())
+            .allocate_shared_staged(&mut peers, 9, 10, second_binding())
             .unwrap_err(),
         PeerLaneError::Peer(PeerError::WrongPhase)
     );
     peers.finish_retirement(route).unwrap();
     assert_eq!(
         lanes
-            .allocate_shared_staged(&mut peers, 7, 8, second_binding())
+            .allocate_shared_staged(&mut peers, 9, 10, second_binding())
             .unwrap_err(),
         PeerLaneError::Peer(PeerError::WrongOwner)
     );
@@ -150,7 +215,7 @@ fn shared_allocation_preserves_executor_reply_and_lane_capacity_checks() {
     ] {
         assert_eq!(
             lanes
-                .allocate_shared_staged(&mut peers, 7, 8, duplicate)
+                .allocate_shared_staged(&mut peers, 9, 10, duplicate)
                 .unwrap_err(),
             PeerLaneError::Lane(LaneError::DuplicateBinding)
         );

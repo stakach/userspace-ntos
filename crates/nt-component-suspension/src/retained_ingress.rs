@@ -36,6 +36,14 @@ pub struct RetainedIngress<M> {
 }
 
 impl<M> RetainedIngress<M> {
+    /// Called only by the stopped-route transaction after all ownership/binding preflight.
+    pub(crate) fn cancel_stopped(self, peers: &mut PeerRegistry) -> (ComponentIngress<M>, M) {
+        let Self { ingress, mut retention, completed, admitted: _, reply_attempt: _ } = self;
+        peers.release(&mut retention).expect("preflight exact stopped retention");
+        let (ingress, held) = ingress.into_unbound_parts();
+        (ingress, completed.or(held).expect("retained canceled payload"))
+    }
+
     pub(crate) fn is_acknowledged(&self) -> bool {
         self.completed.is_some()
     }
@@ -65,6 +73,10 @@ impl<M> RetainedIngress<M> {
     }
     pub(crate) fn is_held(&self) -> bool {
         self.admitted.is_none() && self.completed.is_none() && self.ingress.is_held()
+    }
+
+    pub(crate) fn is_admitted_held(&self) -> bool {
+        self.admitted.is_some() && self.completed.is_none() && self.ingress.is_held()
     }
 
     pub fn route(&self) -> PeerRoute {

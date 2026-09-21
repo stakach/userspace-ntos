@@ -53,8 +53,28 @@ impl IngressReceiver<crate::ReceivedMessage> {
         completion_label: u64,
         lanes: &mut ComponentSuspensionLanes<C, R, T>,
         peers: &mut PeerRegistry,
+        query: impl FnMut(u64, u64) -> Result<ReplyBindingObservation, E>,
+    ) -> Result<crate::ReceivedMessage, StoredCompletionError<E>> {
+        self.complete_protocol_from_message(route, dispatch, completion_reply, completion_label,
+            &[], lanes, peers, query)
+    }
+
+    /// Match the final Call against an independently owned protocol token (for example an IRQ
+    /// arena identity). Exact tag equality excludes cap transfer, flags and surplus words.
+    pub fn complete_protocol_from_message<C, R, T, E>(
+        &mut self,
+        route: PeerRoute,
+        dispatch: crate::LaneDispatchIdentity,
+        completion_reply: u64,
+        completion_label: u64,
+        expected_words: &[u64],
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        peers: &mut PeerRegistry,
         mut query: impl FnMut(u64, u64) -> Result<ReplyBindingObservation, E>,
     ) -> Result<crate::ReceivedMessage, StoredCompletionError<E>> {
+        if self.phase().is_some() {
+            return Err(StoredCompletionError::WrongOwner);
+        }
         let lane = lanes
             .lane(route.identity().lane)
             .map_err(|_| StoredCompletionError::WrongOwner)?;
@@ -66,10 +86,12 @@ impl IngressReceiver<crate::ReceivedMessage> {
             .stored_reply(route, completion_reply)
             .map_err(StoredCompletionError::Store)?;
         if !completion.is_held()
+            || expected_words.len() > 120
             || completion_label == 0
             || completion_label > (u64::MAX >> 12)
             || completion.message().badge() != route.badge()
-            || completion.message().info() != completion_label << 12
+            || completion.message().info() != (completion_label << 12) | expected_words.len() as u64
+            || expected_words.iter().enumerate().any(|(index, word)| completion.message().word(index) != Some(*word))
         {
             return Err(StoredCompletionError::InvalidCompletionMessage);
         }
@@ -99,6 +121,17 @@ mod startup_ready;
 pub use startup_ready::StartupReadyError;
 mod startup_fault;
 pub use startup_fault::StartupFaultError;
+mod interim_adoption;
+pub use interim_adoption::InterimAdoptionError;
+mod bootstrap_adoption;
+pub use bootstrap_adoption::BootstrapAdoptionError;
+mod parked_reply;
+mod nested_execution;
+pub use nested_execution::{NestedExecutionError, NestedExecutionScope};
+mod bootstrap_completion;
+mod stopped_route;
+pub use stopped_route::{CancelledStoppedCall, StoppedRouteError};
+mod external;
 
 /// Native adapters must capture the full received message before issuing binding-query IPC.
 /// This owns ingress and storage exclusively; Call provenance, exact physical lifetime and
@@ -129,6 +162,9 @@ impl<M> IngressReceiver<M> {
         peers: &mut PeerRegistry,
         query: impl FnOnce(u64, u64) -> Result<ReplyBindingObservation, E>,
     ) -> Result<M, StoredCompletionError<E>> {
+        if self.phase().is_some() {
+            return Err(StoredCompletionError::WrongOwner);
+        }
         let call = self
             .store
             .stored_dispatch_mut(route, dispatch)
@@ -247,6 +283,16 @@ impl<M> IngressReceiver<M> {
 
     pub fn available(&self) -> usize {
         self.store.available()
+    }
+
+    /// Observational payload access does not check out the Call or transfer Reply authority.
+    pub fn stored_message(&self, route: PeerRoute, reply: u64) -> Result<&M, RetainedWorkError> {
+        Ok(self.store.stored_reply(route, reply)?.message())
+    }
+
+    /// Held arrivals only; acknowledged or already admitted Calls are not dispatch candidates.
+    pub fn next_unadmitted(&self, route: PeerRoute) -> Option<(u64, &M)> {
+        self.store.next_unadmitted(route).map(|call| (call.reply(), call.message()))
     }
 
     /// Includes the currently owned receive Reply even before its next reservation begins.

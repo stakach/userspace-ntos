@@ -256,7 +256,7 @@ fn capacity_is_bounded_and_reclaimed_only_on_removal() {
 
 #[test]
 fn badge_exhaustion_never_wraps_or_changes_existing_entries() {
-    for value in [0, ENDPOINT_BADGE_MAX + 1, u64::MAX] {
+    for value in [0, 1, COMPONENT_BADGE - 1, COMPONENT_BADGE, ENDPOINT_BADGE_MAX + 1, u64::MAX] {
         let counter = AtomicU64::new(value);
         let mut registry = PeerRegistry::new(10, 2);
         let route = active(&mut registry, 1);

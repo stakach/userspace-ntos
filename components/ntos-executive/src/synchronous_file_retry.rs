@@ -73,16 +73,7 @@ unsafe fn retire_reply(nt_handler: &mut ExecNtHandler, identity: SynchronousFile
         *view.waiter
     };
     // No IPC, allocation or callbacks occur between local pool retirement and ownership ACK.
-    let local = match wait_reply_pool_mut()
-        .iter_mut()
-        .find(|record| record.cap == waiter.reply_cap && record.used)
-    {
-        Some(record) => {
-            record.used = false;
-            Ok(())
-        }
-        None => Err(0xC000_0008),
-    };
+    let local = crate::parked_reply::retire_sent(waiter.reply_cap);
     let retired = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
         .finish_retry(identity, local)
         .expect("File retry local ACK lost its owner");

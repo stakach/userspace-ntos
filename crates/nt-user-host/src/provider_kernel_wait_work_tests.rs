@@ -1,9 +1,9 @@
 use super::*;
 
-#[path = "provider_kernel_wait_runtime_tests.rs"]
-mod runtime;
 #[path = "provider_kernel_wait_publication_tests.rs"]
 mod publication;
+#[path = "provider_kernel_wait_runtime_tests.rs"]
+mod runtime;
 
 fn next_work(
     f: &mut Fixture,
@@ -91,7 +91,7 @@ fn stale_authority_is_reported_once_without_retiring_the_original_recipient() {
     for mode in 0..4 {
         let (mut f, _) = fixture(false);
         let lane = f.caller.dispatch.lane();
-        let reply = f.caller.binding.reply_object;
+        let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
         match mode {
             0 => {
                 f.pm.terminate_thread(f.caller.thread().thread_id(), 0)
@@ -105,7 +105,7 @@ fn stale_authority_is_reported_once_without_retiring_the_original_recipient() {
                 f.lanes.begin_dispatch(lane, reply).unwrap();
             }
             _ => {
-                f.activations.rows[0].caller.binding.reply_object += 1;
+                f.activations.rows[0].caller.receive_endpoint += 1;
             }
         }
         let retained = f.activations.rows[0].caller;
@@ -239,7 +239,11 @@ fn append_waiting_activation_with(
 fn bounded_pass_excludes_later_rows_and_does_not_revisit_failed_rows() {
     let (mut f, _) = fixture(false);
     f.lanes
-        .suspend_running(f.caller.dispatch.lane(), f.caller.binding.reply_object, 99)
+        .suspend_running(
+            f.caller.dispatch.lane(),
+            f.caller.current_binding(&f.lanes).unwrap().reply_object,
+            99,
+        )
         .unwrap();
     let mut old = f.activations.wait_work_cursor();
     let second = append_waiting_activation(&mut f);
@@ -307,7 +311,7 @@ fn a_new_capture_in_a_visited_activation_waits_for_the_next_pass() {
 fn rejected_or_uncaptured_waits_report_errors_and_other_pump_stops_are_skipped() {
     for mode in 0..7 {
         let (mut f, _) = fixture(false);
-        let reply = f.caller.binding.reply_object;
+        let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
         let mut state = KernelProviderWaitState::new(reply).unwrap();
         let mut attempt = state.begin_initial().unwrap();
         let mut observed = facts(reply, false);

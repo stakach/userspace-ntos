@@ -17,7 +17,7 @@ unsafe fn claim_driver_entry_wait_resume(
     let _durable = allocator::enter_durable();
     let channel = (&*core::ptr::addr_of!(ACTIVATIONS))
         .recipient(caller)?
-        .execution_channel(caller);
+        .execution_channel(caller)?;
     if authenticated_channel_caller(&channel)? != caller {
         return Err(nt_process::STATUS_INVALID_HANDLE);
     }

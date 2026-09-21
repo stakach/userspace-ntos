@@ -8,7 +8,7 @@ fn validate_unchanged(f: &mut Fixture) -> Result<(), KernelProviderResumeError> 
     let observation = f
         .state()
         .progress()
-        .provider_wait_observation(f.caller.binding.reply_object);
+        .provider_wait_observation(f.caller.current_binding(&f.lanes).unwrap().reply_object);
     let capture = f.state().captured_wait();
     let active = f.state().active_resume();
     let bank = &*f.activations.recipient(f.caller).unwrap().bank as *const u64;
@@ -21,7 +21,7 @@ fn validate_unchanged(f: &mut Fixture) -> Result<(), KernelProviderResumeError> 
     assert_eq!(
         f.state()
             .progress()
-            .provider_wait_observation(f.caller.binding.reply_object),
+            .provider_wait_observation(f.caller.current_binding(&f.lanes).unwrap().reply_object),
         observation
     );
     assert_eq!(f.state().captured_wait(), capture);

@@ -9,7 +9,10 @@ mod wake;
 fn pending(f: &mut Fixture, observed: bool) -> TerminalIdentity {
     f.lanes.select(f.capture.key(), 258).unwrap();
     let (_, mut attempt, _) = f.resume().unwrap().into_parts();
-    let mut result = facts(f.caller.binding.reply_object, true);
+    let mut result = facts(
+        f.caller.current_binding(&f.lanes).unwrap().reply_object,
+        true,
+    );
     result.completed = observed;
     f.activations
         .recipient_mut(f.caller)
@@ -34,7 +37,7 @@ fn begin(f: &mut Fixture, terminal: TerminalIdentity) -> TerminalAttempt {
     f.lanes
         .begin_terminal_stage(
             terminal,
-            f.caller.binding.reply_object,
+            f.caller.current_binding(&f.lanes).unwrap().reply_object,
             TerminalStage::LocalDelivery,
         )
         .unwrap()
@@ -65,7 +68,7 @@ fn local_destination_receives_return_not_wait_status_before_exact_retirement_and
     let mut f = Fixture::new();
     let bank = &*f.activations.recipient(f.caller).unwrap().bank as *const u64;
     let terminal = pending(&mut f, true);
-    let reply = f.caller.binding.reply_object;
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
     assert!(f.activations.recipient_mut(f.caller).is_err());
     assert!(f.activations.completion(f.caller).is_err());
     let mut attempt = begin(&mut f, terminal);
@@ -187,7 +190,7 @@ fn foreign_terminal_attempt_caller_and_manager_never_access_the_recipient() {
     f.lanes
         .record_terminal_stage(
             &mut attempt,
-            f.caller.binding.reply_object,
+            f.caller.current_binding(&f.lanes).unwrap().reply_object,
             TerminalStageOutcome::Acknowledged,
         )
         .unwrap();
@@ -209,7 +212,7 @@ fn unobserved_or_wrong_return_is_no_effects_and_never_ready_completion() {
     for observed in [false, true] {
         let mut f = Fixture::new();
         let terminal = pending(&mut f, observed);
-        let reply = f.caller.binding.reply_object;
+        let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
         let mut attempt = begin(&mut f, terminal);
         let wrong = f
             .activations
@@ -271,7 +274,7 @@ fn delivered_local_result_survives_lost_ack_without_reopening_execution() {
         .lanes
         .begin_terminal_stage(
             terminal,
-            f.caller.binding.reply_object,
+            f.caller.current_binding(&f.lanes).unwrap().reply_object,
             TerminalStage::LocalDelivery
         )
         .is_err());
@@ -295,7 +298,7 @@ fn exited_caller_and_retired_provider_keep_the_original_local_destination() {
     f.lanes
         .record_terminal_stage(
             &mut attempt,
-            f.caller.binding.reply_object,
+            f.caller.current_binding(&f.lanes).unwrap().reply_object,
             TerminalStageOutcome::Acknowledged,
         )
         .unwrap();

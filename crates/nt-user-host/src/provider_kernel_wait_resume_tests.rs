@@ -12,14 +12,14 @@ use nt_provider_wait::{
     ProviderWaitRequestMetadata, ProviderWaitTimeoutKind, ProviderWaitType,
 };
 
-#[path = "provider_kernel_wait_execution_tests.rs"]
-mod execution;
-#[path = "provider_kernel_wait_eligibility_tests.rs"]
-mod eligibility;
-#[path = "provider_kernel_local_delivery_tests.rs"]
-mod local_delivery;
 #[path = "provider_kernel_wait_admission_tests.rs"]
 mod admission;
+#[path = "provider_kernel_wait_eligibility_tests.rs"]
+mod eligibility;
+#[path = "provider_kernel_wait_execution_tests.rs"]
+mod execution;
+#[path = "provider_kernel_local_delivery_tests.rs"]
+mod local_delivery;
 #[path = "provider_kernel_stopped_outcome_tests.rs"]
 mod stopped_outcome;
 
@@ -170,10 +170,12 @@ impl Fixture {
         let phase = self.lanes.phase(lane).unwrap();
         let frame = self.lanes.top(lane).unwrap().cloned();
         let dispatch = self.lanes.active_dispatch_identity(lane).unwrap();
-        let observation = self
-            .state()
-            .progress()
-            .provider_wait_observation(self.caller.binding.reply_object);
+        let observation = self.state().progress().provider_wait_observation(
+            self.caller
+                .current_binding(&self.lanes)
+                .unwrap()
+                .reply_object,
+        );
         let capture = self.state().captured_wait();
         let bank = &*self.activations.recipient(self.caller).unwrap().bank as *const u64;
         let error = self.resume().unwrap_err();
@@ -181,9 +183,12 @@ impl Fixture {
         assert_eq!(self.lanes.top(lane).unwrap().cloned(), frame);
         assert_eq!(self.lanes.active_dispatch_identity(lane).unwrap(), dispatch);
         assert_eq!(
-            self.state()
-                .progress()
-                .provider_wait_observation(self.caller.binding.reply_object),
+            self.state().progress().provider_wait_observation(
+                self.caller
+                    .current_binding(&self.lanes)
+                    .unwrap()
+                    .reply_object
+            ),
             observation
         );
         assert_eq!(self.state().captured_wait(), capture);
@@ -199,7 +204,11 @@ impl Fixture {
     fn repark(&mut self, next_id: u64, sequence: u64) -> KernelProviderWaitCapture {
         let ticket = self.resume().unwrap();
         let (_, mut attempt, _) = ticket.into_parts();
-        let reply = self.caller.binding.reply_object;
+        let reply = self
+            .caller
+            .current_binding(&self.lanes)
+            .unwrap()
+            .reply_object;
         self.activations
             .recipient_mut(self.caller)
             .unwrap()
@@ -273,7 +282,7 @@ fn selected_and_cancelled_waits_claim_exact_pump_entry_once() {
         );
         let (capture, mut attempt, selection) = ticket.into_parts();
         assert_eq!(capture, f.capture);
-        let reply = f.caller.binding.reply_object;
+        let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
         let state = &mut f.activations.recipient_mut(f.caller).unwrap().state;
         assert_eq!(
             state.observe(&mut attempt, facts(reply, true), Some(7)),
@@ -378,7 +387,7 @@ fn mismatched_caller_and_exited_requestor_leave_selected_capture_intact() {
     let mut f = Fixture::new();
     f.lanes.select(f.capture.key(), 258).unwrap();
     let mut wrong = f.caller;
-    wrong.binding.reply_object += 1;
+    wrong.receive_endpoint += 1;
     assert_eq!(
         f.activations
             .begin_wait_resume(wrong, &f.pm, &f.catalog, &mut f.lanes, f.capture)
@@ -467,7 +476,7 @@ fn rejected_request_remains_retained_without_capture_or_reply_retry() {
     let mut f = Fixture::new();
     f.lanes.select(f.capture.key(), 258).unwrap();
     let (_, mut attempt, _) = f.resume().unwrap().into_parts();
-    let reply = f.caller.binding.reply_object;
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
     let mut request = request(f.caller.owner(), 72);
     request.header.magic = 0;
     f.activations
@@ -521,7 +530,7 @@ fn repeated_waits_return_only_through_terminal_retirement_and_exact_ack() {
     f.lanes.select(f.capture.key(), 258).unwrap();
     f.repark(72, 2);
     let (_, mut attempt, _) = f.resume().unwrap().into_parts();
-    let reply = f.caller.binding.reply_object;
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
     f.activations
         .recipient_mut(f.caller)
         .unwrap()

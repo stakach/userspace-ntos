@@ -14,24 +14,30 @@ use core::sync::atomic::{AtomicU64, Ordering};
 static NEXT_DISPATCH_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 mod terminal;
+mod external_stop;
+mod external_ingress;
+pub use external_ingress::{ExternalIngress, ExternalIngressError, ExternalRestartObservation};
 mod ingress;
 pub mod badge;
+pub mod source_registry;
 mod message;
 mod receive_probe;
 pub mod peer_registry;
 mod lane_peer;
 mod peer_installation;
-pub use peer_installation::{PeerCapabilityDestination, PeerSpaceBinding, PeerInstallation, PeerInstallationError, PeerInstallationPhase, PeerStartupError};
+pub use peer_installation::{PeerCapabilityDestination, PeerSpaceBinding, PeerInstallation, PeerInstallationError, PeerInstallationPhase, PeerStartupError, PeerRetirementEffect, PeerRetirementError, PeerRetirementPhase};
 mod retained_ingress;
 mod retained_dispatch;
 mod retained_work;
 mod reserved_receive;
 mod ingress_receiver;
+pub use ingress_receiver::{NestedExecutionError, NestedExecutionScope};
+pub use ingress_receiver::{CancelledStoppedCall, StoppedRouteError};
 mod reply_pool;
 mod ingress_resources;
 pub use ingress_resources::{IngressResources, IngressResourceKind, IngressResourcePhase, IngressResourceRecord, IngressResourceError};
 pub use reply_pool::{IngressReplyPool, ReplyAdmissionError, ReplyPoolError};
-pub use ingress_receiver::{CanonicalCompletionError, IngressReceiver, StartupFaultError, StartupReadyError, StoredCompletionError, StoredReplyError};
+pub use ingress_receiver::{BootstrapAdoptionError, CanonicalCompletionError, IngressReceiver, InterimAdoptionError, StartupFaultError, StartupReadyError, StoredCompletionError, StoredReplyError};
 pub use reserved_receive::{ReservedIngressReceive, ReservedReceiveError, ReservedReceivePhase};
 mod startup;
 pub use startup::StartupError;
@@ -245,6 +251,8 @@ pub enum LanePhase {
     StartupSchedulerDeleted,
     Idle,
     Running,
+    /// Execution lent to a nested provider; only its retained scope may restore this epoch.
+    NestedExecution(u64),
     Suspended,
     Terminal,
 }
@@ -274,6 +282,7 @@ struct Lane<C, R, T> {
     shared_peer: Option<peer_registry::PeerRoute>,
     phase: LanePhase,
     dispatch: Option<LaneDispatchIdentity>,
+    bootstrap_dispatch: Option<(LaneDispatchIdentity, u64)>,
     external_tokens: Vec<u64>,
     suspensions: ComponentSuspensionStack<C, R>,
     terminal: Option<terminal::TerminalRecord<T>>,
@@ -666,6 +675,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
                 shared_peer: None,
                 phase,
                 dispatch: None,
+                bootstrap_dispatch: None,
                 external_tokens: Vec::new(),
                 suspensions: ComponentSuspensionStack::new(self.max_depth_per_lane),
                 terminal: None,
@@ -694,6 +704,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
                 shared_peer: None,
                 phase,
                 dispatch: None,
+                bootstrap_dispatch: None,
                 external_tokens: Vec::new(),
                 suspensions: ComponentSuspensionStack::new(self.max_depth_per_lane),
                 terminal: None,

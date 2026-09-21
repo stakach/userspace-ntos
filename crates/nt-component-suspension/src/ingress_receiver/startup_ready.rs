@@ -30,10 +30,38 @@ impl IngressReceiver<crate::ReceivedMessage> {
         peers: &PeerRegistry,
         publication_slot: &mut Option<P>,
         decode: impl FnOnce([u64; 5]) -> Option<P>,
+        query: impl FnMut(u64, u64) -> Result<ReplyBindingObservation, E>,
+    ) -> Result<(), StartupReadyError<E>> {
+        self.ready_protocol_from_message(
+            route,
+            ready_reply,
+            label,
+            lanes,
+            peers,
+            publication_slot,
+            decode,
+            query,
+        )
+    }
+
+    /// Authenticate a provider-specific exact publication shape. The decoder must compare the
+    /// words with independently owned physical identity, never infer authority from the payload.
+    pub fn ready_protocol_from_message<const N: usize, C, R, T, P, E>(
+        &mut self,
+        route: PeerRoute,
+        ready_reply: u64,
+        label: u64,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        peers: &PeerRegistry,
+        publication_slot: &mut Option<P>,
+        decode: impl FnOnce([u64; N]) -> Option<P>,
         mut query: impl FnMut(u64, u64) -> Result<ReplyBindingObservation, E>,
     ) -> Result<(), StartupReadyError<E>> {
         if publication_slot.is_some() {
             return Err(StartupReadyError::AlreadyPublished);
+        }
+        if self.phase().is_some() {
+            return Err(StartupReadyError::WrongOwner);
         }
         lanes
             .validate_ingress_execution(IngressExecutionOwner::Startup(route))
@@ -66,15 +94,17 @@ impl IngressReceiver<crate::ReceivedMessage> {
             return Err(StartupReadyError::WrongOwner);
         }
         let message = call.message();
-        if label == 0
+        if N > 120
+            || label == 0
             || label > u64::MAX >> 12
             || message.badge() != route.badge()
-            || message.info() != (label << 12) | 5
+            || message.info() != (label << 12) | N as u64
         {
             return Err(StartupReadyError::InvalidMessage);
         }
-        let words =
-            core::array::from_fn(|index| message.word(index).expect("validated five-word message"));
+        let words = core::array::from_fn(|index| {
+            message.word(index).expect("validated exact message length")
+        });
         let publication = decode(words).ok_or(StartupReadyError::InvalidPublication)?;
         if query(binding.executor_id, binding.reply_object).map_err(StartupReadyError::Query)?
             != ReplyBindingObservation::Free

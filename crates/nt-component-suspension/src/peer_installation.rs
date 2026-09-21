@@ -13,6 +13,16 @@ mod tests;
 mod startup;
 pub use startup::PeerStartupError;
 
+#[path = "peer_bootstrap.rs"]
+mod bootstrap;
+
+#[path = "peer_autonomous.rs"]
+mod autonomous;
+
+#[path = "peer_retirement.rs"]
+mod retirement;
+pub use retirement::{PeerRetirementEffect, PeerRetirementError, PeerRetirementPhase};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerInstallationPhase {
     Reserved,
@@ -25,6 +35,8 @@ pub enum PeerInstallationPhase {
     SpaceBound,
     Resuming,
     ResumeAcknowledged,
+    Retiring(PeerRetirementPhase),
+    Retired,
     Deleting,
     Deleted,
     Aborted,

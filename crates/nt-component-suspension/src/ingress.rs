@@ -147,6 +147,15 @@ impl<M> ComponentIngress<M> {
         self.message.as_ref()
     }
 
+    /// Internal transport release only after exact Stop or restart ACK and a fresh Free proof.
+    /// This ends any Reply attempt; it never retries or claims acknowledgment of its effect.
+    pub(crate) fn into_unbound_parts(mut self) -> (Self, Option<M>) {
+        let message = self.message.take();
+        self.phase = Phase::Ready;
+        self.held_receive = 0;
+        (self, message)
+    }
+
     fn begin_receive(
         &mut self,
         counter: &AtomicU64,

@@ -5,9 +5,25 @@ type Lanes = ComponentSuspensionLanes<(), (), ()>;
 const LABEL: u64 = 123;
 const WORDS: [u64; 5] = [11, 22, 33, 44, 55];
 
+#[path = "startup_ready_protocol_tests.rs"]
+mod protocol_tests;
+
 fn setup(
     info: u64,
     wrong_badge: bool,
+) -> (
+    Lanes,
+    PeerRegistry,
+    PeerRoute,
+    IngressReceiver<ReceivedMessage>,
+) {
+    setup_with_capacity(info, wrong_badge, 1)
+}
+
+fn setup_with_capacity(
+    info: u64,
+    wrong_badge: bool,
+    capacity: usize,
 ) -> (
     Lanes,
     PeerRegistry,
@@ -32,7 +48,7 @@ fn setup(
     lanes
         .begin_startup(lane, 30, |_, _| Ok::<_, u8>(ReplyBindingObservation::Free))
         .unwrap();
-    let mut receiver = IngressReceiver::new(20, 40, 1).unwrap();
+    let mut receiver = IngressReceiver::new(20, 40, capacity).unwrap();
     receiver
         .begin_receive_for_owner(&lanes, IngressExecutionOwner::Startup(route))
         .unwrap();

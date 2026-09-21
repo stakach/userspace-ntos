@@ -3,6 +3,9 @@ use crate::{IpcBufferSnapshot, LaneBinding, ReceivedMessage};
 
 type Lanes = ComponentSuspensionLanes<(), (), ()>;
 
+#[path = "completion_protocol_tests.rs"]
+mod protocol_tests;
+
 fn message(badge: u64, info: u64) -> ReceivedMessage {
     ReceivedMessage::new(
         badge,
@@ -15,6 +18,20 @@ fn message(badge: u64, info: u64) -> ReceivedMessage {
 fn setup(
     info: u64,
     wrong_badge: bool,
+) -> (
+    Lanes,
+    PeerRegistry,
+    PeerRoute,
+    crate::LaneDispatchIdentity,
+    IngressReceiver<ReceivedMessage>,
+) {
+    setup_with_capacity(info, wrong_badge, 2)
+}
+
+fn setup_with_capacity(
+    info: u64,
+    wrong_badge: bool,
+    capacity: usize,
 ) -> (
     Lanes,
     PeerRegistry,
@@ -45,7 +62,7 @@ fn setup(
             Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)
         })
         .unwrap();
-    let mut owner = IngressReceiver::new(20, 40, 2).unwrap();
+    let mut owner = IngressReceiver::new(20, 40, capacity).unwrap();
     owner.begin_receive(&lanes).unwrap();
     owner
         .capture(message(route.badge(), 123 << 12))

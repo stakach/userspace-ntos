@@ -11,6 +11,9 @@ use nt_types::AccessMode;
 #[path = "provider_kernel_terminal_tests.rs"]
 mod terminal_completion;
 
+#[path = "provider_kernel_shared_completion_tests.rs"]
+mod shared_completion;
+
 #[path = "provider_kernel_recipient_tests.rs"]
 mod recipient_completion;
 
@@ -96,7 +99,7 @@ fn capture_requires_exact_running_provider_and_duplicate_capture_is_atomic() {
         .capture(&mut parts.pm, &catalog, &lanes, provider, lane, native)
         .unwrap();
     let dispatch = lanes.active_dispatch_identity(lane).unwrap().unwrap();
-    assert_eq!(caller.binding(), binding(1));
+    assert_eq!(caller.current_binding(&lanes), Ok(binding(1)));
     assert_eq!(caller.owner().dispatch_id, dispatch.epoch());
     assert_eq!(caller.owner().caller, SuspensionCaller::Kernel { lane });
     assert_eq!(references(&parts.pm, caller.thread()), (1, 1));
@@ -407,7 +410,10 @@ fn foreign_table_copies_cannot_validate_or_release_an_identical_physical_job() {
         .unwrap();
     assert_eq!(first.owner(), second.owner());
     assert_eq!(first.thread(), second.thread());
-    assert_eq!(first.binding(), second.binding());
+    assert_eq!(
+        first.current_binding(&lanes),
+        second.current_binding(&lanes)
+    );
     assert_ne!(first, second);
     assert_eq!(references(&parts.pm, first.thread()), (2, 2));
     assert_eq!(

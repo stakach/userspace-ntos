@@ -12087,7 +12087,7 @@ impl ExecNtHandler {
     /// Park the thread that just reported a debug event for hosted process `pi` on the event it
     /// queued, so it does **not** return from its fault/syscall until `NtDebugContinue` resolves it
     /// (`dbgk_wake_target`). The park itself is the ordinary reply-capability steal
-    /// ([`dbgk_reporter_park`]); the stolen capability is recorded ON THE `DEBUG_EVENT`
+    /// is committed only after the capability is recorded ON THE `DEBUG_EVENT`
     /// ([`nt_process::dbgk::ReporterBlock`]) — where NT keeps the waiting reporter.
     ///
     /// `kind` is the fault flavour that says which reply shape resumes it (`DBGK_BLOCK_*`);
@@ -12128,43 +12128,37 @@ impl ExecNtHandler {
             unique_process: pid,
             unique_thread: tid,
         };
-        let parked = if reply_cap != 0 {
-            let block = nt_process::dbgk::ReporterBlock {
-                kind,
-                reply_cap,
-                pi: pi as u32,
-                tid: tid as u64,
-                badge,
-                resume_ip,
-                resume_sp,
-                resume_flags,
-                resume_status,
+        let park = if reply_cap == 0 {
+            let Some(park) = root_reply_park::RootReplyPark::prepare() else {
+                return false;
             };
-            DBGK_REPORTERS_BLOCKED.fetch_add(1, Ordering::Relaxed);
-            block.is_blocked().then_some(block)
+            Some(park)
         } else {
-            dbgk_reporter_park(
-                kind,
-                pi,
-                tid as u64,
-                badge,
-                resume_ip,
-                resume_sp,
-                resume_flags,
-                resume_status,
-            )
+            None
         };
-        let Some(block) = parked else {
+        let block = nt_process::dbgk::ReporterBlock {
+            kind,
+            reply_cap: if reply_cap == 0 {
+                REPLY_MAIN_SLOT.load(Ordering::Relaxed)
+            } else {
+                reply_cap
+            },
+            pi: pi as u32,
+            tid: tid as u64,
+            badge,
+            resume_ip,
+            resume_sp,
+            resume_flags,
+            resume_status,
+        };
+        if !block.is_blocked() || !self.pm.block_reporter(object, client_id, block) {
             return false;
-        };
-        if self.pm.block_reporter(object, client_id, block) {
-            return true;
         }
-        // Nothing eligible took the block (no non-NOWAIT event queued for this client). Recycle the
-        // stolen Reply object and let the caller's own handling proceed — the reporter is left
-        // blocked exactly as `park_and_log!`'s recv-without-reply would leave it.
-        dbgk_reporter_abandon(&block);
-        false
+        if let Some(park) = park {
+            park.commit();
+        }
+        DBGK_REPORTERS_BLOCKED.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// `DbgkpWakeTarget` — apply a continue status to the reporter blocked on a resolved event.

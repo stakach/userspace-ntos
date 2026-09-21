@@ -808,7 +808,18 @@ impl HostedIrqRootSession {
         lane_index: usize,
         reply: nt_hosted_runtime::HostedIrqArenaToken,
     ) -> Result<crate::spawn_hosts::HostedIrqExchangeMessage, nt_status::NtStatus> {
-        let lane = self.lane(lane_index)?;
+        let retained = self.lane(lane_index)?;
+        let lane = lane_view_for_domain(
+            retained.projection_instance,
+            HostedDomainIdentity {
+                domain_id: nt_io_manager::HostedDomainId(retained.identity.domain_id),
+                cookie: retained.identity.domain_cookie,
+            },
+            retained.identity.lane_generation,
+        )?;
+        if lane.channel.tcb != retained.channel.tcb || lane.arena_va != retained.arena_va {
+            return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+        }
         let result = crate::spawn_hosts::component_hosted_irq_exchange(
             &lane.channel,
             crate::spawn_hosts::HostedIrqExchangeAction::ReplyToken {
@@ -818,7 +829,15 @@ impl HostedIrqRootSession {
             lane.badge,
             FSD_IRQ_LANE_COMPLETION_LABEL,
         );
-        if result.reply_cap != lane.channel.reply_cap
+        let current_reply = lane_view_for_domain(
+            lane.projection_instance,
+            HostedDomainIdentity {
+                domain_id: nt_io_manager::HostedDomainId(lane.identity.domain_id),
+                cookie: lane.identity.domain_cookie,
+            },
+            lane.identity.lane_generation,
+        ).map(|current| current.channel.reply_cap);
+        if current_reply != Ok(result.reply_cap)
             || result.message == crate::spawn_hosts::HostedIrqExchangeMessage::Wall
         {
             print_str(b"[hosted-irq-arena-fault] domain=");

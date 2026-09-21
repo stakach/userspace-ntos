@@ -12,6 +12,7 @@ struct Fixture {
     lanes: Lanes,
     activations: KernelProviderActivations,
     caller: KernelProviderCaller,
+    received_envelope: KernelProviderServiceEnvelope,
 }
 
 impl Fixture {
@@ -27,6 +28,11 @@ impl Fixture {
         let caller = activations
             .capture(&mut pm, &catalog, &lanes, provider, lane, native)
             .unwrap();
+        let received_envelope = KernelProviderServiceEnvelope {
+            badge: 0,
+            message_info: MESSAGE_INFO,
+            reply_cap: caller.current_binding(&lanes).unwrap().reply_object,
+        };
         Self {
             pm,
             catalog,
@@ -34,15 +40,12 @@ impl Fixture {
             lanes,
             activations,
             caller,
+            received_envelope,
         }
     }
 
     fn envelope(&self) -> KernelProviderServiceEnvelope {
-        KernelProviderServiceEnvelope {
-            badge: 0,
-            message_info: MESSAGE_INFO,
-            reply_cap: self.caller.binding.reply_object,
-        }
+        self.received_envelope
     }
 
     fn validate(&self, envelope: KernelProviderServiceEnvelope) -> Result<(), u32> {
@@ -149,7 +152,7 @@ fn valid_envelope_does_not_replace_foreign_manager_catalog_lane_or_caller_author
         );
     }
     let mut forged = f.caller;
-    forged.binding.executor_id += 1;
+    forged.executor_id += 1;
     assert_eq!(
         f.activations.validate_service_call(
             forged,
@@ -169,7 +172,7 @@ fn valid_envelope_does_not_replace_foreign_manager_catalog_lane_or_caller_author
 fn suspended_or_replaced_dispatch_refuses_service_without_resuming_stack() {
     let mut f = Fixture::new();
     let lane = f.caller.dispatch.lane();
-    let reply = f.caller.binding.reply_object;
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
     f.lanes.suspend_running(lane, reply, 91).unwrap();
     assert_eq!(f.validate(f.envelope()), Err(STATUS_INVALID_HANDLE));
     assert_eq!(f.lanes.phase(lane), Ok(LanePhase::Suspended));

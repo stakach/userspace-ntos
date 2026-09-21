@@ -52,11 +52,13 @@ mod dispatcher_signal;
 mod file_reference_retirement;
 mod hosted_termination;
 mod parked_reply;
+mod root_reply_park;
 mod pending_file_caller;
 mod pending_file_apc;
 mod current_apc;
 mod user_apc;
 mod ipc_message;
+mod executive_ingress;
 mod executive_va;
 mod fs_loader;
 mod mounted_volume;
@@ -101,6 +103,7 @@ pub(crate) use hosted_pnp_context::*;
 mod hosted_pnp_start;
 pub(crate) use hosted_pnp_start::*;
 mod selftests;
+mod shared_ingress_selftest;
 pub(crate) use selftests::*;
 mod img_spawn;
 mod temporary_frame_alias;
@@ -2257,67 +2260,10 @@ static SYSTEM_PROCESSOR_COUNT: AtomicU64 = AtomicU64::new(1);
 /// mid-servicing a csrss syscall, the fault Call clobbers `reply_to` from csrss -> win32k and
 /// csrss's pending reply is orphaned. Binding each channel's caller to its OWN `Cap::Reply`
 /// (recv-with-r12 + Send-on-reply-cap / decode_reply) resumes exactly that caller regardless of
-/// `reply_to`. REPLY_MAIN backs the main service loop (csrss/smss); REPLY_W32 backs win32k's
-/// demand-page faults during a dispatch. cptr 0 = "not yet retyped" (legacy reply_to fallback).
+/// `reply_to`. REPLY_MAIN identifies the currently delivered hosted Call; shared ingress owns
+/// component Replies and rotates them independently. Zero means no hosted Call is delivered.
 static REPLY_MAIN_SLOT: AtomicU64 = AtomicU64::new(0);
-static REPLY_W32_SLOT: AtomicU64 = AtomicU64::new(0);
 static REPLY_TRANSPORT_PROBE_SLOT: AtomicU64 = AtomicU64::new(0);
-
-/// ★ COMPONENT-DISPATCH TRANSPORT (`docs/transport-migration.md`): active MCS reply object per
-/// launched Family-A IRP driver instance. These back the `Call`(component) to `reply_on`
-/// (executive) transport that replaces the hand-rolled Send/Recv dispatch pair.
-///
-/// FSD reply objects stay separate from the hosted-user `WAIT_REPLY_POOL`. Driver dispatch and
-/// immediate component-service calls reuse the instance's active reply object; hosted driver waits
-/// that need to park a worker must rotate through a driver-owned reply pool instead of stealing from
-/// the user-process wait/pipe/dbgk/iocp pool.
-static mut REPLY_FSD_SLOTS: Option<Vec<u64>> = None;
-
-/// The dedicated reply object backing driver instance `i`'s dispatch transport (0 = none).
-#[allow(dead_code)] // Phase 0: additive, wired in Phase 1.
-pub(crate) fn fsd_reply_slot(i: usize) -> u64 {
-    unsafe {
-        (*core::ptr::addr_of!(REPLY_FSD_SLOTS))
-            .as_ref()
-            .and_then(|slots| slots.get(i).copied())
-            .unwrap_or(0)
-    }
-}
-
-unsafe fn fsd_reply_slots_mut() -> &'static mut Vec<u64> {
-    let slot = &mut *core::ptr::addr_of_mut!(REPLY_FSD_SLOTS);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    slot.as_mut().unwrap()
-}
-
-pub(crate) fn ensure_fsd_reply_slot(i: usize) -> u64 {
-    unsafe {
-        let slots = fsd_reply_slots_mut();
-        while slots.len() <= i {
-            slots.push(0);
-        }
-        if slots[i] == 0 {
-            let rf = alloc_slot();
-            if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rf) != 0 || rf == 0 {
-                return 0;
-            }
-            slots[i] = rf;
-        }
-        slots[i]
-    }
-}
-
-pub(crate) fn replace_fsd_reply_slot(i: usize, reply_cap: u64) {
-    unsafe {
-        let slots = fsd_reply_slots_mut();
-        while slots.len() <= i {
-            slots.push(0);
-        }
-        slots[i] = reply_cap;
-    }
-}
 
 /// ═══ Checkpoint B: real reply-cap parking for NtWaitForSingleObject on unsignaled events ═══
 /// A parked waiter = a hosted thread that issued `NtWaitForSingleObject` on an event whose
@@ -13066,7 +13012,7 @@ unsafe fn copy_cap(src: u64) -> u64 {
 /// Mint an endpoint capability with a badge outside the bound-notification namespace.
 /// The caller supplies a known endpoint source; failed minting never publishes a destination.
 unsafe fn mint_badged(src: u64, badge: u64) -> Result<u64, u32> {
-    if src <= 1 || !nt_component_suspension::badge::valid_endpoint_badge(badge) {
+    if src <= 1 || !nt_component_suspension::badge::valid_hosted_badge(badge) {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
     let d = try_alloc_slot().ok_or(nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
@@ -13401,6 +13347,9 @@ unsafe fn tcb_write_registers_r(target: u64, rip: u64, rsp: u64, arg0: u64) -> u
     reply >> 12
 }
 unsafe fn tcb_resume_r(target: u64) -> u64 {
+    if !spawn_hosts::shared_ingress::owner::runtime::hosted_can_resume(target) {
+        return u64::MAX;
+    }
     let reply: u64;
     core::arch::asm!(
         "syscall",
@@ -14274,6 +14223,16 @@ pub(crate) unsafe fn map_demand_scratch_pts(base: u64) {
 const LBL_TCB_SUSPEND: u64 = 12;
 const LBL_CNODE_DELETE: u64 = 23;
 unsafe fn tcb_suspend_r(tcb: u64) -> u64 {
+    match spawn_hosts::shared_ingress::owner::runtime::stop_hosted_caller(
+        tcb, || tcb_suspend_raw_r(tcb),
+    ) {
+        Some(Ok(())) => 0,
+        Some(Err(_)) => u64::MAX,
+        None => tcb_suspend_raw_r(tcb),
+    }
+}
+
+unsafe fn tcb_suspend_raw_r(tcb: u64) -> u64 {
     let reply: u64;
     core::arch::asm!(
         "syscall",
@@ -14295,6 +14254,11 @@ unsafe fn tcb_suspend_r(tcb: u64) -> u64 {
 /// WORD_BITS, which resolves a direct root-CNode slot). Returns the error label (0 = success).
 #[track_caller]
 unsafe fn cnode_delete_r(idx: u64) -> u64 {
+    // A shared hosted Call owns its Reply until acknowledged reply or recorded-stop cancellation.
+    // Legacy wait cleanup must not delete/retype that capability behind the ingress owner.
+    if spawn_hosts::shared_ingress::owner::runtime::owns_ingress_reply(idx) {
+        return u64::MAX;
+    }
     if root_slot_is_pinned(idx) {
         let caller = core::panic::Location::caller();
         ROOT_SLOT_PIN_DELETE_REFUSALS.fetch_add(1, Ordering::Relaxed);
@@ -15940,6 +15904,9 @@ unsafe fn reply_recv_badge(
 /// faulting dispatch can't orphan an outer caller's pending reply. The kernel preserves the user's
 /// r12 across the syscall (it reads it, never writes it), so `in` is sufficient.
 unsafe fn recv_full_r12(ep: u64, reply_cptr: u64) -> (u64, u64, u64, u64, u64, u64) {
+    if executive_ingress::handles(ep) {
+        return executive_ingress::receive(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+    }
     let message = recv_owned_r12(ep, reply_cptr);
     // recv_owned_r12's bookkeeping is memory-only; the live buffer remains this receive's buffer.
     let [mr0, mr1, mr2, mr3] = message.registers();
@@ -15989,9 +15956,8 @@ unsafe fn recv_owned_r12(ep: u64, reply_cptr: u64) -> nt_component_suspension::R
     message
 }
 
-/// Reply through a caller-bound Reply cap and receive the next executive event in one kernel entry.
-/// This is the bound-reply replacement for legacy `ReplyRecv`: r13 names the Reply cap consumed by
-/// the send half, and r12 offers the same Reply cap to the receive half for the next client `Call`.
+/// Unified ingress separates acknowledged reply from owned receive. Isolated diagnostic endpoints
+/// retain their combined transport: r13 consumes the bound Reply and r12 offers it for receive.
 unsafe fn client_reply_recv_badge(
     recv_ep: u64,
     reply_cptr: u64,
@@ -16001,6 +15967,9 @@ unsafe fn client_reply_recv_badge(
     r2: u64,
     r3: u64,
 ) -> (u64, u64, u64, u64, u64, u64) {
+    if executive_ingress::handles(recv_ep) {
+        return executive_ingress::reply_receive(reply_cptr, reply_len, r0, r1, r2, r3);
+    }
     let recv_started = disk_census_ticks();
     let badge: u64;
     let msginfo: u64;
@@ -16057,9 +16026,8 @@ unsafe fn client_reply_recv_badge(
 /// instead of vanishing. `SYS_SEND`'s error-swallowing predecessor (`send_on_reply`) is DELETED —
 /// kill-list item 3, the last of the 34.
 ///
-/// Two wrappers add the bookkeeping their plane needs: [`client_reply_on`] (hosted clients) and
-/// `spawn_hosts::pump_reply_on` (components). Nothing else calls this directly except the
-/// deliberately-unbound negative-control probe in the gate.
+/// Hosted clients use [`client_reply_on`]; shared component/hosted ingress invokes this only
+/// through retained Reply ownership. The gate also issues a deliberately-unbound negative control.
 unsafe fn reply_on(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64, r3: u64) -> u64 {
     let reply: u64;
     core::arch::asm!(
@@ -16104,6 +16072,19 @@ unsafe fn client_reply_on(
     r2: u64,
     r3: u64,
 ) -> bool {
+    if spawn_hosts::shared_ingress::owner::runtime::owns_hosted_reply(reply_cptr) {
+        let delivered = spawn_hosts::shared_ingress::owner::runtime::reply_hosted(
+            reply_cptr, msginfo, [r0, r1, r2, r3],
+        ).is_ok();
+        CLIENT_REPLY_BOUND.fetch_add(1, Ordering::Relaxed);
+        if !delivered { CLIENT_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed); }
+        return delivered;
+    }
+    if spawn_hosts::shared_ingress::owner::runtime::owns_ingress_reply(reply_cptr) {
+        // A stale legacy snapshot cannot send through a pooled or component-owned Reply.
+        CLIENT_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
     let label = reply_on(reply_cptr, msginfo, r0, r1, r2, r3);
     CLIENT_REPLY_BOUND.fetch_add(1, Ordering::Relaxed);
     if label != 0 && CLIENT_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -16428,7 +16409,8 @@ fn wait_reply_pool_find_free() -> Option<(usize, u64)> {
         if let Some((index, record)) = pool
             .iter()
             .enumerate()
-            .find(|(_, record)| record.cap != 0 && !record.used)
+            .find(|(_, record)| record.cap != 0 && !record.used
+                && !spawn_hosts::shared_ingress::owner::runtime::owns_ingress_reply(record.cap))
         {
             return Some((index, record.cap));
         }
@@ -16437,10 +16419,7 @@ fn wait_reply_pool_find_free() -> Option<(usize, u64)> {
 }
 
 fn wait_reply_pool_has_free() -> bool {
-    if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 {
-        return false;
-    }
-    wait_reply_pool_find_free().is_some()
+    unsafe { root_reply_park::RootReplyPark::prepare().is_some() }
 }
 
 fn wait_reply_pool_find_cap(cap: u64) -> Option<usize> {
@@ -16521,9 +16500,32 @@ fn wait_reply_pool_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
 }
 
 fn release_reply_pool_cap(cap: u64) {
+    if unsafe { spawn_hosts::shared_ingress::owner::runtime::owns_hosted_reply(cap) } {
+        // Memory-only semantic release. The shared owner keeps this legacy slot unavailable
+        // until its later checked pool transfer; uncertain Calls cannot pass this gate.
+        unsafe { spawn_hosts::shared_ingress::owner::runtime::release_hosted_reply(cap) }
+            .expect("semantic Reply owner must retain uncertain transport completion");
+        return;
+    }
+    if unsafe { spawn_hosts::shared_ingress::owner::runtime::owns_ingress_reply(cap) } {
+        panic!("legacy pool cannot release a component ingress Reply");
+    }
     if let Some(index) = wait_reply_pool_find_cap(cap) {
         wait_reply_pool_mark_free(index);
     }
+}
+
+/// Complete transport cancellation only after its exact shared owner recorded physical stop.
+/// Private legacy Replies retain their delete/retype path; shared owners are never deleted.
+unsafe fn cancel_parked_reply_transport(cap: u64) -> bool {
+    if spawn_hosts::shared_ingress::owner::runtime::owns_hosted_reply(cap) {
+        return spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(cap);
+    }
+    if spawn_hosts::shared_ingress::owner::runtime::owns_ingress_reply(cap) {
+        return false;
+    }
+    cnode_delete_r(cap) == 0
+        && untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap) == 0
 }
 
 unsafe fn ensure_executive_event_notification_bound(
@@ -16793,7 +16795,7 @@ unsafe fn delay_park(
     if reply_cap == 0 || !delay_timer_init() {
         return false;
     }
-    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
         return false;
     };
     let waiter = nt_delay_execution::Waiter {
@@ -16806,8 +16808,7 @@ unsafe fn delay_park(
     if queue.insert(waiter).is_err() {
         return false;
     }
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    reply_park.commit();
     DELAY_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
     thread_wait_state_mark_badge_waiting(handler, badge);
     let now = nt_time_snapshot();
@@ -17291,23 +17292,16 @@ unsafe fn delay_cancel_thread(
 ) {
     while let Some(waiter) = queue.pop_thread(thread_id) {
         let cap = waiter.reply_cap;
-        let deleted = cnode_delete_r(cap);
-        let retyped = if deleted == 0 {
-            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
-        } else {
-            u64::MAX
-        };
-        if deleted == 0 && retyped == 0 {
+        let cancelled = cancel_parked_reply_transport(cap);
+        if cancelled {
             release_reply_pool_cap(cap);
         }
         print_str(b"[delay] CANCEL tid=");
         print_u64(thread_id);
         print_str(b" reply=0x");
         print_hex_u64(cap);
-        print_str(b" delete=");
-        print_u64(deleted);
-        print_str(b" retype=");
-        print_u64(retyped);
+        print_str(b" cancelled=");
+        print_u64(cancelled as u64);
         print_str(b"\n");
     }
     delay_timer_rearm(queue, handler);
@@ -17318,13 +17312,8 @@ unsafe fn io_completion_cancel_thread(handler: &mut ExecNtHandler, thread_id: u6
         unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_thread(thread_id) }
     {
         let cap = waiter.reply_cap;
-        let deleted = cnode_delete_r(cap);
-        let retyped = if deleted == 0 {
-            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
-        } else {
-            u64::MAX
-        };
-        if deleted == 0 && retyped == 0 {
+        let cancelled = cancel_parked_reply_transport(cap);
+        if cancelled {
             release_reply_pool_cap(cap);
         }
         thread_wait_state_clear_badge(waiter.badge);
@@ -17337,13 +17326,8 @@ unsafe fn io_completion_cancel_process(handler: &mut ExecNtHandler, process_inde
         unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_process(process_index) }
     {
         let cap = waiter.reply_cap;
-        let deleted = cnode_delete_r(cap);
-        let retyped = if deleted == 0 {
-            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
-        } else {
-            u64::MAX
-        };
-        if deleted == 0 && retyped == 0 {
+        let cancelled = cancel_parked_reply_transport(cap);
+        if cancelled {
             release_reply_pool_cap(cap);
         }
         thread_wait_state_clear_badge(waiter.badge);
@@ -17385,51 +17369,6 @@ unsafe fn wait_cancel_thread(handler: &mut ExecNtHandler, tid: u64) {
     thread_wait_state_clear_tid(handler, tid);
 }
 
-/// ═══ Dbgk TARGET-SIDE BLOCKING: park / resume / abandon a REPORTING thread ═══════════════════
-///
-/// `DbgkpQueueMessage` blocks the thread that reported a debug event on the event's `ContinueEvent`
-/// until `NtDebugContinue` runs `DbgkpWakeTarget`. Our reporting thread is blocked in-kernel on the
-/// Call that delivered its fault/syscall, so "park" is the SAME reply-capability steal every other
-/// wait uses (`wait_park` / `keyed_wait_park` / pending File I/O): take the Reply object the last
-/// recv bound to this caller and rotate a fresh pool object into `REPLY_MAIN_SLOT` so the loop's
-/// next recv binds a NEW one. The stolen capability rides on the `DEBUG_EVENT` itself
-/// ([`nt_process::dbgk::ReporterBlock`]) — exactly where NT keeps the waiting reporter.
-///
-/// Returns `None` (⇒ the caller must NOT block: it falls back to post-and-continue) when there is no
-/// active reply object or the pool is exhausted. Never a hang.
-#[allow(clippy::too_many_arguments)]
-unsafe fn dbgk_reporter_park(
-    kind: u8,
-    pi: usize,
-    tid: u64,
-    badge: u64,
-    resume_ip: u64,
-    sp: u64,
-    flags: u64,
-    resume_status: u64,
-) -> Option<nt_process::dbgk::ReporterBlock> {
-    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    if stolen == 0 {
-        return None;
-    }
-    let (fresh_index, fresh) = wait_reply_pool_find_free()?;
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
-    let block = nt_process::dbgk::ReporterBlock {
-        kind,
-        reply_cap: stolen,
-        pi: pi as u32,
-        tid,
-        badge,
-        resume_ip,
-        resume_sp: sp,
-        resume_flags: flags,
-        resume_status,
-    };
-    DBGK_REPORTERS_BLOCKED.fetch_add(1, Ordering::Relaxed);
-    block.is_blocked().then_some(block)
-}
-
 /// `DbgkpWakeTarget`'s RESUME half: reply to the blocked reporter so it CONTINUES EXECUTION.
 ///
 /// ★ The reply SHAPE is per fault flavour — this is the whole reason target-side blocking needed its
@@ -17449,9 +17388,9 @@ unsafe fn dbgk_reporter_resume(
     if !block.is_blocked() {
         return false;
     }
-    match block.kind {
+    let acknowledged = match block.kind {
         DBGK_BLOCK_SYSCALL => {
-            reply_parked_syscall(block.reply_cap, block.resume_status);
+            reply_parked_syscall(block.reply_cap, block.resume_status)
         }
         DBGK_BLOCK_USER_EXCEPTION => {
             client_reply_on(
@@ -17461,13 +17400,14 @@ unsafe fn dbgk_reporter_resume(
                 block.resume_sp,
                 block.resume_flags,
                 0,
-            );
+            )
         }
         // VMFault / DebugException: restart with no register transfer.
         _ => {
-            client_reply_on(block.reply_cap, 0, 0, 0, 0, 0);
+            client_reply_on(block.reply_cap, 0, 0, 0, 0, 0)
         }
-    }
+    };
+    assert!(acknowledged, "debugger reporter retains uncertain Reply completion");
     release_reply_pool_cap(block.reply_cap);
     thread_wait_state_clear_badge_ready(handler, block.badge);
     DBGK_REPORTERS_RESUMED.fetch_add(1, Ordering::Relaxed);
@@ -17477,23 +17417,19 @@ unsafe fn dbgk_reporter_resume(
 /// `DbgkpWakeTarget`'s NON-resuming half: the reporter is never woken (`DBG_EXCEPTION_NOT_HANDLED`
 /// at a fault ⇒ the fault site's own unrecoverable handling stands; `DBG_TERMINATE_*` ⇒ the thread
 /// is dead; a teardown release ⇒ the fault was unrecoverable anyway). The thread stays blocked
-/// in-kernel exactly as `park_and_log!`'s recv-without-reply leaves it.
-///
-/// The Reply object is RECYCLED (delete → re-retype gives a fresh UNBOUND one) so a run of abandoned
-/// reporters can never drain the reply pool — the same discipline `wait_cancel_thread` uses.
+/// after acknowledged containment. Shared ingress retains the Reply until semantic release;
+/// private debugger fixtures use their owned delete/retype path.
 unsafe fn dbgk_reporter_abandon(block: &nt_process::dbgk::ReporterBlock) -> bool {
     if block.reply_cap == 0 {
         return false;
     }
-    let deleted = cnode_delete_r(block.reply_cap);
-    let retyped = if deleted == 0 {
-        untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, block.reply_cap)
-    } else {
-        u64::MAX
-    };
-    if deleted == 0 && retyped == 0 {
-        release_reply_pool_cap(block.reply_cap);
+    if spawn_hosts::shared_ingress::owner::runtime::owns_hosted_reply(block.reply_cap) {
+        spawn_hosts::shared_ingress::owner::runtime::stop_and_cancel_hosted(block.reply_cap)
+            .expect("debugger containment retains uncertain Stop or cancellation");
+    } else if !cancel_parked_reply_transport(block.reply_cap) {
+        return false;
     }
+    release_reply_pool_cap(block.reply_cap);
     true
 }
 
@@ -17565,7 +17501,7 @@ unsafe fn keyed_wait_park(
     if stolen == 0 {
         return false;
     }
-    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
         return false;
     };
 
@@ -17577,8 +17513,7 @@ unsafe fn keyed_wait_park(
     }) {
         return false;
     }
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    reply_park.commit();
     KEYED_WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
     true
 }
@@ -17622,7 +17557,7 @@ unsafe fn keyed_release_wait_park(
     if stolen == 0 {
         return false;
     }
-    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
         return false;
     };
 
@@ -17634,8 +17569,7 @@ unsafe fn keyed_release_wait_park(
     }) {
         return false;
     }
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    reply_park.commit();
     KEYED_RELEASE_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
     true
 }
@@ -17714,13 +17648,7 @@ unsafe fn keyed_wait_cancel_thread(handler: &ExecNtHandler, tid: u64) {
         }
         let cap = record.reply_cap;
         if cap != 0 {
-            let deleted = cnode_delete_r(cap);
-            let retyped = if deleted == 0 {
-                untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
-            } else {
-                u64::MAX
-            };
-            if deleted == 0 && retyped == 0 {
+            if cancel_parked_reply_transport(cap) {
                 release_reply_pool_cap(cap);
             }
         }
@@ -17739,13 +17667,7 @@ unsafe fn keyed_release_wait_cancel_thread(handler: &ExecNtHandler, tid: u64) {
         }
         let cap = record.reply_cap;
         if cap != 0 {
-            let deleted = cnode_delete_r(cap);
-            let retyped = if deleted == 0 {
-                untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
-            } else {
-                u64::MAX
-            };
-            if deleted == 0 && retyped == 0 {
+            if cancel_parked_reply_transport(cap) {
                 release_reply_pool_cap(cap);
             }
         }
@@ -17754,15 +17676,18 @@ unsafe fn keyed_release_wait_cancel_thread(handler: &ExecNtHandler, tid: u64) {
     thread_wait_state_clear_tid(handler, tid);
 }
 
-/// Consume the Reply object bound to the current hosted fault/native Call without sending, then
-/// rotate a fresh pool object into `REPLY_MAIN_SLOT`. Deleting the bound object clears the only
-/// capability that can resume this Call; the caller remains blocked until its TCB is destroyed.
-/// The vacated cptr is retyped as an unbound Reply, or removed from the pool if retype fails.
+/// Contain the current hosted fault/native Call without replying. Shared ingress records Stop
+/// acknowledgement and cancellation before semantic release; only private bootstrap Replies
+/// use the legacy delete/retype rotation below.
 /// Never call for bound notifications: they do not bind the receive's offered Reply object.
 unsafe fn drop_current_hosted_reply() -> bool {
     let active = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if active == 0 {
         return false;
+    }
+    if spawn_hosts::shared_ingress::owner::runtime::owns_hosted_reply(active) {
+        return spawn_hosts::shared_ingress::owner::runtime::stop_and_cancel_hosted(active).is_ok()
+            && spawn_hosts::shared_ingress::owner::runtime::release_hosted_reply(active).is_ok();
     }
     let active_index = wait_reply_pool_find_cap(active);
     let fresh = wait_reply_pool_find_free();
@@ -18217,6 +18142,13 @@ unsafe fn terminate_hosted_thread_mechanism(
         None => return false,
         Some(_) => return false,
     };
+    // Seal physical cancellation before any parked owner redrives its revoke/retype stages.
+    // Shared Reply cleanup consumes this stop ACK, never a numeric capability deletion.
+    if tcb_suspend_r(tcb) != 0
+        || spawn_hosts::shared_ingress::owner::runtime::cancel_hosted_caller(tcb).is_err()
+    {
+        return false;
+    }
     crate::service_sec_image::synchronous_file_cancellation::request_thread(handler, tid);
     object_wait_apc::request_thread(handler, tid);
     object_wait_reply::request_thread(handler, tid);
@@ -18276,7 +18208,8 @@ unsafe fn terminate_hosted_thread_mechanism(
     {
         return false;
     }
-    let suspend = tcb_suspend_r(tcb);
+    // The stop above already acknowledged; no second Suspend after cancellation erased its owner.
+    let suspend = 0;
     let stack_release = if suspend == 0 {
         match handler.capture_hosted_thread_stack_release(tid, tcb) {
             Ok(request) => request,
@@ -18339,6 +18272,32 @@ unsafe fn terminate_hosted_process_mechanisms(
     };
     if handler.pm.has_process_suspend_control(pid) {
         return 0;
+    }
+    // Process-wide cancellation can redrive before the per-thread teardown loop. Seal every
+    // target's transport first so its semantic owner can consume a real cancellation receipt.
+    // A refusal leaves all semantic rows intact for the next teardown attempt.
+    let thread_count = handler.pm.process(pid)
+        .map_or(0, |process| process.threads.len());
+    for index in 0..thread_count {
+        let Some(tid) = handler.pm.process(pid)
+            .and_then(|process| process.threads.get(index))
+            .copied()
+            .map(u64::from)
+        else {
+            continue;
+        };
+        if preserve_tid == Some(tid) {
+            continue;
+        }
+        let Some(tcb) = handler.hosted_thread_tcb(tid).filter(|tcb| *tcb > 1) else {
+            continue;
+        };
+        if handler.pm.has_thread_suspend_control(tid as nt_process::ThreadId)
+            || tcb_suspend_r(tcb) != 0
+            || spawn_hosts::shared_ingress::owner::runtime::cancel_hosted_caller(tcb).is_err()
+        {
+            return 0;
+        }
     }
     // Mark every target before any cancellation wake or provider callout can reenter. Preserved
     // callers keep their own continuation and are cancelled by their separate thread teardown.
@@ -18468,9 +18427,9 @@ unsafe fn wait_park_multi(
         WAIT_PARK_NO_REPLY_CAP.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    // Find a FREE pool object to become the new active REPLY_MAIN. The stolen one is (still) marked
-    // used; we need a different free bit.
-    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
+    // Reserve the root-pointer transition. Shared ingress needs no replacement Reply;
+    // the stolen Call remains marked used until semantic retirement.
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
         WAIT_PARK_NO_REPLY_CAP.fetch_add(1, Ordering::Relaxed);
         return false; // pool exhausted → caller reports STATUS_INSUFFICIENT_RESOURCES
     };
@@ -18495,8 +18454,7 @@ unsafe fn wait_park_multi(
         event_leases[retained] = lease;
         retained += 1;
     }
-    // Commit: record the waiter's object set + its syscall resume context, install the fresh object as
-    // the active recv reply cap.
+    // Publish the semantic waiter before removing the Call from the current root slot.
     if !object_waiter_park(ObjectWaiterRecord::new(
         caller,
         next_dispatcher_wait_sequence(),
@@ -18520,8 +18478,7 @@ unsafe fn wait_park_multi(
         WAIT_PARK_NO_WAITER_SLOT.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    reply_park.commit();
     WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
     true
 }
@@ -27826,13 +27783,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // per-TCB `reply_to` slot, so a nested win32k fault no longer orphans csrss's reply.
     let rm = alloc_slot();
     let e_rm = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rm);
-    let rw = alloc_slot();
-    let e_rw = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rw);
     if e_rm == 0 {
         REPLY_MAIN_SLOT.store(rm, Ordering::Relaxed);
-    }
-    if e_rw == 0 {
-        REPLY_W32_SLOT.store(rw, Ordering::Relaxed);
     }
     // Dedicated negative-control reply object for transport gates. It is never registered in a
     // `recv`, so `reply_on` must fail with seL4_InvalidCapability without blocking.
@@ -27851,15 +27803,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_hex(REPLY_MAIN_SLOT.load(Ordering::Relaxed) as u32);
     print_str(b" (retype e=0x");
     print_hex(e_rm as u32);
-    print_str(b") REPLY_W32 cptr=0x");
-    print_hex(REPLY_W32_SLOT.load(Ordering::Relaxed) as u32);
-    print_str(b" (retype e=0x");
-    print_hex(e_rw as u32);
     print_str(b") REPLY_PROBE cptr=0x");
     print_hex(REPLY_TRANSPORT_PROBE_SLOT.load(Ordering::Relaxed) as u32);
     print_str(b" (retype e=0x");
     print_hex(e_rprobe as u32);
-    print_str(b") REPLY_FSD dynamic=1\n");
+    print_str(b") component Replies owned by shared ingress\n");
 
     print_str(
         b"[ntos-exec] NT executive core: spawning the Object Manager as an isolated service\n",
@@ -29504,6 +29452,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         );
     }
 
+    shared_ingress_selftest::run();
+
     // --- Phase 2b (graphics): LOAD the real ReactOS win32k.sys into an ISOLATED win32k-service
     // component and RUN its DriverEntry as far as it goes. The storage host staged the 2.1 MiB
     // image into WIN32KBUF; the executive parses+relocates+IAT-patches it into a run of frames at
@@ -29823,8 +29773,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // dynamic path; only the launch scaffolding was bespoke. The region map ORDER + every
             // `pts` value + the alloc sequence are reproduced EXACTLY (PAINT 768/768 @ 0x003a6ea5 is
             // load-bearing). Component-side trampolines (win32k_subsystem) are unchanged.
-            let w_fault = make_object(OBJ_ENDPOINT);
-            let host_pml4 = {
+            let primary_component = {
                 let stack_frames = 32u64; // 128 KiB — win32k init call chains are deep
                 let code_rights_static: &'static [u64] =
                     core::mem::transmute::<&[u64], &'static [u64]>(win32k_subsystem::code_rights());
@@ -30037,7 +29986,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     regions: &regions[..n],
                     granted: GrantedCaps {
                         result_ntfn: None,
-                        fault_ep: Some(w_fault),
+                        fault_ep: None,
                     },
                     prio: 100,
                     // win32k is a kernel driver: it reads the KPCR via gs:[..]. Point GS at a zeroed
@@ -30045,7 +29994,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     gs_base: Some(win32k_subsystem::WIN32K_KPCR_VA),
                     caps: HostCaps::default(),
                 };
-                let sc = spawn_component(&d);
+                let sc = spawn_component_suspended(&d);
                 if !win32k_glue::ensure_w32_client_paging(
                     win32k_subsystem::WIN32K_KUSER_SHARED_DATA_VA,
                     sc.pml4,
@@ -30069,8 +30018,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 WIN32K_STACK_FRAMES.store(stack_frames, Ordering::Relaxed);
                 WIN32K_TCB.store(sc.tcb, Ordering::Relaxed);
                 WIN32K_ROOT_IMAGE_MAP_OWNER.store(sc.map_cap_bank.owner as u64, Ordering::Relaxed);
-                sc.pml4
+                sc
             };
+            let host_pml4 = primary_component.pml4;
+            let primary_cnode = primary_component.cnode;
+            let primary_sched_context = primary_component.sched_context;
+            let primary_reply = spawn_hosts::shared_ingress::owner::runtime::allocate_reply(
+                primary_component.tcb,
+            ).expect("primary win32k initial Reply allocation failed");
+            let init_route = win32k_glue::register_primary_win32k_physical_lane(
+                primary_component,
+                primary_reply,
+            ).expect("primary win32k shared peer registration failed");
+            let w_fault = init_route.endpoint();
 
             // ★ THE DRIVER-ENTRY INIT LOOP IS NOW THE SHARED PUMP (`docs/transport-migration.md`
             // Phase 2 step 3). It used to be a bespoke `ep_recv_full` + `reply_recv_full` pair right
@@ -30083,6 +30043,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // begin until this pump publishes its retained kernel caller through that handoff.
             let code_va = win32k_subsystem::WIN32K_CODE_VA;
             let init_ch = spawn_hosts::PumpChannel {
+                ingress_route: Some(init_route),
                 fault_ep: w_fault,
                 physical_domain: None,
                 pml4: host_pml4,
@@ -30097,7 +30058,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 trace_faults: true,
                 initial: spawn_hosts::InitialAction::RecvFirst,
                 tcb: WIN32K_TCB.load(Ordering::Relaxed),
-                reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
+                reply_cap: primary_reply,
                 client_pi: 0,
                 client_generation: 0,
                 logical_caller: None,
@@ -30126,24 +30087,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             ).expect("win32k Ps provider identity registration failed");
             ps_object_backing::register_provider(ps_provider)
                 .expect("win32k Ps provider VSpace retention failed");
-            assert!(
-                win32k_glue::register_primary_win32k_physical_lane(
-                    init_ch.tcb,
-                    init_ch.fault_ep,
-                    init_ch.reply_cap,
-                ),
-                "primary win32k execution lane registration failed"
-            );
-            let init_lane = win32k_glue::win32k_physical_lane_for_channel(
-                init_ch.tcb,
-                init_ch.fault_ep,
-                init_ch.reply_cap,
-            )
-            .expect("registered DriverEntry channel must have a physical lane");
-            assert!(
-                service_sec_image::begin_component_execution_lane(init_lane),
-                "primary win32k initialization dispatch admission failed"
-            );
+            let init_lane = init_route.identity().lane;
+            let init_dispatch = spawn_hosts::shared_ingress::owner::runtime::start_bootstrap(
+                init_route,
+                primary_cnode,
+                primary_sched_context,
+            ).expect("primary win32k bootstrap dispatch admission failed");
+            assert_eq!(init_dispatch.lane(), init_lane);
             let init_caller = service_sec_image::kernel_provider_activation::capture_win32k_initial_system(
                 &init_ch,
                 init_lane,
@@ -30372,9 +30322,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // which intentionally requires no GUI-client context.
             if initialized {
                 // --- Fix (B): prove a win32k dispatch whose handler FAULTS is resolved through the
-                // per-caller reply cap (REPLY_W32 / decode_reply), NOT the single per-TCB reply_to.
+                // canonical shared-ingress Reply, not the single per-TCB reply_to.
                 // SSN_TEST_FAULT's handler reads an un-demand-paged page → the executive demand-maps
-                // it via Send-on-REPLY_W32 + recv-with-r12 and resumes win32k, which returns the
+                // it through its owned Reply and resumes win32k, which returns the
                 // sentinel. A clean round-trip means the dispatch fault path no longer depends on
                 // reply_to — so a nested faulting SSN can't clobber an outer caller's pending reply.
                 let (fst, fok) = win32k_dispatch(win32k_subsystem::SSN_TEST_FAULT, 0, 0, 0, 0);
@@ -30391,7 +30341,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 check(
                     b"win32k_dispatch_fault_via_reply_cap",
                     fok && fst == win32k_subsystem::TEST_FAULT_STATUS as u32 as u64
-                        && REPLY_W32_SLOT.load(Ordering::Relaxed) != 0,
+                        && spawn_hosts::shared_ingress::owner::runtime::current_reply(init_route)
+                            .is_ok(),
                     &mut passed,
                 );
             }
@@ -31800,7 +31751,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 assert!((ntdll_size as u64) <= NTDLLBUF_FRAMES * 0x1000);
                 let ntdll_bytes =
                     core::slice::from_raw_parts(NTDLLBUF_VADDR as *const u8, ntdll_size as usize);
-                let si_fault = make_object(OBJ_ENDPOINT);
+                let si_fault = spawn_hosts::shared_ingress::owner::runtime::prepare(1)
+                    .expect("hosted users share the owned executive ingress endpoint");
                 // OUR Rust ntdll IS `\reactos\system32\ntdll.dll` (make_image stages ours under that
                 // name; the real ReactOS ntdll is NOT on the image). So the ntdll bytes the storage
                 // host read into NTDLLBUF are OURS — no separate load, no flag, no fallback. We DERIVE
@@ -33100,7 +33052,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     //      as the return value of the component's OWN Call, not as "some message with the right
     //      label" (which is all the old transport could check).
     //  (3) The NEGATIVE control, and the reason (1) is not vacuous: replying to a reply object we
-    //      KNOW is unbound (a spare `REPLY_FSD` slot no driver instance ever used) must come back
+    //      KNOW is unbound (the dedicated transport probe Reply) must come back
     //      `seL4_InvalidCapability` — which is **2** (`rust-micro/src/types.rs:114`), NOT the 6 the
     //      plan claimed (6 is `seL4_FailedLookup`) — IMMEDIATELY, and the boot must continue. That is both halves
     //      of the claim in one probe — the kernel really does reject an unbound reply (so label 0

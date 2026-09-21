@@ -8,6 +8,7 @@ use nt_user_host::provider_kernel_pump::{
 use nt_user_host::provider_kernel_wait::{KernelProviderWaitRecipient, KernelProviderWaitState};
 
 pub(super) struct DriverEntryRecipient {
+    // Physical layout template only; Reply is resolved from the live dispatch at each entry.
     channel: spawn_hosts::PumpChannel,
     wait: KernelProviderWaitState,
     observation: Option<spawn_hosts::PumpResult>,
@@ -27,37 +28,55 @@ fn pump_error(error: PumpProgressError) -> u32 {
 }
 
 impl DriverEntryRecipient {
-    pub(super) fn new(channel: spawn_hosts::PumpChannel) -> Result<Self, u32> {
+    pub(super) fn new(mut channel: spawn_hosts::PumpChannel) -> Result<Self, u32> {
+        let wait = KernelProviderWaitState::new(channel.reply_cap).map_err(pump_error)?;
+        channel.reply_cap = 0;
         Ok(Self {
-            wait: KernelProviderWaitState::new(channel.reply_cap).map_err(pump_error)?,
+            wait,
             channel,
             observation: None,
         })
     }
 
     pub(super) fn matches(&self, channel: &spawn_hosts::PumpChannel) -> bool {
-        channel_binding(&self.channel) == channel_binding(channel)
+        self.channel.tcb == channel.tcb
+            && self.channel.fault_ep == channel.fault_ep
             && self.channel.pml4 == channel.pml4
             && self.channel.shared_va == channel.shared_va
             && self.channel.dispatch_label == channel.dispatch_label
     }
 
-    pub(super) fn begin_initial(
+    pub(super) fn completion_label(&self) -> u64 {
+        self.channel.dispatch_label
+    }
+
+    pub(super) unsafe fn begin_initial(
         &mut self,
         caller: KernelProviderCaller,
     ) -> Result<(spawn_hosts::PumpChannel, KernelProviderPumpAttempt), u32> {
+        let channel = self.execution_channel(caller)?;
         let attempt = self.wait.begin_initial().map_err(pump_error)?;
-        Ok((self.execution_channel(caller), attempt))
+        Ok((channel, attempt))
     }
 
-    pub(super) fn execution_channel(&self, caller: KernelProviderCaller) -> spawn_hosts::PumpChannel {
+    pub(super) unsafe fn execution_channel(
+        &self,
+        caller: KernelProviderCaller,
+    ) -> Result<spawn_hosts::PumpChannel, u32> {
+        let binding = kernel_provider_current_binding(caller)?;
+        if binding.executor_id != self.channel.tcb
+            || binding.receive_endpoint != self.channel.fault_ep
+        {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
         let mut channel = self.channel;
+        channel.reply_cap = binding.reply_object;
         channel.kernel_caller = Some(caller);
         channel.caps.kernel_irq_yield = true;
-        channel
+        Ok(channel)
     }
 
-    pub(super) fn begin_receive_after_yield(
+    pub(super) unsafe fn begin_receive_after_yield(
         &mut self,
         caller: KernelProviderCaller,
     ) -> Result<
@@ -71,11 +90,12 @@ impl DriverEntryRecipient {
         let previous = self
             .observation
             .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let channel = self.execution_channel(caller)?;
         let attempt = self
             .wait
             .begin_receive_after_yield()
             .map_err(pump_error)?;
-        Ok((self.execution_channel(caller), attempt, previous))
+        Ok((channel, attempt, previous))
     }
 
     pub(super) fn observe(
@@ -84,10 +104,11 @@ impl DriverEntryRecipient {
         pump: spawn_hosts::PumpResult,
         facts: KernelProviderPumpFacts,
         returned_status: Option<u32>,
+        current_reply: u64,
     ) -> Result<(), u32> {
         let disposition = self
             .wait
-            .observe(attempt, facts, returned_status)
+            .observe_current(attempt, facts, returned_status, current_reply)
             .map_err(pump_error)?;
         self.observation = Some(pump);
         if disposition == KernelProviderPumpDisposition::Invalid {
@@ -143,20 +164,23 @@ impl DriverEntryRecipient {
 
     pub(super) unsafe fn can_initialize(&self, caller: KernelProviderCaller) -> bool {
         let owner = caller.owner();
+        let lane = caller.dispatch().lane();
+        let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+        let Ok(binding) = lanes.binding(lane) else {
+            return false;
+        };
         current_win32k_provider_domain().is_some_and(|provider| {
             provider.domain == owner.provider_domain
                 && provider.generation == owner.provider_generation
-        }) && win32k_glue::win32k_physical_lane_for_channel(
-            self.channel.tcb,
-            self.channel.fault_ep,
-            self.channel.reply_cap,
-        )
-        .is_some_and(|lane| {
-            owner.caller == nt_component_suspension::SuspensionCaller::Kernel { lane }
-                && component_execution_lane_is_idle(lane)
-                && (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane)
-                    == Ok(caller.binding())
-        })
+        }) && binding.executor_id == caller.executor_id()
+            && binding.receive_endpoint == caller.receive_endpoint()
+            && binding.executor_id == self.channel.tcb
+            && binding.receive_endpoint == self.channel.fault_ep
+            && win32k_glue::win32k_physical_lane_for_channel(
+                binding.executor_id, binding.receive_endpoint, binding.reply_object,
+            ) == Some(lane)
+            && component_execution_lane_is_idle(lane)
+            && lanes.active_dispatch_identity(lane) == Ok(None)
     }
 }
 
