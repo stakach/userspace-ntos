@@ -6,7 +6,7 @@ use crate::*;
 use ingress::{PhysicalDomain, PhysicalSource, PhysicalSourceKind};
 use nt_component_suspension::peer_registry::PeerRoute;
 
-const LABEL: u64 = 0x7e0;
+pub(crate) const LABEL: u64 = 0x7e0;
 const NESTED: u64 = 0x7e1;
 const READY: [u64; 4] = [0x5348_4152, 1, 0, 0];
 const WORKER_STACK: u64 = STACK_BASE + 0x10000;
@@ -191,7 +191,7 @@ unsafe fn secondary(primary: PeerRoute) -> PeerRoute {
     enroll(index, reply)
 }
 
-unsafe fn receive(route: PeerRoute) {
+pub(crate) unsafe fn receive(route: PeerRoute) {
     // Every fixture command has at most one next Call. Bound the number of unrelated events;
     // the external boot runner separately enforces its wall-clock deadline.
     let index = (&*core::ptr::addr_of!(FIXTURES))
@@ -244,7 +244,7 @@ unsafe fn receive(route: PeerRoute) {
     panic!("fixture event bound exceeded");
 }
 
-unsafe fn dispatch_once(route: PeerRoute) {
+pub(crate) unsafe fn dispatch_once(route: PeerRoute) {
     let dispatch = ingress::admit(route).expect("fixture admission");
     let reply = ingress::current_reply(route).unwrap();
     ingress::reply(route, reply, &[0]).expect("fixture request ACK");
@@ -348,6 +348,11 @@ pub(crate) unsafe fn run() {
         LABEL,
     )
     .expect("outer completion");
+    service_sec_image::bootstrap_wait_selftest::run(
+        first,
+        second,
+        &*core::ptr::addr_of!(DOMAINS),
+    );
     cleanup(2);
     cleanup(1);
     cleanup(0);

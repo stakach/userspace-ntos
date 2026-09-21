@@ -62,8 +62,8 @@ unsafe fn next_kernel_in_pass(pass: &mut ResumePass) -> Option<Candidate> {
     .expect("bootstrap continuation pass must retain its process owner")
 }
 
-/// Called only after the initial physical DriverEntry scope has returned. This is one bounded
-/// scheduling pass, not a receive loop, and does not admit otherwise unsupported blocking waits.
+/// Called after the physical DriverEntry scope has returned. The bootstrap receive owner drives
+/// these bounded passes; memory-only wait publication is not delayed by execution pacing.
 pub(crate) unsafe fn run_bootstrap_outer(
     target: KernelProviderCaller,
 ) -> Result<BootstrapPassOutcome, u32> {
@@ -80,6 +80,7 @@ pub(crate) unsafe fn run_bootstrap_outer(
     if is_running() {
         return Ok(BootstrapPassOutcome::PassActive);
     }
+    let published = kernel_provider_activation::publish_bootstrap_waits()?;
     let can_schedule = ps_bootstrap::with_process_manager(|pm| {
         let demand = observe_kernel_demand(pm);
         (&mut *core::ptr::addr_of_mut!(WAKE)).reconcile_demand(demand, monotonic_time_100ns());
@@ -97,8 +98,7 @@ pub(crate) unsafe fn run_bootstrap_outer(
         .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?
     {
         ran_pass = true;
-        let mut progressed = kernel_provider_activation::publish_bootstrap_waits()
-            .expect("bootstrap continuation pass must retain its dispatcher owner");
+        let mut progressed = published;
         let mut pass = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).resume_pass();
         progressed |= drain_completions(target, &mut acknowledged);
         while let Some(candidate) = next_kernel_in_pass(&mut pass) {
@@ -130,8 +130,6 @@ pub(crate) unsafe fn run_bootstrap_outer(
             .finish_pass(&mut ticket, monotonic_time_100ns(), has_work, progressed)
             .expect("bootstrap continuation pass must finish with its owned wake ticket");
     }
-    assert!(dispatcher_bootstrap::request_receive_checkpoint());
-    dispatcher_bootstrap::prepare_receive()?;
     if let Some(initialized) = acknowledged {
         return Ok(BootstrapPassOutcome::TargetAcknowledged { initialized });
     }

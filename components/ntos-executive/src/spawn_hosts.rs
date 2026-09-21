@@ -2316,9 +2316,8 @@ unsafe fn component_pump_loop(
                 );
                 continue;
             }
-            assert!(ch.kernel_caller.is_none(), "kernel wait must not enter hosted suspension");
             // The executive validates and admits the copied shared-page request only after the
-            // native caller's continuation storage is reserved. Keep this Call bound until then.
+            // exact hosted or kernel continuation storage is reserved. Keep this Call bound.
             outcome.provider_wait_suspended = true;
             break;
         } else if label == crate::win32k_subsystem::W32_LPC_WAIT_LABEL

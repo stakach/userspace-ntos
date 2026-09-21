@@ -170,6 +170,52 @@ fn nested_unbound_activation_cannot_inherit_outer_owner_and_restores_outer_irql(
 }
 
 #[test]
+fn blocking_kernel_wait_restores_only_its_original_stack_activation() {
+    let (mut catalog, lane) = fixture();
+    let sibling = catalog.register_lane(2, 0x3000, 0x1000).unwrap();
+    let outer = catalog
+        .begin_kernel_for_stack_pointer(0x1800, PROVIDER, descriptor(50, 20))
+        .unwrap();
+    let expected = owner(50, 20);
+    catalog.raise_irql(outer, 1).unwrap();
+    let restored = |catalog: &ProviderStackActivationCatalog, sp| {
+        catalog.resolve(sp, 1).ok().is_some_and(|(binding, _)| {
+            catalog.active(binding.handle) == Ok(outer)
+                && catalog.owner(outer) == Ok(Some(expected))
+        })
+    };
+    for timeout in [
+        crate::ProviderWaitTimeoutKind::Infinite,
+        crate::ProviderWaitTimeoutKind::Relative,
+        crate::ProviderWaitTimeoutKind::Absolute,
+    ] {
+        assert_eq!(catalog.can_wait(outer, timeout), Ok(true));
+        assert!(restored(&catalog, 0x1800));
+        let nested = catalog.begin(lane, 99).unwrap();
+        assert!(!restored(&catalog, 0x1800));
+        assert_eq!(catalog.owner(nested), Ok(None));
+        catalog.finish(nested).unwrap();
+        assert!(restored(&catalog, 0x1800));
+        assert_eq!(catalog.current_irql(outer), Ok(1));
+    }
+    let other = catalog
+        .begin_kernel_for_stack_pointer(0x3800, PROVIDER, descriptor(60, 21))
+        .unwrap();
+    assert!(!restored(&catalog, 0x3800));
+    assert!(restored(&catalog, 0x1800));
+    catalog.finish(other).unwrap();
+    catalog.lower_irql(outer, 0).unwrap();
+    catalog.finish(outer).unwrap();
+    assert!(!restored(&catalog, 0x1800));
+    let next = catalog
+        .begin_kernel_for_stack_pointer(0x1800, PROVIDER, descriptor(50, 21))
+        .unwrap();
+    assert!(!restored(&catalog, 0x1800));
+    catalog.finish(next).unwrap();
+    catalog.unregister_lane(sibling).unwrap();
+}
+
+#[test]
 fn epochs_are_nonreplayable_and_live_root_dispatch_cannot_be_overlapped() {
     let (mut catalog, lane) = fixture();
     let first = catalog

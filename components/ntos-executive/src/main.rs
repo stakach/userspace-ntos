@@ -104,6 +104,7 @@ mod hosted_pnp_start;
 pub(crate) use hosted_pnp_start::*;
 mod selftests;
 mod shared_ingress_selftest;
+mod bootstrap_receive;
 pub(crate) use selftests::*;
 mod img_spawn;
 mod temporary_frame_alias;
@@ -30114,23 +30115,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
             // Readiness follows an acknowledged successful initialization result, not merely a
             // return to the component loop. A failed DriverEntry must not receive client dispatches.
-            let mut initialized = init_receipt.is_some_and(|receipt| {
-                match service_sec_image::kernel_provider_activation::deliver_driver_entry_completion(receipt) {
-                    Ok(initialized) => initialized,
-                    // Deferred acknowledgment is retained for the outer loop, not boot success.
-                    Err(_) => false,
-                }
+            let mut acknowledged = init_receipt.and_then(|receipt| {
+                service_sec_image::kernel_provider_activation::deliver_driver_entry_completion(receipt).ok()
             });
-
-            // The physical invocation's scheduler scope has ended. Only an exact acknowledged
-            // target completion may update readiness; receipt disappearance is not success.
-            if let service_sec_image::component_resume::BootstrapPassOutcome::TargetAcknowledged {
-                initialized: completed,
-            } = service_sec_image::component_resume::run_bootstrap_outer(init_caller)
-                .expect("bootstrap continuation pass must retain its original owners")
+            // A failed acknowledged DriverEntry is also terminal. Only a retained completion or
+            // captured wait enters the outer receive owner; a protocol wall is never wait success.
+            if acknowledged.is_none() && (init_receipt.is_some()
+                || matches!(init_outcome.stop, KernelProviderStoppedOutcome::WaitCaptured(_)))
             {
-                initialized = completed;
+                acknowledged = Some(service_sec_image::component_resume::await_bootstrap_completion(init_caller)
+                    .expect("bootstrap wait retains its exact completion and receive owners"));
             }
+            let initialized = acknowledged.unwrap_or(false);
 
             let verdict = core::ptr::read_volatile(
                 (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_VERDICT)

@@ -15,6 +15,7 @@ pub mod object_wait;
 pub mod current_apc;
 pub mod dispatcher_state;
 pub mod bootstrap_store;
+pub mod bootstrap_receive;
 pub mod dispatcher_deadlines;
 pub mod provider_dispatcher_backend;
 pub mod provider_wait_selection;

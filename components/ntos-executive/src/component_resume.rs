@@ -11,6 +11,20 @@ pub(super) use execute::run_hosted;
 mod bootstrap;
 pub(crate) use bootstrap::{run_bootstrap_outer, BootstrapPassOutcome};
 
+pub(crate) unsafe fn await_bootstrap_completion(
+    target: nt_user_host::provider_kernel_activation::KernelProviderCaller,
+) -> Result<bool, u32> {
+    crate::bootstrap_receive::drive(target, || {
+        match run_bootstrap_outer(target)? {
+            BootstrapPassOutcome::TargetAcknowledged { initialized } => Ok(Some(initialized)),
+            BootstrapPassOutcome::Deferred { .. }
+            | BootstrapPassOutcome::NoReadyWork
+            | BootstrapPassOutcome::PassFinished { .. } => Ok(None),
+            _ => Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32),
+        }
+    })
+}
+
 // Scheduling latency/backoff, independent of the original NT wait's retained deadline.
 static mut WAKE: ResumeWake = match ResumeWake::new(10_000, 160_000) {
     Ok(wake) => wake,
@@ -64,7 +78,7 @@ unsafe fn next_in_pass(pm: &nt_process::ProcessManager, pass: &mut ResumePass) -
     candidate(resume)
 }
 
-pub(super) unsafe fn is_running() -> bool {
+pub(crate) unsafe fn is_running() -> bool {
     (&*core::ptr::addr_of!(WAKE)).is_running()
 }
 
