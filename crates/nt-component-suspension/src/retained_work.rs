@@ -239,12 +239,28 @@ impl<M> RetainedWork<M> {
         &mut self,
         route: PeerRoute,
     ) -> Result<RetainedWorkCheckout<M>, RetainedWorkError> {
+        self.checkout_matching(route, None)
+    }
+
+    pub(crate) fn checkout_reply(
+        &mut self,
+        route: PeerRoute,
+        reply: u64,
+    ) -> Result<RetainedWorkCheckout<M>, RetainedWorkError> {
+        self.checkout_matching(route, Some(reply))
+    }
+
+    fn checkout_matching(
+        &mut self,
+        route: PeerRoute,
+        reply: Option<u64>,
+    ) -> Result<RetainedWorkCheckout<M>, RetainedWorkError> {
         let index = self
             .slots
             .iter()
             .position(|slot| {
                 matches!(slot,
-            Slot::Stored { call, .. } if call.route() == route)
+            Slot::Stored { call, .. } if call.route() == route && reply.is_none_or(|reply| call.reply() == reply))
             })
             .ok_or(RetainedWorkError::NotFound)?;
         let Slot::Stored { identity, call } =
@@ -272,6 +288,24 @@ impl<M> RetainedWork<M> {
             .iter_mut()
             .find_map(|slot| match slot {
                 Slot::Stored { call, .. } if call.route() == route => Some(call),
+                _ => None,
+            })
+            .ok_or(RetainedWorkError::NotFound)
+    }
+
+    pub(crate) fn stored_dispatch_mut(
+        &mut self,
+        route: PeerRoute,
+        dispatch: crate::LaneDispatchIdentity,
+    ) -> Result<&mut RetainedIngress<M>, RetainedWorkError> {
+        self.slots
+            .iter_mut()
+            .find_map(|slot| match slot {
+                Slot::Stored { call, .. }
+                    if call.route() == route && call.admitted == Some(dispatch) =>
+                {
+                    Some(call)
+                }
                 _ => None,
             })
             .ok_or(RetainedWorkError::NotFound)

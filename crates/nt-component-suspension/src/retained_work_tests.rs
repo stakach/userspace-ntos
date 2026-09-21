@@ -6,6 +6,48 @@ use crate::{
 
 type Lanes = ComponentSuspensionLanes<(), (), ()>;
 
+#[test]
+fn exact_dispatch_and_reply_selection_skip_an_earlier_call_for_same_peer() {
+    let (mut lanes, mut peers, route, mut old) = call(40);
+    let mut ingress = ComponentIngress::new(20, 42).unwrap();
+    let mut receive = lanes.begin_ingress_receive(&mut ingress).unwrap();
+    assert!(ingress
+        .observe_receive(&mut receive, IngressObservation::Call(456))
+        .is_ok());
+    let next = lanes
+        .retain_peer_ingress(
+            &mut ingress,
+            ComponentIngress::new(20, 43).unwrap(),
+            &mut peers,
+            route.badge(),
+            |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget),
+        )
+        .ok()
+        .unwrap();
+    let receipt = lanes
+        .begin_retained_dispatch(&peers, &mut old, 1, 2, |_, reply| {
+            Ok::<_, u8>(if reply == 30 {
+                ReplyBindingObservation::Free
+            } else {
+                ReplyBindingObservation::BoundToTarget
+            })
+        })
+        .unwrap();
+    let mut store = RetainedWork::new(20, 2).unwrap();
+    let slot = store.reserve(42).unwrap();
+    assert!(store.commit(slot, next).is_ok());
+    let slot = store.reserve(40).unwrap();
+    assert!(store.commit(slot, old).is_ok());
+    let selected = store.stored_dispatch_mut(route, receipt.dispatch).unwrap();
+    assert_eq!(selected.reply(), 40);
+    assert_eq!(*selected.message(), 140);
+    let checkout = store.checkout_reply(route, 40).unwrap();
+    assert_eq!(checkout.call().reply(), 40);
+    let next = store.checkout(route).unwrap();
+    assert_eq!(next.call().reply(), 42);
+    assert_eq!(*next.call().message(), 456);
+}
+
 fn call(reply: u64) -> (Lanes, PeerRegistry, PeerRoute, RetainedIngress<u64>) {
     call_for(reply, 1, 10)
 }

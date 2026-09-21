@@ -37189,6 +37189,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Both serialized native release builds pass (.tmp/build-stored-reply-executive-20260921.log
         and .tmp/build-stored-reply-io-manager-20260921.log). No new boot or
         desktop proof is claimed; the last measured boot retains the strict 27-export barrier.
+        Stored completion checkpoint (2026-09-21): complete_stored keeps the old acknowledged
+        Call in durable storage through exact shared-route/dispatch validation and a fresh Free
+        binding query. Only then does it end the dispatch and release that Call's storage/retention
+        with memory-only transitions, consuming the Ready wrapper into canonical Reply ownership.
+        Missing ACK, wrong registry, query failure and non-Free binding leave execution and payload
+        intact. Defensive finish refusal restores storage without inventing an ended dispatch epoch.
+
+        Multiple Calls from one peer exposed an ordering gap: reply/completion now locate the exact
+        admitted dispatch, then remove the exact Reply rather than the first matching peer entry.
+        Tests retain the provider's new continuation while completing the old Call, and reverse slot
+        ordering to prove a newer same-peer Call cannot be consumed accidentally. The new continuation
+        keeps its payload, bound Reply and peer retention independently of old dispatch completion.
+
+        Native completion wiring remains open: it must authenticate the actual final protocol message
+        and durably retain its new Call before using this operation. ACK alone cannot supply that
+        evidence. Contract review found no blocking issues. Validation: 257 unit and 14 doc tests
+        pass (.tmp/test-stored-completion-20260921.log). Both serialized native release builds pass
+        (.tmp/build-stored-completion-executive-20260921.log and
+        .tmp/build-stored-completion-io-manager-20260921.log). No new boot result is claimed; the last
+        measured boot remains blocked by the strict 27-export win32k barrier.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

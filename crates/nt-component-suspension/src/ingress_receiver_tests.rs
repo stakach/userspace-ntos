@@ -5,6 +5,123 @@ use crate::{IngressReplyObservation, LaneBinding};
 type Lanes = ComponentSuspensionLanes<(), (), ()>;
 
 #[test]
+fn stored_completion_releases_only_old_call_and_preserves_new_continuation() {
+    let (mut lanes, mut peers, route, mut owner, checkout) = canonical_completion_with_capacity(2);
+    let dispatch = lanes
+        .active_dispatch_identity(route.identity().lane)
+        .unwrap()
+        .unwrap();
+    assert!(owner.restore(checkout).is_ok());
+    owner
+        .reply_stored(
+            route,
+            dispatch,
+            &lanes,
+            |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget),
+            |_| IngressReplyObservation::Acknowledged,
+        )
+        .unwrap();
+    owner
+        .begin_receive_for_owner(&lanes, IngressExecutionOwner::Dispatch(dispatch))
+        .unwrap();
+    owner.capture(456).unwrap();
+    owner.resolve(IngressReceiveDisposition::Call).unwrap();
+    owner
+        .retain(
+            &lanes,
+            ComponentIngress::new(20, 42).unwrap(),
+            &mut peers,
+            route.badge(),
+            |_, reply| {
+                assert_eq!(reply, 41);
+                Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)
+            },
+        )
+        .ok()
+        .unwrap();
+    assert_eq!(peers.state(route).unwrap().1, 2);
+    assert_eq!(
+        owner.complete_stored(route, dispatch, &mut lanes, &mut peers, |tcb, reply| {
+            assert_eq!((tcb, reply), (10, 40));
+            Ok::<_, u8>(ReplyBindingObservation::Free)
+        }),
+        Ok(123)
+    );
+    assert_eq!(lanes.running(), None);
+    assert_eq!(lanes.binding(dispatch.lane).unwrap().reply_object, 40);
+    assert_eq!(owner.available(), 1);
+    assert_eq!(peers.state(route).unwrap().1, 1);
+    let continuation = owner.checkout(route).unwrap();
+    assert_eq!(*continuation.call().message(), 456);
+    assert_eq!(continuation.call().reply(), 41);
+    assert!(owner.excludes_reply(41));
+}
+
+#[test]
+fn stored_completion_failures_preserve_dispatch_payload_and_peer() {
+    let (mut lanes, mut peers, route, mut owner, checkout) = canonical_completion();
+    let dispatch = lanes
+        .active_dispatch_identity(route.identity().lane)
+        .unwrap()
+        .unwrap();
+    assert!(owner.restore(checkout).is_ok());
+    assert_eq!(
+        owner.complete_stored(
+            route,
+            dispatch,
+            &mut lanes,
+            &mut peers,
+            |_, _| -> Result<ReplyBindingObservation, u8> { panic!("missing ACK") }
+        ),
+        Err(StoredCompletionError::NotAcknowledged)
+    );
+    owner
+        .reply_stored(
+            route,
+            dispatch,
+            &lanes,
+            |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget),
+            |_| IngressReplyObservation::Acknowledged,
+        )
+        .unwrap();
+    for result in [Err(7u8), Ok(ReplyBindingObservation::BoundToTarget)] {
+        assert_eq!(
+            owner.complete_stored(route, dispatch, &mut lanes, &mut peers, |_, _| result),
+            Err(if result.is_err() {
+                StoredCompletionError::Query(7)
+            } else {
+                StoredCompletionError::NotFree
+            })
+        );
+        assert_eq!(
+            lanes.active_dispatch_identity(dispatch.lane),
+            Ok(Some(dispatch))
+        );
+        assert_eq!(owner.available(), 0);
+        assert_eq!(peers.state(route).unwrap().1, 1);
+    }
+    let mut foreign = PeerRegistry::new(20, 1);
+    assert_eq!(
+        owner.complete_stored(
+            route,
+            dispatch,
+            &mut lanes,
+            &mut foreign,
+            |_, _| -> Result<ReplyBindingObservation, u8> { panic!("foreign registry") }
+        ),
+        Err(StoredCompletionError::WrongOwner)
+    );
+    peers.begin_retirement(route).unwrap();
+    assert_eq!(
+        owner.complete_stored(route, dispatch, &mut lanes, &mut peers, |_, _| Ok::<_, u8>(
+            ReplyBindingObservation::Free
+        )),
+        Ok(123)
+    );
+    assert_eq!(peers.state(route).unwrap().1, 0);
+}
+
+#[test]
 fn stored_reply_ack_keeps_execution_and_storage_until_completion() {
     let (mut lanes, mut peers, route, mut owner, checkout) = canonical_completion();
     let dispatch = lanes
@@ -133,6 +250,18 @@ fn canonical_completion() -> (
     IngressReceiver<u64>,
     RetainedWorkCheckout<u64>,
 ) {
+    canonical_completion_with_capacity(1)
+}
+
+fn canonical_completion_with_capacity(
+    capacity: usize,
+) -> (
+    Lanes,
+    PeerRegistry,
+    PeerRoute,
+    IngressReceiver<u64>,
+    RetainedWorkCheckout<u64>,
+) {
     let mut lanes = Lanes::new(2, 2);
     let mut peers = PeerRegistry::new(20, 2);
     let (lane, mut ticket) = lanes
@@ -156,7 +285,7 @@ fn canonical_completion() -> (
             Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)
         })
         .unwrap();
-    let mut owner = IngressReceiver::new(20, 40, 1).unwrap();
+    let mut owner = IngressReceiver::new(20, 40, capacity).unwrap();
     capture_call(&mut owner, &lanes, 123);
     owner
         .retain(

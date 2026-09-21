@@ -36,6 +36,10 @@ pub struct RetainedIngress<M> {
 }
 
 impl<M> RetainedIngress<M> {
+    pub(crate) fn is_acknowledged(&self) -> bool {
+        self.completed.is_some()
+    }
+
     /// Keep the attempt in the durable Call before invoking native reply. Uncertainty must never
     /// turn into replay permission; ACK and proven NoEffects consume only this exact attempt.
     pub(crate) fn reply_owned(

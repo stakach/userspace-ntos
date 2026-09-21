@@ -27,6 +27,17 @@ pub enum StoredReplyError<E> {
     Ingress(crate::IngressError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoredCompletionError<E> {
+    Store(RetainedWorkError),
+    NotAcknowledged,
+    WrongOwner,
+    NotFree,
+    Query(E),
+    Dispatch(crate::RetainedDispatchError<Infallible>),
+    Finish(RetainedWorkFinishError),
+}
+
 #[cfg(test)]
 #[path = "ingress_receiver_tests.rs"]
 mod tests;
@@ -47,6 +58,68 @@ pub struct IngressReceiver<M> {
 }
 
 impl<M> IngressReceiver<M> {
+    /// Complete only after the adapter authenticates the provider's completion protocol and
+    /// physical lifetime. ACK alone is not completion evidence. Keep the Call stored through the
+    /// final kernel query; all following transitions are nonreentrant, in-memory ownership moves.
+    /// Refusals retain the Call. A finish refusal after ending execution restores it for cleanup,
+    /// but does not recreate an already-ended dispatch epoch.
+    pub fn complete_stored<C, R, T, E>(
+        &mut self,
+        route: PeerRoute,
+        dispatch: crate::LaneDispatchIdentity,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        peers: &mut PeerRegistry,
+        query: impl FnOnce(u64, u64) -> Result<ReplyBindingObservation, E>,
+    ) -> Result<M, StoredCompletionError<E>> {
+        let call = self
+            .store
+            .stored_dispatch_mut(route, dispatch)
+            .map_err(StoredCompletionError::Store)?;
+        let lane = lanes
+            .lane(route.identity().lane)
+            .map_err(|_| StoredCompletionError::WrongOwner)?;
+        if call.admitted != Some(dispatch)
+            || lane.dispatch != Some(dispatch)
+            || lane.shared_peer != Some(route)
+            || lane.binding.executor_id != route.identity().executor
+            || lane.binding.receive_endpoint != route.endpoint()
+            || lane.binding.reply_object != call.reply()
+            || lanes
+                .validate_ingress_execution(IngressExecutionOwner::Dispatch(dispatch))
+                .is_err()
+            || !matches!(peers.state(route), Ok((_, count)) if count > 0)
+        {
+            return Err(StoredCompletionError::WrongOwner);
+        }
+        if !call.is_acknowledged() {
+            return Err(StoredCompletionError::NotAcknowledged);
+        }
+        if query(route.identity().executor, call.reply()).map_err(StoredCompletionError::Query)?
+            != ReplyBindingObservation::Free
+        {
+            return Err(StoredCompletionError::NotFree);
+        }
+        let reply = call.reply();
+        lanes
+            .finish_retained_dispatch(call)
+            .map_err(StoredCompletionError::Dispatch)?;
+        let checkout = self
+            .store
+            .checkout_reply(route, reply)
+            .map_err(StoredCompletionError::Store)?;
+        match self.store.finish_checkout(checkout, peers) {
+            Ok((ready, message)) => {
+                drop(ready); // The exact canonical lane retains sole Reply ownership.
+                Ok(message)
+            }
+            Err((error, checkout)) => {
+                // No effect or callback intervenes between checkout and restoration.
+                assert!(self.store.restore(checkout).is_ok());
+                Err(StoredCompletionError::Finish(error))
+            }
+        }
+    }
+
     /// Reply only for the exact admitted running dispatch. Keep its attempt and payload stored
     /// before the native effect; ACK does not end dispatch or release peer/storage ownership.
     /// Both callbacks must preserve physical lifetimes and must not reenter this owner.
@@ -60,7 +133,7 @@ impl<M> IngressReceiver<M> {
     ) -> Result<crate::IngressReplyObservation, StoredReplyError<E>> {
         let call = self
             .store
-            .stored_call_mut(route)
+            .stored_dispatch_mut(route, dispatch)
             .map_err(StoredReplyError::Store)?;
         let lane = lanes
             .lane(route.identity().lane)
