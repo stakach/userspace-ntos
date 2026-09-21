@@ -34,6 +34,11 @@ unsafe fn rearm_pending() -> bool {
     (&*core::ptr::addr_of!(REARM)).pending().is_some()
 }
 
+/// Fresh receive eligibility after all scheduler effects and timer programming have returned.
+pub(crate) unsafe fn receive_work_pending() -> bool {
+    rearm_pending() || pending_timer_snapshot().is_some()
+}
+
 unsafe fn pending_timer_snapshot() -> Option<u64> {
     if !(&*core::ptr::addr_of!(BOOTSTRAP)).is_owned() {
         return None;

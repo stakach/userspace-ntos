@@ -151,3 +151,81 @@ fn candidate_claim_refusal_is_not_retried_inside_same_pass() {
     assert_eq!(next_in_pass(&mut f, &mut next_pass), Some(capture));
     assert!(f.resume().is_ok());
 }
+
+#[test]
+fn stopped_wait_publication_releases_running_before_future_pacing_deadline() {
+    for repeated in [false, true] {
+        for signaled in [false, true] {
+            let (mut f, mut state) = fixture(repeated || signaled);
+            let mut arbiter = ProviderDispatcherWaitArbiter::new();
+            let work = if repeated {
+                admit(&mut f, &mut state, &mut arbiter, 1).unwrap();
+                let previous = f.capture;
+                let next = next_capture(&mut f, 72);
+                if signaled {
+                    assert_eq!(state.events.set_existing(101), Some(false));
+                }
+                KernelProviderWaitWork::Repark { previous, next }
+            } else {
+                KernelProviderWaitWork::Initial(f.capture)
+            };
+            let capture = match work {
+                KernelProviderWaitWork::Initial(capture) => capture,
+                KernelProviderWaitWork::Repark { next, .. } => next,
+            };
+            let mut wake = ResumeWake::new(10, 40).unwrap();
+            wake.reconcile_demand(ResumeDemand::Pending, 100);
+            let mut previous_pass = wake.begin_pass(100).unwrap().unwrap();
+            wake.finish_pass(&mut previous_pass, 100, true, true)
+                .unwrap();
+            assert_eq!(wake.next_deadline(), Some(110));
+            assert!(wake.begin_pass(105).unwrap().is_none());
+            assert!(f.lanes.execution_busy());
+
+            // Publication is memory-only and precedes the pacing gate. Deferring it would
+            // strand Running ownership and prevent the outer scheduler from receiving.
+            let publication_time = TimeSnapshot {
+                monotonic_100ns: 105,
+                ..now()
+            };
+            let (admission, _) = f
+                .activations
+                .publish_wait_work(
+                    f.caller,
+                    &f.pm,
+                    &f.catalog,
+                    &mut f.lanes,
+                    &mut arbiter,
+                    &mut backend(&mut state, Some(f.caller.owner())),
+                    work,
+                    2,
+                    publication_time,
+                    capture,
+                    |status| status,
+                )
+                .unwrap();
+            f.capture = capture;
+            assert!(!f.lanes.execution_busy());
+            assert_eq!(f.state().captured_wait(), Some(capture));
+            assert_eq!(wake.next_deadline(), Some(110));
+            assert!(wake.begin_pass(109).unwrap().is_none());
+            if signaled {
+                assert!(matches!(admission, Admission::Satisfied { .. }));
+                assert!(f.lanes.next_resumable().is_some());
+                wake.reconcile_demand(ResumeDemand::Pending, 109);
+                assert_eq!(wake.next_deadline(), Some(110));
+                let mut pass = wake.begin_pass(110).unwrap().unwrap();
+                let _execution = f.resume().unwrap();
+                assert!(f.lanes.execution_busy());
+                wake.finish_pass(&mut pass, 110, true, true).unwrap();
+            } else {
+                assert!(matches!(admission, Admission::Parked { .. }));
+                assert!(f.lanes.next_resumable().is_none());
+                // The NT timeout is based on captured time 10, not publication time 105.
+                assert_eq!(capture.observed_at(), now());
+                assert_eq!(arbiter.next_deadline(publication_time), Some(100_010));
+                assert_eq!(state.event_objects.live_lease_count(), 1);
+            }
+        }
+    }
+}

@@ -5,6 +5,9 @@ use crate::exec_handler::HostedCreatePublication;
 use crate::*;
 use nt_user_host::hosted_return_target::HostedReturnTarget;
 
+#[path = "bootstrap_wait_selftest.rs"]
+pub(crate) mod bootstrap_wait_selftest;
+
 #[path = "provider_wait_selection.rs"]
 mod wait_selection;
 #[path = "component_terminal.rs"]
@@ -1575,14 +1578,14 @@ pub(crate) unsafe fn service_provider_wait_poll(
     let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
         as *mut nt_provider_wait::ProviderWaitSharedPage;
     let request = core::ptr::read_volatile(core::ptr::addr_of!((*page).request));
-    if channel.kernel_caller.is_none()
-        && request.header.timeout_kind != nt_provider_wait::ProviderWaitTimeoutKind::Poll as u32
+    if request.header.timeout_kind != nt_provider_wait::ProviderWaitTimeoutKind::Poll as u32
     {
         return false;
     }
     let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     let status = if channel.kernel_caller.is_some() {
-        // Unsupported kernel requests complete with an error; they never enter suspension admission.
+        // Polls keep their distinct synchronous authority; blocking requests are captured below
+        // the pump by the kernel activation's retained wait owner.
         kernel_provider_activation::service_event_poll(channel, envelope, &request)
     } else {
         match win32k_glue::current_provider_poll_owner(channel) {

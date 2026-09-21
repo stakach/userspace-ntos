@@ -59,8 +59,8 @@ pub(crate) enum DriverEntryWaitOutcome {
     Stopped(spawn_hosts::PumpResult),
 }
 
-/// Readiness must select the real typed frame before this entry. Blocking DriverEntry admission
-/// remains disabled until bootstrap owns the complete scheduling and receive path.
+/// Readiness selects the real typed frame before this entry. The outer bootstrap receive owner
+/// retains the target while this invocation runs, reparks, or publishes terminal completion.
 pub(crate) unsafe fn run_driver_entry_wait_resume(
     caller: KernelProviderCaller,
     capture: KernelProviderWaitCapture,

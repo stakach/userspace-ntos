@@ -6,7 +6,7 @@ use nt_provider_wait::{ProviderWaitOwner, ProviderWaitRequest, SuspensionCaller}
 #[derive(Clone, Copy)]
 pub(super) enum ProviderWaitContext {
     Hosted(Win32kCallbackRequestContext),
-    KernelPoll {
+    Kernel {
         activation: ProviderStackEventActivation,
         owner: ProviderWaitOwner,
     },
@@ -32,14 +32,11 @@ impl ProviderWaitContext {
                     .ok_or(0xC000_000D)
             }
             SuspensionCaller::Kernel { .. } => {
-                if !request.is_kernel_event_poll() {
-                    return Err(0xC000_00BB);
-                }
                 let activation = active_provider_stack_event_activation().ok_or(0xC000_000Du32)?;
                 if current_provider_wait_owner() != Some(request.owner) {
                     return Err(0xC000_000D);
                 }
-                Ok(Self::KernelPoll {
+                Ok(Self::Kernel {
                     activation,
                     owner: request.owner,
                 })
@@ -50,8 +47,9 @@ impl ProviderWaitContext {
     pub(super) unsafe fn restore(self) -> bool {
         match self {
             Self::Hosted(context) => restore_user_callback_request_context(context),
-            Self::KernelPoll { activation, owner } => {
-                // No nested dispatch is legal during a poll, so this activation must be unchanged.
+            Self::Kernel { activation, owner } => {
+                // Nested dispatch guards retire their own activation before returning here.
+                // Validate the original stack-local owner; never republish a shared descriptor.
                 active_provider_stack_event_activation() == Some(activation)
                     && current_provider_wait_owner() == Some(owner)
             }
