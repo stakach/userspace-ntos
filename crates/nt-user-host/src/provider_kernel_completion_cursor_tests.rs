@@ -192,7 +192,11 @@ fn unfinished_row_becoming_ready_behind_selection_waits_for_next_pass() {
     let mut f = Fixture::new();
     let (lane, first) = f.running(1);
     f.lanes
-        .suspend_running(lane, first.binding().reply_object, 71)
+        .suspend_running(
+            lane,
+            first.current_binding(&f.lanes).unwrap().reply_object,
+            71,
+        )
         .unwrap();
     let second = f.ready(2);
     let mut cursor = f.activations.completion_cursor();
@@ -201,10 +205,18 @@ fn unfinished_row_becoming_ready_behind_selection_waits_for_next_pass() {
         Some(second)
     );
     f.lanes
-        .resume_external(lane, first.binding().reply_object, 71)
+        .resume_external(
+            lane,
+            first.current_binding(&f.lanes).unwrap().reply_object,
+            71,
+        )
         .unwrap();
     f.lanes
-        .retire_external_running(lane, first.binding().reply_object, 71)
+        .retire_external_running(
+            lane,
+            first.current_binding(&f.lanes).unwrap().reply_object,
+            71,
+        )
         .unwrap();
     let first = f.complete(first);
     f.activations
@@ -223,7 +235,7 @@ fn unfinished_row_becoming_ready_behind_selection_waits_for_next_pass() {
 fn terminal_pending_is_invisible_until_exact_terminal_retirement() {
     let mut f = Fixture::new();
     let (lane, caller) = f.running(1);
-    let reply = caller.binding().reply_object;
+    let reply = caller.current_binding(&f.lanes).unwrap().reply_object;
     let key = SuspensionKey::provider_wait(71);
     f.lanes
         .admit_running(lane, reply, key, 1, caller.owner(), 123)

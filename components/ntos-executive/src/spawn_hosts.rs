@@ -2268,7 +2268,7 @@ pub(crate) unsafe fn component_pump_resume_kernel_provider_wait(
     previous: &PumpResult,
 ) -> Result<PumpResult, u32> {
     let caller = ch.kernel_caller.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-    let binding = caller.binding();
+    let binding = crate::service_sec_image::kernel_provider_current_binding(caller)?;
     if ch.logical_caller.is_some()
         || ch.client_pi != 0
         || ch.client_generation != 0

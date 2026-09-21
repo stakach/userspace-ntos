@@ -51,7 +51,8 @@ pub struct KernelProviderCaller {
     catalog: CatalogIdentity,
     provider: ProviderDomainIdentity,
     dispatch: LaneDispatchIdentity,
-    binding: LaneBinding,
+    executor_id: u64,
+    receive_endpoint: u64,
     thread: ThreadLifetime,
 }
 
@@ -67,8 +68,36 @@ impl KernelProviderCaller {
         }
     }
 
-    pub const fn binding(self) -> LaneBinding {
-        self.binding
+    pub const fn executor_id(self) -> u64 {
+        self.executor_id
+    }
+
+    pub const fn receive_endpoint(self) -> u64 {
+        self.receive_endpoint
+    }
+
+    pub const fn dispatch(self) -> LaneDispatchIdentity {
+        self.dispatch
+    }
+
+    /// Resolve transport only under the original physical execution identity. This is routing
+    /// metadata, not activation admission; callers must still validate the retained row and Ps
+    /// lifetime. Reply changes are valid only through canonical same-epoch ownership transitions.
+    pub fn current_binding<C, R, T>(
+        self,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+    ) -> Result<LaneBinding, u32> {
+        let binding = lanes
+            .binding(self.dispatch.lane())
+            .map_err(|_| STATUS_INVALID_HANDLE)?;
+        if lanes.active_dispatch_identity(self.dispatch.lane()) != Ok(Some(self.dispatch))
+            || binding.executor_id != self.executor_id
+            || binding.receive_endpoint != self.receive_endpoint
+            || binding.reply_object == 0
+        {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        Ok(binding)
     }
 
     pub const fn thread(self) -> ThreadLifetime {
@@ -222,7 +251,8 @@ impl<D> KernelProviderActivations<D> {
                 catalog: catalog_identity,
                 provider,
                 dispatch,
-                binding,
+                executor_id: binding.executor_id,
+                receive_endpoint: binding.receive_endpoint,
                 thread: reference.thread_lifetime(),
             };
             Ok((caller, reference))
@@ -284,7 +314,7 @@ impl<D> KernelProviderActivations<D> {
                 Ok(LanePhase::Running | LanePhase::Suspended)
             )
             || lanes.active_dispatch_identity(lane) != Ok(Some(caller.dispatch))
-            || lanes.binding(lane) != Ok(caller.binding)
+            || caller.current_binding(lanes).is_err()
         {
             return Err(STATUS_INVALID_HANDLE);
         }
@@ -327,7 +357,7 @@ impl<D> KernelProviderActivations<D> {
         request: ProviderWaitRequest,
     ) -> Result<KernelProviderWaitCapture, u32> {
         self.validate(caller, pm, catalog, lanes)?;
-        if bound_reply != caller.binding.reply_object
+        if bound_reply != caller.current_binding(lanes)?.reply_object
             || !progress.observed_provider_wait(bound_reply)
             || request
                 .validate()
@@ -359,9 +389,13 @@ impl<D> KernelProviderActivations<D> {
         expected_message_info: u64,
     ) -> Result<(), u32> {
         self.validate(caller, pm, catalog, lanes)?;
-        if envelope.badge != 0
+        let expected_badge = lanes
+            .peer_route(caller.dispatch.lane())
+            .map_err(|_| STATUS_INVALID_HANDLE)?
+            .map_or(0, |route| route.badge());
+        if envelope.badge != expected_badge
             || envelope.reply_cap == 0
-            || envelope.reply_cap != caller.binding.reply_object
+            || envelope.reply_cap != caller.current_binding(lanes)?.reply_object
             || envelope.message_info != expected_message_info
         {
             return Err(STATUS_INVALID_PARAMETER);
@@ -381,14 +415,7 @@ impl<D> KernelProviderActivations<D> {
         expected_message_info: u64,
         request: &ProviderWaitRequest,
     ) -> Result<(), u32> {
-        self.validate_service_call(
-            caller,
-            pm,
-            catalog,
-            lanes,
-            envelope,
-            expected_message_info,
-        )?;
+        self.validate_service_call(caller, pm, catalog, lanes, envelope, expected_message_info)?;
         let request = request.validate().map_err(|_| STATUS_INVALID_PARAMETER)?;
         if request.owner != caller.owner() {
             return Err(STATUS_INVALID_PARAMETER);
@@ -450,7 +477,14 @@ impl<D> KernelProviderActivations<D> {
         self.validate_resume(caller, pm, catalog, lanes, key)
             .map_err(KernelProviderResumeError::Authority)?;
         lanes
-            .begin_resume(caller.dispatch.lane(), caller.binding.reply_object, key)
+            .begin_resume(
+                caller.dispatch.lane(),
+                caller
+                    .current_binding(lanes)
+                    .map_err(KernelProviderResumeError::Authority)?
+                    .reply_object,
+                key,
+            )
             .map_err(KernelProviderResumeError::Lane)
     }
 
@@ -474,6 +508,14 @@ impl<D> KernelProviderActivations<D> {
         }
         self.validate_resume(caller, pm, catalog, lanes, capture.key())
             .map_err(KernelProviderResumeError::Authority)?;
+        if capture.observation.reply_cap()
+            != caller
+                .current_binding(lanes)
+                .map_err(KernelProviderResumeError::Authority)?
+                .reply_object
+        {
+            return Err(KernelProviderResumeError::Authority(STATUS_INVALID_HANDLE));
+        }
         if lanes
             .top(caller.dispatch.lane())
             .map_err(KernelProviderResumeError::Lane)?
@@ -513,7 +555,14 @@ impl<D> KernelProviderActivations<D> {
             .prepare_resume(capture)
             .map_err(KernelProviderResumeError::Pump)?;
         let selection = lanes
-            .begin_resume(caller.dispatch.lane(), caller.binding.reply_object, capture.key())
+            .begin_resume(
+                caller.dispatch.lane(),
+                caller
+                    .current_binding(lanes)
+                    .map_err(KernelProviderResumeError::Authority)?
+                    .reply_object,
+                capture.key(),
+            )
             .map_err(KernelProviderResumeError::Lane)?;
         state.commit_resume(capture, &attempt);
         Ok(KernelProviderWaitResume {
@@ -583,7 +632,10 @@ impl<D> KernelProviderActivations<D> {
             .find(|row| row.caller == caller)
             .ok_or(STATUS_INVALID_HANDLE)?;
         lanes
-            .finish_dispatch(caller.dispatch.lane(), caller.binding.reply_object)
+            .finish_dispatch(
+                caller.dispatch.lane(),
+                caller.current_binding(lanes)?.reply_object,
+            )
             .map_err(|_| STATUS_INVALID_HANDLE)?;
         row.completion = Some(Completion::Ready(status));
         Ok(KernelProviderCompletionReceipt { caller, status })
@@ -622,7 +674,10 @@ impl<D> KernelProviderActivations<D> {
         let terminal = lanes
             .retain_local_terminal_running(
                 lane,
-                caller.binding.reply_object,
+                caller
+                    .current_binding(lanes)
+                    .expect("validated retained binding")
+                    .reply_object,
                 key,
                 caller.owner(),
                 payload,
@@ -659,14 +714,14 @@ impl<D> KernelProviderActivations<D> {
             || terminal.owner() != caller.owner()
             || terminal.external_token().is_some()
             || lanes.active_dispatch_identity(lane) != Ok(Some(caller.dispatch))
-            || lanes.binding(lane) != Ok(caller.binding)
+            || caller.current_binding(lanes).is_err()
             || lanes.suspension_count(lane) != Ok(1)
             || lanes.external_depth(lane) != Ok(0)
         {
             return Err(STATUS_INVALID_HANDLE);
         }
         lanes
-            .terminal(terminal, caller.binding.reply_object)
+            .terminal(terminal, caller.current_binding(lanes)?.reply_object)
             .map_err(|_| STATUS_INVALID_HANDLE)?;
         Ok(())
     }
@@ -696,9 +751,11 @@ impl<D> KernelProviderActivations<D> {
             unreachable!("validated terminal destination lost its result");
         };
         lanes
-            .with_terminal_payload(attempt, caller.binding.reply_object, |payload| {
-                deliver(&mut row.recipient, payload, status)
-            })
+            .with_terminal_payload(
+                attempt,
+                caller.current_binding(lanes)?.reply_object,
+                |payload| deliver(&mut row.recipient, payload, status),
+            )
             .map_err(|_| STATUS_INVALID_HANDLE)
     }
 
@@ -726,7 +783,7 @@ impl<D> KernelProviderActivations<D> {
         };
         if !matches!(
             lanes
-                .terminal(terminal, caller.binding.reply_object)
+                .terminal(terminal, caller.current_binding(lanes)?.reply_object)
                 .map_err(|_| STATUS_INVALID_HANDLE)?
                 .phase,
             TerminalPhase::Acknowledged { .. }
@@ -734,7 +791,11 @@ impl<D> KernelProviderActivations<D> {
             return Err(STATUS_INVALID_HANDLE);
         }
         let Some(retired) = lanes
-            .finish_terminal(terminal, caller.binding.reply_object, local_retirement)
+            .finish_terminal(
+                terminal,
+                caller.current_binding(lanes)?.reply_object,
+                local_retirement,
+            )
             .map_err(|_| STATUS_INVALID_HANDLE)?
         else {
             return Ok(None);

@@ -56,6 +56,302 @@ fn observed(reply_cap: u64, mask: u8) -> KernelProviderPumpProgress {
     progress
 }
 
+#[test]
+fn shared_interim_handoff_preserves_caller_but_rejects_old_transport_observations() {
+    use nt_component_suspension::{
+        peer_registry::PeerRegistry, ComponentIngress, IngressExecutionOwner,
+        IngressReceiveDisposition, IngressReceiver, IngressReplyObservation, IngressReplyPool,
+        ReplyBindingObservation,
+    };
+    let mut pm = bootstrap().into_parts().pm;
+    let native = requestor(&mut pm, 0x3000);
+    let mut catalog = ProviderDomainCatalog::new();
+    let provider = catalog.register().unwrap();
+    let mut lanes = ComponentSuspensionLanes::<KernelProviderWaitCapture, u32, ()>::new(1, 4);
+    let mut peers = PeerRegistry::new(22, 1);
+    let (lane, mut registration) = lanes
+        .allocate_shared_staged(
+            &mut peers,
+            provider.domain,
+            provider.generation,
+            LaneBinding {
+                executor_id: 11,
+                receive_endpoint: 22,
+                reply_object: 33,
+            },
+        )
+        .unwrap();
+    let route = peers
+        .publish_lane(
+            &mut registration,
+            provider.domain,
+            provider.generation,
+            &lanes,
+        )
+        .unwrap();
+    lanes
+        .begin_startup(lane, 33, |_, _| Ok::<_, u8>(ReplyBindingObservation::Free))
+        .unwrap();
+    lanes
+        .complete_startup(lane, 33, |_, _| {
+            Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)
+        })
+        .unwrap();
+    let mut receiver = IngressReceiver::new(22, 40, 2).unwrap();
+    receiver.begin_receive(&lanes).unwrap();
+    receiver.capture(1u64).ok().unwrap();
+    receiver
+        .resolve(IngressReceiveDisposition::Call)
+        .ok()
+        .unwrap();
+    receiver
+        .retain(
+            &lanes,
+            ComponentIngress::new(22, 41).unwrap(),
+            &mut peers,
+            route.badge(),
+            |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget),
+        )
+        .ok()
+        .unwrap();
+    let mut pool = IngressReplyPool::new(22, 1).unwrap();
+    let dispatch = pool
+        .admit(
+            &mut receiver,
+            route,
+            &mut lanes,
+            &peers,
+            provider.domain,
+            provider.generation,
+            |_, reply| {
+                Ok::<_, u8>(if reply == 33 {
+                    ReplyBindingObservation::Free
+                } else {
+                    ReplyBindingObservation::BoundToTarget
+                })
+            },
+        )
+        .unwrap();
+    let mut activations = KernelProviderActivations::new();
+    let caller = activations
+        .capture_with_recipient(
+            &mut pm,
+            &catalog,
+            &lanes,
+            provider,
+            lane,
+            native,
+            crate::provider_kernel_wait::KernelProviderWaitState::new(40).unwrap(),
+        )
+        .unwrap();
+    let old_progress = observed(40, 4);
+    let wait = request(caller.owner());
+    let mut initial = activations
+        .recipient_mut(caller)
+        .unwrap()
+        .begin_initial()
+        .unwrap();
+    let wait_facts = KernelProviderPumpFacts {
+        observed_at: nt_kernel_exec::TimeSnapshot {
+            monotonic_100ns: 10,
+            system_time_100ns: 100,
+            clock_generation: 0,
+        },
+        reply_cap: 40,
+        completed: false,
+        callback_suspended: false,
+        provider_wait_suspended: true,
+        lpc_wait_suspended: false,
+        scheduler_yielded: false,
+    };
+    activations
+        .recipient_mut(caller)
+        .unwrap()
+        .observe(&mut initial, wait_facts, None)
+        .unwrap();
+    let old_capture = activations
+        .capture_provider_wait(
+            caller,
+            &pm,
+            &catalog,
+            &lanes,
+            40,
+            activations.recipient(caller).unwrap().progress(),
+            wait,
+        )
+        .unwrap();
+    activations
+        .recipient_mut(caller)
+        .unwrap()
+        .retain_provider_wait(wait, Ok(old_capture))
+        .unwrap();
+    lanes
+        .admit_running(lane, 40, old_capture.key(), 1, caller.owner(), old_capture)
+        .unwrap();
+    lanes.select(old_capture.key(), 0).unwrap();
+    let (_, mut resume_attempt, _) = activations
+        .begin_wait_resume(caller, &pm, &catalog, &mut lanes, old_capture)
+        .unwrap()
+        .into_parts();
+    receiver
+        .reply_stored(
+            route,
+            dispatch,
+            &lanes,
+            |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget),
+            |_| IngressReplyObservation::Acknowledged,
+        )
+        .unwrap();
+    receiver
+        .begin_receive_for_owner(&lanes, IngressExecutionOwner::Dispatch(dispatch))
+        .unwrap();
+    receiver.capture(2u64).ok().unwrap();
+    receiver
+        .resolve(IngressReceiveDisposition::Call)
+        .ok()
+        .unwrap();
+    receiver
+        .retain(
+            &lanes,
+            ComponentIngress::new(22, 42).unwrap(),
+            &mut peers,
+            route.badge(),
+            |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget),
+        )
+        .ok()
+        .unwrap();
+    let mut pending = None;
+    receiver
+        .adopt_interim_call(
+            route,
+            dispatch,
+            41,
+            &mut lanes,
+            &mut peers,
+            &mut pending,
+            |_, reply| {
+                Ok::<_, u8>(if reply == 40 {
+                    ReplyBindingObservation::Free
+                } else {
+                    ReplyBindingObservation::BoundToTarget
+                })
+            },
+        )
+        .unwrap();
+    assert_eq!(caller.current_binding(&lanes).unwrap().reply_object, 41);
+    assert_eq!(activations.validate(caller, &pm, &catalog, &lanes), Ok(()));
+    assert_eq!(
+        activations.validate_wait_execution(
+            caller,
+            &pm,
+            &catalog,
+            &lanes,
+            old_capture,
+            &resume_attempt
+        ),
+        Ok(())
+    );
+    let yielded = KernelProviderPumpFacts {
+        reply_cap: 41,
+        provider_wait_suspended: false,
+        scheduler_yielded: true,
+        ..wait_facts
+    };
+    activations
+        .recipient_mut(caller)
+        .unwrap()
+        .observe_current(&mut resume_attempt, yielded, None, 41)
+        .unwrap();
+    let receive_attempt = activations
+        .recipient_mut(caller)
+        .unwrap()
+        .begin_receive_after_yield()
+        .unwrap();
+    assert_eq!(
+        activations.validate_wait_execution(
+            caller,
+            &pm,
+            &catalog,
+            &lanes,
+            old_capture,
+            &receive_attempt
+        ),
+        Ok(())
+    );
+    assert!(activations
+        .capture_provider_wait(caller, &pm, &catalog, &lanes, 40, &old_progress, wait)
+        .is_err());
+    assert!(activations
+        .capture_provider_wait(caller, &pm, &catalog, &lanes, 41, &old_progress, wait)
+        .is_err());
+    let envelope = KernelProviderServiceEnvelope {
+        badge: route.badge(),
+        message_info: 77 << 12,
+        reply_cap: 40,
+    };
+    assert!(activations
+        .validate_service_call(caller, &pm, &catalog, &lanes, envelope, 77 << 12)
+        .is_err());
+    assert_eq!(
+        activations.validate_service_call(
+            caller,
+            &pm,
+            &catalog,
+            &lanes,
+            KernelProviderServiceEnvelope {
+                reply_cap: 41,
+                ..envelope
+            },
+            77 << 12
+        ),
+        Ok(())
+    );
+    for badge in [0, route.badge() + 1] {
+        assert!(activations
+            .validate_service_call(
+                caller,
+                &pm,
+                &catalog,
+                &lanes,
+                KernelProviderServiceEnvelope {
+                    badge,
+                    reply_cap: 41,
+                    ..envelope
+                },
+                77 << 12
+            )
+            .is_err());
+    }
+    let mut progress = KernelProviderPumpProgress::new(40).unwrap();
+    let mut attempt = progress.begin_initial().unwrap();
+    let facts = KernelProviderPumpFacts {
+        observed_at: old_capture.observed_at(),
+        reply_cap: 41,
+        completed: false,
+        callback_suspended: false,
+        provider_wait_suspended: true,
+        lpc_wait_suspended: false,
+        scheduler_yielded: false,
+    };
+    progress
+        .observe_current(
+            &mut attempt,
+            facts,
+            None,
+            caller.current_binding(&lanes).unwrap().reply_object,
+        )
+        .unwrap();
+    assert!(!progress.observed_provider_wait(40));
+    let current = activations
+        .capture_provider_wait(caller, &pm, &catalog, &lanes, 41, &progress, wait)
+        .unwrap();
+    assert_eq!(current.caller(), old_capture.caller());
+    assert_ne!(current.observation(), old_capture.observation());
+    assert!(progress
+        .observe_current(&mut attempt, facts, None, 41)
+        .is_err());
+}
+
 struct Fixture {
     pm: ProcessManager,
     catalog: ProviderDomainCatalog,
@@ -65,6 +361,7 @@ struct Fixture {
     caller: KernelProviderCaller,
     progress: KernelProviderPumpProgress,
     request: ProviderWaitRequest,
+    received_reply: u64,
 }
 
 impl Fixture {
@@ -80,6 +377,7 @@ impl Fixture {
         let caller = activations
             .capture(&mut pm, &catalog, &lanes, provider, lane, native)
             .unwrap();
+        let received_reply = caller.current_binding(&lanes).unwrap().reply_object;
         Self {
             pm,
             catalog,
@@ -89,6 +387,7 @@ impl Fixture {
             caller,
             progress: observed(binding(1).reply_object, 4),
             request: request(caller.owner()),
+            received_reply,
         }
     }
 
@@ -98,7 +397,7 @@ impl Fixture {
             &self.pm,
             &self.catalog,
             &self.lanes,
-            self.caller.binding.reply_object,
+            self.received_reply,
             &self.progress,
             self.request,
         )
@@ -150,13 +449,13 @@ fn capture_owns_copied_request_without_admitting_wait_or_execution() {
     );
     assert!(f
         .progress
-        .observed_provider_wait(f.caller.binding.reply_object));
+        .observed_provider_wait(f.caller.current_binding(&f.lanes).unwrap().reply_object));
 }
 
 #[test]
 fn only_exact_provider_wait_stop_and_reply_can_be_captured() {
     let mut f = Fixture::new();
-    let reply = f.caller.binding.reply_object;
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
     for mask in 0..32 {
         f.progress = observed(reply, mask);
         assert_eq!(f.progress.observed_provider_wait(reply), mask == 4);
@@ -188,7 +487,7 @@ fn only_exact_provider_wait_stop_and_reply_can_be_captured() {
 #[test]
 fn fresh_or_unobserved_pump_is_not_a_stopped_wait() {
     let mut f = Fixture::new();
-    let reply = f.caller.binding.reply_object;
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
     f.progress = KernelProviderPumpProgress::new(reply).unwrap();
     assert!(!f.progress.observed_provider_wait(reply));
     assert_eq!(f.capture(), Err(STATUS_INVALID_PARAMETER));
@@ -222,7 +521,7 @@ fn malformed_wire_requests_are_rejected_without_lane_or_reference_effects() {
         f.assert_unmodified();
         assert!(f
             .progress
-            .observed_provider_wait(f.caller.binding.reply_object));
+            .observed_provider_wait(f.caller.current_binding(&f.lanes).unwrap().reply_object));
     }
 }
 
@@ -278,7 +577,7 @@ fn foreign_authority_and_retired_provider_do_not_capture_request() {
             &other_pm,
             &f.catalog,
             &f.lanes,
-            f.caller.binding.reply_object,
+            f.caller.current_binding(&f.lanes).unwrap().reply_object,
             &f.progress,
             f.request,
         ),
@@ -292,7 +591,7 @@ fn foreign_authority_and_retired_provider_do_not_capture_request() {
             &f.pm,
             &other_catalog,
             &f.lanes,
-            f.caller.binding.reply_object,
+            f.caller.current_binding(&f.lanes).unwrap().reply_object,
             &f.progress,
             f.request,
         ),
@@ -310,7 +609,7 @@ fn foreign_authority_and_retired_provider_do_not_capture_request() {
             &f.pm,
             &f.catalog,
             &other_lanes,
-            f.caller.binding.reply_object,
+            f.caller.current_binding(&f.lanes).unwrap().reply_object,
             &f.progress,
             f.request,
         ),
@@ -325,7 +624,7 @@ fn foreign_authority_and_retired_provider_do_not_capture_request() {
 fn old_dispatch_and_suspended_lane_cannot_capture_fresh_provider_request() {
     let mut f = Fixture::new();
     let lane = f.caller.dispatch.lane();
-    let reply = f.caller.binding.reply_object;
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
     f.lanes.suspend_running(lane, reply, 91).unwrap();
     assert_eq!(f.capture(), Err(STATUS_INVALID_HANDLE));
     assert_eq!(f.lanes.phase(lane), Ok(LanePhase::Suspended));
@@ -357,5 +656,5 @@ fn exited_original_caller_is_retained_but_cannot_capture_new_wait() {
     f.assert_unmodified();
     assert!(f
         .progress
-        .observed_provider_wait(f.caller.binding.reply_object));
+        .observed_provider_wait(f.caller.current_binding(&f.lanes).unwrap().reply_object));
 }

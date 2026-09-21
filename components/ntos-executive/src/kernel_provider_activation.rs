@@ -75,7 +75,7 @@ fn authenticated_channel_caller(
     if !kernel_channel(channel)
         || channel.shared_va != win32k_subsystem::WIN32K_SHARED_VADDR
         || channel.dispatch_label != win32k_subsystem::W32_DISPATCH_LABEL
-        || caller.binding() != channel_binding(channel)
+        || unsafe { kernel_provider_current_binding(caller) } != Ok(channel_binding(channel))
         || !unsafe { (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller) }
             .is_ok_and(|recipient| recipient.matches(channel))
         || current_win32k_provider_domain().is_none_or(|provider| {
@@ -243,6 +243,9 @@ unsafe fn receive_driver_entry_yields(
         // Dedicated IRQ workers can perform nested IPC. Recheck authority after those effects,
         // without minting another attempt or permitting a failed entered continuation to replay.
         validate_driver_entry_execution(caller, capture, &receive_attempt)?;
+        let receiving = (&*core::ptr::addr_of!(ACTIVATIONS))
+            .recipient(caller)?
+            .execution_channel(caller)?;
         result = spawn_hosts::component_pump_continue_receive(&receiving, &previous)?;
         observe_driver_entry_pump(&receiving, &mut receive_attempt, &result)?;
     }
@@ -340,7 +343,17 @@ unsafe fn observe_driver_entry_pump(
     attempt: &mut KernelProviderPumpAttempt,
     result: &spawn_hosts::PumpResult,
 ) -> Result<(), u32> {
-    let caller = authenticated_channel_caller(channel)?;
+    let caller = channel.kernel_caller.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    // An interim Call can change the canonical Reply during this attempt. Reconstruct the
+    // transport snapshot before validating the stop; the original attempt remains unchanged.
+    let current = (&*core::ptr::addr_of!(ACTIVATIONS))
+        .recipient(caller)?
+        .execution_channel(caller)?;
+    if authenticated_channel_caller(&current)? != caller
+        || !(&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?.matches(channel)
+    {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
     let facts = KernelProviderPumpFacts {
         observed_at: nt_time_snapshot(),
         reply_cap: result.reply_cap,
@@ -350,12 +363,12 @@ unsafe fn observe_driver_entry_pump(
         lpc_wait_suspended: result.lpc_wait_suspended,
         scheduler_yielded: result.scheduler_yielded,
     };
-    let status = facts.is_return(channel.reply_cap).then(|| {
+    let status = facts.is_return(current.reply_cap).then(|| {
         core::ptr::read_volatile((channel.shared_va + win32k_subsystem::SH_DE_STATUS) as *const u32)
     });
     (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
         .recipient_mut(caller)?
-        .observe(attempt, *result, facts, status)?;
+        .observe(attempt, *result, facts, status, current.reply_cap)?;
     if result.provider_wait_suspended {
         let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
             as *const nt_provider_wait::ProviderWaitSharedPage;

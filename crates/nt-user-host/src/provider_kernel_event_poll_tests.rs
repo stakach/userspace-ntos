@@ -198,7 +198,7 @@ fn event_poll_requires_exact_request_owner_and_valid_abi() {
         );
     }
     let mut forged = f.caller;
-    forged.binding.executor_id += 1;
+    forged.executor_id += 1;
     assert_eq!(
         validate(&f, forged, f.wait_envelope(), &request(&f)),
         Err(STATUS_INVALID_HANDLE)
@@ -265,7 +265,7 @@ fn event_poll_refuses_suspended_replaced_and_completed_activation() {
     let mut f = Fixture::new();
     let request = request(&f);
     let lane = f.caller.dispatch.lane();
-    let reply = f.caller.binding.reply_object;
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
     f.lanes.suspend_running(lane, reply, 91).unwrap();
     assert_eq!(
         validate(&f, f.caller, f.wait_envelope(), &request),

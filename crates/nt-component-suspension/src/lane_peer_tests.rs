@@ -32,6 +32,10 @@ fn shared_allocation_stages_distinct_authenticated_peers_without_execution() {
     }
     let ar = peers.publish_lane(&mut a, 7, 8, &lanes).unwrap();
     let br = peers.publish_lane(&mut b, 7, 8, &lanes).unwrap();
+    assert_eq!(lanes.peer_route(first), Ok(Some(ar)));
+    assert_eq!(lanes.peer_route(second), Ok(Some(br)));
+    let stale = LaneHandle { generation: first.generation + 1, ..first };
+    assert!(lanes.peer_route(stale).is_err());
     assert_eq!(peers.resolve_lane(ar.badge(), 7, 8, &lanes), Ok(ar));
     assert_eq!(peers.resolve_lane(br.badge(), 7, 8, &lanes), Ok(br));
     assert_eq!(lanes.running(), None);
@@ -99,7 +103,8 @@ fn unpublished_peers_from_different_domains_can_share_ingress() {
 
 #[test]
 fn private_and_shared_endpoint_ownership_cannot_mix() {
-    let (mut private, _, mut peers) = setup();
+    let (mut private, lane, mut peers) = setup();
+    assert_eq!(private.peer_route(lane), Ok(None));
     assert_eq!(
         private
             .allocate_shared_staged(&mut peers, 9, 10, second_binding())

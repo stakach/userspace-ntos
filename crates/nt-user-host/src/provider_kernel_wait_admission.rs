@@ -41,16 +41,14 @@ impl<D: KernelProviderWaitRecipient> KernelProviderActivations<D> {
         capture: KernelProviderWaitCapture,
     ) -> Result<(), u32> {
         self.validate(caller, pm, catalog, lanes)?;
-        if capture.caller() != caller
-            || lanes.external_depth(caller.dispatch.lane()) != Ok(0)
-        {
+        if capture.caller() != caller || lanes.external_depth(caller.dispatch.lane()) != Ok(0) {
             return Err(STATUS_INVALID_HANDLE);
         }
         let state = self.recipient_mut(caller)?.kernel_wait_state();
         if state.captured_wait() != Some(capture)
             || state
                 .progress()
-                .provider_wait_observation(caller.binding.reply_object)
+                .provider_wait_observation(caller.current_binding(lanes)?.reply_object)
                 != Some(capture.observation())
             || state.active_resume() != previous
         {
@@ -155,7 +153,10 @@ impl<D: KernelProviderWaitRecipient> KernelProviderActivations<D> {
                         None => lanes
                             .admit_running_owned(
                                 caller.dispatch.lane(),
-                                caller.binding.reply_object,
+                                caller
+                                    .current_binding(lanes)
+                                    .expect("validated wait publication")
+                                    .reply_object,
                                 capture.key(),
                                 sequence,
                                 caller.owner(),
@@ -165,7 +166,10 @@ impl<D: KernelProviderWaitRecipient> KernelProviderActivations<D> {
                         Some(previous) => lanes
                             .rearm_running_owned(
                                 caller.dispatch.lane(),
-                                caller.binding.reply_object,
+                                caller
+                                    .current_binding(lanes)
+                                    .expect("validated wait publication")
+                                    .reply_object,
                                 previous.key(),
                                 capture.key(),
                                 sequence,

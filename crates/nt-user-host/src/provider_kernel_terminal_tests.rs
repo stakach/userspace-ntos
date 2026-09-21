@@ -44,7 +44,10 @@ impl Fixture {
         self.lanes
             .admit_running(
                 self.caller.dispatch.lane(),
-                self.caller.binding.reply_object,
+                self.caller
+                    .current_binding(&self.lanes)
+                    .unwrap()
+                    .reply_object,
                 self.key,
                 1,
                 self.caller.owner(),
@@ -58,7 +61,10 @@ impl Fixture {
         self.lanes
             .begin_resume(
                 self.caller.dispatch.lane(),
-                self.caller.binding.reply_object,
+                self.caller
+                    .current_binding(&self.lanes)
+                    .unwrap()
+                    .reply_object,
                 self.key,
             )
             .unwrap();
@@ -83,7 +89,11 @@ impl Fixture {
     }
 
     fn ack_stage(&mut self, terminal: TerminalIdentity, stage: TerminalStage) {
-        let reply = self.caller.binding.reply_object;
+        let reply = self
+            .caller
+            .current_binding(&self.lanes)
+            .unwrap()
+            .reply_object;
         let mut attempt = self
             .lanes
             .begin_terminal_stage(terminal, reply, stage)
@@ -118,7 +128,11 @@ fn terminal_admission_rejects_wrong_phase_key_owner_catalog_and_manager_atomical
     assert_eq!(f.retain(), Err((STATUS_INVALID_HANDLE, PAYLOAD)));
     let lane = f.caller.dispatch.lane();
     f.lanes
-        .begin_resume(lane, f.caller.binding.reply_object, f.key)
+        .begin_resume(
+            lane,
+            f.caller.current_binding(&f.lanes).unwrap().reply_object,
+            f.key,
+        )
         .unwrap();
     let original_key = f.key;
     f.key = SuspensionKey::provider_wait(72);
@@ -173,7 +187,7 @@ fn extra_frames_and_external_tokens_prevent_whole_activation_completion() {
     for external in [false, true] {
         let mut f = Fixture::new();
         let lane = f.caller.dispatch.lane();
-        let reply = f.caller.binding.reply_object;
+        let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
         if external {
             f.lanes.suspend_running(lane, reply, 70).unwrap();
             f.lanes.resume_external(lane, reply, 70).unwrap();
@@ -240,7 +254,7 @@ fn cancellation_is_not_a_return_but_cancelled_resume_can_retain_its_actual_statu
     f.lanes
         .begin_resume(
             f.caller.dispatch.lane(),
-            f.caller.binding.reply_object,
+            f.caller.current_binding(&f.lanes).unwrap().reply_object,
             f.key,
         )
         .unwrap();
@@ -270,7 +284,7 @@ fn every_terminal_stage_preserves_pending_authority_on_failure_uncertainty_or_lo
         for mode in 0..3 {
             let mut f = Fixture::new();
             let terminal = f.pending();
-            let reply = f.caller.binding.reply_object;
+            let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
             for previous in &STAGES[..index] {
                 f.ack_stage(terminal, *previous);
             }
@@ -342,7 +356,7 @@ fn local_retirement_and_receipt_acknowledgment_retry_after_caller_and_provider_e
     f.pm.terminate_thread(f.caller.thread().thread_id(), 0)
         .unwrap();
     let terminal = f.retain().unwrap();
-    let reply = f.caller.binding.reply_object;
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
     for stage in STAGES {
         f.ack_stage(terminal, stage);
     }
@@ -414,6 +428,7 @@ fn retired_terminal_cannot_complete_a_replacement_lane_or_foreign_activation() {
     for replace_lane in [false, true] {
         let mut f = Fixture::new();
         let old_caller = f.caller;
+        let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
         let old = f.pending();
         for stage in STAGES {
             f.ack_stage(old, stage);
@@ -423,7 +438,6 @@ fn retired_terminal_cannot_complete_a_replacement_lane_or_foreign_activation() {
             .finish_terminal_completion(f.caller, &f.pm, &mut f.lanes, old, Ok(()))
             .unwrap()
             .unwrap();
-        let reply = f.caller.binding.reply_object;
         let lane = if replace_lane {
             f.lanes.release(f.caller.dispatch.lane(), reply).unwrap();
             let replacement = f.lanes.allocate(binding(1)).unwrap();

@@ -393,6 +393,14 @@ pub(crate) unsafe fn component_execution_lane_binding(
         .ok()
 }
 
+/// Current transport snapshot only. Admission still requires the retained activation, physical
+/// provider lifetime and phase-specific owner; a copied caller cannot authorize execution.
+pub(crate) unsafe fn kernel_provider_current_binding(
+    caller: nt_user_host::provider_kernel_activation::KernelProviderCaller,
+) -> Result<nt_component_suspension::LaneBinding, u32> {
+    caller.current_binding(&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+}
+
 fn component_execution_lane_reply(
     lanes: &nt_component_suspension::ComponentSuspensionLanes<
         ComponentNativeContinuation,

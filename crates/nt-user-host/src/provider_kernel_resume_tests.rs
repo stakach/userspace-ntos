@@ -208,7 +208,7 @@ fn waiting_wrong_key_owner_and_forged_binding_reject_without_mutation() {
     );
     f.lanes.frame_mut(lane, key).unwrap().unwrap().owner = f.caller.owner();
     let caller = f.caller;
-    f.caller.binding.reply_object += 1;
+    f.caller.receive_endpoint += 1;
     assert_eq!(
         f.assert_resume_rejected_unchanged(),
         KernelProviderResumeError::Authority(STATUS_INVALID_HANDLE)
@@ -247,7 +247,7 @@ fn same_lane_replacement_dispatch_cannot_resume_previous_activation() {
     f.select(false);
     f.resume().unwrap();
     let lane = f.caller.dispatch.lane();
-    let reply = f.caller.binding.reply_object;
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
     let terminal = f
         .lanes
         .retain_terminal_running(lane, reply, f.key, f.caller.owner(), 99)

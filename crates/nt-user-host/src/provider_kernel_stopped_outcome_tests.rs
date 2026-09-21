@@ -48,7 +48,7 @@ fn captured_stop_does_not_survive_entry_or_authorize_a_later_observation() {
     f.lanes.select(f.capture.key(), 258).unwrap();
     let (_, mut attempt, _) = f.resume().unwrap().into_parts();
     assert_eq!(f.state().stopped_outcome(), Err(STATUS_INVALID_PARAMETER));
-    let reply = f.caller.binding.reply_object;
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
     let state = &mut f.activations.recipient_mut(f.caller).unwrap().state;
     state
         .observe(&mut attempt, facts(reply, false), None)

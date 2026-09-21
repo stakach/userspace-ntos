@@ -50,7 +50,7 @@ fn selected_and_cancelled_claims_validate_until_the_exact_entry_is_observed() {
         let (capture, mut attempt, _) = f.resume().unwrap().into_parts();
         assert_eq!(validate(&mut f, capture, &attempt), Ok(()));
         assert_eq!(validate(&mut f, capture, &attempt), Ok(()));
-        let reply = f.caller.binding.reply_object;
+        let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
         f.activations
             .recipient_mut(f.caller)
             .unwrap()
@@ -70,7 +70,7 @@ fn irq_yield_requires_fresh_receive_entry_without_reopening_the_wait_claim() {
     let mut f = Fixture::new();
     f.lanes.select(f.capture.key(), 258).unwrap();
     let (capture, mut resumed, _) = f.resume().unwrap().into_parts();
-    let reply = f.caller.binding.reply_object;
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
     let mut yielded = facts(reply, false);
     yielded.provider_wait_suspended = false;
     yielded.scheduler_yielded = true;
@@ -106,8 +106,12 @@ fn a_foreign_unconsumed_attempt_with_the_same_reply_number_is_not_execution() {
     let mut f = Fixture::new();
     let mut foreign = Fixture::new();
     assert_eq!(
-        f.caller.binding.reply_object,
-        foreign.caller.binding.reply_object
+        f.caller.current_binding(&f.lanes).unwrap().reply_object,
+        foreign
+            .caller
+            .current_binding(&foreign.lanes)
+            .unwrap()
+            .reply_object
     );
     f.lanes.select(f.capture.key(), 258).unwrap();
     foreign.lanes.select(foreign.capture.key(), 258).unwrap();
@@ -166,7 +170,7 @@ fn foreign_canonical_authorities_and_wrong_caller_refuse_the_claimed_entry() {
             .is_err());
     }
     let mut wrong = f.caller;
-    wrong.binding.reply_object += 1;
+    wrong.receive_endpoint += 1;
     assert!(f
         .activations
         .validate_wait_execution(wrong, &f.pm, &f.catalog, &f.lanes, capture, &attempt,)
@@ -219,7 +223,10 @@ fn paired_stale_frame_and_capture_cannot_replace_the_claimed_origin_across_irq_y
         assert_ne!(original, current);
         let (_, mut attempt, _) = f.resume().unwrap().into_parts();
         if after_yield {
-            let mut yielded = facts(f.caller.binding.reply_object, false);
+            let mut yielded = facts(
+                f.caller.current_binding(&f.lanes).unwrap().reply_object,
+                false,
+            );
             yielded.provider_wait_suspended = false;
             yielded.scheduler_yielded = true;
             let state = &mut f.activations.recipient_mut(f.caller).unwrap().state;

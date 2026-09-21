@@ -77,11 +77,11 @@ unsafe fn deliver_and_retire(
     caller: KernelProviderCaller,
     identity: TerminalIdentity,
 ) -> Result<(), u32> {
-    let reply = caller.binding().reply_object;
     let retired = with_provider_process_manager(|pm| {
         let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
         let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
         activations.validate_terminal_completion(caller, pm, lanes, identity)?;
+        let reply = caller.current_binding(lanes)?.reply_object;
         let phase = lanes
             .terminal(identity, reply)
             .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?

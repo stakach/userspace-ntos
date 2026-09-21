@@ -156,7 +156,11 @@ fn mislabeled_repark_retains_both_captures_until_exact_replacement() {
 fn rejected_discovery_does_not_block_later_work_or_restart_the_pass() {
     let (mut f, mut state) = fixture(true);
     f.lanes
-        .suspend_running(f.caller.dispatch.lane(), f.caller.binding.reply_object, 99)
+        .suspend_running(
+            f.caller.dispatch.lane(),
+            f.caller.current_binding(&f.lanes).unwrap().reply_object,
+            99,
+        )
         .unwrap();
     let object = f.capture.request().objects[0];
     let second = append_waiting_activation_with(&mut f, |request| request.objects[0] = object);

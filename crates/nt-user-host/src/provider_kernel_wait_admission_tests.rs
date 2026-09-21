@@ -9,12 +9,12 @@ use nt_provider_wait::{
     ProviderDispatcherWaitAdmission as Admission, ProviderDispatcherWaitArbiter, ProviderWaitOwner,
 };
 
-#[path = "provider_kernel_wait_work_tests.rs"]
-mod work;
-#[path = "provider_kernel_wait_origin_tests.rs"]
-mod origin;
 #[path = "provider_kernel_bootstrap_pass_tests.rs"]
 mod bootstrap_pass;
+#[path = "provider_kernel_wait_origin_tests.rs"]
+mod origin;
+#[path = "provider_kernel_wait_work_tests.rs"]
+mod work;
 
 struct Backing;
 impl ProviderEventBacking for Backing {
@@ -74,7 +74,7 @@ fn fixture(signaled: bool) -> (Fixture, DispatcherState) {
     assert_eq!(
         f.lanes.rollback_admission(
             f.caller.dispatch.lane(),
-            f.caller.binding.reply_object,
+            f.caller.current_binding(&f.lanes).unwrap().reply_object,
             f.capture.key()
         ),
         Ok(f.capture)
@@ -133,7 +133,7 @@ fn next_capture_at(
     update: impl FnOnce(&mut ProviderWaitRequest),
 ) -> KernelProviderWaitCapture {
     let (_, mut attempt, _) = f.resume().unwrap().into_parts();
-    let reply = f.caller.binding.reply_object;
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
     f.activations
         .recipient_mut(f.caller)
         .unwrap()
