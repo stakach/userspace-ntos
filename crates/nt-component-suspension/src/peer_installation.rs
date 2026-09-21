@@ -9,6 +9,10 @@ use crate::{ComponentSuspensionLanes, PeerLaneError};
 #[path = "peer_installation_tests.rs"]
 mod tests;
 
+#[path = "peer_startup.rs"]
+mod startup;
+pub use startup::PeerStartupError;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerInstallationPhase {
     Reserved,
@@ -19,6 +23,8 @@ pub enum PeerInstallationPhase {
     Exported,
     BindingSpace,
     SpaceBound,
+    Resuming,
+    ResumeAcknowledged,
     Deleting,
     Deleted,
     Aborted,
