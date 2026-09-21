@@ -44,6 +44,11 @@ jobs:
             /dll/win32/browseui/res/rebarbandsite.rgs
             /dll/win32/comctl32/amd64_microsoft.windows.common-controls_6595b64144ccf1df_5.82.2600.2982_none_deadbeef.manifest
             /dll/win32/comctl32/amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef.manifest
+            /win32ss/drivers/miniport/bochs/bochsmp.inf
+      - name: Stage hive-generator INF input
+        run: |
+          mkdir -p rust-micro/.tmp/reactos/reactos/inf
+          cp references/reactos/win32ss/drivers/miniport/bochs/bochsmp.inf rust-micro/.tmp/reactos/reactos/inf/bochsmp.inf
       - uses: dtolnay/rust-toolchain@stable
       - name: Workspace unit, integration and doc specs
         run: cargo test --workspace --locked 2>&1 | tee crate-specs.log

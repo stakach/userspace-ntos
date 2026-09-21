@@ -61,8 +61,8 @@ RUST_TEST_THREADS=1 cargo test --workspace --locked
 RUST_TEST_THREADS=1 cargo test -p nt-ntdll --features native_transport --locked
 ```
 
-A clean checkout also needs the four public ReactOS source fixtures at the pinned
-revision listed in [the CI checkout step](.github/workflows/ci.yml).
+A clean checkout also needs the public ReactOS source fixtures at the pinned
+revision and INF staging shown in [the CI setup steps](.github/workflows/ci.yml).
 No kernel build or proprietary Windows binaries are required. The optional
 Windows 7 export test requires a locally supplied `references/ntdll.dll`:
 `cargo test -p nt-pe-loader --test ntdll_exports -- --ignored`.
