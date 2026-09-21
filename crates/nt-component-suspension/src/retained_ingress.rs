@@ -2,8 +2,8 @@
 
 use crate::peer_registry::{PeerError, PeerRegistry, PeerRetention, PeerRoute};
 use crate::{
-    ComponentIngress, ComponentSuspensionLanes, IngressError, IngressReplyAttempt,
-    IngressReplyObservation, ReplyBindingObservation,
+    ComponentIngress, ComponentSuspensionLanes, IngressError, IngressExecutionOwner,
+    IngressReplyAttempt, IngressReplyObservation, ReplyBindingObservation,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,6 +119,28 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         badge: u64,
         query_binding: impl FnOnce(u64, u64) -> Result<ReplyBindingObservation, E>,
     ) -> Result<RetainedIngress<M>, (RetainedIngressError<E>, ComponentIngress<M>)> {
+        self.retain_peer_ingress_for_owner(
+            ingress,
+            replacement,
+            peers,
+            badge,
+            query_binding,
+            IngressExecutionOwner::Idle,
+        )
+    }
+
+    pub fn retain_peer_ingress_for_owner<M, E>(
+        &self,
+        ingress: &mut ComponentIngress<M>,
+        replacement: ComponentIngress<M>,
+        peers: &mut PeerRegistry,
+        badge: u64,
+        query_binding: impl FnOnce(u64, u64) -> Result<ReplyBindingObservation, E>,
+        owner: IngressExecutionOwner,
+    ) -> Result<RetainedIngress<M>, (RetainedIngressError<E>, ComponentIngress<M>)> {
+        if let Err(error) = self.validate_ingress_execution(owner) {
+            return Err((RetainedIngressError::Ingress(error), replacement));
+        }
         let route = match peers
             .resolve(badge)
             .or_else(|| peers.resolve_retiring(badge))
@@ -138,7 +160,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             Ok(retention) => retention,
             Err(error) => return Err((RetainedIngressError::Peer(error), replacement)),
         };
-        match self.handoff_ingress_call(ingress, replacement) {
+        match self.handoff_ingress_call_for_owner(ingress, replacement, owner) {
             Ok(ingress) => Ok(RetainedIngress {
                 ingress,
                 retention,

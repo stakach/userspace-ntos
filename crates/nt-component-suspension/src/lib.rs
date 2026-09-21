@@ -43,6 +43,7 @@ pub use receive_probe::{
 };
 pub use message::{IpcBufferSnapshot, ReceivedMessage, IPC_BUFFER_WORDS};
 pub use ingress::{
+    IngressExecutionOwner,
     ComponentIngress, IngressError, IngressObservation, IngressReceiveAttempt, IngressReplyAttempt,
     IngressReplyObservation, IngressReceiveDisposition,
 };

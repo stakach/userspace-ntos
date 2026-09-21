@@ -116,7 +116,11 @@ pub(super) struct TerminalRecord<T> {
 impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
     /// Provider execution and entered terminal mechanisms share the same execution fence.
     pub fn execution_busy(&self) -> bool {
-        self.running.is_some() || self.slots.iter().any(|slot| {
+        self.running.is_some() || self.terminal_execution_busy()
+    }
+
+    pub(super) fn terminal_execution_busy(&self) -> bool {
+        self.slots.iter().any(|slot| {
             slot.lane.as_ref().and_then(|lane| lane.terminal.as_ref())
                 .is_some_and(|record| matches!(record.phase, TerminalPhase::Invoking { .. }))
         })

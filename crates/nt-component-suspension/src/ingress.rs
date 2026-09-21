@@ -9,6 +9,7 @@ pub enum IngressError {
     InvalidBinding,
     ReplyInUse,
     ExecutionBusy,
+    ExecutionOwnerMismatch,
     NotReady,
     WrongAttempt,
     IdentityExhausted,
@@ -28,6 +29,14 @@ pub enum IngressObservation<M> {
 pub enum IngressReceiveDisposition {
     Call,
     NoCall,
+}
+
+/// Authority to receive while idle or on behalf of one exact currently running dispatch.
+/// This does not authorize another lane to execute or change any scheduling ownership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngressExecutionOwner {
+    Idle,
+    Dispatch(LaneDispatchIdentity),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -258,10 +267,39 @@ impl<M> ComponentIngress<M> {
 }
 
 impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
-    fn validate_ingress_reply(&self, reply: u64) -> Result<(), IngressError> {
-        if self.execution_busy() {
-            return Err(IngressError::ExecutionBusy);
+    pub(crate) fn validate_ingress_execution(
+        &self,
+        owner: IngressExecutionOwner,
+    ) -> Result<(), IngressError> {
+        match owner {
+            IngressExecutionOwner::Idle if self.execution_busy() => {
+                return Err(IngressError::ExecutionBusy)
+            }
+            IngressExecutionOwner::Idle => {}
+            IngressExecutionOwner::Dispatch(dispatch) => {
+                if self.terminal_execution_busy() {
+                    return Err(IngressError::ExecutionBusy);
+                }
+                let lane = self
+                    .lane(dispatch.lane)
+                    .map_err(|_| IngressError::ExecutionOwnerMismatch)?;
+                if self.running != Some(dispatch.lane)
+                    || lane.phase != LanePhase::Running
+                    || lane.dispatch != Some(dispatch)
+                {
+                    return Err(IngressError::ExecutionOwnerMismatch);
+                }
+            }
         }
+        Ok(())
+    }
+
+    fn validate_ingress_reply(
+        &self,
+        reply: u64,
+        owner: IngressExecutionOwner,
+    ) -> Result<(), IngressError> {
+        self.validate_ingress_execution(owner)?;
         if self.slots.iter().any(|slot| {
             slot.lane
                 .as_ref()
@@ -278,7 +316,15 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         &self,
         ingress: &mut ComponentIngress<M>,
     ) -> Result<IngressReceiveAttempt, IngressError> {
-        self.validate_ingress_reply(ingress.reply)?;
+        self.begin_ingress_receive_for_owner(ingress, IngressExecutionOwner::Idle)
+    }
+
+    pub fn begin_ingress_receive_for_owner<M>(
+        &self,
+        ingress: &mut ComponentIngress<M>,
+        owner: IngressExecutionOwner,
+    ) -> Result<IngressReceiveAttempt, IngressError> {
+        self.validate_ingress_reply(ingress.reply, owner)?;
         ingress.begin_receive(&NEXT_ATTEMPT)
     }
 
@@ -292,6 +338,15 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         ingress: &mut ComponentIngress<M>,
         replacement: ComponentIngress<M>,
     ) -> Result<ComponentIngress<M>, (IngressError, ComponentIngress<M>)> {
+        self.handoff_ingress_call_for_owner(ingress, replacement, IngressExecutionOwner::Idle)
+    }
+
+    pub fn handoff_ingress_call_for_owner<M>(
+        &self,
+        ingress: &mut ComponentIngress<M>,
+        replacement: ComponentIngress<M>,
+        owner: IngressExecutionOwner,
+    ) -> Result<ComponentIngress<M>, (IngressError, ComponentIngress<M>)> {
         let check = (|| {
             if ingress.phase != Phase::Held || replacement.phase != Phase::Ready {
                 return Err(IngressError::NotReady);
@@ -299,8 +354,8 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             if replacement.endpoint != ingress.endpoint || replacement.reply == ingress.reply {
                 return Err(IngressError::InvalidBinding);
             }
-            self.validate_ingress_reply(ingress.reply)?;
-            self.validate_ingress_reply(replacement.reply)
+            self.validate_ingress_reply(ingress.reply, owner)?;
+            self.validate_ingress_reply(replacement.reply, owner)
         })();
         if let Err(error) = check {
             return Err((error, replacement));

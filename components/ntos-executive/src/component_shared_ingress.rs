@@ -1,9 +1,9 @@
-//! Receive-only adapter for the shared ingress owner at idle scheduling boundaries.
-//! Private pumps remain in use until active-lane routing and ReplyRecv ownership are wired.
+//! Receive-only adapter for shared ingress with exact execution-owner admission.
+//! Private pumps remain in use until native routing and ReplyRecv ownership are wired.
 
 use core::convert::Infallible;
 use nt_component_suspension::{
-    classify_received_call, require_free_reply, ComponentSuspensionLanes,
+    classify_received_call, require_free_reply, ComponentSuspensionLanes, IngressExecutionOwner,
     IngressReceiveDisposition, IngressReceiver, ReceiveProbeError, ReceivedMessage,
     ReservedReceiveError, ReservedReceivePhase,
 };
@@ -20,6 +20,7 @@ pub(crate) enum ReceiveError {
 pub(crate) unsafe fn receive<C, R, T>(
     owner: &mut IngressReceiver<ReceivedMessage>,
     lanes: &ComponentSuspensionLanes<C, R, T>,
+    execution: IngressExecutionOwner,
     probe_tcb: u64,
     blocking: bool,
 ) -> Result<(), ReceiveError> {
@@ -31,7 +32,7 @@ pub(crate) unsafe fn receive<C, R, T>(
             .map_err(ReceiveError::Probe)?;
     }
     owner
-        .begin_receive(lanes)
+        .begin_receive_for_owner(lanes, execution)
         .map_err(ReceiveError::Ownership)?;
     let badge: u64;
     let info: u64;

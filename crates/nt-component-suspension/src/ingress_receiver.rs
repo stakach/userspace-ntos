@@ -4,9 +4,9 @@ use core::convert::Infallible;
 
 use crate::peer_registry::{PeerRegistry, PeerRoute};
 use crate::{
-    ComponentIngress, ComponentSuspensionLanes, IngressReceiveDisposition, ReplyBindingObservation,
-    ReservedIngressReceive, ReservedReceiveError, ReservedReceivePhase, RetainedWork,
-    RetainedWorkCheckout, RetainedWorkError, RetainedWorkFinishError,
+    ComponentIngress, ComponentSuspensionLanes, IngressExecutionOwner, IngressReceiveDisposition,
+    ReplyBindingObservation, ReservedIngressReceive, ReservedReceiveError, ReservedReceivePhase,
+    RetainedWork, RetainedWorkCheckout, RetainedWorkError, RetainedWorkFinishError,
 };
 
 #[cfg(test)]
@@ -73,10 +73,21 @@ impl<M> IngressReceiver<M> {
         &mut self,
         lanes: &ComponentSuspensionLanes<C, R, T>,
     ) -> Result<(), ReservedReceiveError<Infallible>> {
+        self.begin_receive_for_owner(lanes, IngressExecutionOwner::Idle)
+    }
+
+    pub fn begin_receive_for_owner<C, R, T>(
+        &mut self,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        owner: IngressExecutionOwner,
+    ) -> Result<(), ReservedReceiveError<Infallible>> {
         if self.receive.is_some() {
             return Err(ReservedReceiveError::InvalidPhase);
         }
-        self.receive = Some(self.store.begin_receive(lanes, &mut self.ingress)?);
+        self.receive = Some(
+            self.store
+                .begin_receive_for_owner(lanes, &mut self.ingress, owner)?,
+        );
         Ok(())
     }
 

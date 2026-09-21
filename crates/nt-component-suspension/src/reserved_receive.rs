@@ -4,9 +4,9 @@ use core::convert::Infallible;
 
 use crate::peer_registry::PeerRegistry;
 use crate::{
-    ComponentIngress, ComponentSuspensionLanes, IngressError, IngressReceiveAttempt,
-    IngressReceiveDisposition, ReplyBindingObservation, RetainedIngressError, RetainedWork,
-    RetainedWorkError, RetainedWorkReservation,
+    ComponentIngress, ComponentSuspensionLanes, IngressError, IngressExecutionOwner,
+    IngressReceiveAttempt, IngressReceiveDisposition, ReplyBindingObservation,
+    RetainedIngressError, RetainedWork, RetainedWorkError, RetainedWorkReservation,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,6 +39,7 @@ pub struct ReservedIngressReceive {
     reservation: Option<RetainedWorkReservation>,
     attempt: IngressReceiveAttempt,
     receive_identity: u64,
+    execution_owner: IngressExecutionOwner,
     endpoint: u64,
     reply: u64,
     phase: ReservedReceivePhase,
@@ -52,13 +53,22 @@ impl<M> RetainedWork<M> {
         lanes: &ComponentSuspensionLanes<C, R, T>,
         ingress: &mut ComponentIngress<M>,
     ) -> Result<ReservedIngressReceive, ReservedReceiveError<Infallible>> {
+        self.begin_receive_for_owner(lanes, ingress, IngressExecutionOwner::Idle)
+    }
+
+    pub fn begin_receive_for_owner<C, R, T>(
+        &mut self,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        ingress: &mut ComponentIngress<M>,
+        owner: IngressExecutionOwner,
+    ) -> Result<ReservedIngressReceive, ReservedReceiveError<Infallible>> {
         if ingress.endpoint() != self.endpoint() {
             return Err(ReservedReceiveError::WrongIngress);
         }
         let mut reservation = self
             .reserve(ingress.reply())
             .map_err(ReservedReceiveError::Store)?;
-        let attempt = match lanes.begin_ingress_receive(ingress) {
+        let attempt = match lanes.begin_ingress_receive_for_owner(ingress, owner) {
             Ok(attempt) => attempt,
             Err(error) => {
                 self.release_reservation(&mut reservation)
@@ -69,6 +79,7 @@ impl<M> RetainedWork<M> {
         Ok(ReservedIngressReceive {
             reservation: Some(reservation),
             receive_identity: attempt.identity(),
+            execution_owner: owner,
             attempt,
             endpoint: ingress.endpoint(),
             reply: ingress.reply(),
@@ -184,7 +195,14 @@ impl ReservedIngressReceive {
             ));
         }
         let call = lanes
-            .retain_peer_ingress(ingress, replacement, peers, badge, query)
+            .retain_peer_ingress_for_owner(
+                ingress,
+                replacement,
+                peers,
+                badge,
+                query,
+                self.execution_owner,
+            )
             .map_err(|(error, replacement)| (ReservedReceiveError::Retain(error), replacement))?;
         let reservation = self
             .reservation

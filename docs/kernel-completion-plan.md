@@ -36958,6 +36958,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         Both serialized native release builds pass (.tmp/build-ingress-receiver-executive-20260921.log
         and .tmp/build-ingress-receiver-io-manager-20260921.log). The adapter has compile/review
         coverage, not runtime receive coverage; no new QEMU/desktop result is claimed.
+        Exact active-dispatch ingress checkpoint (2026-09-21): owner-aware receive and handoff
+        variants now accept either Idle or one exact LaneDispatchIdentity. Dispatch admission
+        requires the canonical current running lane, Running phase and globally unique dispatch
+        epoch, and still rejects entered terminal mechanisms. The existing APIs remain strict
+        Idle wrappers. Canonical Reply exclusions are unchanged; this permits transport retention,
+        never a second lane's execution or mutation of the execution fence.
+
+        Each reserved receive captures its original execution owner. Retained handoff revalidates
+        it before any binding query and again before transfer; it cannot substitute a newer epoch
+        or silently downgrade to Idle. Capture and proven NoCall still return owned evidence after
+        execution ends. The native receive-only adapter now takes explicit execution ownership.
+        This resolves the previous idle-only contract limitation, but does not yet switch private
+        pumps: durable native allocation/registry ownership, unrelated-arrival routing and separate
+        ReplyRecv effect accounting remain open.
+
+        Validation passes 227 component-suspension unit tests and 12 documentation tests
+        (.tmp/test-active-ingress-20260921.log). Six new regressions cover unrelated incoming work
+        under another running lane, blocked incoming dispatch, stale and foreign epochs, canonical
+        Reply aliases, NoCall after execution ends, and startup/terminal fences. Both serialized
+        native release builds pass (.tmp/build-active-ingress-executive-20260921.log and
+        .tmp/build-active-ingress-io-manager-20260921.log). No live-pump cutover or new boot result
+        is claimed; the last measured strict 27-export win32k barrier remains unchanged.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

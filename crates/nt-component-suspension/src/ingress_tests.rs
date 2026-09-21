@@ -534,4 +534,80 @@ fn dropped_unresolved_ticket_retains_snapshot_without_any_new_authority() {
     assert_eq!(ingress.message(), Some(&123));
 }
 
+#[test]
+fn active_ingress_cannot_use_startup_or_uncertain_startup_stop_as_dispatch() {
+    let mut lanes = Lanes::new(1, 1);
+    let lane = lanes.allocate_staged(LaneBinding {
+        executor_id: 10,
+        receive_endpoint: 20,
+        reply_object: 30,
+    }).unwrap();
+    lanes.begin_startup(lane, 30, |_, _| {
+        Ok::<_, u8>(ReplyBindingObservation::Free)
+    }).unwrap();
+    let owner = IngressExecutionOwner::Dispatch(LaneDispatchIdentity { lane, epoch: 1 });
+    let mut ingress = ComponentIngress::<()>::new(40, 50).unwrap();
+    for phase in [LanePhase::Starting, LanePhase::StartupStopping] {
+        assert_eq!(lanes.phase(lane), Ok(phase));
+        assert_eq!(lanes.running(), Some(lane));
+        assert_eq!(
+            lanes.begin_ingress_receive_for_owner(&mut ingress, owner).unwrap_err(),
+            IngressError::ExecutionOwnerMismatch
+        );
+        assert_eq!(
+            lanes.begin_ingress_receive(&mut ingress).unwrap_err(),
+            IngressError::ExecutionBusy
+        );
+        assert_eq!(ingress.phase, Phase::Ready);
+        assert!(ingress.message().is_none());
+        if phase == LanePhase::Starting {
+            assert!(lanes.stop_startup(lane, 30, |_| Err(7u8), |_, _| -> Result<_, u8> {
+                panic!("failed suspension must not query")
+            }).is_err());
+        }
+    }
+}
+
+#[test]
+fn terminal_invocation_excludes_idle_and_dispatch_ingress_owners() {
+    let mut lanes = Lanes::new(1, 1);
+    let lane = lanes.allocate(LaneBinding {
+        executor_id: 10,
+        receive_endpoint: 20,
+        reply_object: 30,
+    }).unwrap();
+    let key = SuspensionKey::provider_wait(1);
+    let caller = SuspensionOwner {
+        provider_domain: 1,
+        provider_generation: 2,
+        caller: SuspensionCaller::Hosted(SuspensionHostedClient {
+            client_pi: 3,
+            client_generation: 4,
+            client_tid: 5,
+            client_badge: 6,
+        }),
+        dispatch_id: 1,
+    };
+    lanes.begin_dispatch(lane, 30).unwrap();
+    let dispatch = lanes.lane(lane).unwrap().dispatch.unwrap();
+    lanes.admit_running(lane, 30, key, 1, caller, 100).unwrap();
+    lanes.select(key, 42).unwrap();
+    lanes.begin_resume(lane, 30, key).unwrap();
+    let terminal = lanes.retain_terminal_running(lane, 30, key, caller, ()).unwrap();
+    let _attempt = lanes.begin_terminal_stage(terminal, 30, TerminalStage::Output).unwrap();
+    let before = lanes.terminal(terminal, 30).unwrap().phase;
+    let mut ingress = ComponentIngress::<()>::new(40, 50).unwrap();
+    for owner in [IngressExecutionOwner::Idle, IngressExecutionOwner::Dispatch(dispatch)] {
+        assert_eq!(
+            lanes.begin_ingress_receive_for_owner(&mut ingress, owner).unwrap_err(),
+            IngressError::ExecutionBusy
+        );
+        assert_eq!(ingress.phase, Phase::Ready);
+        assert!(ingress.message().is_none());
+        assert_eq!(lanes.terminal(terminal, 30).unwrap().phase, before);
+        assert!(lanes.execution_busy());
+        assert_eq!(lanes.running(), None);
+    }
+}
+
 // Native fan-in must still prove capability provenance and retain returned owners while routing.
