@@ -18,6 +18,7 @@ pub(crate) enum ReceiveError {
     PendingReplyRecovery,
     Ready(nt_component_suspension::StartupReadyError<sel4_rt::reply_binding::Error>),
     Complete(nt_component_suspension::StoredCompletionError<sel4_rt::reply_binding::Error>),
+    Interim(nt_component_suspension::InterimAdoptionError<sel4_rt::reply_binding::Error>),
     InvalidReplyLength,
     Reply(nt_component_suspension::StoredReplyError<sel4_rt::reply_binding::Error>),
     Probe(ReceiveProbeError<sel4_rt::reply_binding::Error>),

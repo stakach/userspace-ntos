@@ -1176,8 +1176,7 @@ pub(crate) unsafe fn spawn_storage_host(
 /// `Call` transport the question becomes a statement about the reply object:
 ///
 /// * [`InitialAction::ReplyRequest`] — the component is blocked in a `Call` bound to this channel's
-///   reply object, so the pump answers that Call and receives the next component message in one
-///   composite kernel entry.
+///   reply object, so the pump acknowledges that Call before receiving the next component message.
 /// * [`InitialAction::RecvFirst`] — the component is not yet blocked in a dispatch `Call` (it is
 ///   mid-DriverEntry: either blocked in a fault Call or about to issue its ready Call), so the pump
 ///   starts by RECEIVING.
@@ -1425,9 +1424,8 @@ pub(crate) fn harness_dispatches(kind: ReqKind) -> u64 {
 // property in userspace are deleted.
 // =============================================================================================
 
-/// Requests answered on a component's reply object, BY KIND. Every one of them uses the composite
-/// reply+receive syscall, so the executive cannot keep running between reply delivery and the next
-/// receive boundary.
+/// Requests answered on a component's reply object, BY KIND. Reply acknowledgement and the next
+/// receive are separate boundaries; an uncertain reply stops the pump before another receive.
 static PUMP_CALL_REQUESTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// Dispatches whose completion arrived as the return value of the COMPONENT'S OWN `Call` on the
 /// bound reply object, BY KIND. Must equal [`HARNESS_IRP_DISPATCHES`] /
@@ -1442,10 +1440,7 @@ pub(crate) fn pump_call_requests(kind: ReqKind) -> u64 {
 pub(crate) fn pump_call_dispatches(kind: ReqKind) -> u64 {
     PUMP_CALL_DISPATCHES[kind as usize].load(Ordering::Relaxed)
 }
-/// Legacy counter retained for transport gates that assert no component reply-object error was
-/// observed. The component pump now uses composite reply+receive rather than the older standalone
-/// `reply_on` helper, so this remains zero unless a future explicit error-returning component reply
-/// path is added.
+/// Component reply-object errors observed at the explicit acknowledgement boundary.
 pub(crate) static PUMP_REPLY_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Components suspended (`TCB_Suspend`) because their pump WALLED — see risk R2 at the wall tail.
 pub(crate) static PUMP_WALL_SUSPENDS: AtomicU64 = AtomicU64::new(0);
@@ -1856,9 +1851,8 @@ unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
     }
 }
 
-/// Reply to the component's outstanding `Call` and receive the next component message in one kernel
-/// entry. The send half targets the reply cap in r13; the receive half offers the same reply cap in
-/// r12 so the next component `Call` binds to the same kernel reply object.
+/// Acknowledge the component's outstanding Call before entering the receive-only path.
+/// An uncertain reply never permits another receive or retransmission of this request.
 #[inline(never)]
 unsafe fn pump_reply_recv(
     ch: &PumpChannel,
@@ -1878,65 +1872,16 @@ unsafe fn pump_reply_recv4(
     reply_r2: u64,
     reply_r3: u64,
 ) -> PumpMessage {
+    if !pump_reply_on(reply_cap, reply_msginfo, reply_r0, reply_r1, reply_r2, reply_r3) {
+        return PumpMessage::transport_wall();
+    }
     if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
         && crate::dispatcher_bootstrap::request_receive_checkpoint()
         && crate::dispatcher_bootstrap::timer_work_pending()
     {
-        // The continuation is receive-only: publish the exact reply once before yielding.
-        if !pump_reply_on(reply_cap, reply_msginfo, reply_r0, reply_r1, reply_r2, reply_r3) {
-            return PumpMessage::transport_wall();
-        }
         return PumpMessage::scheduler_yield();
     }
-    let badge: u64;
-    let mi: u64;
-    let m0: u64;
-    let m1: u64;
-    let m2: u64;
-    let m3: u64;
-    core::arch::asm!(
-        "syscall",
-        in("rdx") crate::SYS_NB_SEND_RECV as u64,
-        inout("rdi") ch.fault_ep => badge,
-        inout("rsi") reply_msginfo => mi,
-        inout("r10") reply_r0 => m0,
-        inout("r8") reply_r1 => m1,
-        inout("r9") reply_r2 => m2,
-        inout("r15") reply_r3 => m3,
-        in("r12") reply_cap,
-        in("r13") reply_cap,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-    let received = crate::ipc_message::capture_received(badge, mi, [m0, m1, m2, m3]);
-    let received_call = receive_probe::received_call(ch, reply_cap, badge);
-    let (executive_event, timer, irq) = pump_handle_executive_event_badge(badge);
-    if executive_event {
-        if pump_deadman_tripped() {
-            return PumpMessage::deadman_wall();
-        }
-        if pump_scheduler_work_pending(ch, irq) {
-            return PumpMessage::scheduler_yield();
-        }
-        if timer {
-            if let Some(polled) = pump_try_recv_after_timer(ch, reply_cap) {
-                crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
-                return polled;
-            }
-            let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
-            if n < 8 {
-                crate::print_str(
-                    b"[pump] HPET tick landed on a component replyrecv -> deferred to the service loop (NOT a wall)\n",
-                );
-            }
-        }
-        return pump_recv(ch, reply_cap);
-    }
-    if !received_call {
-        // The send half already consumed the old Call; never retransmit it after a plain Send.
-        return pump_recv(ch, reply_cap);
-    }
-    PumpMessage::from_received(received)
+    pump_recv(ch, reply_cap)
 }
 
 /// Reply to a component `Call` that was deliberately parked outside the immediate pump
@@ -2161,57 +2106,11 @@ unsafe fn hosted_irq_reply_recv(
     identity: nt_hosted_runtime::HostedIrqLaneIdentity,
     expected_badge: u64,
 ) -> PumpMessage {
-    let mut send_reply = true;
-    loop {
-        let badge: u64;
-        let mi: u64;
-        let m0: u64;
-        let m1: u64;
-        let m2: u64;
-        let m3: u64;
-        let received;
-        if send_reply {
-            let send_mi = reply_len;
-            let send_m0 = reply[0];
-            let send_m1 = reply[1];
-            let send_m2 = reply[2];
-            let send_m3 = reply[3];
-            core::arch::asm!(
-                "syscall",
-                in("rdx") crate::SYS_NB_SEND_RECV as u64,
-                inout("rdi") ch.fault_ep => badge,
-                inout("rsi") send_mi => mi,
-                inout("r10") send_m0 => m0,
-                inout("r8") send_m1 => m1,
-                inout("r9") send_m2 => m2,
-                inout("r15") send_m3 => m3,
-                in("r12") reply_cap,
-                in("r13") reply_cap,
-                lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-                options(nostack),
-            );
-            received = crate::ipc_message::capture_received(badge, mi, [m0, m1, m2, m3]);
-            if badge == crate::COMPOSITE_SEND_ERROR_BADGE {
-                return PumpMessage::transport_wall();
-            }
-            send_reply = false;
-        } else {
-            return hosted_irq_recv(ch, reply_cap, identity, expected_badge);
-        }
-        let received_call =
-            receive_probe::irq_received_call(ch, reply_cap, identity, expected_badge, badge);
-        if hosted_irq_exchange_event(badge) {
-            if pump_deadman_tripped() {
-                return PumpMessage::deadman_wall();
-            }
-            continue;
-        }
-        if !received_call {
-            // The reply half already ran; continue receive-only after a plain Send.
-            continue;
-        }
-        return PumpMessage::from_received(received);
+    if !pump_reply_on(reply_cap, reply_len, reply[0], reply[1], reply[2], reply[3]) {
+        return PumpMessage::transport_wall();
     }
+    // This path only latches notifications; it must not run ordinary provider request handlers.
+    hosted_irq_recv(ch, reply_cap, identity, expected_badge)
 }
 
 /// Exchange one command with a private hosted-interrupt lane. This protocol deliberately has a
@@ -2500,7 +2399,7 @@ unsafe fn pump_deliver_initial_request(
     reply_cap: u64,
     request_tag: u64,
 ) -> Option<PumpMessage> {
-    // ★ ONE composite reply+receive hands over the request. `RecvFirst` means the component has not
+    // The reply is acknowledged before receive. `RecvFirst` means the component has not
     // yet issued the Call we would be answering (mid-DriverEntry), so the caller performs a plain
     // receive instead.
     if ch.initial != InitialAction::ReplyRequest {
@@ -3149,11 +3048,8 @@ unsafe fn component_pump_loop(
                 break;
             }
             outcome.accounting.record_demand();
-            // Resume the server + recv the next fault/DONE with one composite reply+receive. A
-            // VMFault reply is restarted unconditionally (`fault.rs`), and the receive half
-            // re-registers `R`. A nested demand fault therefore rides the SAME reply object as the
-            // dispatch it happened inside, which is exactly Fix B's guarantee (the outer client's
-            // REPLY_MAIN binding is untouched) with no second transport to keep gated.
+            // Acknowledge the serviced fault before receiving again. The outer client's Reply
+            // remains untouched; an uncertain fault reply stops this pump without another receive.
             pump_reply_recv_into!(ch, *reply_cap, msg, 0, 0);
             continue;
         } else if label == 3 && ch.caps.io_port_faults {

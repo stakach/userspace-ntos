@@ -569,6 +569,42 @@ impl NativeSharedIngress {
         ).map_err(super::ReceiveError::Reply)
     }
 
+    /// Move an acknowledged dispatch to its next authenticated, retained interim Call. The
+    /// physical resolver must also validate the incoming protocol against the provider contract;
+    /// final completion uses `complete` instead. A pool insertion failure leaves the new binding
+    /// installed and the displaced Reply in `pending_reply`: retry only `recycle_pending_reply`,
+    /// never this transition or the already acknowledged reply.
+    pub(crate) unsafe fn adopt_interim_call<C, R, T>(
+        &mut self,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        route: PeerRoute,
+        dispatch: nt_component_suspension::LaneDispatchIdentity,
+        incoming_reply: u64,
+        resolve_caller: impl FnOnce(PeerRoute) -> Option<u64>,
+    ) -> Result<(), super::ReceiveError> {
+        if !self.ready || self.pending_reply.is_some() {
+            return Err(super::ReceiveError::PendingReplyRecovery);
+        }
+        let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+        if resolve_caller(route) != Some(route.identity().executor) {
+            return Err(super::ReceiveError::Probe(
+                nt_component_suspension::ReceiveProbeError::UnknownCaller,
+            ));
+        }
+        let _acknowledged_message = self.receiver.as_mut().expect("initialized receiver")
+            .adopt_interim_call(
+                route,
+                dispatch,
+                incoming_reply,
+                lanes,
+                self.peers.as_mut().expect("initialized registry"),
+                &mut self.pending_reply,
+                |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
+            )
+            .map_err(super::ReceiveError::Interim)?;
+        self.recycle_pending_reply(lanes, route.identity().executor)
+    }
+
     /// Expected layout comes from the physical worker descriptor. Its receipt slot must remain
     /// durably owned with that worker; publish it before releasing the startup execution fence.
     pub(crate) unsafe fn ready<C, R, T>(
