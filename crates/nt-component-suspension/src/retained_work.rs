@@ -184,7 +184,7 @@ impl<M> RetainedWork<M> {
         })
     }
 
-    fn owns_reservation(&self, reservation: &RetainedWorkReservation) -> bool {
+    pub(crate) fn owns_reservation(&self, reservation: &RetainedWorkReservation) -> bool {
         reservation.identity != 0
             && matches!(self.slots.get(reservation.slot),
             Some(Slot::Reserved { identity, reply }) if *identity == reservation.identity && *reply == reservation.reply)

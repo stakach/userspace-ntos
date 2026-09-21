@@ -25,6 +25,8 @@ pub use peer_installation::{PeerCapabilityDestination, PeerInstallation, PeerIns
 mod retained_ingress;
 mod retained_dispatch;
 mod retained_work;
+mod reserved_receive;
+pub use reserved_receive::{ReservedIngressReceive, ReservedReceiveError, ReservedReceivePhase};
 mod startup;
 pub use startup::StartupError;
 pub use startup::StartupStopError;

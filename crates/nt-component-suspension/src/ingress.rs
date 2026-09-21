@@ -55,6 +55,7 @@ pub struct ComponentIngress<M> {
     reply: u64,
     phase: Phase,
     message: Option<M>,
+    held_receive: u64,
 }
 
 /// Dropping a receive attempt leaves Receiving or Unresolved intact, including any captured
@@ -68,6 +69,12 @@ pub struct ComponentIngress<M> {
 #[derive(Debug)]
 pub struct IngressReceiveAttempt {
     identity: u64,
+}
+
+impl IngressReceiveAttempt {
+    pub(crate) const fn identity(&self) -> u64 {
+        self.identity
+    }
 }
 
 /// Dropping a reply attempt retains the message and excludes replay of uncertain effects.
@@ -104,6 +111,7 @@ impl<M> ComponentIngress<M> {
             reply,
             phase: Phase::Ready,
             message: None,
+            held_receive: 0,
         })
     }
 
@@ -115,6 +123,9 @@ impl<M> ComponentIngress<M> {
     }
     pub(crate) fn is_held(&self) -> bool {
         self.phase == Phase::Held
+    }
+    pub(crate) fn held_receive_matches(&self, identity: u64) -> bool {
+        identity != 0 && self.phase == Phase::Held && self.held_receive == identity
     }
     /// Inspect retained data, including unresolved receives. Presence does not prove Call or Reply
     /// binding authority; classification requires separately established transport provenance.
@@ -161,14 +172,17 @@ impl<M> ComponentIngress<M> {
         if attempt.identity == 0 || self.phase != Phase::Unresolved(attempt.identity) {
             return Err(IngressError::WrongAttempt);
         }
+        let receive_identity = attempt.identity;
         attempt.identity = 0;
         match disposition {
             IngressReceiveDisposition::Call => {
                 self.phase = Phase::Held;
+                self.held_receive = receive_identity;
                 Ok(None)
             }
             IngressReceiveDisposition::NoCall => {
                 self.phase = Phase::Ready;
+                self.held_receive = 0;
                 Ok(self.message.take())
             }
         }
@@ -186,10 +200,14 @@ impl<M> ComponentIngress<M> {
             return Err((IngressError::WrongAttempt, observed));
         }
         match observed {
-            IngressObservation::NoCall => self.phase = Phase::Ready,
+            IngressObservation::NoCall => {
+                self.phase = Phase::Ready;
+                self.held_receive = 0;
+            }
             IngressObservation::Call(message) => {
                 self.message = Some(message);
                 self.phase = Phase::Held;
+                self.held_receive = attempt.identity;
             }
         }
         attempt.identity = 0;
@@ -231,6 +249,7 @@ impl<M> ComponentIngress<M> {
             }
             IngressReplyObservation::Acknowledged => {
                 self.phase = Phase::Ready;
+                self.held_receive = 0;
                 attempt.identity = 0;
                 Ok(self.message.take())
             }

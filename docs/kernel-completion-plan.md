@@ -36903,6 +36903,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         (.tmp/build-peer-export-executive-20260921.log and
         .tmp/build-peer-export-io-manager-20260921.log). No fresh QEMU run is claimed for this
         contract-only change; the last measured boot still stops at the strict 27-export barrier.
+        Reserved ingress receive checkpoint (2026-09-21): RetainedWork now starts a receive only
+        after reserving bounded storage for its exact Reply. The non-clone ReservedIngressReceive
+        seals that reservation with the receive attempt through capture, classification and storage.
+        A canonical admission refusal rolls back the never-entered reservation; a captured or
+        uncertain receive cannot release capacity or start another receive by dropping its ticket.
+        Proven NoCall returns the complete owned snapshot for separate notification/Send processing
+        and releases only its exact reservation. A Call keeps the slot charged until authenticated
+        handoff commits it without intervening effects or allocation.
+
+        Review also found that endpoint/Reply equality alone could let an old reservation retain
+        a later Call after ordinary reply ACK and receive on the same ingress. Ingress now retains
+        the original receive nonce through Held and no-effect replies, clears it on ACK/NoCall,
+        and reserved handoff checks that exact nonce before any query. The regression exercises
+        this legitimate same-object reuse without constructing duplicate capability owners.
+
+        Replacement Replies are excluded against reserved, stored and checked-out work before any
+        binding query. Wrong store/ingress, unknown peer, failed authentication or handoff retain
+        the original Call and return the replacement. This closes the hand-assembled reservation
+        ordering gap, but is not yet the native ingress owner: native capture/provenance, physical
+        domain lifetime, replacement-Free proof and cross-domain Reply exclusion remain mandatory.
+        Native endpoint migration and the strict boot barrier remain unchanged.
+
+        Validation: the broad transport run passed 1,545 tests across 24 suites before the final
+        nonce correction (.tmp/test-reserved-receive-broad-20260921.log). The corrected crate then
+        passed 217 unit tests and 11 documentation tests, including seven receive-transaction
+        regressions (.tmp/test-reserved-receive-20260921.log). Both serialized native release
+        rebuilds pass after that correction (.tmp/build-reserved-receive-executive-20260921.log
+        and .tmp/build-reserved-receive-io-manager-20260921.log). No QEMU or desktop result is
+        claimed for this contract-only change; native receive integration remains the next step.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
