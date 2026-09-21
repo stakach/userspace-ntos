@@ -37003,6 +37003,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         .tmp/build-ingress-reply-pool-io-manager-20260921.log). Review also moved native IPC-bank
         preservation before physical caller resolution, and the resolver now receives the full
         route for domain-generation validation. No new runtime receive or desktop result is claimed.
+        Durable ingress preparation checkpoint (2026-09-21): the native shared owner now groups
+        the root capability run, construction ledger, sealed receiver, replacement pool, peer
+        registry and reserved installation-record capacity in static storage. Its one-shot prepare
+        path reserves the complete root slot run before retype, records each Creating transition
+        before the acknowledged kernel invocation, and marks Created only on success. Every error
+        leaves the owner unready without deleting, recycling or retrying any retained resource.
+        Pool-admission refusal also retains the exact pending Reply owner.
+
+        The construction ledger is host-testable and rejects zero/duplicate/endpoint-alias slots,
+        preserves the original slot list on constructor failure, and retains earlier acknowledgments,
+        the uncertain current effect and untouched later reservations after partial failure.
+        Native preparation checks real Reply Free state and makes no provider resume or capability
+        export. There is no live prepare call yet: capacity policy and canonical peer publication
+        must be connected together with routing before replacing the private topology. The native
+        owner delegates receive/classify/retain through the previously checked adapters without
+        exposing mutable subowners. Registry capacity is currently logical, not heap-preallocated;
+        peer staging still has a checked allocation failure path.
+
+        Validation passes 235 component-suspension unit tests and 14 documentation tests
+        (.tmp/test-ingress-resources-20260921.log), including invalid slot sets, successful exact
+        construction, failure at every creation boundary and non-clone ownership. Both serialized
+        native release builds pass (.tmp/build-ingress-resources-executive-20260921.log and
+        .tmp/build-ingress-resources-io-manager-20260921.log). Native preparation has compile/review
+        coverage only; no live allocation, endpoint migration or fresh desktop result is claimed.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

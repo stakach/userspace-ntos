@@ -1,6 +1,9 @@
 //! Receive-only adapter for shared ingress with exact execution-owner admission.
 //! Private pumps remain in use until native routing and ReplyRecv ownership are wired.
 
+#[path = "component_ingress_owner.rs"]
+pub(crate) mod owner;
+
 use core::convert::Infallible;
 use nt_component_suspension::peer_registry::{PeerRegistry, PeerRoute};
 use nt_component_suspension::{
