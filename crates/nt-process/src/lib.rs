@@ -24,10 +24,12 @@ pub mod job;
 pub mod job_abi;
 mod initial_system;
 pub mod native_handle;
+mod registry_key_handle;
 pub mod process_object_retirement;
 pub mod thread_suspend;
 
 pub use initial_system::InitialSystemIdentity;
+pub use registry_key_handle::RegistryKeyHandlePublication;
 
 use dbgk::{DbgKmMessage, DebugEvent, DebugObjectId, DebugObjectStore};
 
@@ -1099,6 +1101,8 @@ pub struct ProcessManager {
     suspend_manager_identity: u64,
     /// Move-stable owner identity for exact queued user-APC claims.
     user_apc_manager_identity: u64,
+    /// Move-stable owner identity for staged registry handle publication.
+    registry_publication_identity: u64,
     processes: IdTable<NtProcess>,
     threads: IdTable<NtThread>,
     /// Withdrawn Ps objects remain owned until their exact cleanup ticket is finished.
