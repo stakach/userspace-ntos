@@ -5,7 +5,7 @@ use core::convert::Infallible;
 use nt_component_suspension::peer_registry::{PeerRegistration, PeerRegistry, PeerRoute};
 use nt_component_suspension::{
     ComponentIngress, ComponentSuspensionLanes, IngressExecutionOwner, IngressReceiver,
-    IngressReplyPool, IngressResourceKind, IngressResources, LaneHandle, LanePhase,
+    IngressReplyPool, IngressResourceKind, IngressResources, LaneBinding, LanePhase,
     PeerCapabilityDestination, PeerInstallation, PeerInstallationError, PeerInstallationPhase,
     PeerLaneError, ReceivedMessage,
 };
@@ -125,15 +125,16 @@ pub(crate) unsafe fn prepare_worker_peer<C, R, T>(
         .map_err(PublicationError::FaultSpace)
 }
 
-/// The physical owner must keep this exact domain generation, stopped lane and endpoint alive.
-/// This publishes only a root alias; child export and startup admission remain separate.
-pub(crate) unsafe fn publish_peer<C, R, T>(
-    lanes: &ComponentSuspensionLanes<C, R, T>,
+/// The physical owner must keep this exact domain generation, stopped worker and endpoint alive.
+/// Reserve its canonical shared lane and publish only a root alias; child export and startup
+/// admission remain separate. On failure after staging, the owner retains the lane registration.
+pub(crate) unsafe fn allocate_publish_peer<C, R, T>(
+    lanes: &mut ComponentSuspensionLanes<C, R, T>,
     domain: u64,
     generation: u64,
-    lane: LaneHandle,
+    binding: LaneBinding,
 ) -> Result<PeerRoute, PublicationError> {
-    (&mut *core::ptr::addr_of_mut!(SHARED_INGRESS)).publish_peer(lanes, domain, generation, lane)
+    (&mut *core::ptr::addr_of_mut!(SHARED_INGRESS)).allocate_publish_peer(lanes, domain, generation, binding)
 }
 
 /// The resolver only observes an already-owned stopped worker and reserved empty child slot.
@@ -292,12 +293,12 @@ impl NativeSharedIngress {
 
     /// Callbacks into scheduling are forbidden while references into this owner are held.
     /// Every failure after staging retains either the pending ticket/slot or an installation row.
-    unsafe fn publish_peer<C, R, T>(
+    unsafe fn allocate_publish_peer<C, R, T>(
         &mut self,
-        lanes: &ComponentSuspensionLanes<C, R, T>,
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
         domain: u64,
         generation: u64,
-        lane: LaneHandle,
+        binding: LaneBinding,
     ) -> Result<PeerRoute, PublicationError> {
         if !self.ready {
             return Err(PublicationError::NotReady);
@@ -308,15 +309,14 @@ impl NativeSharedIngress {
         if self.installations.len() >= self.peer_capacity {
             return Err(PublicationError::NoCapacity);
         }
-        if lanes.phase(lane) != Ok(LanePhase::Staged) {
-            return Err(PublicationError::WrongPhase);
-        }
         let _saved = crate::ipc_message::SavedMessageBuffer::capture();
-        let registration = self
-            .peers
-            .as_mut()
-            .expect("initialized registry")
-            .stage_lane(domain, generation, lanes, lane)
+        let (_, registration) = lanes
+            .allocate_shared_staged(
+                self.peers.as_mut().expect("initialized registry"),
+                domain,
+                generation,
+                binding,
+            )
             .map_err(PublicationError::Stage)?;
         self.pending_peer = Some(PendingPeer {
             registration,

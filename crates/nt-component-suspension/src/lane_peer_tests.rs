@@ -4,6 +4,166 @@ use crate::{LaneBinding, LanePhase};
 
 type Lanes = ComponentSuspensionLanes<(), (), ()>;
 
+fn second_binding() -> LaneBinding {
+    LaneBinding {
+        executor_id: 44,
+        reply_object: 66,
+        ..binding()
+    }
+}
+
+#[test]
+fn shared_allocation_stages_distinct_authenticated_peers_without_execution() {
+    let mut lanes = Lanes::new(2, 4);
+    let mut peers = PeerRegistry::new(22, 2);
+    let (first, mut a) = lanes
+        .allocate_shared_staged(&mut peers, 7, 8, binding())
+        .unwrap();
+    let (second, mut b) = lanes
+        .allocate_shared_staged(&mut peers, 7, 8, second_binding())
+        .unwrap();
+    assert_ne!(a.route().unwrap().badge(), b.route().unwrap().badge());
+    for (lane, reply) in [(first, 33), (second, 66)] {
+        assert_eq!(lanes.phase(lane), Ok(LanePhase::Staged));
+        assert_eq!(
+            lanes.begin_dispatch(lane, reply),
+            Err(LaneError::InvalidPhase)
+        );
+    }
+    let ar = peers.publish_lane(&mut a, 7, 8, &lanes).unwrap();
+    let br = peers.publish_lane(&mut b, 7, 8, &lanes).unwrap();
+    assert_eq!(peers.resolve_lane(ar.badge(), 7, 8, &lanes), Ok(ar));
+    assert_eq!(peers.resolve_lane(br.badge(), 7, 8, &lanes), Ok(br));
+    assert_eq!(lanes.running(), None);
+}
+
+#[test]
+fn private_and_shared_endpoint_ownership_cannot_mix() {
+    let (mut private, _, mut peers) = setup();
+    assert_eq!(
+        private
+            .allocate_shared_staged(&mut peers, 7, 8, second_binding())
+            .unwrap_err(),
+        PeerLaneError::Lane(LaneError::DuplicateBinding)
+    );
+    let mut shared = Lanes::new(2, 4);
+    let _ticket = shared
+        .allocate_shared_staged(&mut peers, 7, 8, binding())
+        .unwrap();
+    assert_eq!(
+        shared.allocate(second_binding()),
+        Err(LaneError::DuplicateBinding)
+    );
+    assert_eq!(
+        shared.allocate_staged(second_binding()),
+        Err(LaneError::DuplicateBinding)
+    );
+    assert_eq!(private.len(), 1);
+    assert_eq!(shared.len(), 1);
+}
+
+#[test]
+fn shared_allocation_rejects_foreign_registry_domain_and_retired_identity() {
+    let mut lanes = Lanes::new(2, 4);
+    let mut peers = PeerRegistry::new(22, 2);
+    let (_, mut ticket) = lanes
+        .allocate_shared_staged(&mut peers, 7, 8, binding())
+        .unwrap();
+    let mut foreign = PeerRegistry::new(22, 2);
+    assert_eq!(
+        lanes
+            .allocate_shared_staged(&mut foreign, 7, 8, second_binding())
+            .unwrap_err(),
+        PeerLaneError::Peer(PeerError::WrongOwner)
+    );
+    for (domain, generation) in [(0, 8), (7, 0), (9, 8), (7, 9)] {
+        assert_eq!(
+            lanes
+                .allocate_shared_staged(&mut peers, domain, generation, second_binding())
+                .unwrap_err(),
+            PeerLaneError::Peer(PeerError::WrongOwner)
+        );
+    }
+    let route = peers.publish_lane(&mut ticket, 7, 8, &lanes).unwrap();
+    peers.begin_retirement(route).unwrap();
+    assert_eq!(
+        lanes
+            .allocate_shared_staged(&mut peers, 7, 8, second_binding())
+            .unwrap_err(),
+        PeerLaneError::Peer(PeerError::WrongPhase)
+    );
+    peers.finish_retirement(route).unwrap();
+    assert_eq!(
+        lanes
+            .allocate_shared_staged(&mut peers, 7, 8, second_binding())
+            .unwrap_err(),
+        PeerLaneError::Peer(PeerError::WrongOwner)
+    );
+    assert_eq!(lanes.len(), 1);
+}
+
+#[test]
+fn shared_peer_capacity_failure_rolls_back_only_unpublished_lane() {
+    let mut lanes = Lanes::new(2, 4);
+    let mut full = PeerRegistry::new(22, 0);
+    assert_eq!(
+        lanes
+            .allocate_shared_staged(&mut full, 7, 8, binding())
+            .unwrap_err(),
+        PeerLaneError::Peer(PeerError::NoCapacity)
+    );
+    assert!(lanes.is_empty());
+    let mut peers = PeerRegistry::new(22, 1);
+    let (first, ticket) = lanes
+        .allocate_shared_staged(&mut peers, 7, 8, binding())
+        .unwrap();
+    assert_eq!(first.generation, 2);
+    assert_eq!(
+        lanes
+            .allocate_shared_staged(&mut peers, 7, 8, second_binding())
+            .unwrap_err(),
+        PeerLaneError::Peer(PeerError::NoCapacity)
+    );
+    assert_eq!(lanes.len(), 1);
+    assert_eq!(
+        peers.state(ticket.route().unwrap()),
+        Ok((PeerPhase::Staged, 0))
+    );
+}
+
+#[test]
+fn shared_allocation_preserves_executor_reply_and_lane_capacity_checks() {
+    let mut lanes = Lanes::new(1, 4);
+    let mut peers = PeerRegistry::new(22, 3);
+    let _ticket = lanes
+        .allocate_shared_staged(&mut peers, 7, 8, binding())
+        .unwrap();
+    for duplicate in [
+        LaneBinding {
+            executor_id: 11,
+            ..second_binding()
+        },
+        LaneBinding {
+            reply_object: 33,
+            ..second_binding()
+        },
+    ] {
+        assert_eq!(
+            lanes
+                .allocate_shared_staged(&mut peers, 7, 8, duplicate)
+                .unwrap_err(),
+            PeerLaneError::Lane(LaneError::DuplicateBinding)
+        );
+    }
+    assert_eq!(
+        lanes
+            .allocate_shared_staged(&mut peers, 7, 8, second_binding())
+            .unwrap_err(),
+        PeerLaneError::Lane(LaneError::NoCapacity)
+    );
+    assert_eq!(lanes.len(), 1);
+}
+
 fn binding() -> LaneBinding {
     LaneBinding {
         executor_id: 11,

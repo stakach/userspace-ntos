@@ -271,6 +271,7 @@ pub enum LaneError {
 
 struct Lane<C, R, T> {
     binding: LaneBinding,
+    shared_peer: Option<peer_registry::PeerRoute>,
     phase: LanePhase,
     dispatch: Option<LaneDispatchIdentity>,
     external_tokens: Vec<u64>,
@@ -623,18 +624,19 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
     }
 
     pub fn allocate(&mut self, binding: LaneBinding) -> Result<LaneHandle, LaneError> {
-        self.allocate_with_phase(binding, LanePhase::Idle)
+        self.allocate_with_phase(binding, LanePhase::Idle, false)
     }
 
     /// Reserve canonical identity without making the worker eligible for dispatch.
     pub fn allocate_staged(&mut self, binding: LaneBinding) -> Result<LaneHandle, LaneError> {
-        self.allocate_with_phase(binding, LanePhase::Staged)
+        self.allocate_with_phase(binding, LanePhase::Staged, false)
     }
 
     fn allocate_with_phase(
         &mut self,
         binding: LaneBinding,
         phase: LanePhase,
+        shared_endpoint: bool,
     ) -> Result<LaneHandle, LaneError> {
         if !binding.is_valid() || self.max_depth_per_lane == 0 {
             return Err(LaneError::InvalidIdentity);
@@ -642,7 +644,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         if self.slots.iter().any(|slot| {
             slot.lane.as_ref().is_some_and(|lane| {
                 lane.binding.executor_id == binding.executor_id
-                    || lane.binding.receive_endpoint == binding.receive_endpoint
+                    || (!shared_endpoint && lane.binding.receive_endpoint == binding.receive_endpoint)
                     || lane.binding.reply_object == binding.reply_object
             })
         }) {
@@ -661,6 +663,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
                 .ok_or(LaneError::NoCapacity)?;
             slot.lane = Some(Lane {
                 binding,
+                shared_peer: None,
                 phase,
                 dispatch: None,
                 external_tokens: Vec::new(),
@@ -688,6 +691,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             generation: handle.generation,
             lane: Some(Lane {
                 binding,
+                shared_peer: None,
                 phase,
                 dispatch: None,
                 external_tokens: Vec::new(),

@@ -37108,6 +37108,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         rejection before DriverEntry (.tmp/boot-shared-worker-preparation-20260921.log). QEMU was
         deliberately stopped at that barrier; the runner correctly reports failure, not desktop
         success. Shared-worker runtime and native failure injection remain unmeasured.
+        Shared canonical topology checkpoint (2026-09-21): allocate_shared_staged now composes
+        stopped canonical lane allocation with a registry reservation before any native effect.
+        Each shared lane retains its exact opaque peer route. Endpoint sharing requires every
+        colliding lane to belong to that registry and the same physical table domain/generation;
+        private/shared collisions, missing or retiring routes, duplicate TCBs and duplicate Replies
+        remain rejected. Ordinary allocate/allocate_staged retain their private-endpoint checks.
+        Failed registry staging removes only the new unpublished lane while burning its generation.
+        Publication/resolution also reject a route that differs from the canonical shared marker.
+
+        Native allocate_publish_peer replaces the old separate staging helper: it receives the
+        stopped worker binding, allocates the lane and peer together, then stores the registration
+        before slot allocation or mint. No-slot and uncertain-mint failures retain canonical and
+        native ownership. The returned route carries the lane handle for subsequent child export
+        and acknowledged fault-handler binding. Neither allocation nor publication resumes a worker.
+
+        Validation: 246 unit and 14 doc tests pass (.tmp/test-shared-lane-topology-20260921.log),
+        including shared staging, private/shared isolation, foreign registry/domain rejection,
+        retirement exclusion, capacity rollback, burned generation, and TCB/Reply uniqueness.
+        Both serialized native release builds pass (.tmp/build-shared-lane-topology-executive-20260921.log
+        and .tmp/build-shared-lane-topology-io-manager-20260921.log). Read-only contract/native review
+        found no blocking issues. No new boot result is claimed; the preceding boot still documents
+        the strict 27-export barrier. Live creation, authenticated arrival routing and retained Reply
+        admission remain to be integrated before replacing private endpoints or enabling DriverEntry.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime
