@@ -11,6 +11,9 @@ use nt_types::AccessMode;
 #[path = "provider_kernel_terminal_tests.rs"]
 mod terminal_completion;
 
+#[path = "provider_kernel_shared_completion_tests.rs"]
+mod shared_completion;
+
 #[path = "provider_kernel_recipient_tests.rs"]
 mod recipient_completion;
 

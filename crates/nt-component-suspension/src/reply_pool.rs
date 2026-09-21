@@ -1,6 +1,8 @@
 //! Fixed-capacity ownership of spare ingress Replies, checked again before each handoff.
 
 use alloc::vec::Vec;
+mod external;
+mod initial;
 use core::convert::Infallible;
 
 use crate::peer_registry::PeerRoute;
@@ -26,6 +28,7 @@ pub enum ReplyPoolError<E> {
     NotFree,
     Query(E),
     Retain(ReservedReceiveError<E>),
+    External(crate::ExternalIngressError<E>),
 }
 
 /// Each entry is an owned Ready ingress, never a reconstructed numeric Reply capability.

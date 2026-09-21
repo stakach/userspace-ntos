@@ -9,6 +9,9 @@ use crate::{ComponentIngress, RetainedIngress, RetainedIngressError};
 
 static NEXT_RESERVATION: AtomicU64 = AtomicU64::new(1);
 
+mod stopped_route;
+mod external;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetainedWorkError {
     InvalidConfiguration,
@@ -91,6 +94,10 @@ impl<M> RetainedWorkCheckout<M> {
 
 enum Slot<M> {
     Vacant,
+    External {
+        identity: u64,
+        reply: u64,
+    },
     Reserved {
         identity: u64,
         reply: u64,
@@ -143,6 +150,17 @@ impl<M> RetainedWork<M> {
             Slot::Stored { call, .. } => call.reply() == reply,
             Slot::CheckedOut { reply: owned, .. } => *owned == reply,
             Slot::Reserved { reply: owned, .. } => *owned == reply,
+            Slot::External { reply: owned, .. } => *owned == reply,
+            _ => false,
+        })
+    }
+
+    /// A checked-out Call's admitted marker is temporarily outside this store. Conservatively
+    /// exclude its lane until restoration rather than treating absent payload as no admission.
+    pub(crate) fn excludes_bootstrap_dispatch(&self, dispatch: crate::LaneDispatchIdentity) -> bool {
+        self.slots.iter().any(|slot| match slot {
+            Slot::Stored { call, .. } => call.admitted == Some(dispatch),
+            Slot::CheckedOut { route, .. } => route.identity().lane == dispatch.lane(),
             _ => false,
         })
     }
@@ -291,6 +309,14 @@ impl<M> RetainedWork<M> {
                 _ => None,
             })
             .ok_or(RetainedWorkError::NotFound)
+    }
+
+    pub(crate) fn next_unadmitted(&self, route: PeerRoute) -> Option<&RetainedIngress<M>> {
+        self.slots.iter().find_map(|slot| match slot {
+            Slot::Stored { call, .. }
+                if call.route() == route && call.admitted.is_none() && call.is_held() => Some(call),
+            _ => None,
+        })
     }
 
     pub(crate) fn stored_dispatch_mut(

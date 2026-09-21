@@ -31,6 +31,10 @@ pub use wait_admission::KernelProviderWaitAdmissionError;
 mod wait_work;
 pub use wait_work::{KernelProviderWaitWork, KernelProviderWaitWorkCursor};
 
+#[path = "provider_kernel_shared_completion.rs"]
+mod shared_completion;
+pub use shared_completion::KernelProviderSharedCompletion;
+
 fn next_activation(counter: &AtomicU64) -> Result<u64, u32> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -160,6 +164,16 @@ struct Activation<D> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Completion {
+    SharedEntered {
+        status: u32,
+        route: nt_component_suspension::peer_registry::PeerRoute,
+        reply: u64,
+    },
+    SharedIndeterminate {
+        status: u32,
+        route: nt_component_suspension::peer_registry::PeerRoute,
+        reply: u64,
+    },
     TerminalPending {
         status: u32,
         terminal: TerminalIdentity,
@@ -623,7 +637,9 @@ impl<D> KernelProviderActivations<D> {
         status: u32,
     ) -> Result<KernelProviderCompletionReceipt, u32> {
         self.validate_retained(caller, pm, catalog, lanes)?;
-        if lanes.phase(caller.dispatch.lane()) != Ok(LanePhase::Running) {
+        if lanes.phase(caller.dispatch.lane()) != Ok(LanePhase::Running)
+            || lanes.peer_route(caller.dispatch.lane()) != Ok(None)
+        {
             return Err(STATUS_INVALID_HANDLE);
         }
         let row = self
@@ -773,6 +789,9 @@ impl<D> KernelProviderActivations<D> {
         local_retirement: Result<(), u32>,
     ) -> Result<Option<(KernelProviderCompletionReceipt, RetiredTerminal<C, R, T>)>, u32> {
         self.validate_terminal_completion(caller, pm, lanes, terminal)?;
+        if lanes.peer_route(caller.dispatch.lane()) != Ok(None) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
         let row = self
             .rows
             .iter_mut()

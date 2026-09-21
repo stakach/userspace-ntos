@@ -4,6 +4,7 @@
 pub const IPC_BUFFER_WORDS: usize = 128;
 const MESSAGE_WORDS: usize = 120;
 
+#[derive(Clone)]
 pub struct IpcBufferSnapshot {
     words: [u64; IPC_BUFFER_WORDS],
 }
@@ -28,6 +29,7 @@ impl IpcBufferSnapshot {
 /// A receive observation, not evidence that a Call bound a Reply object. Badge/tag values alone
 /// cannot distinguish a Call, Send, notification, or empty nonblocking receive. Captured cap words
 /// are metadata, not ownership of transferred capabilities. This object has no Drop-side effects.
+#[derive(Clone)]
 pub struct ReceivedMessage {
     badge: u64,
     info: u64,

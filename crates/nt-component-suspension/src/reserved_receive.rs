@@ -2,6 +2,8 @@
 
 use core::convert::Infallible;
 
+mod external;
+
 use crate::peer_registry::PeerRegistry;
 use crate::{
     ComponentIngress, ComponentSuspensionLanes, IngressError, IngressExecutionOwner,

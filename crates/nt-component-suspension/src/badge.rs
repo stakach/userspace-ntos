@@ -7,6 +7,13 @@ pub const TIMER_BADGE: u64 = 1 << 62;
 pub const IRQ_BADGE: u64 = 1 << 61;
 pub const IRQ_SLOT_COUNT: u8 = 61;
 pub const ENDPOINT_BADGE_MAX: u64 = IRQ_BADGE - 1;
+pub const COMPONENT_BADGE: u64 = 1 << 60;
+
+/// Hosted thread identities occupy only the lower endpoint namespace. This validates minting,
+/// not source authority; native routing still authenticates the exact ThreadBinding lifetime.
+pub const fn valid_hosted_badge(badge: u64) -> bool {
+    badge < COMPONENT_BADGE
+}
 
 /// Zero is a valid unbadged endpoint. Bits 61 and above are never endpoint identities.
 pub const fn valid_endpoint_badge(badge: u64) -> bool {
@@ -30,6 +37,17 @@ pub const fn valid_notification_badge(badge: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosted_and_component_endpoint_namespaces_do_not_overlap() {
+        for badge in [0, 1, COMPONENT_BADGE - 1] {
+            assert!(valid_hosted_badge(badge));
+            assert!(valid_endpoint_badge(badge));
+        }
+        for badge in [COMPONENT_BADGE, COMPONENT_BADGE | 1, ENDPOINT_BADGE_MAX, IRQ_BADGE, TIMER_BADGE, u64::MAX] {
+            assert!(!valid_hosted_badge(badge));
+        }
+    }
 
     #[test]
     fn endpoint_range_is_disjoint_from_every_notification_bit() {
