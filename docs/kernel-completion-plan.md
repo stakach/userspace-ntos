@@ -37249,6 +37249,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
         table rejection, staged/completed phase refusal, and held-call preservation after transition.
         Both serialized native release builds pass (.tmp/build-startup-ingress-owner-executive-20260921.log
         and .tmp/build-startup-ingress-owner-io-manager-20260921.log). No new boot result is claimed.
+        Shared startup-readiness checkpoint (2026-09-21), tracked by GitHub issue #2 under the
+        Shared component ingress integration milestone: retained readiness now checks the exact
+        Startup peer owner, active registry route, distinct held ready Reply, exact five-word tag
+        and badge, and decoded publication before querying initial Reply Free and ready Reply
+        BoundToTarget. It stores the validated receipt in the physical owner's empty publication
+        slot before releasing startup exclusion. No callback or native effect occurs after proof.
+
+        Review adjustment: readiness must not adopt the ready Reply early. The initial Free Reply
+        stays canonical and the ready Call stays held; the first ordinary dispatch reuses existing
+        atomic retained admission and displaced-Reply recycling. This avoids a second ownership
+        path and preserves the blocked provider until genuine work is selected. The native adapter
+        uses ProviderStackReadyReceipt::decode against expected lane/range and slot capacity, with
+        physical generation validation and saved IPC contents. Private worker creation remains
+        unchanged until live receive-loop routing is connected. Two independent reviews found no
+        blocking issues. Validation: 392 tests across eight suites pass, comprising 267 component
+        unit tests, 14 component doc tests and 111 provider-wait tests
+        (.tmp/test-shared-startup-ready-20260921.log). Both serialized native release builds pass
+        (.tmp/build-shared-startup-ready-executive-20260921.log and
+        .tmp/build-shared-startup-ready-io-manager-20260921.log). Tests cover owned fifth-word capture,
+        readiness followed by ordinary Reply adoption, malformed framing/identity, decoder refusal,
+        binding-query failures and occupied publication slots. No new boot or desktop proof is claimed.
       - [~] Generalize provider waits to authenticated kernel-only activations before Eng cutover.
         Next whole native ownership slice: install pre-loop receive/deadline/readiness ownership
         for initial kernel activations before enabling blocking DriverEntry admission. Runtime

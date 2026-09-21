@@ -95,6 +95,9 @@ mod completion_message_tests;
 #[path = "startup_receive_tests.rs"]
 mod startup_receive_tests;
 
+mod startup_ready;
+pub use startup_ready::StartupReadyError;
+
 /// Native adapters must capture the full received message before issuing binding-query IPC.
 /// This owns ingress and storage exclusively; Call provenance, exact physical lifetime and
 /// capability alias exclusions outside this receiver remain native obligations.
