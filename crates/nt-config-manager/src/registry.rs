@@ -364,6 +364,7 @@ impl Registry {
         let (parent_path, name) = trimmed.rsplit_once('\\').ok_or(0xC000_0033u32)?;
         if name.is_empty() { return Err(0xC000_0033); }
         let parent = self.open_key(parent_path).ok_or(0xC000_003Au32)?;
+        if !volatile && self.is_volatile(parent) { return Err(0xC000_0181); }
         let mut assigned = Vec::new();
         assigned.try_reserve_exact(descriptor.len()).map_err(|_| 0xC000_009Au32)?;
         assigned.extend_from_slice(descriptor);
@@ -768,6 +769,21 @@ impl Drop for RegistryTransaction<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secured_runtime_children_obey_parent_storage_class() {
+        let mut registry = Registry::new();
+        let parent = registry.create_key(r"\Registry\Transient");
+        registry.set_volatile(parent, true);
+        let descriptor = registry.key_security_descriptor(parent).unwrap().to_vec();
+        let generation = registry.generation(parent).unwrap();
+        let path = r"\Registry\Transient\Child";
+        assert_eq!(registry.create_secured_key_checked(path, &descriptor, false, parent, generation), Err(0xC000_0181));
+        assert!(registry.open_key(path).is_none());
+        let (key, created) = registry.create_secured_key_checked(path, &descriptor, true, parent, generation).unwrap();
+        assert!(created && registry.is_volatile(key));
+        assert_eq!(registry.create_secured_key_checked(path, &descriptor, false, parent, generation), Ok((key, false)));
+    }
 
     #[test]
     fn generated_keys_have_assigned_inherited_security() {

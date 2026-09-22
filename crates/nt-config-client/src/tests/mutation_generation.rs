@@ -83,6 +83,7 @@ fn absence_based_creation_and_setup_batch_keep_the_original_read_generation() {
         &mut client,
         resolved.mount_generation,
         &[SystemHiveMutation::CreateChild {
+            volatile: false,
             parent: SERVICES,
             name: "New",
             class_name: Some("winner"),
@@ -145,6 +146,7 @@ fn opaque_upload_uses_final_exact_lease_validation_not_begin_generation() {
         &mut client,
         begin.mount_generation,
         &[SystemHiveMutation::CreateChild {
+            volatile: false,
             parent: SERVICES,
             name: "Unrelated",
             class_name: None,
@@ -191,6 +193,7 @@ fn deleted_and_recreated_path_cannot_replace_an_uploads_original_lease() {
         &[
             SystemHiveMutation::DeleteKey { path: &before.path },
             SystemHiveMutation::CreateChild {
+                volatile: false,
                 parent: SERVICES,
                 name: "Device",
                 class_name: None,

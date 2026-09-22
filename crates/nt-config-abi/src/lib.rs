@@ -260,7 +260,7 @@ pub mod hive_mutation_kind {
     /// carries one [`device_action_kind`] value; it does not directly mutate registry cells.
     pub const PUBLISH_DEVICE_ACTION: u16 = 7;
     /// Exact-parent child creation: path=parent, name=child, value_type=0. Data uses
-    /// hive_create_child_metadata; CLASS_PRESENT is the only valid flag.
+    /// hive_create_child_metadata; CLASS_PRESENT and VOLATILE are the only valid flags.
     pub const CREATE_CHILD: u16 = 8;
     /// Exact leased parent, empty path. Data begins with a nonzero u64 lease token,
     /// followed by the same metadata as CREATE_CHILD. Tokens never enter the disk journal.
@@ -272,6 +272,9 @@ pub mod hive_create_child_metadata;
 pub mod hive_mutation_flags {
     /// Distinguishes an explicitly present empty class from clearing the class metadata.
     pub const CLASS_PRESENT: u16 = 1 << 0;
+    /// Create a memory-only child in the mounted hive. This is valid only for CREATE_CHILD and
+    /// CREATE_CHILD_LEASED; the server owns durable filtering and sequence advancement.
+    pub const VOLATILE: u16 = 1 << 1;
 }
 
 /// Operation carried by [`CmLaunchPlanRequest::operation`].

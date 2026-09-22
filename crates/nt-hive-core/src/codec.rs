@@ -151,7 +151,7 @@ pub fn try_encode_subtree_image(
     hive: &Hive,
     subtree_root: CellId,
 ) -> Result<Vec<u8>, HiveSubtreeEncodeError> {
-    if hive.key(subtree_root).is_none() {
+    if hive.key(subtree_root).is_none() || hive.is_volatile(subtree_root) {
         return Err(HiveSubtreeEncodeError::InvalidRoot);
     }
     let (payload_len, record_count) =
@@ -251,6 +251,7 @@ fn image_payload_len(hive: &Hive) -> Result<usize, HiveEncodeError> {
 }
 
 fn subtree_payload_len(hive: &Hive, root: CellId) -> Result<(usize, u64), HiveEncodeError> {
+    if hive.is_volatile(root) { return Ok((0, 0)); }
     let Some(key) = hive.key(root) else {
         return Ok((0, 0));
     };
@@ -306,6 +307,7 @@ fn write_value_record(p: &mut CheckedWriter, hive: &Hive, value: &ValueCell) {
 }
 
 fn write_subtree_records(hive: &Hive, root: CellId, subtree_root: CellId, p: &mut CheckedWriter) {
+    if hive.is_volatile(root) { return; }
     let Some(key) = hive.key(root) else {
         return;
     };
@@ -452,6 +454,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
                 let parent = (raw_id.0 != root_cell)
                     .then(|| map_decoded_cell_id(&mut id_map, CellId(parent_raw), &mut next_id));
                 hive.insert_key(KeyCell {
+                    volatile: false,
                     id,
                     parent,
                     name,

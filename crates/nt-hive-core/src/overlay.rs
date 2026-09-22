@@ -203,6 +203,9 @@ impl RegistryOverlay {
     pub fn create_secured_owned(&mut self, canon: String, volatile: bool, class_name: Option<String>, descriptor: Vec<u8>) -> Result<usize, u32> {
         if descriptor.is_empty() { return Err(0xC000_0079); }
         if self.find(&canon).is_some() { return Err(0xC000_0035); }
+        if !volatile && canon.rsplit_once('\\').and_then(|(parent, _)| self.find(parent)).is_some_and(|parent| self.is_volatile(parent) == Some(true)) {
+            return Err(0xC000_0181);
+        }
         self.keys.try_reserve(1).map_err(|_| 0xC000_009Au32)?;
         let existing = self.blobs.iter().position(|blob| *blob == descriptor);
         if existing.is_none() { self.blobs.try_reserve(1).map_err(|_| 0xC000_009Au32)?; }
@@ -524,6 +527,17 @@ fn immediate_child<'a>(path: &'a str, parent: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secured_overlay_rejects_stable_child_of_volatile_parent() {
+        let mut overlay = RegistryOverlay::new();
+        overlay.create_secured_owned(r"\registry\transient".into(), true, None, b"sd".to_vec()).unwrap();
+        let path = r"\registry\transient\child";
+        assert_eq!(overlay.create_secured_owned(path.into(), false, None, b"sd".to_vec()), Err(0xC000_0181));
+        assert!(overlay.find(path).is_none());
+        let key = overlay.create_secured_owned(path.into(), true, None, b"sd".to_vec()).unwrap();
+        assert_eq!(overlay.is_volatile(key), Some(true));
+    }
 
     #[test]
     fn secured_create_has_metadata_at_publication_and_does_not_reuse_detached_identity() {

@@ -9,6 +9,7 @@ pub enum CreateChildError {
     NameCollision,
     EmptySecurityDescriptor,
     InsufficientResources,
+    ChildMustBeVolatile,
 }
 
 fn copy_slice<T: Copy>(source: &[T]) -> Result<Vec<T>, CreateChildError> {
@@ -43,6 +44,7 @@ fn snapshot_key(key: &KeyCell) -> Result<KeyCell, CreateChildError> {
             .map(copy_slice)
             .transpose()?,
         last_write_sequence: key.last_write_sequence,
+        volatile: key.volatile,
     })
 }
 
@@ -60,6 +62,17 @@ impl HiveTransaction<'_> {
         class_name: Option<String>,
         security_descriptor: Vec<u8>,
     ) -> Result<CellId, CreateChildError> {
+        self.try_create_child_with_options(parent, name, class_name, security_descriptor, false)
+    }
+
+    pub fn try_create_child_with_options(
+        &mut self,
+        parent: CellId,
+        name: String,
+        class_name: Option<String>,
+        security_descriptor: Vec<u8>,
+        volatile: bool,
+    ) -> Result<CellId, CreateChildError> {
         if name.is_empty() || name.contains(['\\', '\0']) {
             return Err(CreateChildError::InvalidName);
         }
@@ -69,6 +82,9 @@ impl HiveTransaction<'_> {
             .ok_or(CreateChildError::ParentNotFound)?;
         if self.hive.open_subkey(parent, &name).is_some() {
             return Err(CreateChildError::NameCollision);
+        }
+        if parent_cell.volatile && !volatile {
+            return Err(CreateChildError::ChildMustBeVolatile);
         }
         if security_descriptor.is_empty() {
             return Err(CreateChildError::EmptySecurityDescriptor);
@@ -86,7 +102,7 @@ impl HiveTransaction<'_> {
         let sequence = self
             .hive
             .sequence
-            .checked_add(1)
+            .checked_add(u64::from(!volatile))
             .ok_or(CreateChildError::InsufficientResources)?;
         if index < self.hive.cells.len() {
             return Err(CreateChildError::InsufficientResources);
@@ -134,10 +150,13 @@ impl HiveTransaction<'_> {
             class_name,
             security_descriptor: Some(security_descriptor),
             last_write_sequence: sequence,
+            volatile,
         }));
         let parent_cell = self.hive.key_mut(parent).unwrap();
         parent_cell.subkeys.push(id);
-        parent_cell.last_write_sequence = sequence;
+        if !volatile {
+            parent_cell.last_write_sequence = sequence;
+        }
         self.hive.next_id = next_id;
         self.hive.sequence = sequence;
         Ok(id)

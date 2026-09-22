@@ -16,6 +16,7 @@ fn lost_commit_and_ack_replies_preserve_exact_publication_and_durable_replay() {
             1,
             &[
                 SystemHiveMutation::CreateChild {
+                    volatile: false,
                     parent: PARENT,
                     name: "Child",
                     class_name: Some("class"),

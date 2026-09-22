@@ -138,6 +138,7 @@ pub struct QueryError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemHiveMutation<'a> {
     CreateChildRelative {
+        volatile: bool,
         parent: SystemHiveKeyLease,
         name: &'a str,
         class_name: Option<&'a str>,
@@ -145,6 +146,7 @@ pub enum SystemHiveMutation<'a> {
     },
     /// Caller must retain the exact parent and authorize at the generation passed to PREPARE.
     CreateChild {
+        volatile: bool,
         parent: &'a str,
         name: &'a str,
         class_name: Option<&'a str>,
@@ -1166,13 +1168,13 @@ fn encode_hive_mutation_journal(mutations: &[SystemHiveMutation<'_>]) -> Result<
     let mut journal = Vec::new();
     for mutation in mutations {
         match *mutation {
-            SystemHiveMutation::CreateChildRelative { parent, name, class_name, descriptor } => {
-                child_creation::append_leased(&mut journal, parent, name, class_name, descriptor)?;
+            SystemHiveMutation::CreateChildRelative { parent, name, class_name, descriptor, volatile } => {
+                child_creation::append_leased(&mut journal, parent, name, class_name, descriptor, volatile)?;
             }
             SystemHiveMutation::CreateChild {
-                parent, name, class_name, descriptor,
+                parent, name, class_name, descriptor, volatile,
             } => {
-                child_creation::append(&mut journal, parent, name, class_name, descriptor)?;
+                child_creation::append(&mut journal, parent, name, class_name, descriptor, volatile)?;
             }
             SystemHiveMutation::CreateKey { path } => append_hive_mutation_record(
                 &mut journal,

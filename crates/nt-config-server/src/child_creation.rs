@@ -49,14 +49,19 @@ pub(super) fn apply(
     name: &str,
     class: Option<&str>,
     descriptor: &[u8],
+    volatile: bool,
 ) -> Result<(), i32> {
     let parent = tx.open_key(parent).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-    apply_cell(tx, parent, name, class, descriptor)
+    apply_cell(tx, parent, name, class, descriptor, volatile)
 }
 
 pub(super) fn apply_cell(
-    tx: &mut HiveTransaction<'_>, parent: nt_hive_core::CellId, name: &str,
-    class: Option<&str>, descriptor: &[u8],
+    tx: &mut HiveTransaction<'_>,
+    parent: nt_hive_core::CellId,
+    name: &str,
+    class: Option<&str>,
+    descriptor: &[u8],
+    volatile: bool,
 ) -> Result<(), i32> {
     let name = string(name)?;
     let class = class.map(string).transpose()?;
@@ -65,7 +70,7 @@ pub(super) fn apply_cell(
         .try_reserve_exact(descriptor.len())
         .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     security.extend_from_slice(descriptor);
-    tx.try_create_child(parent, name, class, security)
+    tx.try_create_child_with_options(parent, name, class, security, volatile)
         .map(|_| ())
         .map_err(|error| {
             use nt_hive_core::CreateChildError;
@@ -73,6 +78,7 @@ pub(super) fn apply_cell(
                 CreateChildError::ParentNotFound => STATUS_OBJECT_NAME_NOT_FOUND,
                 CreateChildError::NameCollision => 0xc000_0035u32 as i32,
                 CreateChildError::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
+                CreateChildError::ChildMustBeVolatile => 0xc000_0181u32 as i32,
                 CreateChildError::InvalidName | CreateChildError::EmptySecurityDescriptor => {
                     STATUS_INVALID_PARAMETER
                 }

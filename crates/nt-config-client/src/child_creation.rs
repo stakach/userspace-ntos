@@ -6,21 +6,22 @@ pub(super) fn append(
     name: &str,
     class_name: Option<&str>,
     descriptor: &[u8],
+    volatile: bool,
 ) -> Result<(), i32> {
-    append_inner(journal, parent, 0, name, class_name, descriptor)
+    append_inner(journal, parent, 0, name, class_name, descriptor, volatile)
 }
 
 pub(super) fn append_leased(
     journal: &mut Vec<u8>, parent: SystemHiveKeyLease, name: &str,
-    class_name: Option<&str>, descriptor: &[u8],
+    class_name: Option<&str>, descriptor: &[u8], volatile: bool,
 ) -> Result<(), i32> {
     if parent.token == 0 || parent.opened_generation == 0 { return Err(STATUS_INVALID_PARAMETER); }
-    append_inner(journal, "", parent.token, name, class_name, descriptor)
+    append_inner(journal, "", parent.token, name, class_name, descriptor, volatile)
 }
 
 fn append_inner(
     journal: &mut Vec<u8>, parent: &str, lease: u64, name: &str,
-    class_name: Option<&str>, descriptor: &[u8],
+    class_name: Option<&str>, descriptor: &[u8], volatile: bool,
 ) -> Result<(), i32> {
     use nt_config_abi::hive_create_child_metadata as metadata;
     if name.is_empty() || name.contains(['\\', '\0']) || descriptor.is_empty() {
@@ -48,14 +49,52 @@ fn append_inner(
     append_hive_mutation_record(
         journal,
         if lease == 0 { hive_mutation_kind::CREATE_CHILD } else { hive_mutation_kind::CREATE_CHILD_LEASED },
-        if class_name.is_some() {
+        (if class_name.is_some() {
             hive_mutation_flags::CLASS_PRESENT
         } else {
             0
-        },
+        }) | if volatile { hive_mutation_flags::VOLATILE } else { 0 },
         0,
         parent,
         name,
         &data,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volatility_is_explicit_for_path_and_leased_child_creation() {
+        for volatile in [false, true] {
+            for class_name in [None, Some(""), Some("class")] {
+                for leased in [false, true] {
+                    let mutation = if leased {
+                        SystemHiveMutation::CreateChildRelative {
+                            parent: SystemHiveKeyLease { token: 17, opened_generation: 9 },
+                            name: "Child", class_name, descriptor: b"security", volatile,
+                        }
+                    } else {
+                        SystemHiveMutation::CreateChild {
+                            parent: "Parent", name: "Child", class_name,
+                            descriptor: b"security", volatile,
+                        }
+                    };
+                    let encoded = encode_hive_mutation_journal(&[mutation]).unwrap();
+                    assert_eq!(u16::from_le_bytes(encoded[..2].try_into().unwrap()),
+                        if leased { hive_mutation_kind::CREATE_CHILD_LEASED } else { hive_mutation_kind::CREATE_CHILD });
+                    let flags = u16::from_le_bytes(encoded[2..4].try_into().unwrap());
+                    assert_eq!(flags & hive_mutation_flags::VOLATILE != 0, volatile);
+                    assert_eq!(flags & hive_mutation_flags::CLASS_PRESENT != 0, class_name.is_some());
+                    assert_eq!(flags & !(hive_mutation_flags::VOLATILE | hive_mutation_flags::CLASS_PRESENT), 0);
+                    assert!(encoded.ends_with(b"security"));
+                    if leased {
+                        let token_offset = CM_HIVE_MUTATION_RECORD_HEADER_BYTES + "Child".encode_utf16().count() * 2;
+                        assert_eq!(u64::from_le_bytes(encoded[token_offset..token_offset + 8].try_into().unwrap()), 17);
+                    }
+                }
+            }
+        }
+    }
 }

@@ -297,20 +297,29 @@ fn apply_system_hive_mutation(
     };
     match mutation {
         HiveMutation::CreateChild {
-            authority, parent, name, class_name, descriptor,
+            authority, parent, name, class_name, descriptor, volatile,
         } => {
             match authority {
                 mutation::ChildParentAuthority::Path => child_creation::apply(
-                    transaction, &relative(parent)?, name, class_name.as_deref(), descriptor,
+                    transaction, &relative(parent)?, name, class_name.as_deref(), descriptor, *volatile,
                 ),
                 mutation::ChildParentAuthority::Cell(cell) => child_creation::apply_cell(
-                    transaction, *cell, name, class_name.as_deref(), descriptor,
+                    transaction, *cell, name, class_name.as_deref(), descriptor, *volatile,
                 ),
                 mutation::ChildParentAuthority::Lease(_) => Err(STATUS_INVALID_HANDLE),
             }
         }
         HiveMutation::CreateKey { path } => {
-            transaction.create_key(&relative(&path)?);
+            let path = relative(path)?;
+            let mut parent = transaction.hive().root();
+            for name in path.split('\\').filter(|part| !part.is_empty()) {
+                match transaction.hive().open_subkey(parent, name) {
+                    Some(child) => parent = child,
+                    None if transaction.hive().is_volatile(parent) => return Err(0xc000_0181u32 as i32),
+                    None => break,
+                }
+            }
+            transaction.create_key(&path);
             Ok(())
         }
         HiveMutation::SetValue {
@@ -447,8 +456,9 @@ fn project_system_hive_mutations(
             HiveMutation::CreateKey { .. } => {
                 registry.create_key(&path);
             }
-            HiveMutation::CreateChild { descriptor, class_name, .. } => {
+            HiveMutation::CreateChild { descriptor, class_name, volatile, .. } => {
                 let key = registry.create_key(&path);
+                registry.set_volatile(key, *volatile);
                 let _ = registry.import_key_security_descriptor(key, Some(descriptor));
                 registry.set_key_class(key, class_name.as_deref());
             }

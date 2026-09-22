@@ -24,6 +24,7 @@ pub(crate) enum HiveMutation {
         name: String,
         class_name: Option<String>,
         descriptor: Vec<u8>,
+        volatile: bool,
     },
     CreateKey {
         path: String,
@@ -245,7 +246,7 @@ pub(crate) fn decode_mutation_journal(bytes: &[u8]) -> Option<Vec<HiveMutation>>
         let data = bytes.get(data_start..record_end)?;
         let mutation = match header.kind {
             hive_mutation_kind::CREATE_CHILD | hive_mutation_kind::CREATE_CHILD_LEASED
-                if header.flags & !hive_mutation_flags::CLASS_PRESENT == 0
+                if header.flags & !(hive_mutation_flags::CLASS_PRESENT | hive_mutation_flags::VOLATILE) == 0
                     && header.value_type == 0
                     && !name.is_empty()
                     && !name.contains('\\') =>
@@ -273,6 +274,7 @@ pub(crate) fn decode_mutation_journal(bytes: &[u8]) -> Option<Vec<HiveMutation>>
                     name,
                     class_name,
                     descriptor: owned,
+                    volatile: header.flags & hive_mutation_flags::VOLATILE != 0,
                 }
             }
             hive_mutation_kind::CREATE_KEY

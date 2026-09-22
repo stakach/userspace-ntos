@@ -175,6 +175,7 @@ fn import_hive_key_inner(
     // can remain indexable, but a later access check must not see a generated permissive ACL.
     let _ = dst.import_key_security_descriptor(dst_key, hive.key_security_descriptor(src));
     dst.set_key_class(dst_key, hive.key_class(src));
+    dst.set_volatile(dst_key, hive.is_volatile(src));
     for value_name in hive.enum_values(src) {
         if let Some((value_type, data)) = hive.query_value(src, &value_name) {
             let _ = dst.set_value(dst_key, &value_name, value_type, Vec::from(data));
