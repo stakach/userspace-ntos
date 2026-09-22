@@ -47,6 +47,7 @@ fn child_wire_preserves_large_descriptor_and_class_presence() {
         assert_eq!(
             decoded,
             vec![HiveMutation::CreateChild {
+                authority: crate::mutation::ChildParentAuthority::Path,
                 parent: r"\Registry\Machine\System\ControlSet001\Services".into(),
                 name: "Child".into(),
                 class_name: class.map(String::from),

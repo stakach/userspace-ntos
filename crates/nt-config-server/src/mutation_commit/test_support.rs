@@ -24,6 +24,7 @@ pub(super) fn prepare(server: &mut CmServer, name: &str) -> CmHiveMutationCommit
     let token = server.identities.take().unwrap();
     let expected = server.system_hive.as_ref().unwrap().generation;
     let mutations = alloc::vec![HiveMutation::CreateChild {
+        authority: crate::mutation::ChildParentAuthority::Path,
         parent: String::from(r"\Registry\Machine\System\ControlSet001\Services"),
         name: String::from(name),
         class_name: Some(String::from("class")),

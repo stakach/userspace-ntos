@@ -14,6 +14,7 @@ extern crate alloc;
 mod retained_snapshot_integration;
 
 mod active_driver_service;
+mod runtime_key;
 mod system_mount;
 pub use system_mount::{SystemHiveMount, SystemHiveMountState};
 mod retained_snapshot;
@@ -66,6 +67,13 @@ pub use broker_key_owner::{
 
 use alloc::string::String;
 use alloc::vec::Vec;
+
+#[derive(Debug)]
+pub struct RuntimeKeySecuritySnapshot {
+    pub key: u64,
+    pub generation: u32,
+    pub descriptor: Vec<u8>,
+}
 
 use nt_config_abi::{
     device_action_kind, device_action_service, device_action_transfer, device_property_transfer,
@@ -129,6 +137,12 @@ pub struct QueryError {
 /// One operation in an atomic, generation-checked mutation of the CM-owned SYSTEM hive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemHiveMutation<'a> {
+    CreateChildRelative {
+        parent: SystemHiveKeyLease,
+        name: &'a str,
+        class_name: Option<&'a str>,
+        descriptor: &'a [u8],
+    },
     /// Caller must retain the exact parent and authorize at the generation passed to PREPARE.
     CreateChild {
         parent: &'a str,
@@ -1152,6 +1166,9 @@ fn encode_hive_mutation_journal(mutations: &[SystemHiveMutation<'_>]) -> Result<
     let mut journal = Vec::new();
     for mutation in mutations {
         match *mutation {
+            SystemHiveMutation::CreateChildRelative { parent, name, class_name, descriptor } => {
+                child_creation::append_leased(&mut journal, parent, name, class_name, descriptor)?;
+            }
             SystemHiveMutation::CreateChild {
                 parent, name, class_name, descriptor,
             } => {
@@ -1287,6 +1304,79 @@ impl<B: Backend> ConfigClient<B> {
     /// Whether a key exists at `path`.
     pub fn open_key(&mut self, path: &str) -> bool {
         self.key_op(opcode::CM_OP_OPEN_KEY, path).status == STATUS_SUCCESS
+    }
+
+    pub fn delete_value(&mut self, path: &str, name: &str) -> Result<(), i32> {
+        let result = self.raw_value_op(opcode::CM_OP_DELETE_VALUE, path, name, 0, &[], &mut []);
+        if result.status == STATUS_SUCCESS { Ok(()) } else { Err(result.status) }
+    }
+
+    pub fn query_key_security(&mut self, path: &str) -> Result<Vec<u8>, i32> {
+        self.query_key_security_snapshot(path).map(|snapshot| snapshot.descriptor)
+    }
+
+    pub fn query_key_security_snapshot(&mut self, path: &str) -> Result<RuntimeKeySecuritySnapshot, i32> {
+        let mut output = alloc::vec![0u8; nt_config_abi::CM_KEY_SECURITY_FRAME_BYTES];
+        let result = self.key_security_op(opcode::CM_OP_QUERY_KEY_SECURITY, path, &[], 0, None, None, &mut output)?;
+        if result.status != STATUS_SUCCESS { return Err(result.status); }
+        let length = result.information as usize;
+        if length > output.len() { return Err(STATUS_INVALID_PARAMETER); }
+        output.truncate(length);
+        if result.detail0 == 0 || result.detail1 == 0 || result.detail1 > u32::MAX as u64
+            || nt_security::security_descriptor_bytes_for_access(&output).is_err()
+        { return Err(STATUS_INVALID_PARAMETER); }
+        Ok(RuntimeKeySecuritySnapshot { key: result.detail0, generation: result.detail1 as u32, descriptor: output })
+    }
+
+    /// Executive-authorized replacement of a complete runtime-key descriptor.
+    pub fn set_key_security(&mut self, path: &str, descriptor: &[u8]) -> Result<(), i32> {
+        let result = self.key_security_op(opcode::CM_OP_SET_KEY_SECURITY, path, descriptor, 0, None, None, &mut [])?;
+        if result.status != STATUS_SUCCESS { return Err(result.status); }
+        if result.information != 0 || result.detail0 != 0 || result.detail1 != 0 { return Err(STATUS_INVALID_PARAMETER); }
+        Ok(())
+    }
+
+    /// Create one leaf with its already assigned descriptor, without changing an existing key.
+    pub fn create_secured_key(&mut self, path: &str, descriptor: &[u8], volatile: bool) -> Result<(u64, bool), i32> {
+        let parent_path = path.trim_end_matches('\\').rsplit_once('\\').ok_or(STATUS_INVALID_PARAMETER)?.0;
+        let parent = self.query_key_security_snapshot(parent_path)?;
+        self.create_secured_key_checked(path, descriptor, volatile, parent.key, parent.generation)
+    }
+
+    pub fn create_secured_key_checked(&mut self, path: &str, descriptor: &[u8], volatile: bool, parent_key: u64, parent_generation: u32) -> Result<(u64, bool), i32> {
+        self.create_secured_key_checked_with_class(path, descriptor, volatile, parent_key, parent_generation, None)
+    }
+
+    pub fn create_secured_key_checked_with_class(&mut self, path: &str, descriptor: &[u8], volatile: bool, parent_key: u64, parent_generation: u32, class: Option<&str>) -> Result<(u64, bool), i32> {
+        let flags = if volatile { key_flags::VOLATILE } else { 0 };
+        let result = self.key_security_op(opcode::CM_OP_CREATE_SECURED_KEY, path, descriptor, flags, Some((parent_key, parent_generation)), class, &mut [])?;
+        if result.status != STATUS_SUCCESS { return Err(result.status); }
+        if result.information != 0 || result.detail0 == 0 || result.detail1 > 1 { return Err(STATUS_INVALID_PARAMETER); }
+        Ok((result.detail0, result.detail1 == 1))
+    }
+
+    fn key_security_op(&mut self, op: u16, path: &str, descriptor: &[u8], flags: u16, parent: Option<(u64, u32)>, class: Option<&str>, output: &mut [u8]) -> Result<CmReply, i32> {
+        use nt_config_abi::{CmKeySecurityRequest, CM_KEY_SECURITY_FRAME_BYTES};
+        let path = utf16_bytes(path);
+        let class = utf16_bytes(class.unwrap_or(""));
+        let header = core::mem::size_of::<CmKeySecurityRequest>();
+        let descriptor_offset = header.checked_add(path.len()).and_then(|len| len.checked_add(class.len())).ok_or(STATUS_INVALID_PARAMETER)?;
+        let total = descriptor_offset.checked_add(descriptor.len()).ok_or(STATUS_INVALID_PARAMETER)?;
+        if total > CM_KEY_SECURITY_FRAME_BYTES { return Err(STATUS_INVALID_PARAMETER); }
+        let request = CmKeySecurityRequest {
+            abi_size: header as u16, flags, path_offset: header as u32,
+            path_len_bytes: path.len() as u32, descriptor_offset: descriptor_offset as u32,
+            descriptor_len: descriptor.len() as u32,
+            reserved: 0, expected_parent: parent.map_or(0, |parent| parent.0),
+            class_len: class.len() as u32, class_reserved: 0,
+            expected_parent_generation: parent.map_or(0, |parent| parent.1 as u64),
+        };
+        let mut bytes = Vec::with_capacity(total);
+        bytes.extend_from_slice(request.as_bytes());
+        bytes.extend_from_slice(&path);
+        bytes.extend_from_slice(&class);
+        bytes.extend_from_slice(descriptor);
+        Ok(self.backend.call(op, &bytes, output))
     }
 
     /// Enumerate an immediate subkey name by index into `out` as UTF-16LE bytes without a NUL.
@@ -1541,6 +1631,11 @@ impl<B: Backend> ConfigClient<B> {
             &request_bytes,
             &mut chunk,
         );
+        self.collect_raw_value_snapshot(first, &mut chunk)
+    }
+
+    fn collect_raw_value_snapshot(&mut self, first: CmReply, chunk: &mut [u8; CM_RAW_VALUE_CHUNK_BYTES]) -> Result<(u32, Vec<u8>), QueryError> {
+        let base = core::mem::size_of::<CmRawValueQueryRequest>();
         if first.status != STATUS_SUCCESS {
             return Err(QueryError {
                 status: first.status,
@@ -1589,13 +1684,15 @@ impl<B: Backend> ConfigClient<B> {
             let next = self.backend.call(
                 opcode::CM_OP_QUERY_VALUE_TRANSFER,
                 request.as_bytes(),
-                &mut chunk,
+                chunk,
             );
             let written = next.information as usize;
             if next.status != STATUS_SUCCESS
                 || next.detail0 as usize != required
                 || written == 0
                 || written > core::cmp::min(chunk.len(), required - data.len())
+                // PULL echoes the admitted token even on the final chunk; completion is length.
+                || next.detail1 != token
             {
                 let _ = self.abort_query_value_transfer(token);
                 return Err(QueryError {
@@ -3810,6 +3907,7 @@ impl<B: Backend> ConfigClient<B> {
 
 #[cfg(test)]
 mod tests {
+    mod runtime_security;
     mod hardware_profile;
     mod key_creation;
     mod secured_child_cm;

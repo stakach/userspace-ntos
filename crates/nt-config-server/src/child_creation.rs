@@ -51,6 +51,13 @@ pub(super) fn apply(
     descriptor: &[u8],
 ) -> Result<(), i32> {
     let parent = tx.open_key(parent).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+    apply_cell(tx, parent, name, class, descriptor)
+}
+
+pub(super) fn apply_cell(
+    tx: &mut HiveTransaction<'_>, parent: nt_hive_core::CellId, name: &str,
+    class: Option<&str>, descriptor: &[u8],
+) -> Result<(), i32> {
     let name = string(name)?;
     let class = class.map(string).transpose()?;
     let mut security = Vec::new();

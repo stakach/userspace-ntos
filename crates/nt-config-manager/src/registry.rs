@@ -168,6 +168,24 @@ fn fold(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+fn generated_key_security(parent: Option<&[u8]>) -> Vec<u8> {
+    use nt_security::*;
+    // Generated CM namespace keys have a fixed System creator, not a request subject.
+    let system = AccessToken::system();
+    let mut audit = SecurityAssignmentAudit::default();
+    match parent {
+        None => assign_registry_root_security(&CapturedSubjectTokens {
+            primary: &system, client: None, process_audit_id: 0,
+        }, &mut audit),
+        Some(parent) => assign_object_security_with_audit(&ObjectSecurityAssignment {
+            primary: &system, client: None, creator: None, parent: Some(parent),
+            mapping: &KEY_GENERIC_MAPPING, is_container: true,
+            mode: ProcessorMode::KernelMode, object_type: None,
+            inheritance: SecurityAssignmentInheritance::Legacy,
+        }, &mut audit),
+    }.expect("generated registry security assignment")
+}
+
 #[derive(Clone)]
 struct KeyRecord {
     id: RegistryKeyId,
@@ -177,6 +195,8 @@ struct KeyRecord {
     values: Vec<RegistryValue>,
     volatile: bool,
     generation: u32,
+    security_descriptor: Option<Vec<u8>>,
+    class_name: Option<String>,
 }
 
 /// The registry tree.
@@ -228,6 +248,11 @@ impl Registry {
     }
 
     fn alloc_key(&mut self, parent: Option<RegistryKeyId>, name: &str) -> RegistryKeyId {
+        let security_descriptor = match parent {
+            None => Some(generated_key_security(None)),
+            Some(id) => self.record(id).expect("registry parent exists").security_descriptor
+                .as_deref().map(|descriptor| generated_key_security(Some(descriptor))),
+        };
         let id = self.next_id;
         self.next_id += 1;
         let generation = self.next_gen;
@@ -240,6 +265,8 @@ impl Registry {
             values: Vec::new(),
             volatile: false,
             generation,
+            security_descriptor,
+            class_name: None,
         });
         id
     }
@@ -296,6 +323,81 @@ impl Registry {
 
     pub fn key_exists(&self, id: RegistryKeyId) -> bool {
         self.record(id).is_some()
+    }
+
+    pub fn key_security_descriptor(&self, id: RegistryKeyId) -> Option<&[u8]> {
+        self.record(id)?.security_descriptor.as_deref()
+    }
+
+    /// Imported security is authoritative: absence or corruption must not retain generated ACLs.
+    pub fn import_key_security_descriptor(&mut self, id: RegistryKeyId, descriptor: Option<&[u8]>) -> Result<(), u32> {
+        let generation = self.next_gen;
+        self.next_gen = self.next_gen.checked_add(1).ok_or(0xC000_009Au32)?;
+        let key = self.record_mut(id).ok_or(0xC000_0034u32)?;
+        key.security_descriptor = None;
+        key.generation = generation;
+        match descriptor {
+            Some(descriptor) => self.set_key_security_descriptor(id, descriptor),
+            None => Ok(()),
+        }
+    }
+
+    /// Store a complete descriptor already assigned and authorized by the executive.
+    pub fn set_key_security_descriptor(&mut self, id: RegistryKeyId, descriptor: &[u8]) -> Result<(), u32> {
+        nt_security::security_descriptor_bytes_for_access(descriptor)?;
+        let mut assigned = Vec::new();
+        assigned.try_reserve_exact(descriptor.len()).map_err(|_| 0xC000_009Au32)?;
+        assigned.extend_from_slice(descriptor);
+        let generation = self.next_gen;
+        self.next_gen = self.next_gen.checked_add(1).ok_or(0xC000_009Au32)?;
+        let key = self.record_mut(id).ok_or(0xC000_0034u32)?;
+        key.security_descriptor = Some(assigned);
+        key.generation = generation;
+        Ok(())
+    }
+
+    /// Atomically create only the final child. Existing keys retain their original security.
+    pub fn create_secured_key(&mut self, path: &str, descriptor: &[u8], volatile: bool) -> Result<(RegistryKeyId, bool), u32> {
+        nt_security::security_descriptor_bytes_for_access(descriptor)?;
+        if let Some(id) = self.open_key(path) { return Ok((id, false)); }
+        let trimmed = path.trim_end_matches('\\');
+        let (parent_path, name) = trimmed.rsplit_once('\\').ok_or(0xC000_0033u32)?;
+        if name.is_empty() { return Err(0xC000_0033); }
+        let parent = self.open_key(parent_path).ok_or(0xC000_003Au32)?;
+        let mut assigned = Vec::new();
+        assigned.try_reserve_exact(descriptor.len()).map_err(|_| 0xC000_009Au32)?;
+        assigned.extend_from_slice(descriptor);
+        let id = self.create_subkey(parent, name);
+        let key = self.record_mut(id).expect("new registry key exists");
+        key.security_descriptor = Some(assigned);
+        key.volatile = volatile;
+        Ok((id, true))
+    }
+
+    pub fn create_secured_key_checked(&mut self, path: &str, descriptor: &[u8], volatile: bool, expected_parent: RegistryKeyId, expected_generation: u32) -> Result<(RegistryKeyId, bool), u32> {
+        self.create_secured_key_checked_with_class(path, descriptor, volatile, expected_parent, expected_generation, None)
+    }
+
+    pub fn create_secured_key_checked_with_class(&mut self, path: &str, descriptor: &[u8], volatile: bool, expected_parent: RegistryKeyId, expected_generation: u32, class: Option<&str>) -> Result<(RegistryKeyId, bool), u32> {
+        nt_security::security_descriptor_bytes_for_access(descriptor)?;
+        if let Some(key) = self.open_key(path) { return Ok((key, false)); }
+        let parent_path = path.trim_end_matches('\\').rsplit_once('\\').ok_or(0xC000_0033u32)?.0;
+        let parent = self.open_key(parent_path).ok_or(0xC000_003Au32)?;
+        if parent != expected_parent || self.generation(parent) != Some(expected_generation) { return Err(0xC000_022D); }
+        let class_name = class.map(String::from);
+        let (key, created) = self.create_secured_key(path, descriptor, volatile)?;
+        if created { self.record_mut(key).unwrap().class_name = class_name; }
+        Ok((key, created))
+    }
+
+    pub fn key_class(&self, key: RegistryKeyId) -> Option<&str> {
+        self.record(key)?.class_name.as_deref()
+    }
+
+    pub fn set_key_class(&mut self, key: RegistryKeyId, class: Option<&str>) -> bool {
+        let Some(record) = self.record_mut(key) else { return false; };
+        record.class_name = class.map(String::from);
+        true
     }
 
     /// The full NT path of a key (`\Registry\…`).
@@ -536,6 +638,22 @@ impl<'a> RegistryTransaction<'a> {
         }
     }
 
+    pub fn set_key_security_descriptor(&mut self, id: RegistryKeyId, descriptor: &[u8]) -> Result<(), u32> {
+        nt_security::security_descriptor_bytes_for_access(descriptor)?;
+        self.snapshot_key(id);
+        self.registry.set_key_security_descriptor(id, descriptor)
+    }
+
+    pub fn import_key_security_descriptor(&mut self, id: RegistryKeyId, descriptor: Option<&[u8]>) -> Result<(), u32> {
+        self.snapshot_key(id);
+        self.registry.import_key_security_descriptor(id, descriptor)
+    }
+
+    pub fn set_key_class(&mut self, key: RegistryKeyId, class: Option<&str>) -> bool {
+        self.snapshot_key(key);
+        self.registry.set_key_class(key, class)
+    }
+
     /// `ZwSetValueKey` — set (create or replace) a named value on a key.
     pub fn set_value(
         &mut self,
@@ -650,6 +768,55 @@ impl Drop for RegistryTransaction<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_keys_have_assigned_inherited_security() {
+        let mut registry = Registry::new();
+        let parent = registry.open_key(r"\Registry\Machine").unwrap();
+        let child = registry.create_subkey(parent, "Generated");
+        for key in [parent, child] {
+            let bytes = registry.key_security_descriptor(key).unwrap();
+            let descriptor = nt_security::security_descriptor_bytes_for_access(bytes).unwrap();
+            assert!(descriptor.owner.is_some());
+            assert!(descriptor.dacl.is_some());
+        }
+    }
+
+    #[test]
+    fn imported_missing_or_malformed_security_never_keeps_generated_acl() {
+        let mut registry = Registry::new();
+        let key = registry.create_key(r"\Registry\Machine\Imported");
+        assert!(registry.key_security_descriptor(key).is_some());
+        registry.import_key_security_descriptor(key, None).unwrap();
+        assert!(registry.key_security_descriptor(key).is_none());
+        let child = registry.create_subkey(key, "Child");
+        assert!(registry.key_security_descriptor(child).is_none());
+        assert!(registry.import_key_security_descriptor(key, Some(b"malformed")).is_err());
+        assert!(registry.key_security_descriptor(key).is_none());
+    }
+
+    #[test]
+    fn secured_create_is_leaf_only_and_does_not_replace_existing_security() {
+        let mut registry = Registry::new();
+        let parent = registry.open_key(r"\Registry\Machine").unwrap();
+        let descriptor = registry.key_security_descriptor(parent).unwrap().to_vec();
+        assert!(registry.create_secured_key(r"\Registry\Missing\Child", &descriptor, false).is_err());
+        assert!(registry.open_key(r"\Registry\Missing").is_none());
+        assert!(registry.create_secured_key(r"\Registry\Machine\Bad", &[0; 20], false).is_err());
+        assert!(registry.open_key(r"\Registry\Machine\Bad").is_none());
+        let (id, created) = registry.create_secured_key(r"\Registry\Machine\Child", &descriptor, true).unwrap();
+        assert!(created);
+        assert!(registry.is_volatile(id));
+        let mut other = descriptor.clone();
+        other[2] |= 1; // SE_OWNER_DEFAULTED is valid, but must not replace an existing target.
+        assert_eq!(registry.create_secured_key(r"\Registry\Machine\Child", &other, false), Ok((id, false)));
+        assert_eq!(registry.key_security_descriptor(id), Some(descriptor.as_slice()));
+        {
+            let mut transaction = registry.begin_transaction();
+            transaction.set_key_security_descriptor(id, &other).unwrap();
+        }
+        assert_eq!(registry.key_security_descriptor(id), Some(descriptor.as_slice()));
+    }
 
     #[test]
     fn create_open_nested_and_case_insensitive() {

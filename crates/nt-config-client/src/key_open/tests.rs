@@ -68,6 +68,24 @@ impl Backend for CloseBackend {
 }
 
 #[test]
+fn relative_root_is_retained_in_exact_begin_replay_only() {
+    let mut manager = SystemHiveKeyOpenAttempts::new();
+    let root = SystemHiveKeyLease { token: 81, opened_generation: 3 };
+    assert!(manager.reserve_relative(root, r"\absolute").is_err());
+    let mut attempt = manager.reserve_relative(root, "Child").unwrap();
+    query(&manager, &mut attempt);
+    let mut first = manager.begin_exchange(&mut attempt, SystemHiveKeyOpenOperation::Begin).unwrap();
+    let request = CmHiveKeyOpenRequest::from_bytes(&first.bytes[..first.len]).unwrap();
+    assert_eq!(request.root_lease_token, root.token);
+    let bytes = first.bytes[..first.len].to_vec();
+    assert!(manager.complete_exchange(&mut attempt, &mut first, SystemHiveKeyOpenResponse::transport_error(STATUS_DEVICE_NOT_READY)).is_err());
+    let replay = manager.begin_exchange(&mut attempt, SystemHiveKeyOpenOperation::Begin).unwrap();
+    assert_eq!(&replay.bytes[..replay.len], &bytes);
+    assert!(manager.release(&mut attempt).is_err());
+    assert!(manager.reserve_relative(root, "").is_ok());
+}
+
+#[test]
 fn success_transfers_acknowledged_lease_once_without_reallocating_path() {
     let mut manager = SystemHiveKeyOpenAttempts::new();
     let mut attempt = manager.reserve(r"\Registry\Machine\System").unwrap();

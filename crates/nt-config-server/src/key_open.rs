@@ -27,6 +27,7 @@ impl OpenOutcome {
 
 struct PendingOpen {
     generation: u64,
+    root_lease_token: u64,
     path: Vec<u16>,
     outcome: Option<OpenOutcome>,
 }
@@ -87,7 +88,7 @@ impl OpenJournal {
                 if pending.generation != request.request_generation {
                     return Err(STATUS_INVALID_HANDLE);
                 }
-                if pending.path != path {
+                if pending.path != path || pending.root_lease_token != request.root_lease_token {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
                 if pending.outcome.is_none() {
@@ -126,6 +127,7 @@ impl OpenJournal {
         }
         self.slots[index].pending = Some(PendingOpen {
             generation: request.request_generation,
+            root_lease_token: request.root_lease_token,
             path: captured,
             outcome: None,
         });
@@ -181,22 +183,48 @@ fn decoded_path(units: &[u16]) -> Result<String, i32> {
 fn acquire(
     mounted: Option<&MountedSystemHive>,
     leases: &mut SystemKeyLeaseBank,
+    root_lease_token: u64,
     path: &str,
 ) -> Result<OpenOutcome, i32> {
     let mounted = mounted.ok_or(STATUS_DEVICE_NOT_READY)?;
-    let relative = mounted.resolve_relative_path(path)?;
-    let key = mounted
-        .hive
-        .open_key(&relative)
-        .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+    let (relative, key) = if root_lease_token == 0 {
+        let relative = mounted.resolve_relative_path(path)?;
+        let key = mounted.hive.open_key(&relative).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        (relative, key)
+    } else {
+        if path.starts_with('\\') { return Err(STATUS_INVALID_PARAMETER); }
+        let root = leases.get(root_lease_token).ok_or(STATUS_INVALID_HANDLE)?;
+        let root_path = mounted.hive.key_path(root.key).ok_or(0xc000_017cu32 as i32)?;
+        let root_path = root_path.trim_start_matches('\\');
+        let mut logical = String::new();
+        logical.try_reserve_exact(SYSTEM_HIVE_PATH.len() + root_path.len() + path.len() + 2)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        logical.push_str(SYSTEM_HIVE_PATH);
+        if !root_path.is_empty() { logical.push('\\'); logical.push_str(root_path); }
+        if !path.is_empty() { logical.push('\\'); logical.push_str(path); }
+        let resolved = mounted.resolve_relative_path(&logical)?;
+        // Alias translation can change descendants, never the authority-bearing root cell.
+        let descendants = if root_path.is_empty() { resolved.as_str() } else {
+            resolved.strip_prefix(root_path).ok_or(STATUS_INVALID_HANDLE)?
+                .strip_prefix('\\').or_else(|| (resolved == root_path).then_some(""))
+                .ok_or(STATUS_INVALID_HANDLE)?
+        };
+        let mut key = root.key;
+        for component in descendants.split('\\').filter(|part| !part.is_empty()) {
+            key = mounted.hive.open_subkey(key, component).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        }
+        let relative = mounted.hive.key_path(key).ok_or(0xc000_017cu32 as i32)?;
+        (relative, key)
+    };
     let mut physical_path = String::new();
     physical_path
         .try_reserve_exact(SYSTEM_HIVE_PATH.len() + 1 + relative.len())
         .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     physical_path.push_str(SYSTEM_HIVE_PATH);
+    let relative = relative.trim_start_matches('\\');
     if !relative.is_empty() {
         physical_path.push('\\');
-        physical_path.push_str(&relative);
+        physical_path.push_str(relative);
     }
     if physical_path.len() > CM_HIVE_KEY_OPEN_REPLY_MAX_BYTES - CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES
     {
@@ -243,6 +271,7 @@ impl CmServer {
                     || request.request_generation != 0
                     || request.path_offset != 0
                     || request.path_len_bytes != 0
+                    || request.root_lease_token != 0
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
@@ -250,7 +279,7 @@ impl CmServer {
             }
             operation::BEGIN => {
                 if request.path_offset as usize != header
-                    || request.path_len_bytes == 0
+                    || (request.path_len_bytes == 0 && request.root_lease_token == 0)
                     || request.path_len_bytes % 2 != 0
                     || request.path_len_bytes as usize > CM_MAX_HIVE_PATH_UNITS * 2
                     || header.checked_add(request.path_len_bytes as usize) != Some(input.len())
@@ -268,7 +297,7 @@ impl CmServer {
                 Some(count)
             }
             operation::ACKNOWLEDGE => {
-                if input.len() != header || request.path_offset != 0 || request.path_len_bytes != 0
+                if input.len() != header || request.path_offset != 0 || request.path_len_bytes != 0 || request.root_lease_token != 0
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
@@ -319,6 +348,7 @@ impl CmServer {
                             acquire(
                                 self.system_hive.as_ref(),
                                 &mut self.system_key_leases,
+                                request.root_lease_token,
                                 &decoded,
                             )
                         })

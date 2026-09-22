@@ -82,6 +82,70 @@ fn ack(outcome: CmHiveKeyOpenReply) -> CmHiveKeyOpenRequest {
 
 const DEVICE: &str = r"\Registry\Machine\System\CurrentControlSet\Services\Device";
 
+fn relative_begin(nonce: u64, slot: u64, root: u64, path: &str) -> Vec<u8> {
+    let mut bytes = begin(nonce, slot, 1, path);
+    let mut request = CmHiveKeyOpenRequest::from_bytes(&bytes).unwrap();
+    request.root_lease_token = root;
+    bytes[..core::mem::size_of::<CmHiveKeyOpenRequest>()].copy_from_slice(request.as_bytes());
+    bytes
+}
+
+#[test]
+fn relative_system_root_resolves_control_set_alias_without_reopening_root() {
+    let mut server = server();
+    let nonce = authority(&mut server);
+    let (_, root, _) = run(&mut server, &begin(nonce, 0, 1, r"\Registry\Machine\System"));
+    let (_, child, _) = run(&mut server, &relative_begin(nonce, 1, root.lease_token, r"CurrentControlSet\Services\Device"));
+    assert_eq!(child.outcome_status, STATUS_SUCCESS);
+    assert_eq!(server.system_key_leases.get(child.lease_token).unwrap().physical_path, r"\Registry\Machine\System\ControlSet001\Services\Device");
+}
+
+#[test]
+fn relative_open_is_cell_rooted_and_replay_survives_root_close() {
+    let mut server = server();
+    let nonce = authority(&mut server);
+    let (_, root, _) = run(&mut server, &begin(nonce, 0, 1, r"\Registry\Machine\System\CurrentControlSet\Services"));
+    let input = relative_begin(nonce, 1, root.lease_token, "Device");
+    let (_, child, original) = run(&mut server, &input);
+    assert_eq!(child.outcome_status, STATUS_SUCCESS);
+    assert_eq!(&original[CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES..], b"\\Registry\\Machine\\System\\ControlSet001\\Services\\Device");
+    let close = server.system_key_leases.prepare_close(root.lease_token).unwrap();
+    server.system_key_leases.acknowledge_close(close.bank, close.slot, close.generation).unwrap();
+    assert_eq!(run(&mut server, &input).2, original);
+    assert!(server.system_key_leases.get(child.lease_token).is_some());
+    let changed = relative_begin(nonce, 1, child.lease_token, "Device");
+    assert_eq!(run(&mut server, &changed).0.status, STATUS_INVALID_PARAMETER);
+    let late = relative_begin(nonce, 2, root.lease_token, "Device");
+    assert_eq!(run(&mut server, &late).1.outcome_status, STATUS_INVALID_HANDLE);
+}
+
+#[test]
+fn deleted_relative_root_cannot_reopen_replacement_at_same_path() {
+    let mut server = server();
+    let nonce = authority(&mut server);
+    let (_, root, _) = run(&mut server, &begin(nonce, 0, 1, DEVICE));
+    let key = server.system_key_leases.get(root.lease_token).unwrap().key;
+    let hive = &mut server.system_hive.as_mut().unwrap().hive;
+    hive.delete_key(key).unwrap();
+    hive.create_key("ControlSet001\\Services\\Device\\Child");
+    let (_, outcome, _) = run(&mut server, &relative_begin(nonce, 1, root.lease_token, "Child"));
+    assert_eq!(outcome.outcome_status, 0xc000_017cu32 as i32);
+    assert_eq!(outcome.lease_token, 0);
+}
+
+#[test]
+fn relative_empty_name_opens_exact_root_and_absolute_name_is_rejected() {
+    let mut server = server();
+    let nonce = authority(&mut server);
+    let (_, root, _) = run(&mut server, &begin(nonce, 0, 1, DEVICE));
+    let (_, same, _) = run(&mut server, &relative_begin(nonce, 1, root.lease_token, ""));
+    assert_eq!(same.outcome_status, STATUS_SUCCESS);
+    assert_eq!(server.system_key_leases.get(root.lease_token).unwrap().key, server.system_key_leases.get(same.lease_token).unwrap().key);
+    assert_ne!(root.lease_token, same.lease_token);
+    let (_, invalid, _) = run(&mut server, &relative_begin(nonce, 2, root.lease_token, DEVICE));
+    assert_eq!(invalid.outcome_status, STATUS_INVALID_PARAMETER);
+}
+
 #[test]
 fn lost_open_reply_replays_the_exact_single_acquisition() {
     let mut server = server();
@@ -231,7 +295,8 @@ fn malformed_and_short_reply_banks_fail_before_acquisition() {
     bad.pop();
     assert_eq!(run(&mut server, &bad).0.status, STATUS_INVALID_PARAMETER);
     let mut bad = begin(nonce, 0, 1, "x");
-    bad[48..50].copy_from_slice(&0xd800u16.to_le_bytes());
+    let header = core::mem::size_of::<CmHiveKeyOpenRequest>();
+    bad[header..header + 2].copy_from_slice(&0xd800u16.to_le_bytes());
     assert_eq!(run(&mut server, &bad).0.status, STATUS_INVALID_PARAMETER);
     let bad = begin(nonce, 0, 1, "nul\0path");
     assert_eq!(run(&mut server, &bad).0.status, STATUS_INVALID_PARAMETER);
