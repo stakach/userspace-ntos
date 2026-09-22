@@ -26,6 +26,11 @@ mod alpc_selftest;
 pub(crate) use acpi_platform::*;
 mod cm_server;
 mod cm_key_ownership;
+mod cm_mutation_transport;
+mod registry_mutation_work;
+mod registry_key_targets;
+mod registry_security_audit;
+mod provider_registry_caller;
 mod cm_snapshot_ownership;
 mod io_server;
 mod lpc_server;
@@ -3091,12 +3096,12 @@ const DELAY_TIMER_SOURCE_JOB_TIME: u64 = 10;
 const DELAY_TIMER_SOURCE_ACPI_PCI_ROUTE_RECOVERY: u64 = 11;
 const DELAY_TIMER_SOURCE_PROVIDER_WAIT: u64 = 12;
 const DELAY_TIMER_SOURCE_PROVIDER_TIMER: u64 = 13;
-const DELAY_TIMER_SOURCE_REGISTRY_CLOSE: u64 = 14;
 const DELAY_TIMER_SOURCE_CM_KEY_CLEANUP: u64 = 15;
 const DELAY_TIMER_SOURCE_CM_SNAPSHOT_CLEANUP: u64 = 16;
 const DELAY_TIMER_SOURCE_HOSTED_FILE_RETRY: u64 = 17;
 const DELAY_TIMER_SOURCE_COMPONENT_RESUME: u64 = 18;
 const DELAY_TIMER_SOURCE_HOSTED_DPC: u64 = 19;
+const DELAY_TIMER_SOURCE_REGISTRY_MUTATION: u64 = 20;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -4722,26 +4727,8 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
         print_u64(value);
     }
     print_str(b"\n");
-    let registry = unsafe { driver_launch::driver_registry_owner_stats() };
-    print_str(b"[driver-registry-owners]");
-    for (label, value) in [
-        (&b" active="[..], registry.active as u64),
-        (&b" unpublished="[..], registry.unpublished as u64),
-        (&b" inflight="[..], registry.inflight as u64),
-        (&b" pending="[..], registry.pending),
-        (&b" close-attempts="[..], registry.close_attempts),
-        (&b" close-failures="[..], registry.close_failures),
-        (&b" retries="[..], registry.retry_attempts),
-        (&b" open-pending="[..], registry.open_pending as u64),
-        (&b" open-inflight="[..], registry.open_inflight as u64),
-        (&b" open-requests="[..], registry.open_requests),
-        (&b" open-failures="[..], registry.open_failures),
-    ] {
-        print_str(label);
-        print_u64(value);
-    }
-    print_str(b"\n");
     unsafe { cm_key_ownership::print_stats() };
+    registry_security_audit::print_stats();
     unsafe { cm_snapshot_ownership::print_stats() };
     let fb_readback = unsafe { explorer_framebuffer_final_readback() };
     let fb_span_x = fb_readback.span_x();
@@ -7057,7 +7044,7 @@ pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SCHED_RUNTIME_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to independently timed wake paths;
 /// one of them owns the whole boot, so they are timed individually.
-pub(crate) const SUBDRAIN_N: usize = 17;
+pub(crate) const SUBDRAIN_N: usize = 18;
 pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
@@ -15152,6 +15139,15 @@ unsafe fn install_config_manager_client(client: &mut ConfigClient<CmChan<'static
     CONFIG_CLIENT_PTR = client as *mut _;
 }
 
+/// Explicit boot-loader execution context, never a default for an unbound provider request.
+unsafe fn initial_system_driver_caller() -> nt_process::native_handle::NativeHandleCaller {
+    with_provider_process_manager(|pm| {
+        let identity = pm.initial_system_identity().ok_or(0xc000_0008u32)?;
+        let thread = pm.thread_lifetime(identity.thread_id()).ok_or(0xc000_0008u32)?;
+        pm.capture_native_handle_caller(thread, nt_types::AccessMode::KernelMode)
+    }).expect("boot driver execution requires the retained initial System identity")
+}
+
 pub(crate) unsafe fn config_manager_create_key(path: &str) -> Result<u64, i32> {
     let client = CONFIG_CLIENT_PTR
         .as_mut()
@@ -15176,15 +15172,20 @@ pub(crate) unsafe fn config_manager_open_key(path: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) unsafe fn config_manager_enumerate_key(
-    path: &str,
-    index: u32,
-    out: &mut [u8],
-) -> Result<usize, i32> {
-    let client = CONFIG_CLIENT_PTR
-        .as_mut()
-        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    client.enumerate_key(path, index, out)
+pub(crate) unsafe fn config_manager_open_key_id(path: &str) -> Result<u64, i32> {
+    CONFIG_CLIENT_PTR.as_mut().ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?.open_key_id(path)
+}
+
+pub(crate) unsafe fn config_manager_runtime_key_class(key: u64) -> Result<Option<alloc::string::String>, i32> {
+    CONFIG_CLIENT_PTR.as_mut().ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?.runtime_key_class(key)
+}
+
+pub(crate) unsafe fn config_manager_runtime_key_operation(key: u64, operation: u16, index: u32, name: &str, value_type: u32, data: &[u8]) -> Result<(nt_config_abi::CmReply, alloc::vec::Vec<u8>), i32> {
+    CONFIG_CLIENT_PTR.as_mut().ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?.runtime_key_operation(key, operation, index, name, value_type, data)
+}
+
+pub(crate) unsafe fn config_manager_create_secured_key_checked_with_class(path: &str, descriptor: &[u8], volatile: bool, parent_key: u64, parent_generation: u32, class: Option<&str>) -> Result<(u64, bool), i32> {
+    CONFIG_CLIENT_PTR.as_mut().ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?.create_secured_key_checked_with_class(path, descriptor, volatile, parent_key, parent_generation, class)
 }
 
 pub(crate) unsafe fn config_manager_set_dword(
@@ -15208,50 +15209,6 @@ pub(crate) unsafe fn config_manager_set_value(
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     client.set_value(key_path, name, value_type, data)
-}
-
-pub(crate) unsafe fn config_manager_begin_set_value_transfer(
-    key_path: &str,
-    name: &str,
-    value_type: u32,
-    total_len: usize,
-) -> Result<u64, i32> {
-    let client = CONFIG_CLIENT_PTR
-        .as_mut()
-        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    client.begin_set_value_transfer(key_path, name, value_type, total_len)
-}
-
-pub(crate) unsafe fn config_manager_append_set_value_transfer(
-    token: u64,
-    value_offset: usize,
-    total_len: usize,
-    data: &[u8],
-) -> Result<(), i32> {
-    let client = CONFIG_CLIENT_PTR
-        .as_mut()
-        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    client.append_set_value_transfer(token, value_offset, total_len, data)
-}
-
-pub(crate) unsafe fn config_manager_commit_set_value_transfer(
-    token: u64,
-    total_len: usize,
-) -> Result<(), i32> {
-    let client = CONFIG_CLIENT_PTR
-        .as_mut()
-        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    client.commit_set_value_transfer(token, total_len)
-}
-
-pub(crate) unsafe fn config_manager_abort_set_value_transfer(
-    token: u64,
-    total_len: usize,
-) -> Result<(), i32> {
-    let client = CONFIG_CLIENT_PTR
-        .as_mut()
-        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    client.abort_set_value_transfer(token, total_len)
 }
 
 pub(crate) unsafe fn config_manager_query_value_owned(
@@ -15472,6 +15429,13 @@ pub(crate) unsafe fn config_manager_open_system_hive_key(
     path: &str,
 ) -> Result<nt_config_client::OpenedSystemHiveKey, i32> {
     cm_key_ownership::open(path)
+}
+
+pub(crate) unsafe fn config_manager_open_relative_system_hive_key(
+    root: nt_config_client::SystemHiveKeyLease,
+    path: &str,
+) -> Result<nt_config_client::OpenedSystemHiveKey, i32> {
+    cm_key_ownership::open_relative(root, path)
 }
 
 pub(crate) unsafe fn config_manager_exchange_system_hive_key_open(
@@ -16899,10 +16863,10 @@ unsafe fn user_timer_wake_due(handler: &mut ExecNtHandler, now: nt_time::TimeSna
 
 /// Publish retry readiness only; cleanup and native execution stay at their outer boundaries.
 unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
-    subdrain!(13, driver_launch::driver_registry_close_retry_wake_due(now_100ns))
-        + subdrain!(14, cm_key_ownership::wake_due(now_100ns))
+    subdrain!(14, cm_key_ownership::wake_due(now_100ns))
         + subdrain!(15, cm_snapshot_ownership::wake_due(now_100ns))
         + subdrain!(16, driver_launch::hosted_file_retry_wake_due(now_100ns))
+        + subdrain!(17, registry_mutation_work::wake_due(now_100ns))
 }
 
 /// May reply to driver waiters and establish DPC lanes; never use from ACK-only paths.
@@ -18165,6 +18129,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         || object_wait_reply::has_thread(tid)
         || pending_file_apc::has_thread(tid)
         || current_apc::has_thread(tid)
+        || registry_mutation_work::has_thread(tid)
     {
         return false;
     }
@@ -18206,6 +18171,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         || object_wait_reply::has_thread(tid)
         || pending_file_apc::has_thread(tid)
         || current_apc::has_thread(tid)
+        || registry_mutation_work::has_thread(tid)
     {
         return false;
     }
@@ -18326,6 +18292,7 @@ unsafe fn terminate_hosted_process_mechanisms(
         || object_wait_reply::has_process(process_index as usize, preserve_tid)
         || pending_file_apc::has_process(process_index as usize, preserve_tid)
         || current_apc::has_process(process_index as usize, preserve_tid)
+        || registry_mutation_work::has_process(process_index as usize, preserve_tid)
     {
         return 0;
     }
@@ -19154,7 +19121,7 @@ const MUTABLE_KEY_TAG: u32 = 0x7000_0000;
 const MUTABLE_KEY_MAX: u32 = 0x1000;
 /// A registry `KeyRef` in `[CM_SYSTEM_KEY_TAG, CM_SYSTEM_KEY_TAG+CM_SYSTEM_KEY_MAX)` names one
 /// CM-owned SYSTEM key
-/// lease. Its low bits index `ExecNtHandler::cm_system_key_handles`; the isolated Configuration
+/// lease. Its low bits index the shared `registry_key_targets` namespace; the isolated Configuration
 /// Manager owns the stable hive-cell identity and the executive owns only the lease reference.
 const CM_SYSTEM_KEY_TAG: u32 = 0x7100_0000;
 const CM_SYSTEM_KEY_MAX: u32 = 0x1000;
@@ -22895,7 +22862,8 @@ struct PendingLpcConnectionViews {
     acceptor_mapping: Option<MappedLpcPortView>,
 }
 
-struct CmSystemKeyTarget {
+#[derive(Clone)]
+pub(crate) struct CmSystemKeyTarget {
     lease: nt_config_client::SystemHiveKeyLease,
     physical_path: alloc::string::String,
 }
@@ -22933,12 +22901,6 @@ struct ExecNtHandler {
     /// are released when the last process handle to that target closes; dynamic hive unload also
     /// clears entries for that hive so stale handles stop resolving.
     mutable_key_handles: alloc::vec::Vec<Option<ResolvedHiveKey>>,
-    /// Native handle targets for the CM-owned SYSTEM hive. Each slot owns exactly one CM lease;
-    /// duplicated process handles share the slot and final Object Manager release closes the lease.
-    cm_system_key_handles: alloc::vec::Vec<Option<CmSystemKeyTarget>>,
-    /// Native handle targets for Config Manager-owned volatile/runtime keys outside the persistent
-    /// SYSTEM mount. Entries carry only canonical paths; Config Manager owns key/value identity.
-    cm_runtime_key_handles: alloc::vec::Vec<Option<alloc::string::String>>,
     /// Durable hive journal records appended since the last writable-volume snapshot, including
     /// CM-owned SYSTEM records. The append itself is synchronous in the mounted volume; this counter
     /// batches the expensive snapshot reserve commit instead of exporting the whole writable volume
@@ -23363,6 +23325,7 @@ unsafe fn launch_boot_driver_service(
         spec.image_path.as_bytes(),
         spec.class,
         spec.driver_object_path.as_str(),
+        initial_system_driver_caller(),
     ) else {
         if let Some((_, reservation)) = prepared_start {
             driver_starts
@@ -30685,7 +30648,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         match driver_launch::dispatch_hosted_file_create_irp_result_exact(
                             file_id,
                             1, /* IRP_MJ_CREATE_NAMED_PIPE */
-                            0,
+                            initial_system_driver_caller(),
                             CreateParameters {
                                 opened_case_sensitive: false,
                                 desired_access: AccessMask::from_bits_retain(0x001f_01ff),
@@ -30742,7 +30705,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             match driver_launch::dispatch_hosted_file_create_irp_result_exact(
                                 file_id,
                                 0, /* IRP_MJ_CREATE */
-                                0,
+                                initial_system_driver_caller(),
                                 CreateParameters {
                                     opened_case_sensitive: false,
                                     desired_access: AccessMask::from_bits_retain(0x001f_01ff),
@@ -30782,6 +30745,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             &mut passed,
                         );
                         if cst == 0 && cli_fid != 0 {
+                            let boot_caller = initial_system_driver_caller();
+                            let npfs_dispatch_irp = |major, fsctl, file_id, input: &[u8], output: &mut [u8]| {
+                                driver_launch::npfs_dispatch_irp(major, fsctl, file_id, input, output, boot_caller)
+                            };
                             let pipe_info = [1u8, 0, 0, 0, 0, 0, 0, 0];
                             let mut set_out = [];
                             if let Some((sst, sinfo)) = npfs_dispatch_irp(
@@ -30901,6 +30868,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 srv_fid,
                                 &[],
                                 &mut fout1,
+                                boot_caller,
                             );
                             let srv_flush_pended = matches!(
                                 srv_flush,
@@ -30938,6 +30906,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 cli_fid,
                                 &[],
                                 &mut fout2,
+                                boot_caller,
                             );
                             let cli_flush_pended = matches!(
                                 cli_flush,
@@ -30999,6 +30968,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 srv_fid,
                                 &[],
                                 &mut pend_out,
+                                boot_caller,
                             );
                             let srv_read_pended = matches!(
                                 srv_pending,
@@ -31119,6 +31089,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 cli_fid,
                                 &[],
                                 &mut hdr_in,
+                                boot_caller,
                             );
                             let hdr_pended = matches!(
                                 hdr_pend,
@@ -31268,6 +31239,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 &proof_driver_spec.image_path,
                 proof_driver_spec.class,
                 &proof_driver_spec.driver_object_path,
+                initial_system_driver_caller(),
             ) {
                 let driver_ready = dc.finished && (dc.verdict & V_MJ) != 0;
                 driver_launch::register_driver_ready(dc.driver_id, driver_ready);

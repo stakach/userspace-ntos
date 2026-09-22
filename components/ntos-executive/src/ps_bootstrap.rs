@@ -129,6 +129,18 @@ pub(crate) unsafe fn with_process_manager<R>(
         .map_err(|_| 0xc000_00a3u32)?
 }
 
+/// Paired canonical stores; captured token references must never come from a replacement store.
+pub(crate) unsafe fn with_security_managers<R>(
+    operation: impl FnOnce(&mut nt_process::ProcessManager, &mut nt_security::TokenStore) -> Result<R, u32>,
+) -> Result<R, u32> {
+    (&mut *core::ptr::addr_of_mut!(BOOTSTRAP))
+        .with_mut(|seed| {
+            let (pm, tokens) = seed.ps.managers_mut();
+            operation(pm, tokens)
+        })
+        .map_err(|_| 0xc000_00a3u32)?
+}
+
 #[inline(never)]
 fn seed_processes(entry: u64, parameter: u64) -> Result<PsBootstrapSeed, u32> {
     let mut ps = nt_user_host::ps_bootstrap::PsBootstrapState::try_new(entry, parameter)?;

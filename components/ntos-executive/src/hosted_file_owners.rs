@@ -62,6 +62,8 @@ impl Authority {
 }
 
 struct Row {
+    caller: nt_process::native_handle::NativeHandleCaller,
+    requestor: nt_process::native_handle::NativeThreadProcessReference,
     id: u64,
     irp_id: Option<IrpId>,
     primary_device: Option<nt_io_manager::DeviceId>,
@@ -158,10 +160,12 @@ fn remove(id: u64) {
         .iter()
         .position(|row| row.id == id)
         .expect("File IRP owner missing");
+    unsafe { crate::with_provider_process_manager(|pm| rows()[index].requestor.release(pm)) }
+        .expect("retired IRP retains its original requestor reference pair");
     rows().swap_remove(index);
 }
 
-fn reserve(output_capture: ExternalFileIrpOutputCapture) -> Result<u64, nt_status::NtStatus> {
+fn reserve(caller: nt_process::native_handle::NativeHandleCaller, output_capture: ExternalFileIrpOutputCapture) -> Result<u64, nt_status::NtStatus> {
     let id = unsafe { NEXT_ID };
     let next = id
         .checked_add(1)
@@ -169,8 +173,12 @@ fn reserve(output_capture: ExternalFileIrpOutputCapture) -> Result<u64, nt_statu
     rows()
         .try_reserve(1)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let requestor = unsafe { crate::with_provider_process_manager(|pm| pm.reference_native_requestor(caller)) }
+        .map_err(|status| nt_status::NtStatus(status as i32))?;
     unsafe { NEXT_ID = next };
     rows().push(Row {
+        caller,
+        requestor,
         id,
         irp_id: None,
         primary_device: None,
@@ -310,6 +318,7 @@ pub(super) enum DispatchResult {
 
 /// Exact-device callers must authenticate and retain their Device and completion recipient.
 pub(super) fn dispatch(
+    caller: nt_process::native_handle::NativeHandleCaller,
     request: ExternalFileIrpRequest,
     input: &[u8],
     initial_output: &[u8],
@@ -325,7 +334,7 @@ pub(super) fn dispatch(
         Ok(bytes)
     };
     let buffers = ExternalFileIrpBuffers::new(copy(input)?, copy(initial_output)?);
-    let id = reserve(policy.output_capture())?;
+    let id = reserve(caller, policy.output_capture())?;
     let preparation = policy.prepare(io_manager_mut(), request, buffers);
     let prepared = match preparation {
         Ok(prepared) => prepared,
@@ -348,7 +357,7 @@ pub(super) fn dispatch(
         }
     };
     row(id).flight = Flight::Dispatch;
-    let returned = hosted_file_dispatch::invoke(invocation);
+    let returned = hosted_file_dispatch::invoke(invocation, row(id).caller);
     let result = match io_manager_mut().finish_external_file_irp(returned) {
         Ok(result) => result,
         Err(rejection) => {

@@ -78,6 +78,8 @@ unsafe fn drain_instance(index: usize, inst: DriverInstance) -> Result<u64, nt_s
     {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
+    // Deferred retirement runs as executive work; it does not impersonate the old File caller.
+    let caller = crate::initial_system_driver_caller();
     dispatch_device_projection_control_for_instance(
         index,
         inst.driver_object,
@@ -85,6 +87,7 @@ unsafe fn drain_instance(index: usize, inst: DriverInstance) -> Result<u64, nt_s
         0,
         0,
         false,
+        caller,
     )
 }
 

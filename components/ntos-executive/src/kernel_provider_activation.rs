@@ -88,6 +88,20 @@ fn authenticated_channel_caller(
     Ok(caller)
 }
 
+/// Recover native registry authority only from the exact retained, currently executing job.
+pub(crate) unsafe fn registry_caller(
+    channel: &spawn_hosts::PumpChannel,
+) -> Result<nt_process::native_handle::NativeHandleCaller, u32> {
+    let caller = authenticated_channel_caller(channel)?;
+    with_provider_process_manager(|pm| {
+        (&*core::ptr::addr_of!(ACTIVATIONS)).validate(
+            caller, pm, &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+            &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
+        )?;
+        pm.capture_native_handle_caller(caller.thread(), nt_types::AccessMode::KernelMode)
+    })
+}
+
 /// The component blocks in this request before DriverEntry. Capture may occur after its TCB was
 /// started, but the reply cannot publish an owner until the root has retained the real activation.
 pub(crate) unsafe fn publish(channel: &spawn_hosts::PumpChannel) -> u32 {

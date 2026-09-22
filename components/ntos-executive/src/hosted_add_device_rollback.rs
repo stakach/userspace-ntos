@@ -459,6 +459,7 @@ unsafe fn advance_inner(id: u64) -> Result<(), nt_status::NtStatus> {
             pdo,
             previous_head,
             delete_pdo,
+            crate::initial_system_driver_caller(),
         );
         if let Err(error) = result {
             // This mutating RPC has no replay receipt. Retain its owner without resending it.

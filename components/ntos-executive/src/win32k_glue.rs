@@ -660,24 +660,15 @@ pub(crate) fn win32k_client_process_row_stats(
     }
 }
 
-#[derive(Clone, Copy)]
-struct UserCallbackClientRecord {
-    dispatch_id: u64,
-    client: crate::spawn_hosts::UserCallbackClient,
-}
+type Win32kDispatchClients = nt_user_host::provider_dispatch_clients::ProviderDispatchClients<crate::spawn_hosts::UserCallbackClient>;
+use nt_user_host::provider_dispatch_clients::DispatchClientIdentity;
 
-static mut USER_CALLBACK_CLIENT_REGISTRY: Option<Vec<UserCallbackClientRecord>> = None;
+// Every logical provider command owns a row, independently of whether it permits user callbacks.
+// Callback/wait continuations retain the same row until their exact dispatch retirement.
+static mut WIN32K_DISPATCH_CLIENT_REGISTRY: Win32kDispatchClients = Win32kDispatchClients::new();
 
-unsafe fn user_callback_client_registry_mut() -> &'static mut Vec<UserCallbackClientRecord> {
-    let slot = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CLIENT_REGISTRY);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    slot.as_mut().unwrap()
-}
-
-unsafe fn user_callback_client_registry() -> Option<&'static Vec<UserCallbackClientRecord>> {
-    (&*core::ptr::addr_of!(USER_CALLBACK_CLIENT_REGISTRY)).as_ref()
+unsafe fn win32k_dispatch_client_registry_mut() -> &'static mut Win32kDispatchClients {
+    &mut *core::ptr::addr_of_mut!(WIN32K_DISPATCH_CLIENT_REGISTRY)
 }
 
 static mut USER_CALLBACK_SAS_SEQUENCE: nt_user_callback::SasWmCreateNestedSequence =
@@ -865,6 +856,21 @@ type UserCallbackDispatchContext = nt_user_callback::DispatchContext;
 
 static mut USER_CALLBACK_CURRENT_DISPATCH: UserCallbackDispatchContext =
     UserCallbackDispatchContext::EMPTY;
+
+/// Bind a registry request to the logical client registered for this exact running GUI job.
+/// A live thread plus a live physical channel alone does not establish their association.
+pub(crate) unsafe fn registry_logical_caller_is_current(
+    channel: &crate::spawn_hosts::PumpChannel,
+) -> bool {
+    let Some(caller) = channel.logical_caller else { return false; };
+    let Some(lane) = win32k_physical_lane_for_channel(channel.tcb, channel.fault_ep, channel.reply_cap) else { return false; };
+    let dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    if dispatch.lane != lane || dispatch.dispatch_id == 0
+        || !crate::service_sec_image::component_execution_lane_is_running(lane)
+    { return false; }
+    (&*core::ptr::addr_of!(WIN32K_DISPATCH_CLIENT_REGISTRY)).dispatch(dispatch.dispatch_id).is_some_and(|client|
+        client.logical_caller == Some(caller) && client.tcb == caller.tcb() && client.generation == channel.client_generation)
+}
 
 /// Authenticate an inline poll from the active physical pump and retained logical requestor.
 /// Shared callback/wait headers supply claims, never the expected dispatch identity.
@@ -1078,93 +1084,48 @@ pub(crate) unsafe fn win32k_client_context_is_admitted(client: Win32kClientConte
     crate::service_sec_image::validate_provider_logical_caller(caller)
 }
 
-fn user_callback_client_record_matches(
-    record: &UserCallbackClientRecord,
+fn win32k_dispatch_client_identity(
     dispatch_id: u64,
     client_pi: u32,
     client_tid: u64,
     client_badge: u64,
-) -> bool {
-    record.dispatch_id == dispatch_id
-        && record.client.pi == client_pi
-        && record.client.tid == client_tid
-        && record.client.badge == client_badge
+) -> DispatchClientIdentity {
+    DispatchClientIdentity { dispatch: dispatch_id, process_slot: client_pi, thread: client_tid, badge: client_badge }
 }
 
 fn user_callback_client_can_register(client: crate::spawn_hosts::UserCallbackClient) -> bool {
     client.pi != 0 && client.tid != 0 && client.badge != 0 && client.tcb > 1
 }
 
-unsafe fn register_user_callback_client_for_dispatch(
+unsafe fn register_win32k_dispatch_client(
     dispatch_id: u64,
     client: crate::spawn_hosts::UserCallbackClient,
 ) -> bool {
     if dispatch_id == 0 || !user_callback_client_can_register(client) {
         return false;
     }
-    let registry = user_callback_client_registry_mut();
-    for record in registry.iter_mut() {
-        if user_callback_client_record_matches(
-            record,
-            dispatch_id,
-            client.pi,
-            client.tid,
-            client.badge,
-        ) {
-            record.client = client;
-            return true;
-        }
-    }
-    registry.push(UserCallbackClientRecord {
-        dispatch_id,
-        client,
-    });
-    true
+    let registry = win32k_dispatch_client_registry_mut();
+    registry.register(win32k_dispatch_client_identity(dispatch_id, client.pi, client.tid, client.badge), client)
 }
 
-unsafe fn unregister_user_callback_client_for_dispatch(
+unsafe fn unregister_win32k_dispatch_client(
     dispatch_id: u64,
     client_pi: u32,
     client_tid: u64,
     client_badge: u64,
 ) {
-    let registry = user_callback_client_registry_mut();
-    let mut index = 0usize;
-    while index < registry.len() {
-        if user_callback_client_record_matches(
-            &registry[index],
-            dispatch_id,
-            client_pi,
-            client_tid,
-            client_badge,
-        ) {
-            registry.swap_remove(index);
-            return;
-        }
-        index += 1;
-    }
+    let registry = win32k_dispatch_client_registry_mut();
+    registry.retire(win32k_dispatch_client_identity(dispatch_id, client_pi, client_tid, client_badge));
 }
 
 unsafe fn user_callback_client_for_request(
     request: &nt_user_callback::CallbackHeader,
 ) -> Option<crate::spawn_hosts::UserCallbackClient> {
-    let registry = user_callback_client_registry()?;
-    registry.iter().find_map(|record| {
-        user_callback_client_record_matches(
-            record,
-            request.dispatch_id,
-            request.client_pi,
-            request.client_tid,
-            request.client_badge,
-        )
-        .then_some(record.client)
-    })
+    (&*core::ptr::addr_of!(WIN32K_DISPATCH_CLIENT_REGISTRY)).resolve(win32k_dispatch_client_identity(request.dispatch_id, request.client_pi, request.client_tid, request.client_badge))
 }
 
 unsafe fn clear_user_callback_client_registry() {
-    if let Some(registry) = (*core::ptr::addr_of_mut!(USER_CALLBACK_CLIENT_REGISTRY)).as_mut() {
-        registry.clear();
-    }
+    win32k_dispatch_client_registry_mut().clear();
 }
 
 #[derive(Clone, Copy, Default)]
@@ -3742,7 +3703,7 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     ) {
         return ProviderWaitPumpCompletion::Failed(0xC000_0001u32 as i32);
     }
-    unregister_user_callback_client_for_dispatch(
+    unregister_win32k_dispatch_client(
         pending.dispatch.dispatch_id,
         client.pi,
         client.tid,
@@ -3955,7 +3916,7 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
     ) {
         return LpcWaitPumpCompletion::Failed(0xC000_0001u32 as i32);
     }
-    unregister_user_callback_client_for_dispatch(
+    unregister_win32k_dispatch_client(
         pending.dispatch.dispatch_id,
         client.pi,
         client.tid,
@@ -4351,8 +4312,8 @@ pub(crate) unsafe fn retire_dead_user_callback_client(client_pi: u32, pid: u64) 
     {
         return false;
     }
-    let registry = user_callback_client_registry_mut();
-    registry.retain(|record| record.client.pi != client_pi || record.client.pid != pid);
+    let registry = win32k_dispatch_client_registry_mut();
+    registry.retain(|client| client.pi != client_pi || client.pid != pid);
     let suspended = suspended_published_contexts_mut();
     suspended.retain(|record| record.pi != client_pi || record.pid != pid);
     USER_CALLBACK_DEAD_CLIENTS.fetch_and(!(1u64 << client_pi), Ordering::Relaxed);
@@ -4784,7 +4745,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         print_str(b"[user-callback] dispatch continuation failed to unwind\n");
         return None;
     }
-    unregister_user_callback_client_for_dispatch(
+    unregister_win32k_dispatch_client(
         request.dispatch_id,
         request.client_pi,
         request.client_tid,
@@ -6370,9 +6331,11 @@ unsafe fn win32k_dispatch_wide_observed(
     clear_published_win32k_context();
     let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
     let callback_client = client.callback_client();
-    let callback_capable = request_kind == win32k_subsystem::WIN32K_REQUEST_SSDT
+    let registered_client = client.logical_caller.is_some()
         && user_callback_client_can_register(callback_client);
-    if callback_capable && !register_user_callback_client_for_dispatch(dispatch_id, callback_client)
+    let callback_capable = request_kind == win32k_subsystem::WIN32K_REQUEST_SSDT
+        && registered_client;
+    if registered_client && !register_win32k_dispatch_client(dispatch_id, callback_client)
     {
         print_str(b"[user-callback] callback client registry full for dispatch\n");
         return (0xC000_009Au64, false);
@@ -6395,8 +6358,8 @@ unsafe fn win32k_dispatch_wide_observed(
                     b"dispatch correlation mismatch\n"
                 }
             });
-            if callback_capable {
-                unregister_user_callback_client_for_dispatch(
+            if registered_client {
+                unregister_win32k_dispatch_client(
                     dispatch_id,
                     client.pi,
                     client.tid,
@@ -6421,8 +6384,8 @@ unsafe fn win32k_dispatch_wide_observed(
         if nested_user_callback {
             let _ = complete_nested_user_callback_dispatch(client, dispatch_id);
         }
-        if callback_capable {
-            unregister_user_callback_client_for_dispatch(
+        if registered_client {
+            unregister_win32k_dispatch_client(
                 dispatch_id,
                 client.pi,
                 client.tid,
@@ -6700,8 +6663,8 @@ unsafe fn win32k_dispatch_wide_observed(
         }
         if !pr.completed || !complete_nested_user_callback_dispatch(client, dispatch_id) {
             print_str(b"[user-callback] nested win32k dispatch failed to unwind\n");
-            if callback_capable {
-                unregister_user_callback_client_for_dispatch(
+            if registered_client {
+                unregister_win32k_dispatch_client(
                     dispatch_id,
                     client.pi,
                     client.tid,
@@ -6711,12 +6674,12 @@ unsafe fn win32k_dispatch_wide_observed(
             return (pr.result, false);
         }
     }
-    if callback_capable
+    if registered_client
         && !pr.callback_suspended
         && !pr.provider_wait_suspended
         && !pr.lpc_wait_suspended
     {
-        unregister_user_callback_client_for_dispatch(
+        unregister_win32k_dispatch_client(
             dispatch_id,
             client.pi,
             client.tid,

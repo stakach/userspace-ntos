@@ -4404,7 +4404,7 @@ pub(crate) unsafe fn service_win32k_ps_request(
 
 /// Serialized memory-only ownership operation, across the bootstrap-to-live Ps store transfer.
 /// No manager borrow may escape the callback or span IPC/reentrant dispatch.
-unsafe fn with_provider_process_manager<R>(
+pub(crate) unsafe fn with_provider_process_manager<R>(
     operation: impl FnOnce(&mut nt_process::ProcessManager) -> Result<R, u32>,
 ) -> Result<R, u32> {
     let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
@@ -4413,6 +4413,24 @@ unsafe fn with_provider_process_manager<R>(
     } else {
         operation(&mut (*handler).pm)
     }
+}
+
+/// Memory-only paired-store operation. Neither borrow may span provider IPC.
+pub(crate) unsafe fn with_provider_security_managers<R>(
+    operation: impl FnOnce(&mut nt_process::ProcessManager, &mut nt_security::TokenStore) -> Result<R, u32>,
+) -> Result<R, u32> {
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if handler.is_null() {
+        ps_bootstrap::with_security_managers(operation)
+    } else {
+        operation(&mut (*handler).pm, &mut (*handler).token_store)
+    }
+}
+
+pub(crate) unsafe fn registry_live_handler() -> Result<&'static mut ExecNtHandler, u32> {
+    (SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler)
+        .as_mut()
+        .ok_or(0xc000_00a3)
 }
 
 /// Service `MmSecureVirtualMemory` for the authenticated hosted process generation. The returned
@@ -8359,11 +8377,11 @@ pub(crate) unsafe fn service_sec_image(
         crate::client_frame_cleanup::retry_pending();
         crate::pagefile_retirement::retry_pending();
         // CM retries run only between hosted events, never inside a timer callback or nested pump.
-        driver_launch::retry_driver_registry_closes(monotonic_time_100ns());
         crate::cm_key_ownership::retry_cleanup(monotonic_time_100ns());
         crate::cm_snapshot_ownership::retry_cleanup(monotonic_time_100ns());
         {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
+            crate::registry_mutation_work::redrive(&mut nt_handler);
             crate::current_apc::redrive(&mut nt_handler);
             crate::current_apc::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
             crate::object_wait_reply::redrive(&mut nt_handler);
@@ -11418,6 +11436,22 @@ pub(crate) unsafe fn service_sec_image(
                         crate::disk_census_ticks().wrapping_sub(dispatch_started),
                     );
                     result = res.status as u64;
+                    if crate::registry_mutation_work::take_transferred() {
+                        // The durable mutation owner already captured and rotated this Reply.
+                        // STATUS_PENDING is internal state, never the syscall's terminal reply.
+                        mark_wait_parked!(pi, resume_ip);
+                        crate::registry_mutation_work::redrive(&mut nt_handler);
+                        let _ = finalize_service_loop_state(&mut nt_handler);
+                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                        badge = nb;
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
                     if pi == 3 && m0 == 161 {
                         let trace = SERVICES_NQIP_TRACE.fetch_add(1, Ordering::Relaxed);
                         if trace < 24 || trace.is_power_of_two() {
@@ -24450,6 +24484,22 @@ unsafe fn pending_driver_start_reply_owner(
     delivered
 }
 
+pub(crate) unsafe fn complete_registry_mutation_reply(
+    handler: &mut ExecNtHandler,
+    tid: u64,
+    badge: u64,
+    reply: u64,
+    status: u32,
+) -> bool {
+    assert!(crate::registry_mutation_work::has_thread(tid));
+    if !reply_parked_syscall(reply, status as u64) {
+        return false;
+    }
+    release_reply_pool_cap(reply);
+    thread_wait_state_clear_badge_ready(handler, badge);
+    true
+}
+
 fn record_pending_start_result(
     nt_handler: &mut ExecNtHandler,
     request: nt_pnp_manager::StartDeviceRequestIdentity,
@@ -24984,6 +25034,19 @@ unsafe fn pending_set_file_name_caller_is_live(
             .is_some_and(|caller| handler.set_file_name_caller_is_current(caller))
 }
 
+unsafe fn pending_file_native_caller(
+    handler: &ExecNtHandler,
+    identity: nt_io_manager::PendingFileIoIdentity,
+    pending: nt_io_manager::PendingFileIo,
+) -> Result<nt_process::native_handle::NativeHandleCaller, u32> {
+    if !pending_set_file_name_caller_is_live(handler, identity, pending) {
+        return Err(nt_status::NtStatus::CANCELLED.raw() as u32);
+    }
+    let caller = crate::pending_file_caller::caller(identity, pending)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    handler.pm.capture_native_handle_caller(caller.thread(), nt_types::AccessMode::KernelMode)
+}
+
 /// Publish terminal results for general pending File IRPs in NT completion order. The backend
 /// completion remains retained until every required surface and synchronous reply is visible.
 unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
@@ -25289,9 +25352,9 @@ unsafe fn pending_file_io_redrive_pass(
                                         let dispatch = if !pending_set_file_name_caller_is_live(nt_handler, identity, pending) {
                                             Err(nt_status::NtStatus::CANCELLED.raw() as u32)
                                         } else { match length {
-                                            Ok(length) => driver_launch::dispatch_hosted_file_set_information_irp_result_exact(
+                                            Ok(length) => pending_file_native_caller(nt_handler, identity, pending).and_then(|caller| driver_launch::dispatch_hosted_file_set_information_irp_result_exact(
                                                 transaction.source_file_id,
-                                                pending.tid,
+                                                caller,
                                                 nt_io_manager::SetInformationParameters {
                                                     info_class: transaction.information_class,
                                                     length,
@@ -25301,7 +25364,7 @@ unsafe fn pending_file_io_redrive_pass(
                                                     control: transaction.control,
                                                 },
                                                 transaction.set_information(),
-                                            ),
+                                            )),
                                             Err(_) => Err(nt_fs::STATUS_INVALID_PARAMETER),
                                         }};
                                         match dispatch {
@@ -25401,9 +25464,9 @@ unsafe fn pending_file_io_redrive_pass(
                         {
                             let dispatch = if !pending_set_file_name_caller_is_live(nt_handler, identity, pending) {
                                 Err(nt_status::NtStatus::CANCELLED.raw() as u32)
-                            } else { driver_launch::dispatch_hosted_file_set_information_irp_result_exact(
+                            } else { pending_file_native_caller(nt_handler, identity, pending).and_then(|caller| driver_launch::dispatch_hosted_file_set_information_irp_result_exact(
                                 transaction.source_file_id,
-                                pending.tid,
+                                caller,
                                 nt_io_manager::SetInformationParameters {
                                     info_class: transaction.information_class,
                                     length,
@@ -25413,7 +25476,7 @@ unsafe fn pending_file_io_redrive_pass(
                                     control: transaction.control,
                                 },
                                 transaction.set_information(),
-                            )};
+                            ))};
                             match dispatch {
                                 Ok((status, _information, Some(irp_id), _))
                                     if status == nt_status::NtStatus::PENDING.raw() =>

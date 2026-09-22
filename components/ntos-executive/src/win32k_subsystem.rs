@@ -1977,14 +1977,6 @@ const SID_HEADER_BYTES: usize = 8;
 const SID_MAX_SUB_AUTHORITIES: usize = 15;
 const VALID_INHERIT_FLAGS: u64 = 0x1F;
 
-fn local_system_sid_native() -> ([u8; WIN32K_TOKEN_USER_SID_MAX], usize) {
-    let mut sid = [0u8; WIN32K_TOKEN_USER_SID_MAX];
-    let len = nt_security::Sid::local_system()
-        .write_native(&mut sid)
-        .unwrap_or(0);
-    (sid, len)
-}
-
 fn native_sid_len(sid: &[u8], supplied_len: usize) -> Option<usize> {
     if supplied_len < 8 || supplied_len > WIN32K_TOKEN_USER_SID_MAX || supplied_len > sid.len() {
         return None;
@@ -3759,6 +3751,11 @@ extern "win64" fn s_zw_close(handle: u64) -> i32 {
         return status;
     }
     s_ob_close_handle(handle, 0)
+}
+
+extern "win64" fn s_nt_close(handle: u64) -> i32 {
+    let (status, mode, _) = unsafe { win32k_registry_broker_call(WIN32K_REGISTRY_OP_CLOSE | WIN32K_REGISTRY_USE_PREVIOUS_MODE, handle) };
+    if status as u32 == 0xc000_0024 { s_ob_close_handle(handle, mode) } else { status }
 }
 
 unsafe fn retire_provider_local_event(
@@ -11794,15 +11791,16 @@ const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x0000_0020;
 const RTL_QUERY_REGISTRY_TABLE_SIZE: u64 = 56;
 const REG_NONE: u32 = 0;
 const REG_DWORD: u32 = 4;
-const WIN32K_REG_HANDLE_BASE: u64 = 0xFFFF_5700_0000_0000;
-const WIN32K_REG_HANDLE_TOKEN_MASK: u64 = 0x0000_00FF_FFFF_FFFF;
-static WIN32K_REG_HANDLE_NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 const WIN32K_REGISTRY_PATH_MAX: usize = 384;
 const WIN32K_REGISTRY_KEY_LEN: u64 = 0;
 const WIN32K_REGISTRY_VALUE_LEN: u64 = 4;
 const WIN32K_REGISTRY_VALUE_TYPE: u64 = 8;
 const WIN32K_REGISTRY_DATA_LEN: u64 = 12;
-const WIN32K_REGISTRY_KEY_OFF: u64 = 16;
+const WIN32K_REGISTRY_DESIRED_ACCESS: u64 = 16;
+const WIN32K_REGISTRY_ATTRIBUTES: u64 = 20;
+const WIN32K_REGISTRY_SECURITY_LEN: u64 = 24;
+const WIN32K_REGISTRY_PREVIOUS_MODE: u64 = 28;
+const WIN32K_REGISTRY_KEY_OFF: u64 = 32;
 const WIN32K_REGISTRY_VALUE_OFF: u64 = WIN32K_REGISTRY_KEY_OFF + WIN32K_REGISTRY_PATH_MAX as u64;
 const WIN32K_REGISTRY_DATA_OFF: u64 = WIN32K_REGISTRY_VALUE_OFF + WIN32K_REGISTRY_PATH_MAX as u64;
 const WIN32K_REGISTRY_VALUE_CAP: usize = WIN32K_REGISTRY_BYTES - WIN32K_REGISTRY_DATA_OFF as usize;
@@ -11817,6 +11815,10 @@ const WIN32K_REGISTRY_OP_COMMIT_SET_VALUE: u64 = 8;
 const WIN32K_REGISTRY_OP_ABORT_SET_VALUE: u64 = 9;
 const WIN32K_REGISTRY_OP_DELETE_VALUE: u64 = 10;
 const WIN32K_REGISTRY_OP_CREATE_KEY: u64 = 11;
+const WIN32K_REGISTRY_OP_PUBLISH: u64 = 12;
+const WIN32K_REGISTRY_OP_ABORT: u64 = 13;
+const WIN32K_REGISTRY_OP_IS_KEY: u64 = 14;
+const WIN32K_REGISTRY_USE_PREVIOUS_MODE: u64 = 1 << 63;
 const REG_OPTION_VOLATILE: u32 = 0x0000_0001;
 const REG_OPTION_CREATE_LINK: u32 = 0x0000_0002;
 const REG_OPTION_BACKUP_RESTORE: u32 = 0x0000_0004;
@@ -11825,40 +11827,46 @@ const REG_OPTION_VALID_MASK: u32 = REG_OPTION_VOLATILE
     | REG_OPTION_CREATE_LINK
     | REG_OPTION_BACKUP_RESTORE
     | REG_OPTION_OPEN_LINK;
-const REG_CREATED_NEW_KEY: u64 = 1;
-const REG_OPENED_EXISTING_KEY: u64 = 2;
 const _: () = assert!(
     WIN32K_REGISTRY_DATA_OFF + WIN32K_REGISTRY_VALUE_CAP as u64 <= WIN32K_REGISTRY_BYTES as u64
 );
-static WIN32K_VIDEO_REG_QUERY_TRACE: AtomicU64 = AtomicU64::new(0);
 
-enum Win32kRegHandleTarget {
-    Empty,
-    VideoDeviceMap,
-    SystemHive {
-        lease: nt_config_client::SystemHiveKeyLease,
-        physical_path: alloc::string::String,
-    },
+
+struct Win32kRegistrySubject(nt_user_host::registry_subject::RegistrySubject);
+
+impl Drop for Win32kRegistrySubject {
+    fn drop(&mut self) {
+        unsafe { crate::with_provider_security_managers(|_, tokens| self.0.release(tokens)) }
+            .expect("captured Win32k registry subject owns its original tokens");
+    }
 }
 
-struct Win32kRegHandle {
-    handle: u64,
-    target: Win32kRegHandleTarget,
+struct Win32kRegistryDescriptorMemory;
+
+impl nt_security::ClientMemory for Win32kRegistryDescriptorMemory {
+    fn read(&self, address: u64, output: &mut [u8]) -> bool {
+        if address == 0 || address.checked_add(output.len() as u64).is_none() { return false; }
+        unsafe { core::ptr::copy_nonoverlapping(address as *const u8, output.as_mut_ptr(), output.len()); }
+        true
+    }
 }
 
-struct Win32kRegSetTransfer {
-    token: u64,
-    handle: u64,
-    lease: nt_config_client::SystemHiveKeyLease,
-    physical_path: alloc::string::String,
-    name: alloc::string::String,
-    value_type: u32,
-    upload: nt_config_client::SystemHiveValueUpload,
+unsafe fn stage_win32k_registry_metadata(desired: u64, attributes: u64, previous_mode: bool) -> Result<(), i32> {
+    if desired > u32::MAX as u64 || attributes == 0 || read_unaligned(attributes as *const u32) != 48 {
+        return Err(STATUS_INVALID_PARAMETER_I32);
+    }
+    let descriptor = read_unaligned((attributes + 32) as *const u64);
+    let bytes = if descriptor == 0 { Vec::new() } else {
+        nt_security::capture_security_descriptor_bytes(&Win32kRegistryDescriptorMemory, descriptor).map_err(|status| status as i32)?
+    };
+    if bytes.len() > WIN32K_REGISTRY_VALUE_CAP { return Err(STATUS_BUFFER_TOO_SMALL_I32); }
+    core::ptr::copy_nonoverlapping(bytes.as_ptr(), (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_OFF) as *mut u8, bytes.len());
+    write_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_SECURITY_LEN) as *mut u32, bytes.len() as u32);
+    write_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DESIRED_ACCESS) as *mut u32, desired as u32);
+    write_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_ATTRIBUTES) as *mut u32, read_unaligned((attributes + 24) as *const u32));
+    write_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_PREVIOUS_MODE) as *mut u32, u32::from(previous_mode));
+    Ok(())
 }
-
-static mut WIN32K_REG_HANDLES: Option<Vec<Win32kRegHandle>> = None;
-static mut WIN32K_REG_SET_TRANSFER: Option<Win32kRegSetTransfer> = None;
-static WIN32K_REG_SET_NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct DisplayRegistrySpec<'a> {
     pub(crate) display_driver_leaf: &'a [u8],
@@ -11874,161 +11882,12 @@ pub(crate) struct DisplayModeSpec {
     pub(crate) stride: u32,
 }
 
-fn reg_ascii_eq(a: &[u8], b: &[u8]) -> bool {
-    ascii_eq_ignore_case(a, b)
-}
-
-fn win32k_reg_handles_mut() -> &'static mut Vec<Win32kRegHandle> {
-    unsafe {
-        let slot = &mut *core::ptr::addr_of_mut!(WIN32K_REG_HANDLES);
-        if slot.is_none() {
-            *slot = Some(Vec::new());
-        }
-        slot.as_mut().expect("initialized above")
-    }
-}
-
-fn win32k_reg_handles() -> Option<&'static Vec<Win32kRegHandle>> {
-    unsafe { (&*core::ptr::addr_of!(WIN32K_REG_HANDLES)).as_ref() }
-}
-
-fn register_win32k_reg_handle(target: Win32kRegHandleTarget) -> Result<u64, Win32kRegHandleTarget> {
-    if matches!(&target, Win32kRegHandleTarget::Empty) {
-        return Err(target);
-    }
-    let Ok(token) = WIN32K_REG_HANDLE_NEXT_TOKEN.fetch_update(
-        Ordering::AcqRel,
-        Ordering::Acquire,
-        |next| (next <= WIN32K_REG_HANDLE_TOKEN_MASK).then_some(next + 1),
-    ) else {
-        return Err(target);
-    };
-    let handle = WIN32K_REG_HANDLE_BASE | token;
-    let handles = win32k_reg_handles_mut();
-    for entry in handles.iter_mut() {
-        if matches!(&entry.target, Win32kRegHandleTarget::Empty) {
-            *entry = Win32kRegHandle { handle, target };
-            return Ok(handle);
-        }
-    }
-    if handles.try_reserve(1).is_err() {
-        return Err(target);
-    }
-    handles.push(Win32kRegHandle { handle, target });
-    Ok(handle)
-}
-
 fn is_win32k_reg_handle(handle: u64) -> bool {
-    handle & !WIN32K_REG_HANDLE_TOKEN_MASK == WIN32K_REG_HANDLE_BASE
-}
-
-fn take_win32k_reg_handle(handle: u64) -> Option<Win32kRegHandleTarget> {
-    let handles = win32k_reg_handles_mut();
-    if let Some(entry) = handles.iter_mut().find(|entry| {
-        entry.handle == handle && !matches!(&entry.target, Win32kRegHandleTarget::Empty)
-    }) {
-        unsafe {
-            let pending = &mut *core::ptr::addr_of_mut!(WIN32K_REG_SET_TRANSFER);
-            if pending
-                .as_ref()
-                .is_some_and(|transfer| transfer.handle == handle)
-            {
-                *pending = None;
-            }
-        }
-        entry.handle = 0;
-        Some(core::mem::replace(
-            &mut entry.target,
-            Win32kRegHandleTarget::Empty,
-        ))
-    } else {
-        None
-    }
-}
-
-fn strip_ascii_prefix<'a>(bytes: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
-    if bytes.len() >= prefix.len() && reg_ascii_eq(&bytes[..prefix.len()], prefix) {
-        Some(&bytes[prefix.len()..])
-    } else {
-        None
-    }
-}
-
-fn registry_path_tail(mut path: &[u8]) -> &[u8] {
-    while path.first() == Some(&b'\\') {
-        path = &path[1..];
-    }
-    strip_ascii_prefix(path, b"registry\\machine\\").unwrap_or(path)
-}
-
-fn is_video_device_map_key(path: &[u8]) -> bool {
-    reg_ascii_eq(registry_path_tail(path), b"hardware\\devicemap\\video")
-}
-
-fn system_hive_absolute_path(path: &[u8]) -> Result<alloc::string::String, i32> {
-    let mut tail = registry_path_tail(path);
-    tail = if reg_ascii_eq(tail, b"system") {
-        &[]
-    } else {
-        strip_ascii_prefix(tail, b"system\\").ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?
-    };
-    let tail = core::str::from_utf8(tail).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
-    let prefix = r"\Registry\Machine\System";
-    let mut absolute = alloc::string::String::new();
-    absolute
-        .try_reserve_exact(
-            prefix
-                .len()
-                .saturating_add(usize::from(!tail.is_empty()))
-                .saturating_add(tail.len()),
-        )
-        .map_err(|_| STATUS_NO_MEMORY)?;
-    absolute.push_str(prefix);
-    if !tail.is_empty() {
-        absolute.push('\\');
-        absolute.push_str(tail);
-    }
-    Ok(absolute)
-}
-
-fn system_hive_relative_path_from_handle(
-    root: u64,
-    path: &[u8],
-) -> Result<alloc::string::String, i32> {
-    let handles = win32k_reg_handles().ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-    let entry = handles
-        .iter()
-        .find(|entry| entry.handle == root)
-        .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-    let Win32kRegHandleTarget::SystemHive { physical_path, .. } = &entry.target else {
-        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-    };
-    let relative = core::str::from_utf8(path).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
-    let separator = usize::from(!relative.is_empty());
-    let mut absolute = alloc::string::String::new();
-    absolute
-        .try_reserve_exact(
-            physical_path
-                .len()
-                .saturating_add(separator)
-                .saturating_add(relative.len()),
-        )
-        .map_err(|_| STATUS_NO_MEMORY)?;
-    absolute.push_str(physical_path);
-    if !relative.is_empty() {
-        absolute.push('\\');
-        absolute.push_str(relative);
-    }
-    Ok(absolute)
+    unsafe { win32k_registry_broker_call(WIN32K_REGISTRY_OP_IS_KEY, handle).0 == 0 }
 }
 
 fn win32k_reg_path_is_absolute(path: &[u8]) -> bool {
     path.first() == Some(&b'\\')
-        || strip_ascii_prefix(path, b"registry\\machine\\").is_some()
-        || reg_ascii_eq(path, b"system")
-        || strip_ascii_prefix(path, b"system\\").is_some()
-        || reg_ascii_eq(path, b"hardware")
-        || strip_ascii_prefix(path, b"hardware\\").is_some()
 }
 
 unsafe fn read_unicode_string_ascii_lower(ustr: u64) -> Option<Vec<u8>> {
@@ -12208,6 +12067,26 @@ unsafe fn win32k_registry_broker_call(op: u64, arg: u64) -> (i32, u64, u64) {
     (status as u32 as i32, out1, out2)
 }
 
+unsafe fn acknowledge_win32k_registry_output(handle: u64, previous_mode: bool) -> i32 {
+    let mode = if previous_mode { WIN32K_REGISTRY_USE_PREVIOUS_MODE } else { 0 };
+    let (info, raw, first, second, reserved) = crate::driver_launch::call_on4_raw(
+        (W32_REGISTRY_LABEL << 12) | 4, WIN32K_REGISTRY_OP_PUBLISH | mode, handle, 0, 0);
+    if info != 4 || first != 0 || second != 0 || reserved != 0
+        || (raw != raw as u32 as u64 && raw != raw as u32 as i32 as i64 as u64)
+    {
+        crate::provider_bugcheck::report(0xc4, [W32_REGISTRY_LABEL, WIN32K_REGISTRY_OP_PUBLISH, info, raw]);
+    }
+    let status = raw as u32 as i32;
+    if status != 0 {
+        let (info, raw, first, second, reserved) = crate::driver_launch::call_on4_raw(
+            (W32_REGISTRY_LABEL << 12) | 4, WIN32K_REGISTRY_OP_ABORT | mode, handle, 0, 0);
+        if info != 4 || raw != 0 || first != 0 || second != 0 || reserved != 0 {
+            crate::provider_bugcheck::report(0xc4, [W32_REGISTRY_LABEL, WIN32K_REGISTRY_OP_ABORT, info, raw]);
+        }
+    }
+    status
+}
+
 unsafe fn win32k_registry_broker_call_with_param(
     op: u64,
     arg: u64,
@@ -12306,98 +12185,8 @@ unsafe fn drain_retired_event_provider_bodies() -> bool {
     }
 }
 
-unsafe fn open_cm_system_hive_target(path: &str) -> Result<Win32kRegHandleTarget, i32> {
-    let opened = crate::config_manager_open_system_hive_key(path)?;
-    Ok(Win32kRegHandleTarget::SystemHive {
-        lease: opened.lease,
-        physical_path: opened.physical_path,
-    })
-}
-
-fn close_win32k_reg_target(target: Win32kRegHandleTarget) -> i32 {
-    match target {
-        Win32kRegHandleTarget::Empty => STATUS_OBJECT_NAME_NOT_FOUND,
-        Win32kRegHandleTarget::VideoDeviceMap => 0,
-        Win32kRegHandleTarget::SystemHive { lease, .. } => unsafe {
-            crate::config_manager_retire_system_hive_key(lease)
-                .map(|()| 0)
-                .unwrap_or_else(|status| status)
-        },
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Win32kRegServiceQueryTarget {
-    VideoDeviceMap,
-    SystemHive(nt_config_client::SystemHiveKeyLease),
-}
-
-fn lookup_win32k_reg_service_query_target(handle: u64) -> Option<Win32kRegServiceQueryTarget> {
-    win32k_reg_handles()?
-        .iter()
-        .find(|entry| {
-            entry.handle == handle && !matches!(&entry.target, Win32kRegHandleTarget::Empty)
-        })
-        .and_then(|entry| match &entry.target {
-            Win32kRegHandleTarget::Empty => None,
-            Win32kRegHandleTarget::VideoDeviceMap => {
-                Some(Win32kRegServiceQueryTarget::VideoDeviceMap)
-            }
-            Win32kRegHandleTarget::SystemHive { lease, .. } => {
-                Some(Win32kRegServiceQueryTarget::SystemHive(*lease))
-            }
-        })
-}
-
-fn clone_win32k_system_reg_target(
-    handle: u64,
-) -> Result<
-    (
-        nt_config_client::SystemHiveKeyLease,
-        alloc::string::String,
-    ),
-    i32,
-> {
-    let handles = win32k_reg_handles().ok_or(STATUS_INVALID_HANDLE_I32)?;
-    let entry = handles
-        .iter()
-        .find(|entry| {
-            entry.handle == handle && !matches!(&entry.target, Win32kRegHandleTarget::Empty)
-        })
-        .ok_or(STATUS_INVALID_HANDLE_I32)?;
-    let Win32kRegHandleTarget::SystemHive {
-        lease,
-        physical_path,
-    } = &entry.target
-    else {
-        return Err(STATUS_NOT_SUPPORTED_I32);
-    };
-    let mut path = alloc::string::String::new();
-    path.try_reserve_exact(physical_path.len())
-        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES_I32)?;
-    path.push_str(physical_path);
-    Ok((*lease, path))
-}
-
-fn win32k_system_reg_target_matches(
-    handle: u64,
-    lease: nt_config_client::SystemHiveKeyLease,
-) -> bool {
-    win32k_reg_handles().is_some_and(|handles| {
-        handles.iter().any(|entry| {
-            entry.handle == handle
-                && matches!(
-                    &entry.target,
-                    Win32kRegHandleTarget::SystemHive {
-                        lease: live_lease,
-                        ..
-                    } if *live_lease == lease
-                )
-        })
-    })
-}
-
 unsafe fn service_win32k_registry_begin_set(
+    caller: nt_process::native_handle::NativeHandleCaller,
     handle: u64,
     value_type: u64,
     total_len: u64,
@@ -12405,34 +12194,16 @@ unsafe fn service_win32k_registry_begin_set(
     if value_type > u32::MAX as u64 || total_len > 0x8000_0000 {
         return Err(STATUS_INVALID_PARAMETER_I32);
     }
-    if (&*core::ptr::addr_of!(WIN32K_REG_SET_TRANSFER)).is_some() {
-        return Err(0x8000_0011u32 as i32); // STATUS_DEVICE_BUSY
-    }
     let name = read_win32k_registry_bytes(WIN32K_REGISTRY_VALUE_LEN, WIN32K_REGISTRY_VALUE_OFF)
         .ok_or(STATUS_INVALID_PARAMETER_I32)?;
     let name = alloc::string::String::from_utf8(name).map_err(|_| STATUS_INVALID_PARAMETER_I32)?;
-    let (lease, physical_path) = clone_win32k_system_reg_target(handle)?;
-    crate::config_manager_query_leased_system_hive_key_information(lease)?;
+    let target = crate::driver_launch::driver_registry_handles::driver_registry_handle_slot(caller, handle, 2)?.target;
     let total_len = usize::try_from(total_len).map_err(|_| STATUS_INVALID_PARAMETER_I32)?;
-    let upload = nt_config_client::SystemHiveValueUpload::new(total_len)?;
-    let token = WIN32K_REG_SET_NEXT_TOKEN
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
-            (next != u64::MAX).then_some(next + 1)
-        })
-        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES_I32)?;
-    *core::ptr::addr_of_mut!(WIN32K_REG_SET_TRANSFER) = Some(Win32kRegSetTransfer {
-        token,
-        handle,
-        lease,
-        physical_path,
-        name,
-        value_type: value_type as u32,
-        upload,
-    });
-    Ok(token)
+    crate::driver_launch::driver_registry_value_transfers::begin(caller, handle, target, &name, value_type as u32, total_len)
 }
 
 unsafe fn service_win32k_registry_append_set(
+    caller: nt_process::native_handle::NativeHandleCaller,
     handle: u64,
     token: u64,
     transfer_position: u64,
@@ -12440,19 +12211,11 @@ unsafe fn service_win32k_registry_append_set(
 ) -> Result<(), i32> {
     let total_len = (transfer_position >> 32) as u32 as usize;
     let offset = transfer_position as u32 as usize;
-    let transfer = (&mut *core::ptr::addr_of_mut!(WIN32K_REG_SET_TRANSFER))
-        .as_mut()
-        .ok_or(STATUS_INVALID_PARAMETER_I32)?;
-    if transfer.handle != handle
-        || transfer.token != token
-        || transfer.upload.expected_len() != total_len
-        || transfer.upload.received_len() != offset
-        || staged_data_len == 0
+    if staged_data_len == 0
         || staged_data_len > WIN32K_REGISTRY_VALUE_CAP
         || offset
             .checked_add(staged_data_len)
             .is_none_or(|end| end > total_len)
-        || !win32k_system_reg_target_matches(handle, transfer.lease)
     {
         return Err(STATUS_INVALID_PARAMETER_I32);
     }
@@ -12460,77 +12223,39 @@ unsafe fn service_win32k_registry_append_set(
         (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_OFF) as *const u8,
         staged_data_len,
     );
-    transfer.upload.append(offset, data)
+    crate::driver_launch::driver_registry_value_transfers::append(caller, handle, token, total_len, offset, data)
 }
 
 unsafe fn service_win32k_registry_abort_set(
+    caller: nt_process::native_handle::NativeHandleCaller,
     handle: u64,
     token: u64,
     total_len: u64,
 ) -> Result<(), i32> {
-    let transfer = (&*core::ptr::addr_of!(WIN32K_REG_SET_TRANSFER))
-        .as_ref()
-        .ok_or(STATUS_INVALID_PARAMETER_I32)?;
-    if transfer.handle != handle
-        || transfer.token != token
-        || transfer.upload.expected_len() as u64 != total_len
-    {
-        return Err(STATUS_INVALID_PARAMETER_I32);
-    }
-    *core::ptr::addr_of_mut!(WIN32K_REG_SET_TRANSFER) = None;
-    Ok(())
+    crate::driver_launch::driver_registry_value_transfers::abort(caller, handle, token, usize::try_from(total_len).map_err(|_| STATUS_INVALID_PARAMETER_I32)?)
 }
 
 unsafe fn service_win32k_registry_commit_set(
+    caller: nt_process::native_handle::NativeHandleCaller,
     handle: u64,
     token: u64,
     total_len: u64,
 ) -> Result<(), i32> {
-    let transfer = (&*core::ptr::addr_of!(WIN32K_REG_SET_TRANSFER))
-        .as_ref()
-        .ok_or(STATUS_INVALID_PARAMETER_I32)?;
-    if transfer.handle != handle
-        || transfer.token != token
-        || transfer.upload.expected_len() as u64 != total_len
-        || transfer.upload.complete_data().is_err()
-        || !win32k_system_reg_target_matches(handle, transfer.lease)
-    {
-        return Err(STATUS_INVALID_PARAMETER_I32);
-    }
-    let transfer = (&mut *core::ptr::addr_of_mut!(WIN32K_REG_SET_TRANSFER))
-        .take()
-        .ok_or(STATUS_INVALID_PARAMETER_I32)?;
-    let data = transfer.upload.complete_data()?;
-    let information = crate::config_manager_query_leased_system_hive_key_information(transfer.lease)?;
-    crate::persist_and_publish_system_hive_mutation(information.mount_generation, &[
-        nt_config_client::SystemHiveMutation::SetValue {
-            path: &transfer.physical_path,
-            name: &transfer.name,
-            value_type: transfer.value_type,
-            data,
-        },
-    ])
-    .map(|_| ())
-    .map_err(|status| status as i32)
+    crate::driver_launch::driver_registry_value_transfers::commit(caller, handle, token, usize::try_from(total_len).map_err(|_| STATUS_INVALID_PARAMETER_I32)?)
 }
 
-unsafe fn service_win32k_registry_delete_value(handle: u64) -> Result<(), i32> {
+unsafe fn service_win32k_registry_delete_value(caller: nt_process::native_handle::NativeHandleCaller, handle: u64) -> Result<(), i32> {
     let name = read_win32k_registry_bytes(WIN32K_REGISTRY_VALUE_LEN, WIN32K_REGISTRY_VALUE_OFF)
         .ok_or(STATUS_INVALID_PARAMETER_I32)?;
     let name = alloc::string::String::from_utf8(name).map_err(|_| STATUS_INVALID_PARAMETER_I32)?;
-    let (lease, physical_path) = clone_win32k_system_reg_target(handle)?;
-    let information = crate::config_manager_query_leased_system_hive_key_information(lease)?;
-    crate::persist_and_publish_system_hive_mutation(information.mount_generation, &[
-        nt_config_client::SystemHiveMutation::DeleteValue {
-            path: &physical_path,
-            name: &name,
-        },
-    ])
-    .map(|_| ())
-    .map_err(|status| status as i32)
+    let target = crate::driver_launch::driver_registry_handles::driver_registry_handle_slot(caller, handle, 2)?.target;
+    crate::driver_launch::driver_registry_operations::delete_value(target, &name)
 }
 
 unsafe fn service_win32k_registry_create(
+    caller: nt_process::native_handle::NativeHandleCaller,
+    metadata: &mut crate::driver_launch::DriverRegistryOpenMetadata,
+    subject: &nt_user_host::registry_subject::RegistrySubject,
     root: u64,
     create_options: u64,
     class_present: u64,
@@ -12541,9 +12266,6 @@ unsafe fn service_win32k_registry_create(
     let create_options = create_options as u32;
     if create_options & !REG_OPTION_VALID_MASK != 0 {
         return Err(STATUS_INVALID_PARAMETER_I32);
-    }
-    if create_options != 0 {
-        return Err(STATUS_NOT_SUPPORTED_I32);
     }
     let path_len = read_volatile(
         (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_KEY_LEN) as *const u32,
@@ -12575,120 +12297,93 @@ unsafe fn service_win32k_registry_create(
     } else {
         None
     };
-    let absolute = if win32k_reg_path_is_absolute(&path) {
-        system_hive_absolute_path(&path)?
-    } else {
-        system_hive_relative_path_from_handle(root, &path)?
-    };
+    if !win32k_reg_path_is_absolute(&path) {
+        if root == 0 { return Err(0xc000_003au32 as i32); }
+        metadata.root_handle = Some(root);
+    }
+    let name = core::str::from_utf8(&path).map_err(|_| STATUS_INVALID_PARAMETER_I32)?;
 
-    let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-    match open_cm_system_hive_target(&absolute) {
-        Ok(target) => {
-            let handle = match register_win32k_reg_handle(target) {
-                Ok(handle) => handle,
-                Err(target) => {
-                    let _ = close_win32k_reg_target(target);
-                    return Err(STATUS_NO_MEMORY);
-                }
-            };
-            return Ok((handle, REG_OPENED_EXISTING_KEY));
-        }
-        Err(STATUS_OBJECT_NAME_NOT_FOUND) => {}
-        Err(status) => return Err(status),
-    }
-
-    let resolved = crate::config_manager_resolve_system_hive_path(&absolute)?;
-    if resolved.mount_generation != expected_generation {
-        return Err(0xC000_0059u32 as i32); // STATUS_REVISION_MISMATCH
-    }
-    let Some(separator) = resolved.physical_path.rfind('\\') else {
-        return Err(0xC000_003Au32 as i32); // STATUS_OBJECT_PATH_NOT_FOUND
-    };
-    let parent = &resolved.physical_path[..separator];
-    if parent.is_empty() {
-        return Err(0xC000_003Au32 as i32);
-    }
-    let parent_lease = match crate::config_manager_open_system_hive_key(parent) {
-        Ok(opened) => opened.lease,
-        Err(STATUS_OBJECT_NAME_NOT_FOUND) => return Err(0xC000_003Au32 as i32),
-        Err(status) => return Err(status),
-    };
-    crate::config_manager_retire_system_hive_key(parent_lease)?;
-
-    let mut mutations = Vec::new();
-    mutations
-        .try_reserve_exact(1 + usize::from(class.is_some()))
-        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES_I32)?;
-    mutations.push(nt_config_client::SystemHiveMutation::CreateKey {
-        path: &resolved.physical_path,
-    });
-    if let Some(class) = class.as_deref() {
-        mutations.push(nt_config_client::SystemHiveMutation::SetKeyClass {
-            path: &resolved.physical_path,
-            class_name: Some(class),
-        });
-    }
-    crate::persist_and_publish_system_hive_mutation(expected_generation, &mutations)
-        .map_err(|status| status as i32)?;
-    let target = open_cm_system_hive_target(&resolved.physical_path)?;
-    let handle = match register_win32k_reg_handle(target) {
-        Ok(handle) => handle,
-        Err(target) => {
-            let _ = close_win32k_reg_target(target);
-            return Err(STATUS_NO_MEMORY);
-        }
-    };
-    Ok((handle, REG_CREATED_NEW_KEY))
+    let mut path = crate::driver_launch::HostedAscii::empty();
+    if !path.push_str(name) { return Err(STATUS_INSUFFICIENT_RESOURCES_I32); }
+    let (status, handle, disposition) = crate::driver_launch::service_hosted_driver_create_registry_path(
+        caller, path, create_options, metadata, subject, class.as_deref(),
+    );
+    if status == 0 { Ok((handle, disposition)) } else { Err(status) }
 }
 
-unsafe fn service_win32k_registry_open(root: u64, path: &[u8]) -> Result<u64, i32> {
-    let target = if !win32k_reg_path_is_absolute(path) {
-        let absolute = system_hive_relative_path_from_handle(root, path)?;
-        open_cm_system_hive_target(&absolute)?
-    } else if is_video_device_map_key(path) {
-        let path = core::str::from_utf8(path).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
-        if !crate::config_manager_open_key(path) {
-            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-        }
-        Win32kRegHandleTarget::VideoDeviceMap
-    } else {
-        let absolute = system_hive_absolute_path(path)?;
-        open_cm_system_hive_target(&absolute)?
-    };
-    match register_win32k_reg_handle(target) {
-        Ok(handle) => Ok(handle),
-        Err(target) => {
-            let _ = close_win32k_reg_target(target);
-            Err(STATUS_NO_MEMORY)
-        }
+unsafe fn service_win32k_registry_open(caller: nt_process::native_handle::NativeHandleCaller,
+    metadata: &mut crate::driver_launch::DriverRegistryOpenMetadata,
+    subject: &nt_user_host::registry_subject::RegistrySubject,
+    root: u64, path: &[u8]) -> Result<u64, i32> {
+    if !win32k_reg_path_is_absolute(path) {
+        if root == 0 { return Err(0xc000_003au32 as i32); }
+        metadata.root_handle = Some(root);
     }
+    let name = core::str::from_utf8(path).map_err(|_| STATUS_INVALID_PARAMETER_I32)?;
+    let mut path = crate::driver_launch::HostedAscii::empty();
+    if !path.push_str(name) { return Err(STATUS_INSUFFICIENT_RESOURCES_I32); }
+    let (status, handle, _) = crate::driver_launch::service_hosted_driver_open_registry_path(caller, path, metadata, subject);
+    if status == 0 { Ok(handle) } else { Err(status) }
 }
 
 unsafe fn service_win32k_registry_query(
+    caller: nt_process::native_handle::NativeHandleCaller,
     handle: u64,
     name: &[u8],
-) -> Result<(u32, Vec<u8>, bool), i32> {
-    match lookup_win32k_reg_service_query_target(handle).ok_or(STATUS_INVALID_HANDLE_I32)? {
-        Win32kRegServiceQueryTarget::VideoDeviceMap => {
-            crate::video_device::query_video_device_map_value_owned(name)
-                .map(|(value_type, data)| (value_type, data, true))
-        }
-        Win32kRegServiceQueryTarget::SystemHive(lease) => {
-            let name = core::str::from_utf8(name).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
-            crate::config_manager_query_leased_system_hive_value(lease, name)
-                .map(|value| (value.value_type, value.data, false))
-        }
-    }
+) -> Result<(u32, Vec<u8>), i32> {
+    let slot = crate::driver_launch::driver_registry_handles::driver_registry_handle_slot(caller, handle, 1)?;
+    let name = core::str::from_utf8(name).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
+    crate::driver_launch::driver_registry_operations::query_value(slot.target, name)
 }
 
 /// Service one pointer-free registry request from the win32k component. This is called only by the
 /// executive-side component pump, which owns the Configuration Manager transport and handle table.
 pub(crate) unsafe fn service_registry_request(
+    channel: &crate::spawn_hosts::PumpChannel,
     op: u64,
     arg: u64,
     param1: u64,
     param2: u64,
 ) -> (i32, u64, u64) {
+    let use_previous_mode = op & WIN32K_REGISTRY_USE_PREVIOUS_MODE != 0;
+    let op = op & !WIN32K_REGISTRY_USE_PREVIOUS_MODE;
+    let caller = match crate::provider_registry_caller::resolve(channel) {
+        Ok(caller) => caller,
+        Err(status) => return (status as i32, 0, 0),
+    };
+    // Publication controls carry their mode explicitly; nested work may have replaced metadata.
+    let caller = if (use_previous_mode || (matches!(op, WIN32K_REGISTRY_OP_OPEN | WIN32K_REGISTRY_OP_CREATE_KEY)
+        && read_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_PREVIOUS_MODE) as *const u32) != 0))
+        && channel.logical_caller.is_some()
+    {
+        match crate::with_provider_process_manager(|pm| pm.capture_native_handle_caller(caller.original_thread(), nt_types::AccessMode::UserMode)) {
+            Ok(caller) => caller,
+            Err(status) => return (status as i32, 0, 0),
+        }
+    } else { caller };
+    let dispatch = match crate::driver_launch::driver_registry_handles::RegistryPublicationDispatch::capture(channel) {
+        Ok(dispatch) => dispatch,
+        Err(status) => return (status as i32, 0, 0),
+    };
+    let mut metadata = if matches!(op, WIN32K_REGISTRY_OP_OPEN | WIN32K_REGISTRY_OP_CREATE_KEY) {
+        let length = read_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_SECURITY_LEN) as *const u32) as usize;
+        if length > WIN32K_REGISTRY_VALUE_CAP { return (STATUS_INVALID_PARAMETER_I32, 0, 0); }
+        let attributes = read_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_ATTRIBUTES) as *const u32);
+        if attributes & !0x6c2 != 0 { return (STATUS_INVALID_PARAMETER_I32, 0, 0); }
+        Some(crate::driver_launch::DriverRegistryOpenMetadata {
+            dispatch,
+            root_handle: None,
+            desired_access: read_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DESIRED_ACCESS) as *const u32),
+            attributes,
+            security_descriptor: (length != 0).then(|| core::slice::from_raw_parts((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_OFF) as *const u8, length).to_vec()),
+        })
+    } else { None };
+    let subject = if metadata.is_some() {
+        match crate::with_provider_security_managers(|pm, tokens| nt_user_host::registry_subject::RegistrySubject::capture(pm, tokens, caller)) {
+            Ok(subject) => Some(Win32kRegistrySubject(subject)),
+            Err(status) => return (status as i32, 0, 0),
+        }
+    } else { None };
     let staged_data_len =
         read_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_LEN) as *const u32) as usize;
     write_volatile(
@@ -12706,23 +12401,27 @@ pub(crate) unsafe fn service_registry_request(
             else {
                 return (STATUS_INVALID_PARAMETER_I32, 0, 0);
             };
-            match service_win32k_registry_open(arg, &path) {
+            match service_win32k_registry_open(caller, metadata.as_mut().unwrap(), &subject.as_ref().unwrap().0, arg, &path) {
                 Ok(handle) => (0, handle, 0),
                 Err(status) => (status, 0, 0),
             }
         }
-        WIN32K_REGISTRY_OP_CLOSE => match take_win32k_reg_handle(arg) {
-            Some(target) => (close_win32k_reg_target(target), 0, 0),
-            None => (STATUS_INVALID_HANDLE_I32, 0, 0),
-        },
+        WIN32K_REGISTRY_OP_CLOSE => {
+            let result = crate::driver_launch::driver_registry_handles::close_driver_registry_handle(caller, arg);
+            let (status, _, _) = crate::driver_launch::finish_driver_registry_close(channel, result);
+            (status, u64::from(caller.mode() == nt_types::AccessMode::UserMode), 0)
+        }
+        WIN32K_REGISTRY_OP_IS_KEY => (crate::driver_launch::driver_registry_handles::driver_registry_handle_slot(caller, arg, 0).err().unwrap_or(0), 0, 0),
+        WIN32K_REGISTRY_OP_PUBLISH => (crate::driver_launch::driver_registry_handles::publish_driver_registry_handle(dispatch, caller, arg).err().unwrap_or(0), 0, 0),
+        WIN32K_REGISTRY_OP_ABORT => (crate::driver_launch::driver_registry_handles::abort_driver_registry_publication(dispatch, caller, arg).err().unwrap_or(0), 0, 0),
         WIN32K_REGISTRY_OP_QUERY_VALUE => {
             let Some(name) =
                 read_win32k_registry_ascii(WIN32K_REGISTRY_VALUE_LEN, WIN32K_REGISTRY_VALUE_OFF)
             else {
                 return (STATUS_INVALID_PARAMETER_I32, 0, 0);
             };
-            match service_win32k_registry_query(arg, &name) {
-                Ok((value_type, data, video)) => {
+            match service_win32k_registry_query(caller, arg, &name) {
+                Ok((value_type, data)) => {
                     write_volatile(
                         (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_VALUE_TYPE) as *mut u32,
                         value_type,
@@ -12745,41 +12444,14 @@ pub(crate) unsafe fn service_registry_request(
                             byte,
                         );
                     }
-                    if video {
-                        let trace = WIN32K_VIDEO_REG_QUERY_TRACE.fetch_add(1, Ordering::Relaxed);
-                        if trace < 16 {
-                            print_str(b"[win32k-reg] CM-validated video devicemap query name=");
-                            print_str(&name);
-                            print_str(b" len=");
-                            print_u64(data.len() as u64);
-                            print_str(b" status=0x00000000\n");
-                        }
-                    }
                     (0, value_type as u64, data.len() as u64)
                 }
                 Err(status) => (status, 0, 0),
             }
         }
         WIN32K_REGISTRY_OP_QUERY_KEY => {
-            let Some(handles) = win32k_reg_handles() else {
-                return (STATUS_INVALID_HANDLE_I32, 0, 0);
-            };
-            let Some(entry) = handles.iter().find(|entry| {
-                entry.handle == arg && !matches!(&entry.target, Win32kRegHandleTarget::Empty)
-            }) else {
-                return (STATUS_INVALID_HANDLE_I32, 0, 0);
-            };
-            let Win32kRegHandleTarget::SystemHive {
-                lease,
-                physical_path,
-            } = &entry.target
-            else {
-                return (STATUS_NOT_SUPPORTED_I32, 0, 0);
-            };
-            let information = match crate::config_manager_query_leased_system_hive_key_information(
-                *lease,
-            ) {
-                Ok(information) => information,
+            let slot = match crate::driver_launch::driver_registry_handles::driver_registry_handle_slot(caller, arg, 1) {
+                Ok(slot) => slot,
                 Err(status) => return (status, 0, 0),
             };
             let info_class = match u32::try_from(param1) {
@@ -12787,12 +12459,7 @@ pub(crate) unsafe fn service_registry_request(
                 Err(_) => return (STATUS_INVALID_PARAMETER_I32, 0, 0),
             };
             let (bytes, minimum_length) =
-                match crate::exec_handler::build_registry_key_query_info(
-                    info_class,
-                    physical_path,
-                    crate::exec_handler::RegistryKeyStats::from_leased_key(&information),
-                    information.class_name.as_deref(),
-                ) {
+                match crate::driver_launch::driver_registry_operations::query_key(slot.target, info_class) {
                     Ok(result) => result,
                     Err(status) => return (status as i32, 0, 0),
                 };
@@ -12812,29 +12479,16 @@ pub(crate) unsafe fn service_registry_request(
             (0, bytes.len() as u64, minimum_length as u64)
         }
         WIN32K_REGISTRY_OP_ENUMERATE_VALUE => {
-            let lease = match lookup_win32k_reg_service_query_target(arg) {
-                Some(Win32kRegServiceQueryTarget::SystemHive(lease)) => lease,
-                Some(Win32kRegServiceQueryTarget::VideoDeviceMap) => {
-                    return (STATUS_NOT_SUPPORTED_I32, 0, 0);
-                }
-                None => return (STATUS_INVALID_HANDLE_I32, 0, 0),
+            let slot = match crate::driver_launch::driver_registry_handles::driver_registry_handle_slot(caller, arg, 1) {
+                Ok(slot) => slot,
+                Err(status) => return (status, 0, 0),
             };
             let index = match u32::try_from(param1) {
                 Ok(index) => index,
                 Err(_) => return (STATUS_INVALID_PARAMETER_I32, 0, 0),
             };
-            let value = match crate::config_manager_enumerate_leased_system_hive_value(lease, index)
-            {
-                Ok(value) => value,
-                Err(status) => return (status, 0, 0),
-            };
             let (bytes, minimum_length) =
-                match crate::exec_handler::build_registry_value_query_info(
-                    param2,
-                    &value.name,
-                    value.value_type,
-                    &value.data,
-                ) {
+                match crate::driver_launch::driver_registry_operations::enumerate_value(slot.target, index, param2) {
                     Ok(result) => result,
                     Err(status) => return (status as i32, 0, 0),
                 };
@@ -12854,35 +12508,35 @@ pub(crate) unsafe fn service_registry_request(
             (0, bytes.len() as u64, minimum_length as u64)
         }
         WIN32K_REGISTRY_OP_BEGIN_SET_VALUE => {
-            match service_win32k_registry_begin_set(arg, param1, param2) {
+            match service_win32k_registry_begin_set(caller, arg, param1, param2) {
                 Ok(token) => (0, token, 0),
                 Err(status) => (status, 0, 0),
             }
         }
         WIN32K_REGISTRY_OP_APPEND_SET_VALUE => {
-            match service_win32k_registry_append_set(arg, param1, param2, staged_data_len) {
+            match service_win32k_registry_append_set(caller, arg, param1, param2, staged_data_len) {
                 Ok(()) => (0, 0, 0),
                 Err(status) => (status, 0, 0),
             }
         }
         WIN32K_REGISTRY_OP_COMMIT_SET_VALUE => {
-            match service_win32k_registry_commit_set(arg, param1, param2) {
+            match service_win32k_registry_commit_set(caller, arg, param1, param2) {
                 Ok(()) => (0, 0, 0),
                 Err(status) => (status, 0, 0),
             }
         }
         WIN32K_REGISTRY_OP_ABORT_SET_VALUE => {
-            match service_win32k_registry_abort_set(arg, param1, param2) {
+            match service_win32k_registry_abort_set(caller, arg, param1, param2) {
                 Ok(()) => (0, 0, 0),
                 Err(status) => (status, 0, 0),
             }
         }
-        WIN32K_REGISTRY_OP_DELETE_VALUE => match service_win32k_registry_delete_value(arg) {
+        WIN32K_REGISTRY_OP_DELETE_VALUE => match service_win32k_registry_delete_value(caller, arg) {
             Ok(()) => (0, 0, 0),
             Err(status) => (status, 0, 0),
         },
         WIN32K_REGISTRY_OP_CREATE_KEY => {
-            match service_win32k_registry_create(arg, param1, param2) {
+            match service_win32k_registry_create(caller, metadata.as_mut().unwrap(), &subject.as_ref().unwrap().0, arg, param1, param2) {
                 Ok((handle, disposition)) => (0, handle, disposition),
                 Err(status) => (status, 0, 0),
             }
@@ -12894,7 +12548,15 @@ pub(crate) unsafe fn service_registry_request(
 /// `NTSTATUS ZwOpenKey(PHANDLE KeyHandle, ACCESS_MASK, POBJECT_ATTRIBUTES)`. OBJECT_ATTRIBUTES x64:
 /// ObjectName (PUNICODE_STRING) at +0x10. Resolve win32k's registry imports to live registry/device
 /// targets; optional keys not present in CM's mounted hive fail with CM's exact status.
-extern "win64" fn s_zw_open_key(handle_out: *mut u64, _desired_access: u64, obj_attr: u64) -> i32 {
+extern "win64" fn s_zw_open_key(handle_out: *mut u64, desired_access: u64, obj_attr: u64) -> i32 {
+    win32k_open_key(handle_out, desired_access, obj_attr, false)
+}
+
+extern "win64" fn s_nt_open_key(handle_out: *mut u64, desired_access: u64, obj_attr: u64) -> i32 {
+    win32k_open_key(handle_out, desired_access, obj_attr, true)
+}
+
+fn win32k_open_key(handle_out: *mut u64, desired_access: u64, obj_attr: u64, previous_mode: bool) -> i32 {
     if handle_out.is_null() {
         return STATUS_ACCESS_VIOLATION_I32;
     }
@@ -12902,6 +12564,7 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _desired_access: u64, obj_
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     unsafe {
+        if let Err(status) = stage_win32k_registry_metadata(desired_access, obj_attr, previous_mode) { return status; }
         let Some(path) = object_attributes_name_ascii_lower(obj_attr) else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
@@ -12914,6 +12577,11 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _desired_access: u64, obj_
             return status;
         }
         write_unaligned(handle_out, hkey);
+        let status = acknowledge_win32k_registry_output(hkey, previous_mode);
+        if status != 0 {
+            write_unaligned(handle_out, 0);
+            return status;
+        }
     }
     0
 }
@@ -12923,7 +12591,7 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _desired_access: u64, obj_
 /// durably creates only that final child before returning a newly leased provider handle.
 extern "win64" fn s_zw_create_key(
     handle_out: *mut u64,
-    _desired_access: u64,
+    desired_access: u64,
     object_attributes: u64,
     _title_index: u64,
     class: u64,
@@ -12939,6 +12607,7 @@ extern "win64" fn s_zw_create_key(
         return STATUS_INVALID_PARAMETER_I32;
     }
     unsafe {
+        if let Err(status) = stage_win32k_registry_metadata(desired_access, object_attributes, false) { return status; }
         if read_unaligned(object_attributes as *const u32) < 48 {
             return STATUS_INVALID_PARAMETER_I32;
         }
@@ -12960,7 +12629,7 @@ extern "win64" fn s_zw_create_key(
         if WIN32K_REGISTRY_KEY_OFF
             .checked_add(path.len() as u64)
             .and_then(|offset| offset.checked_add(class_len as u64))
-            .is_none_or(|end| end > WIN32K_REGISTRY_BYTES as u64)
+            .is_none_or(|end| end > WIN32K_REGISTRY_DATA_OFF)
         {
             return STATUS_INVALID_PARAMETER_I32;
         }
@@ -12991,6 +12660,11 @@ extern "win64" fn s_zw_create_key(
         write_unaligned(handle_out, handle);
         if !disposition.is_null() {
             write_unaligned(disposition, create_disposition as u32);
+        }
+        let status = acknowledge_win32k_registry_output(handle, false);
+        if status != 0 {
+            write_unaligned(handle_out, 0);
+            return status;
         }
     }
     0
@@ -13144,6 +12818,7 @@ unsafe fn copy_registry_information(
 }
 
 unsafe fn query_win32k_registry_value(
+    previous_mode: bool,
     handle: u64,
     name: &[u8],
     info_class: u64,
@@ -13168,7 +12843,7 @@ unsafe fn query_win32k_registry_value(
         return STATUS_INVALID_PARAMETER_I32;
     }
     let (status, value_type, data_len) =
-        win32k_registry_broker_call(WIN32K_REGISTRY_OP_QUERY_VALUE, handle);
+        win32k_registry_broker_call(WIN32K_REGISTRY_OP_QUERY_VALUE | if previous_mode { WIN32K_REGISTRY_USE_PREVIOUS_MODE } else { 0 }, handle);
     if status != 0 {
         if status == STATUS_BUFFER_TOO_SMALL_I32 {
             if let Ok((required, _)) = crate::exec_handler::registry_value_query_information_size(
@@ -13210,6 +12885,14 @@ extern "win64" fn s_zw_query_value_key(
     length: u64,
     result_len: *mut u32,
 ) -> i32 {
+    win32k_query_value_key(false, hkey, value_name, info_class, kvi, length, result_len)
+}
+
+extern "win64" fn s_nt_query_value_key(hkey: u64, value_name: u64, info_class: u64, kvi: u64, length: u64, result_len: *mut u32) -> i32 {
+    win32k_query_value_key(true, hkey, value_name, info_class, kvi, length, result_len)
+}
+
+fn win32k_query_value_key(previous_mode: bool, hkey: u64, value_name: u64, info_class: u64, kvi: u64, length: u64, result_len: *mut u32) -> i32 {
     if value_name == 0 {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
@@ -13217,7 +12900,7 @@ extern "win64" fn s_zw_query_value_key(
         let Some(name) = read_unicode_string_ascii_lower(value_name) else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
-        query_win32k_registry_value(hkey, &name, info_class, kvi, length, result_len)
+        query_win32k_registry_value(previous_mode, hkey, &name, info_class, kvi, length, result_len)
     }
 }
 
@@ -14157,7 +13840,7 @@ fn register_trampolines() -> bool {
     reg.bind("ZwDuplicateObject", s_zw_duplicate_object as usize as u64);
     reg.bind("NtDuplicateObject", s_zw_duplicate_object as usize as u64);
     reg.bind("ZwClose", s_zw_close as usize as u64);
-    reg.bind("NtClose", s_zw_close as usize as u64);
+    reg.bind("NtClose", s_nt_close as usize as u64);
     reg.bind(
         "LpcRequestPort",
         s_lpc_request_port as *const () as usize as u64,
@@ -14414,7 +14097,7 @@ fn register_trampolines() -> bool {
     reg.bind("ZwOpenFile", s_zw_open_file_fail as usize as u64);
     reg.bind("NtOpenFile", s_zw_open_file_fail as usize as u64);
     reg.bind("ZwOpenKey", s_zw_open_key as usize as u64);
-    reg.bind("NtOpenKey", s_zw_open_key as usize as u64);
+    reg.bind("NtOpenKey", s_nt_open_key as usize as u64);
     reg.bind(
         "ZwCreateKey",
         s_zw_create_key as *const () as usize as u64,
@@ -14428,7 +14111,7 @@ fn register_trampolines() -> bool {
         s_zw_delete_value_key as *const () as usize as u64,
     );
     reg.bind("ZwQueryValueKey", s_zw_query_value_key as usize as u64);
-    reg.bind("NtQueryValueKey", s_zw_query_value_key as usize as u64);
+    reg.bind("NtQueryValueKey", s_nt_query_value_key as usize as u64);
     reg.bind("ZwQueryKey", s_zw_query_key as usize as u64);
     reg.bind(
         "ZwEnumerateValueKey",

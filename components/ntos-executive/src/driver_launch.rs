@@ -70,16 +70,30 @@ pub(crate) mod hosted_file_capture;
 pub(crate) use hosted_file_owners::Stats as HostedFileOwnerStats;
 #[path = "hosted_video_port_control.rs"]
 mod hosted_video_port_control;
+#[path = "driver_ps_context.rs"]
+mod driver_ps_context;
+#[path = "driver_ps_pool_alias.rs"]
+mod driver_ps_pool_alias;
+
+pub(crate) fn ps_pool_alias_owns_cap(cap: u64) -> bool { driver_ps_pool_alias::owns_cap(cap) }
 
 #[path = "driver_registry_handles.rs"]
 pub(crate) mod driver_registry_handles;
+#[path = "driver_registry_policy.rs"]
+mod driver_registry_policy;
+pub(crate) use driver_registry_policy::{
+    DriverRegistryOpenMetadata, authorize_driver_registry_open, driver_registry_live_handler,
+    finish_driver_registry_close,
+    service_hosted_driver_open_registry_path, service_hosted_driver_create_registry_path,
+};
+use driver_registry_policy::{DriverRegistrySubject, hosted_registry_path_is_system};
+#[path = "driver_registry_operations.rs"]
+pub(crate) mod driver_registry_operations;
+#[path = "driver_registry_value_transfers.rs"]
+pub(crate) mod driver_registry_value_transfers;
 use driver_registry_handles::{
     close_driver_registry_handle, driver_registry_handle_slot, open_driver_registry_handle,
-    retire_driver_registry_handle,
-};
-pub(crate) use driver_registry_handles::{
-    driver_registry_close_retry_deadline, driver_registry_close_retry_wake_due,
-    retry_driver_registry_closes, stats as driver_registry_owner_stats,
+    retire_driver_registry_handle, publish_driver_registry_handle, abort_driver_registry_publication,
 };
 
 use core::mem::MaybeUninit;
@@ -253,6 +267,7 @@ pub const FSD_WORKER_STACK_FRAMES: u64 = 32;
 const FSD_WORKER_IPCBUF_OFFSET: u64 = 0x0004_0000;
 const FSD_WORKER_TRAMP_OFFSET: u64 = 0x0004_1000;
 const FSD_WORKER_SCRATCH_OFFSET: u64 = 0x0004_2000;
+const FSD_WORKER_KPCR_OFFSET: u64 = 0x0004_3000;
 const FSD_IRQ_LANE_ARENA_OFFSET: u64 = 0x0004_3000;
 const FSD_IRQ_LANE_COMPONENT_SLOT: usize = 0;
 const FSD_WORKER_EXEC_ALIAS_BASE: u64 = 0x0000_0102_0000_0000;
@@ -5066,18 +5081,18 @@ extern "win64" fn s_vsnwprintf(dst: u64, count: usize, fmt: u64, va_list: u64) -
     unsafe { format_wide_driver(dst, count, fmt, &mut args) }
 }
 
-const DRIVER_REGISTRY_HANDLE_BASE: u64 = 0xFFFF_4400_0000_0000;
-const DRIVER_REGISTRY_HANDLE_TOKEN_MASK: u64 = 0x0000_00FF_FFFF_FFFF;
-static DRIVER_REGISTRY_HANDLE_NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 const HOSTED_INSTANCE_PATH_MAX: usize = 128;
 const HOSTED_DRIVER_KEY_NAME_MAX: usize = 128;
-const HOSTED_REGISTRY_PATH_MAX: usize = 384;
+pub(crate) const HOSTED_REGISTRY_PATH_MAX: usize = 384;
 const HOSTED_REGISTRY_VALUE_SCRATCH_MAX: usize = nt_config_abi::CM_RAW_VALUE_CHUNK_BYTES;
 const HOSTED_REGISTRY_ARG_KEY_LEN: u64 = 0;
 const HOSTED_REGISTRY_ARG_VALUE_LEN: u64 = 4;
 const HOSTED_REGISTRY_ARG_VALUE_TYPE: u64 = 8;
 const HOSTED_REGISTRY_ARG_DATA_LEN: u64 = 12;
-const HOSTED_REGISTRY_ARG_KEY_OFF: u64 = 16;
+const HOSTED_REGISTRY_ARG_DESIRED_ACCESS: u64 = 16;
+const HOSTED_REGISTRY_ARG_ATTRIBUTES: u64 = 20;
+const HOSTED_REGISTRY_ARG_SECURITY_LENGTH: u64 = 24;
+const HOSTED_REGISTRY_ARG_KEY_OFF: u64 = 32;
 const HOSTED_REGISTRY_ARG_VALUE_OFF: u64 =
     HOSTED_REGISTRY_ARG_KEY_OFF + HOSTED_REGISTRY_PATH_MAX as u64;
 const HOSTED_REGISTRY_ARG_DATA_OFF: u64 =
@@ -5097,6 +5112,8 @@ const HOSTED_REGISTRY_OP_APPEND_SET_HANDLE_VALUE: u64 = 10;
 const HOSTED_REGISTRY_OP_COMMIT_SET_HANDLE_VALUE: u64 = 11;
 const HOSTED_REGISTRY_OP_ABORT_SET_HANDLE_VALUE: u64 = 12;
 const HOSTED_REGISTRY_OP_DELETE_HANDLE_VALUE: u64 = 13;
+const HOSTED_REGISTRY_OP_PUBLISH_HANDLE: u64 = 14;
+const HOSTED_REGISTRY_OP_ABORT_PUBLICATION: u64 = 15;
 const REG_OPTION_VOLATILE: u32 = 0x0000_0001;
 const REG_CREATED_NEW_KEY: u32 = 1;
 const REG_OPENED_EXISTING_KEY: u32 = 2;
@@ -5138,13 +5155,13 @@ struct DriverObjectExtensionSlot {
 static mut DRIVER_OBJECT_EXTENSIONS: Option<Vec<DriverObjectExtensionSlot>> = None;
 
 #[derive(Clone, Copy)]
-struct HostedAscii<const N: usize> {
+pub(crate) struct HostedAscii<const N: usize> {
     bytes: [u8; N],
     len: usize,
 }
 
 impl<const N: usize> HostedAscii<N> {
-    const fn empty() -> Self {
+    pub(crate) const fn empty() -> Self {
         Self {
             bytes: [0; N],
             len: 0,
@@ -5164,7 +5181,7 @@ impl<const N: usize> HostedAscii<N> {
         true
     }
 
-    fn push_str(&mut self, src: &str) -> bool {
+    pub(crate) fn push_str(&mut self, src: &str) -> bool {
         let bytes = src.as_bytes();
         if self.len + bytes.len() > N {
             return false;
@@ -5212,7 +5229,7 @@ impl<const N: usize> HostedAscii<N> {
         &self.bytes[..self.len]
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         core::str::from_utf8(self.as_bytes()).unwrap_or("")
     }
 
@@ -5252,8 +5269,13 @@ impl HostedDriverRegistryIdentity {
 }
 
 #[derive(Clone, Copy)]
-enum DriverRegistryHandleTarget {
+pub(crate) enum DriverRegistryHandleTarget {
+    Hosted {
+        key: u32,
+        path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
+    },
     Generic {
+        key: u64,
         path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
     },
     System {
@@ -5263,9 +5285,10 @@ enum DriverRegistryHandleTarget {
 }
 
 impl DriverRegistryHandleTarget {
-    fn path(self) -> HostedAscii<HOSTED_REGISTRY_PATH_MAX> {
+    pub(crate) fn path(self) -> HostedAscii<HOSTED_REGISTRY_PATH_MAX> {
         match self {
-            Self::Generic { path } => path,
+            Self::Hosted { path, .. } => path,
+            Self::Generic { path, .. } => path,
             Self::System { physical_path, .. } => physical_path,
         }
     }
@@ -5311,24 +5334,11 @@ const EMPTY_HOSTED_REGISTRY_IDENTITY_SLOT: HostedRegistryIdentitySlot =
     };
 
 #[derive(Clone, Copy)]
-struct DriverRegistryHandleSlot {
-    handle: u64,
-    target: DriverRegistryHandleTarget,
+pub(crate) struct DriverRegistryHandleSlot {
+    pub(crate) handle: u64,
+    pub(crate) target: DriverRegistryHandleTarget,
 }
 
-struct HostedSystemRegistrySetTransfer {
-    token: u64,
-    handle: u64,
-    lease: nt_config_client::SystemHiveKeyLease,
-    physical_path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
-    name: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
-    value_type: u32,
-    upload: nt_config_client::SystemHiveValueUpload,
-}
-
-static mut HOSTED_SYSTEM_REGISTRY_SET_TRANSFERS: Option<Vec<HostedSystemRegistrySetTransfer>> =
-    None;
-static HOSTED_SYSTEM_REGISTRY_SET_NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static mut HOSTED_REGISTRY_IDENTITIES: Option<Vec<HostedRegistryIdentitySlot>> = None;
 static mut HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID: HostedRegistryIdentityId =
     INVALID_HOSTED_REGISTRY_IDENTITY_ID;
@@ -5749,31 +5759,6 @@ fn hosted_driver_key_cm_path(
     Some(path)
 }
 
-fn cm_registry_path_from_object_attributes(
-    root_slot: Option<&DriverRegistryHandleSlot>,
-    name: &HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
-) -> Option<HostedAscii<HOSTED_REGISTRY_PATH_MAX>> {
-    if name.starts_with_byte(b'\\') {
-        let mut path = HostedAscii::<HOSTED_REGISTRY_PATH_MAX>::empty();
-        return path.push_ascii(name).then_some(path);
-    }
-
-    let root = root_slot?;
-    let root_path = root.target.path();
-    if name.is_empty() {
-        return Some(root_path);
-    }
-
-    let mut path = HostedAscii::<HOSTED_REGISTRY_PATH_MAX>::empty();
-    if !path.push_ascii(&root_path) {
-        return None;
-    }
-    if !path.ends_with_byte(b'\\') && !path.push_byte(b'\\') {
-        return None;
-    }
-    path.push_ascii(name).then_some(path)
-}
-
 fn cm_registry_path_from_rtl_path(
     relative_to: u32,
     path: &HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
@@ -5973,6 +5958,83 @@ unsafe fn hosted_registry_broker_call(op: u64, a1: u64, a2: u64, a3: u64) -> (i3
     let (_label, status, out1, out2, _) =
         call_on4((FSD_SERVICE_REGISTRY_LABEL << 12) | 4, op, a1, a2, a3);
     (status as u32 as i32, out1, out2)
+}
+
+struct HostedRegistryDescriptorMemory;
+
+impl nt_security::ClientMemory for HostedRegistryDescriptorMemory {
+    fn read(&self, address: u64, output: &mut [u8]) -> bool {
+        if address == 0 || address.checked_add(output.len() as u64).is_none() {
+            return false;
+        }
+        // This runs in the calling driver's address space. Invalid kernel pointers take the
+        // provider's normal fault path; no executive dereferences a transmitted driver pointer.
+        unsafe { core::ptr::copy_nonoverlapping(address as *const u8, output.as_mut_ptr(), output.len()); }
+        true
+    }
+}
+
+unsafe fn stage_registry_open_metadata(desired_access: u32, attributes: u32, descriptor: u64) -> Result<(), i32> {
+    write_volatile((FSD_ARG_VADDR + HOSTED_REGISTRY_ARG_SECURITY_LENGTH) as *mut u32, 0);
+    let descriptor = if descriptor == 0 { Vec::new() } else {
+        nt_security::capture_security_descriptor_bytes(&HostedRegistryDescriptorMemory, descriptor)
+            .map_err(|status| status as i32)?
+    };
+    if descriptor.len() as u64 > HOSTED_REGISTRY_ARG_DATA_CAP {
+        return Err(STATUS_INVALID_BUFFER_SIZE as i32);
+    }
+    copy_bytes_unchecked(FSD_ARG_VADDR + HOSTED_REGISTRY_ARG_DATA_OFF, descriptor.as_ptr() as u64, descriptor.len() as u64);
+    write_volatile((FSD_ARG_VADDR + HOSTED_REGISTRY_ARG_DESIRED_ACCESS) as *mut u32, desired_access);
+    write_volatile((FSD_ARG_VADDR + HOSTED_REGISTRY_ARG_ATTRIBUTES) as *mut u32, attributes);
+    write_volatile((FSD_ARG_VADDR + HOSTED_REGISTRY_ARG_SECURITY_LENGTH) as *mut u32, descriptor.len() as u32);
+    Ok(())
+}
+
+unsafe fn stage_registry_object_attributes(desired_access: u32, attributes: u64) -> Result<(), i32> {
+    if attributes == 0 || read_unaligned(attributes as *const u32) != 48 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    stage_registry_open_metadata(desired_access,
+        read_unaligned((attributes + 24) as *const u32),
+        read_unaligned((attributes + 32) as *const u64))
+}
+
+
+unsafe fn capture_registry_open_metadata(arg: u64, dispatch: driver_registry_handles::RegistryPublicationDispatch) -> Result<DriverRegistryOpenMetadata, i32> {
+    let length = read_volatile((arg + HOSTED_REGISTRY_ARG_SECURITY_LENGTH) as *const u32) as usize;
+    if length as u64 > HOSTED_REGISTRY_ARG_DATA_CAP {
+        return Err(STATUS_INVALID_BUFFER_SIZE as i32);
+    }
+    let security_descriptor = if length == 0 { None } else {
+        let bytes = core::slice::from_raw_parts((arg + HOSTED_REGISTRY_ARG_DATA_OFF) as *const u8, length).to_vec();
+        nt_security::security_descriptor_bytes_for_access(&bytes).map_err(|status| status as i32)?;
+        Some(bytes)
+    };
+    Ok(DriverRegistryOpenMetadata {
+        dispatch,
+        root_handle: None,
+        desired_access: read_volatile((arg + HOSTED_REGISTRY_ARG_DESIRED_ACCESS) as *const u32),
+        attributes: read_volatile((arg + HOSTED_REGISTRY_ARG_ATTRIBUTES) as *const u32),
+        security_descriptor,
+    })
+}
+
+unsafe fn acknowledge_registry_handle_output(handle: u64) -> i32 {
+    let (info, raw, first, second, reserved) = call_on4_raw(
+        (FSD_SERVICE_REGISTRY_LABEL << 12) | 4, HOSTED_REGISTRY_OP_PUBLISH_HANDLE, handle, 0, 0);
+    if info != 4 || first != 0 || second != 0 || reserved != 0
+        || (raw != raw as u32 as u64 && raw != raw as u32 as i32 as i64 as u64)
+    {
+        // An uncertain ACK may already have published the table entry. Do not abort or replay it.
+        crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_REGISTRY_LABEL, HOSTED_REGISTRY_OP_PUBLISH_HANDLE, info, raw]);
+    }
+    let status = raw as u32 as i32;
+    if status != STATUS_SUCCESS {
+        // Publication refusal is a known failure; abort owns any CM cleanup retry. A provider
+        // fault before this point sends neither ACK nor abort and leaves the owner retained.
+        let _ = hosted_registry_broker_call(HOSTED_REGISTRY_OP_ABORT_PUBLICATION, handle, 0, 0);
+    }
+    status
 }
 
 unsafe fn hosted_device_claim_port_range(pdo: u64, start: u64, length: u64) -> i32 {
@@ -6983,132 +7045,32 @@ unsafe fn release_hosted_registry_identity(identity_id: HostedRegistryIdentityId
 }
 
 
-unsafe fn hosted_system_registry_set_transfers_mut(
-) -> &'static mut Vec<HostedSystemRegistrySetTransfer> {
-    let transfers = &mut *core::ptr::addr_of_mut!(HOSTED_SYSTEM_REGISTRY_SET_TRANSFERS);
-    if transfers.is_none() {
-        *transfers = Some(Vec::new());
-    }
-    transfers.as_mut().unwrap()
-}
-
-unsafe fn begin_hosted_system_registry_set(
-    handle: u64,
-    lease: nt_config_client::SystemHiveKeyLease,
-    physical_path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
-    name: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
-    value_type: u32,
-    total_len: usize,
-) -> Result<u64, i32> {
-    crate::config_manager_query_leased_system_hive_key_information(lease)?;
-    let upload = nt_config_client::SystemHiveValueUpload::new(total_len)?;
-    let token = HOSTED_SYSTEM_REGISTRY_SET_NEXT_TOKEN
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
-            (next != u64::MAX).then_some(next + 1)
-        })
-        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-    let transfers = hosted_system_registry_set_transfers_mut();
-    transfers
-        .try_reserve(1)
-        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-    transfers.push(HostedSystemRegistrySetTransfer {
-        token,
-        handle,
-        lease,
-        physical_path,
-        name,
-        value_type,
-        upload,
-    });
-    Ok(token)
-}
-
-unsafe fn validate_hosted_system_registry_set_target(
-    handle: u64,
-    lease: nt_config_client::SystemHiveKeyLease,
-) -> Result<u64, i32> {
-    let matches_target = driver_registry_handle_slot(handle).is_some_and(|slot| {
-        matches!(
-            slot.target,
-            DriverRegistryHandleTarget::System {
-                lease: live_lease,
-                ..
-            } if live_lease == lease
-        )
-    });
-    if !matches_target {
-        return Err(STATUS_INVALID_HANDLE);
-    }
-    crate::config_manager_query_leased_system_hive_key_information(lease)
-        .map(|information| information.mount_generation)
-}
-
-unsafe fn append_hosted_system_registry_set(
-    handle: u64,
-    token: u64,
-    total_len: usize,
-    offset: usize,
-    data: &[u8],
-) -> Result<(), i32> {
-    let lease = hosted_system_registry_set_transfers_mut()
-        .iter()
-        .find(|transfer| transfer.token == token && transfer.handle == handle)
-        .map(|transfer| transfer.lease)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-    validate_hosted_system_registry_set_target(handle, lease)?;
-    let transfer = hosted_system_registry_set_transfers_mut()
-        .iter_mut()
-        .find(|transfer| transfer.token == token && transfer.handle == handle)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-    if transfer.upload.expected_len() != total_len {
-        return Err(STATUS_INVALID_PARAMETER);
-    }
-    transfer.upload.append(offset, data)
-}
-
-unsafe fn take_hosted_system_registry_set(
-    handle: u64,
-    token: u64,
-    total_len: usize,
-) -> Result<HostedSystemRegistrySetTransfer, i32> {
-    let transfers = hosted_system_registry_set_transfers_mut();
-    let index = transfers
-        .iter()
-        .position(|transfer| {
-            transfer.token == token
-                && transfer.handle == handle
-                && transfer.upload.expected_len() == total_len
-        })
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-    Ok(transfers.swap_remove(index))
-}
-
-unsafe fn abort_hosted_system_registry_sets_for_handle(handle: u64) {
-    let Some(transfers) = (*core::ptr::addr_of_mut!(HOSTED_SYSTEM_REGISTRY_SET_TRANSFERS)).as_mut()
-    else {
-        return;
-    };
-    transfers.retain(|transfer| transfer.handle != handle);
-}
 
 /// `NTSTATUS IoOpenDeviceRegistryKey(PDEVICE_OBJECT, ULONG, ACCESS_MASK, PHANDLE)`.
 extern "win64" fn s_io_open_device_registry_key(
     pdo: u64,
     _dev_inst_key_type: u32,
-    _desired_access: u32,
+    desired_access: u32,
     handle_out: u64,
 ) -> i32 {
     if handle_out == 0 {
         return STATUS_INVALID_PARAMETER;
     }
     unsafe {
+        if let Err(status) = stage_registry_open_metadata(desired_access, nt_process::native_handle::OBJ_KERNEL_HANDLE | 0x40, 0) {
+            return status;
+        }
         let (status, handle, _) =
             hosted_registry_broker_call(HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY, pdo, 0, 0);
         write_unaligned(
             handle_out as *mut u64,
             if status == STATUS_SUCCESS { handle } else { 0 },
         );
-        status
+        if status == STATUS_SUCCESS {
+            let published = acknowledge_registry_handle_output(handle);
+            if published != STATUS_SUCCESS { write_unaligned(handle_out as *mut u64, 0); }
+            published
+        } else { status }
     }
 }
 
@@ -7883,7 +7845,7 @@ extern "win64" fn s_io_build_device_io_control_request(
         write_unaligned((irp + 0x48) as *mut u64, io_status_block);
         write_unaligned((irp + 0x50) as *mut u64, event);
         write_unaligned((irp + 0x70) as *mut u64, user_buffer);
-        write_unaligned((irp + 0xa8) as *mut u64, s_current_process());
+        write_unaligned((irp + 0xa8) as *mut u64, s_current_thread());
     }
     irp
 }
@@ -8592,7 +8554,7 @@ unsafe fn require_hosted_mdl_service(op: u64, mdl: u64, virtual_address: u64, le
             0x4D44_4C53,
             mdl,
             status as u32 as u64,
-            s_ps_get_current_thread_id(),
+            hosted_thread_correlation(),
         );
     }
 }
@@ -11833,7 +11795,7 @@ fn hosted_fast_mutex_failure(mutex: u64, status: i32) -> ! {
         0x4654_4D58,
         mutex,
         status as u32 as u64,
-        s_ps_get_current_thread_id(),
+        hosted_thread_correlation(),
     );
     loop {
         crate::yield_now();
@@ -11867,7 +11829,7 @@ extern "win64" fn s_ex_acquire_fast_mutex(mutex: u64) {
         hosted_fast_mutex_failure(mutex, STATUS_INVALID_PARAMETER);
     }
     let old_irql = unsafe { hosted_raise_irql(APC_LEVEL) };
-    let current_thread = s_ps_get_current_thread_id();
+    let current_thread = hosted_thread_correlation();
     if current_thread == 0 {
         unsafe { hosted_lower_irql(old_irql) };
         hosted_fast_mutex_failure(mutex, STATUS_INVALID_HANDLE);
@@ -11929,7 +11891,7 @@ extern "win64" fn s_ex_try_to_acquire_fast_mutex(mutex: u64) -> u8 {
         unsafe { hosted_lower_irql(old_irql) };
         return 0;
     }
-    let current_thread = s_ps_get_current_thread_id();
+    let current_thread = hosted_thread_correlation();
     if current_thread == 0 {
         count.store(1, Ordering::SeqCst);
         unsafe { hosted_lower_irql(old_irql) };
@@ -13881,15 +13843,25 @@ extern "win64" fn s_ob_set_security_object_by_pointer(
 
 /// `HANDLE PsGetCurrentProcessId()`.
 extern "win64" fn s_ps_get_current_process_id() -> u64 {
-    4
+    current_ps_value(2)
 }
 
-/// `HANDLE PsGetCurrentThreadId()` from the executive-owned hosted thread table.
+/// Public NT identifiers never expose scheduler-private hosted handles.
 extern "win64" fn s_ps_get_current_thread_id() -> u64 {
+    current_ps_value(1)
+}
+
+fn hosted_thread_correlation() -> u64 { current_ps_value(0) }
+
+fn current_ps_value(selector: u64) -> u64 {
     let (_label, status, thread_id, _, _) =
-        unsafe { call_on4(FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL << 12, 0, 0, 0, 0) };
+        unsafe { call_on4((FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL << 12) | 1, selector, 0, 0, 0) };
     if status as u32 as i32 == STATUS_SUCCESS {
         thread_id
+    } else if selector != 0 {
+        unsafe {
+            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL, selector, status, 0]);
+        }
     } else {
         0
     }
@@ -13897,7 +13869,7 @@ extern "win64" fn s_ps_get_current_thread_id() -> u64 {
 
 /// `PTEB PsGetCurrentThreadTeb()`.
 extern "win64" fn s_ps_get_current_thread_teb() -> u64 {
-    0
+    current_ps_value(5)
 }
 
 /// `NTSTATUS PsCreateSystemThread(...)`.
@@ -13952,14 +13924,33 @@ extern "win64" fn s_ps_terminate_system_thread(status: i32) {
     }
 }
 
-/// `PEPROCESS PsGetCurrentProcess()` / `PsGetCurrentThread()` — a fake non-null object pointer.
+/// Canonical published objects, mapped under the authenticated execution actor.
 extern "win64" fn s_current_process() -> u64 {
-    FSD_DATA_VADDR // a mapped, zeroed placeholder page
+    current_ps_value(4)
+}
+
+extern "win64" fn s_current_thread() -> u64 { current_ps_value(3) }
+
+extern "win64" fn s_io_thread_to_process(thread: u64) -> u64 {
+    unsafe { read_unaligned((thread + nt_kernel_abi::ps_reactos_x64::ETHREAD_THREADS_PROCESS as u64) as *const u64) }
+}
+
+/// Requestor identity belongs to the retained IRP thread, not the thread completing its I/O.
+extern "win64" fn s_io_get_requestor_process(irp: u64) -> u64 {
+    unsafe {
+        let thread = read_unaligned((irp + 0xa8) as *const u64);
+        if thread == 0 { return 0; }
+        match read_unaligned((irp + 0x46) as *const u8) {
+            0 => s_io_thread_to_process(thread),
+            1 => read_unaligned((thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_PROCESS as u64) as *const u64),
+            _ => 0,
+        }
+    }
 }
 
 /// `PVOID IoGetCurrentProcess()` — same as above.
 extern "win64" fn s_io_get_current_process() -> u64 {
-    FSD_DATA_VADDR
+    current_ps_value(4)
 }
 
 /// `NTSTATUS ZwClose(HANDLE)`.
@@ -14079,7 +14070,7 @@ unsafe fn write_rtl_direct_registry_value(value_type: u32, data: &[u8], entry_co
 /// `NTSTATUS ZwCreateKey(...)` against the executive Configuration Manager.
 extern "win64" fn s_zw_create_key(
     handle_out: u64,
-    _desired_access: u32,
+    desired_access: u32,
     object_attributes: u64,
     title_index: u32,
     class: u64,
@@ -14096,8 +14087,11 @@ extern "win64" fn s_zw_create_key(
         if handle_out == 0 || title_index != 0 || class != 0 {
             return STATUS_INVALID_PARAMETER;
         }
-        if create_options & !REG_OPTION_VOLATILE != 0 {
+        if create_options & !5 != 0 {
             return STATUS_NOT_SUPPORTED;
+        }
+        if let Err(status) = stage_registry_object_attributes(desired_access, object_attributes) {
+            return status;
         }
         let Some((root, name)) =
             object_attributes_root_and_name::<HOSTED_REGISTRY_PATH_MAX>(object_attributes)
@@ -14124,14 +14118,19 @@ extern "win64" fn s_zw_create_key(
         if disposition != 0 {
             write_unaligned(disposition as *mut u32, create_disposition as u32);
         }
+        let published = acknowledge_registry_handle_output(handle);
+        if published != STATUS_SUCCESS {
+            write_unaligned(handle_out as *mut u64, 0);
+            if disposition != 0 { write_unaligned(disposition as *mut u32, 0); }
+        }
+        published
     }
-    STATUS_SUCCESS
 }
 
 /// `NTSTATUS ZwOpenKey(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES)`.
 extern "win64" fn s_zw_open_key(
     handle_out: u64,
-    _desired_access: u32,
+    desired_access: u32,
     object_attributes: u64,
 ) -> i32 {
     if handle_out != 0 {
@@ -14143,6 +14142,9 @@ extern "win64" fn s_zw_open_key(
         return STATUS_INVALID_PARAMETER;
     }
     unsafe {
+        if let Err(status) = stage_registry_object_attributes(desired_access, object_attributes) {
+            return status;
+        }
         let Some((root, name)) =
             object_attributes_root_and_name::<HOSTED_REGISTRY_PATH_MAX>(object_attributes)
         else {
@@ -14161,8 +14163,10 @@ extern "win64" fn s_zw_open_key(
             return status;
         }
         write_unaligned(handle_out as *mut u64, handle);
+        let published = acknowledge_registry_handle_output(handle);
+        if published != STATUS_SUCCESS { write_unaligned(handle_out as *mut u64, 0); }
+        published
     }
-    STATUS_SUCCESS
 }
 
 /// `NTSTATUS ZwEnumerateKey(...)`.
@@ -28644,6 +28648,10 @@ unsafe fn service_hosted_provider_export_explicit(
     caller_rsp: u64,
     args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
 ) -> u64 {
+    let caller = match crate::provider_registry_caller::resolve(dependent_channel) {
+        Ok(caller) => caller,
+        Err(status) => return hosted_provider_export_failure(status as i32),
+    };
     service_hosted_provider_export_with_dispatch(
         dependent_channel,
         provider_export_rva,
@@ -28653,6 +28661,7 @@ unsafe fn service_hosted_provider_export_explicit(
         HostedProviderMarshalWindowSource::LEGACY_SHARED_BANK,
         |singleton, provider_inst, exec_code_va, marshalled_args, caller_rsp| {
             dispatch_hosted_provider_export_legacy(
+                caller,
                 singleton,
                 provider_inst,
                 exec_code_va,
@@ -28665,6 +28674,7 @@ unsafe fn service_hosted_provider_export_explicit(
 }
 
 unsafe fn dispatch_hosted_provider_export_legacy(
+    caller: nt_process::native_handle::NativeHandleCaller,
     singleton: HostedProviderSingleton,
     provider_inst: DriverInstance,
     exec_code_va: u64,
@@ -28733,7 +28743,7 @@ unsafe fn dispatch_hosted_provider_export_legacy(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = hosted_component_pump(&ch);
+    let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
     if pr.completed {
         return Ok(read_volatile((provider_shared + SH_REQ_INFO) as *const u64));
     }
@@ -29121,6 +29131,7 @@ unsafe fn dispatch_hosted_component_target(
     target: u64,
     args: [u64; 4],
     stack_args: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<u64, HostedComponentDispatchError> {
     let inst = instance(instance_index).unwrap_or(inst);
     let shared = inst.exec_shared_va;
@@ -29178,7 +29189,7 @@ unsafe fn dispatch_hosted_component_target(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = hosted_component_pump(&ch);
+    let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
     if !pr.completed {
         register_instance_ready(instance_index, false);
         return Err(HostedComponentDispatchError::Wall(pr));
@@ -29288,6 +29299,7 @@ unsafe fn trace_hosted_work_queue_capacity(
 unsafe fn drain_hosted_work_queue_for_instance(
     instance_index: usize,
     inst: DriverInstance,
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<u64, i32> {
     let shared = inst.exec_shared_va;
     let Some(exec_code_va) = ExecVaWindow::try_for_instance(instance_index).map(|win| win.code_va)
@@ -29346,6 +29358,7 @@ unsafe fn drain_hosted_work_queue_for_instance(
             routine,
             args,
             [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+            caller,
         ) {
             Ok(_) => {
                 if ndis_work_dispatch.is_some_and(|dispatch| {
@@ -29435,6 +29448,8 @@ unsafe fn drain_hosted_work_queues_at_passive_level() -> Result<u64, i32> {
     if instance_count == 0 {
         return Ok(0);
     }
+    // This sweep schedules executive work items, not continuations of their enqueueing threads.
+    let caller = crate::initial_system_driver_caller();
     let sweep_budget = instance_count.saturating_mul(4).max(1);
     let mut total = 0u64;
     let mut sweeps = 0usize;
@@ -29453,7 +29468,7 @@ unsafe fn drain_hosted_work_queues_at_passive_level() -> Result<u64, i32> {
             if head == tail && drops == 0 {
                 continue;
             }
-            let drained = drain_hosted_work_queue_for_instance(instance_index, inst)?;
+            let drained = drain_hosted_work_queue_for_instance(instance_index, inst, caller)?;
             sweep_drained = sweep_drained.saturating_add(drained);
             total = total.saturating_add(drained);
         }
@@ -30961,6 +30976,10 @@ unsafe fn service_hosted_provider_callback_explicit(
     callback_cookie: u64,
     args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
 ) -> u64 {
+    let caller = match crate::provider_registry_caller::resolve(provider_channel) {
+        Ok(caller) => caller,
+        Err(status) => return status as u64,
+    };
     let mut dispatch = |record: HostedProviderCallbackRecord,
                         dependent_inst: DriverInstance,
                         exec_code_va: u64,
@@ -30973,6 +30992,7 @@ unsafe fn service_hosted_provider_callback_explicit(
             record.target,
             args,
             stack_args,
+            caller,
         )
     };
     service_hosted_provider_callback_with_dispatch(
@@ -32439,7 +32459,7 @@ fn register_fsd_trampolines() -> bool {
     );
     reg.bind(
         "PsGetCurrentThread",
-        s_current_process as *const () as usize as u64,
+        s_current_thread as *const () as usize as u64,
     );
     reg.bind(
         "PsGetCurrentThreadTeb",
@@ -32455,15 +32475,15 @@ fn register_fsd_trampolines() -> bool {
     );
     reg.bind(
         "KeGetCurrentThread",
-        s_current_process as *const () as usize as u64,
+        s_current_thread as *const () as usize as u64,
     );
     reg.bind(
         "IoGetRequestorProcess",
-        s_current_process as *const () as usize as u64,
+        s_io_get_requestor_process as *const () as usize as u64,
     );
     reg.bind(
         "IoThreadToProcess",
-        s_current_process as *const () as usize as u64,
+        s_io_thread_to_process as *const () as usize as u64,
     );
     reg.bind(
         "IoGetCurrentProcess",
@@ -34595,7 +34615,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             flags: irp_flags,
             system_buffer,
             user_buffer,
-            thread: s_current_process(),
+            thread: s_current_thread(),
             auxiliary_buffer: if major as u8 == major::IRP_MJ_LOCK_CONTROL {
                 aux_data
             } else if matches!(
@@ -36241,6 +36261,7 @@ pub(crate) unsafe fn load_driver(
     path: &[u8],
     class: DriverClass,
     driver_object_path: &str,
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<DriverComponent, nt_status::NtStatus> {
     let (caps, _wants_device_caps) = caps_and_layout_for(class);
     if !caps.dispatch_server {
@@ -36259,7 +36280,7 @@ pub(crate) unsafe fn load_driver(
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     };
 
-    let loaded = load_driver_reserved(fs, path, driver_object_path, instance);
+    let loaded = load_driver_reserved(fs, path, driver_object_path, instance, caller);
     if loaded.is_err() {
         let _ = clear_instance(instance);
     }
@@ -36271,6 +36292,7 @@ unsafe fn load_driver_reserved(
     path: &[u8],
     driver_object_path: &str,
     instance: usize,
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<DriverComponent, nt_status::NtStatus> {
     let Some(win) = ExecVaWindow::try_for_instance(instance) else {
         print_str(b"[driver-launch] instance VA window exhausted inst=");
@@ -36694,7 +36716,7 @@ unsafe fn load_driver_reserved(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = hosted_component_pump(&ch);
+    let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
     crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(parent)
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
     let faults = pr.faults;
@@ -42282,6 +42304,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
         let input = Vec::from(&ctx.system_buffer[..input_len]);
         let result = hosted_file_dispatch::execute(
             self.instance,
+            None,
             irp,
             &input,
             &mut ctx.system_buffer[output_offset..output_end],
@@ -42314,6 +42337,8 @@ impl DriverDispatchBackend for HostedDriverBackend {
         ctx: DispatchContext<'_>,
         irp: &IrpProjection,
     ) -> PnpBackendDispatch {
+        // PnP dispatch is scheduled executive work, not an inferred IRP requestor identity.
+        let caller = unsafe { crate::initial_system_driver_caller() };
         if irp.major != major::IRP_MJ_PNP || irp.file_id.is_some() {
             return PnpBackendDispatch::NotDispatched {
                 status: nt_status::NtStatus::INVALID_PARAMETER,
@@ -42357,6 +42382,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
                         binding,
                         irp,
                         ctx.system_buffer,
+                        caller,
                     )
                 };
             }
@@ -42383,6 +42409,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
                 Some(request),
                 &input,
                 output,
+                Some(caller),
             )
         };
         match result {
@@ -42644,7 +42671,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
     major: u64,
     fsctl: u64,
     file_id: u64,
-    requestor_tid: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
     in_data: &[u8],
     out: &mut [u8],
     create: Option<CreateParameters>,
@@ -42675,12 +42702,13 @@ fn dispatch_external_irp_to_device_record_result_exact(
     )
     .ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let result = hosted_file_owners::dispatch(
+        caller,
         nt_io_manager::detached_file_irp::ExternalFileIrpRequest {
             client: ClientId(IO_MANAGER_COMPONENT_ID),
             device_id: nt_io_manager::DeviceId(device_id),
             file_id: canonical_file_id,
             user_data: file_id,
-            requestor_tid,
+            requestor_tid: u64::from(caller.original_thread().thread_id()),
             major,
             parameters: params,
             stack_flags,
@@ -52041,7 +52069,6 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
     if !hosted_file_retirements::instance_quiesced(i)
         || !hosted_file_owners::instance_quiesced(i)
         || !unsafe { hosted_add_device_rollback::instance_quiesced(i) }
-        || instance(i).is_some_and(|inst| ps_object_backing::references_provider_vspace(inst.pml4))
     {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
@@ -52349,6 +52376,11 @@ fn instance_domain_identity(inst: DriverInstance) -> Option<HostedDomainIdentity
     })
 }
 
+pub(crate) fn matches_ps_provider_root(domain: HostedDomainIdentity, pml4: u64) -> bool {
+    unsafe { driver_instances() }.is_some_and(|rows| rows.iter().any(|inst|
+        inst.used && inst.pml4 == pml4 && instance_domain_identity(*inst) == Some(domain)))
+}
+
 pub(crate) fn hosted_domain_identity_for_pml4(pml4: u64) -> Option<HostedDomainIdentity> {
     if pml4 == 0 {
         return None;
@@ -52500,6 +52532,29 @@ pub(crate) unsafe fn autonomous_pump_channel(
         caps: crate::spawn_hosts::HostCaps { kind: crate::spawn_hosts::ReqKind::Irp,
             ..crate::spawn_hosts::HostCaps::default() },
     })
+}
+
+/// Resolve only an enrolled autonomous worker, never the provider's main lane or its creator.
+pub(crate) unsafe fn autonomous_registry_caller(
+    channel: &crate::spawn_hosts::PumpChannel,
+) -> Result<Option<nt_process::native_handle::NativeHandleCaller>, u32> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let invalid = nt_process::STATUS_INVALID_HANDLE;
+    let route = runtime::channel_route(channel).map_err(|_| invalid)?.ok_or(invalid)?;
+    let source = runtime::physical_source(route).map_err(|_| invalid)?;
+    let runtime::PhysicalSourceKind::SystemThread { handle } = source.kind else {
+        return Ok(None);
+    };
+    let runtime::PhysicalDomain::Hosted(domain) = source.domain else { return Err(invalid); };
+    let worker = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES)).as_ref()
+        .and_then(|rows| rows.iter().find(|row| row.domain == domain && row.handle == handle
+            && row.ingress_route == Some(route) && row.tcb == source.tcb
+            && row.pml4 == source.pml4 && row.tcb == channel.tcb && row.pml4 == channel.pml4))
+        .copied().ok_or(invalid)?;
+    if hosted_ingress_sources::system_thread_route(worker.instance, handle) != Some(route) {
+        return Err(invalid);
+    }
+    hosted_thread_resources::registry_caller(worker).map(Some)
 }
 
 /// File projection services authenticate the physical address space, not a dependent driver's
@@ -53262,89 +53317,6 @@ unsafe fn hosted_registry_identity_by_pdo_object_at(
     }
 }
 
-unsafe fn service_hosted_driver_open_registry_path(
-    path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
-) -> (i32, u64, u64) {
-    match open_driver_registry_handle(path, true) {
-        Ok(slot) => (STATUS_SUCCESS, slot.handle, 0),
-        Err(status) => (status, 0, 0),
-    }
-}
-
-fn hosted_registry_path_is_system(path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>) -> bool {
-    let path = path.as_str();
-    path.eq_ignore_ascii_case(r"\Registry\Machine\System")
-        || ascii_prefix_eq_ignore_case(path, r"\Registry\Machine\System\")
-}
-
-unsafe fn service_hosted_driver_create_registry_path(
-    path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
-    volatile: bool,
-) -> (i32, u64, u64) {
-    if !hosted_registry_path_is_system(path) {
-        let created = match crate::config_manager_create_key_with_options(path.as_str(), volatile) {
-            Ok((_key, created)) => created,
-            Err(status) => return (status, 0, 0),
-        };
-        let (status, handle, _) = service_hosted_driver_open_registry_path(path);
-        return (
-            status,
-            handle,
-            if created {
-                REG_CREATED_NEW_KEY as u64
-            } else {
-                REG_OPENED_EXISTING_KEY as u64
-            },
-        );
-    }
-    if volatile {
-        return (STATUS_NOT_SUPPORTED, 0, 0);
-    }
-    let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-    let (status, handle, _) = service_hosted_driver_open_registry_path(path);
-    if status == STATUS_SUCCESS {
-        return (STATUS_SUCCESS, handle, REG_OPENED_EXISTING_KEY as u64);
-    }
-    if status != STATUS_OBJECT_NAME_NOT_FOUND {
-        return (status, 0, 0);
-    }
-    let resolved = match crate::config_manager_resolve_system_hive_path(path.as_str()) {
-        Ok(resolved) => resolved,
-        Err(status) => return (status, 0, 0),
-    };
-    if resolved.mount_generation != expected_generation {
-        return (0xC000_0059u32 as i32, 0, 0);
-    }
-    let Some(separator) = resolved.physical_path.rfind('\\') else {
-        return (STATUS_OBJECT_PATH_NOT_FOUND, 0, 0);
-    };
-    let parent = &resolved.physical_path[..separator];
-    let mut parent_path = HostedAscii::empty();
-    if !parent_path.push_str(parent) {
-        return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
-    }
-    let parent_owner = match open_driver_registry_handle(parent_path, false) {
-        Ok(opened) => opened,
-        Err(STATUS_OBJECT_NAME_NOT_FOUND) => return (STATUS_OBJECT_PATH_NOT_FOUND, 0, 0),
-        Err(status) => return (status, 0, 0),
-    };
-    if let Err(status) = retire_driver_registry_handle(parent_owner.handle) {
-        return (status, 0, 0);
-    }
-    if let Err(status) = crate::persist_and_publish_system_hive_mutation(expected_generation, &[
-        nt_config_client::SystemHiveMutation::CreateKey {
-            path: &resolved.physical_path,
-        },
-    ]) {
-        return (status as i32, 0, 0);
-    }
-    let mut physical_path = HostedAscii::<HOSTED_REGISTRY_PATH_MAX>::empty();
-    if !physical_path.push_str(&resolved.physical_path) {
-        return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
-    }
-    let (status, handle, _) = service_hosted_driver_open_registry_path(physical_path);
-    (status, handle, REG_CREATED_NEW_KEY as u64)
-}
 
 unsafe fn service_hosted_driver_query_registry_value(
     arg: u64,
@@ -53356,18 +53328,20 @@ unsafe fn service_hosted_driver_query_registry_value(
         HOSTED_REGISTRY_VALUE_SCRATCH_MAX,
     );
     let value = match target {
+        DriverRegistryHandleTarget::Hosted { key, .. } => {
+            match driver_registry_live_handler() {
+                Ok(handler) => handler.registry_value_with_result(key, value_name.as_str(), |ty, data| (ty, data.to_vec()))
+                    .map_err(|status| status as i32).and_then(|value| value.ok_or(STATUS_OBJECT_NAME_NOT_FOUND)),
+                Err(status) => Err(status),
+            }
+        }
         DriverRegistryHandleTarget::System { lease, .. } => {
             match crate::config_manager_query_leased_system_hive_value(lease, value_name.as_str()) {
                 Ok(value) => Ok((value.value_type, value.data)),
                 Err(status) => Err(status),
             }
         }
-        DriverRegistryHandleTarget::Generic { path } => {
-            match crate::config_manager_query_value_owned(path.as_str(), value_name.as_str()) {
-                Ok(value) => Ok(value),
-                Err(error) => Err(error.status),
-            }
-        }
+        target @ DriverRegistryHandleTarget::Generic { .. } => driver_registry_operations::query_value(target, value_name.as_str()),
     };
     match value {
         Ok((value_type, value)) if value.len() <= data.len() => {
@@ -53407,10 +53381,43 @@ pub(crate) fn service_hosted_driver_registry(
         return (STATUS_INVALID_PARAMETER, 0, 0);
     }
     unsafe {
+        let caller = match crate::provider_registry_caller::resolve(ch) {
+            Ok(caller) => caller,
+            Err(status) => return (status as i32, 0, 0),
+        };
+        let dispatch = match driver_registry_handles::RegistryPublicationDispatch::capture(ch) {
+            Ok(dispatch) => dispatch,
+            Err(status) => return (status as i32, 0, 0),
+        };
+        let subject = match crate::with_provider_security_managers(|pm, tokens| {
+            nt_user_host::registry_subject::RegistrySubject::capture(pm, tokens, caller)
+        }) {
+            Ok(subject) => DriverRegistrySubject(subject),
+            Err(status) => return (status as i32, 0, 0),
+        };
+        let mut metadata = if matches!(op, HOSTED_REGISTRY_OP_OPEN_RELATIVE_KEY | HOSTED_REGISTRY_OP_CREATE_RELATIVE_KEY | HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY) {
+            match capture_registry_open_metadata(arg, dispatch) {
+                Ok(metadata) if metadata.attributes & !0x6c2 == 0 => metadata,
+                Ok(_) => return (STATUS_INVALID_PARAMETER, 0, 0),
+                Err(status) => return (status, 0, 0),
+            }
+        } else { DriverRegistryOpenMetadata { dispatch, root_handle: None, desired_access: 1, attributes: 0, security_descriptor: None } };
         let staged_data_len = read_volatile((arg + HOSTED_REGISTRY_ARG_DATA_LEN) as *const u32);
         write_volatile((arg + HOSTED_REGISTRY_ARG_VALUE_TYPE) as *mut u32, 0);
         write_volatile((arg + HOSTED_REGISTRY_ARG_DATA_LEN) as *mut u32, 0);
         match op {
+            HOSTED_REGISTRY_OP_PUBLISH_HANDLE => {
+                match publish_driver_registry_handle(dispatch, caller, a1) {
+                    Ok(()) => (STATUS_SUCCESS, 0, 0),
+                    Err(status) => (status, 0, 0),
+                }
+            }
+            HOSTED_REGISTRY_OP_ABORT_PUBLICATION => {
+                match abort_driver_registry_publication(dispatch, caller, a1) {
+                    Ok(()) => (STATUS_SUCCESS, 0, 0),
+                    Err(status) => (status, 0, 0),
+                }
+            }
             HOSTED_REGISTRY_OP_OPEN_RELATIVE_KEY => {
                 let Some(name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
                     arg,
@@ -53420,22 +53427,14 @@ pub(crate) fn service_hosted_driver_registry(
                 ) else {
                     return (STATUS_INVALID_PARAMETER, 0, 0);
                 };
-                let root_slot = if a1 == 0 {
-                    None
-                } else {
-                    match driver_registry_handle_slot(a1) {
-                        Some(slot) => Some(slot),
-                        _ => return (STATUS_INVALID_HANDLE, 0, 0),
-                    }
-                };
-                let Some(path) = cm_registry_path_from_object_attributes(root_slot.as_ref(), &name)
-                else {
-                    return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
-                };
-                service_hosted_driver_open_registry_path(path)
+                if !name.starts_with_byte(b'\\') {
+                    if a1 == 0 { return (STATUS_OBJECT_PATH_NOT_FOUND, 0, 0); }
+                    metadata.root_handle = Some(a1);
+                }
+                service_hosted_driver_open_registry_path(caller, name, &metadata, &subject.0)
             }
             HOSTED_REGISTRY_OP_CREATE_RELATIVE_KEY => {
-                if a2 as u32 & !REG_OPTION_VOLATILE != 0 || a2 > u32::MAX as u64 {
+                if a2 as u32 & !5 != 0 || a2 > u32::MAX as u64 {
                     return (STATUS_INVALID_PARAMETER, 0, 0);
                 }
                 let Some(name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
@@ -53446,20 +53445,11 @@ pub(crate) fn service_hosted_driver_registry(
                 ) else {
                     return (STATUS_INVALID_PARAMETER, 0, 0);
                 };
-                let root_slot = if a1 == 0 {
-                    None
-                } else {
-                    match driver_registry_handle_slot(a1) {
-                        Some(slot) => Some(slot),
-                        _ => return (STATUS_INVALID_HANDLE, 0, 0),
-                    }
-                };
-                let Some(path) = cm_registry_path_from_object_attributes(root_slot.as_ref(), &name)
-                else {
-                    return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
-                };
-                let volatile = a2 as u32 & REG_OPTION_VOLATILE != 0;
-                service_hosted_driver_create_registry_path(path, volatile)
+                if !name.starts_with_byte(b'\\') {
+                    if a1 == 0 { return (STATUS_OBJECT_PATH_NOT_FOUND, 0, 0); }
+                    metadata.root_handle = Some(a1);
+                }
+                service_hosted_driver_create_registry_path(caller, name, a2 as u32, &metadata, &subject.0, None)
             }
             HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY => {
                 if !hosted_pdo_known_at(inst.exec_shared_va, a1) {
@@ -53476,16 +53466,13 @@ pub(crate) fn service_hosted_driver_registry(
                 let Some(path) = hosted_driver_key_cm_path(&identity) else {
                     return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
                 };
-                service_hosted_driver_open_registry_path(path)
+                service_hosted_driver_open_registry_path(caller, path, &metadata, &subject.0)
             }
             HOSTED_REGISTRY_OP_CLOSE => {
-                match close_driver_registry_handle(a1) {
-                    Ok(()) => (STATUS_SUCCESS, 0, 0),
-                    Err(status) => (status, 0, 0),
-                }
+                finish_driver_registry_close(ch, close_driver_registry_handle(caller, a1))
             }
             HOSTED_REGISTRY_OP_ENUMERATE_KEY => {
-                let Some(slot) = driver_registry_handle_slot(a1) else {
+                let Ok(slot) = driver_registry_handle_slot(caller, a1, 8) else {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 };
                 let data = core::slice::from_raw_parts_mut(
@@ -53493,6 +53480,18 @@ pub(crate) fn service_hosted_driver_registry(
                     HOSTED_REGISTRY_VALUE_SCRATCH_MAX,
                 );
                 let result = match slot.target {
+                    DriverRegistryHandleTarget::Hosted { key, .. } => {
+                        driver_registry_live_handler().and_then(|handler| {
+                            handler.registry_subkey_by_index(key, a2 as usize, false)
+                                .map_err(|status| status as i32)?
+                                .map(|entry| entry.name)
+                                .ok_or(0x8000_001au32 as i32)
+                        }).and_then(|name| {
+                            if name.len() > data.len() { Err(STATUS_BUFFER_TOO_SMALL) } else {
+                                data[..name.len()].copy_from_slice(name.as_bytes()); Ok(name.len())
+                            }
+                        })
+                    }
                     DriverRegistryHandleTarget::System { lease, .. } => {
                         crate::config_manager_enumerate_leased_system_hive_subkey(lease, a2 as u32)
                             .and_then(|subkey| {
@@ -53505,8 +53504,14 @@ pub(crate) fn service_hosted_driver_registry(
                                 }
                             })
                     }
-                    DriverRegistryHandleTarget::Generic { path } => {
-                        crate::config_manager_enumerate_key(path.as_str(), a2 as u32, data)
+                    DriverRegistryHandleTarget::Generic { key, .. } => {
+                        crate::config_manager_runtime_key_operation(key, nt_config_abi::runtime_key_op::ENUM_KEY, a2 as u32, "", 0, &[])
+                            .and_then(|(_, bytes)| driver_registry_operations::decode_name(&bytes))
+                            .and_then(|name| {
+                                if name.len() > data.len() { return Err(STATUS_BUFFER_TOO_SMALL); }
+                                data[..name.len()].copy_from_slice(name.as_bytes());
+                                Ok(name.len())
+                            })
                     }
                 };
                 match result {
@@ -53518,7 +53523,7 @@ pub(crate) fn service_hosted_driver_registry(
                 }
             }
             HOSTED_REGISTRY_OP_QUERY_HANDLE_VALUE => {
-                let Some(slot) = driver_registry_handle_slot(a1) else {
+                let Ok(slot) = driver_registry_handle_slot(caller, a1, 1) else {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 };
                 let Some(value_name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
@@ -53548,14 +53553,8 @@ pub(crate) fn service_hosted_driver_registry(
                 ) else {
                     return (STATUS_INVALID_PARAMETER, 0, 0);
                 };
-                if !hosted_registry_path_is_system(key_path) {
-                    return service_hosted_driver_query_registry_value(
-                        arg,
-                        DriverRegistryHandleTarget::Generic { path: key_path },
-                        value_name,
-                    );
-                }
-                let opened = match open_driver_registry_handle(key_path, false) {
+                let opened = match open_driver_registry_handle(dispatch, caller, key_path, None, 0,
+                    |target| authorize_driver_registry_open(&subject.0, &metadata, target)) {
                     Ok(opened) => opened,
                     Err(status) => return (status, 0, 0),
                 };
@@ -53564,7 +53563,7 @@ pub(crate) fn service_hosted_driver_registry(
                     opened.target,
                     value_name,
                 );
-                let close_status = retire_driver_registry_handle(opened.handle);
+                let close_status = retire_driver_registry_handle(dispatch, caller, opened.handle);
                 if result.0 == STATUS_SUCCESS {
                     if let Err(status) = close_status {
                         return (status, 0, 0);
@@ -53573,7 +53572,7 @@ pub(crate) fn service_hosted_driver_registry(
                 result
             }
             HOSTED_REGISTRY_OP_DELETE_HANDLE_VALUE => {
-                let Some(slot) = driver_registry_handle_slot(a1) else {
+                let Ok(slot) = driver_registry_handle_slot(caller, a1, 2) else {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 };
                 let Some(value_name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
@@ -53585,6 +53584,10 @@ pub(crate) fn service_hosted_driver_registry(
                     return (STATUS_INVALID_PARAMETER, 0, 0);
                 };
                 let result = match slot.target {
+                    DriverRegistryHandleTarget::Hosted { key, .. } => driver_registry_live_handler().and_then(|handler| {
+                        let status = handler.registry_target_delete_value(key, value_name.as_str());
+                        if status == 0 { Ok(()) } else { Err(status as i32) }
+                    }),
                     DriverRegistryHandleTarget::System {
                         lease,
                         physical_path,
@@ -53599,7 +53602,7 @@ pub(crate) fn service_hosted_driver_registry(
                             .map(|_| ())
                             .map_err(|status| status as i32)
                         }),
-                    DriverRegistryHandleTarget::Generic { .. } => Err(STATUS_NOT_SUPPORTED),
+                    target @ DriverRegistryHandleTarget::Generic { .. } => driver_registry_operations::delete_value(target, value_name.as_str()),
                 };
                 match result {
                     Ok(()) => (STATUS_SUCCESS, 0, 0),
@@ -53611,194 +53614,44 @@ pub(crate) fn service_hosted_driver_registry(
             | HOSTED_REGISTRY_OP_APPEND_SET_HANDLE_VALUE
             | HOSTED_REGISTRY_OP_COMMIT_SET_HANDLE_VALUE
             | HOSTED_REGISTRY_OP_ABORT_SET_HANDLE_VALUE => {
-                let Some(slot) = driver_registry_handle_slot(a1) else {
+                let Ok(slot) = driver_registry_handle_slot(caller, a1, 2) else {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 };
-                match op {
-                    HOSTED_REGISTRY_OP_SET_HANDLE_VALUE => {
-                        if a3 > HOSTED_REGISTRY_ARG_DATA_CAP {
-                            return (STATUS_INVALID_BUFFER_SIZE as i32, 0, 0);
+                let result = match op {
+                    HOSTED_REGISTRY_OP_SET_HANDLE_VALUE | HOSTED_REGISTRY_OP_BEGIN_SET_HANDLE_VALUE => {
+                        let Some(name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
+                            arg, HOSTED_REGISTRY_ARG_VALUE_LEN, HOSTED_REGISTRY_ARG_VALUE_OFF, true,
+                        ) else { return (STATUS_INVALID_PARAMETER, 0, 0); };
+                        if op == HOSTED_REGISTRY_OP_BEGIN_SET_HANDLE_VALUE {
+                            if a3 > u32::MAX as u64 { return (STATUS_INVALID_PARAMETER, 0, 0); }
+                            return match driver_registry_value_transfers::begin(caller, a1, slot.target,
+                                name.as_str(), a2 as u32, a3 as usize) {
+                                Ok(token) => (STATUS_SUCCESS, token, 0), Err(status) => (status, 0, 0),
+                            };
                         }
-                        let Some(value_name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
-                            arg,
-                            HOSTED_REGISTRY_ARG_VALUE_LEN,
-                            HOSTED_REGISTRY_ARG_VALUE_OFF,
-                            true,
-                        ) else {
-                            return (STATUS_INVALID_PARAMETER, 0, 0);
-                        };
-                        let data = core::slice::from_raw_parts(
-                            (arg + HOSTED_REGISTRY_ARG_DATA_OFF) as *const u8,
-                            a3 as usize,
-                        );
-                        let result = match slot.target {
-                            DriverRegistryHandleTarget::System {
-                                lease,
-                                physical_path,
-                            } => validate_hosted_system_registry_set_target(a1, lease).and_then(
-                                |expected_generation| {
-                                    crate::persist_and_publish_system_hive_mutation(expected_generation, &[
-                                        nt_config_client::SystemHiveMutation::SetValue {
-                                            path: physical_path.as_str(),
-                                            name: value_name.as_str(),
-                                            value_type: a2 as u32,
-                                            data,
-                                        },
-                                    ])
-                                    .map(|_| ())
-                                    .map_err(|status| status as i32)
-                                },
-                            ),
-                            DriverRegistryHandleTarget::Generic { path } => {
-                                crate::config_manager_set_value(
-                                    path.as_str(),
-                                    value_name.as_str(),
-                                    a2 as u32,
-                                    data,
-                                )
-                            }
-                        };
-                        match result {
-                            Ok(()) => (STATUS_SUCCESS, 0, 0),
-                            Err(status) => (status, 0, 0),
-                        }
-                    }
-                    HOSTED_REGISTRY_OP_BEGIN_SET_HANDLE_VALUE => {
-                        if a3 > u32::MAX as u64 {
-                            return (STATUS_INVALID_PARAMETER, 0, 0);
-                        }
-                        let Some(value_name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
-                            arg,
-                            HOSTED_REGISTRY_ARG_VALUE_LEN,
-                            HOSTED_REGISTRY_ARG_VALUE_OFF,
-                            true,
-                        ) else {
-                            return (STATUS_INVALID_PARAMETER, 0, 0);
-                        };
-                        let result = match slot.target {
-                            DriverRegistryHandleTarget::System {
-                                lease,
-                                physical_path,
-                            } => begin_hosted_system_registry_set(
-                                a1,
-                                lease,
-                                physical_path,
-                                value_name,
-                                a2 as u32,
-                                a3 as usize,
-                            ),
-                            DriverRegistryHandleTarget::Generic { path } => {
-                                crate::config_manager_begin_set_value_transfer(
-                                    path.as_str(),
-                                    value_name.as_str(),
-                                    a2 as u32,
-                                    a3 as usize,
-                                )
-                            }
-                        };
-                        match result {
-                            Ok(token) => (STATUS_SUCCESS, token, 0),
-                            Err(status) => (status, 0, 0),
-                        }
+                        if a3 > HOSTED_REGISTRY_ARG_DATA_CAP { return (STATUS_INVALID_BUFFER_SIZE as i32, 0, 0); }
+                        let data = core::slice::from_raw_parts((arg + HOSTED_REGISTRY_ARG_DATA_OFF) as *const u8, a3 as usize);
+                        driver_registry_operations::set_value(slot.target, name.as_str(), a2 as u32, data)
                     }
                     HOSTED_REGISTRY_OP_APPEND_SET_HANDLE_VALUE => {
-                        let total_len = (a3 >> 32) as u32 as usize;
-                        let value_offset = a3 as u32 as usize;
-                        let chunk_len = staged_data_len as usize;
-                        if a2 == 0
-                            || total_len == 0
-                            || chunk_len == 0
-                            || chunk_len > HOSTED_REGISTRY_VALUE_SCRATCH_MAX
-                            || value_offset
-                                .checked_add(chunk_len)
-                                .is_none_or(|end| end > total_len)
-                        {
+                        let total = (a3 >> 32) as u32 as usize;
+                        let offset = a3 as u32 as usize;
+                        let length = staged_data_len as usize;
+                        if length == 0 || length > HOSTED_REGISTRY_VALUE_SCRATCH_MAX {
                             return (STATUS_INVALID_PARAMETER, 0, 0);
                         }
-                        let data = core::slice::from_raw_parts(
-                            (arg + HOSTED_REGISTRY_ARG_DATA_OFF) as *const u8,
-                            chunk_len,
-                        );
-                        let result = match slot.target {
-                            DriverRegistryHandleTarget::System { .. } => {
-                                append_hosted_system_registry_set(
-                                    a1,
-                                    a2,
-                                    total_len,
-                                    value_offset,
-                                    data,
-                                )
-                            }
-                            DriverRegistryHandleTarget::Generic { .. } => {
-                                crate::config_manager_append_set_value_transfer(
-                                    a2,
-                                    value_offset,
-                                    total_len,
-                                    data,
-                                )
-                            }
-                        };
-                        match result {
-                            Ok(()) => (STATUS_SUCCESS, 0, 0),
-                            Err(status) => (status, 0, 0),
-                        }
+                        let data = core::slice::from_raw_parts((arg + HOSTED_REGISTRY_ARG_DATA_OFF) as *const u8, length);
+                        driver_registry_value_transfers::append(caller, a1, a2, total, offset, data)
                     }
                     HOSTED_REGISTRY_OP_COMMIT_SET_HANDLE_VALUE => {
-                        let result = match slot.target {
-                            DriverRegistryHandleTarget::System { .. } => {
-                                let transfer =
-                                    match take_hosted_system_registry_set(a1, a2, a3 as usize) {
-                                        Ok(transfer) => transfer,
-                                        Err(status) => return (status, 0, 0),
-                                    };
-                                let expected_generation = match validate_hosted_system_registry_set_target(
-                                    a1, transfer.lease,
-                                ) {
-                                    Ok(generation) => generation,
-                                    Err(status) => return (status, 0, 0),
-                                };
-                                match transfer.upload.complete_data() {
-                                    Ok(data) => {
-                                        crate::persist_and_publish_system_hive_mutation(
-                                            expected_generation,
-                                            &[nt_config_client::SystemHiveMutation::SetValue {
-                                                path: transfer.physical_path.as_str(),
-                                                name: transfer.name.as_str(),
-                                                value_type: transfer.value_type,
-                                                data,
-                                            }],
-                                        )
-                                        .map(|_| ())
-                                        .map_err(|status| status as i32)
-                                    }
-                                    Err(status) => Err(status),
-                                }
-                            }
-                            DriverRegistryHandleTarget::Generic { .. } => {
-                                crate::config_manager_commit_set_value_transfer(a2, a3 as usize)
-                            }
-                        };
-                        match result {
-                            Ok(()) => (STATUS_SUCCESS, 0, 0),
-                            Err(status) => (status, 0, 0),
-                        }
+                        driver_registry_value_transfers::commit(caller, a1, a2, a3 as usize)
                     }
                     HOSTED_REGISTRY_OP_ABORT_SET_HANDLE_VALUE => {
-                        let result = match slot.target {
-                            DriverRegistryHandleTarget::System { .. } => {
-                                take_hosted_system_registry_set(a1, a2, a3 as usize).map(|_| ())
-                            }
-                            DriverRegistryHandleTarget::Generic { .. } => {
-                                crate::config_manager_abort_set_value_transfer(a2, a3 as usize)
-                            }
-                        };
-                        match result {
-                            Ok(()) => (STATUS_SUCCESS, 0, 0),
-                            Err(status) => (status, 0, 0),
-                        }
+                        driver_registry_value_transfers::abort(caller, a1, a2, a3 as usize)
                     }
-                    _ => (STATUS_INVALID_PARAMETER, 0, 0),
-                }
+                    _ => Err(STATUS_INVALID_PARAMETER),
+                };
+                match result { Ok(()) => (STATUS_SUCCESS, 0, 0), Err(status) => (status, 0, 0) }
             }
             _ => (STATUS_INVALID_PARAMETER, 0, 0),
         }
@@ -53818,13 +53671,16 @@ unsafe fn spawn_hosted_driver_worker_thread(
     let ipcbuf_va = component_base.checked_add(FSD_WORKER_IPCBUF_OFFSET)?;
     let tramp_va = component_base.checked_add(FSD_WORKER_TRAMP_OFFSET)?;
     let scratch_va = component_base.checked_add(FSD_WORKER_SCRATCH_OFFSET)?;
+    let kpcr_va = component_base.checked_add(FSD_WORKER_KPCR_OFFSET)?;
     let exec_alias_slot = HOSTED_DRIVER_WORKER_ALIAS_NEXT.fetch_add(1, Ordering::Relaxed);
     let exec_base = hosted_worker_exec_base_for_alias(exec_alias_slot)?;
     let tramp_exec_va = exec_base.checked_add(FSD_WORKER_TRAMP_OFFSET)?;
     let scratch_exec_va = exec_base.checked_add(FSD_WORKER_SCRATCH_OFFSET)?;
+    let kpcr_exec_va = exec_base.checked_add(FSD_WORKER_KPCR_OFFSET)?;
 
     let domain = instance_domain_identity(inst)?;
     let construction = hosted_thread_resources::begin(instance, handle, domain, inst.pml4)?;
+    hosted_thread_resources::initialize_actor(construction, start_routine, start_context).ok()?;
     if !ensure_paging(stack_base, inst.pml4, domain) || !crate::ensure_executive_paging(exec_base) {
         return None;
     }
@@ -53853,6 +53709,16 @@ unsafe fn spawn_hosted_driver_worker_thread(
     hosted_thread_resources::mapping(construction, scratch_exec);
     if page_map_r(scratch_exec, scratch_exec_va, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 { return None; }
     core::ptr::write_bytes(scratch_exec_va as *mut u8, 0, 0x1000);
+
+    let kpcr = alloc_frame();
+    hosted_thread_resources::root(construction, kpcr);
+    let kpcr_exec = copy_cap(kpcr);
+    hosted_thread_resources::root(construction, kpcr_exec);
+    hosted_thread_resources::mapping(construction, kpcr);
+    if page_map_r(kpcr, kpcr_va, RW_NX, inst.pml4) != 0 { return None; }
+    hosted_thread_resources::mapping(construction, kpcr_exec);
+    if page_map_r(kpcr_exec, kpcr_exec_va, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 { return None; }
+    hosted_thread_resources::initialize_kpcr(construction, inst, kpcr_va, kpcr_exec_va).ok()?;
 
     let ipcbuf = alloc_frame();
     hosted_thread_resources::root(construction, ipcbuf);
@@ -53926,7 +53792,7 @@ unsafe fn spawn_hosted_driver_worker_thread(
     if tcb_retype != 0 || set_space != 0 || set_ipc != 0 || set_regs != 0 {
         return None;
     }
-    if tcb_set_gs_base_r(tcb, FSD_KPCR_VA) != 0 || tcb_set_priority_r(tcb, 100) != 0 { return None; }
+    if tcb_set_gs_base_r(tcb, kpcr_va) != 0 || tcb_set_priority_r(tcb, 100) != 0 { return None; }
     let sched_context = match attach_sched_context(tcb) {
         Ok(sc) => sc,
         Err(_) => return None,
@@ -54772,15 +54638,36 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
 
 pub(crate) fn service_hosted_driver_ps_get_current_thread_id(
     ch: &crate::spawn_hosts::PumpChannel,
+    selector: u64,
     caller_badge: u64,
     active_reply_cap: u64,
 ) -> (i32, u64) {
     let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         return (STATUS_INVALID_PARAMETER, 0);
     };
-    match hosted_driver_caller(instance, inst, caller_badge) {
-        Some(caller) => (STATUS_SUCCESS, caller.thread_handle),
-        None => (STATUS_INVALID_HANDLE, 0),
+    if selector == 0 {
+        return match hosted_driver_caller(instance, inst, caller_badge) {
+            Some(caller) => (STATUS_SUCCESS, caller.thread_handle),
+            None => (STATUS_INVALID_HANDLE, 0),
+        };
+    }
+    let result = unsafe { crate::provider_registry_caller::resolve(ch).and_then(|caller| {
+        if matches!(selector, 1 | 2 | 5) {
+            crate::service_sec_image::with_provider_process_manager(|pm| {
+                pm.validate_native_handle_caller(caller)?;
+                let thread = caller.original_thread();
+                Ok((u64::from(thread.process_id()), u64::from(thread.thread_id()), 0, 0,
+                    pm.thread(thread.thread_id()).ok_or(nt_process::STATUS_INVALID_HANDLE)?.teb_base))
+            })
+        } else { driver_ps_context::project(inst, caller) }
+    }) };
+    match result {
+        Ok((pid, tid, process, thread, teb)) => match selector {
+            1 => (STATUS_SUCCESS, tid), 2 => (STATUS_SUCCESS, pid),
+            3 => (STATUS_SUCCESS, thread), 4 => (STATUS_SUCCESS, process),
+            5 => (STATUS_SUCCESS, teb), _ => (STATUS_INVALID_PARAMETER, 0),
+        },
+        Err(status) => (status as i32, 0),
     }
 }
 
@@ -54856,6 +54743,7 @@ pub(crate) fn service_hosted_driver_ps_terminate_system_thread(
 unsafe fn dispatch_driver_unload_for_instance(
     index: usize,
     inst: DriverInstance,
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<(), nt_status::NtStatus> {
     if inst.driver_object == 0 || inst.driver_unload == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
@@ -54902,7 +54790,7 @@ unsafe fn dispatch_driver_unload_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = hosted_component_pump(&ch);
+    let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
     if !pr.completed {
         register_instance_ready(index, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
@@ -54917,6 +54805,7 @@ unsafe fn dispatch_device_projection_control_for_instance(
     pdo_object: u64,
     previous_device_head: u64,
     delete_pdo: bool,
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<u64, nt_status::NtStatus> {
     let inst = instance(index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     if inst.fault_ep == 0 || inst.pml4 == 0 || inst.reply_cap == 0 {
@@ -54962,7 +54851,7 @@ unsafe fn dispatch_device_projection_control_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = hosted_component_pump(&ch);
+    let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
     if !pr.completed {
         register_instance_ready(index, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
@@ -54973,6 +54862,7 @@ unsafe fn dispatch_device_projection_control_for_instance(
 
 unsafe fn create_hosted_pdo_projection(
     projection_instance: usize,
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<u64, nt_status::NtStatus> {
     let pdo_object = dispatch_device_projection_control_for_instance(
         projection_instance,
@@ -54981,6 +54871,7 @@ unsafe fn create_hosted_pdo_projection(
         0,
         0,
         false,
+        caller,
     )?;
     if pdo_object == 0 {
         Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
@@ -54995,6 +54886,7 @@ unsafe fn rollback_hosted_add_device_projection(
     pdo_object: u64,
     previous_device_head: u64,
     delete_pdo: bool,
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<(), nt_status::NtStatus> {
     dispatch_device_projection_control_for_instance(
         projection_instance,
@@ -55003,6 +54895,7 @@ unsafe fn rollback_hosted_add_device_projection(
         pdo_object,
         previous_device_head,
         delete_pdo,
+        caller,
     )
     .map(|_| ())
 }
@@ -55046,6 +54939,7 @@ unsafe fn dispatch_video_add_device_for_instance(
     inst: DriverInstance,
     object_number: u32,
     pdo_object: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<AddDeviceDispatchResult, nt_status::NtStatus> {
     if inst.driver_object == 0 || pdo_object == 0 || !hosted_instance_video_port_initialized(inst) {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
@@ -55097,7 +54991,7 @@ unsafe fn dispatch_video_add_device_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = hosted_component_pump(&ch);
+    let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
     if !pr.completed {
         register_instance_ready(index, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
@@ -55120,6 +55014,7 @@ unsafe fn dispatch_video_add_device_for_instance(
 unsafe fn dispatch_provider_add_device_for_instance(
     route: HostedProviderDispatchRoute,
     pdo_object: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<AddDeviceDispatchResult, nt_status::NtStatus> {
     if !route.add_device_ready() || pdo_object == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
@@ -55173,7 +55068,7 @@ unsafe fn dispatch_provider_add_device_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = hosted_component_pump(&ch);
+    let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
     if !pr.completed {
         register_instance_ready(route.provider_instance, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
@@ -55197,18 +55092,19 @@ unsafe fn dispatch_add_device_for_instance(
     index: usize,
     inst: DriverInstance,
     pdo_object: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<AddDeviceDispatchResult, nt_status::NtStatus> {
     if inst.driver_object == 0 || pdo_object == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     if let Some(route) = hosted_provider_dispatch_route_for_instance(index) {
-        return dispatch_provider_add_device_for_instance(route, pdo_object);
+        return dispatch_provider_add_device_for_instance(route, pdo_object, caller);
     }
     if inst.add_device == 0 {
         if hosted_instance_video_port_initialized(inst) {
             let number = allocate_hosted_video_object_number()
                 .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-            return dispatch_video_add_device_for_instance(index, inst, number, pdo_object);
+            return dispatch_video_add_device_for_instance(index, inst, number, pdo_object, caller);
         }
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
@@ -55256,7 +55152,7 @@ unsafe fn dispatch_add_device_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = hosted_component_pump(&ch);
+    let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
     if !pr.completed {
         register_instance_ready(index, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
@@ -55389,6 +55285,7 @@ unsafe fn call_add_device_for_existing_pdo(
     pdo_address: u32,
 ) -> Result<u64, nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
+    let caller = crate::initial_system_driver_caller();
     let pdo_device = nt_io_manager::DeviceId(pdo_device_id);
     let (index, inst) =
         instance_by_driver_id(driver_id).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
@@ -55448,7 +55345,7 @@ unsafe fn call_add_device_for_existing_pdo(
             pdo_object
         }
         None => {
-            let pdo_object = match create_hosted_pdo_projection(projection_instance) {
+            let pdo_object = match create_hosted_pdo_projection(projection_instance, caller) {
                 Ok(pdo) => pdo,
                 Err(status) => {
                     hosted_add_device_rollback::block(rollback.take().unwrap(), status);
@@ -55504,7 +55401,7 @@ unsafe fn call_add_device_for_existing_pdo(
             power_driver_object,
         );
         hosted_add_device_rollback::begin_dispatch(rollback.as_ref().unwrap());
-        let dispatch = dispatch_add_device_for_instance(index, inst, pdo_object);
+        let dispatch = dispatch_add_device_for_instance(index, inst, pdo_object, caller);
         let dispatch = match dispatch {
             Ok(dispatch) => dispatch,
             Err(status) => {
@@ -56729,6 +56626,7 @@ unsafe fn dispatch_video_pnp_irp_for_instance(
     binding: HostedDeviceBinding,
     irp: &IrpProjection,
     system_buffer: &[u8],
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> PnpBackendDispatch {
     let IoParameters::Pnp(parameters) = &irp.parameters else {
         return PnpBackendDispatch::NotDispatched {
@@ -56798,13 +56696,14 @@ unsafe fn dispatch_video_pnp_irp_for_instance(
         };
     }
 
-    dispatch_video_find_adapter_pnp_for_instance(index, inst, binding.device_id)
+    dispatch_video_find_adapter_pnp_for_instance(index, inst, binding.device_id, caller)
 }
 
 unsafe fn dispatch_video_find_adapter_pnp_for_instance(
     index: usize,
     inst: DriverInstance,
     device_id: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> PnpBackendDispatch {
     let sh = inst.exec_shared_va;
     if read_volatile((sh + SH_VIDEO_PORT_INITIALIZED) as *const u32) == 0 {
@@ -56902,7 +56801,7 @@ unsafe fn dispatch_video_find_adapter_pnp_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = hosted_component_pump(&ch);
+    let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
     if !pr.completed {
         register_instance_ready(index, false);
         return PnpBackendDispatch::Indeterminate {
@@ -57756,7 +57655,9 @@ pub(crate) unsafe fn unload_driver_by_name(
                 return Err(nt_status::NtStatus::DEVICE_BUSY);
             }
             io_manager_mut().request_driver_unload_records(DriverId(driver_id))?;
-            if let Err(status) = dispatch_driver_unload_for_instance(index, inst) {
+            // DriverUnload executes as executive System work, independently of the stop caller.
+            let caller = crate::initial_system_driver_caller();
+            if let Err(status) = dispatch_driver_unload_for_instance(index, inst, caller) {
                 register_instance_ready(index, false);
                 return Err(status);
             }
@@ -58044,6 +57945,7 @@ unsafe fn dispatch_irp_for_instance_exact(
     mut dispatch_request: Option<IrpDispatchRequest>,
     in_data: &[u8],
     out: &mut [u8],
+    caller: Option<nt_process::native_handle::NativeHandleCaller>,
 ) -> Option<HostedIrpTransportResult> {
     if in_data.len() > u32::MAX as usize || out.len() > u32::MAX as usize {
         return Some(HostedIrpTransportResult::NotDispatched {
@@ -58349,7 +58251,10 @@ unsafe fn dispatch_irp_for_instance_exact(
         print_u64(out.len() as u64);
         print_str(b"\n");
     }
-    let pr = hosted_component_pump(&ch);
+    let pr = match caller {
+        Some(caller) => component_scheduler::hosted_component_pump_with_caller(&ch, caller),
+        None => hosted_component_pump(&ch),
+    };
     drop(transfer_guard);
     drop(active_dispatch);
     if trace_dispatch {
@@ -58637,7 +58542,7 @@ pub(crate) unsafe fn dispatch_hosted_file_irp_result_exact(
     file_id: u64,
     major: u64,
     fsctl: u64,
-    requestor_tid: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
     in_data: &[u8],
     out: &mut [u8],
     initial_information: u64,
@@ -58655,7 +58560,7 @@ pub(crate) unsafe fn dispatch_hosted_file_irp_result_exact(
         major,
         fsctl,
         0,
-        requestor_tid,
+        caller,
         in_data,
         out,
         None,
@@ -58674,7 +58579,7 @@ pub(crate) unsafe fn dispatch_hosted_file_irp_result_exact(
 pub(crate) unsafe fn dispatch_hosted_file_read_write_irp_result_exact(
     file_id: u64,
     major: u8,
-    requestor_tid: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
     parameters: ReadWriteParameters,
     in_data: &[u8],
     out: &mut [u8],
@@ -58700,7 +58605,7 @@ pub(crate) unsafe fn dispatch_hosted_file_read_write_irp_result_exact(
         major as u64,
         0,
         0,
-        requestor_tid,
+        caller,
         in_data,
         out,
         None,
@@ -58719,7 +58624,7 @@ pub(crate) unsafe fn dispatch_hosted_file_read_write_irp_result_exact(
 /// The optional target File is validated and retained by the I/O Manager.
 pub(crate) unsafe fn dispatch_hosted_file_set_information_irp_result_exact(
     file_id: u64,
-    requestor_tid: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
     parameters: SetInformationParameters,
     in_data: &[u8],
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
@@ -58740,7 +58645,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_information_irp_result_exact(
         major::IRP_MJ_SET_INFORMATION as u64,
         parameters.info_class as u64,
         0,
-        requestor_tid,
+        caller,
         in_data,
         &mut output,
         None,
@@ -58759,7 +58664,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_information_irp_result_exact(
 /// the provider's result buffer.
 pub(crate) unsafe fn dispatch_hosted_file_query_ea_irp_result_exact(
     file_id: u64,
-    requestor_tid: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
     parameters: QueryEaParameters,
     stack_flags: StackFlags,
     ea_list: &[u8],
@@ -58784,7 +58689,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_ea_irp_result_exact(
         major::IRP_MJ_QUERY_EA as u64,
         0,
         0,
-        requestor_tid,
+        caller,
         ea_list,
         out,
         None,
@@ -58802,7 +58707,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_ea_irp_result_exact(
 /// Dispatch a validated EA update through the canonical provider File.
 pub(crate) unsafe fn dispatch_hosted_file_set_ea_irp_result_exact(
     file_id: u64,
-    requestor_tid: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
     input: &[u8],
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
     if input.len() > u32::MAX as usize {
@@ -58822,7 +58727,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_ea_irp_result_exact(
         major::IRP_MJ_SET_EA as u64,
         0,
         0,
-        requestor_tid,
+        caller,
         input,
         &mut output,
         None,
@@ -58841,7 +58746,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_ea_irp_result_exact(
 /// kept separate from the driver's output buffer.
 pub(crate) unsafe fn dispatch_hosted_file_query_quota_irp_result_exact(
     file_id: u64,
-    requestor_tid: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
     parameters: QueryQuotaParameters,
     stack_flags: StackFlags,
     auxiliary: &[u8],
@@ -58866,7 +58771,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_quota_irp_result_exact(
         major::IRP_MJ_QUERY_QUOTA as u64,
         0,
         0,
-        requestor_tid,
+        caller,
         auxiliary,
         out,
         None,
@@ -58884,7 +58789,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_quota_irp_result_exact(
 /// Dispatch a validated quota update through the canonical provider File.
 pub(crate) unsafe fn dispatch_hosted_file_set_quota_irp_result_exact(
     file_id: u64,
-    requestor_tid: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
     input: &[u8],
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
     if input.is_empty() || input.len() > u32::MAX as usize {
@@ -58904,7 +58809,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_quota_irp_result_exact(
         major::IRP_MJ_SET_QUOTA as u64,
         0,
         0,
-        requestor_tid,
+        caller,
         input,
         &mut output,
         None,
@@ -58922,7 +58827,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_quota_irp_result_exact(
 /// Dispatch a query-volume IRP through the canonical provider File.
 pub(crate) unsafe fn dispatch_hosted_file_query_volume_information_irp_result_exact(
     file_id: u64,
-    requestor_tid: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
     parameters: QueryVolumeInformationParameters,
     out: &mut [u8],
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
@@ -58943,7 +58848,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_volume_information_irp_result_ex
         major::IRP_MJ_QUERY_VOLUME_INFORMATION as u64,
         parameters.information_class as u64,
         0,
-        requestor_tid,
+        caller,
         &mut input,
         out,
         None,
@@ -58964,7 +58869,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_volume_information_irp_result_ex
 /// Dispatch a set-volume IRP through the canonical provider File.
 pub(crate) unsafe fn dispatch_hosted_file_set_volume_information_irp_result_exact(
     file_id: u64,
-    requestor_tid: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
     parameters: SetVolumeInformationParameters,
     input: &[u8],
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
@@ -58985,7 +58890,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_volume_information_irp_result_exac
         major::IRP_MJ_SET_VOLUME_INFORMATION as u64,
         parameters.information_class as u64,
         0,
-        requestor_tid,
+        caller,
         input,
         &mut output,
         None,
@@ -59007,7 +58912,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_volume_information_irp_result_exac
 /// retained by the I/O Manager when the FSD pends the request.
 pub(crate) unsafe fn dispatch_hosted_file_notify_directory_irp_result_exact(
     file_id: u64,
-    requestor_tid: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
     parameters: nt_io_manager::DirectoryNotifyParameters,
     stack_flags: StackFlags,
     out: &mut [u8],
@@ -59032,7 +58937,7 @@ pub(crate) unsafe fn dispatch_hosted_file_notify_directory_irp_result_exact(
         major::IRP_MJ_DIRECTORY_CONTROL as u64,
         parameters.completion_filter as u64,
         0,
-        requestor_tid,
+        caller,
         &mut input,
         out,
         None,
@@ -59050,7 +58955,7 @@ pub(crate) unsafe fn dispatch_hosted_file_notify_directory_irp_result_exact(
 /// Dispatch a typed byte-range lock operation through the canonical provider File.
 pub(crate) unsafe fn dispatch_hosted_file_lock_control_irp_result_exact(
     file_id: u64,
-    requestor_tid: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
     parameters: LockControlParameters,
     stack_flags: StackFlags,
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
@@ -59079,7 +58984,7 @@ pub(crate) unsafe fn dispatch_hosted_file_lock_control_irp_result_exact(
         major::IRP_MJ_LOCK_CONTROL as u64,
         0,
         0,
-        requestor_tid,
+        caller,
         &mut input,
         &mut output,
         None,
@@ -59100,7 +59005,7 @@ pub(crate) unsafe fn dispatch_hosted_file_lock_control_irp_result_exact(
 pub(crate) unsafe fn dispatch_hosted_file_create_irp_result_exact(
     file_id: u64,
     major: u8,
-    requestor_tid: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
     parameters: CreateParameters,
     in_data: &[u8],
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
@@ -59125,7 +59030,7 @@ pub(crate) unsafe fn dispatch_hosted_file_create_irp_result_exact(
         major as u64,
         0,
         0,
-        requestor_tid,
+        caller,
         in_data,
         &mut [],
         Some(parameters),
@@ -59145,7 +59050,7 @@ pub(crate) unsafe fn dispatch_hosted_file_create_irp_result_exact(
 /// directive crossing the driver boundary.
 pub(crate) unsafe fn dispatch_hosted_target_directory_create_irp_result_exact(
     file_id: u64,
-    requestor_tid: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
     parameters: CreateParameters,
     in_data: &[u8],
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
@@ -59169,7 +59074,7 @@ pub(crate) unsafe fn dispatch_hosted_target_directory_create_irp_result_exact(
         major::IRP_MJ_CREATE as u64,
         0,
         0,
-        requestor_tid,
+        caller,
         in_data,
         &mut output,
         Some(parameters),
@@ -59272,8 +59177,9 @@ pub(crate) unsafe fn npfs_dispatch_irp(
     file_id: u64,
     in_data: &[u8],
     out: &mut [u8],
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Option<(i32, u64)> {
-    dispatch_hosted_file_irp_result_exact(file_id, major, fsctl, 0, in_data, out, 0)
+    dispatch_hosted_file_irp_result_exact(file_id, major, fsctl, caller, in_data, out, 0)
         .ok()
         .map(|(status, information, _, _)| (status, information))
 }
@@ -59284,8 +59190,9 @@ pub(crate) unsafe fn npfs_dispatch_irp_exact(
     file_id: u64,
     in_data: &[u8],
     out: &mut [u8],
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Option<(i32, u64, u64)> {
-    dispatch_hosted_file_irp_result_exact(file_id, major, fsctl, 0, in_data, out, 0)
+    dispatch_hosted_file_irp_result_exact(file_id, major, fsctl, caller, in_data, out, 0)
         .ok()
         .map(|(status, information, irp_id, _)| {
             (
