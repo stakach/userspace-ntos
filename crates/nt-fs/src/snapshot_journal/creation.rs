@@ -15,6 +15,29 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
         journal: Vec<u8>,
         context: C,
     ) -> Result<Self, SnapshotJournalOpenError<C>> {
+        Self::create_storage(
+            StorageOwner::Borrowed(fs),
+            StorageOwner::Borrowed(dev),
+            store,
+            path,
+            journal,
+            context,
+        )
+        .map_err(|error| SnapshotJournalOpenError {
+            status: error.status,
+            journal: error.journal,
+            context: error.context,
+        })
+    }
+
+    pub(super) fn create_storage(
+        fs: StorageOwner<'a, FileSystem>,
+        dev: StorageOwner<'a, D>,
+        store: SnapshotBlockStore,
+        path: &str,
+        journal: Vec<u8>,
+        context: C,
+    ) -> Result<Self, StorageAdmissionError<'a, D, C>> {
         let admit = (|| {
             if journal.is_empty() {
                 return Err(STATUS_INVALID_PARAMETER);
@@ -31,8 +54,10 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
             Ok(owned)
         })();
         match admit {
-            Err(status) => Err(SnapshotJournalOpenError {
+            Err(status) => Err(StorageAdmissionError {
                 status,
+                fs,
+                dev,
                 journal,
                 context,
             }),
@@ -127,7 +152,7 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
             Err(status) => return Err(SnapshotJournalError::File(status)),
         }
         self.fs
-            .commit_volume_snapshot(&self.store, self.dev)
+            .commit_volume_snapshot(&self.store, &mut *self.dev)
             .map_err(SnapshotJournalError::Snapshot)?;
         self.phase = RolledBack;
         Ok(())
