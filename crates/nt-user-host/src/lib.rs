@@ -41,6 +41,8 @@ pub mod provider_subject;
 pub mod ps_bootstrap;
 pub mod registry_bootstrap;
 pub mod registry_subject;
+pub mod provider_registry_callers;
+pub mod provider_dispatch_clients;
 mod services;
 pub mod sched_context;
 pub mod slot_recycle;

@@ -144,6 +144,33 @@ impl RegistryKeyHandlePublication {
         }
     }
 
+    /// Install a security decision while the retained target is still invisible. Binding zero
+    /// rights before a CM access check keeps shared targets alive across reentrant provider IPC.
+    /// This is not an access check; only the native policy owner may supply the authorized grant.
+    pub fn authorize_bound_grant(
+        &mut self,
+        pm: &mut ProcessManager,
+        granted_access: u32,
+    ) -> Result<(), u32> {
+        let key = self.validate_bound(pm)?;
+        admit_owner(pm, self.reservation.process_id)?;
+        let slot = crate::handle_to_slot(self.reservation.handle).ok_or(STATUS_INVALID_HANDLE)?;
+        let HandleSlot::Bound { entry, .. } = &mut pm
+            .processes
+            .get_mut(&self.reservation.process_id)
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .handles[slot]
+        else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        entry.granted_access = granted_access;
+        self.phase = Phase::Bound {
+            key,
+            granted_access,
+        };
+        Ok(())
+    }
+
     /// Publish only after successful output delivery. Failed admission retains the bound target.
     pub fn publish(&mut self, pm: &mut ProcessManager) -> Result<u64, u32> {
         self.validate_bound(pm)?;

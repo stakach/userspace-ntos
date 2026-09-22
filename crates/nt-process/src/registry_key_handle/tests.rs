@@ -7,6 +7,26 @@ fn fixture() -> (ProcessManager, ProcessId) {
 }
 
 #[test]
+fn registry_mount_selector_retains_invisible_and_visible_keys() {
+    let (mut pm, pid) = fixture();
+    let selector = 0x3000_0000;
+    let mask = 0xf000_0000;
+    let mut transaction = pm.reserve_registry_key_handle(pid).unwrap();
+    assert!(!pm.has_registry_key_selector_references(selector, mask));
+    transaction.bind(&mut pm, selector | 0x1234, 1).unwrap();
+    assert!(pm.has_registry_key_selector_references(selector, mask));
+    assert!(!pm.has_registry_key_selector_references(0x5000_0000, mask));
+    transaction.abort(&mut pm).unwrap();
+    assert!(!pm.has_registry_key_selector_references(selector, mask));
+    let mut transaction = pm.reserve_registry_key_handle(pid).unwrap();
+    transaction.bind(&mut pm, selector | 0x5678, 1).unwrap();
+    let handle = transaction.publish(&mut pm).unwrap();
+    assert!(pm.has_registry_key_selector_references(selector, mask));
+    pm.close_handle(pid, handle as crate::Handle).unwrap();
+    assert!(!pm.has_registry_key_selector_references(selector, mask));
+}
+
+#[test]
 fn key_remains_invisible_until_exact_publication() {
     let (mut pm, pid) = fixture();
     let mut transaction = pm.reserve_registry_key_handle(pid).unwrap();
@@ -209,4 +229,28 @@ fn manager_move_preserves_publication_authority() {
         transaction.publish(&mut moved_again),
         Ok(transaction.value())
     );
+}
+
+#[test]
+fn authorization_updates_only_an_invisible_exact_bound_target() {
+    let (mut pm, pid) = fixture();
+    let mut publication = pm.reserve_registry_key_handle(pid).unwrap();
+    assert_eq!(
+        publication.authorize_bound_grant(&mut pm, 7),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    publication.bind(&mut pm, 17, 0).unwrap();
+    publication.authorize_bound_grant(&mut pm, 3).unwrap();
+    assert_eq!(pm.lookup_handle(pid, publication.value() as u32), None);
+    assert_eq!(
+        pm.handle_object_reference_count(HandleObject::RegistryKey(17)),
+        1
+    );
+    publication.publish(&mut pm).unwrap();
+    assert_eq!(pm.handle_access(pid, publication.value() as u32), Some(3));
+    assert_eq!(
+        publication.authorize_bound_grant(&mut pm, 7),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(pm.handle_access(pid, publication.value() as u32), Some(3));
 }
