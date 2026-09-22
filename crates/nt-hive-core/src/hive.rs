@@ -54,6 +54,7 @@ pub(crate) struct KeyCell {
     pub class_name: Option<String>,
     pub security_descriptor: Option<Vec<u8>>,
     pub last_write_sequence: u64,
+    pub volatile: bool,
 }
 
 #[derive(Clone)]
@@ -383,7 +384,7 @@ fn compose_hive_overlay_inner(
             {
                 return Err(HiveOverlayError::InvalidSource);
             }
-            children.push((*child_id, child.name.clone()));
+            children.push((*child_id, child.name.clone(), child.volatile));
         }
 
         if let Some(destination_id) = destination_id {
@@ -403,7 +404,7 @@ fn compose_hive_overlay_inner(
                 }
             }
         }
-        for (child_id, name) in children.into_iter().rev() {
+        for (child_id, name, volatile) in children.into_iter().rev() {
             let destination_child = match destination_id {
                 Some(destination_id) if source_id == overlay.root() => {
                     if system_control_set_remap.is_some() && name.eq_ignore_ascii_case("Select") {
@@ -415,10 +416,10 @@ fn compose_hive_overlay_inner(
                             }
                             _ => name.as_str(),
                         };
-                        Some(composed.create_subkey(destination_id, destination_name))
+                        Some(composed.create_subkey_in_storage(destination_id, destination_name, volatile || composed.is_volatile(destination_id)))
                     }
                 }
-                Some(destination_id) => Some(composed.create_subkey(destination_id, &name)),
+                Some(destination_id) => Some(composed.create_subkey_in_storage(destination_id, &name, volatile || composed.is_volatile(destination_id))),
                 None => None,
             };
             pending.push((child_id, destination_child));
@@ -589,6 +590,7 @@ impl Hive {
             class_name: None,
             security_descriptor: None,
             last_write_sequence: self.sequence,
+            volatile: parent.is_some_and(|parent| self.is_volatile(parent)),
         }));
         id
     }
@@ -696,13 +698,18 @@ impl Hive {
 
     /// Open or create an immediate subkey.
     pub fn create_subkey(&mut self, parent: CellId, name: &str) -> CellId {
+        self.create_subkey_in_storage(parent, name, self.is_volatile(parent))
+    }
+
+    fn create_subkey_in_storage(&mut self, parent: CellId, name: &str, volatile: bool) -> CellId {
         if let Some(id) = self.open_subkey(parent, name) {
             return id;
         }
-        self.sequence += 1;
+        if !volatile { self.sequence += 1; }
         let id = self.alloc_key(Some(parent), name);
+        self.key_mut(id).unwrap().volatile = volatile;
         self.key_mut(parent).unwrap().subkeys.push(id);
-        self.mark_dirty(parent);
+        if !volatile { self.mark_dirty(parent); }
         self.mark_dirty(id);
         id
     }
@@ -720,7 +727,7 @@ impl Hive {
         if self.key(key).is_none() {
             return false;
         }
-        self.sequence += 1;
+        if !self.is_volatile(key) { self.sequence += 1; }
         let seq = self.sequence;
         let Some(cell) = self.key_mut(key) else {
             return false;
@@ -739,7 +746,7 @@ impl Hive {
         if self.key(key).is_none() {
             return false;
         }
-        self.sequence += 1;
+        if !self.is_volatile(key) { self.sequence += 1; }
         let seq = self.sequence;
         let Some(cell) = self.key_mut(key) else {
             return false;
@@ -754,7 +761,12 @@ impl Hive {
         self.key(key)?.security_descriptor.as_deref()
     }
 
+    pub fn is_volatile(&self, key: CellId) -> bool {
+        self.key(key).is_some_and(|cell| cell.volatile)
+    }
+
     fn mark_dirty(&mut self, id: CellId) {
+        if self.is_volatile(id) || self.value(id).is_some_and(|value| self.is_volatile(value.parent_key)) { return; }
         let seq = self.sequence;
         match self
             .cells
@@ -770,8 +782,8 @@ impl Hive {
         self.cells
             .iter()
             .filter(|cell| match cell {
-                Some(Cell::Key(key)) => key.last_write_sequence > self.clean_sequence,
-                Some(Cell::Value(value)) => value.last_write_sequence > self.clean_sequence,
+                Some(Cell::Key(key)) => !key.volatile && key.last_write_sequence > self.clean_sequence,
+                Some(Cell::Value(value)) => !self.is_volatile(value.parent_key) && value.last_write_sequence > self.clean_sequence,
                 None => false,
             })
             .count()
@@ -822,7 +834,7 @@ impl Hive {
             return false;
         }
         let data_blob = self.intern_value_data(data);
-        self.sequence += 1;
+        if !self.is_volatile(key) { self.sequence += 1; }
         let seq = self.sequence;
         // Existing value?
         let existing = self.value_id_by_name(key, name);
@@ -874,7 +886,7 @@ impl Hive {
         let Some(source_blob) = self.value(source).map(|source| source.data_blob) else {
             return false;
         };
-        self.sequence += 1;
+        if !self.is_volatile(key) { self.sequence += 1; }
         let seq = self.sequence;
         if let Some(vid) = self.value_id_by_name(key, name) {
             let Some(Cell::Value(value)) = self
@@ -917,7 +929,7 @@ impl Hive {
             return false;
         }
         let data_blob = self.intern_value_blob_handle(data);
-        self.sequence += 1;
+        if !self.is_volatile(key) { self.sequence += 1; }
         let seq = self.sequence;
         if let Some(vid) = self.value_id_by_name(key, name) {
             let Some(Cell::Value(value)) = self
@@ -963,7 +975,7 @@ impl Hive {
         }) else {
             return false;
         };
-        self.sequence += 1;
+        if !self.is_volatile(key) { self.sequence += 1; }
         let seq = self.sequence;
         let Some(parent) = self.key_mut(key) else {
             return false;
@@ -995,12 +1007,15 @@ impl Hive {
             }
             (cell.parent.unwrap(), cell.values.clone())
         };
-        self.sequence += 1;
+        let volatile = self.is_volatile(key);
+        if !volatile { self.sequence += 1; }
         let seq = self.sequence;
         if let Some(parent) = self.key_mut(parent_id) {
             parent.subkeys.retain(|child| *child != key);
-            parent.last_write_sequence = seq;
-            self.mark_dirty(parent_id);
+            if !volatile {
+                parent.last_write_sequence = seq;
+                self.mark_dirty(parent_id);
+            }
         } else {
             return Err(DeleteKeyError::NotFound);
         }
@@ -1138,16 +1153,16 @@ impl Hive {
         Some(path)
     }
 
-    /// Iterate `(cell_id, parent, name, class, seq)` for every key cell (image encode).
+    /// Durable image cells; volatile descendants stay exclusively in the live arena.
     pub(crate) fn key_cells(&self) -> impl Iterator<Item = &KeyCell> {
         self.cells.iter().filter_map(|c| match c {
-            Some(Cell::Key(k)) => Some(k),
+            Some(Cell::Key(k)) if !k.volatile => Some(k),
             _ => None,
         })
     }
     pub(crate) fn value_cells(&self) -> impl Iterator<Item = &ValueCell> {
         self.cells.iter().filter_map(|c| match c {
-            Some(Cell::Value(v)) => Some(v),
+            Some(Cell::Value(v)) if !self.is_volatile(v.parent_key) => Some(v),
             _ => None,
         })
     }

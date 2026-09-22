@@ -135,6 +135,7 @@ pub(super) fn owns_root_cap(cap: u64) -> bool {
     if cap == 0 {
         return false;
     }
+    if driver_launch::ps_pool_alias_owns_cap(cap) { return true; }
     let Ok(_borrow) = Borrow::acquire() else {
         return true;
     };
@@ -226,12 +227,18 @@ pub(super) fn references_provider_vspace(pml4: u64) -> bool {
     }
 }
 
+pub(super) enum PublishedBody {
+    Process,
+    Thread,
+}
+
 /// # Safety
 /// Root has admitted this provider to operate on the exact current PM thread/process objects.
 /// This must finish before provider execution, and may not pump component IPC while borrowed.
-pub(super) unsafe fn grant_published_pair(
+pub(super) unsafe fn grant_published_body(
     pm: &ProcessManager,
     lifetime: ThreadLifetime,
+    body: PublishedBody,
     target: ProviderRoot,
     scratch_base: u64,
 ) -> Result<(), u32> {
@@ -241,39 +248,48 @@ pub(super) unsafe fn grant_published_pair(
         .ok_or(INVALID)?;
     arena.validate(pm)?;
     arena.providers.mapping_root(target)?;
-    let process = arena
-        .existing(BodyId::Process(lifetime.process_id()))
-        .ok_or(INVALID)?;
-    let thread = arena
-        .existing(BodyId::Thread(lifetime.thread_id()))
-        .ok_or(INVALID)?;
-    if pm.thread_lifetime(lifetime.thread_id()) != Some(lifetime)
-        || pm.process_kernel_object(lifetime.process_id())
-            != Some(arena.rows[process].page.descriptor().address)
-        || pm.thread_kernel_object(lifetime.thread_id())
-            != Some(arena.rows[thread].page.descriptor().address)
-        || arena.rows[thread].current_thread_lifetime != Some(lifetime)
-        || [process, thread]
-            .into_iter()
-            .any(|index| arena.rows[index].phase != BodyPhase::Published)
-    {
-        return Err(INVALID);
-    }
+    if pm.thread_lifetime(lifetime.thread_id()) != Some(lifetime) { return Err(INVALID); }
+    let initial = ps_bootstrap::initial_system_projection().ok_or(INVALID)?;
+    let index = match body {
+        PublishedBody::Process if lifetime.process_id() == arena.root.system.process_id() => {
+            if initial.identity != arena.root.system
+                || pm.process_kernel_object(lifetime.process_id()) != Some(initial.process_body)
+            { return Err(INVALID); }
+            // The provider image owner retains and maps the initial executive-image body.
+            return Ok(());
+        }
+        PublishedBody::Thread if lifetime == arena.root.system.thread() => {
+            if initial.identity != arena.root.system
+                || pm.thread_kernel_object(lifetime.thread_id()) != Some(initial.thread_body)
+            { return Err(INVALID); }
+            return Ok(());
+        }
+        PublishedBody::Process => {
+            let index = arena.existing(BodyId::Process(lifetime.process_id())).ok_or(INVALID)?;
+            if pm.process_kernel_object(lifetime.process_id()) != Some(arena.rows[index].page.descriptor().address)
+            { return Err(INVALID); }
+            index
+        }
+        PublishedBody::Thread => {
+            let index = arena.existing(BodyId::Thread(lifetime.thread_id())).ok_or(INVALID)?;
+            if pm.thread_kernel_object(lifetime.thread_id()) != Some(arena.rows[index].page.descriptor().address)
+                || arena.rows[index].current_thread_lifetime != Some(lifetime)
+            { return Err(INVALID); }
+            index
+        }
+    };
+    if arena.rows[index].phase != BodyPhase::Published { return Err(INVALID); }
     let _durable = allocator::enter_durable();
-    for index in [process, thread] {
-        let row = &mut arena.rows[index];
-        let mut io = Io {
-            paging: &mut arena.paging,
-            providers: &mut arena.providers,
-            root: arena.root,
-            scratch_base,
-            address: row.page.descriptor().address,
-            borrow: &borrow,
-        };
-        row.page
-            .map_alias(MappingTarget::Provider(target), ROOT_ALIAS_RIGHTS, &mut io)?;
-    }
-    Ok(())
+    let row = &mut arena.rows[index];
+    let mut io = Io {
+        paging: &mut arena.paging,
+        providers: &mut arena.providers,
+        root: arena.root,
+        scratch_base,
+        address: row.page.descriptor().address,
+        borrow: &borrow,
+    };
+    row.page.map_alias(MappingTarget::Provider(target), ROOT_ALIAS_RIGHTS, &mut io)
 }
 
 /// # Safety
@@ -425,14 +441,22 @@ pub(super) unsafe fn prepare_thread(
     {
         return Err(INVALID);
     }
-    let process_index = arena
-        .existing(BodyId::Process(lifetime.process_id()))
-        .ok_or(INVALID)?;
-    let process = &arena.rows[process_index].page;
-    if !process.is_initialized() || process.is_released() {
-        return Err(INVALID);
-    }
-    let process_body = process.descriptor().address;
+    let process_body = if lifetime.process_id() == arena.root.system.process_id() {
+        let projection = ps_bootstrap::initial_system_projection().ok_or(INVALID)?;
+        if projection.identity != arena.root.system
+            || pm.process_kernel_object(lifetime.process_id()) != Some(projection.process_body)
+        {
+            return Err(INVALID);
+        }
+        projection.process_body
+    } else {
+        let process_index = arena.existing(BodyId::Process(lifetime.process_id())).ok_or(INVALID)?;
+        let process = &arena.rows[process_index].page;
+        if !process.is_initialized() || process.is_released() {
+            return Err(INVALID);
+        }
+        process.descriptor().address
+    };
     let thread = pm.thread(lifetime.thread_id()).ok_or(INVALID)?;
     let (teb, system_thread) = (thread.teb_base, thread.is_system_thread);
     arena.prepare(
@@ -543,6 +567,29 @@ pub(super) unsafe fn publish_prepared_pair(
     arena.rows[process].phase = BodyPhase::Published;
     arena.rows[thread].phase = BodyPhase::Published;
     Ok((eprocess, ethread))
+}
+
+/// Initial System's static process body is already published; only the fresh worker body
+/// belongs to this arena. Exited worker bodies remain PM-owned until thread reclamation exists.
+pub(super) unsafe fn publish_system_worker(
+    pm: &mut ProcessManager,
+    lifetime: ThreadLifetime,
+) -> Result<(), u32> {
+    let _borrow = Borrow::acquire()?;
+    let arena = (&mut *core::ptr::addr_of_mut!(ARENA)).as_mut().ok_or(INVALID)?;
+    arena.validate(pm)?;
+    if lifetime.process_id() != arena.root.system.process_id()
+        || pm.thread_lifetime(lifetime.thread_id()) != Some(lifetime)
+        || !pm.thread(lifetime.thread_id()).is_some_and(|thread| thread.is_system_thread)
+    { return Err(INVALID); }
+    let index = arena.existing(BodyId::Thread(lifetime.thread_id())).ok_or(INVALID)?;
+    let row = &mut arena.rows[index];
+    if row.phase != BodyPhase::Prepared || !row.page.is_initialized()
+        || row.current_thread_lifetime != Some(lifetime)
+        || !pm.publish_thread_kernel_object(lifetime.thread_id(), row.page.descriptor().address)
+    { return Err(INVALID); }
+    row.phase = BodyPhase::Published;
+    Ok(())
 }
 
 /// Commit PM activation and refresh its stable body without an intervening provider entry.

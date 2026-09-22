@@ -42,7 +42,7 @@ pub use fs::{
     InstalledFileOpenAction, MemFs, MemFsBlobCompactError, MemFsBlobCompaction, MemFsSnapshotError,
     MemFsSnapshotInfo, MoveClusterInformation, SetFileNameInformation, StandardInformation,
     INVALID_HANDLE, SnapshotJournal, SnapshotJournalDurability, SnapshotJournalError,
-    SnapshotJournalOpenError, SnapshotJournalPhase,
+    SnapshotJournalOpenError, SnapshotJournalPhase, OwnedSnapshotJournal, OwnedSnapshotJournalOpenError,
 };
 pub use hive_provider::NtFileHiveIoProvider;
 pub use notify::*;

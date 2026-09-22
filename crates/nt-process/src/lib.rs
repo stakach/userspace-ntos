@@ -5314,6 +5314,17 @@ impl ProcessManager {
             })
             .sum()
     }
+
+    /// Mount storage cannot be recycled while any published or bound Key names its selector.
+    pub fn has_registry_key_selector_references(&self, selector: u32, mask: u32) -> bool {
+        self.processes.values().any(|process| {
+            process.handles.iter().any(|slot| {
+                slot.reference_entry().is_some_and(|entry| {
+                    matches!(entry.object, HandleObject::RegistryKey(key) if key & mask == selector)
+                })
+            })
+        })
+    }
 }
 
 #[cfg(test)]

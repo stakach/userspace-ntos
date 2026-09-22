@@ -198,6 +198,26 @@ impl RegistryOverlay {
         (self.keys.len() - 1, true)
     }
 
+    /// Publish an absent key with already assigned security and class in one memory operation.
+    /// Detached slots are never resurrected: retained KeyRefs must not name a replacement key.
+    pub fn create_secured_owned(&mut self, canon: String, volatile: bool, class_name: Option<String>, descriptor: Vec<u8>) -> Result<usize, u32> {
+        if descriptor.is_empty() { return Err(0xC000_0079); }
+        if self.find(&canon).is_some() { return Err(0xC000_0035); }
+        if !volatile && canon.rsplit_once('\\').and_then(|(parent, _)| self.find(parent)).is_some_and(|parent| self.is_volatile(parent) == Some(true)) {
+            return Err(0xC000_0181);
+        }
+        self.keys.try_reserve(1).map_err(|_| 0xC000_009Au32)?;
+        let existing = self.blobs.iter().position(|blob| *blob == descriptor);
+        if existing.is_none() { self.blobs.try_reserve(1).map_err(|_| 0xC000_009Au32)?; }
+        let security_descriptor = Some(match existing {
+            Some(index) => index,
+            None => { self.blobs.push(descriptor); self.blobs.len() - 1 },
+        });
+        let index = self.keys.len();
+        self.keys.push(OverlayKey { path: canon, values: Vec::new(), class_name, security_descriptor, volatile, detached: false });
+        Ok(index)
+    }
+
     /// The canonical path of an overlay key. `None` for a detached slot.
     pub fn path(&self, idx: usize) -> Option<&str> {
         self.keys
@@ -507,6 +527,34 @@ fn immediate_child<'a>(path: &'a str, parent: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secured_overlay_rejects_stable_child_of_volatile_parent() {
+        let mut overlay = RegistryOverlay::new();
+        overlay.create_secured_owned(r"\registry\transient".into(), true, None, b"sd".to_vec()).unwrap();
+        let path = r"\registry\transient\child";
+        assert_eq!(overlay.create_secured_owned(path.into(), false, None, b"sd".to_vec()), Err(0xC000_0181));
+        assert!(overlay.find(path).is_none());
+        let key = overlay.create_secured_owned(path.into(), true, None, b"sd".to_vec()).unwrap();
+        assert_eq!(overlay.is_volatile(key), Some(true));
+    }
+
+    #[test]
+    fn secured_create_has_metadata_at_publication_and_does_not_reuse_detached_identity() {
+        let mut overlay = RegistryOverlay::new();
+        let path = r"\registry\user\test";
+        assert_eq!(overlay.create_secured_owned(path.into(), true, None, Vec::new()), Err(0xC000_0079));
+        assert!(overlay.find(path).is_none());
+        let first = overlay.create_secured_owned(path.into(), true, Some("class".into()), b"assigned".to_vec()).unwrap();
+        assert_eq!(overlay.key_security_descriptor(first), Some(b"assigned".as_slice()));
+        assert_eq!(overlay.key_class(first), Some("class"));
+        assert_eq!(overlay.create_secured_owned(path.into(), false, None, b"different".to_vec()), Err(0xC000_0035));
+        assert_eq!(overlay.key_security_descriptor(first), Some(b"assigned".as_slice()));
+        overlay.detach_subtree(path);
+        let second = overlay.create_secured_owned(path.into(), true, None, b"replacement".to_vec()).unwrap();
+        assert_ne!(first, second);
+        assert!(overlay.path(first).is_none());
+    }
 
     #[test]
     fn canon_is_case_insensitive_and_trims() {

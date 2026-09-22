@@ -31,6 +31,9 @@ struct Construction {
     cursor: usize,
     step: Step,
     finished: bool,
+    thread: Option<nt_process::ThreadLifetime>,
+    caller: Option<nt_process::native_handle::NativeHandleCaller>,
+    reference: Option<nt_process::native_handle::NativeThreadProcessReference>,
 }
 
 static mut OWNERS: Vec<Construction> = Vec::new();
@@ -70,8 +73,81 @@ pub(super) unsafe fn begin(
         cursor: 0,
         step: Step::Unmap,
         finished: false,
+        thread: None,
+        caller: None,
+        reference: None,
     });
     Some(id)
+}
+
+pub(super) unsafe fn initialize_actor(id: usize, entry: u64, argument: u64) -> Result<(), u32> {
+    let lifetime = crate::service_sec_image::with_provider_process_manager(|pm| {
+        let system = pm.initial_system_identity().ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let tid = pm.create_thread(system.process_id(), entry, argument, true)?;
+        pm.thread_lifetime(tid).ok_or(nt_process::STATUS_INVALID_HANDLE)
+    })?;
+    // Construction retains the new identity before body allocation can enter native effects.
+    owner(id).thread = Some(lifetime);
+    crate::service_sec_image::with_provider_process_manager(|pm| {
+        crate::ps_object_backing::prepare_thread(
+            pm, lifetime, crate::ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+        )?;
+        crate::ps_object_backing::publish_system_worker(pm, lifetime)?;
+        let caller = pm.capture_native_handle_caller(lifetime, nt_types::AccessMode::KernelMode)?;
+        let reference = pm.reference_native_requestor(caller)?;
+        owner(id).caller = Some(caller);
+        owner(id).reference = Some(reference);
+        Ok(())
+    })
+}
+
+pub(super) unsafe fn registry_caller(
+    runtime: HostedDriverThreadRuntime,
+) -> Result<nt_process::native_handle::NativeHandleCaller, u32> {
+    if !matches(runtime.construction, runtime) || owner(runtime.construction).stopped {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    crate::service_sec_image::with_provider_process_manager(|pm| {
+        let row = owner(runtime.construction);
+        row.reference.as_ref().ok_or(nt_process::STATUS_INVALID_HANDLE)?.validate(pm)?;
+        let caller = row.caller.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        pm.validate_native_handle_caller(caller)?;
+        Ok(caller)
+    })
+}
+
+pub(super) unsafe fn initialize_kpcr(
+    id: usize, inst: DriverInstance, component: u64, executive: u64,
+) -> Result<(), u32> {
+    let caller = owner(id).caller.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let (_, _, _, thread, _) = driver_ps_context::project(inst, caller)?;
+    core::ptr::write_bytes(executive as *mut u8, 0, 0x1000);
+    write_volatile((executive + 0x18) as *mut u64, component);
+    write_volatile((executive + 0x20) as *mut u64, component + 0x180);
+    write_volatile((executive + 0x188) as *mut u64, thread);
+    Ok(())
+}
+
+unsafe fn retire_actor(id: usize) -> Result<(), u32> {
+    let exit_status = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_TABLES)).as_ref()
+        .and_then(|tables| tables.get(owner(id).instance))
+        .and_then(|table| table.get(owner(id).handle))
+        .and_then(|thread| thread.exit_status)
+        .unwrap_or(STATUS_UNSUCCESSFUL) as u32;
+    crate::service_sec_image::with_provider_process_manager(|pm| {
+        let row = owner(id);
+        if let Some(lifetime) = row.thread {
+            if pm.thread_lifetime(lifetime.thread_id()) != Some(lifetime) {
+                return Err(nt_process::STATUS_INVALID_HANDLE);
+            }
+            pm.terminate_thread(lifetime.thread_id(), exit_status)?;
+            if let Some(reference) = row.reference.as_mut() { reference.release(pm)?; }
+            row.reference = None;
+            row.caller = None;
+            row.thread = None;
+        }
+        Ok(())
+    })
 }
 
 pub(super) unsafe fn root(id: usize, cap: u64) {
@@ -162,6 +238,7 @@ pub(super) unsafe fn retire(id: usize, shared_retired: bool) -> bool {
         }
         owner(id).cursor = owner(id).resources.len();
     }
+    if retire_actor(id).is_err() { return false; }
     while owner(id).cursor != 0 {
         let index = owner(id).cursor - 1;
         let resource = owner(id).resources[index];

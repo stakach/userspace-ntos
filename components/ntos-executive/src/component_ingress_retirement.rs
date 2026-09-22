@@ -23,7 +23,10 @@ pub(super) fn failure(stage: &str, error: impl core::fmt::Debug) -> Error {
             Ok(())
         }
     }
-    let _ = core::fmt::write(&mut Serial, format_args!("[shared-ingress-retire] {stage}: {error:?}\n"));
+    let _ = core::fmt::write(
+        &mut Serial,
+        format_args!("[shared-ingress-retire] {stage}: {error:?}\n"),
+    );
     Error::Retirement
 }
 
@@ -234,6 +237,10 @@ pub(crate) unsafe fn retire(route: PeerRoute) -> Result<(), Error> {
                 // is insufficient: lane release, Reply return or source retirement may still fail.
                 // Fresh routes and source tombstones remain in their independent durable owners.
                 let _retired = owner.installations.swap_remove(installation_index);
+                // Only confirmed physical retirement permits reclaiming invisible publications.
+                // Published handles have already left this dispatch journal, even if ACK was lost.
+                let _ = owner;
+                crate::driver_launch::driver_registry_handles::retire_confirmed_dispatches(route);
                 return Ok(());
             }
             // Entered uncertain effects are deliberately not replayed.

@@ -45,8 +45,23 @@ impl MountedSystemHive {
     /// No later selector edit can redirect a prepared mutation to another key. The decoded
     /// decoded mutations are discarded on PREPARE error, but the original upload remains owned.
     /// This method changes no CM state.
-    pub(super) fn resolve_mutation_paths(&self, mutations: &mut [HiveMutation]) -> Result<(), i32> {
+    pub(super) fn resolve_mutation_paths(&self, leases: &super::SystemKeyLeaseBank, mutations: &mut [HiveMutation]) -> Result<(), i32> {
         for mutation in mutations {
+            if let HiveMutation::CreateChild { authority, parent, name, .. } = mutation {
+                if let super::mutation::ChildParentAuthority::Lease(token) = authority {
+                    let lease = leases.get(*token).ok_or(super::STATUS_INVALID_HANDLE)?;
+                    let relative = self.hive.key_path(lease.key).ok_or(0xc000_017cu32 as i32)?;
+                    let relative = relative.trim_start_matches('\\');
+                    let mut path = String::new();
+                    path.try_reserve_exact(SYSTEM_HIVE_PATH.len() + 1 + relative.len()).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                    path.push_str(SYSTEM_HIVE_PATH);
+                    if !relative.is_empty() { path.push('\\'); path.push_str(relative); }
+                    super::child_creation::validate_path(&path, name)?;
+                    *parent = path;
+                    *authority = super::mutation::ChildParentAuthority::Cell(lease.key);
+                    continue;
+                }
+            }
             let path = match mutation {
                 HiveMutation::CreateChild { parent, .. } => parent,
                 HiveMutation::CreateKey { path }

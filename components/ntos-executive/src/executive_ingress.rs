@@ -69,8 +69,14 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> (u64, u64, u64, u64, u64, u64) 
         if let Some((_reply, message)) = delivered {
             return materialize(message);
         }
-        if runtime::service_autonomous().expect("autonomous ingress remains retained on failure") {
-            continue;
+        // The snapshot journal owns the mounted volume through COMMIT and its terminal ACK.
+        // Autonomous Calls stay retained and unadmitted while that ownership is live.
+        if !crate::writable_fs::registry_journal::owns_volume() {
+            if runtime::service_autonomous()
+                .expect("autonomous ingress remains retained on failure")
+            {
+                continue;
+            }
         }
         match runtime::receive(IngressExecutionOwner::Idle, ROOT_THREAD_CAP, true)
             .expect("unified executive ingress retained after receive failure")

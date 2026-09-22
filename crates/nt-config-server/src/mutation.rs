@@ -10,12 +10,21 @@ use nt_config_abi::{
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ChildParentAuthority {
+    Path,
+    Lease(u64),
+    Cell(nt_hive_core::CellId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HiveMutation {
     CreateChild {
+        authority: ChildParentAuthority,
         parent: String,
         name: String,
         class_name: Option<String>,
         descriptor: Vec<u8>,
+        volatile: bool,
     },
     CreateKey {
         path: String,
@@ -236,13 +245,19 @@ pub(crate) fn decode_mutation_journal(bytes: &[u8]) -> Option<Vec<HiveMutation>>
         )?;
         let data = bytes.get(data_start..record_end)?;
         let mutation = match header.kind {
-            hive_mutation_kind::CREATE_CHILD
-                if header.flags & !hive_mutation_flags::CLASS_PRESENT == 0
+            hive_mutation_kind::CREATE_CHILD | hive_mutation_kind::CREATE_CHILD_LEASED
+                if header.flags & !(hive_mutation_flags::CLASS_PRESENT | hive_mutation_flags::VOLATILE) == 0
                     && header.value_type == 0
                     && !name.is_empty()
                     && !name.contains('\\') =>
             {
                 let present = header.flags & hive_mutation_flags::CLASS_PRESENT != 0;
+                let (authority, data) = if header.kind == hive_mutation_kind::CREATE_CHILD_LEASED {
+                    if !path.is_empty() { return None; }
+                    let token = u64::from_le_bytes(data.get(..8)?.try_into().ok()?);
+                    if token == 0 { return None; }
+                    (ChildParentAuthority::Lease(token), data.get(8..)?)
+                } else { (ChildParentAuthority::Path, data) };
                 let (class, descriptor) =
                     nt_config_abi::hive_create_child_metadata::split(data, present)?;
                 let class_name = if present {
@@ -254,10 +269,12 @@ pub(crate) fn decode_mutation_journal(bytes: &[u8]) -> Option<Vec<HiveMutation>>
                 owned.try_reserve_exact(descriptor.len()).ok()?;
                 owned.extend_from_slice(descriptor);
                 HiveMutation::CreateChild {
+                    authority,
                     parent: path,
                     name,
                     class_name,
                     descriptor: owned,
+                    volatile: header.flags & hive_mutation_flags::VOLATILE != 0,
                 }
             }
             hive_mutation_kind::CREATE_KEY

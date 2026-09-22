@@ -6,6 +6,11 @@
 
 use super::*;
 
+#[path = "snapshot_journal/storage_owner.rs"]
+mod storage_owner;
+pub use storage_owner::{OwnedSnapshotJournal, OwnedSnapshotJournalOpenError};
+use storage_owner::{StorageAdmissionError, StorageOwner};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotJournalPhase {
     CreatePending,
@@ -79,8 +84,8 @@ impl SnapshotJournalDurability {
 /// ```
 #[must_use = "retain unresolved journal work; an I/O error does not release its ownership"]
 pub struct SnapshotJournal<'a, D: SnapshotBlockDevice, C> {
-    fs: &'a mut FileSystem,
-    dev: &'a mut D,
+    fs: StorageOwner<'a, FileSystem>,
+    dev: StorageOwner<'a, D>,
     store: SnapshotBlockStore,
     handle: u64,
     file_id: u64,
@@ -105,6 +110,29 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
         journal: Vec<u8>,
         context: C,
     ) -> Result<Self, SnapshotJournalOpenError<C>> {
+        Self::open_storage(
+            StorageOwner::Borrowed(fs),
+            StorageOwner::Borrowed(dev),
+            store,
+            path,
+            journal,
+            context,
+        )
+        .map_err(|error| SnapshotJournalOpenError {
+            status: error.status,
+            journal: error.journal,
+            context: error.context,
+        })
+    }
+
+    fn open_storage(
+        mut fs: StorageOwner<'a, FileSystem>,
+        dev: StorageOwner<'a, D>,
+        store: SnapshotBlockStore,
+        path: &str,
+        journal: Vec<u8>,
+        context: C,
+    ) -> Result<Self, StorageAdmissionError<'a, D, C>> {
         let admit = (|| {
             if journal.is_empty() {
                 return Err(STATUS_INVALID_PARAMETER);
@@ -134,8 +162,10 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
             Ok((opened.handle, file_id, original_end, final_end))
         })();
         match admit {
-            Err(status) => Err(SnapshotJournalOpenError {
+            Err(status) => Err(StorageAdmissionError {
                 status,
+                fs,
+                dev,
                 journal,
                 context,
             }),
@@ -242,7 +272,7 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
         }
         let (snapshot_generation, snapshot_bytes) = self
             .fs
-            .commit_volume_snapshot(&self.store, self.dev)
+            .commit_volume_snapshot(&self.store, &mut *self.dev)
             .map_err(SnapshotJournalError::Snapshot)?;
         self.durability = Some(SnapshotJournalDurability {
             snapshot_generation,
@@ -293,7 +323,7 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
             return Err(SnapshotJournalError::File(status));
         }
         self.fs
-            .commit_volume_snapshot(&self.store, self.dev)
+            .commit_volume_snapshot(&self.store, &mut *self.dev)
             .map_err(SnapshotJournalError::Snapshot)?;
         self.phase = RolledBack;
         Ok(())
@@ -320,8 +350,17 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
 
 impl<D: SnapshotBlockDevice, C> Drop for SnapshotJournal<'_, D, C> {
     fn drop(&mut self) {
+        if self.fs.is_owned() {
+            // Unknown publication is not cancellation. Keep the filesystem and device authority
+            // unavailable, including a SnapshotReserveLease whose Drop would otherwise unlock it.
+            core::mem::forget(core::mem::replace(&mut self.fs, StorageOwner::Released));
+            core::mem::forget(core::mem::replace(&mut self.dev, StorageOwner::Released));
+            core::mem::forget(self.context.take());
+            core::mem::forget(core::mem::take(&mut self.journal));
+            return;
+        }
         // The private handle is held in an exclusively borrowed table and is closed exactly once.
-        if self.handle != INVALID_HANDLE {
+        if self.handle != INVALID_HANDLE && !matches!(self.fs, StorageOwner::Released) {
             let status = self.fs.zw_close(self.handle);
             debug_assert_eq!(status, STATUS_SUCCESS);
         }

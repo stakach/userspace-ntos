@@ -42,13 +42,17 @@ unsafe fn row(index: usize) -> &'static mut Row {
     &mut (&mut *core::ptr::addr_of_mut!(ROWS))[index]
 }
 
-unsafe fn reserve(path: &str) -> Result<usize, i32> {
+unsafe fn reserve(path: &str, root: Option<SystemHiveKeyLease>) -> Result<usize, i32> {
     let rows = &mut *core::ptr::addr_of_mut!(ROWS);
     let vacant = rows.iter().position(|row| row.phase == Phase::Closed);
     if vacant.is_none() {
         rows.try_reserve(1).map_err(|_| NO_MEMORY)?;
     }
-    let attempt = (&mut *core::ptr::addr_of_mut!(ATTEMPTS)).reserve(path)?;
+    let attempts = &mut *core::ptr::addr_of_mut!(ATTEMPTS);
+    let attempt = match root {
+        Some(root) => attempts.reserve_relative(root, path)?,
+        None => attempts.reserve(path)?,
+    };
     let entry = Row {
         phase: Phase::Opening,
         attempt: Some(attempt),
@@ -112,12 +116,88 @@ unsafe fn retain_failure(index: usize, phase: Phase) {
 }
 
 pub(crate) unsafe fn open(path: &str) -> Result<OpenedSystemHiveKey, i32> {
+    open_target(path, None)
+}
+
+pub(crate) unsafe fn open_relative(
+    root: SystemHiveKeyLease,
+    path: &str,
+) -> Result<OpenedSystemHiveKey, i32> {
+    open_target(path, Some(root))
+}
+
+/// A publication keeps its exact OPEN rather than abandoning an uncertain acquisition.
+#[must_use]
+pub(crate) struct PublicationOpen {
+    index: usize,
+}
+
+pub(crate) unsafe fn reserve_publication_open(
+    root: SystemHiveKeyLease,
+    path: &str,
+) -> Result<PublicationOpen, i32> {
+    let index = reserve(path, Some(root))?;
+    OPEN_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    Ok(PublicationOpen { index })
+}
+
+/// None is an unresolved transport outcome; the same owner must be retried.
+pub(crate) unsafe fn resume_publication_open(
+    owner: &PublicationOpen,
+) -> Result<Option<Result<OpenedSystemHiveKey, i32>>, i32> {
+    let index = owner.index;
+    assert!(row(index).phase == Phase::Opening);
+    if row(index).attempt.as_ref().unwrap().server_nonce().is_none() {
+        exchange(index, SystemHiveKeyOpenOperation::Query)?;
+    }
+    if row(index).attempt.as_ref().unwrap().validation_status() != Some(0) {
+        exchange(index, SystemHiveKeyOpenOperation::Begin)?;
+    }
+    if !row(index).attempt.as_ref().unwrap().is_acknowledged() {
+        exchange(index, SystemHiveKeyOpenOperation::Acknowledge)?;
+    }
+    let generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let attempt = row(index).attempt.as_mut().expect("publication OPEN");
+    let result = (&mut *core::ptr::addr_of_mut!(ATTEMPTS))
+        .take_validated(attempt, generation);
+    match result {
+        Ok(opened) => {
+            let entry = row(index);
+            entry.lease = Some(opened.lease);
+            (&mut *core::ptr::addr_of_mut!(ATTEMPTS))
+                .release(entry.attempt.as_mut().unwrap())
+                .expect("publication OPEN receipt released");
+            entry.attempt = None;
+            entry.phase = Phase::Active;
+            Ok(Some(Ok(opened)))
+        }
+        Err(status) if row(index).attempt.as_ref().unwrap().known_lease().is_none() => {
+            let entry = row(index);
+            (&mut *core::ptr::addr_of_mut!(ATTEMPTS))
+                .release(entry.attempt.as_mut().unwrap())
+                .expect("failed publication OPEN receipt released");
+            entry.attempt = None;
+            entry.phase = Phase::Closed;
+            Ok(Some(Err(status)))
+        }
+        Err(status) => {
+            // A validated terminal failure with an acquired lease transfers cleanup ownership.
+            retain_failure(index, Phase::RetryOpen);
+            Ok(Some(Err(status)))
+        }
+    }
+}
+
+unsafe fn open_target(
+    path: &str,
+    root: Option<SystemHiveKeyLease>,
+) -> Result<OpenedSystemHiveKey, i32> {
     let _durable = allocator::enter_durable();
     let generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
     if generation == 0 || CONFIG_CLIENT_PTR.is_null() {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
-    let index = reserve(path)?;
+    let index = reserve(path, root)?;
     OPEN_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let result = (|| {
         resolve_open(index)?;

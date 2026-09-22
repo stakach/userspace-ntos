@@ -100,6 +100,7 @@ pub(crate) fn prepare(
         .prepare_system_hive_mutation(
             generation,
             &[SystemHiveMutation::CreateChild {
+                volatile: false,
                 parent: PARENT,
                 name,
                 class_name: Some("class"),

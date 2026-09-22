@@ -17,7 +17,12 @@ pub(crate) mod nested;
 #[path = "component_ingress_services.rs"]
 mod services;
 pub(crate) use services::{
-    cancel_parked_service, finish_autonomous, park_service, resume_service, wake_service,
+    acknowledge_registry_service_cancellation, cancel_parked_service, finish_autonomous,
+    park_registry_service, park_service, reconcile_registry_service_reply,
+    registry_service_cancelled, registry_service_resume_next_deadline,
+    resume_acknowledged_registry_services, resume_service,
+    retire_stopped_acknowledged_registry_service,
+    wake_registry_service, wake_service,
 };
 
 #[path = "component_ingress_retirement.rs"]
@@ -27,9 +32,10 @@ pub(crate) use retirement::retire;
 #[path = "component_ingress_hosted.rs"]
 mod hosted;
 pub(crate) use hosted::{
-    can_park_hosted_reply, cancel_hosted, cancel_hosted_caller, hosted_can_resume,
-    hosted_cancellation_proven, hosted_reply_cancelled, owns_hosted_reply, release_hosted_reply,
-    reply_hosted, restart_hosted, stop_and_cancel_hosted, stop_hosted_caller, take_hosted_with,
+    can_park_hosted_reply, cancel_hosted, cancel_hosted_caller, defer_hosted_delivery,
+    finish_acknowledged_hosted_reply, hosted_can_resume, hosted_cancellation_proven,
+    hosted_reply_cancelled, owns_hosted_reply, release_hosted_reply, reply_hosted, restart_hosted,
+    stop_and_cancel_hosted, stop_hosted_caller, take_hosted_with,
 };
 
 const RETAINED_CALL_CAPACITY: usize = 256;
@@ -900,6 +906,7 @@ pub(crate) unsafe fn complete(
             )
             .map_err(|_| Error::Protocol)?;
         (&mut *core::ptr::addr_of_mut!(NATIVE_PEERS))[index].bootstrap = false;
+        crate::provider_registry_caller::retire_completed(route, dispatch);
         return Ok(());
     }
     owner()
@@ -907,6 +914,7 @@ pub(crate) unsafe fn complete(
             resolve(route, false)
         })
         .map_err(|_| Error::Protocol)?;
+    crate::provider_registry_caller::retire_completed(route, dispatch);
     Ok(())
 }
 
@@ -952,6 +960,7 @@ pub(crate) unsafe fn complete_protocol(
             |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
         )
         .map_err(|_| Error::Protocol)?;
+    crate::provider_registry_caller::retire_completed(route, dispatch);
     Ok(())
 }
 

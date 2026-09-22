@@ -83,6 +83,11 @@ pub mod opcode {
     pub const CM_OP_CREATE_KEY: u16 = 0x2110;
     /// Open an existing key by full path. `status` = SUCCESS if found, else not-found.
     pub const CM_OP_OPEN_KEY: u16 = 0x2111;
+    pub const CM_OP_QUERY_KEY_SECURITY: u16 = 0x2112;
+    pub const CM_OP_RUNTIME_KEY: u16 = 0x2115;
+    pub const CM_OP_RUNTIME_KEY_SNAPSHOT: u16 = 0x2116;
+    pub const CM_OP_SET_KEY_SECURITY: u16 = 0x2113;
+    pub const CM_OP_CREATE_SECURED_KEY: u16 = 0x2114;
     /// Set a DWORD value on a key (created if absent).
     pub const CM_OP_SET_DWORD: u16 = 0x2120;
     /// Query a DWORD value. Reply `detail0` = value; not-found status if absent.
@@ -95,6 +100,7 @@ pub mod opcode {
     pub const CM_OP_SET_VALUE_TRANSFER: u16 = 0x2124;
     /// Query a typed raw value through an immutable, tokenized snapshot.
     pub const CM_OP_QUERY_VALUE_TRANSFER: u16 = 0x2125;
+    pub const CM_OP_DELETE_VALUE: u16 = 0x2126;
     /// Enumerate an existing key's immediate subkey name by index. Reply `information` = name bytes.
     pub const CM_OP_ENUMERATE_KEY: u16 = 0x2130;
     /// Query one legacy device property by stable devnode instance path.
@@ -166,6 +172,7 @@ pub mod hive_key_close_disposition {
 }
 
 pub mod raw_value_transfer {
+    pub const BEGIN_ID: u16 = 5;
     pub const BEGIN: u16 = 1;
     pub const APPEND: u16 = 2;
     pub const COMMIT: u16 = 3;
@@ -253,8 +260,11 @@ pub mod hive_mutation_kind {
     /// carries one [`device_action_kind`] value; it does not directly mutate registry cells.
     pub const PUBLISH_DEVICE_ACTION: u16 = 7;
     /// Exact-parent child creation: path=parent, name=child, value_type=0. Data uses
-    /// hive_create_child_metadata; CLASS_PRESENT is the only valid flag.
+    /// hive_create_child_metadata; CLASS_PRESENT and VOLATILE are the only valid flags.
     pub const CREATE_CHILD: u16 = 8;
+    /// Exact leased parent, empty path. Data begins with a nonzero u64 lease token,
+    /// followed by the same metadata as CREATE_CHILD. Tokens never enter the disk journal.
+    pub const CREATE_CHILD_LEASED: u16 = 9;
 }
 
 pub mod hive_create_child_metadata;
@@ -262,6 +272,9 @@ pub mod hive_create_child_metadata;
 pub mod hive_mutation_flags {
     /// Distinguishes an explicitly present empty class from clearing the class metadata.
     pub const CLASS_PRESENT: u16 = 1 << 0;
+    /// Create a memory-only child in the mounted hive. This is valid only for CREATE_CHILD and
+    /// CREATE_CHILD_LEASED; the server owns durable filtering and sequence advancement.
+    pub const VOLATILE: u16 = 1 << 1;
 }
 
 /// Operation carried by [`CmLaunchPlanRequest::operation`].
@@ -362,6 +375,62 @@ pub struct CmKeyRequest {
     pub flags: u16,
     pub path_offset: u32,
     pub path_len_bytes: u32,
+}
+
+/// Bounded runtime-key descriptor operations. Security bytes are complete self-relative SDs;
+/// authorization and assignment belong to the executive, never the CM transport service.
+pub const CM_KEY_SECURITY_FRAME_BYTES: usize = 4096;
+pub const CM_RUNTIME_FRAME_BYTES: usize = 4096;
+pub mod runtime_key_op {
+    pub const SECURITY: u16 = 1;
+    pub const SET_SECURITY: u16 = 2;
+    pub const VALUE: u16 = 3;
+    pub const SET_VALUE: u16 = 4;
+    pub const DELETE_VALUE: u16 = 5;
+    pub const ENUM_VALUE: u16 = 6;
+    pub const ENUM_KEY: u16 = 7;
+    pub const INFO: u16 = 8;
+    pub const CLASS: u16 = 9;
+    pub const OPEN_RELATIVE: u16 = 10;
+}
+/// Payload is exactly `name_len` UTF-16 bytes followed by `data_len` bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CmRuntimeKeyRequest {
+    pub abi_size: u16,
+    pub operation: u16,
+    pub index: u32,
+    pub key: u64,
+    pub name_len: u32,
+    pub data_len: u32,
+    pub value_type: u32,
+    pub reserved: u32,
+}
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CmRuntimeKeyInfo {
+    pub subkeys: u32,
+    pub max_subkey_name: u32,
+    pub values: u32,
+    pub max_value_name: u32,
+    pub max_value_data: u32,
+    pub generation: u32,
+    pub max_subkey_class: u32,
+}
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CmKeySecurityRequest {
+    pub abi_size: u16,
+    pub flags: u16,
+    pub path_offset: u32,
+    pub path_len_bytes: u32,
+    pub descriptor_offset: u32,
+    pub descriptor_len: u32,
+    pub reserved: u32,
+    pub class_len: u32,
+    pub class_reserved: u32,
+    pub expected_parent: u64,
+    pub expected_parent_generation: u64,
 }
 
 /// `enumerate_key`: a key path plus zero-based subkey index. The returned payload is the selected
@@ -658,6 +727,8 @@ pub struct CmHiveKeyOpenRequest {
     pub request_generation: u64,
     pub path_offset: u32,
     pub path_len_bytes: u32,
+    /// Zero for an absolute path; otherwise BEGIN resolves from this exact live lease.
+    pub root_lease_token: u64,
 }
 
 /// Protocol SUCCESS delivers this envelope, not necessarily a successful OPEN. OUTCOME contains
@@ -933,6 +1004,9 @@ macro_rules! wire {
     };
 }
 wire!(CmKeyRequest);
+wire!(CmKeySecurityRequest);
+wire!(CmRuntimeKeyRequest);
+wire!(CmRuntimeKeyInfo);
 wire!(CmEnumerateKeyRequest);
 wire!(CmValueRequest);
 wire!(CmRawValueRequest);
@@ -1162,7 +1236,7 @@ mod tests {
         assert_eq!(core::mem::size_of::<CmHivePathRequest>(), 16);
         assert_eq!(core::mem::size_of::<CmHiveKeyCloseRequest>(), 40);
         assert_eq!(core::mem::size_of::<CmHiveKeyCloseReply>(), 40);
-        assert_eq!(core::mem::size_of::<CmHiveKeyOpenRequest>(), 48);
+        assert_eq!(core::mem::size_of::<CmHiveKeyOpenRequest>(), 56);
         assert_eq!(core::mem::size_of::<CmHiveKeyOpenReply>(), CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES);
         assert_eq!(core::mem::size_of::<CmLeasedHiveKeyRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmLeasedHiveRecordRequest>(), 48);

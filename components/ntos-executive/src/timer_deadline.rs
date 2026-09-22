@@ -54,16 +54,16 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
         ),
         (owner.job_time, DELAY_TIMER_SOURCE_JOB_TIME),
         (
-            driver_launch::driver_registry_close_retry_deadline(),
-            DELAY_TIMER_SOURCE_REGISTRY_CLOSE,
-        ),
-        (
             cm_key_ownership::next_deadline(),
             DELAY_TIMER_SOURCE_CM_KEY_CLEANUP,
         ),
         (
             cm_snapshot_ownership::next_deadline(),
             DELAY_TIMER_SOURCE_CM_SNAPSHOT_CLEANUP,
+        ),
+        (
+            registry_mutation_work::next_deadline(),
+            DELAY_TIMER_SOURCE_REGISTRY_MUTATION,
         ),
         (
             driver_launch::hosted_file_retry_deadline(now.monotonic_100ns),

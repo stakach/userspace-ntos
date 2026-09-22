@@ -169,7 +169,7 @@ impl CmServer {
                     .system_hive
                     .as_ref()
                     .unwrap()
-                    .resolve_mutation_paths(&mut mutations)
+                    .resolve_mutation_paths(&self.system_key_leases, &mut mutations)
                 {
                     return reply(status, current_generation);
                 }

@@ -11,6 +11,7 @@
 extern crate alloc;
 
 mod key_lease;
+mod runtime_key;
 mod key_close;
 mod mutation_commit;
 mod mutation_transfer;
@@ -296,14 +297,29 @@ fn apply_system_hive_mutation(
     };
     match mutation {
         HiveMutation::CreateChild {
-            parent, name, class_name, descriptor,
+            authority, parent, name, class_name, descriptor, volatile,
         } => {
-            child_creation::apply(
-                transaction, &relative(parent)?, name, class_name.as_deref(), descriptor,
-            )
+            match authority {
+                mutation::ChildParentAuthority::Path => child_creation::apply(
+                    transaction, &relative(parent)?, name, class_name.as_deref(), descriptor, *volatile,
+                ),
+                mutation::ChildParentAuthority::Cell(cell) => child_creation::apply_cell(
+                    transaction, *cell, name, class_name.as_deref(), descriptor, *volatile,
+                ),
+                mutation::ChildParentAuthority::Lease(_) => Err(STATUS_INVALID_HANDLE),
+            }
         }
         HiveMutation::CreateKey { path } => {
-            transaction.create_key(&relative(&path)?);
+            let path = relative(path)?;
+            let mut parent = transaction.hive().root();
+            for name in path.split('\\').filter(|part| !part.is_empty()) {
+                match transaction.hive().open_subkey(parent, name) {
+                    Some(child) => parent = child,
+                    None if transaction.hive().is_volatile(parent) => return Err(0xc000_0181u32 as i32),
+                    None => break,
+                }
+            }
+            transaction.create_key(&path);
             Ok(())
         }
         HiveMutation::SetValue {
@@ -437,8 +453,14 @@ fn project_system_hive_mutations(
         };
         enum_changed |= affects_enum;
         match mutation {
-            HiveMutation::CreateKey { .. } | HiveMutation::CreateChild { .. } => {
+            HiveMutation::CreateKey { .. } => {
                 registry.create_key(&path);
+            }
+            HiveMutation::CreateChild { descriptor, class_name, volatile, .. } => {
+                let key = registry.create_key(&path);
+                registry.set_volatile(key, *volatile);
+                let _ = registry.import_key_security_descriptor(key, Some(descriptor));
+                registry.set_key_class(key, class_name.as_deref());
             }
             HiveMutation::SetValue {
                 name,
@@ -465,9 +487,13 @@ fn project_system_hive_mutations(
                     return Err(STATUS_REGISTRY_CORRUPT);
                 }
             }
-            HiveMutation::SetKeyClass { .. } | HiveMutation::SetKeySecurity { .. } => {
-                // Class and security metadata remain authoritative in the mounted hive. The
-                // semantic ConfigManager registry does not model either attribute.
+            HiveMutation::SetKeySecurity { descriptor, .. } => {
+                let key = registry.open_key(&path).ok_or(STATUS_REGISTRY_CORRUPT)?;
+                let _ = registry.import_key_security_descriptor(key, Some(descriptor));
+            }
+            HiveMutation::SetKeyClass { class_name, .. } => {
+                let key = registry.open_key(&path).ok_or(STATUS_REGISTRY_CORRUPT)?;
+                if !registry.set_key_class(key, class_name.as_deref()) { return Err(STATUS_REGISTRY_CORRUPT); }
             }
             HiveMutation::PublishDeviceAction { .. } => unreachable!(),
         }
@@ -1006,9 +1032,14 @@ struct PreparedSystemHiveCheckpoint {
     offset: usize,
 }
 
+enum RawValueTarget {
+    Path(String),
+    Runtime(u64),
+}
+
 struct RawValueUpload {
     token: u64,
-    key_path: String,
+    target: RawValueTarget,
     name: String,
     value_type: RegistryValueType,
     total_len: usize,
@@ -1139,9 +1170,14 @@ impl CmServer {
             opcode::CM_OP_PING => reply(STATUS_SUCCESS, 0),
             opcode::CM_OP_CREATE_KEY => self.op_create_key(in_buf),
             opcode::CM_OP_OPEN_KEY => self.op_open_key(in_buf),
+            opcode::CM_OP_RUNTIME_KEY => self.op_runtime_key(in_buf, out_buf),
+            opcode::CM_OP_RUNTIME_KEY_SNAPSHOT => self.op_runtime_key_snapshot(in_buf, out_buf),
+            opcode::CM_OP_QUERY_KEY_SECURITY | opcode::CM_OP_SET_KEY_SECURITY
+            | opcode::CM_OP_CREATE_SECURED_KEY => self.op_key_security(opcode, in_buf, out_buf),
             opcode::CM_OP_SET_DWORD => self.op_set_dword(in_buf),
             opcode::CM_OP_QUERY_DWORD => self.op_query_dword(in_buf),
             opcode::CM_OP_SET_VALUE => self.op_set_value(in_buf),
+            opcode::CM_OP_DELETE_VALUE => self.op_delete_value(in_buf),
             opcode::CM_OP_SET_VALUE_TRANSFER => self.op_set_value_transfer(in_buf),
             opcode::CM_OP_QUERY_VALUE => self.op_query_value(in_buf, out_buf),
             opcode::CM_OP_QUERY_VALUE_TRANSFER => self.op_query_value_transfer(in_buf, out_buf),
@@ -1174,6 +1210,51 @@ impl CmServer {
             opcode::CM_OP_QUERY_NETWORK_PLAN => self.op_query_network_plan(in_buf, out_buf),
             opcode::CM_OP_DEVICE_ACTION => self.op_device_action(in_buf, out_buf),
             _ => reply(STATUS_INVALID_SYSTEM_SERVICE, 0),
+        }
+    }
+
+    fn op_key_security(&mut self, op: u16, buf: &[u8], output: &mut [u8]) -> CmReply {
+        use nt_config_abi::{CmKeySecurityRequest, CM_KEY_SECURITY_FRAME_BYTES};
+        let Some(req) = CmKeySecurityRequest::from_bytes(buf) else { return reply(STATUS_INVALID_PARAMETER, 0); };
+        let header = core::mem::size_of::<CmKeySecurityRequest>();
+        let path_end = (req.path_offset as usize).checked_add(req.path_len_bytes as usize);
+        let descriptor_end = (req.descriptor_offset as usize).checked_add(req.descriptor_len as usize);
+        let create = op == opcode::CM_OP_CREATE_SECURED_KEY;
+        let query = op == opcode::CM_OP_QUERY_KEY_SECURITY;
+        if req.abi_size as usize != header || buf.len() > CM_KEY_SECURITY_FRAME_BYTES
+            || req.reserved != 0 || req.class_reserved != 0 || (!create && req.class_len != 0)
+            || (!create && (req.expected_parent != 0 || req.expected_parent_generation != 0))
+            || (create && (req.expected_parent == 0 || req.expected_parent_generation > u32::MAX as u64))
+            || req.flags & !(if create { key_flags::VOLATILE } else { 0 }) != 0
+            || req.path_offset as usize != header
+            || path_end.and_then(|end| end.checked_add(req.class_len as usize)) != Some(req.descriptor_offset as usize)
+            || descriptor_end != Some(buf.len())
+            || (query && req.descriptor_len != 0)
+            || (!query && req.descriptor_len == 0)
+        { return reply(STATUS_INVALID_PARAMETER, 0); }
+        let Some(path) = decode(buf, req.path_offset, req.path_len_bytes) else { return reply(STATUS_INVALID_PARAMETER, 0); };
+        if query {
+            let Some(key) = self.cm.registry().open_key(&path) else { return reply(STATUS_OBJECT_NAME_NOT_FOUND, 0); };
+            let Some(descriptor) = self.cm.registry().key_security_descriptor(key) else {
+                return reply(0xC000_0079u32 as i32, 0);
+            };
+            if output.len() < descriptor.len() { return reply_with_info(STATUS_BUFFER_TOO_SMALL, descriptor.len() as u32, 0, 0); }
+            output[..descriptor.len()].copy_from_slice(descriptor);
+            return reply_with_info(STATUS_SUCCESS, descriptor.len() as u32, key, self.cm.registry().generation(key).unwrap() as u64);
+        }
+        let descriptor = &buf[req.descriptor_offset as usize..];
+        if create {
+            let Some(class) = decode(buf, path_end.unwrap() as u32, req.class_len) else { return reply(STATUS_INVALID_PARAMETER, 0); };
+            match self.cm.registry_mut().create_secured_key_checked_with_class(&path, descriptor, req.flags & key_flags::VOLATILE != 0, req.expected_parent, req.expected_parent_generation as u32, (!class.is_empty()).then_some(class.as_str())) {
+                Ok((id, created)) => reply_with_info(STATUS_SUCCESS, 0, id, created as u64),
+                Err(status) => reply(status as i32, 0),
+            }
+        } else {
+            let Some(key) = self.cm.registry().open_key(&path) else { return reply(STATUS_OBJECT_NAME_NOT_FOUND, 0); };
+            match self.cm.registry_mut().set_key_security_descriptor(key, descriptor) {
+                Ok(()) => reply(STATUS_SUCCESS, 0),
+                Err(status) => reply(status as i32, 0),
+            }
         }
     }
 
@@ -1311,7 +1392,7 @@ impl CmServer {
             return reply(STATUS_REVISION_MISMATCH, 0);
         }
         match req.operation {
-            raw_value_transfer::BEGIN => {
+            raw_value_transfer::BEGIN | raw_value_transfer::BEGIN_ID => {
                 if req.transfer_token != 0
                     || req.value_offset != 0
                     || req.chunk_offset != 0
@@ -1332,8 +1413,14 @@ impl CmServer {
                 {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 }
+                let key_id = if req.operation == raw_value_transfer::BEGIN_ID {
+                    let Some(bytes) = request_slice(buf, req.key_offset, req.key_len_bytes).filter(|bytes| bytes.len() == 8) else { return reply(STATUS_INVALID_PARAMETER, 0); };
+                    let key = u64::from_le_bytes(bytes.try_into().unwrap());
+                    if self.cm.registry().generation(key).is_none() { return reply(0xC000_017Cu32 as i32, 0); }
+                    Some(key)
+                } else { None };
                 let (Some(key_path), Some(name), Some(value_type)) = (
-                    decode(buf, req.key_offset, req.key_len_bytes),
+                    if key_id.is_some() { Some(String::new()) } else { decode(buf, req.key_offset, req.key_len_bytes) },
                     decode(buf, req.name_offset, req.name_len_bytes),
                     RegistryValueType::from_u32(req.value_type),
                 ) else {
@@ -1352,7 +1439,7 @@ impl CmServer {
                 self.next_raw_value_upload_token = next_token;
                 self.raw_value_uploads.push(RawValueUpload {
                     token,
-                    key_path,
+                    target: match key_id { Some(key) => RawValueTarget::Runtime(key), None => RawValueTarget::Path(key_path) },
                     name,
                     value_type,
                     total_len,
@@ -1420,7 +1507,13 @@ impl CmServer {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
                 let upload = self.raw_value_uploads.swap_remove(index);
-                let key = self.cm.registry_mut().create_key(&upload.key_path);
+                let key = match upload.target {
+                    RawValueTarget::Runtime(key) => {
+                        if self.cm.registry().generation(key).is_none() { return reply(0xC000_017Cu32 as i32, 0); }
+                        key
+                    }
+                    RawValueTarget::Path(path) => self.cm.registry_mut().create_key(&path),
+                };
                 if self.cm.registry_mut().set_value(
                     key,
                     &upload.name,
@@ -1457,6 +1550,16 @@ impl CmServer {
             }
             _ => reply(STATUS_INVALID_PARAMETER, 0),
         }
+    }
+
+    fn op_delete_value(&mut self, buf: &[u8]) -> CmReply {
+        let Some(req) = CmRawValueRequest::from_bytes(buf) else { return reply(STATUS_INVALID_PARAMETER, 0); };
+        if req.abi_size as usize != core::mem::size_of::<CmRawValueRequest>() || req._pad != 0 || req.data_len_bytes != 0 {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
+        let (Some(path), Some(name)) = (decode(buf, req.key_offset, req.key_len_bytes), decode(buf, req.name_offset, req.name_len_bytes)) else { return reply(STATUS_INVALID_PARAMETER, 0); };
+        let Some(key) = self.cm.registry().open_key(&path) else { return reply(STATUS_OBJECT_NAME_NOT_FOUND, 0); };
+        if self.cm.registry_mut().delete_value(key, &name) { reply(STATUS_SUCCESS, 0) } else { reply(STATUS_OBJECT_NAME_NOT_FOUND, 0) }
     }
 
     fn op_query_value(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {

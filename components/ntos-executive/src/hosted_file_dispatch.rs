@@ -11,7 +11,7 @@ use nt_io_manager::detached_file_irp::{
     ExternalFileIrpInvocation, ExternalFileIrpOutcome, ExternalFileIrpReturn,
 };
 
-pub(super) fn invoke(mut invocation: ExternalFileIrpInvocation) -> ExternalFileIrpReturn {
+pub(super) fn invoke(mut invocation: ExternalFileIrpInvocation, caller: nt_process::native_handle::NativeHandleCaller) -> ExternalFileIrpReturn {
     let projection = invocation.projection().clone();
     let route = invocation.route();
     let Some((instance_index, _)) = instance_by_driver_id(route.driver_id().raw()) else {
@@ -25,7 +25,7 @@ pub(super) fn invoke(mut invocation: ExternalFileIrpInvocation) -> ExternalFileI
         });
     }
     let (input, output) = invocation.buffers_mut().split();
-    let result = execute(instance_index, &projection, input, output);
+    let result = execute(instance_index, Some(caller), &projection, input, output);
     let outcome = match result {
         HostedIrpTransportResult::NotDispatched { status } => {
             ExternalFileIrpOutcome::NotEntered { status }
@@ -234,6 +234,7 @@ pub(super) fn control(
     }
     let storage_instance = hosted_completion_storage_instance(instance_index);
     unsafe {
+        let caller = crate::initial_system_driver_caller();
         dispatch_irp_for_instance_exact(
             storage_instance,
             operation,
@@ -247,6 +248,7 @@ pub(super) fn control(
             None,
             &[],
             output,
+            Some(caller),
         )
     }
     .unwrap_or(HostedIrpTransportResult::NotDispatched {
@@ -256,6 +258,7 @@ pub(super) fn control(
 
 pub(super) fn execute(
     instance_index: usize,
+    caller: Option<nt_process::native_handle::NativeHandleCaller>,
     projection: &IrpProjection,
     input: &[u8],
     output: &mut [u8],
@@ -287,6 +290,7 @@ pub(super) fn execute(
             Some(request),
             input,
             output,
+            caller,
         )
     }
     .unwrap_or(HostedIrpTransportResult::NotDispatched {

@@ -84,6 +84,20 @@ impl Drop for ComponentSchedulerScope {
 pub(super) unsafe fn hosted_component_pump(
     channel: &crate::spawn_hosts::PumpChannel,
 ) -> crate::spawn_hosts::PumpResult {
+    hosted_component_pump_inner(channel, None)
+}
+
+pub(super) unsafe fn hosted_component_pump_with_caller(
+    channel: &crate::spawn_hosts::PumpChannel,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> crate::spawn_hosts::PumpResult {
+    hosted_component_pump_inner(channel, Some(caller))
+}
+
+unsafe fn hosted_component_pump_inner(
+    channel: &crate::spawn_hosts::PumpChannel,
+    caller: Option<nt_process::native_handle::NativeHandleCaller>,
+) -> crate::spawn_hosts::PumpResult {
     use crate::spawn_hosts::shared_ingress::owner::runtime;
     let mut channel = *channel;
     let route = runtime::channel_route(&channel).expect("physical hosted ingress identity");
@@ -95,6 +109,12 @@ pub(super) unsafe fn hosted_component_pump(
         parent
     } else { None };
     let channel = &mut channel;
+    let _registry_caller = caller.map(|caller| {
+        crate::provider_registry_caller::Scope::enter(channel, caller)
+            .expect("root-issued provider registry caller must match the executing job")
+    });
+    crate::driver_launch::driver_thread_projection::enter(channel, caller)
+        .expect("driver execution requires its exact retained thread projection");
     let scope = ComponentSchedulerScope::enter();
     let mut result = crate::spawn_hosts::component_pump(channel);
     while result.scheduler_yielded {

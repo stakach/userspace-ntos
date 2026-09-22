@@ -39,11 +39,62 @@ fn create<'a>(
     sd: &'a [u8],
 ) -> SystemHiveMutation<'a> {
     SystemHiveMutation::CreateChild {
+        volatile: false,
         parent,
         name,
         class_name: class,
         descriptor: sd,
     }
+}
+
+#[test]
+fn leased_parent_is_captured_before_close_and_disk_replay_needs_no_lease() {
+    let original = hive();
+    let mut client = client();
+    client.import_system_hive(&encode_image(&original)).unwrap();
+    let parent = retained_test_keys::open(&mut client, SERVICES);
+    let prepared = client.prepare_system_hive_mutation(1, &[
+        SystemHiveMutation::CreateChildRelative { volatile: false, parent: parent.lease, name: "Child", class_name: Some("class"), descriptor: b"assigned" },
+    ]).unwrap();
+    retained_test_keys::close(&mut client, parent.lease).unwrap();
+    assert_eq!(client.import_system_hive(&encode_image(&original)), Err(STATUS_DEVICE_BUSY));
+    client.publish_system_hive_mutation(&prepared).unwrap();
+    let info = client.query_system_hive_key(CHILD).unwrap();
+    assert_eq!(info.class_name.as_deref(), Some("class"));
+    assert_eq!(info.security_descriptor.as_deref(), Some(&b"assigned"[..]));
+    let mut replayed = original.clone();
+    try_replay_log(&mut replayed, &prepared.durable_journal, original.sequence).unwrap();
+    assert!(replayed.open_key(r"ControlSet001\Services\Child").is_some());
+}
+
+#[test]
+fn leased_creation_rejects_closed_parent_before_any_child_is_visible() {
+    let mut client = client();
+    client.import_system_hive(&encode_image(&hive())).unwrap();
+    let parent = retained_test_keys::open(&mut client, SERVICES);
+    retained_test_keys::close(&mut client, parent.lease).unwrap();
+    let result = client.prepare_system_hive_mutation(1, &[
+        SystemHiveMutation::CreateChildRelative { volatile: false, parent: parent.lease, name: "Child", class_name: None, descriptor: b"assigned" },
+    ]);
+    assert_eq!(result.unwrap_err(), 0xC000_0008u32 as i32);
+    assert_eq!(client.query_system_hive_key(CHILD), Err(STATUS_OBJECT_NAME_NOT_FOUND));
+}
+
+#[test]
+fn leased_creation_does_not_rebind_deleted_parent_to_replacement() {
+    let mut client = client();
+    client.import_system_hive(&encode_image(&hive())).unwrap();
+    let parent = retained_test_keys::open(&mut client, SERVICES);
+    let replacement = client.prepare_system_hive_mutation(1, &[
+        SystemHiveMutation::DeleteKey { path: SERVICES },
+        SystemHiveMutation::CreateKey { path: SERVICES },
+    ]).unwrap();
+    client.publish_system_hive_mutation(&replacement).unwrap();
+    assert_eq!(client.prepare_system_hive_mutation(2, &[
+        SystemHiveMutation::CreateChildRelative { volatile: false, parent: parent.lease, name: "Child", class_name: None, descriptor: b"assigned" },
+    ]).unwrap_err(), 0xc000_017cu32 as i32);
+    assert_eq!(client.query_system_hive_key(CHILD), Err(STATUS_OBJECT_NAME_NOT_FOUND));
+    retained_test_keys::close(&mut client, parent.lease).unwrap();
 }
 
 #[test]

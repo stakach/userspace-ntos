@@ -139,9 +139,9 @@ impl ExecNtHandler {
             target_name,
         )?;
         assert!(transaction.advance_to_target_create(target));
-        let result = driver_launch::dispatch_hosted_target_directory_create_irp_result_exact(
+        let result = self.hosted_file_native_caller().and_then(|caller| driver_launch::dispatch_hosted_target_directory_create_irp_result_exact(
             target,
-            self.current_tid,
+            caller,
             nt_io_manager::CreateParameters {
                 opened_case_sensitive,
                 desired_access: nt_types::AccessMask::from_bits_retain(access),
@@ -153,7 +153,7 @@ impl ExecNtHandler {
                 related_file: None,
             },
             &input,
-        );
+        ));
         drop(root_owner);
         result
     }
@@ -592,15 +592,15 @@ impl ExecNtHandler {
         // The direct-device exception needs an authoritative FO_DIRECT_DEVICE_OPEN state.
         let source_is_directory = {
             let mut basic = [0u8; FILE_BASIC_INFORMATION_LEN];
-            let query = driver_launch::dispatch_hosted_file_irp_result_exact(
+            let query = self.hosted_file_native_caller().and_then(|caller| driver_launch::dispatch_hosted_file_irp_result_exact(
                 route.file_id,
                 major::IRP_MJ_QUERY_INFORMATION as u64,
                 nt_fs::FILE_BASIC_INFORMATION as u64,
-                self.current_tid,
+                caller,
                 &[],
                 &mut basic,
                 0,
-            );
+            ));
             let (status, information, irp_id) = match query {
                 Ok((status, information, irp_id, _)) => (
                     status as u32,

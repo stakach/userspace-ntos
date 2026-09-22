@@ -125,7 +125,7 @@ impl<'a, B: Backend, C> SystemHiveStorageAdmission<'a, B, C> {
 }
 
 impl<B: Backend> ConfigClient<B> {
-    pub(crate) fn validate_system_hive_preparation_for_storage(
+    pub fn validate_system_hive_preparation_for_storage(
         &mut self,
         prepared: &PreparedSystemHiveMutation,
     ) -> Result<(), i32> {

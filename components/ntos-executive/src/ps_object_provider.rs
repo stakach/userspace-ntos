@@ -16,9 +16,14 @@ const RESOURCES: u32 = nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ProviderRoot {
-    catalog: CatalogIdentity,
-    provider: ProviderDomainIdentity,
+    identity: ProviderIdentity,
     source_pml4: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderIdentity {
+    Catalog(CatalogIdentity, ProviderDomainIdentity),
+    Hosted(nt_io_manager::HostedDomainIdentity),
 }
 
 impl ProviderRoot {
@@ -33,19 +38,20 @@ impl ProviderRoot {
         source_pml4: u64,
     ) -> Result<Self, u32> {
         let target = Self {
-            catalog,
-            provider,
+            identity: ProviderIdentity::Catalog(catalog, provider),
             source_pml4,
         };
         target.validate_current()?;
         Ok(target)
     }
 
-    pub(crate) const fn catalog(self) -> CatalogIdentity {
-        self.catalog
-    }
-    pub(crate) const fn provider(self) -> ProviderDomainIdentity {
-        self.provider
+    pub(crate) unsafe fn hosted(
+        domain: nt_io_manager::HostedDomainIdentity,
+        source_pml4: u64,
+    ) -> Result<Self, u32> {
+        let target = Self { identity: ProviderIdentity::Hosted(domain), source_pml4 };
+        target.validate_current()?;
+        Ok(target)
     }
     pub(crate) const fn source_pml4(self) -> u64 {
         self.source_pml4
@@ -53,9 +59,13 @@ impl ProviderRoot {
 
     fn validate_current(self) -> Result<(), u32> {
         let catalog = unsafe { &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS) };
-        if self.source_pml4 == 0
-            || catalog.identity() != Some(self.catalog)
-            || !catalog.contains(self.provider)
+        let live = match self.identity {
+            ProviderIdentity::Catalog(identity, provider) =>
+                catalog.identity() == Some(identity) && catalog.contains(provider),
+            ProviderIdentity::Hosted(domain) =>
+                crate::driver_launch::matches_ps_provider_root(domain, self.source_pml4),
+        };
+        if self.source_pml4 == 0 || !live
         {
             return Err(INVALID);
         }
@@ -119,8 +129,7 @@ impl ProviderRoots {
             // Its identity tombstone still forbids resurrection or rebinding to a different slot.
             if self.records.iter().any(|row| {
                 (row.target.source_pml4 == target.source_pml4 && !row.root.is_released())
-                    || (row.target.catalog == target.catalog
-                        && row.target.provider == target.provider)
+                    || row.target.identity == target.identity
             }) {
                 return Err(INVALID);
             }

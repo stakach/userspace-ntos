@@ -1366,6 +1366,7 @@ fn hive_image_compacts_sparse_cell_ids_on_decode() {
     };
     h.cells.resize_with(1025, || None);
     h.cells[64] = Some(Cell::Key(KeyCell {
+        volatile: false,
         id: CellId(64),
         parent: None,
         name: String::new(),
@@ -1376,6 +1377,7 @@ fn hive_image_compacts_sparse_cell_ids_on_decode() {
         last_write_sequence: 1,
     }));
     h.cells[512] = Some(Cell::Key(KeyCell {
+        volatile: false,
         id: CellId(512),
         parent: Some(CellId(64)),
         name: String::from("Services"),

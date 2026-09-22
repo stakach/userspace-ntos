@@ -35,6 +35,7 @@ pub struct SystemHiveKeyOpenAttempt {
     inflight: Option<SystemHiveKeyOpenOperation>,
     submitted: bool,
     request_path: Vec<u8>,
+    root_lease_token: u64,
     physical_path: String,
     outcome: Option<i32>,
     validation: Option<i32>,
@@ -106,8 +107,20 @@ impl SystemHiveKeyOpenAttempts {
     pub const fn new() -> Self { Self { requester: 0, slots: Vec::new() } }
 
     pub fn reserve(&mut self, path: &str) -> Result<SystemHiveKeyOpenAttempt, i32> {
+        self.reserve_rooted(0, path)
+    }
+
+    /// The caller retains the root lease until BEGIN has a confirmed outcome.
+    pub fn reserve_relative(&mut self, root: SystemHiveKeyLease, path: &str) -> Result<SystemHiveKeyOpenAttempt, i32> {
+        if root.token == 0 || root.opened_generation == 0 || path.starts_with('\\') {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.reserve_rooted(root.token, path)
+    }
+
+    fn reserve_rooted(&mut self, root_lease_token: u64, path: &str) -> Result<SystemHiveKeyOpenAttempt, i32> {
         let units = path.encode_utf16().count();
-        if units == 0 || units > CM_MAX_HIVE_PATH_UNITS || path.contains('\0') { return Err(STATUS_INVALID_PARAMETER); }
+        if (units == 0 && root_lease_token == 0) || units > CM_MAX_HIVE_PATH_UNITS || path.contains('\0') { return Err(STATUS_INVALID_PARAMETER); }
         let mut request_path = Vec::new();
         request_path.try_reserve_exact(units * 2).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         for unit in path.encode_utf16() { request_path.extend_from_slice(&unit.to_le_bytes()); }
@@ -126,7 +139,7 @@ impl SystemHiveKeyOpenAttempts {
         if vacant.is_some() { self.slots[index] = slot; } else { self.slots.push(slot); }
         Ok(SystemHiveKeyOpenAttempt {
             identity: Identity { requester, slot: index as u64, sequence }, server: 0, epoch: 0,
-            inflight: None, submitted: false, request_path, physical_path, outcome: None,
+            inflight: None, submitted: false, request_path, root_lease_token, physical_path, outcome: None,
             validation: None, lease: None, receipt: None, acknowledged: false,
             lease_closed: false, transferred: false, released: false,
         })
@@ -170,6 +183,7 @@ impl SystemHiveKeyOpenAttempts {
         }
         let mut bytes = [0; REQUEST_MAX];
         let len = if op == SystemHiveKeyOpenOperation::Begin {
+            request.root_lease_token = attempt.root_lease_token;
             request.path_offset = header_size as u32;
             request.path_len_bytes = attempt.request_path.len() as u32;
             bytes[header_size..header_size + attempt.request_path.len()].copy_from_slice(&attempt.request_path);

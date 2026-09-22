@@ -36,6 +36,9 @@ use nt_fs::SnapshotBlockDevice;
 #[path = "writable_fs/snapshot_storage.rs"]
 pub(crate) mod snapshot_storage;
 
+#[path = "writable_fs/registry_journal.rs"]
+pub(crate) mod registry_journal;
+
 #[path = "writable_fs/file_cleanup.rs"]
 mod file_cleanup;
 pub(crate) use file_cleanup::{
@@ -279,6 +282,10 @@ pub(crate) unsafe fn hive_image_value_len_at(
 /// publication except for replacing the whole vector with a newer setup snapshot.
 pub(crate) unsafe fn set_default_user_ntuser_dat_image(image: alloc::vec::Vec<u8>) -> bool {
     if !PROVISION_NTUSER_DAT || image.is_empty() || !hive_image_ok(&image) {
+        return false;
+    }
+    if registry_journal::owns_volume() {
+        *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = Some(image);
         return false;
     }
     let len = image.len() as u64;
@@ -599,6 +606,9 @@ fn note_restored_snapshot(generation: u64, bytes: usize, nodes: usize) {
 static mut WRITABLE_MOUNT_ID: Option<nt_memory_manager::SectionMountId> = None;
 
 unsafe fn install_writable_fs(mut fs: nt_fs::FileSystem, restored: bool) -> Result<(), u32> {
+    if registry_journal::owns_volume() {
+        return Err(snapshot_storage::BUSY);
+    }
     if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some() {
         return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
     }
@@ -911,6 +921,9 @@ unsafe fn provision_missing_installed_sources(fs: &mut nt_fs::FileSystem) -> boo
 /// # Safety
 /// Single-threaded executive; the returned reference must not outlive the calling syscall service.
 unsafe fn writable_fs() -> Result<&'static mut nt_fs::FileSystem, u32> {
+    if registry_journal::owns_volume() {
+        return Err(snapshot_storage::BUSY);
+    }
     if !WRITABLE_OVERLAY_MOUNTED {
         return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     }
@@ -955,6 +968,9 @@ pub(crate) unsafe fn ensure_mounted() -> Result<(), u32> {
 /// A non-mounting namespace observation. An unread or unsuccessfully installed snapshot is not
 /// an absent upper layer. Only a disabled overlay or a confirmed empty reserve permits that result.
 unsafe fn mounted_namespace_fs() -> Result<Option<&'static mut nt_fs::FileSystem>, u32> {
+    if registry_journal::owns_volume() {
+        return Err(snapshot_storage::BUSY);
+    }
     if !WRITABLE_OVERLAY_MOUNTED {
         return Ok(None);
     }
@@ -1012,6 +1028,9 @@ fn owned_file_before_publish(
 /// Single-threaded early boot, after the executable FAT volume is mounted and before hosted code.
 pub(crate) unsafe fn restore_boot_system_persistence(
 ) -> Result<BootSystemPersistence, BootSystemRestoreError> {
+    if registry_journal::owns_volume() {
+        return Err(BootSystemRestoreError::Snapshot(snapshot_storage::BUSY));
+    }
     if !WRITABLE_OVERLAY_MOUNTED {
         return Err(BootSystemRestoreError::OverlayDisabled);
     }
@@ -1069,7 +1088,7 @@ pub(crate) unsafe fn restore_boot_system_persistence(
 
 /// Whether the volume has been mounted (i.e. something actually resolved into it).
 pub(crate) unsafe fn writable_fs_mounted() -> bool {
-    (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some()
+    registry_journal::owns_volume() || (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some()
 }
 
 /// Copy a complete internal file into caller-owned storage without exposing a filesystem borrow.
@@ -1794,11 +1813,17 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
     }
 
     fn flush_image(&mut self) -> Result<(), nt_hive_core::HiveIoError> {
-        Ok(())
+        // Hive bytes live in the writable volume. A file-cache flush alone does not publish
+        // its immutable snapshot or issue the backing device's durability barrier.
+        unsafe { checkpoint_dirty_volume() }
+            .map(|_| ())
+            .map_err(|_| nt_hive_core::HiveIoError::Io)
     }
 
     fn flush_log(&mut self) -> Result<(), nt_hive_core::HiveIoError> {
-        Ok(())
+        unsafe { checkpoint_dirty_volume() }
+            .map(|_| ())
+            .map_err(|_| nt_hive_core::HiveIoError::Io)
     }
 
     fn get_status(&self) -> Result<nt_hive_core::HiveIoStatus, nt_hive_core::HiveIoError> {

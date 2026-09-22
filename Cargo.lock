@@ -241,6 +241,9 @@ dependencies = [
 [[package]]
 name = "nt-config-manager"
 version = "0.1.0"
+dependencies = [
+ "nt-security",
+]
 
 [[package]]
 name = "nt-config-server"
