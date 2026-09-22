@@ -1,4 +1,4 @@
-//! Native ownership of a hosted SYSTEM create from before BEGIN through exact terminal ACK.
+//! Native SYSTEM create ownership from before BEGIN through exact terminal ACK.
 
 use crate::*;
 use alloc::string::String;

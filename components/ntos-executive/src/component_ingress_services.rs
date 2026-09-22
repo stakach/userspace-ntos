@@ -508,7 +508,11 @@ pub(crate) unsafe fn cancel_parked_service(route: PeerRoute) -> Result<(), Error
     }
     wait.phase = if registry {
         if acknowledged {
-            WaitPhase::StoppedAcknowledged
+            if wait.semantic_retired {
+                WaitPhase::Finished
+            } else {
+                WaitPhase::StoppedAcknowledged
+            }
         } else {
             WaitPhase::Cancelled
         }
