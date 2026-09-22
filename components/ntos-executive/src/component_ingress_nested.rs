@@ -5,6 +5,7 @@ use nt_component_suspension::NestedExecutionScope;
 
 struct Parent {
     route: PeerRoute,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
     hold: Option<u64>,
     scope: Option<NestedExecutionScope>,
     release_entered: bool,
@@ -33,6 +34,7 @@ pub(crate) unsafe fn park_current() -> Result<Option<usize>, Error> {
     };
     rows[index] = Some(Parent {
         route,
+        dispatch,
         hold: None,
         scope: None,
         release_entered: false,
@@ -43,6 +45,8 @@ pub(crate) unsafe fn park_current() -> Result<Option<usize>, Error> {
     let hold = sel4_rt::execution_hold::acquire(route.identity().executor)
         .map_err(|_| Error::Admission)?;
     rows[index].as_mut().expect("retained parent").hold = Some(hold);
+    crate::driver_launch::driver_thread_projection::hold(route, dispatch)
+        .map_err(|_| Error::Admission)?;
     let owner = owner();
     let scope = owner
         .receiver
@@ -87,8 +91,12 @@ pub(crate) unsafe fn restore(index: Option<usize>) -> Result<(), Error> {
             |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
         )
         .map_err(|_| Error::Admission)?;
+    crate::driver_launch::driver_thread_projection::restore(parent.route, parent.dispatch)
+        .map_err(|_| Error::Admission)?;
     parent.release_entered = true;
     sel4_rt::execution_hold::release(parent.route.identity().executor, hold)
+        .map_err(|_| Error::Admission)?;
+    crate::driver_launch::driver_thread_projection::restored(parent.route, parent.dispatch)
         .map_err(|_| Error::Admission)?;
     rows[index] = None;
     Ok(())

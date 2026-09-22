@@ -42,6 +42,7 @@ pub mod ps_bootstrap;
 pub mod registry_bootstrap;
 pub mod registry_subject;
 pub mod provider_registry_callers;
+pub mod provider_thread_projection;
 pub mod provider_dispatch_clients;
 mod services;
 pub mod sched_context;

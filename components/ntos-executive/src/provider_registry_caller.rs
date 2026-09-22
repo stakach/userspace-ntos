@@ -43,6 +43,8 @@ impl Scope {
 
 /// Called only after canonical shared ingress has authenticated this job's final completion.
 pub(crate) unsafe fn retire_completed(route: PeerRoute, dispatch: LaneDispatchIdentity) {
+    crate::driver_launch::driver_thread_projection::complete(route, dispatch)
+        .expect("completed driver projection retains exact thread references");
     service_sec_image::with_provider_process_manager(|pm| {
         (&mut *core::ptr::addr_of_mut!(OWNERS)).retire(pm, route, dispatch)
     })

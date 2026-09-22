@@ -113,6 +113,8 @@ unsafe fn hosted_component_pump_inner(
         crate::provider_registry_caller::Scope::enter(channel, caller)
             .expect("root-issued provider registry caller must match the executing job")
     });
+    crate::driver_launch::driver_thread_projection::enter(channel, caller)
+        .expect("driver execution requires its exact retained thread projection");
     let scope = ComponentSchedulerScope::enter();
     let mut result = crate::spawn_hosts::component_pump(channel);
     while result.scheduler_yielded {

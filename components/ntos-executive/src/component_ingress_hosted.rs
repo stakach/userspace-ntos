@@ -1,6 +1,7 @@
 //! Hosted-user Calls retain independent thread identity beside component dispatch ownership.
 
 use super::*;
+use core::sync::atomic::Ordering;
 use nt_component_suspension::{ExternalIngress, ReplyBindingObservation};
 type Binding = nt_user_host::thread_binding::ThreadBinding<crate::HostedThreadRole>;
 
@@ -98,6 +99,9 @@ pub(crate) unsafe fn take_hosted_with(
     import: impl FnOnce(u64, &ReceivedMessage) -> bool,
 ) -> Result<Option<(u64, ReceivedMessage)>, Error> {
     recycle_completed()?;
+    if crate::writable_fs::registry_journal::owns_volume() {
+        return Ok(None);
+    }
     let Some(row) = (&mut *core::ptr::addr_of_mut!(CALLS))
         .iter_mut()
         .filter_map(Option::as_mut)
@@ -122,6 +126,46 @@ pub(crate) unsafe fn take_hosted_with(
     }
     row.delivered = true;
     Ok(Some((reply, message)))
+}
+
+/// Return an unexecuted root delivery to its existing physical ingress owner. No syscall has
+/// been admitted yet, so replay restores the original full message rather than captured argv.
+pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(), Error> {
+    if !crate::writable_fs::registry_journal::owns_volume()
+        || crate::REPLY_MAIN_SLOT.load(Ordering::Relaxed) != reply
+    {
+        return Err(Error::PhysicalIdentity);
+    }
+    let index = (&*core::ptr::addr_of!(CALLS))
+        .iter()
+        .position(|entry| entry.as_ref().is_some_and(|row| {
+            row.binding.badge == badge
+                && row.delivered
+                && row.completion.is_none()
+                && !row.released
+                && row.call.as_ref().is_some_and(|call| call.reply() == reply && call.can_park())
+        }))
+        .ok_or(Error::Retain)?;
+    let binding = (&*core::ptr::addr_of!(CALLS))[index].as_ref().unwrap().binding;
+    if crate::service_sec_image::hosted_ingress_binding(badge) != Some(binding) {
+        return Err(Error::PhysicalIdentity);
+    }
+    {
+        let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+        if crate::spawn_hosts::query_component_reply_binding(binding.tcb, reply)
+            != Ok(ReplyBindingObservation::BoundToTarget)
+        {
+            return Err(Error::Reply);
+        }
+    }
+    let pool_index = crate::wait_reply_pool_find_cap(reply).ok_or(Error::Reply)?;
+    let park = crate::root_reply_park::RootReplyPark::prepare().ok_or(Error::Retain)?;
+    // This is a memory-only ownership transfer. The ingress owner keeps the capability and its
+    // exact caller; only the root semantic pool record is removed, never the physical Reply.
+    park.commit();
+    crate::wait_reply_pool_clear_cap(pool_index);
+    (&mut *core::ptr::addr_of_mut!(CALLS))[index].as_mut().unwrap().delivered = false;
+    Ok(())
 }
 
 pub(crate) unsafe fn owns_hosted_reply(reply: u64) -> bool {

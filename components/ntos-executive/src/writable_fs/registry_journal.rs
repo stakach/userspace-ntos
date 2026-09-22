@@ -7,7 +7,7 @@ use nt_fs::{OwnedSnapshotJournal, SnapshotJournalError};
 
 static OWNED: AtomicBool = AtomicBool::new(false);
 
-pub(super) fn owns_volume() -> bool {
+pub(crate) fn owns_volume() -> bool {
     OWNED.load(Ordering::Acquire)
 }
 

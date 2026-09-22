@@ -33,9 +33,16 @@ enum Phase {
     Open,
     Acknowledge,
     Abort,
+    Rollback,
     AcknowledgeAbort(SystemHiveMutationAbortReceipt),
+    ReleaseRollback,
     Complete,
+    ReadyReply,
     ReplyEntered,
+    ReplySent,
+    RevokeReply,
+    RetypeReply,
+    ReconcileRuntime,
 }
 
 struct Work {
@@ -46,6 +53,9 @@ struct Work {
     receipt: Option<SystemHiveMutationCommitReceipt>,
     opening: Option<cm_key_ownership::PublicationOpen>,
     status: u32,
+    cancelled: bool,
+    commit_entered: bool,
+    published: bool,
 }
 
 static mut ATTEMPTS: CmMutationBeginAttempts = CmMutationBeginAttempts::new();
@@ -56,6 +66,7 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 static TRANSFERRED: AtomicBool = AtomicBool::new(false);
 static mut EXECUTING: Option<ProviderLogicalCaller> = None;
+static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 const RETRY_DELAY: u64 = 10_000_000;
 
 /// Failure returns both canonical owners unchanged; no CM mutation has been sent.
@@ -75,10 +86,16 @@ pub(crate) unsafe fn submit_hosted(
         let logical = handler.capture_provider_logical_caller(
             handler.pi, handler.current_tid, handler.current_badge, tcb,
         ).ok_or(0xC000_0008u32)?;
+        if logical.thread() != publication.subject.caller().original_thread() {
+            return Err(0xC000_0008);
+        }
         let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT.ok_or(0xC000_00A3u32)?;
         let park = root_reply_park::RootReplyPark::prepare().ok_or(0xC000_009Au32)?;
         let rows = &mut *core::ptr::addr_of_mut!(WORK);
-        rows.try_reserve(1).map_err(|_| 0xC000_009Au32)?;
+        let index = rows.iter().enumerate().find_map(|(index, row)|
+            (row.is_none() && EXECUTING_INDEX.load(Ordering::Relaxed) != index as u64)
+                .then_some(index));
+        if index.is_none() { rows.try_reserve(1).map_err(|_| 0xC000_009Au32)?; }
         let mut reference = handler.pm.reference_native_requestor(publication.subject.caller())?;
         let attempt = match (&mut *core::ptr::addr_of_mut!(ATTEMPTS))
             .reserve(mount, expected_generation, &[mutation], ())
@@ -89,9 +106,9 @@ pub(crate) unsafe fn submit_hosted(
                 return Err(status as u32);
             }
         };
-        Ok((park, attempt, logical, reference))
+        Ok((park, attempt, logical, reference, index))
     })();
-    let (park, attempt, logical, reference) = match admission {
+    let (park, attempt, logical, reference, index) = match admission {
         Ok(admission) => admission,
         Err(status) => return Err((status, publication, parent_owner)),
     };
@@ -114,10 +131,16 @@ pub(crate) unsafe fn submit_hosted(
         },
     };
     assert_ne!(caller.reply, 0);
-    (&mut *core::ptr::addr_of_mut!(WORK)).push(Some(Work {
+    let work = Some(Work {
         caller, phase: Phase::Begin(attempt), prepared: None, journal: None,
         receipt: None, opening: None, status: 0,
-    }));
+        cancelled: false, commit_entered: false, published: false,
+    });
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
+    match index {
+        Some(index) => rows[index] = work,
+        None => rows.push(work),
+    }
     // The row owns the live Reply before ingress can select a replacement.
     park.commit();
     PENDING.fetch_add(1, Ordering::Release);
@@ -143,7 +166,8 @@ fn has_matching(predicate: impl Fn(ProviderLogicalCaller) -> bool) -> bool {
     unsafe {
         (*core::ptr::addr_of!(EXECUTING)).is_some_and(&predicate)
             || (&*core::ptr::addr_of!(WORK)).iter().flatten()
-                .any(|work| predicate(work.caller.logical))
+                .any(|work| !matches!(work.phase, Phase::ReconcileRuntime)
+                    && predicate(work.caller.logical))
     }
 }
 
@@ -156,7 +180,7 @@ pub(crate) fn wake_due(now: u64) -> u64 {
 }
 
 /// Top-level only. The selected owner is moved, never borrowed, across component IPC.
-pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
+pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_execution::Queue) {
     if PENDING.load(Ordering::Acquire) == 0
         || monotonic_time_100ns() < NEXT.load(Ordering::Acquire)
         || ACTIVE.swap(true, Ordering::AcqRel)
@@ -175,12 +199,15 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         })
     };
     if let Some((index, mut work)) = selected {
+        EXECUTING_INDEX.store(index as u64, Ordering::Relaxed);
         CURSOR.store(index as u64 + 1, Ordering::Relaxed);
         *core::ptr::addr_of_mut!(EXECUTING) = Some(work.caller.logical);
         let mut completed = false;
         // Bound each sweep; long journals resume fairly on the next maintenance tick.
         for _ in 0..16 {
-            match advance(handler, &mut work) {
+            *core::ptr::addr_of_mut!(EXECUTING) =
+                (!matches!(work.phase, Phase::ReconcileRuntime)).then_some(work.caller.logical);
+            match advance(handler, queue, &mut work) {
                 Ok(true) => { completed = true; break; }
                 Ok(false) => {}
                 Err(_) => { failed = true; break; }
@@ -192,12 +219,27 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
             (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
         }
         *core::ptr::addr_of_mut!(EXECUTING) = None;
+        EXECUTING_INDEX.store(u64::MAX, Ordering::Relaxed);
     }
     NEXT.store(monotonic_time_100ns().saturating_add(if failed { RETRY_DELAY } else { 0 }), Ordering::Release);
     ACTIVE.store(false, Ordering::Release);
 }
 
-unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> Result<bool, i32> {
+unsafe fn caller_cancelled(handler: &ExecNtHandler, caller: &Caller) -> bool {
+    spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(caller.reply)
+        || handler.pm.thread(caller.logical.thread().thread_id())
+            .is_some_and(|thread| thread.state == nt_process::ThreadState::Terminated)
+        || handler.pm.process(caller.logical.process().pid)
+            .is_some_and(|process| process.state == nt_process::ProcessState::Terminated)
+}
+
+unsafe fn advance(
+    handler: &mut ExecNtHandler,
+    queue: &mut nt_delay_execution::Queue,
+    work: &mut Work,
+) -> Result<bool, i32> {
+    work.cancelled |= caller_cancelled(handler, &work.caller);
+    if work.cancelled && work.status == 0 { work.status = 0xC000_0120; }
     match &mut work.phase {
         Phase::Begin(attempt) => {
             let attempts = &mut *core::ptr::addr_of_mut!(ATTEMPTS);
@@ -259,6 +301,10 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> Result<bool, 
             }
         }
         Phase::Admit => {
+            if work.cancelled {
+                work.phase = Phase::Abort;
+                return Ok(false);
+            }
             let prepared = work.prepared.as_ref().unwrap();
             if let Err(status) = cm_mutation_transport::validate_storage(prepared) {
                 work.status = status as u32;
@@ -279,12 +325,26 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> Result<bool, 
             }
         }
         Phase::Durable => {
+            if work.cancelled {
+                work.phase = Phase::Rollback;
+                return Ok(false);
+            }
             let journal = work.journal.as_mut().unwrap();
             journal.make_durable().map_err(|status| status as i32)?;
-            journal.begin_publication().map_err(|status| status as i32)?;
             work.phase = Phase::Commit;
         }
         Phase::Commit => {
+            if work.cancelled && !work.commit_entered {
+                work.phase = if work.journal.is_some() { Phase::Rollback } else { Phase::Abort };
+                return Ok(false);
+            }
+            if !work.commit_entered {
+                if let Some(journal) = work.journal.as_mut() {
+                    journal.begin_publication().map_err(|status| status as i32)?;
+                }
+                // No IPC separates the storage barrier from recording COMMIT entry.
+                work.commit_entered = true;
+            }
             let receipt = cm_mutation_transport::commit(work.prepared.as_ref().unwrap())?;
             let outcome = receipt.outcome();
             LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(outcome.generation, Ordering::AcqRel);
@@ -295,6 +355,10 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> Result<bool, 
             work.phase = Phase::Open;
         }
         Phase::Open => {
+            if work.cancelled && work.opening.is_none() {
+                work.phase = Phase::Acknowledge;
+                return Ok(false);
+            }
             if work.opening.is_none() {
                 let parent = handler.cm_system_key_target(work.caller.parent)
                     .expect("retained SYSTEM parent disappeared");
@@ -305,12 +369,17 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> Result<bool, 
             };
             work.opening = None;
             let result = match opened {
+                Ok(opened) if work.cancelled => {
+                    let _ = config_manager_retire_system_hive_key(opened.lease);
+                    Err(work.status)
+                }
                 Ok(opened) => match handler.install_cm_system_key_target(CmSystemKeyTarget {
                     lease: opened.lease,
                     physical_path: nt_hive_core::canon_path(&opened.physical_path),
                 }) {
                     Ok(target) => {
-                        if !handler.validate_provider_logical_caller(work.caller.logical) {
+                        if caller_cancelled(handler, &work.caller)
+                            || !handler.validate_provider_logical_caller(work.caller.logical) {
                             handler.release_registry_key_target(target);
                             work.status = 0xC000_004B;
                             work.phase = Phase::Acknowledge;
@@ -322,6 +391,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> Result<bool, 
                             &mut work.caller.publication, target, work.caller.grant, true,
                         );
                         handler.pi = saved_pi;
+                        work.published = result.is_ok();
                         result
                     }
                     Err(status) => {
@@ -351,28 +421,82 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> Result<bool, 
             let receipt = cm_mutation_transport::abort(work.prepared.as_ref().unwrap())?;
             work.phase = Phase::AcknowledgeAbort(receipt);
         }
+        Phase::Rollback => {
+            work.journal.as_mut().expect("unpublished journal owner")
+                .rollback().map_err(|status| status as i32)?;
+            work.phase = Phase::Abort;
+        }
         Phase::AcknowledgeAbort(receipt) => {
             cm_mutation_transport::acknowledge_abort(*receipt)?;
+            work.phase = Phase::ReleaseRollback;
+        }
+        Phase::ReleaseRollback => {
+            if let Some(journal) = work.journal.take() {
+                match journal.release_rolled_back() {
+                    Ok(()) => {}
+                    Err(journal) => {
+                        work.journal = Some(journal);
+                        return Err(0xC000_000Du32 as i32);
+                    }
+                }
+            }
             work.phase = Phase::Complete;
         }
         Phase::Complete => {
-            if work.status != 0 {
+            if !work.published {
                 handler.abort_hosted_registry_publication(&mut work.caller.publication);
             }
             if let Some(target) = work.caller.parent_owner.abort(&mut handler.pm)
                 .expect("retained registry create parent") {
                 handler.release_registry_key_target(target);
             }
+            work.phase = Phase::ReadyReply;
+        }
+        Phase::ReadyReply => {
+            if work.cancelled {
+                work.phase = Phase::RevokeReply;
+                return Ok(false);
+            }
+            parked_reply::validate_saved(work.caller.reply).map_err(|status| status as i32)?;
             // An uncertain send cannot repeat cleanup or issue a second reply to this owner.
             work.phase = Phase::ReplyEntered;
             let delivered = crate::service_sec_image::complete_registry_mutation_reply(
                 handler, work.caller.tid, work.caller.badge, work.caller.reply, work.status,
             );
             if !delivered { return Err(0xC000_00A3u32 as i32); }
+            work.phase = Phase::ReplySent;
+        }
+        Phase::ReplySent => {
+            parked_reply::retire_sent(work.caller.reply).map_err(|status| status as i32)?;
+            if work.cancelled {
+                work.phase = Phase::ReconcileRuntime;
+                return Ok(false);
+            }
+            thread_wait_state_clear_badge_ready(handler, work.caller.badge);
             work.caller.reference.release(&mut handler.pm).expect("registry caller reference");
             return Ok(true);
         }
-        Phase::ReplyEntered => return Err(0xC000_00A3u32 as i32),
+        Phase::ReplyEntered => {
+            if !work.cancelled { return Err(0xC000_00A3u32 as i32); }
+            work.phase = Phase::RevokeReply;
+        }
+        Phase::RevokeReply => {
+            if !spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(work.caller.reply) {
+                parked_reply::revoke(work.caller.reply).map_err(|status| status as i32)?;
+            }
+            work.phase = Phase::RetypeReply;
+        }
+        Phase::RetypeReply => {
+            parked_reply::retype(work.caller.reply).map_err(|status| status as i32)?;
+            work.phase = Phase::ReconcileRuntime;
+        }
+        Phase::ReconcileRuntime => {
+            if !hosted_termination::reconcile(handler, queue, work.caller.logical) {
+                return Err(0xC000_00A3u32 as i32);
+            }
+            work.caller.reference.release(&mut handler.pm).expect("retired registry caller reference");
+            return Ok(true);
+        }
     }
     Ok(false)
 }

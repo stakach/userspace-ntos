@@ -3286,6 +3286,11 @@ fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
 }
 
 fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
+    // The journal owns the mounted volume, including all dirty state, until its terminal proof.
+    // Leave maintenance flags untouched; an unavailable volume is neither clean nor absent.
+    if crate::writable_fs::registry_journal::owns_volume() {
+        return nt_fs::STATUS_SUCCESS;
+    }
     unsafe { kernel_provider_activation::publish_runtime_waits(nt_handler) };
     unsafe { inline_file_retirement::redrive(nt_handler) };
     unsafe { crate::object_wait_apc::redrive(nt_handler) };
@@ -8277,6 +8282,7 @@ pub(crate) unsafe fn service_sec_image(
                     b"all-live-waiting",
                 )
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-waiting")
+                && crate::registry_mutation_work::next_deadline().is_none()
             {
                 print_str(
                     b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n",
@@ -8381,12 +8387,28 @@ pub(crate) unsafe fn service_sec_image(
         crate::cm_snapshot_ownership::retry_cleanup(monotonic_time_100ns());
         {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
-            crate::registry_mutation_work::redrive(&mut nt_handler);
+            crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
             crate::current_apc::redrive(&mut nt_handler);
             crate::current_apc::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
             crate::object_wait_reply::redrive(&mut nt_handler);
             crate::object_wait_reply::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
             inline_file_retirement::redrive(&mut nt_handler);
+        }
+        if crate::writable_fs::registry_journal::owns_volume()
+            && badge != DELAY_TIMER_BADGE
+            && hosted_irq_lines_from_badge(badge) == 0
+        {
+            crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
+                REPLY_MAIN_SLOT.load(Ordering::Relaxed), badge,
+            ).expect("unexecuted hosted delivery retains its physical ingress owner");
+            let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            badge = received.0;
+            mi = received.1;
+            m0 = received.2;
+            m1 = received.3;
+            m2 = received.4;
+            m3 = received.5;
+            continue;
         }
         let ingress = if badge == DELAY_TIMER_BADGE || hosted_irq_lines_from_badge(badge) != 0 {
             None
@@ -11440,7 +11462,7 @@ pub(crate) unsafe fn service_sec_image(
                         // The durable mutation owner already captured and rotated this Reply.
                         // STATUS_PENDING is internal state, never the syscall's terminal reply.
                         mark_wait_parked!(pi, resume_ip);
-                        crate::registry_mutation_work::redrive(&mut nt_handler);
+                        crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
                         let _ = finalize_service_loop_state(&mut nt_handler);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
@@ -24495,8 +24517,7 @@ pub(crate) unsafe fn complete_registry_mutation_reply(
     if !reply_parked_syscall(reply, status as u64) {
         return false;
     }
-    release_reply_pool_cap(reply);
-    thread_wait_state_clear_badge_ready(handler, badge);
+    let _ = (handler, badge);
     true
 }
 

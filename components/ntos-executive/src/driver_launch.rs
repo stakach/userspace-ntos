@@ -72,6 +72,8 @@ pub(crate) use hosted_file_owners::Stats as HostedFileOwnerStats;
 mod hosted_video_port_control;
 #[path = "driver_ps_context.rs"]
 mod driver_ps_context;
+#[path = "driver_thread_projection.rs"]
+pub(crate) mod driver_thread_projection;
 #[path = "driver_ps_pool_alias.rs"]
 mod driver_ps_pool_alias;
 
@@ -36675,6 +36677,8 @@ unsafe fn load_driver_reserved(
     );
     let route = hosted_ingress_sources::enroll_primary(instance)
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
+    driver_thread_projection::bootstrap(route, caller)
+        .map_err(|status| nt_status::NtStatus(status as i32))?;
     let parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
     crate::spawn_hosts::shared_ingress::owner::runtime::start_bootstrap(route, cnode, sched_context)

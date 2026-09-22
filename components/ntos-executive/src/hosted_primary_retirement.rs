@@ -245,6 +245,7 @@ pub(super) unsafe fn release(instance_index: usize, inst: DriverInstance) -> boo
         }
     }
     // Exact primary stop/drain and worker retirement precede canonical Ps alias teardown.
+    if driver_thread_projection::retire_stopped(route, inst).is_err() { return false; }
     if driver_ps_context::retire(inst).is_err() { return false; }
     while row(index).next < row(index).effects.len() {
         let effect = row(index).effects[row(index).next];
