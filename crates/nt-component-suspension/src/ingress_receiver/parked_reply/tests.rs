@@ -107,11 +107,23 @@ fn parked_reply_ack_preserves_other_running_lane_and_wait_epoch() {
         Ok(Some(dispatch))
     );
     assert_eq!(lanes.external_top(dispatch.lane()), Ok(Some(77)));
+    assert_eq!(
+        receiver.stored_reply_acknowledged(route, dispatch, 40),
+        Ok(true)
+    );
     assert!(receiver
-        .store
-        .stored_dispatch_mut(route, dispatch)
-        .unwrap()
-        .is_acknowledged());
+        .stored_reply_acknowledged(route, dispatch, 41)
+        .is_err());
+    assert!(receiver
+        .stored_reply_acknowledged(
+            route,
+            LaneDispatchIdentity {
+                lane: dispatch.lane(),
+                epoch: dispatch.epoch() + 1,
+            },
+            40
+        )
+        .is_err());
     assert!(lanes.resume_external(dispatch.lane(), 40, 77).is_err());
     lanes.finish_dispatch(other, 70).unwrap();
     lanes.resume_external(dispatch.lane(), 40, 77).unwrap();
@@ -160,6 +172,10 @@ fn uncertain_reply_is_retained_and_never_replayed() {
     assert_eq!(lanes.running(), Some(other));
     assert_eq!(lanes.external_top(dispatch.lane()), Ok(Some(77)));
     assert_eq!(peers.state(route).unwrap().1, 1);
+    assert_eq!(
+        receiver.stored_reply_acknowledged(route, dispatch, 40),
+        Ok(false)
+    );
 }
 
 #[test]

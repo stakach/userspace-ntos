@@ -6,6 +6,7 @@ use nt_component_suspension::peer_registry::PeerRoute;
 
 pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute) -> PumpMessage {
     loop {
+        crate::registry_mutation_work::redrive_provider();
         if runtime::resume_service(route).is_err() {
             return PumpMessage::transport_wall();
         }
@@ -24,14 +25,18 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute) -> PumpMessage 
             }
             return message;
         }
-        match runtime::next_autonomous() {
-            Ok(Some(sender)) => {
-                service_autonomous(sender)
-                    .expect("autonomous failure retains its own source and parent scope");
-                continue;
+        // The registry journal has moved the mounted volume into its own transaction.
+        // Leave autonomous Calls in the retained receiver until that owner releases it.
+        if !crate::writable_fs::registry_journal::owns_volume() {
+            match runtime::next_autonomous() {
+                Ok(Some(sender)) => {
+                    service_autonomous(sender)
+                        .expect("autonomous failure retains its own source and parent scope");
+                    continue;
+                }
+                Ok(None) => {}
+                Err(_) => return PumpMessage::transport_wall(),
             }
-            Ok(None) => {}
-            Err(_) => return PumpMessage::transport_wall(),
         }
         if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
             && crate::dispatcher_bootstrap::timer_work_pending()

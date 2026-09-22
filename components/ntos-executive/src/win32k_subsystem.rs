@@ -11832,12 +11832,14 @@ const _: () = assert!(
 );
 
 
-struct Win32kRegistrySubject(nt_user_host::registry_subject::RegistrySubject);
+struct Win32kRegistrySubject(Option<nt_user_host::registry_subject::RegistrySubject>);
 
 impl Drop for Win32kRegistrySubject {
     fn drop(&mut self) {
-        unsafe { crate::with_provider_security_managers(|_, tokens| self.0.release(tokens)) }
-            .expect("captured Win32k registry subject owns its original tokens");
+        if let Some(subject) = self.0.as_mut() {
+            unsafe { crate::with_provider_security_managers(|_, tokens| subject.release(tokens)) }
+                .expect("captured Win32k registry subject owns its original tokens");
+        }
     }
 }
 
@@ -12259,7 +12261,7 @@ unsafe fn service_win32k_registry_create(
     root: u64,
     create_options: u64,
     class_present: u64,
-) -> Result<(u64, u64), i32> {
+) -> Result<crate::driver_launch::DriverRegistryCreateResult, i32> {
     if create_options > u32::MAX as u64 || class_present > 1 {
         return Err(STATUS_INVALID_PARAMETER_I32);
     }
@@ -12305,10 +12307,9 @@ unsafe fn service_win32k_registry_create(
 
     let mut path = crate::driver_launch::HostedAscii::empty();
     if !path.push_str(name) { return Err(STATUS_INSUFFICIENT_RESOURCES_I32); }
-    let (status, handle, disposition) = crate::driver_launch::service_hosted_driver_create_registry_path(
+    Ok(crate::driver_launch::service_hosted_driver_create_registry_path(
         caller, path, create_options, metadata, subject, class.as_deref(),
-    );
-    if status == 0 { Ok((handle, disposition)) } else { Err(status) }
+    ))
 }
 
 unsafe fn service_win32k_registry_open(caller: nt_process::native_handle::NativeHandleCaller,
@@ -12339,6 +12340,74 @@ unsafe fn service_win32k_registry_query(
 /// Service one pointer-free registry request from the win32k component. This is called only by the
 /// executive-side component pump, which owns the Configuration Manager transport and handle table.
 pub(crate) unsafe fn service_registry_request(
+    channel: &crate::spawn_hosts::PumpChannel,
+    op: u64,
+    arg: u64,
+    param1: u64,
+    param2: u64,
+) -> crate::registry_mutation_work::ProviderRegistryResult {
+    use crate::registry_mutation_work::ProviderRegistryResult;
+    if op & !WIN32K_REGISTRY_USE_PREVIOUS_MODE != WIN32K_REGISTRY_OP_CREATE_KEY {
+        return ProviderRegistryResult::Ready(service_registry_request_sync(
+            channel, op, arg, param1, param2,
+        ));
+    }
+    let caller = match crate::provider_registry_caller::resolve(channel) {
+        Ok(caller) => caller,
+        Err(status) => return ProviderRegistryResult::Ready((status as i32, 0, 0)),
+    };
+    let previous_mode = op & WIN32K_REGISTRY_USE_PREVIOUS_MODE != 0
+        || read_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_PREVIOUS_MODE) as *const u32) != 0;
+    let caller = if previous_mode && channel.logical_caller.is_some() {
+        match crate::with_provider_process_manager(|pm| {
+            pm.capture_native_handle_caller(caller.original_thread(), nt_types::AccessMode::UserMode)
+        }) {
+            Ok(caller) => caller,
+            Err(status) => return ProviderRegistryResult::Ready((status as i32, 0, 0)),
+        }
+    } else {
+        caller
+    };
+    let dispatch = match crate::driver_launch::driver_registry_handles::RegistryPublicationDispatch::capture(channel) {
+        Ok(dispatch) => dispatch,
+        Err(status) => return ProviderRegistryResult::Ready((status as i32, 0, 0)),
+    };
+    let length = read_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_SECURITY_LEN) as *const u32) as usize;
+    if length > WIN32K_REGISTRY_VALUE_CAP {
+        return ProviderRegistryResult::Ready((STATUS_INVALID_PARAMETER_I32, 0, 0));
+    }
+    let attributes = read_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_ATTRIBUTES) as *const u32);
+    if attributes & !0x6c2 != 0 {
+        return ProviderRegistryResult::Ready((STATUS_INVALID_PARAMETER_I32, 0, 0));
+    }
+    let mut metadata = crate::driver_launch::DriverRegistryOpenMetadata {
+        dispatch,
+        root_handle: None,
+        desired_access: read_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DESIRED_ACCESS) as *const u32),
+        attributes,
+        security_descriptor: (length != 0).then(|| {
+            core::slice::from_raw_parts((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_OFF) as *const u8, length).to_vec()
+        }),
+    };
+    let mut subject = match crate::with_provider_security_managers(|pm, tokens| {
+        nt_user_host::registry_subject::RegistrySubject::capture(pm, tokens, caller)
+    }) {
+        Ok(subject) => Win32kRegistrySubject(Some(subject)),
+        Err(status) => return ProviderRegistryResult::Ready((status as i32, 0, 0)),
+    };
+    write_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_VALUE_TYPE) as *mut u32, 0);
+    write_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_LEN) as *mut u32, 0);
+    match service_win32k_registry_create(
+        caller, &mut metadata, subject.0.as_ref().unwrap(), arg, param1, param2,
+    ) {
+        Ok(crate::driver_launch::DriverRegistryCreateResult::Ready(result)) => ProviderRegistryResult::Ready(result),
+        Ok(crate::driver_launch::DriverRegistryCreateResult::Deferred(admission)) =>
+            crate::registry_mutation_work::submit_provider(channel, admission, subject.0.take().unwrap()),
+        Err(status) => ProviderRegistryResult::Ready((status, 0, 0)),
+    }
+}
+
+unsafe fn service_registry_request_sync(
     channel: &crate::spawn_hosts::PumpChannel,
     op: u64,
     arg: u64,
@@ -12380,7 +12449,7 @@ pub(crate) unsafe fn service_registry_request(
     } else { None };
     let subject = if metadata.is_some() {
         match crate::with_provider_security_managers(|pm, tokens| nt_user_host::registry_subject::RegistrySubject::capture(pm, tokens, caller)) {
-            Ok(subject) => Some(Win32kRegistrySubject(subject)),
+            Ok(subject) => Some(Win32kRegistrySubject(Some(subject))),
             Err(status) => return (status as i32, 0, 0),
         }
     } else { None };
@@ -12401,7 +12470,7 @@ pub(crate) unsafe fn service_registry_request(
             else {
                 return (STATUS_INVALID_PARAMETER_I32, 0, 0);
             };
-            match service_win32k_registry_open(caller, metadata.as_mut().unwrap(), &subject.as_ref().unwrap().0, arg, &path) {
+            match service_win32k_registry_open(caller, metadata.as_mut().unwrap(), subject.as_ref().unwrap().0.as_ref().unwrap(), arg, &path) {
                 Ok(handle) => (0, handle, 0),
                 Err(status) => (status, 0, 0),
             }
@@ -12535,12 +12604,7 @@ pub(crate) unsafe fn service_registry_request(
             Ok(()) => (0, 0, 0),
             Err(status) => (status, 0, 0),
         },
-        WIN32K_REGISTRY_OP_CREATE_KEY => {
-            match service_win32k_registry_create(caller, metadata.as_mut().unwrap(), &subject.as_ref().unwrap().0, arg, param1, param2) {
-                Ok((handle, disposition)) => (0, handle, disposition),
-                Err(status) => (status, 0, 0),
-            }
-        }
+        WIN32K_REGISTRY_OP_CREATE_KEY => (STATUS_INVALID_PARAMETER_I32, 0, 0),
         _ => (STATUS_INVALID_PARAMETER_I32, 0, 0),
     }
 }

@@ -2346,9 +2346,18 @@ unsafe fn component_pump_loop(
         } else if label == crate::win32k_subsystem::W32_REGISTRY_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
-            let (status, out1, out2) =
-                crate::win32k_subsystem::service_registry_request(ch, msg.m0, msg.m1, msg.m2, msg.m3);
-            pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u32 as u64, out1, out2, 0);
+            match crate::win32k_subsystem::service_registry_request(ch, msg.m0, msg.m1, msg.m2, msg.m3) {
+                crate::registry_mutation_work::ProviderRegistryResult::Ready((status, out1, out2)) => {
+                    pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u32 as u64, out1, out2, 0);
+                }
+                crate::registry_mutation_work::ProviderRegistryResult::Deferred => {
+                    if shared_pump::autonomous(ch) {
+                        outcome.provider_wait_suspended = true;
+                        break;
+                    }
+                    msg = pump_recv(ch, *reply_cap);
+                }
+            }
             continue;
         } else if label == crate::win32k_subsystem::W32_EVENT_LABEL
             && ch.caps.kind == ReqKind::Syscall
@@ -2825,10 +2834,21 @@ unsafe fn component_pump_loop(
         } else if label == crate::driver_launch::FSD_SERVICE_REGISTRY_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
-            let (status, out1, out2) = crate::driver_launch::service_hosted_driver_registry(
+            let registry = crate::driver_launch::service_hosted_driver_registry(
                 ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
             );
-            pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u32 as u64, out1, out2, 0);
+            match registry {
+                crate::registry_mutation_work::ProviderRegistryResult::Ready((status, out1, out2)) => {
+                    pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u32 as u64, out1, out2, 0);
+                }
+                crate::registry_mutation_work::ProviderRegistryResult::Deferred => {
+                    if shared_pump::autonomous(ch) {
+                        outcome.provider_wait_suspended = true;
+                        break;
+                    }
+                    msg = pump_recv(ch, *reply_cap);
+                }
+            }
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PROVIDER_EXPORT_LABEL
             && ch.caps.kind == ReqKind::Irp

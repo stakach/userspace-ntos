@@ -10,12 +10,52 @@ pub(crate) struct DriverRegistryOpenMetadata {
     pub(crate) root_handle: Option<u64>,
 }
 
-pub(super) struct DriverRegistrySubject(pub(super) nt_user_host::registry_subject::RegistrySubject);
+#[must_use = "deferred creation owns canonical reservations until terminal publication or abort"]
+pub(crate) enum DriverRegistryCreateResult {
+    Ready((i32, u64, u64)),
+    Deferred(DeferredRegistryCreate),
+}
+
+pub(crate) struct DeferredRegistryCreate {
+    pub(crate) caller: nt_process::native_handle::NativeHandleCaller,
+    pub(crate) dispatch: driver_registry_handles::RegistryPublicationDispatch,
+    parent: driver_registry_handles::OwnedDriverRegistryPublication,
+    pub(crate) parent_lease: nt_config_client::SystemHiveKeyLease,
+    child: driver_registry_handles::OwnedDriverRegistryPublication,
+    pub(crate) leaf: String,
+    pub(crate) class_name: Option<String>,
+    pub(crate) descriptor: Vec<u8>,
+    pub(crate) grant: u32,
+    pub(crate) volatile: bool,
+    pub(crate) expected_generation: u64,
+}
+
+impl DeferredRegistryCreate {
+    pub(crate) unsafe fn bind_child(&mut self, target: u32) -> Result<(), i32> {
+        self.child.bind_reserved_target(target, self.grant)
+    }
+
+    pub(crate) unsafe fn release_parent(&mut self) -> Result<(), i32> {
+        self.parent.abort()
+    }
+
+    pub(crate) unsafe fn abort_child(&mut self) -> Result<(), i32> {
+        self.child.abort()
+    }
+
+    pub(crate) unsafe fn return_child_pending(&mut self) -> Result<u64, i32> {
+        self.child.return_pending()
+    }
+}
+
+pub(super) struct DriverRegistrySubject(pub(super) Option<nt_user_host::registry_subject::RegistrySubject>);
 
 impl Drop for DriverRegistrySubject {
     fn drop(&mut self) {
-        unsafe { crate::with_provider_security_managers(|_, tokens| self.0.release(tokens)) }
-            .expect("captured registry subject retains its canonical token references");
+        if let Some(subject) = self.0.as_mut() {
+            unsafe { crate::with_provider_security_managers(|_, tokens| subject.release(tokens)) }
+                .expect("captured registry subject retains its canonical token references");
+        }
     }
 }
 
@@ -158,7 +198,8 @@ pub(crate) unsafe fn service_hosted_driver_create_registry_path(
     metadata: &DriverRegistryOpenMetadata,
     subject: &nt_user_host::registry_subject::RegistrySubject,
     class: Option<&str>,
-) -> (i32, u64, u64) {
+) -> DriverRegistryCreateResult {
+    let _durable = crate::allocator::enter_durable();
     match driver_registry_handles::with_registry_root(
         metadata.dispatch,
         caller,
@@ -170,7 +211,7 @@ pub(crate) unsafe fn service_hosted_driver_create_registry_path(
         },
     ) {
         Ok(result) => result,
-        Err(status) => (status, 0, 0),
+        Err(status) => DriverRegistryCreateResult::Ready((status, 0, 0)),
     }
 }
 
@@ -182,9 +223,10 @@ unsafe fn create_registry_path(
     subject: &nt_user_host::registry_subject::RegistrySubject,
     class: Option<&str>,
     root: Option<DriverRegistryHandleTarget>,
-) -> (i32, u64, u64) {
+) -> DriverRegistryCreateResult {
+    use DriverRegistryCreateResult::{Deferred, Ready};
     if options & !5 != 0 {
-        return (STATUS_NOT_SUPPORTED, 0, 0);
+        return Ready((STATUS_NOT_SUPPORTED, 0, 0));
     }
     let volatile = options & 1 != 0;
     let backup = options & 4 != 0;
@@ -218,24 +260,20 @@ unsafe fn create_registry_path(
         metadata.attributes & 0x202,
         open,
     ) {
-        Ok(slot) => return (STATUS_SUCCESS, slot.handle, REG_OPENED_EXISTING_KEY as u64),
+        Ok(slot) => return Ready((STATUS_SUCCESS, slot.handle, REG_OPENED_EXISTING_KEY as u64)),
         Err(STATUS_OBJECT_NAME_NOT_FOUND) => (),
-        Err(status) => return (status, 0, 0),
+        Err(status) => return Ready((status, 0, 0)),
     }
-    let system = match root {
-        Some(DriverRegistryHandleTarget::System { .. }) => true,
-        Some(_) => false,
-        None => hosted_registry_path_is_system(path),
-    };
+    let absolute_system = root.is_none() && hosted_registry_path_is_system(path);
     let physical = if root.is_some() {
         alloc::string::String::from(path.as_str())
-    } else if system {
+    } else if absolute_system {
         let resolved = match crate::config_manager_resolve_system_hive_path(path.as_str()) {
             Ok(resolved) => resolved,
-            Err(status) => return (status, 0, 0),
+            Err(status) => return Ready((status, 0, 0)),
         };
         if resolved.mount_generation != expected_generation {
-            return (0xc000_0059u32 as i32, 0, 0);
+            return Ready((0xc000_0059u32 as i32, 0, 0));
         }
         resolved.physical_path
     } else {
@@ -243,11 +281,11 @@ unsafe fn create_registry_path(
     };
     let separator = physical.rfind('\\');
     if separator.is_none() && root.is_none() {
-        return (STATUS_OBJECT_PATH_NOT_FOUND, 0, 0);
+        return Ready((STATUS_OBJECT_PATH_NOT_FOUND, 0, 0));
     }
     let mut parent_path = HostedAscii::empty();
     if !parent_path.push_str(separator.map_or("", |index| &physical[..index])) {
-        return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
+        return Ready((STATUS_INSUFFICIENT_RESOURCES, 0, 0));
     }
     let mut prepared = None;
     let mut parent_revision = None;
@@ -315,10 +353,12 @@ unsafe fn create_registry_path(
         },
     ) {
         Ok(opened) => opened,
-        Err(STATUS_OBJECT_NAME_NOT_FOUND) => return (STATUS_OBJECT_PATH_NOT_FOUND, 0, 0),
-        Err(status) => return (status, 0, 0),
+        Err(STATUS_OBJECT_NAME_NOT_FOUND) => return Ready((STATUS_OBJECT_PATH_NOT_FOUND, 0, 0)),
+        Err(status) => return Ready((status, 0, 0)),
     };
     let prepared = prepared.expect("parent authorization prepares child security");
+    // Relative opens can cross from a virtual root into the CM-owned SYSTEM mount.
+    let system = matches!(parent_owner.target, DriverRegistryHandleTarget::System { .. });
     let physical = if root.is_some() {
         let mut admitted = String::from(parent_owner.target.path().as_str());
         if !admitted.ends_with('\\') {
@@ -360,7 +400,7 @@ unsafe fn create_registry_path(
         };
         retire_driver_registry_handle(metadata.dispatch, caller, parent_owner.handle)
             .expect("hosted parent remains retained through mutation");
-        return match result {
+        return Ready(match result {
             Ok((slot, created)) => (
                 STATUS_SUCCESS,
                 slot.handle,
@@ -371,7 +411,7 @@ unsafe fn create_registry_path(
                 } as u64,
             ),
             Err(status) => (status, 0, 0),
-        };
+        });
     }
     if !system {
         let result = match parent_revision {
@@ -405,7 +445,7 @@ unsafe fn create_registry_path(
         };
         retire_driver_registry_handle(metadata.dispatch, caller, parent_owner.handle)
             .expect("runtime parent retains publication");
-        return match result {
+        return Ready(match result {
             Ok((slot, created)) => (
                 STATUS_SUCCESS,
                 slot.handle,
@@ -416,59 +456,37 @@ unsafe fn create_registry_path(
                 } as u64,
             ),
             Err(status) => (status, 0, 0),
-        };
+        });
     }
-    let mutation = if system {
-        let DriverRegistryHandleTarget::System { lease, .. } = parent_owner.target else {
-            unreachable!("SYSTEM parent admission retains a CM lease")
-        };
-        let name = physical.rsplit('\\').next().unwrap_or("");
-        crate::persist_and_publish_system_hive_mutation(expected_generation, &[
-            nt_config_client::SystemHiveMutation::CreateChildRelative {
-                parent: lease,
-                name,
-                class_name: class,
-                descriptor: &prepared.descriptor,
-                volatile,
-            },
-        ])
-            .map(|_| true)
-            .map_err(|status| status as i32)
-    } else {
-        unreachable!("runtime creation returned above")
+    let DriverRegistryHandleTarget::System { lease, .. } = parent_owner.target else {
+        unreachable!("SYSTEM parent admission retains a CM lease")
     };
-    let result = mutation.and_then(|created| {
-        let mut leaf = HostedAscii::empty();
-        if !leaf.push_str(physical.rsplit('\\').next().unwrap_or("")) {
-            return Err(STATUS_INSUFFICIENT_RESOURCES);
+    let child = match driver_registry_handles::reserve_driver_registry_publication(
+        metadata.dispatch,
+        caller,
+        metadata.attributes & 0x202,
+    ) {
+        Ok(child) => child,
+        Err(status) => {
+            retire_driver_registry_handle(metadata.dispatch, caller, parent_owner.handle)
+                .expect("failed child reservation retains parent publication");
+            return Ready((status, 0, 0));
         }
-        open_driver_registry_handle(
-            metadata.dispatch,
-            caller,
-            leaf,
-            Some(parent_owner.target),
-            metadata.attributes & 0x202,
-            |target| {
-                if created {
-                    Ok(prepared.granted_access)
-                } else {
-                    open(target)
-                }
-            },
-        ).map(|slot| (slot, created))
-    });
-    retire_driver_registry_handle(metadata.dispatch, caller, parent_owner.handle)
-        .expect("parent publication remains bound through child acquisition");
-    match result {
-        Ok((slot, created)) => (
-            STATUS_SUCCESS,
-            slot.handle,
-            if created {
-                REG_CREATED_NEW_KEY
-            } else {
-                REG_OPENED_EXISTING_KEY
-            } as u64,
-        ),
-        Err(status) => (status, 0, 0),
-    }
+    };
+    let parent =
+        driver_registry_handles::take_pending_owned(metadata.dispatch, caller, parent_owner.handle)
+            .expect("authorized parent publication remains owned before BEGIN");
+    Deferred(DeferredRegistryCreate {
+        caller,
+        dispatch: metadata.dispatch,
+        parent,
+        parent_lease: lease,
+        child,
+        leaf: String::from(physical.rsplit('\\').next().unwrap_or("")),
+        class_name: class.map(String::from),
+        descriptor: prepared.descriptor,
+        grant: prepared.granted_access,
+        volatile,
+        expected_generation,
+    })
 }

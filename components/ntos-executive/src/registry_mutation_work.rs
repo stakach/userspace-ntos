@@ -9,7 +9,7 @@ use nt_process::native_handle::NativeThreadProcessReference;
 use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
 use nt_thread_start::amd64_context::UserApcContinuation;
 
-struct Caller {
+struct HostedCaller {
     publication: HostedRegistryPublication,
     parent_owner: RegistryKeyHandlePublication,
     parent: KeyRef,
@@ -24,7 +24,35 @@ struct Caller {
     _continuation: UserApcContinuation,
 }
 
+#[path = "registry_mutation_provider.rs"]
+mod provider;
+pub(crate) use provider::{submit_provider, ProviderRegistryResult};
+
+enum Caller {
+    Hosted(HostedCaller),
+    Provider(provider::ProviderCaller),
+}
+
+impl Caller {
+    fn logical(&self) -> Option<ProviderLogicalCaller> {
+        match self {
+            Self::Hosted(caller) => Some(caller.logical),
+            Self::Provider(caller) => caller.logical,
+        }
+    }
+
+    fn leaf(&self) -> &str {
+        match self {
+            Self::Hosted(caller) => &caller.leaf,
+            Self::Provider(caller) => &caller.admission.leaf,
+        }
+    }
+}
+
+type HostedContext<'a> = Option<(&'a mut ExecNtHandler, &'a mut nt_delay_execution::Queue)>;
+
 enum Phase {
+    ProviderAdmit,
     Begin(CmMutationBeginAttempt<()>),
     Prepare(SystemHiveMutationPreparation<()>),
     Admit,
@@ -43,6 +71,7 @@ enum Phase {
     RevokeReply,
     RetypeReply,
     ReconcileRuntime,
+    ProviderReplyEntered,
 }
 
 struct Work {
@@ -112,7 +141,7 @@ pub(crate) unsafe fn submit_hosted(
         Ok(admission) => admission,
         Err(status) => return Err((status, publication, parent_owner)),
     };
-    let caller = Caller {
+    let caller = HostedCaller {
         publication, parent_owner, parent, leaf, grant,
         pi: handler.pi,
         tid: handler.current_tid,
@@ -132,7 +161,7 @@ pub(crate) unsafe fn submit_hosted(
     };
     assert_ne!(caller.reply, 0);
     let work = Some(Work {
-        caller, phase: Phase::Begin(attempt), prepared: None, journal: None,
+        caller: Caller::Hosted(caller), phase: Phase::Begin(attempt), prepared: None, journal: None,
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
     });
@@ -167,7 +196,7 @@ fn has_matching(predicate: impl Fn(ProviderLogicalCaller) -> bool) -> bool {
         (*core::ptr::addr_of!(EXECUTING)).is_some_and(&predicate)
             || (&*core::ptr::addr_of!(WORK)).iter().flatten()
                 .any(|work| !matches!(work.phase, Phase::ReconcileRuntime)
-                    && predicate(work.caller.logical))
+                    && work.caller.logical().is_some_and(&predicate))
     }
 }
 
@@ -181,6 +210,15 @@ pub(crate) fn wake_due(now: u64) -> u64 {
 
 /// Top-level only. The selected owner is moved, never borrowed, across component IPC.
 pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_execution::Queue) {
+    redrive_inner(Some((handler, queue)));
+}
+
+/// Bootstrap and provider pumps may progress provider work without inventing a hosted handler.
+pub(crate) unsafe fn redrive_provider() {
+    redrive_inner(None);
+}
+
+unsafe fn redrive_inner(mut context: HostedContext<'_>) {
     if PENDING.load(Ordering::Acquire) == 0
         || monotonic_time_100ns() < NEXT.load(Ordering::Acquire)
         || ACTIVE.swap(true, Ordering::AcqRel)
@@ -195,19 +233,23 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_e
         let start = CURSOR.load(Ordering::Relaxed) as usize % count;
         (0..count).find_map(|step| {
             let index = (start + step) % count;
+            if context.is_none() && rows[index].as_ref()
+                .is_some_and(|work| matches!(work.caller, Caller::Hosted(_))) {
+                return None;
+            }
             rows[index].take().map(|work| (index, work))
         })
     };
     if let Some((index, mut work)) = selected {
         EXECUTING_INDEX.store(index as u64, Ordering::Relaxed);
         CURSOR.store(index as u64 + 1, Ordering::Relaxed);
-        *core::ptr::addr_of_mut!(EXECUTING) = Some(work.caller.logical);
+        *core::ptr::addr_of_mut!(EXECUTING) = work.caller.logical();
         let mut completed = false;
         // Bound each sweep; long journals resume fairly on the next maintenance tick.
         for _ in 0..16 {
             *core::ptr::addr_of_mut!(EXECUTING) =
-                (!matches!(work.phase, Phase::ReconcileRuntime)).then_some(work.caller.logical);
-            match advance(handler, queue, &mut work) {
+                if matches!(work.phase, Phase::ReconcileRuntime) { None } else { work.caller.logical() };
+            match advance(&mut context, &mut work) {
                 Ok(true) => { completed = true; break; }
                 Ok(false) => {}
                 Err(_) => { failed = true; break; }
@@ -225,7 +267,7 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_e
     ACTIVE.store(false, Ordering::Release);
 }
 
-unsafe fn caller_cancelled(handler: &ExecNtHandler, caller: &Caller) -> bool {
+unsafe fn caller_cancelled(handler: &ExecNtHandler, caller: &HostedCaller) -> bool {
     spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(caller.reply)
         || handler.pm.thread(caller.logical.thread().thread_id())
             .is_some_and(|thread| thread.state == nt_process::ThreadState::Terminated)
@@ -234,13 +276,26 @@ unsafe fn caller_cancelled(handler: &ExecNtHandler, caller: &Caller) -> bool {
 }
 
 unsafe fn advance(
-    handler: &mut ExecNtHandler,
-    queue: &mut nt_delay_execution::Queue,
+    context: &mut HostedContext<'_>,
     work: &mut Work,
 ) -> Result<bool, i32> {
-    work.cancelled |= caller_cancelled(handler, &work.caller);
+    work.cancelled |= match &work.caller {
+        Caller::Hosted(caller) => caller_cancelled(&*context.as_ref().unwrap().0, caller),
+        Caller::Provider(caller) => caller.cancelled(),
+    };
     if work.cancelled && work.status == 0 { work.status = 0xC000_0120; }
     match &mut work.phase {
+        Phase::ProviderAdmit => {
+            if work.cancelled {
+                work.phase = Phase::Complete;
+                return Ok(false);
+            }
+            let Caller::Provider(caller) = &work.caller else { unreachable!() };
+            match caller.begin() {
+                Ok(attempt) => work.phase = Phase::Begin(attempt),
+                Err(status) => { work.status = status as u32; work.phase = Phase::Complete; }
+            }
+        }
         Phase::Begin(attempt) => {
             let attempts = &mut *core::ptr::addr_of_mut!(ATTEMPTS);
             if attempt.is_acknowledged() {
@@ -347,6 +402,8 @@ unsafe fn advance(
             }
             let receipt = cm_mutation_transport::commit(work.prepared.as_ref().unwrap())?;
             let outcome = receipt.outcome();
+            CM_RUNTIME_SYSTEM_MUTATION_COMMITS.fetch_add(1, Ordering::Relaxed);
+            CM_RUNTIME_SYSTEM_CREATE_KEYS.fetch_add(1, Ordering::Relaxed);
             LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(outcome.generation, Ordering::AcqRel);
             if outcome.has_pending_device_action {
                 CONFIG_DEVICE_ACTION_PENDING.store(true, Ordering::Release);
@@ -360,9 +417,12 @@ unsafe fn advance(
                 return Ok(false);
             }
             if work.opening.is_none() {
-                let parent = handler.cm_system_key_target(work.caller.parent)
-                    .expect("retained SYSTEM parent disappeared");
-                work.opening = Some(cm_key_ownership::reserve_publication_open(parent.lease, &work.caller.leaf)?);
+                let lease = match &work.caller {
+                    Caller::Hosted(caller) => registry_key_targets::system(caller.parent)
+                        .expect("retained SYSTEM parent disappeared").lease,
+                    Caller::Provider(caller) => caller.admission.parent_lease,
+                };
+                work.opening = Some(cm_key_ownership::reserve_publication_open(lease, work.caller.leaf())?);
             }
             let Some(opened) = cm_key_ownership::resume_publication_open(work.opening.as_ref().unwrap())? else {
                 return Ok(false);
@@ -373,24 +433,12 @@ unsafe fn advance(
                     let _ = config_manager_retire_system_hive_key(opened.lease);
                     Err(work.status)
                 }
-                Ok(opened) => match handler.install_cm_system_key_target(CmSystemKeyTarget {
+                Ok(opened) => match registry_key_targets::install_system(CmSystemKeyTarget {
                     lease: opened.lease,
                     physical_path: nt_hive_core::canon_path(&opened.physical_path),
                 }) {
                     Ok(target) => {
-                        if caller_cancelled(handler, &work.caller)
-                            || !handler.validate_provider_logical_caller(work.caller.logical) {
-                            handler.release_registry_key_target(target);
-                            work.status = 0xC000_004B;
-                            work.phase = Phase::Acknowledge;
-                            return Ok(false);
-                        }
-                        let saved_pi = handler.pi;
-                        handler.pi = work.caller.pi;
-                        let result = handler.finish_hosted_registry_publication(
-                            &mut work.caller.publication, target, work.caller.grant, true,
-                        );
-                        handler.pi = saved_pi;
+                        let result = publish_target(context, &mut work.caller, target);
                         work.published = result.is_ok();
                         result
                     }
@@ -443,60 +491,108 @@ unsafe fn advance(
             work.phase = Phase::Complete;
         }
         Phase::Complete => {
-            if !work.published {
-                handler.abort_hosted_registry_publication(&mut work.caller.publication);
-            }
-            if let Some(target) = work.caller.parent_owner.abort(&mut handler.pm)
-                .expect("retained registry create parent") {
-                handler.release_registry_key_target(target);
+            match &mut work.caller {
+                Caller::Hosted(caller) => {
+                    let handler = &mut *context.as_mut().unwrap().0;
+                    if !work.published {
+                        handler.abort_hosted_registry_publication(&mut caller.publication);
+                    }
+                    if let Some(target) = caller.parent_owner.abort(&mut handler.pm)
+                        .expect("retained registry create parent") {
+                        handler.release_registry_key_target(target);
+                    }
+                }
+                Caller::Provider(caller) => {
+                    caller.cleanup(work.published && !work.cancelled)?;
+                    work.phase = Phase::ProviderReplyEntered;
+                    return caller.finish(work.status, work.published);
+                }
             }
             work.phase = Phase::ReadyReply;
         }
         Phase::ReadyReply => {
+            let Caller::Hosted(caller) = &mut work.caller else { unreachable!() };
+            let handler = &mut *context.as_mut().unwrap().0;
             if work.cancelled {
                 work.phase = Phase::RevokeReply;
                 return Ok(false);
             }
-            parked_reply::validate_saved(work.caller.reply).map_err(|status| status as i32)?;
+            parked_reply::validate_saved(caller.reply).map_err(|status| status as i32)?;
             // An uncertain send cannot repeat cleanup or issue a second reply to this owner.
             work.phase = Phase::ReplyEntered;
             let delivered = crate::service_sec_image::complete_registry_mutation_reply(
-                handler, work.caller.tid, work.caller.badge, work.caller.reply, work.status,
+                handler, caller.tid, caller.badge, caller.reply, work.status,
             );
             if !delivered { return Err(0xC000_00A3u32 as i32); }
             work.phase = Phase::ReplySent;
         }
         Phase::ReplySent => {
-            parked_reply::retire_sent(work.caller.reply).map_err(|status| status as i32)?;
+            let Caller::Hosted(caller) = &mut work.caller else { unreachable!() };
+            let handler = &mut *context.as_mut().unwrap().0;
+            parked_reply::retire_sent(caller.reply).map_err(|status| status as i32)?;
             if work.cancelled {
                 work.phase = Phase::ReconcileRuntime;
                 return Ok(false);
             }
-            thread_wait_state_clear_badge_ready(handler, work.caller.badge);
-            work.caller.reference.release(&mut handler.pm).expect("registry caller reference");
+            thread_wait_state_clear_badge_ready(handler, caller.badge);
+            caller.reference.release(&mut handler.pm).expect("registry caller reference");
             return Ok(true);
         }
         Phase::ReplyEntered => {
+            let Caller::Hosted(caller) = &work.caller else { unreachable!() };
+            if spawn_hosts::shared_ingress::owner::runtime::finish_acknowledged_hosted_reply(caller.reply)
+                .map_err(|_| 0xC000_00A3u32 as i32)? {
+                work.phase = Phase::ReplySent;
+                return Ok(false);
+            }
             if !work.cancelled { return Err(0xC000_00A3u32 as i32); }
             work.phase = Phase::RevokeReply;
         }
         Phase::RevokeReply => {
-            if !spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(work.caller.reply) {
-                parked_reply::revoke(work.caller.reply).map_err(|status| status as i32)?;
+            let Caller::Hosted(caller) = &work.caller else { unreachable!() };
+            if !spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(caller.reply) {
+                parked_reply::revoke(caller.reply).map_err(|status| status as i32)?;
             }
             work.phase = Phase::RetypeReply;
         }
         Phase::RetypeReply => {
-            parked_reply::retype(work.caller.reply).map_err(|status| status as i32)?;
+            let Caller::Hosted(caller) = &work.caller else { unreachable!() };
+            parked_reply::retype(caller.reply).map_err(|status| status as i32)?;
             work.phase = Phase::ReconcileRuntime;
         }
         Phase::ReconcileRuntime => {
-            if !hosted_termination::reconcile(handler, queue, work.caller.logical) {
+            let Caller::Hosted(caller) = &mut work.caller else { unreachable!() };
+            let (handler, queue) = context.as_mut().unwrap();
+            if !hosted_termination::reconcile(handler, queue, caller.logical) {
                 return Err(0xC000_00A3u32 as i32);
             }
-            work.caller.reference.release(&mut handler.pm).expect("retired registry caller reference");
+            caller.reference.release(&mut handler.pm).expect("retired registry caller reference");
             return Ok(true);
+        }
+        Phase::ProviderReplyEntered => {
+            let Caller::Provider(caller) = &mut work.caller else { unreachable!() };
+            return caller.finish(work.status, work.published);
         }
     }
     Ok(false)
+}
+
+unsafe fn publish_target(context: &mut HostedContext<'_>, caller: &mut Caller, target: KeyRef) -> Result<(), u32> {
+    match caller {
+        Caller::Hosted(caller) => {
+            let handler = &mut *context.as_mut().unwrap().0;
+            if caller_cancelled(handler, caller) || !handler.validate_provider_logical_caller(caller.logical) {
+                handler.release_registry_key_target(target);
+                return Err(0xC000_004B);
+            }
+            let saved_pi = handler.pi;
+            handler.pi = caller.pi;
+            let result = handler.finish_hosted_registry_publication(
+                &mut caller.publication, target, caller.grant, true,
+            );
+            handler.pi = saved_pi;
+            result
+        }
+        Caller::Provider(caller) => caller.bind_target(target).map_err(|status| status as u32),
+    }
 }

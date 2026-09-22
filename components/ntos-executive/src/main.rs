@@ -6424,7 +6424,6 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     let cm_runtime_set_values = CM_RUNTIME_SYSTEM_SET_VALUES.load(Ordering::Relaxed);
     let cm_runtime_delete_values = CM_RUNTIME_SYSTEM_DELETE_VALUES.load(Ordering::Relaxed);
     let cm_runtime_delete_keys = CM_RUNTIME_SYSTEM_DELETE_KEYS.load(Ordering::Relaxed);
-    let cm_runtime_set_classes = CM_RUNTIME_SYSTEM_SET_CLASSES.load(Ordering::Relaxed);
     let cm_runtime_set_security = CM_RUNTIME_SYSTEM_SET_SECURITY.load(Ordering::Relaxed);
     let cm_native_lease_acquires = CM_NATIVE_SYSTEM_KEY_LEASE_ACQUIRES.load(Ordering::Relaxed);
     let cm_native_lease_closes = CM_NATIVE_SYSTEM_KEY_LEASE_CLOSES.load(Ordering::Relaxed);
@@ -6433,7 +6432,6 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
         + cm_runtime_set_values
         + cm_runtime_delete_values
         + cm_runtime_delete_keys
-        + cm_runtime_set_classes
         + cm_runtime_set_security;
     let restored_checkpoint = crate::writable_fs::snapshot_restore_seen()
         && boot_checkpoints >= 1
@@ -6472,7 +6470,7 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     print_u64(cm_runtime_commits);
     print_str(b" rejected=");
     print_u64(cm_runtime_rejections);
-    print_str(b" ops create/set/delete-value/delete-key/class/security=");
+    print_str(b" ops create/set/delete-value/delete-key/security=");
     print_u64(cm_runtime_create_keys);
     print_str(b"/");
     print_u64(cm_runtime_set_values);
@@ -6480,8 +6478,6 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     print_u64(cm_runtime_delete_values);
     print_str(b"/");
     print_u64(cm_runtime_delete_keys);
-    print_str(b"/");
-    print_u64(cm_runtime_set_classes);
     print_str(b"/");
     print_u64(cm_runtime_set_security);
     print_str(b"\n");
@@ -22220,7 +22216,6 @@ pub(crate) static CM_RUNTIME_SYSTEM_CREATE_KEYS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CM_RUNTIME_SYSTEM_SET_VALUES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CM_RUNTIME_SYSTEM_DELETE_VALUES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CM_RUNTIME_SYSTEM_DELETE_KEYS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static CM_RUNTIME_SYSTEM_SET_CLASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CM_RUNTIME_SYSTEM_SET_SECURITY: AtomicU64 = AtomicU64::new(0);
 /// CM-owned SYSTEM key identities acquired for native registry handles.
 pub(crate) static CM_NATIVE_SYSTEM_KEY_LEASE_ACQUIRES: AtomicU64 = AtomicU64::new(0);

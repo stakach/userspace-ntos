@@ -10,6 +10,14 @@ pub(crate) struct RegistryPublicationDispatch {
 }
 
 impl RegistryPublicationDispatch {
+    pub(crate) fn route(self) -> nt_component_suspension::peer_registry::PeerRoute {
+        self.route
+    }
+
+    pub(crate) fn dispatch(self) -> nt_component_suspension::LaneDispatchIdentity {
+        self.dispatch
+    }
+
     pub(crate) unsafe fn capture(channel: &crate::spawn_hosts::PumpChannel) -> Result<Self, u32> {
         use crate::spawn_hosts::shared_ingress::owner::runtime;
         crate::provider_registry_caller::resolve(channel)?;
@@ -44,34 +52,109 @@ unsafe fn pending_index(
         .ok_or(STATUS_INVALID_HANDLE)
 }
 
-unsafe fn reserve(
+#[must_use = "an owned publication must be aborted or returned to the client publication owner"]
+pub(crate) struct OwnedDriverRegistryPublication {
+    pending: Option<Pending>,
+}
+
+pub(crate) unsafe fn reserve_driver_registry_publication(
     dispatch: RegistryPublicationDispatch,
     caller: NativeHandleCaller,
     attributes: u32,
-) -> Result<u64, i32> {
+) -> Result<OwnedDriverRegistryPublication, i32> {
     let _durable = crate::allocator::enter_durable();
-    let rows = &mut *core::ptr::addr_of_mut!(PENDING);
-    let slot = rows.iter().position(Option::is_none).unwrap_or(rows.len());
-    if slot == rows.len() {
-        rows.try_reserve(1)
-            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-    }
     let publication = crate::with_provider_process_manager(|pm| {
         pm.reserve_native_registry_key_handle(caller, attributes)
     })
     .map_err(|status| status as i32)?;
-    let value = publication.value();
-    let row = Some(Pending {
-        dispatch,
-        caller,
-        publication,
-    });
-    if slot == rows.len() {
-        rows.push(row);
-    } else {
-        rows[slot] = row;
+    Ok(OwnedDriverRegistryPublication {
+        pending: Some(Pending {
+            dispatch,
+            caller,
+            publication,
+        }),
+    })
+}
+
+pub(crate) unsafe fn take_pending_owned(
+    dispatch: RegistryPublicationDispatch,
+    caller: NativeHandleCaller,
+    value: u64,
+) -> Result<OwnedDriverRegistryPublication, i32> {
+    let index = pending_index(dispatch, caller, value)?;
+    Ok(OwnedDriverRegistryPublication {
+        pending: (&mut *core::ptr::addr_of_mut!(PENDING))[index].take(),
+    })
+}
+
+impl OwnedDriverRegistryPublication {
+    /// Consume the acquired target even on failure; the reservation remains owned.
+    pub(crate) unsafe fn bind_reserved_target(
+        &mut self,
+        target: u32,
+        grant: u32,
+    ) -> Result<(), i32> {
+        let result = self
+            .pending
+            .as_mut()
+            .ok_or(STATUS_INVALID_HANDLE)
+            .and_then(|row| {
+                crate::with_provider_process_manager(|pm| {
+                    pm.validate_native_handle_caller(row.caller)?;
+                    row.publication.bind(pm, target, grant)
+                })
+                .map_err(|status| status as i32)
+            });
+        if result.is_err() {
+            release_target(target);
+        }
+        result
     }
-    Ok(value)
+
+    pub(crate) unsafe fn authorize_bound_grant(&mut self, grant: u32) -> Result<(), i32> {
+        let row = self.pending.as_mut().ok_or(STATUS_INVALID_HANDLE)?;
+        crate::with_provider_process_manager(|pm| {
+            pm.validate_native_handle_caller(row.caller)?;
+            row.publication.authorize_bound_grant(pm, grant)
+        })
+        .map_err(|status| status as i32)
+    }
+
+    pub(crate) unsafe fn abort(&mut self) -> Result<(), i32> {
+        let Some(row) = self.pending.as_mut() else {
+            return Ok(());
+        };
+        let retired = crate::with_provider_process_manager(|pm| row.publication.abort(pm))
+            .map_err(|status| status as i32)?;
+        self.pending = None;
+        if let Some(target) = retired {
+            release_target(target);
+        }
+        Ok(())
+    }
+
+    /// Restore the client PUBLISH owner after all in-flight CM and admission work completes.
+    /// Allocation failure leaves ownership here for a later retry.
+    pub(crate) unsafe fn return_pending(&mut self) -> Result<u64, i32> {
+        let row = self.pending.as_ref().ok_or(STATUS_INVALID_HANDLE)?;
+        if crate::spawn_hosts::shared_ingress::owner::runtime::dispatch(row.dispatch.route())
+            .ok() != Some(row.dispatch.dispatch())
+        {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let value = row.publication.value();
+        let _durable = crate::allocator::enter_durable();
+        let rows = &mut *core::ptr::addr_of_mut!(PENDING);
+        let slot = rows.iter().position(Option::is_none).unwrap_or(rows.len());
+        if slot == rows.len() {
+            rows.try_reserve(1)
+                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+            rows.push(self.pending.take());
+        } else {
+            rows[slot] = self.pending.take();
+        }
+        Ok(value)
+    }
 }
 
 pub(crate) unsafe fn publish_driver_registry_handle(
@@ -176,7 +259,7 @@ pub(crate) unsafe fn open_driver_registry_handle(
     if path.is_empty() && root.is_none() {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let value = reserve(dispatch, caller, attributes)?;
+    let mut publication = reserve_driver_registry_publication(dispatch, caller, attributes)?;
     let outcome = (|| {
         let key = if let Some(root) = root {
             acquire_relative_target(root, path.as_str())?
@@ -201,35 +284,18 @@ pub(crate) unsafe fn open_driver_registry_handle(
             crate::registry_key_targets::install_runtime(String::from(path.as_str()), key)
                 .map_err(|status| status as i32)?
         };
-        let index = pending_index(dispatch, caller, value)?;
-        if let Err(status) = crate::with_provider_process_manager(|pm| {
-            (&mut *core::ptr::addr_of_mut!(PENDING))[index]
-                .as_mut()
-                .unwrap()
-                .publication
-                .bind(pm, key, 0)
-        }) {
-            release_target(key);
-            return Err(status as i32);
-        }
+        publication.bind_reserved_target(key, 0)?;
         let target = target_snapshot(key)?;
         let grant = authorize(target)?;
-        crate::with_provider_process_manager(|pm| {
-            (&mut *core::ptr::addr_of_mut!(PENDING))[index]
-                .as_mut()
-                .unwrap()
-                .publication
-                .authorize_bound_grant(pm, grant)
-        })
-        .map_err(|status| status as i32)?;
+        publication.authorize_bound_grant(grant)?;
+        let value = publication.return_pending()?;
         Ok(DriverRegistryHandleSlot {
             handle: value,
             target,
         })
     })();
     if outcome.is_err() {
-        abort_driver_registry_publication(dispatch, caller, value)
-            .expect("failed open retains exact PM reservation");
+        publication.abort().expect("failed open retains exact PM reservation");
     }
     outcome
 }
@@ -242,17 +308,21 @@ pub(crate) unsafe fn with_registry_root<T>(
     handle: Option<u64>,
     operation: impl FnOnce(Option<DriverRegistryHandleTarget>) -> Result<T, i32>,
 ) -> Result<T, i32> {
-    let Some(handle) = handle else { return operation(None); };
-    let retained = reserve(dispatch, caller, 0)?;
-    let index = pending_index(dispatch, caller, retained)?;
+    let Some(handle) = handle else {
+        return operation(None);
+    };
+    let mut retained = reserve_driver_registry_publication(dispatch, caller, 0)?;
     let acquired = crate::with_provider_process_manager(|pm| {
-        let key = pm.lookup_native_registry_key_handle(caller, handle, 0)?;
-        (&mut *core::ptr::addr_of_mut!(PENDING))[index].as_mut().unwrap()
-            .publication.bind(pm, key, 0)?;
-        Ok(key)
-    }).map_err(|status| status as i32);
-    let result = acquired.and_then(|key| target_snapshot(key)).and_then(|root| operation(Some(root)));
-    abort_driver_registry_publication(dispatch, caller, retained)
+        pm.lookup_native_registry_key_handle(caller, handle, 0)
+    })
+    .map_err(|status| status as i32);
+    let result = acquired
+        .and_then(|key| {
+            retained.bind_reserved_target(key, 0)?;
+            target_snapshot(key)
+        })
+        .and_then(|root| operation(Some(root)));
+    retained.abort()
         .expect("relative registry admission retains its exact root target");
     result
 }
@@ -265,7 +335,8 @@ unsafe fn acquire_relative_target(
         DriverRegistryHandleTarget::System { lease, .. } => {
             let opened = crate::config_manager_open_relative_system_hive_key(lease, name)?;
             match crate::registry_key_targets::install_system(crate::CmSystemKeyTarget {
-                lease: opened.lease, physical_path: opened.physical_path,
+                lease: opened.lease,
+                physical_path: opened.physical_path,
             }) {
                 Ok(key) => Ok(key),
                 Err(status) => {
@@ -276,18 +347,26 @@ unsafe fn acquire_relative_target(
         }
         DriverRegistryHandleTarget::Generic { key, path } => {
             let (reply, _) = crate::config_manager_runtime_key_operation(
-                key, nt_config_abi::runtime_key_op::OPEN_RELATIVE, 0, name, 0, &[],
+                key,
+                nt_config_abi::runtime_key_op::OPEN_RELATIVE,
+                0,
+                name,
+                0,
+                &[],
             )?;
             let mut diagnostic_path = String::from(path.as_str());
             if !name.is_empty() {
-                if !diagnostic_path.ends_with('\\') { diagnostic_path.push('\\'); }
+                if !diagnostic_path.ends_with('\\') {
+                    diagnostic_path.push('\\');
+                }
                 diagnostic_path.push_str(name);
             }
             crate::registry_key_targets::install_runtime(diagnostic_path, reply.detail0)
                 .map_err(|status| status as i32)
         }
         DriverRegistryHandleTarget::Hosted { key, .. } => driver_registry_live_handler()?
-            .acquire_relative_registry_target(key, name).map_err(|status| status as i32),
+            .acquire_relative_registry_target(key, name)
+            .map_err(|status| status as i32),
     }
 }
 
@@ -315,43 +394,26 @@ pub(crate) unsafe fn prepare_driver_registry_target(
     attributes: u32,
     authorize: impl FnOnce(DriverRegistryHandleTarget) -> Result<u32, i32>,
 ) -> Result<DriverRegistryHandleSlot, i32> {
-    let value = match reserve(dispatch, caller, attributes) {
-        Ok(value) => value,
+    let mut publication = match reserve_driver_registry_publication(dispatch, caller, attributes) {
+        Ok(publication) => publication,
         Err(status) => {
             release_target(target);
             return Err(status);
         }
     };
-    let index = pending_index(dispatch, caller, value)?;
     let result = (|| {
-        if let Err(status) = crate::with_provider_process_manager(|pm| {
-            (&mut *core::ptr::addr_of_mut!(PENDING))[index]
-                .as_mut()
-                .unwrap()
-                .publication
-                .bind(pm, target, 0)
-        }) {
-            release_target(target);
-            return Err(status as i32);
-        }
+        publication.bind_reserved_target(target, 0)?;
         let snapshot = target_snapshot(target)?;
         let grant = authorize(snapshot)?;
-        crate::with_provider_process_manager(|pm| {
-            (&mut *core::ptr::addr_of_mut!(PENDING))[index]
-                .as_mut()
-                .unwrap()
-                .publication
-                .authorize_bound_grant(pm, grant)
-        })
-        .map_err(|status| status as i32)?;
+        publication.authorize_bound_grant(grant)?;
+        let value = publication.return_pending()?;
         Ok(DriverRegistryHandleSlot {
             handle: value,
             target: snapshot,
         })
     })();
     if result.is_err() {
-        abort_driver_registry_publication(dispatch, caller, value)
-            .expect("failed target admission retains publication");
+        publication.abort().expect("failed target admission retains publication");
     }
     result
 }

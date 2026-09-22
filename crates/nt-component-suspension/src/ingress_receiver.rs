@@ -55,8 +55,16 @@ impl IngressReceiver<crate::ReceivedMessage> {
         peers: &mut PeerRegistry,
         query: impl FnMut(u64, u64) -> Result<ReplyBindingObservation, E>,
     ) -> Result<crate::ReceivedMessage, StoredCompletionError<E>> {
-        self.complete_protocol_from_message(route, dispatch, completion_reply, completion_label,
-            &[], lanes, peers, query)
+        self.complete_protocol_from_message(
+            route,
+            dispatch,
+            completion_reply,
+            completion_label,
+            &[],
+            lanes,
+            peers,
+            query,
+        )
     }
 
     /// Match the final Call against an independently owned protocol token (for example an IRQ
@@ -91,7 +99,10 @@ impl IngressReceiver<crate::ReceivedMessage> {
             || completion_label > (u64::MAX >> 12)
             || completion.message().badge() != route.badge()
             || completion.message().info() != (completion_label << 12) | expected_words.len() as u64
-            || expected_words.iter().enumerate().any(|(index, word)| completion.message().word(index) != Some(*word))
+            || expected_words
+                .iter()
+                .enumerate()
+                .any(|(index, word)| completion.message().word(index) != Some(*word))
         {
             return Err(StoredCompletionError::InvalidCompletionMessage);
         }
@@ -125,8 +136,8 @@ mod interim_adoption;
 pub use interim_adoption::InterimAdoptionError;
 mod bootstrap_adoption;
 pub use bootstrap_adoption::BootstrapAdoptionError;
-mod parked_reply;
 mod nested_execution;
+mod parked_reply;
 pub use nested_execution::{NestedExecutionError, NestedExecutionScope};
 mod bootstrap_completion;
 mod stopped_route;
@@ -290,9 +301,27 @@ impl<M> IngressReceiver<M> {
         Ok(self.store.stored_reply(route, reply)?.message())
     }
 
+    /// Observe a retained dispatch's Reply acknowledgement without changing its ownership.
+    /// A caller may use this after an uncertain native send, but must still resume and retire
+    /// the external lane before completing the provider invocation.
+    pub fn stored_reply_acknowledged(
+        &self,
+        route: PeerRoute,
+        dispatch: crate::LaneDispatchIdentity,
+        reply: u64,
+    ) -> Result<bool, RetainedWorkError> {
+        let call = self.store.stored_reply(route, reply)?;
+        if call.admitted != Some(dispatch) {
+            return Err(RetainedWorkError::WrongOwner);
+        }
+        Ok(call.is_acknowledged())
+    }
+
     /// Held arrivals only; acknowledged or already admitted Calls are not dispatch candidates.
     pub fn next_unadmitted(&self, route: PeerRoute) -> Option<(u64, &M)> {
-        self.store.next_unadmitted(route).map(|call| (call.reply(), call.message()))
+        self.store
+            .next_unadmitted(route)
+            .map(|call| (call.reply(), call.message()))
     }
 
     /// Includes the currently owned receive Reply even before its next reservation begins.

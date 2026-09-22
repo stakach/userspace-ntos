@@ -84,6 +84,7 @@ pub(crate) mod driver_registry_handles;
 #[path = "driver_registry_policy.rs"]
 mod driver_registry_policy;
 pub(crate) use driver_registry_policy::{
+    DeferredRegistryCreate, DriverRegistryCreateResult,
     DriverRegistryOpenMetadata, authorize_driver_registry_open, driver_registry_live_handler,
     finish_driver_registry_close,
     service_hosted_driver_open_registry_path, service_hosted_driver_create_registry_path,
@@ -53374,6 +53375,69 @@ pub(crate) fn service_hosted_driver_registry(
     a1: u64,
     a2: u64,
     a3: u64,
+    caller_badge: u64,
+    active_reply_cap: u64,
+) -> crate::registry_mutation_work::ProviderRegistryResult {
+    use crate::registry_mutation_work::ProviderRegistryResult;
+    if op != HOSTED_REGISTRY_OP_CREATE_RELATIVE_KEY {
+        return ProviderRegistryResult::Ready(service_hosted_driver_registry_sync(
+            ch, op, a1, a2, a3, caller_badge, active_reply_cap,
+        ));
+    }
+    unsafe {
+        let Some((_instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+            return ProviderRegistryResult::Ready((STATUS_INVALID_PARAMETER, 0, 0));
+        };
+        let arg = inst.exec_arg_va;
+        if arg == 0 || a2 > u32::MAX as u64 || a2 as u32 & !5 != 0 {
+            return ProviderRegistryResult::Ready((STATUS_INVALID_PARAMETER, 0, 0));
+        }
+        let caller = match crate::provider_registry_caller::resolve(ch) {
+            Ok(caller) => caller,
+            Err(status) => return ProviderRegistryResult::Ready((status as i32, 0, 0)),
+        };
+        let dispatch = match driver_registry_handles::RegistryPublicationDispatch::capture(ch) {
+            Ok(dispatch) => dispatch,
+            Err(status) => return ProviderRegistryResult::Ready((status as i32, 0, 0)),
+        };
+        let mut metadata = match capture_registry_open_metadata(arg, dispatch) {
+            Ok(metadata) if metadata.attributes & !0x6c2 == 0 => metadata,
+            Ok(_) => return ProviderRegistryResult::Ready((STATUS_INVALID_PARAMETER, 0, 0)),
+            Err(status) => return ProviderRegistryResult::Ready((status, 0, 0)),
+        };
+        let mut subject = match crate::with_provider_security_managers(|pm, tokens| {
+            nt_user_host::registry_subject::RegistrySubject::capture(pm, tokens, caller)
+        }) {
+            Ok(subject) => DriverRegistrySubject(Some(subject)),
+            Err(status) => return ProviderRegistryResult::Ready((status as i32, 0, 0)),
+        };
+        let Some(name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
+            arg, HOSTED_REGISTRY_ARG_KEY_LEN, HOSTED_REGISTRY_ARG_KEY_OFF, true,
+        ) else {
+            return ProviderRegistryResult::Ready((STATUS_INVALID_PARAMETER, 0, 0));
+        };
+        if !name.starts_with_byte(b'\\') {
+            if a1 == 0 {
+                return ProviderRegistryResult::Ready((STATUS_OBJECT_PATH_NOT_FOUND, 0, 0));
+            }
+            metadata.root_handle = Some(a1);
+        }
+        match service_hosted_driver_create_registry_path(
+            caller, name, a2 as u32, &metadata, subject.0.as_ref().unwrap(), None,
+        ) {
+            DriverRegistryCreateResult::Ready(result) => ProviderRegistryResult::Ready(result),
+            DriverRegistryCreateResult::Deferred(admission) =>
+                crate::registry_mutation_work::submit_provider(ch, admission, subject.0.take().unwrap()),
+        }
+    }
+}
+
+fn service_hosted_driver_registry_sync(
+    ch: &crate::spawn_hosts::PumpChannel,
+    op: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
     _caller_badge: u64,
     active_reply_cap: u64,
 ) -> (i32, u64, u64) {
@@ -53396,7 +53460,7 @@ pub(crate) fn service_hosted_driver_registry(
         let subject = match crate::with_provider_security_managers(|pm, tokens| {
             nt_user_host::registry_subject::RegistrySubject::capture(pm, tokens, caller)
         }) {
-            Ok(subject) => DriverRegistrySubject(subject),
+            Ok(subject) => DriverRegistrySubject(Some(subject)),
             Err(status) => return (status as i32, 0, 0),
         };
         let mut metadata = if matches!(op, HOSTED_REGISTRY_OP_OPEN_RELATIVE_KEY | HOSTED_REGISTRY_OP_CREATE_RELATIVE_KEY | HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY) {
@@ -53435,25 +53499,7 @@ pub(crate) fn service_hosted_driver_registry(
                     if a1 == 0 { return (STATUS_OBJECT_PATH_NOT_FOUND, 0, 0); }
                     metadata.root_handle = Some(a1);
                 }
-                service_hosted_driver_open_registry_path(caller, name, &metadata, &subject.0)
-            }
-            HOSTED_REGISTRY_OP_CREATE_RELATIVE_KEY => {
-                if a2 as u32 & !5 != 0 || a2 > u32::MAX as u64 {
-                    return (STATUS_INVALID_PARAMETER, 0, 0);
-                }
-                let Some(name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
-                    arg,
-                    HOSTED_REGISTRY_ARG_KEY_LEN,
-                    HOSTED_REGISTRY_ARG_KEY_OFF,
-                    true,
-                ) else {
-                    return (STATUS_INVALID_PARAMETER, 0, 0);
-                };
-                if !name.starts_with_byte(b'\\') {
-                    if a1 == 0 { return (STATUS_OBJECT_PATH_NOT_FOUND, 0, 0); }
-                    metadata.root_handle = Some(a1);
-                }
-                service_hosted_driver_create_registry_path(caller, name, a2 as u32, &metadata, &subject.0, None)
+                service_hosted_driver_open_registry_path(caller, name, &metadata, subject.0.as_ref().unwrap())
             }
             HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY => {
                 if !hosted_pdo_known_at(inst.exec_shared_va, a1) {
@@ -53470,7 +53516,7 @@ pub(crate) fn service_hosted_driver_registry(
                 let Some(path) = hosted_driver_key_cm_path(&identity) else {
                     return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
                 };
-                service_hosted_driver_open_registry_path(caller, path, &metadata, &subject.0)
+                service_hosted_driver_open_registry_path(caller, path, &metadata, subject.0.as_ref().unwrap())
             }
             HOSTED_REGISTRY_OP_CLOSE => {
                 finish_driver_registry_close(ch, close_driver_registry_handle(caller, a1))
@@ -53558,7 +53604,7 @@ pub(crate) fn service_hosted_driver_registry(
                     return (STATUS_INVALID_PARAMETER, 0, 0);
                 };
                 let opened = match open_driver_registry_handle(dispatch, caller, key_path, None, 0,
-                    |target| authorize_driver_registry_open(&subject.0, &metadata, target)) {
+                    |target| authorize_driver_registry_open(subject.0.as_ref().unwrap(), &metadata, target)) {
                     Ok(opened) => opened,
                     Err(status) => return (status, 0, 0),
                 };

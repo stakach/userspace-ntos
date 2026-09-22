@@ -17,8 +17,10 @@ pub(crate) mod nested;
 #[path = "component_ingress_services.rs"]
 mod services;
 pub(crate) use services::{
-    cancel_parked_service, finish_autonomous, park_service, resume_service, wake_service,
-    wake_registry_service,
+    acknowledge_registry_service_cancellation, cancel_parked_service, finish_autonomous,
+    park_registry_service, park_service, reconcile_registry_service_reply,
+    registry_service_cancelled, resume_service, retire_stopped_acknowledged_registry_service,
+    wake_registry_service, wake_service,
 };
 
 #[path = "component_ingress_retirement.rs"]
@@ -28,9 +30,10 @@ pub(crate) use retirement::retire;
 #[path = "component_ingress_hosted.rs"]
 mod hosted;
 pub(crate) use hosted::{
-    can_park_hosted_reply, cancel_hosted, cancel_hosted_caller, defer_hosted_delivery, hosted_can_resume,
-    hosted_cancellation_proven, hosted_reply_cancelled, owns_hosted_reply, release_hosted_reply,
-    reply_hosted, restart_hosted, stop_and_cancel_hosted, stop_hosted_caller, take_hosted_with,
+    can_park_hosted_reply, cancel_hosted, cancel_hosted_caller, defer_hosted_delivery,
+    finish_acknowledged_hosted_reply, hosted_can_resume, hosted_cancellation_proven,
+    hosted_reply_cancelled, owns_hosted_reply, release_hosted_reply, reply_hosted, restart_hosted,
+    stop_and_cancel_hosted, stop_hosted_caller, take_hosted_with,
 };
 
 const RETAINED_CALL_CAPACITY: usize = 256;

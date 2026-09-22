@@ -8,6 +8,8 @@ enum WaitPhase {
     Parked,
     ReplyEntered,
     Acknowledged,
+    StoppedAcknowledged,
+    Cancelled,
     Finished,
 }
 struct Wait {
@@ -17,26 +19,42 @@ struct Wait {
     token: u64,
     phase: WaitPhase,
     completion: Option<ServiceCompletion>,
+    registry: bool,
 }
 
 #[derive(Clone, Copy)]
 enum ServiceCompletion {
     Status(i32),
-    Registry { status: i32, handle: u64, disposition: u64 },
+    Registry {
+        status: i32,
+        handle: u64,
+        disposition: u64,
+    },
 }
 
 impl ServiceCompletion {
     fn words(self) -> (u64, [u64; 4]) {
         match self {
             Self::Status(status) => (1, [status as u32 as u64, 0, 0, 0]),
-            Self::Registry { status, handle, disposition } =>
-                (4, [status as u32 as u64, handle, disposition, 0]),
+            Self::Registry {
+                status,
+                handle,
+                disposition,
+            } => (4, [status as u32 as u64, handle, disposition, 0]),
         }
     }
 }
 static mut WAITS: Vec<Wait> = Vec::new();
 
 pub(crate) unsafe fn park_service(route: PeerRoute, token: u64) -> Result<(), Error> {
+    park(route, token, false)
+}
+
+pub(crate) unsafe fn park_registry_service(route: PeerRoute, token: u64) -> Result<(), Error> {
+    park(route, token, true)
+}
+
+unsafe fn park(route: PeerRoute, token: u64, registry: bool) -> Result<(), Error> {
     let source = physical_source(route)?;
     if !matches!(
         source.kind,
@@ -69,6 +87,7 @@ pub(crate) unsafe fn park_service(route: PeerRoute, token: u64) -> Result<(), Er
             token,
             phase: WaitPhase::Entering,
             completion: None,
+            registry,
         });
         waits.len() - 1
     };
@@ -79,8 +98,12 @@ pub(crate) unsafe fn park_service(route: PeerRoute, token: u64) -> Result<(), Er
         token,
         phase: WaitPhase::Entering,
         completion: None,
+        registry,
     };
-    if lanes().suspend_running(route.identity().lane, reply, token).is_err() {
+    if lanes()
+        .suspend_running(route.identity().lane, reply, token)
+        .is_err()
+    {
         // Lane admission has no native effect and preserves its prior phase on failure.
         waits[index].phase = WaitPhase::Finished;
         return Err(Error::Admission);
@@ -96,7 +119,13 @@ pub(crate) unsafe fn wake_service(
     token: u64,
     status: i32,
 ) -> Result<(), Error> {
-    wake_with_completion(route, dispatch, reply, token, ServiceCompletion::Status(status))
+    wake_with_completion(
+        route,
+        dispatch,
+        reply,
+        token,
+        ServiceCompletion::Status(status),
+    )
 }
 
 pub(crate) unsafe fn wake_registry_service(
@@ -108,8 +137,55 @@ pub(crate) unsafe fn wake_registry_service(
     handle: u64,
     disposition: u64,
 ) -> Result<(), Error> {
-    wake_with_completion(route, dispatch, reply, token,
-        ServiceCompletion::Registry { status, handle, disposition })
+    wake_with_completion(
+        route,
+        dispatch,
+        reply,
+        token,
+        ServiceCompletion::Registry {
+            status,
+            handle,
+            disposition,
+        },
+    )
+}
+
+/// A send may have consumed the physical Reply even if its wrapper returned an error.
+/// Reconcile from the retained Call's acknowledgement bit; never invoke the Reply again.
+pub(crate) unsafe fn reconcile_registry_service_reply(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+) -> Result<bool, Error> {
+    let waits = &mut *core::ptr::addr_of_mut!(WAITS);
+    let wait = waits
+        .iter_mut()
+        .find(|row| {
+            row.registry
+                && row.route == route
+                && row.dispatch == dispatch
+                && row.reply == reply
+                && row.token == token
+        })
+        .ok_or(Error::Admission)?;
+    match wait.phase {
+        WaitPhase::Acknowledged | WaitPhase::StoppedAcknowledged | WaitPhase::Finished => {
+            return Ok(true);
+        }
+        WaitPhase::ReplyEntered => {}
+        _ => return Ok(false),
+    }
+    let acknowledged = owner()
+        .receiver
+        .as_ref()
+        .expect("ready receiver")
+        .stored_reply_acknowledged(route, dispatch, reply)
+        .map_err(|_| Error::Retirement)?;
+    if acknowledged {
+        wait.phase = WaitPhase::Acknowledged;
+    }
+    Ok(acknowledged)
 }
 
 unsafe fn wake_with_completion(
@@ -246,7 +322,27 @@ pub(crate) unsafe fn cancel_parked_service(route: PeerRoute) -> Result<(), Error
     else {
         return Ok(());
     };
+    if matches!(
+        wait.phase,
+        WaitPhase::Cancelled | WaitPhase::StoppedAcknowledged
+    ) {
+        return Ok(());
+    }
     let owner = owner();
+    let acknowledged = if wait.registry {
+        match wait.phase {
+            WaitPhase::Acknowledged => true,
+            WaitPhase::ReplyEntered => owner
+                .receiver
+                .as_ref()
+                .expect("ready receiver")
+                .stored_reply_acknowledged(route, wait.dispatch, wait.reply)
+                .map_err(|_| Error::Retirement)?,
+            _ => false,
+        }
+    } else {
+        false
+    };
     let installation = owner
         .installations
         .iter()
@@ -260,6 +356,78 @@ pub(crate) unsafe fn cancel_parked_service(route: PeerRoute) -> Result<(), Error
             wait.token,
         )
         .map_err(|_| Error::Retirement)?;
+    wait.phase = if wait.registry {
+        if acknowledged {
+            WaitPhase::StoppedAcknowledged
+        } else {
+            WaitPhase::Cancelled
+        }
+    } else {
+        WaitPhase::Finished
+    };
+    Ok(())
+}
+
+/// A sealed stop/drain cancellation receipt, not inference from a missing route or Reply.
+pub(crate) unsafe fn registry_service_cancelled(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+) -> bool {
+    (&*core::ptr::addr_of!(WAITS)).iter().any(|wait| {
+        wait.registry
+            && wait.route == route
+            && wait.dispatch == dispatch
+            && wait.reply == reply
+            && wait.token == token
+            && wait.phase == WaitPhase::Cancelled
+    })
+}
+
+pub(crate) unsafe fn acknowledge_registry_service_cancellation(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+) -> Result<(), Error> {
+    let wait = (&mut *core::ptr::addr_of_mut!(WAITS))
+        .iter_mut()
+        .find(|wait| {
+            wait.registry
+                && wait.route == route
+                && wait.dispatch == dispatch
+                && wait.reply == reply
+                && wait.token == token
+                && wait.phase == WaitPhase::Cancelled
+        })
+        .ok_or(Error::Retirement)?;
     wait.phase = WaitPhase::Finished;
+    Ok(())
+}
+
+/// The Reply was already acknowledged when a stopped route consumed its external token.
+/// Release this tombstone only after the semantic owner finishes its own cleanup.
+pub(crate) unsafe fn retire_stopped_acknowledged_registry_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+) -> Result<(), Error> {
+    let wait = (&mut *core::ptr::addr_of_mut!(WAITS))
+        .iter_mut()
+        .find(|wait| {
+            wait.registry
+                && wait.route == route
+                && wait.dispatch == dispatch
+                && wait.reply == reply
+                && wait.token == token
+        })
+        .ok_or(Error::Retirement)?;
+    match wait.phase {
+        WaitPhase::StoppedAcknowledged => wait.phase = WaitPhase::Finished,
+        WaitPhase::Acknowledged | WaitPhase::Finished => {}
+        _ => return Err(Error::Retirement),
+    }
     Ok(())
 }

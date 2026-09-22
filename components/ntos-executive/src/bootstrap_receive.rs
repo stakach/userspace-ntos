@@ -28,6 +28,7 @@ pub(crate) unsafe fn drive<T: Copy + Eq>(
             let scope = driver_launch::ComponentSchedulerScope::enter();
             scope.service_irq_yield(0);
         }
+        registry_mutation_work::redrive_provider();
         if ingress::service_autonomous().map_err(|_| nt_process::STATUS_UNSUCCESSFUL)? {
             continue;
         }

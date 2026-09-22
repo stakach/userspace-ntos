@@ -539,13 +539,6 @@ impl nt_hive_core::ReactOsSetupSeedTarget for ExecJournalNonSystemSetupSeedTarge
 }
 
 enum OwnedSystemHiveMutation {
-    CreateChild {
-        parent: nt_config_client::SystemHiveKeyLease,
-        name: alloc::string::String,
-        class_name: Option<alloc::string::String>,
-        descriptor: alloc::vec::Vec<u8>,
-        volatile: bool,
-    },
     CreateKey {
         path: alloc::string::String,
     },
@@ -577,9 +570,6 @@ enum SystemHiveMutationOrigin {
 impl OwnedSystemHiveMutation {
     fn as_client_mutation(&self) -> nt_config_client::SystemHiveMutation<'_> {
         match self {
-            Self::CreateChild { parent, name, class_name, descriptor, volatile } => nt_config_client::SystemHiveMutation::CreateChildRelative {
-                parent: *parent, name, class_name: class_name.as_deref(), descriptor, volatile: *volatile,
-            },
             Self::CreateKey { path } => nt_config_client::SystemHiveMutation::CreateKey { path },
             Self::SetValue {
                 path,
@@ -4471,11 +4461,8 @@ impl ExecNtHandler {
             CM_RUNTIME_SYSTEM_MUTATION_COMMITS.fetch_add(1, Ordering::Relaxed);
             for mutation in mutations {
                 match mutation {
-                    OwnedSystemHiveMutation::CreateKey { .. } | OwnedSystemHiveMutation::CreateChild { .. } => {
+                    OwnedSystemHiveMutation::CreateKey { .. } => {
                         CM_RUNTIME_SYSTEM_CREATE_KEYS.fetch_add(1, Ordering::Relaxed);
-                        if matches!(mutation, OwnedSystemHiveMutation::CreateChild { class_name: Some(_), .. }) {
-                            CM_RUNTIME_SYSTEM_SET_CLASSES.fetch_add(1, Ordering::Relaxed);
-                        }
                     }
                     OwnedSystemHiveMutation::SetValue { .. } => {
                         CM_RUNTIME_SYSTEM_SET_VALUES.fetch_add(1, Ordering::Relaxed);

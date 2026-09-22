@@ -23,7 +23,10 @@ pub(super) fn failure(stage: &str, error: impl core::fmt::Debug) -> Error {
             Ok(())
         }
     }
-    let _ = core::fmt::write(&mut Serial, format_args!("[shared-ingress-retire] {stage}: {error:?}\n"));
+    let _ = core::fmt::write(
+        &mut Serial,
+        format_args!("[shared-ingress-retire] {stage}: {error:?}\n"),
+    );
     Error::Retirement
 }
 

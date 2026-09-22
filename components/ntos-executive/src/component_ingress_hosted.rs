@@ -138,15 +138,23 @@ pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(),
     }
     let index = (&*core::ptr::addr_of!(CALLS))
         .iter()
-        .position(|entry| entry.as_ref().is_some_and(|row| {
-            row.binding.badge == badge
-                && row.delivered
-                && row.completion.is_none()
-                && !row.released
-                && row.call.as_ref().is_some_and(|call| call.reply() == reply && call.can_park())
-        }))
+        .position(|entry| {
+            entry.as_ref().is_some_and(|row| {
+                row.binding.badge == badge
+                    && row.delivered
+                    && row.completion.is_none()
+                    && !row.released
+                    && row
+                        .call
+                        .as_ref()
+                        .is_some_and(|call| call.reply() == reply && call.can_park())
+            })
+        })
         .ok_or(Error::Retain)?;
-    let binding = (&*core::ptr::addr_of!(CALLS))[index].as_ref().unwrap().binding;
+    let binding = (&*core::ptr::addr_of!(CALLS))[index]
+        .as_ref()
+        .unwrap()
+        .binding;
     if crate::service_sec_image::hosted_ingress_binding(badge) != Some(binding) {
         return Err(Error::PhysicalIdentity);
     }
@@ -164,7 +172,10 @@ pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(),
     // exact caller; only the root semantic pool record is removed, never the physical Reply.
     park.commit();
     crate::wait_reply_pool_clear_cap(pool_index);
-    (&mut *core::ptr::addr_of_mut!(CALLS))[index].as_mut().unwrap().delivered = false;
+    (&mut *core::ptr::addr_of_mut!(CALLS))[index]
+        .as_mut()
+        .unwrap()
+        .delivered = false;
     Ok(())
 }
 
@@ -306,6 +317,41 @@ pub(crate) unsafe fn reply_hosted(reply: u64, info: u64, words: [u64; 4]) -> Res
             return Err(Error::Reply);
         }
     }
+    finish_acknowledged(row)
+}
+
+/// Reconcile only a Reply whose send already has a positive acknowledgement. This never sends
+/// again, so an indeterminate send remains distinct from a failed post-send Free observation.
+pub(crate) unsafe fn finish_acknowledged_hosted_reply(reply: u64) -> Result<bool, Error> {
+    let row = (&mut *core::ptr::addr_of_mut!(CALLS))
+        .iter_mut()
+        .flatten()
+        .find(|row| {
+            row.call.as_ref().is_some_and(|call| call.reply() == reply)
+                || row
+                    .recycled
+                    .as_ref()
+                    .is_some_and(|call| call.reply() == reply)
+        })
+        .ok_or(Error::Reply)?;
+    if row.completion == Some(Completion::Acknowledged) {
+        return Ok(true);
+    }
+    if row.completion.is_some() {
+        return Ok(false);
+    }
+    if !row
+        .call
+        .as_ref()
+        .is_some_and(ExternalIngress::is_acknowledged)
+    {
+        return Ok(false);
+    }
+    finish_acknowledged(row)?;
+    Ok(true)
+}
+
+unsafe fn finish_acknowledged(row: &mut HostedCall) -> Result<(), Error> {
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
     let owner = owner();
     let (ready, _message) = owner
