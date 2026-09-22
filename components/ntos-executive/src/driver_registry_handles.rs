@@ -94,21 +94,21 @@ impl OwnedDriverRegistryPublication {
         target: u32,
         grant: u32,
     ) -> Result<(), i32> {
-        let result = self
-            .pending
-            .as_mut()
-            .ok_or(STATUS_INVALID_HANDLE)
-            .and_then(|row| {
-                crate::with_provider_process_manager(|pm| {
-                    pm.validate_native_handle_caller(row.caller)?;
-                    row.publication.bind(pm, target, grant)
-                })
-                .map_err(|status| status as i32)
-            });
+        let result = self.bind_borrowed_target(target, grant);
         if result.is_err() {
             release_target(target);
         }
         result
+    }
+
+    /// A handle lookup borrows its target; a failed bind cannot retire that existing Key.
+    unsafe fn bind_borrowed_target(&mut self, target: u32, grant: u32) -> Result<(), i32> {
+        let row = self.pending.as_mut().ok_or(STATUS_INVALID_HANDLE)?;
+        crate::with_provider_process_manager(|pm| {
+            pm.validate_native_handle_caller(row.caller)?;
+            row.publication.bind(pm, target, grant)
+        })
+        .map_err(|status| status as i32)
     }
 
     pub(crate) unsafe fn authorize_bound_grant(&mut self, grant: u32) -> Result<(), i32> {
@@ -318,7 +318,7 @@ pub(crate) unsafe fn with_registry_root<T>(
     .map_err(|status| status as i32);
     let result = acquired
         .and_then(|key| {
-            retained.bind_reserved_target(key, 0)?;
+            retained.bind_borrowed_target(key, 0)?;
             target_snapshot(key)
         })
         .and_then(|root| operation(Some(root)));

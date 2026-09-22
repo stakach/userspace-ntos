@@ -29,8 +29,17 @@ pub(crate) unsafe fn drive<T: Copy + Eq>(
             scope.service_irq_yield(0);
         }
         registry_mutation_work::redrive_provider();
-        if ingress::service_autonomous().map_err(|_| nt_process::STATUS_UNSUCCESSFUL)? {
+        if ingress::resume_acknowledged_registry_services()
+            .map_err(|_| nt_process::STATUS_UNSUCCESSFUL)?
+        {
             continue;
+        }
+        // The registry journal owns the mounted volume until its terminal ACK. Incoming
+        // autonomous Calls remain in the shared receiver while that ownership is live.
+        if !writable_fs::registry_journal::owns_volume() {
+            if ingress::service_autonomous().map_err(|_| nt_process::STATUS_UNSUCCESSFUL)? {
+                continue;
+            }
         }
         // Timer/IRQ service can select a continuation. Run another bounded pass before sleep;
         // its pacing deadline still prevents an immediately reparked job from spinning.

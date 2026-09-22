@@ -19,7 +19,9 @@ mod services;
 pub(crate) use services::{
     acknowledge_registry_service_cancellation, cancel_parked_service, finish_autonomous,
     park_registry_service, park_service, reconcile_registry_service_reply,
-    registry_service_cancelled, resume_service, retire_stopped_acknowledged_registry_service,
+    registry_service_cancelled, registry_service_resume_next_deadline,
+    resume_acknowledged_registry_services, resume_service,
+    retire_stopped_acknowledged_registry_service,
     wake_registry_service, wake_service,
 };
 

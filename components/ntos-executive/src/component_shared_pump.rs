@@ -7,6 +7,11 @@ use nt_component_suspension::peer_registry::PeerRoute;
 pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute) -> PumpMessage {
     loop {
         crate::registry_mutation_work::redrive_provider();
+        match runtime::resume_acknowledged_registry_services() {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(_) => return PumpMessage::transport_wall(),
+        }
         if runtime::resume_service(route).is_err() {
             return PumpMessage::transport_wall();
         }

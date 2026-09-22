@@ -1,5 +1,7 @@
 use super::*;
-use crate::{IngressReplyObservation, LaneBinding, LaneDispatchIdentity, LanePhase};
+use crate::{
+    IngressReplyObservation, LaneBinding, LaneDispatchIdentity, LanePhase, StoredCompletionError,
+};
 
 type Lanes = ComponentSuspensionLanes<(), (), ()>;
 fn bound(_: u64, _: u64) -> Result<ReplyBindingObservation, u8> {
@@ -128,6 +130,46 @@ fn parked_reply_ack_preserves_other_running_lane_and_wait_epoch() {
     lanes.finish_dispatch(other, 70).unwrap();
     lanes.resume_external(dispatch.lane(), 40, 77).unwrap();
     assert_eq!(lanes.running(), Some(dispatch.lane()));
+}
+
+#[test]
+fn acknowledged_external_wait_retries_free_query_after_token_retirement() {
+    let (mut lanes, mut peers, route, dispatch, other, mut receiver, _pending) = fixture();
+    assert_eq!(
+        receiver.reply_parked_stored(route, dispatch, 77, &lanes, &peers, bound, |_| {
+            IngressReplyObservation::Acknowledged
+        }),
+        Ok(IngressReplyObservation::Acknowledged)
+    );
+    lanes.finish_dispatch(other, 70).unwrap();
+    lanes.resume_external(dispatch.lane(), 40, 77).unwrap();
+    lanes
+        .retire_external_running(dispatch.lane(), 40, 77)
+        .unwrap();
+
+    assert_eq!(
+        receiver.complete_stored(route, dispatch, &mut lanes, &mut peers, |_, _| Err::<
+            ReplyBindingObservation,
+            _,
+        >(
+            9u8
+        )),
+        Err(StoredCompletionError::Query(9))
+    );
+    assert_eq!(
+        receiver.stored_reply_acknowledged(route, dispatch, 40),
+        Ok(true)
+    );
+    assert_eq!(peers.state(route).unwrap().1, 1);
+    assert_eq!(lanes.external_top(dispatch.lane()), Ok(None));
+
+    assert_eq!(
+        receiver.complete_stored(route, dispatch, &mut lanes, &mut peers, |_, _| Ok::<_, u8>(
+            ReplyBindingObservation::Free
+        )),
+        Ok(123)
+    );
+    assert_eq!(peers.state(route).unwrap().1, 0);
 }
 
 #[test]

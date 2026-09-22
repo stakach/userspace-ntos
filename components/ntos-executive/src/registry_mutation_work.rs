@@ -201,7 +201,15 @@ fn has_matching(predicate: impl Fn(ProviderLogicalCaller) -> bool) -> bool {
 }
 
 pub(crate) fn next_deadline() -> Option<u64> {
-    (PENDING.load(Ordering::Acquire) != 0).then(|| NEXT.load(Ordering::Acquire))
+    let work = (PENDING.load(Ordering::Acquire) != 0).then(|| NEXT.load(Ordering::Acquire));
+    let service = unsafe {
+        spawn_hosts::shared_ingress::owner::runtime::registry_service_resume_next_deadline()
+    };
+    match (work, service) {
+        (Some(work), Some(service)) => Some(work.min(service)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
 }
 
 pub(crate) fn wake_due(now: u64) -> u64 {
