@@ -270,7 +270,7 @@ const _: () =
 /// Kernel-mode KUSER_SHARED_DATA mapping used by win32k's direct `SharedUserData` reads. User
 /// processes also see the low 0x7FFE0000 alias; win32k, as a kernel driver, reads the canonical
 /// high VA directly (for example TickCount at +0x320).
-pub const WIN32K_KUSER_SHARED_DATA_VA: u64 = 0xFFFF_F780_0000_0000;
+pub const WIN32K_KUSER_SHARED_DATA_VA: u64 = nt_ntdll_layout::kuser::KERNEL_ALIAS_VA;
 /// Executive-only scratch VA, inside the already mapped win32k aux PT, used to initialize the
 /// KUSER frame before aliasing it into the win32k component at the canonical high VA.
 pub const WIN32K_KUSER_SCRATCH_VA: u64 = WIN32K_AUX_PT_VADDR + 0x1B_0000;
