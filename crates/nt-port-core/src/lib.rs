@@ -278,7 +278,7 @@ pub struct DeliveredRequestInfo {
 
 /// Base for allocated port / comm-port handles (a distinct, recognizable range —
 /// ASCII `"LP"` — so a port handle never looks like a fake object handle).
-const PORT_HANDLE_BASE: u64 = 0x0000_4C50_0000_0001;
+pub const PORT_HANDLE_BASE: u64 = 0x0000_4C50_0000_0001;
 
 /// The maximum length of a stored connection-info blob (guards against an
 /// oversized connect payload growing core state without bound).

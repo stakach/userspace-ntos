@@ -9866,7 +9866,7 @@ impl ExecNtHandler {
             .ok_or(nt_process::STATUS_INVALID_HANDLE)
     }
 
-    fn native_directory_caller(
+    fn native_handle_caller(
         &self,
         previous_mode: nt_syscall::ProcessorMode,
     ) -> Result<nt_process::native_handle::NativeHandleCaller, u32> {
@@ -20253,6 +20253,65 @@ impl ExecNtHandler {
             Err(nt_process::STATUS_INVALID_HANDLE) => Ok(false),
             Err(status) => Err(status),
         }
+    }
+
+    /// Close one canonical table entry in the same serialized dispatch as its File preflight.
+    /// The removed entry still needs its host-owned object and side-table release procedures.
+    fn close_native_table_handle(
+        &mut self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        value: u64,
+    ) -> Result<bool, u32> {
+        let target = match self.pm.inspect_native_close_target(caller, value) {
+            Ok(target) => target,
+            Err(nt_process::STATUS_INVALID_HANDLE) => return Ok(false),
+            Err(status) => return Err(status),
+        };
+        let cleanup_file = match target.object() {
+            nt_process::HandleObject::File(file_id)
+            | nt_process::HandleObject::RoutedFile { file_id, .. } => self
+                .file_completion
+                .cleanup_required_on_handle_close(file_id)
+                .expect("process File handle has no completion-policy identity")
+                .then_some(file_id),
+            _ => None,
+        };
+        if let Some(file_id) = cleanup_file {
+            if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
+                return Err(STATUS_INSUFFICIENT_RESOURCES);
+            }
+            let Some(reservation) = (unsafe { reserve_file_cleanup_waiter() }) else {
+                return Err(STATUS_INSUFFICIENT_RESOURCES);
+            };
+            assert!(self.pending_file_cleanup_wait.is_none());
+            self.pending_file_cleanup_wait = Some((file_id, reservation));
+        }
+        let closed = match self.pm.close_native_handle(caller, value) {
+            Ok(closed) => closed,
+            Err(error) => {
+                if let Some((_, reservation)) = self.pending_file_cleanup_wait.take() {
+                    assert!(unsafe {
+                        (&mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS))
+                            .cancel_reservation(reservation)
+                    });
+                }
+                return match error {
+                    nt_process::native_handle::NativeCloseError::Status(status) => Err(status),
+                    nt_process::native_handle::NativeCloseError::BugCheck { .. } => {
+                        panic!("protected kernel handle close")
+                    }
+                };
+            }
+        };
+        unsafe {
+            driver_launch::driver_registry_value_transfers::cancel_closed_handle(
+                closed.table_owner(),
+                closed.handle(),
+            );
+        }
+        self.release_handle_object(closed.into_object());
+        PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
     }
 
     pub(crate) fn close_process_handle(&mut self, pid: nt_process::ProcessId, handle: u64) -> bool {
@@ -31728,120 +31787,41 @@ impl ExecNtHandler {
         _out: &mut alloc::vec::Vec<u8>,
     ) -> u32 {
         match ctx.service {
-            // NtClose(Handle[R10]=args[0]): free the caller's real EPROCESS handle-table slot. The
-            // slot may be reused by a later open, so process-scoped side maps clear their binding
-            // only after the owning handle successfully closes. Handles explicitly marked
-            // protect-from-close fail like NT; a close of a handle the executive doesn't own stays
-            // benign for the hosted boot path. A win32k USER-object handle is closed through that
-            // owning table so a duplicated desktop handle has an independent lifetime.
+            // Close the caller's canonical table entry, or a separately owned LPC/USER handle.
+            // Image bookkeeping is also consulted for a stale table handle because it retains
+            // the original File/Section identity until the matching close is observed.
             NativeService::NtClose => {
                 let tagged_kernel = args[0] & nt_process::native_handle::KERNEL_HANDLE_TAG
                     == nt_process::native_handle::KERNEL_HANDLE_TAG;
-                if tagged_kernel && ctx.previous_mode == nt_syscall::ProcessorMode::UserMode {
-                    return nt_process::STATUS_INVALID_HANDLE;
-                }
-                let local_directory = self.pm_pid_for_pi(self.pi).is_some_and(|pid| {
-                    nt_process::Handle::try_from(args[0]).is_ok_and(|handle| {
-                        matches!(
-                            self.pm.lookup_handle(pid, handle),
-                            Some(nt_process::HandleObject::ObjectDirectory(_))
-                        )
-                    })
-                });
-                if local_directory || tagged_kernel {
-                    let caller = match self.native_directory_caller(ctx.previous_mode) {
+                let native_table = tagged_kernel
+                    || args[0] < nt_object_manager::win32k_ob::OB_HANDLE_BASE;
+                let closed = if native_table {
+                    let caller = match self.native_handle_caller(ctx.previous_mode) {
                         Ok(caller) => caller,
                         Err(status) => return status,
                     };
-                    let (owner, handle) = match self.pm.decode_native_handle(caller, args[0]) {
-                        Ok(nt_process::native_handle::NativeHandleScope::Table {
-                            owner, handle, ..
-                        }) => (owner, handle),
-                        Ok(_) => return nt_process::STATUS_INVALID_HANDLE,
+                    match self.close_native_table_handle(caller, args[0]) {
+                        Ok(closed) => closed,
                         Err(status) => return status,
+                    }
+                } else if nt_object_manager::win32k_ob::ObHandleTable::is_handle_namespace_value(
+                    args[0],
+                ) {
+                    let user_closed = unsafe {
+                        crate::win32k_subsystem::close_user_object_handle(args[0])
                     };
-                    if !matches!(
-                        self.pm.lookup_handle(owner, handle),
-                        Some(nt_process::HandleObject::ObjectDirectory(_))
-                    ) {
-                        return nt_process::STATUS_INVALID_HANDLE;
+                    if user_closed {
+                        PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
                     }
-                    let identity = match self
-                        .pm
-                        .close_native_object_directory_handle(caller, args[0])
-                    {
-                        Ok(identity) => identity,
-                        Err(nt_process::native_handle::NativePsCloseError::Status(status)) => {
-                            return status;
-                        }
-                        Err(nt_process::native_handle::NativePsCloseError::BugCheck { .. }) => {
-                            panic!("protected kernel directory handle close");
-                        }
-                    };
-                    self.release_directory_namespace_reference(identity);
-                    PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
-                    return 0;
-                }
-                let mut closed = false;
-                let pid = self.pm_pid_for_pi(self.pi);
-                if let (Some(pid), Ok(handle)) = (pid, nt_process::Handle::try_from(args[0])) {
-                    if self
-                        .pm
-                        .handle_flags(pid, handle)
-                        .is_some_and(|flags| flags.protect_from_close)
-                    {
-                        return nt_process::STATUS_HANDLE_NOT_CLOSABLE;
-                    }
-                    let cleanup_file = match self.pm.lookup_handle(pid, handle) {
-                        Some(nt_process::HandleObject::File(file_id))
-                        | Some(nt_process::HandleObject::RoutedFile { file_id, .. }) => self
-                            .file_completion
-                            .cleanup_required_on_handle_close(file_id)
-                            .expect("process File handle has no completion-policy identity")
-                            .then_some(file_id),
-                        _ => None,
-                    };
-                    if let Some(file_id) = cleanup_file {
-                        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
-                            || !wait_reply_pool_has_free()
-                        {
-                            return STATUS_INSUFFICIENT_RESOURCES;
-                        }
-                        let Some(reservation) = (unsafe { reserve_file_cleanup_waiter() }) else {
-                            return STATUS_INSUFFICIENT_RESOURCES;
-                        };
-                        assert!(self.pending_file_cleanup_wait.is_none());
-                        self.pending_file_cleanup_wait = Some((file_id, reservation));
-                    }
-                }
-                if let Some(pid) = pid {
-                    match self.close_process_handle_checked(pid, args[0]) {
-                        Ok(was_closed) => closed = was_closed,
-                        Err(status) => {
-                            if let Some((_, reservation)) = self.pending_file_cleanup_wait.take() {
-                                assert!(unsafe {
-                                    (&mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS))
-                                        .cancel_reservation(reservation)
-                                });
-                            }
-                            return status;
-                        }
-                    }
-                }
-                if !closed {
+                    user_closed
+                } else if args[0] >= nt_port_core::PORT_HANDLE_BASE {
                     match self.close_lpc_handle_for_current_process(args[0]) {
-                        Ok(was_closed) => closed = was_closed,
+                        Ok(closed) => closed,
                         Err(status) => return status,
                     }
-                }
-                if !closed {
-                    if let Some((_, reservation)) = self.pending_file_cleanup_wait.take() {
-                        assert!(unsafe {
-                            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS))
-                                .cancel_reservation(reservation)
-                        });
-                    }
-                }
+                } else {
+                    false
+                };
                 if let Some(loop_ctx) = self.loop_ctx {
                     unsafe {
                         let image_target =
@@ -31874,11 +31854,11 @@ impl ExecNtHandler {
                         }
                     }
                 }
-                if !closed && unsafe { crate::win32k_subsystem::close_user_object_handle(args[0]) }
-                {
-                    PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
+                if closed {
+                    0
+                } else {
+                    nt_process::STATUS_INVALID_HANDLE
                 }
-                0 // STATUS_SUCCESS
             }
             // NtAllocateLocallyUniqueId(*LocallyUniqueId[R10]) — `ExAllocateLocallyUniqueId`
             // (`references/reactos/ntoskrnl/ex/uuid.c:335`): atomically post-increment the global
@@ -37064,7 +37044,7 @@ impl ExecNtHandler {
                 if captured.path().is_none() {
                     return 0xC000_0033; // STATUS_OBJECT_NAME_INVALID
                 }
-                let caller = match self.native_directory_caller(ctx.previous_mode) {
+                let caller = match self.native_handle_caller(ctx.previous_mode) {
                     Ok(caller) => caller,
                     Err(status) => return status,
                 };

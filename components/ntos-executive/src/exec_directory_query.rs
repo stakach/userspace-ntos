@@ -70,7 +70,7 @@ impl ExecNtHandler {
         let context_ptr = args[5];
         let return_length_ptr = args[6];
 
-        let caller = match self.native_directory_caller(ctx.previous_mode) {
+        let caller = match self.native_handle_caller(ctx.previous_mode) {
             Ok(caller) => caller,
             Err(status) => return status,
         };
