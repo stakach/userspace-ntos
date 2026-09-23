@@ -2359,6 +2359,46 @@ unsafe fn component_pump_loop(
                 }
             }
             continue;
+        } else if label == crate::win32k_subsystem::W32_DIRECTORY_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let admitted = shared_pump::authenticated_badge(ch, msg.badge)
+                && msg.mi == ((crate::win32k_subsystem::W32_DIRECTORY_LABEL << 12) | 4)
+                && *reply_cap == ch.reply_cap
+                && matches!(
+                    shared_ingress::owner::runtime::channel_route(ch),
+                    Ok(Some(route))
+                        if matches!(
+                            shared_ingress::owner::runtime::current_reply(route),
+                            Ok(reply) if reply == *reply_cap
+                        )
+                            && shared_ingress::owner::runtime::dispatch(route).is_ok()
+                );
+            let (status, out1, out2, out3) = if admitted {
+                crate::service_sec_image::service_win32k_directory_request(
+                    ch,
+                    *reply_cap,
+                    msg.badge,
+                    msg.mi,
+                    msg.m0,
+                    msg.m1,
+                    msg.m2,
+                    msg.m3,
+                )
+            } else {
+                (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0)
+            };
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                4,
+                status as u32 as u64,
+                out1,
+                out2,
+                out3
+            );
+            continue;
         } else if label == crate::win32k_subsystem::W32_EVENT_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {

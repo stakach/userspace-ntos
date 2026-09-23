@@ -214,6 +214,14 @@ impl<R: Copy + Eq, D: Copy + Eq, C: Copy + Eq> DirectoryNameUploads<R, D, C> {
             .map(|entry| entry.phase)
     }
 
+    /// Canonical completion drops only uploads owned by its exact physical dispatch.
+    pub fn retire_matching(
+        &mut self,
+        mut matches: impl FnMut(DirectoryUploadOwner<R, D, C>) -> bool,
+    ) {
+        self.entries.retain(|entry| !matches(entry.owner));
+    }
+
     fn entry_mut(
         &mut self,
         owner: DirectoryUploadOwner<R, D, C>,

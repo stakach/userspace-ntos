@@ -56,7 +56,7 @@ mod registry_reads;
 mod directory_query;
 
 #[path = "exec_directory_object.rs"]
-mod directory_object;
+pub(crate) mod directory_object;
 
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
