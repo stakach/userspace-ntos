@@ -25,11 +25,13 @@ pub mod job_abi;
 mod initial_system;
 pub mod native_handle;
 mod registry_key_handle;
+mod object_directory_handle;
 pub mod process_object_retirement;
 pub mod thread_suspend;
 
 pub use initial_system::InitialSystemIdentity;
 pub use registry_key_handle::RegistryKeyHandlePublication;
+pub use object_directory_handle::ObjectDirectoryHandlePublication;
 
 use dbgk::{DbgKmMessage, DebugEvent, DebugObjectId, DebugObjectStore};
 
@@ -851,6 +853,8 @@ pub enum HandleObject {
     /// A Configuration Manager key target. The executive owns the read-only hive and mutable
     /// overlay for the process lifetime; each handle independently owns only this typed reference.
     RegistryKey(u32),
+    /// Executive-owned object-directory identity; Ps owns only the typed handle reference.
+    ObjectDirectory(u64),
     /// A process primary access token. The id is the owning process id.
     Token(ProcessId),
     /// A stable, independently owned token object.
@@ -1103,6 +1107,8 @@ pub struct ProcessManager {
     user_apc_manager_identity: u64,
     /// Move-stable owner identity for staged registry handle publication.
     registry_publication_identity: u64,
+    /// Move-stable owner identity for staged object-directory handle publication.
+    directory_publication_identity: u64,
     processes: IdTable<NtProcess>,
     threads: IdTable<NtThread>,
     /// Withdrawn Ps objects remain owned until their exact cleanup ticket is finished.
