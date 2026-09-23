@@ -84,7 +84,8 @@ impl HostedExistingKey {
 /// Bind a hidden PM reference before any CM query can reenter the executive.
 pub(crate) fn retain_hosted_existing(handler: &mut ExecNtHandler, key: KeyRef) -> Result<HostedExistingKey, u32> {
     let target = registry_key_targets::system(key).ok_or(0xC000_0008u32)?;
-    let lifetime = handler.pm.thread_lifetime(handler.current_tid as u32).ok_or(0xC000_0008u32)?;
+    let tid = u32::try_from(handler.current_tid).map_err(|_| 0xC000_0008u32)?;
+    let lifetime = handler.pm.thread_lifetime(tid).ok_or(0xC000_0008u32)?;
     let caller = handler.pm.capture_native_handle_caller(lifetime, nt_types::AccessMode::UserMode)?;
     let mut owner = handler.pm.reserve_native_registry_key_handle(caller, 0)?;
     if let Err(status) = owner.bind(&mut handler.pm, key, 0) {
@@ -278,7 +279,7 @@ pub(crate) unsafe fn submit_hosted_existing(
         let logical = handler.capture_provider_logical_caller(
             handler.pi, handler.current_tid, handler.current_badge, tcb,
         ).ok_or(0xC000_0008u32)?;
-        if logical.thread().thread_id() != handler.current_tid as u32 {
+        if u64::from(logical.thread().thread_id()) != handler.current_tid {
             return Err(0xC000_0008u32);
         }
         let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT.ok_or(0xC000_00A3u32)?;
