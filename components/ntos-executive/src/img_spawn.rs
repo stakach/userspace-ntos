@@ -637,13 +637,16 @@ pub(crate) unsafe fn spawn_pe_thread(
     // Map the PE image: write the bytes into fresh frames via an executive scratch mapping,
     // then map each frame RX (rights=2 — W^X) at PE_LOAD_BASE in the new VSpace.
     let pages = (mapped.bytes.len() + 0xFFF) / 0x1000;
+    assert!((pages as u64 + 4) * 0x1000 <= PE_SCRATCH_BYTES);
+    assert!(ensure_executive_paging(PE_SCRATCH_VADDR));
     for i in 0..pages {
         let f = alloc_frame();
-        let _ = page_map(
+        checked_spawn_page_map(
             f,
             PE_SCRATCH_VADDR + i as u64 * 0x1000,
             RW_NX,
             CAP_INIT_THREAD_VSPACE,
+            b"pe-image-scratch",
         );
         for j in 0..0x1000usize {
             let src = i * 0x1000 + j;
@@ -672,13 +675,13 @@ pub(crate) unsafe fn spawn_pe_thread(
     // they never collide with them.
     let env_scratch = PE_SCRATCH_VADDR + pages as u64 * 0x1000;
     let teb = alloc_frame();
-    let _ = page_map(teb, env_scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+    checked_spawn_page_map(teb, env_scratch, RW_NX, CAP_INIT_THREAD_VSPACE, b"pe-teb-scratch");
     zero_scratch_page(env_scratch);
     core::ptr::write_volatile((env_scratch + 0x30) as *mut u64, TEB_VA); // TEB self
     core::ptr::write_volatile((env_scratch + 0x60) as *mut u64, PEB_VA); // ProcessEnvironmentBlock
     let _ = page_map(copy_cap(teb), TEB_VA, RW_NX, pml4);
     let peb = alloc_frame();
-    let _ = page_map(peb, env_scratch + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    checked_spawn_page_map(peb, env_scratch + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE, b"pe-peb-scratch");
     zero_scratch_page(env_scratch + 0x1000);
     core::ptr::write_volatile((env_scratch + 0x1000 + 0x10) as *mut u64, PE_LOAD_BASE); // ImageBaseAddress
     core::ptr::write_volatile(
@@ -711,13 +714,13 @@ pub(crate) unsafe fn spawn_pe_thread(
     let _ = paging_struct_map(pd2, LBL_X86_PAGE_DIRECTORY_MAP, KUSER_VA, pml4);
     let _ = paging_struct_map(pt2, LBL_X86_PAGE_TABLE_MAP, KUSER_VA, pml4);
     let kuser = alloc_frame();
-    let _ = page_map(kuser, env_scratch + 0x3000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    checked_spawn_page_map(kuser, env_scratch + 0x3000, RW_NX, CAP_INIT_THREAD_VSPACE, b"pe-kuser-scratch");
     zero_scratch_page(env_scratch + 0x3000);
     unsafe { initialize_kuser_snapshot(env_scratch + 0x3000) };
     let _ = page_map(copy_cap(kuser), KUSER_VA, 2 | PAGE_EXECUTE_NEVER, pml4);
     // The provided "ntdll": a page of syscall stubs the PE's IAT resolves to, mapped RX.
     let ntdll = alloc_frame();
-    let _ = page_map(ntdll, env_scratch + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    checked_spawn_page_map(ntdll, env_scratch + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE, b"pe-ntdll-scratch");
     zero_scratch_page(env_scratch + 0x2000);
     for (j, &byte) in NTDLL_STUB.iter().enumerate() {
         core::ptr::write_volatile((env_scratch + 0x2000 + j as u64) as *mut u8, byte);
