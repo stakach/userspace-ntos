@@ -32,6 +32,84 @@ pub struct DirectoryQuery {
     pub written: u32,
 }
 
+/// A byte layout for one directory query. The entries supplied to `read_range` must be the same
+/// immutable snapshot used to create the plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectoryPackPlan {
+    query: DirectoryQuery,
+    start: usize,
+    accepted: usize,
+    output_base: u64,
+}
+
+impl DirectoryPackPlan {
+    pub fn query(self) -> DirectoryQuery {
+        self.query
+    }
+
+    /// Emit only a bounded window of the packed x64 result, without allocating the full buffer.
+    pub fn read_range(
+        self,
+        entries: &[(UnicodeString, UnicodeString)],
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<(), NtStatus> {
+        let end = offset
+            .checked_add(output.len())
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if end > self.query.written as usize {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        output.fill(0);
+        if self.accepted == 0 {
+            return Ok(());
+        }
+        let selected = entries
+            .get(self.start..self.start + self.accepted)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let mut string_offset = (self.accepted + 1) * RECORD_SIZE;
+        for (index, (name, type_name)) in selected.iter().enumerate() {
+            for (field, value) in [name, type_name].into_iter().enumerate() {
+                let length = u16::try_from(value.len() * 2)
+                    .map_err(|_| NtStatus::INVALID_PARAMETER)?;
+                let record = index * RECORD_SIZE + field * 16;
+                copy_window(offset, output, record, &length.to_le_bytes());
+                copy_window(offset, output, record + 2, &(length + 2).to_le_bytes());
+                let pointer = self
+                    .output_base
+                    .checked_add(string_offset as u64)
+                    .ok_or(NtStatus::INVALID_PARAMETER)?;
+                copy_window(offset, output, record + 8, &pointer.to_le_bytes());
+                copy_utf16_window(offset, output, string_offset, value.as_units());
+                string_offset = string_offset
+                    .checked_add(value.len() * 2 + 2)
+                    .ok_or(NtStatus::INVALID_PARAMETER)?;
+            }
+        }
+        if string_offset != self.query.written as usize {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(())
+    }
+}
+
+fn copy_window(offset: usize, output: &mut [u8], field: usize, bytes: &[u8]) {
+    let begin = offset.max(field);
+    let end = (offset + output.len()).min(field + bytes.len());
+    if begin < end {
+        output[begin - offset..end - offset].copy_from_slice(&bytes[begin - field..end - field]);
+    }
+}
+
+fn copy_utf16_window(offset: usize, output: &mut [u8], field: usize, units: &[u16]) {
+    let begin = offset.max(field);
+    let end = (offset + output.len()).min(field + units.len() * 2);
+    for position in begin..end {
+        let relative = position - field;
+        output[position - offset] = units[relative / 2].to_le_bytes()[relative & 1];
+    }
+}
+
 fn case(attributes: ObjAttrFlags) -> CaseSensitivity {
     if attributes.contains(ObjAttrFlags::CASE_INSENSITIVE) {
         CaseSensitivity::CaseInsensitive
@@ -40,22 +118,21 @@ fn case(attributes: ObjAttrFlags) -> CaseSensitivity {
     }
 }
 
-/// Pack canonical directory names and type names into NT x64
-/// OBJECT_DIRECTORY_INFORMATION records. `output_base` relocates pointers in
-/// the records but is never dereferenced.
-pub fn pack_directory_entries(
+/// Compute the NT x64 directory layout. `output_base` relocates embedded pointers but is never
+/// dereferenced; a later `read_range` must use these same entries without mutation.
+pub fn plan_directory_entries(
     entries: &[(UnicodeString, UnicodeString)],
     context: u32,
     restart: bool,
     single: bool,
     output_base: u64,
-    output: &mut [u8],
-) -> Result<DirectoryQuery, NtStatus> {
-    if output.len() > u32::MAX as usize {
+    output_length: usize,
+) -> Result<DirectoryPackPlan, NtStatus> {
+    if output_length > u32::MAX as usize {
         return Err(NtStatus::INVALID_PARAMETER);
     }
     output_base
-        .checked_add(output.len() as u64)
+        .checked_add(output_length as u64)
         .ok_or(NtStatus::INVALID_PARAMETER)?;
 
     let start = if restart { 0 } else { context };
@@ -82,7 +159,7 @@ pub fn pack_directory_entries(
         let next_total = total
             .checked_add(needed)
             .ok_or(NtStatus::INVALID_PARAMETER)?;
-        if next_total > output.len() {
+        if next_total > output_length {
             status = if single {
                 total = next_total;
                 NtStatus::BUFFER_TOO_SMALL
@@ -106,51 +183,49 @@ pub fn pack_directory_entries(
     } else {
         context
     };
-    if status == NO_MORE_ENTRIES && total <= output.len() {
-        output[..total].fill(0);
-        return Ok(DirectoryQuery {
+    let written = if status == NO_MORE_ENTRIES && total <= output_length {
+        return_length
+    } else if total > output_length || !status.is_success() {
+        0
+    } else {
+        return_length
+    };
+    Ok(DirectoryPackPlan {
+        query: DirectoryQuery {
             status,
             context: next_context,
             return_length,
-            written: return_length,
-        });
-    }
-    if total > output.len() || !status.is_success() {
-        return Ok(DirectoryQuery {
-            status,
-            context: next_context,
-            return_length,
-            written: 0,
-        });
-    }
-    output[..total].fill(0);
-    let mut string_offset = (accepted + 1) * RECORD_SIZE;
-    for (index, (name, type_name)) in entries
-        .iter()
-        .skip(start as usize)
-        .take(accepted)
-        .enumerate()
-    {
-        for (field, value) in [name, type_name].into_iter().enumerate() {
-            let length = (value.len() * 2) as u16;
-            let record = index * RECORD_SIZE + field * 16;
-            output[record..record + 2].copy_from_slice(&length.to_le_bytes());
-            output[record + 2..record + 4].copy_from_slice(&(length + 2).to_le_bytes());
-            output[record + 8..record + 16]
-                .copy_from_slice(&(output_base + string_offset as u64).to_le_bytes());
-            for unit in value.as_units() {
-                output[string_offset..string_offset + 2].copy_from_slice(&unit.to_le_bytes());
-                string_offset += 2;
-            }
-            string_offset += 2;
-        }
-    }
-    Ok(DirectoryQuery {
-        status,
-        context: next_context,
-        return_length,
-        written: total as u32,
+            written,
+        },
+        start: start as usize,
+        accepted,
+        output_base,
     })
+}
+
+/// Pack canonical directory names and type names into NT x64
+/// OBJECT_DIRECTORY_INFORMATION records.
+pub fn pack_directory_entries(
+    entries: &[(UnicodeString, UnicodeString)],
+    context: u32,
+    restart: bool,
+    single: bool,
+    output_base: u64,
+    output: &mut [u8],
+) -> Result<DirectoryQuery, NtStatus> {
+    let plan = plan_directory_entries(
+        entries,
+        context,
+        restart,
+        single,
+        output_base,
+        output.len(),
+    )?;
+    let result = plan.query();
+    if result.written != 0 {
+        plan.read_range(entries, 0, &mut output[..result.written as usize])?;
+    }
+    Ok(result)
 }
 
 impl ObjectManager {
@@ -340,6 +415,7 @@ impl ObjectManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use crate::ClientKind;
     use nt_types::NtPath;
 
@@ -446,6 +522,118 @@ mod tests {
             pack_directory_entries(&entries, second.context, false, false, 0, &mut output).unwrap();
         assert_eq!(end.status, NO_MORE_ENTRIES);
         assert_eq!(end.context, 2);
+    }
+
+    #[test]
+    fn planned_ranges_reassemble_the_monolithic_x64_result() {
+        let entries = [
+            (
+                UnicodeString::from_str("A\u{4e2d}"),
+                UnicodeString::from_str("Directory"),
+            ),
+            (
+                UnicodeString::from_str("Longer"),
+                UnicodeString::from_str("Mutant"),
+            ),
+        ];
+        for (source, context, restart, single, base, length) in [
+            (&entries[..0], 7, true, false, 0, 0),
+            (&entries[..0], 7, true, true, 0x1000, 32),
+            (&entries[..], 7, true, false, 0, 0),
+            (&entries[..], 7, true, false, 0x1000, 32),
+            (&entries[..], 7, true, true, 0x2000, 87),
+            (&entries[..], 7, true, true, 0x2000, 88),
+            (&entries[..], 7, true, false, 0x3000, 100),
+            (&entries[..], 1, false, false, 0x4000, 200),
+            (&entries[..], 9, false, false, 0x5000, 32),
+            (&entries[..], 9, true, false, 0x6000, 200),
+        ] {
+            let mut whole = vec![0xa5; length];
+            let expected = pack_directory_entries(
+                source, context, restart, single, base, &mut whole,
+            )
+            .unwrap();
+            let plan = plan_directory_entries(source, context, restart, single, base, length)
+                .unwrap();
+            assert_eq!(plan.query(), expected);
+            let mut streamed = vec![0xa5; expected.written as usize];
+            for chunk in [1, 7, 8, 23, 24] {
+                streamed.fill(0xa5);
+                for offset in (0..streamed.len()).step_by(chunk) {
+                    let end = (offset + chunk).min(streamed.len());
+                    plan.read_range(source, offset, &mut streamed[offset..end])
+                        .unwrap();
+                }
+                assert_eq!(streamed, whole[..streamed.len()]);
+            }
+            let mut beyond = [0xa5];
+            assert_eq!(
+                plan.read_range(source, expected.written as usize, &mut beyond),
+                Err(NtStatus::INVALID_PARAMETER)
+            );
+            assert_eq!(beyond, [0xa5]);
+        }
+    }
+
+    #[test]
+    fn planned_ranges_reject_overflow_and_preserve_short_buffers() {
+        let entries = [(
+            UnicodeString::from_str("A"),
+            UnicodeString::from_str("Directory"),
+        )];
+        assert_eq!(
+            plan_directory_entries(&entries, 0, true, true, u64::MAX, 1),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        let plan = plan_directory_entries(&entries, 42, true, true, 0x1000, 87).unwrap();
+        assert_eq!(plan.query().status, NtStatus::BUFFER_TOO_SMALL);
+        assert_eq!(plan.query().context, 42);
+        assert_eq!(plan.query().written, 0);
+        let mut empty = [];
+        plan.read_range(&entries, 0, &mut empty).unwrap();
+        let mut output = [0xa5; 87];
+        assert_eq!(
+            pack_directory_entries(&entries, 42, true, true, 0x1000, &mut output)
+                .unwrap(),
+            plan.query()
+        );
+        assert_eq!(output, [0xa5; 87]);
+    }
+
+    #[test]
+    fn planned_range_matches_an_independent_directory_record() {
+        let entries = [(
+            UnicodeString::from_str("A"),
+            UnicodeString::from_str("Directory"),
+        )];
+        let plan = plan_directory_entries(&entries, 0, false, true, 0x2000, 88).unwrap();
+        assert_eq!(
+            plan.query(),
+            DirectoryQuery {
+                status: NtStatus::SUCCESS,
+                context: 1,
+                return_length: 88,
+                written: 88,
+            }
+        );
+        let mut expected = [0u8; 88];
+        expected[0..2].copy_from_slice(&2u16.to_le_bytes());
+        expected[2..4].copy_from_slice(&4u16.to_le_bytes());
+        expected[8..16].copy_from_slice(&0x2040u64.to_le_bytes());
+        expected[16..18].copy_from_slice(&18u16.to_le_bytes());
+        expected[18..20].copy_from_slice(&20u16.to_le_bytes());
+        expected[24..32].copy_from_slice(&0x2044u64.to_le_bytes());
+        expected[64..66].copy_from_slice(&[b'A', 0]);
+        for (index, byte) in b"Directory".iter().enumerate() {
+            expected[68 + index * 2] = *byte;
+        }
+        let mut actual = [0xa5; 88];
+        for offset in (0..actual.len()).step_by(7) {
+            let end = (offset + 7).min(actual.len());
+            plan.read_range(&entries, offset, &mut actual[offset..end])
+                .unwrap();
+        }
+        assert_eq!(actual, expected);
     }
 
     #[test]
