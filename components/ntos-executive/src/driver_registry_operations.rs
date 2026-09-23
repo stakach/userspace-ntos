@@ -145,23 +145,8 @@ pub(crate) unsafe fn set_value(
                 Err(status as i32)
             }
         }
-        DriverRegistryHandleTarget::System {
-            lease,
-            physical_path,
-        } => {
-            let information =
-                crate::config_manager_query_leased_system_hive_key_information(lease)?;
-            crate::persist_and_publish_system_hive_mutation(
-                information.mount_generation,
-                &[nt_config_client::SystemHiveMutation::SetValue {
-                    path: physical_path.as_str(),
-                    name,
-                    value_type: ty,
-                    data,
-                }],
-            )
-            .map(|_| ())
-            .map_err(|status| status as i32)
+        DriverRegistryHandleTarget::System { .. } => {
+            unreachable!("SYSTEM value SET requires retained mutation work")
         }
         DriverRegistryHandleTarget::Generic { key, .. } => {
             crate::config_manager_runtime_key_operation(
@@ -190,21 +175,8 @@ pub(crate) unsafe fn delete_value(
                 Err(status as i32)
             }
         }
-        DriverRegistryHandleTarget::System {
-            lease,
-            physical_path,
-        } => {
-            let information =
-                crate::config_manager_query_leased_system_hive_key_information(lease)?;
-            crate::persist_and_publish_system_hive_mutation(
-                information.mount_generation,
-                &[nt_config_client::SystemHiveMutation::DeleteValue {
-                    path: physical_path.as_str(),
-                    name,
-                }],
-            )
-            .map(|_| ())
-            .map_err(|status| status as i32)
+        DriverRegistryHandleTarget::System { .. } => {
+            unreachable!("SYSTEM value DELETE requires retained mutation work")
         }
         DriverRegistryHandleTarget::Generic { key, .. } => {
             crate::config_manager_runtime_key_operation(

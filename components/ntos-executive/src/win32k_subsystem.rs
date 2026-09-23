@@ -11819,6 +11819,8 @@ const WIN32K_REGISTRY_OP_PUBLISH: u64 = 12;
 const WIN32K_REGISTRY_OP_ABORT: u64 = 13;
 const WIN32K_REGISTRY_OP_IS_KEY: u64 = 14;
 const WIN32K_REGISTRY_USE_PREVIOUS_MODE: u64 = 1 << 63;
+#[path = "win32k_registry_deferred_value.rs"]
+mod win32k_registry_deferred_value;
 const REG_OPTION_VOLATILE: u32 = 0x0000_0001;
 const REG_OPTION_CREATE_LINK: u32 = 0x0000_0002;
 const REG_OPTION_BACKUP_RESTORE: u32 = 0x0000_0004;
@@ -12347,6 +12349,11 @@ pub(crate) unsafe fn service_registry_request(
     param2: u64,
 ) -> crate::registry_mutation_work::ProviderRegistryResult {
     use crate::registry_mutation_work::ProviderRegistryResult;
+    if let Some(result) = win32k_registry_deferred_value::route(
+        channel, op, arg, param1, param2,
+    ) {
+        return result;
+    }
     if op & !WIN32K_REGISTRY_USE_PREVIOUS_MODE != WIN32K_REGISTRY_OP_CREATE_KEY {
         return ProviderRegistryResult::Ready(service_registry_request_sync(
             channel, op, arg, param1, param2,

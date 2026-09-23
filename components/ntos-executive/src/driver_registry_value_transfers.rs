@@ -14,6 +14,22 @@ struct Transfer {
     upload: nt_config_client::SystemHiveValueUpload,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct CompletedTransferIdentity {
+    caller: NativeHandleCaller,
+    owner: nt_process::ProcessId,
+    handle: nt_process::Handle,
+    token: u64,
+}
+
+pub(crate) struct CompletedTransfer {
+    pub(crate) identity: CompletedTransferIdentity,
+    pub(crate) target: DriverRegistryHandleTarget,
+    pub(crate) name: String,
+    pub(crate) value_type: u32,
+    pub(crate) data: Vec<u8>,
+}
+
 static mut TRANSFERS: Vec<Transfer> = Vec::new();
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -138,6 +154,43 @@ pub(crate) unsafe fn commit(
         row.value_type,
         row.upload.complete_data()?,
     )
+}
+
+/// Copy a complete upload for deferred admission without consuming its retryable source row.
+/// The row is retired only after the service lane transfers all effects to its retained owner.
+pub(crate) unsafe fn snapshot_complete(
+    caller: NativeHandleCaller,
+    handle: u64,
+    token: u64,
+    total: usize,
+) -> Result<CompletedTransfer, i32> {
+    let index = index(caller, handle, token, total)?;
+    let row = &(&*core::ptr::addr_of!(TRANSFERS))[index];
+    let data = row.upload.complete_data()?;
+    let mut owned = Vec::new();
+    owned.try_reserve_exact(data.len()).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    owned.extend_from_slice(data);
+    Ok(CompletedTransfer {
+        identity: CompletedTransferIdentity {
+            caller: row.caller,
+            owner: row.owner,
+            handle: row.handle,
+            token: row.token,
+        },
+        target: row.target,
+        name: row.name.clone(),
+        value_type: row.value_type,
+        data: owned,
+    })
+}
+
+pub(crate) unsafe fn retire_completed(identity: CompletedTransferIdentity) {
+    let rows = &mut *core::ptr::addr_of_mut!(TRANSFERS);
+    if let Some(index) = rows.iter().position(|row| row.caller == identity.caller
+        && row.owner == identity.owner && row.handle == identity.handle
+        && row.token == identity.token) {
+        rows.swap_remove(index);
+    }
 }
 
 pub(crate) unsafe fn abort(

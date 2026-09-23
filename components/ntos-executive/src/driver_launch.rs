@@ -5115,6 +5115,8 @@ const HOSTED_REGISTRY_OP_APPEND_SET_HANDLE_VALUE: u64 = 10;
 const HOSTED_REGISTRY_OP_COMMIT_SET_HANDLE_VALUE: u64 = 11;
 const HOSTED_REGISTRY_OP_ABORT_SET_HANDLE_VALUE: u64 = 12;
 const HOSTED_REGISTRY_OP_DELETE_HANDLE_VALUE: u64 = 13;
+#[path = "driver_registry_deferred_value.rs"]
+mod driver_registry_deferred_value;
 const HOSTED_REGISTRY_OP_PUBLISH_HANDLE: u64 = 14;
 const HOSTED_REGISTRY_OP_ABORT_PUBLICATION: u64 = 15;
 const REG_OPTION_VOLATILE: u32 = 0x0000_0001;
@@ -53379,6 +53381,11 @@ pub(crate) fn service_hosted_driver_registry(
     active_reply_cap: u64,
 ) -> crate::registry_mutation_work::ProviderRegistryResult {
     use crate::registry_mutation_work::ProviderRegistryResult;
+    if let Some(result) = unsafe {
+        driver_registry_deferred_value::route(ch, op, a1, a2, a3, active_reply_cap)
+    } {
+        return result;
+    }
     if op != HOSTED_REGISTRY_OP_CREATE_RELATIVE_KEY {
         return ProviderRegistryResult::Ready(service_hosted_driver_registry_sync(
             ch, op, a1, a2, a3, caller_badge, active_reply_cap,
@@ -53638,20 +53645,9 @@ fn service_hosted_driver_registry_sync(
                         let status = handler.registry_target_delete_value(key, value_name.as_str());
                         if status == 0 { Ok(()) } else { Err(status as i32) }
                     }),
-                    DriverRegistryHandleTarget::System {
-                        lease,
-                        physical_path,
-                    } => crate::config_manager_query_leased_system_hive_key_information(lease)
-                        .and_then(|information| {
-                            crate::persist_and_publish_system_hive_mutation(information.mount_generation, &[
-                                nt_config_client::SystemHiveMutation::DeleteValue {
-                                    path: physical_path.as_str(),
-                                    name: value_name.as_str(),
-                                },
-                            ])
-                            .map(|_| ())
-                            .map_err(|status| status as i32)
-                        }),
+                    DriverRegistryHandleTarget::System { .. } => {
+                        unreachable!("SYSTEM value DELETE requires retained mutation work")
+                    }
                     target @ DriverRegistryHandleTarget::Generic { .. } => driver_registry_operations::delete_value(target, value_name.as_str()),
                 };
                 match result {

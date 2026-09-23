@@ -97,7 +97,10 @@ pub(crate) fn retain_hosted_existing(handler: &mut ExecNtHandler, key: KeyRef) -
 
 #[path = "registry_mutation_provider.rs"]
 mod provider;
-pub(crate) use provider::{submit_provider, ProviderRegistryResult};
+pub(crate) use provider::{
+    submit_provider, submit_provider_existing, DeferredRegistryExisting, ProviderRegistryResult,
+    ProviderValueMutation,
+};
 
 enum Caller {
     Hosted(HostedCaller),
@@ -116,7 +119,10 @@ impl Caller {
         match self {
             Self::Hosted(HostedCaller { completion: HostedCompletion::Create { leaf, .. }, .. }) => leaf,
             Self::Hosted(_) => unreachable!("existing-key mutation does not open a child"),
-            Self::Provider(caller) => &caller.admission.leaf,
+            Self::Provider(provider::ProviderCaller {
+                admission: provider::ProviderAdmission::Create(admission), ..
+            }) => &admission.leaf,
+            Self::Provider(_) => unreachable!("existing provider Key does not open a child"),
         }
     }
 }
@@ -595,6 +601,16 @@ unsafe fn advance(
                         }
                     }
                 }
+                Caller::Provider(provider::ProviderCaller {
+                    admission: provider::ProviderAdmission::Existing(admission), ..
+                }) => match &admission.mutation {
+                    provider::ProviderValueMutation::Set { .. } => {
+                        CM_RUNTIME_SYSTEM_SET_VALUES.fetch_add(1, Ordering::Relaxed);
+                    }
+                    provider::ProviderValueMutation::Delete { .. } => {
+                        CM_RUNTIME_SYSTEM_DELETE_VALUES.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
                 _ => { CM_RUNTIME_SYSTEM_CREATE_KEYS.fetch_add(1, Ordering::Relaxed); }
             }
             LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(outcome.generation, Ordering::AcqRel);
@@ -609,6 +625,8 @@ unsafe fn advance(
         Phase::Open => {
             if matches!(&work.caller, Caller::Hosted(HostedCaller {
                 completion: HostedCompletion::Existing { .. }, ..
+            }) | Caller::Provider(provider::ProviderCaller {
+                admission: provider::ProviderAdmission::Existing(_), ..
             })) {
                 work.published = !work.cancelled;
                 work.phase = Phase::Acknowledge;
@@ -625,7 +643,10 @@ unsafe fn advance(
                     }) => registry_key_targets::system(*parent)
                         .expect("retained SYSTEM parent disappeared").lease,
                     Caller::Hosted(_) => unreachable!("existing Key does not open a child"),
-                    Caller::Provider(caller) => caller.admission.parent_lease,
+                    Caller::Provider(provider::ProviderCaller {
+                        admission: provider::ProviderAdmission::Create(admission), ..
+                    }) => admission.parent_lease,
+                    Caller::Provider(_) => unreachable!("existing provider Key does not open a child"),
                 };
                 work.opening = Some(cm_key_ownership::reserve_publication_open(lease, work.caller.leaf())?);
             }
