@@ -106,6 +106,53 @@ impl<P: ObjectManagerPort> IoManager<P> {
         Ok(())
     }
 
+    /// Start an external File's release without entering a driver backend.
+    /// The caller must drive the queued lifecycle after releasing its manager borrow.
+    /// Unlike `release_external_file`, even an unopened File is retired by the
+    /// deferred-close pump so this operation has no external side effects.
+    pub fn queue_external_file_release(
+        &mut self,
+        client: ClientId,
+        file_id: FileId,
+    ) -> Result<(), NtStatus> {
+        let state = {
+            let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
+            if file.client_id != client {
+                return Err(NtStatus::INVALID_HANDLE);
+            }
+            file.state
+        };
+        if state == FileState::CreateIrpDispatched {
+            let create_irp = self
+                .irps
+                .iter()
+                .find(|(_, irp)| {
+                    irp.file_id == Some(file_id) && crate::is_create_major(irp.origin_major)
+                })
+                .map(|(irp_id, _)| irp_id);
+            if let Some(irp_id) = create_irp {
+                self.queue_abandon_irp_delivery(client, irp_id)?;
+            }
+        }
+        let file = self.file_mut(file_id).expect("validated external File");
+        match state {
+            FileState::Open => {
+                assert!(file.transition(FileState::CleanupPending));
+            }
+            FileState::CreateIrpDispatched => {
+                assert!(file.transition(FileState::ClosePending));
+            }
+            FileState::Allocated
+            | FileState::Closed
+            | FileState::CleanupPending
+            | FileState::CleanupComplete
+            | FileState::ClosePending => {}
+        }
+        file.close_deferred = true;
+        self.queue_deferred_file_close(file_id);
+        Ok(())
+    }
+
     /// Dispatch `IRP_MJ_CLEANUP`. A pending cleanup retains its file reference;
     /// acknowledgement advances the file to `CleanupComplete`.
     pub fn cleanup(&mut self, client: ClientId, handle: HandleValue) -> Result<(), NtStatus> {
@@ -456,3 +503,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "close/queued_release_tests.rs"]
+mod queued_release_tests;

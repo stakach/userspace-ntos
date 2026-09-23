@@ -215,6 +215,47 @@ impl<P: ObjectManagerPort> IoManager<P> {
         Ok(())
     }
 
+    /// Transfer delivery ownership and queue cancellation without entering a backend.
+    /// Used when a hosted File close must release the manager borrow before driver IPC.
+    pub(crate) fn queue_abandon_irp_delivery(
+        &mut self,
+        client: ClientId,
+        irp_id: IrpId,
+    ) -> Result<(), NtStatus> {
+        if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+            return self
+                .queue_detached_file_irp_intent(client, irp_id, true)
+                .map(|_| ());
+        }
+        let Some(irp) = self.irp(irp_id) else {
+            return Ok(());
+        };
+        if irp.client_id != client {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        let queue_cancel = irp.state == IrpState::Pending;
+        if queue_cancel {
+            let driver_id = irp
+                .current_stack()
+                .ok_or(NtStatus::INVALID_PARAMETER)?
+                .driver_id;
+            self.driver_backend_index(driver_id)
+                .filter(|index| *index < self.backends.len())
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
+            self.cancel_dispatch_retries
+                .try_reserve(1)
+                .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        }
+        self.claim_manager_owned_irp(client, irp_id)?;
+        if queue_cancel {
+            let irp = self.irp_mut(irp_id).expect("validated pending IRP");
+            irp.cancel = CancelState::CancelRequested;
+            assert!(irp.transition(IrpState::CancelRequested));
+            self.cancel_dispatch_retries.push(irp_id);
+        }
+        Ok(())
+    }
+
     /// Transfer terminal-delivery ownership for one exact IRP to the manager.
     /// This does not request cancellation; lifecycle IRPs use it so pending
     /// CLEANUP/CLOSE work can finish normally without a user-facing consumer.
