@@ -52,6 +52,9 @@ mod registry_value_mutation;
 #[path = "exec_registry_reads.rs"]
 mod registry_reads;
 
+#[path = "exec_directory_query.rs"]
+mod directory_query;
+
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
 pub(crate) const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
@@ -37147,161 +37150,9 @@ impl ExecNtHandler {
                     0
                 }
             },
-            // NtQueryDirectoryObject captured args: DirectoryHandle=args[0], Buffer=args[1],
-            // Length=args[2], ReturnSingleEntry=args[3], RestartScan=args[4], *Context=args[5],
-            // *ReturnLength=args[6]. ntdll's named-object path enumerates
-            // \BaseNamedObjects. Enumerate the target directory's children as
-            // OBJECT_DIRECTORY_INFORMATION records (x64: {UNICODE_STRING Name; UNICODE_STRING
-            // TypeName;} = 0x20 bytes each), terminated by a zero record, followed by the UTF-16
-            // name/type strings; return STATUS_NO_MORE_ENTRIES when the directory has no more
-            // entries. Context is the next-child index (0 on RestartScan).
+            // Enumerate the canonical namespace through the shared NT x64 packing contract.
             NativeService::NtQueryDirectoryObject => unsafe {
-                SERVICES_QUERY_DIR_OBJECT.fetch_add(1, Ordering::Relaxed);
-                let dir_handle = args[0];
-                let buf = args[1];
-                let length = nt_ulong_arg(args[2]) as u64;
-                let return_single = nt_boolean_arg(args[3]);
-                let restart_scan = nt_boolean_arg(args[4]);
-                let context_ptr = args[5];
-                let retlen_ptr = args[6];
-                let dir_idx = match self.native_directory_caller(ctx.previous_mode).and_then(|caller| {
-                    self.pm
-                        .lookup_native_object_directory_handle(
-                            caller,
-                            dir_handle,
-                            DIRECTORY_QUERY_ACCESS,
-                        )
-                        .and_then(|identity| self.directory_namespace_index_for_identity(identity))
-                }) {
-                    Ok(index) => index,
-                    Err(status) => return status,
-                };
-                let _transient = allocator::enter_transient();
-                // Starting child ordinal: 0 on RestartScan, else the captured Context.
-                let mut start = if restart_scan {
-                    0u64
-                } else if context_ptr != 0 {
-                    let mut c = [0u8; 4];
-                    let _ = self.xas_read(context_ptr, &mut c);
-                    u32::from_le_bytes(c) as u64
-                } else {
-                    0
-                };
-                // Collect this directory's children (by insertion index) beyond `start`.
-                let mut children: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-                for (i, e) in self.obj_ns.iter().enumerate() {
-                    if e.is_live() && e.parent == dir_idx && i != dir_idx {
-                        children.push(i);
-                    }
-                }
-                let total = children.len() as u64;
-                if start >= total {
-                    // No more entries — the standard empty/end result.
-                    if retlen_ptr != 0 {
-                        self.xas_write_buf(retlen_ptr, &0u32.to_le_bytes()); // *ReturnLength = 0 (ULONG)
-                    }
-                    0x8000_001A // STATUS_NO_MORE_ENTRIES
-                } else {
-                    // Emit records + strings into the caller's buffer. Each record is 0x20 bytes;
-                    // there is one terminating zero record, then the strings. Emit as many as fit
-                    // (or one, if ReturnSingleEntry). The type name is "Event"/"Directory"/
-                    // "SymbolicLink" per kind.
-                    const REC: u64 = 0x20;
-                    // First pass: choose how many entries to emit.
-                    let mut records: alloc::vec::Vec<(alloc::vec::Vec<u16>, &'static str)> =
-                        alloc::vec::Vec::new();
-                    let mut idx = start as usize;
-                    while idx < children.len() {
-                        let e = &self.obj_ns[children[idx]];
-                        let name16: alloc::vec::Vec<u16> =
-                            e.name().iter().map(|&b| b as u16).collect();
-                        let type_name = match e.kind {
-                            OBJ_KIND_EVENT => "Event",
-                            OBJ_KIND_SYMBOLIC_LINK => "SymbolicLink",
-                            OBJ_KIND_SEMAPHORE => "Semaphore",
-                            OBJ_KIND_MUTANT => "Mutant",
-                            OBJ_KIND_LPC_PORT => "Port",
-                            OBJ_KIND_TIMER => "Timer",
-                            OBJ_KIND_IO_COMPLETION => "IoCompletion",
-                            OBJ_KIND_JOB => "Job",
-                            _ => "Directory",
-                        };
-                        records.push((name16, type_name));
-                        idx += 1;
-                        if return_single {
-                            break;
-                        }
-                        // Bound the batch by the caller's buffer length (records + strings + null rec).
-                        let mut needed = REC; // terminating null record
-                        for (n, t) in &records {
-                            needed += REC + (n.len() as u64 + 1) * 2 + (t.len() as u64 + 1) * 2;
-                        }
-                        if needed > length {
-                            records.pop();
-                            idx -= 1;
-                            break;
-                        }
-                    }
-                    let emitted = records.len();
-                    // Layout: [records...][null record][name0,type0,name1,type1,...] (UTF-16 null-term).
-                    let rec_area = REC * (emitted as u64 + 1);
-                    let mut str_off = rec_area;
-                    let mut total_len = rec_area;
-                    for (n, t) in &records {
-                        total_len += (n.len() as u64 + 1) * 2 + (t.len() as u64 + 1) * 2;
-                    }
-                    for (k, (n, t)) in records.iter().enumerate() {
-                        let rec_base = buf + REC * k as u64;
-                        // Name UNICODE_STRING {Length, MaxLength, pad, Buffer}
-                        let name_bytes = (n.len() as u64) * 2;
-                        let name_buf_va = buf + str_off;
-                        self.xas_write_u64(rec_base, (name_bytes) | ((name_bytes + 2) << 16));
-                        self.xas_write_u64(rec_base + 8, name_buf_va);
-                        // TypeName UNICODE_STRING
-                        let type_bytes = (t.len() as u64) * 2;
-                        // write name string
-                        let mut nb: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-                        for &w in n {
-                            nb.extend_from_slice(&w.to_le_bytes());
-                        }
-                        nb.extend_from_slice(&0u16.to_le_bytes());
-                        self.xas_write_buf(name_buf_va, &nb);
-                        str_off += name_bytes + 2;
-                        let type_buf_va = buf + str_off;
-                        self.xas_write_u64(
-                            rec_base + 0x10,
-                            (type_bytes) | ((type_bytes + 2) << 16),
-                        );
-                        self.xas_write_u64(rec_base + 0x18, type_buf_va);
-                        let mut tb: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-                        for c in t.encode_utf16() {
-                            tb.extend_from_slice(&c.to_le_bytes());
-                        }
-                        tb.extend_from_slice(&0u16.to_le_bytes());
-                        self.xas_write_buf(type_buf_va, &tb);
-                        str_off += type_bytes + 2;
-                    }
-                    // Terminating zero record.
-                    let term = buf + REC * emitted as u64;
-                    self.xas_write_u64(term, 0);
-                    self.xas_write_u64(term + 8, 0);
-                    self.xas_write_u64(term + 0x10, 0);
-                    self.xas_write_u64(term + 0x18, 0);
-                    start += emitted as u64;
-                    if context_ptr != 0 {
-                        // Context is a PULONG — write only 4 bytes.
-                        self.xas_write_buf(context_ptr, &(start as u32).to_le_bytes());
-                    }
-                    if retlen_ptr != 0 {
-                        self.xas_write_buf(retlen_ptr, &(total_len as u32).to_le_bytes());
-                    }
-                    // STATUS_MORE_ENTRIES if more remain, else SUCCESS.
-                    if start < total {
-                        0x0000_0105 // STATUS_MORE_ENTRIES
-                    } else {
-                        0
-                    }
-                }
+                self.nt_query_directory_object(ctx, args)
             },
             // NtCreateSymbolicLinkObject(*Handle[R10]=args[0], access, *OA[R8]=args[2],
             // *LinkTarget[R9]=args[3]). SmpInit creates the \?? drive-letter links.
