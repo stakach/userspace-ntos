@@ -102,7 +102,7 @@ impl OwnedDriverRegistryPublication {
     }
 
     /// A handle lookup borrows its target; a failed bind cannot retire that existing Key.
-    unsafe fn bind_borrowed_target(&mut self, target: u32, grant: u32) -> Result<(), i32> {
+    pub(crate) unsafe fn bind_borrowed_target(&mut self, target: u32, grant: u32) -> Result<(), i32> {
         let row = self.pending.as_mut().ok_or(STATUS_INVALID_HANDLE)?;
         crate::with_provider_process_manager(|pm| {
             pm.validate_native_handle_caller(row.caller)?;
