@@ -3226,6 +3226,21 @@ unsafe fn pump_service_generic_fault(
         crate::print_hex(addr as u32);
         crate::print_str(b"\n");
     }
+    if let Some(offset) = nt_ntdll_layout::kuser::kernel_alias_offset(addr) {
+        crate::print_str(b"[svc] missing kernel shared-data alias offset=0x");
+        crate::print_hex(offset as u32);
+        crate::print_str(b" pml4=0x");
+        crate::print_hex(ch.pml4 as u32);
+        crate::print_str(b"\n");
+        return false;
+    }
+    if addr >= 0x0000_8000_0000_0000 {
+        crate::print_str(b"[svc] refusing private page outside user VSpace addr=0x");
+        crate::print_hex((addr >> 32) as u32);
+        crate::print_hex(addr as u32);
+        crate::print_str(b"\n");
+        return false;
+    }
     if addr < 0x10000 || in_image || demand >= ch.demand_cap {
         return false;
     }

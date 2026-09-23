@@ -1,6 +1,17 @@
 //! Win7 x64 `KUSER_SHARED_DATA` byte layout and page initialization.
 
 pub const PAGE_SIZE: usize = 0x1000;
+/// Kernel-mode alias of the same physical page exposed to user mode at 0x7ffe0000.
+pub const KERNEL_ALIAS_VA: u64 = 0xffff_f780_0000_0000;
+
+pub const fn kernel_alias_offset(address: u64) -> Option<usize> {
+    if address >= KERNEL_ALIAS_VA && address < KERNEL_ALIAS_VA + PAGE_SIZE as u64 {
+        Some((address - KERNEL_ALIAS_VA) as usize)
+    } else {
+        None
+    }
+}
+
 pub const TICK_COUNT_LOW_DEPRECATED: usize = 0x000;
 pub const TICK_COUNT_MULTIPLIER: usize = 0x004;
 pub const INTERRUPT_TIME: usize = 0x008;
@@ -224,6 +235,22 @@ fn put_u32(page: &mut [u8], offset: usize, value: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_alias_covers_only_the_shared_data_page() {
+        assert_eq!(kernel_alias_offset(KERNEL_ALIAS_VA - 1), None);
+        assert_eq!(kernel_alias_offset(KERNEL_ALIAS_VA), Some(0));
+        assert_eq!(
+            kernel_alias_offset(KERNEL_ALIAS_VA + SYSTEM_TIME as u64),
+            Some(SYSTEM_TIME)
+        );
+        assert_eq!(
+            kernel_alias_offset(KERNEL_ALIAS_VA + PAGE_SIZE as u64 - 1),
+            Some(PAGE_SIZE - 1)
+        );
+        assert_eq!(kernel_alias_offset(KERNEL_ALIAS_VA + PAGE_SIZE as u64), None);
+        assert_eq!(kernel_alias_offset(u64::MAX), None);
+    }
 
     fn read_u32(page: &[u8], offset: usize) -> u32 {
         u32::from_le_bytes(page[offset..offset + 4].try_into().unwrap())
