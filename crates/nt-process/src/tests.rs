@@ -2153,10 +2153,14 @@ fn process_teardown_can_drain_typed_handles() {
     };
     pm.insert_handle(pid, file, 1).unwrap();
     pm.insert_handle(pid, directory, 1).unwrap();
+    let snapshot = pm.snapshot_process_handle_objects(pid).unwrap();
+    assert_eq!(snapshot.as_slice(), &[file, directory]);
+    assert_eq!(pm.handle_count(pid), 2);
     assert_eq!(pm.take_any_handle(pid), Some(file));
     assert_eq!(pm.take_any_handle(pid), Some(directory));
     assert_eq!(pm.take_any_handle(pid), None);
     assert_eq!(pm.handle_count(pid), 0);
+    assert_eq!(pm.snapshot_process_handle_objects(pid).unwrap(), Vec::new());
 }
 
 #[test]

@@ -12044,6 +12044,11 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.dbgk_block_request {
                     park_dbgk_reporter = true;
                 }
+                if let Ok(executor) =
+                    nt_handler.native_handle_caller(nt_syscall::ProcessorMode::KernelMode)
+                {
+                    let _ = driver_launch::pump_hosted_file_lifecycle(executor);
+                }
                 let hosted_io_progress = pump_hosted_io_and_redrive_driver_starts(
                     driver_launch::drain_hosted_driver_dpcs(),
                     &mut nt_handler,
@@ -12053,6 +12058,11 @@ pub(crate) unsafe fn service_sec_image(
                 {
                     let _ = pending_file_io_redrive_all(&mut nt_handler);
                     let _ = file_cleanup_redrive_all(&mut nt_handler);
+                    if let Ok(executor) =
+                        nt_handler.native_handle_caller(nt_syscall::ProcessorMode::KernelMode)
+                    {
+                        let _ = driver_launch::pump_hosted_file_lifecycle(executor);
+                    }
                 }
                 if nt_handler.pipe_endpoint_progress || hosted_io_progress != 0 {
                     let _ = pending_file_io_redrive_all(&mut nt_handler);
@@ -24448,6 +24458,9 @@ pub(crate) unsafe fn start_file_cleanup(nt_handler: &mut ExecNtHandler, file_id:
     }
     driver_launch::release_hosted_file(file_id)
         .expect("canonical File cleanup was rejected before driver acceptance");
+    if let Ok(executor) = nt_handler.native_handle_caller(nt_syscall::ProcessorMode::KernelMode) {
+        driver_launch::pump_hosted_file_lifecycle(executor);
+    }
     // CLEANUP can complete retained reads/listens. Their ordinary completion
     // owners must publish and ACK before the manager is allowed to send CLOSE.
     nt_handler.pipe_endpoint_progress = true;
@@ -25695,6 +25708,9 @@ unsafe fn pending_file_io_redrive_pass(
                         .publish_bound_file_handle(reservation)
                         .expect("pending CREATE bound handle could not be published");
                     assert_eq!(published, create.handle_value);
+                    assert!(driver_launch::cancel_hosted_file_lifecycle_reservation(
+                        pending.route.hosted_file_id().expect("hosted CREATE lost its File route")
+                    ));
                 }
                 delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                     .mark_create_handle_published_exact(slot, pending.irp_id)

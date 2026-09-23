@@ -139,6 +139,7 @@ impl ExecNtHandler {
             target_name,
         )?;
         assert!(transaction.advance_to_target_create(target));
+        self.reserve_unpublished_hosted_file_lifecycle(target)?;
         let result = self.hosted_file_native_caller().and_then(|caller| driver_launch::dispatch_hosted_target_directory_create_irp_result_exact(
             target,
             caller,

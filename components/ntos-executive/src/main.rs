@@ -29749,6 +29749,32 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     b's' as u16,
                     b't' as u16,
                 ];
+                let release_test_file = |file_id: u64| {
+                    let caller = initial_system_driver_caller();
+                    let requestor = with_provider_process_manager(|pm| {
+                        pm.reference_native_requestor(caller)
+                    });
+                    let Ok(requestor) = requestor else { return false };
+                    if let Err((_, mut requestor)) =
+                        driver_launch::reserve_hosted_file_lifecycle(file_id, caller, requestor)
+                    {
+                        with_provider_process_manager(|pm| requestor.release(pm))
+                            .expect("boot lifecycle requestor release");
+                        return false;
+                    }
+                    if driver_launch::release_hosted_file(file_id).is_err() {
+                        let _ = driver_launch::cancel_hosted_file_lifecycle_reservation(file_id);
+                        return false;
+                    }
+                    for _ in 0..4 {
+                        let _ = driver_launch::pump_hosted_file_lifecycle(caller);
+                        let _ = driver_launch::pump_hosted_io_completions();
+                        if !driver_launch::hosted_file_exists(file_id) {
+                            return true;
+                        }
+                    }
+                    false
+                };
                 let npfs_device_id = driver_launch::device_id_by_name("\\Device\\NamedPipe");
                 let r = npfs_device_id
                     .and_then(|device_id| {
@@ -29782,7 +29808,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 Some((status, information, file_id, context.unwrap_or(0)))
                             }
                             Err(_) => {
-                                let _ = driver_launch::release_hosted_file(file_id);
+                                let _ = release_test_file(file_id);
                                 None
                             }
                         }
@@ -29849,7 +29875,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                     print_str(b"[npfs-svc] client CREATE dispatch failed status=0x");
                                     print_hex(status);
                                     print_str(b"\n");
-                                    let _ = driver_launch::release_hosted_file(file_id);
+                                    let _ = release_test_file(file_id);
                                     None
                                 }
                             }
@@ -30327,15 +30353,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             print_u64((slip_in[..11] == slip_payload[..]) as u64);
                             print_str(b"\n");
                         }
-                        let client_released = driver_launch::release_hosted_file(cli_fid).is_ok();
-                        let _ = driver_launch::pump_hosted_io_completions();
-                        client_lifecycle_ok =
-                            client_released && !driver_launch::hosted_file_exists(cli_fid);
+                        client_lifecycle_ok = release_test_file(cli_fid);
                     }
-                    let server_released = driver_launch::release_hosted_file(srv_fid).is_ok();
-                    let _ = driver_launch::pump_hosted_io_completions();
-                    let server_lifecycle_ok =
-                        server_released && !driver_launch::hosted_file_exists(srv_fid);
+                    let server_lifecycle_ok = release_test_file(srv_fid);
                     check(
                         b"exec_npfs_canonical_file_lifecycle",
                         client_lifecycle_ok && server_lifecycle_ok,

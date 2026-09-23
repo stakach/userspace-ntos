@@ -8866,10 +8866,14 @@ impl ExecNtHandler {
         }
         let exit_time = nt_system_time_100ns() as i64;
         let exit_status = if code == 0 { STATUS_UNSUCCESSFUL } else { code };
+        let reserved_files = match self.reserve_rundown_hosted_files(pid) {
+            Ok(files) => files,
+            Err(status) => return status,
+        };
         self.sample_hosted_process_scheduler_times(pid);
         match self.pm.terminate_process_at(pid, exit_status, exit_time) {
             Ok(()) => {
-                self.release_process_handles(pid);
+                self.release_process_handles(pid, reserved_files);
                 self.refresh_job_time_sampling();
                 self.post_action = ExecPostAction::TerminateProcess {
                     process_index: self.pi as u8,
@@ -8879,7 +8883,10 @@ impl ExecNtHandler {
                 unsafe { wait_wake_dispatcher_set(self) };
                 0
             }
-            Err(status) => status,
+            Err(status) => {
+                self.cancel_rundown_hosted_files(&reserved_files);
+                status
+            }
         }
     }
 
@@ -9866,7 +9873,7 @@ impl ExecNtHandler {
             .ok_or(nt_process::STATUS_INVALID_HANDLE)
     }
 
-    fn native_handle_caller(
+    pub(crate) fn native_handle_caller(
         &self,
         previous_mode: nt_syscall::ProcessorMode,
     ) -> Result<nt_process::native_handle::NativeHandleCaller, u32> {
@@ -20243,15 +20250,48 @@ impl ExecNtHandler {
         let Ok(handle) = nt_process::Handle::try_from(handle) else {
             return Ok(false);
         };
+        let cleanup_file = match self.pm.lookup_handle(pid, handle) {
+            Some(nt_process::HandleObject::File(file_id))
+            | Some(nt_process::HandleObject::RoutedFile { file_id, .. })
+                if self.file_completion.cleanup_required_on_handle_close(file_id)? =>
+            {
+                Some(file_id)
+            }
+            _ => None,
+        };
+        let lifecycle_executor = if let Some(file_id) = cleanup_file {
+            let executor = self.native_handle_caller(nt_syscall::ProcessorMode::KernelMode)?;
+            let requestor = self.pm.reference_native_requestor(executor)?;
+            match driver_launch::reserve_hosted_file_lifecycle(file_id, executor, requestor) {
+                Ok(()) => Some(executor),
+                Err((status, mut requestor)) => {
+                    requestor.release(&mut self.pm)?;
+                    return Err(status.raw() as u32);
+                }
+            }
+        } else {
+            None
+        };
         match self.pm.take_handle_for_close(pid, handle) {
             Ok(object) => {
                 unsafe { driver_launch::driver_registry_value_transfers::cancel_closed_handle(pid, handle); }
                 self.release_handle_object(object);
+                if let Some(executor) = lifecycle_executor {
+                    driver_launch::pump_hosted_file_lifecycle(executor);
+                }
                 PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
                 Ok(true)
             }
-            Err(nt_process::STATUS_INVALID_HANDLE) => Ok(false),
-            Err(status) => Err(status),
+            Err(status) => {
+                if let Some(file_id) = cleanup_file {
+                    assert!(driver_launch::cancel_hosted_file_lifecycle_reservation(file_id));
+                }
+                if status == nt_process::STATUS_INVALID_HANDLE {
+                    Ok(false)
+                } else {
+                    Err(status)
+                }
+            }
         }
     }
 
@@ -20286,9 +20326,42 @@ impl ExecNtHandler {
             assert!(self.pending_file_cleanup_wait.is_none());
             self.pending_file_cleanup_wait = Some((file_id, reservation));
         }
+        let lifecycle_executor = if let Some(file_id) = cleanup_file {
+            let result = (|| {
+                let executor = self.pm.capture_native_handle_caller(
+                    caller.original_thread(),
+                    nt_types::AccessMode::KernelMode,
+                )?;
+                let requestor = self.pm.reference_native_requestor(executor)?;
+                match driver_launch::reserve_hosted_file_lifecycle(file_id, executor, requestor) {
+                    Ok(()) => Ok(executor),
+                    Err((status, mut requestor)) => {
+                        requestor.release(&mut self.pm)?;
+                        Err(status.raw() as u32)
+                    }
+                }
+            })();
+            match result {
+                Ok(executor) => Some(executor),
+                Err(status) => {
+                    if let Some((_, reservation)) = self.pending_file_cleanup_wait.take() {
+                        assert!(unsafe {
+                            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS))
+                                .cancel_reservation(reservation)
+                        });
+                    }
+                    return Err(status);
+                }
+            }
+        } else {
+            None
+        };
         let closed = match self.pm.close_native_handle(caller, value) {
             Ok(closed) => closed,
             Err(error) => {
+                if let Some(file_id) = cleanup_file {
+                    assert!(driver_launch::cancel_hosted_file_lifecycle_reservation(file_id));
+                }
                 if let Some((_, reservation)) = self.pending_file_cleanup_wait.take() {
                     assert!(unsafe {
                         (&mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS))
@@ -20310,6 +20383,9 @@ impl ExecNtHandler {
             );
         }
         self.release_handle_object(closed.into_object());
+        if let Some(executor) = lifecycle_executor {
+            driver_launch::pump_hosted_file_lifecycle(executor);
+        }
         PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
         Ok(true)
     }
@@ -20319,11 +20395,65 @@ impl ExecNtHandler {
             .unwrap_or(false)
     }
 
-    fn release_process_handles(&mut self, pid: nt_process::ProcessId) {
+    fn reserve_rundown_hosted_files(&mut self, pid: nt_process::ProcessId) -> Result<Vec<u64>, u32> {
+        let objects = self.pm.snapshot_process_handle_objects(pid)?;
+        let mut files = Vec::new();
+        files
+            .try_reserve_exact(objects.len())
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        for object in objects {
+            let file_id = match object {
+                nt_process::HandleObject::File(file_id)
+                | nt_process::HandleObject::RoutedFile { file_id, .. } => file_id,
+                _ => continue,
+            };
+            if driver_launch::hosted_file_exists(file_id) && !files.contains(&file_id) {
+                files.push(file_id);
+            }
+        }
+        if files.is_empty() {
+            return Ok(files);
+        }
+        let caller = self.native_handle_caller(nt_syscall::ProcessorMode::KernelMode)?;
+        let mut reserved = 0;
+        for &file_id in &files {
+            let requestor = match self.pm.reference_native_requestor(caller) {
+                Ok(requestor) => requestor,
+                Err(status) => {
+                    for &file_id in &files[..reserved] {
+                        assert!(driver_launch::cancel_hosted_file_lifecycle_reservation(file_id));
+                    }
+                    return Err(status);
+                }
+            };
+            match driver_launch::reserve_hosted_file_lifecycle(file_id, caller, requestor) {
+                Ok(()) => reserved += 1,
+                Err((status, mut requestor)) => {
+                    requestor.release(&mut self.pm)?;
+                    for &file_id in &files[..reserved] {
+                        assert!(driver_launch::cancel_hosted_file_lifecycle_reservation(file_id));
+                    }
+                    return Err(status.raw() as u32);
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    fn cancel_rundown_hosted_files(&mut self, files: &[u64]) {
+        for &file_id in files {
+            assert!(driver_launch::cancel_hosted_file_lifecycle_reservation(file_id));
+        }
+    }
+
+    fn release_process_handles(&mut self, pid: nt_process::ProcessId, reserved_files: Vec<u64>) {
         unsafe { driver_launch::driver_registry_value_transfers::cancel_process(pid); }
         while let Some(object) = self.pm.take_any_handle(pid) {
             self.release_handle_object(object);
             PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
+        }
+        for file_id in reserved_files {
+            let _ = driver_launch::cancel_hosted_file_lifecycle_reservation(file_id);
         }
         unsafe {
             crate::power_manager::remove_process_wakeup_latency(pid as u64);
@@ -25067,11 +25197,17 @@ impl ExecNtHandler {
                     .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
             }
         }
+        let reserved_files = self.reserve_rundown_hosted_files(pid)?;
         self.sample_hosted_process_scheduler_times(pid);
-        self.pm.mark_job_process_forced_termination(pid)?;
-        self.pm
-            .terminate_process_at(pid, exit_status, nt_system_time_100ns() as i64)?;
-        self.release_process_handles(pid);
+        let termination = self.pm.mark_job_process_forced_termination(pid).and_then(|_| {
+            self.pm
+                .terminate_process_at(pid, exit_status, nt_system_time_100ns() as i64)
+        });
+        if let Err(status) = termination {
+            self.cancel_rundown_hosted_files(&reserved_files);
+            return Err(status);
+        }
+        self.release_process_handles(pid, reserved_files);
         if let Some(process_index) = process_index {
             if !self.pending_job_terminations.contains(&process_index) {
                 self.pending_job_terminations.push(process_index);
@@ -26175,6 +26311,21 @@ impl ExecNtHandler {
         {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
+        let name_bytes_len = name16
+            .len()
+            .checked_mul(2)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let input_len = name_bytes_len
+            .checked_add(ea.len())
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let mut in_bytes = alloc::vec::Vec::new();
+        in_bytes
+            .try_reserve_exact(input_len)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        for &w in name16 {
+            in_bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        in_bytes.extend_from_slice(ea);
         let reservation = self.reserve_current_process_handle_slot()?;
         let allocated_file = match related_file_id {
             Some(related_file_id) => driver_launch::allocate_hosted_relative_file(
@@ -26199,6 +26350,11 @@ impl ExecNtHandler {
                 return Err(status);
             }
         };
+        if let Err(status) = self.reserve_unpublished_hosted_file_lifecycle(canonical_file_id) {
+            let _ = self.pm.cancel_reserved_handle(reservation);
+            let _ = driver_launch::abandon_unpublished_hosted_file(canonical_file_id);
+            return Err(status);
+        }
         if let Err(status) = self.file_completion.reserve_file_handle_publication(
             canonical_file_id,
             device_id,
@@ -26208,21 +26364,6 @@ impl ExecNtHandler {
             let _ = driver_launch::abandon_unpublished_hosted_file(canonical_file_id);
             return Err(status);
         }
-        let name_bytes_len = name16
-            .len()
-            .checked_mul(2)
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        let input_len = name_bytes_len
-            .checked_add(ea.len())
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        let mut in_bytes = alloc::vec::Vec::new();
-        in_bytes
-            .try_reserve_exact(input_len)
-            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        for &w in name16 {
-            in_bytes.extend_from_slice(&w.to_le_bytes());
-        }
-        in_bytes.extend_from_slice(ea);
         let dispatch = self.hosted_file_native_caller().and_then(|caller| driver_launch::dispatch_hosted_file_create_irp_result_exact(
             canonical_file_id,
             major,
@@ -26464,6 +26605,7 @@ impl ExecNtHandler {
             Ok(publication) => match self.publish_bound_file_handle(reservation) {
                 Ok(handle) => {
                     debug_assert_eq!(handle, publication.handle);
+                    assert!(driver_launch::cancel_hosted_file_lifecycle_reservation(file_id));
                     Some(publication)
                 }
                 Err(status) => {
@@ -26551,6 +26693,21 @@ impl ExecNtHandler {
             return Err(STATUS_INVALID_HANDLE);
         }
         self.pm.capture_native_handle_caller(caller.thread(), nt_types::AccessMode::KernelMode)
+    }
+
+    pub(crate) fn reserve_unpublished_hosted_file_lifecycle(
+        &mut self,
+        file_id: u64,
+    ) -> Result<(), u32> {
+        let caller = unsafe { self.hosted_file_native_caller()? };
+        let requestor = self.pm.reference_native_requestor(caller)?;
+        match driver_launch::reserve_hosted_file_lifecycle(file_id, caller, requestor) {
+            Ok(()) => Ok(()),
+            Err((status, mut requestor)) => {
+                requestor.release(&mut self.pm)?;
+                Err(status.raw() as u32)
+            }
+        }
     }
 
     /// Route an endpoint IRP through the device that owned the handle's FILE_OBJECT.
@@ -41455,10 +41612,15 @@ impl ExecNtHandler {
                         };
                     }
                 } else {
+                    let reserved_files = match self.reserve_rundown_hosted_files(pid) {
+                        Ok(files) => files,
+                        Err(status) => return status,
+                    };
                     if let Err(status) = self.pm.terminate_process_at(pid, status, exit_time) {
+                        self.cancel_rundown_hosted_files(&reserved_files);
                         return status;
                     }
-                    self.release_process_handles(pid);
+                    self.release_process_handles(pid, reserved_files);
                     if let Some(process_index) = process_index {
                         let is_current = pid == caller_pid;
                         self.post_action = ExecPostAction::TerminateProcess {
@@ -41531,6 +41693,10 @@ impl ExecNtHandler {
                     return 0;
                 }
                 self.sample_hosted_process_scheduler_times(target_pid);
+                let reserved_files = match self.reserve_rundown_hosted_files(target_pid) {
+                    Ok(files) => files,
+                    Err(status) => return status,
+                };
                 let exit_time = nt_system_time_100ns() as i64;
                 let outcome = if self.current_process_is_csrss()
                     && self.pm.main_thread(caller_pid) == Some(target)
@@ -41540,6 +41706,7 @@ impl ExecNtHandler {
                     self.pm.terminate_thread_at(target, status, exit_time)
                 };
                 if let Err(status) = outcome {
+                    self.cancel_rundown_hosted_files(&reserved_files);
                     return status;
                 }
                 let abandoned_mutants = unsafe { self.abandon_mutants_for_thread(target as u64) };
@@ -41551,7 +41718,9 @@ impl ExecNtHandler {
                     print_str(b"\n");
                 }
                 if self.pm.is_process_signaled(target_pid) {
-                    self.release_process_handles(target_pid);
+                    self.release_process_handles(target_pid, reserved_files);
+                } else {
+                    self.cancel_rundown_hosted_files(&reserved_files);
                 }
                 self.refresh_job_time_sampling();
                 unsafe { wait_wake_dispatcher_set(self) };
