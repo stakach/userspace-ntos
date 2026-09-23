@@ -145,7 +145,7 @@ fn final_external_file_release_queues_cleanup_without_backend_entry() {
     io.queue_external_file_release(client, file).unwrap();
     assert_eq!(&*majors.borrow(), &[major::IRP_MJ_CREATE]);
     assert_eq!(cancels.get(), 0);
-    let prepared = io.prepare_file_lifecycle_owned(client, file).unwrap();
+    let prepared = io.prepare_file_lifecycle_owned(client, file, 0x42).unwrap();
     assert_eq!(prepared.projection().major, major::IRP_MJ_CLEANUP);
     io.discard_prepared_file_lifecycle(prepared).unwrap();
 }
@@ -172,7 +172,7 @@ fn pending_external_create_queues_abandonment_without_inline_cancel() {
     assert_eq!(io.cancel_dispatch_retries.iter().filter(|id| **id == irp_id).count(), 1);
     assert_eq!(cancels.get(), 0);
     assert_eq!(
-        io.prepare_file_lifecycle_owned(client, file).unwrap_err(),
+        io.prepare_file_lifecycle_owned(client, file, 0x42).unwrap_err(),
         NtStatus::DELETE_PENDING
     );
 }
@@ -192,20 +192,43 @@ fn peer_lifecycle_pump_never_enters_backend_inline() {
     io.pump_with_report();
     assert_eq!(&*majors.borrow(), &[major::IRP_MJ_CREATE]);
     assert_eq!(io.file(file).unwrap().state, FileState::CleanupPending);
-    let prepared = io.prepare_next_queued_peer_file_lifecycle().unwrap().unwrap();
+    assert!(io
+        .prepare_next_queued_peer_file_lifecycle(|_| None)
+        .unwrap()
+        .is_none());
+    assert!(io.file(file).unwrap().close_retry_queued);
+    assert_eq!(
+        io.prepare_file_lifecycle_owned(client, file, 0).unwrap_err(),
+        NtStatus::INVALID_PARAMETER
+    );
+    let prepared = io
+        .prepare_next_queued_peer_file_lifecycle(|id| (id == file).then_some(0x42))
+        .unwrap()
+        .unwrap();
     assert_eq!(prepared.file_id(), file);
     assert_eq!(prepared.projection().major, major::IRP_MJ_CLEANUP);
-    assert!(io.prepare_next_queued_peer_file_lifecycle().unwrap().is_none());
+    assert_eq!(prepared.projection().requestor_tid, 0x42);
+    assert!(io
+        .prepare_next_queued_peer_file_lifecycle(|_| Some(0x42))
+        .unwrap()
+        .is_none());
     io.requeue_prepared_file_lifecycle(prepared).unwrap();
-    let prepared = io.prepare_next_queued_peer_file_lifecycle().unwrap().unwrap();
+    let prepared = io
+        .prepare_next_queued_peer_file_lifecycle(|id| (id == file).then_some(0x42))
+        .unwrap()
+        .unwrap();
     let invocation = io.begin_prepared_file_lifecycle(prepared).unwrap();
     io.finish_file_lifecycle(invocation.returned(FileLifecycleOutcome::Returned {
         status: NtStatus::SUCCESS,
         information: 0,
     })).unwrap();
     io.pump_with_report();
-    let close = io.prepare_next_queued_peer_file_lifecycle().unwrap().unwrap();
+    let close = io
+        .prepare_next_queued_peer_file_lifecycle(|id| (id == file).then_some(0x42))
+        .unwrap()
+        .unwrap();
     assert_eq!(close.projection().major, major::IRP_MJ_CLOSE);
+    assert_eq!(close.projection().requestor_tid, 0x42);
     io.requeue_prepared_file_lifecycle(close).unwrap();
     assert_eq!(&*majors.borrow(), &[major::IRP_MJ_CREATE]);
 }

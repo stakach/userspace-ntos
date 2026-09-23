@@ -173,9 +173,12 @@ impl FileLifecycleAckInvocation {
 impl<P: ObjectManagerPort> IoManager<P> {
     /// Take one ready hosted lifecycle operation without entering its backend.
     /// The returned preparation owns the exact File/IRP until it is begun or
-    /// explicitly requeued; a second pump cannot select the same File.
+    /// explicitly requeued; a second pump cannot select the same File. The
+    /// integration host supplies the retained caller's TID for each File; this
+    /// scalar is IRP metadata, not authority to reconstruct that caller.
     pub fn prepare_next_queued_peer_file_lifecycle(
         &mut self,
+        mut requestor_tid: impl FnMut(FileId) -> Option<u64>,
     ) -> Result<Option<PreparedFileLifecycle>, NtStatus> {
         if !self.owned_peer_file_lifecycle {
             return Ok(None);
@@ -194,14 +197,17 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 _ => continue,
             };
             if self.lifecycle_uses_driver_peer(file_id, major)? {
-                ready = Some((file.client_id, file_id));
+                let Some(tid) = requestor_tid(file_id).filter(|tid| *tid != 0) else {
+                    continue;
+                };
+                ready = Some((file.client_id, file_id, tid));
                 break;
             }
         }
-        let Some((client, file_id)) = ready else {
+        let Some((client, file_id, tid)) = ready else {
             return Ok(None);
         };
-        let prepared = self.prepare_file_lifecycle_owned(client, file_id)?;
+        let prepared = self.prepare_file_lifecycle_owned(client, file_id, tid)?;
         assert!(self.take_deferred_file_close(file_id));
         Ok(Some(prepared))
     }
@@ -224,7 +230,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
         &mut self,
         client: ClientId,
         file_id: FileId,
+        requestor_tid: u64,
     ) -> Result<PreparedFileLifecycle, NtStatus> {
+        if requestor_tid == 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
         if file.client_id != client || !file.close_deferred {
             return Err(NtStatus::INVALID_HANDLE);
@@ -265,6 +275,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             major,
             parameters,
         )?;
+        record.requestor_tid = requestor_tid;
         record.user_data = self
             .file(file_id)
             .and_then(|file| file.driver_context)
