@@ -29809,14 +29809,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // real prefix tree and return a connected client-end FILE_OBJECT (proves Insert+Find work).
                     let client_create = npfs_device_id
                         .and_then(|device_id| {
-                            driver_launch::allocate_hosted_file(
+                            match driver_launch::allocate_hosted_file(
                                 device_id,
                                 0x001f_01ff,
                                 3,
                                 0,
                                 &name_units,
-                            )
-                            .ok()
+                            ) {
+                                Ok(file_id) => Some(file_id),
+                                Err(status) => {
+                                    print_str(b"[npfs-svc] client File allocation failed status=0x");
+                                    print_hex(status);
+                                    print_str(b"\n");
+                                    None
+                                }
+                            }
                         })
                         .and_then(|file_id| {
                             match driver_launch::dispatch_hosted_file_create_irp_result_exact(
@@ -29838,7 +29845,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 Ok((status, information, _, context)) => {
                                     Some((status, information, file_id, context.unwrap_or(0)))
                                 }
-                                Err(_) => {
+                                Err(status) => {
+                                    print_str(b"[npfs-svc] client CREATE dispatch failed status=0x");
+                                    print_hex(status);
+                                    print_str(b"\n");
                                     let _ = driver_launch::release_hosted_file(file_id);
                                     None
                                 }

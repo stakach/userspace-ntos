@@ -7850,7 +7850,7 @@ extern "win64" fn s_io_build_device_io_control_request(
         write_unaligned((irp + 0x48) as *mut u64, io_status_block);
         write_unaligned((irp + 0x50) as *mut u64, event);
         write_unaligned((irp + 0x70) as *mut u64, user_buffer);
-        write_unaligned((irp + 0xa8) as *mut u64, s_current_thread());
+        write_unaligned((irp + 0x98) as *mut u64, s_current_thread());
     }
     irp
 }
@@ -13943,9 +13943,9 @@ extern "win64" fn s_io_thread_to_process(thread: u64) -> u64 {
 /// Requestor identity belongs to the retained IRP thread, not the thread completing its I/O.
 extern "win64" fn s_io_get_requestor_process(irp: u64) -> u64 {
     unsafe {
-        let thread = read_unaligned((irp + 0xa8) as *const u64);
+        let thread = read_unaligned((irp + 0x98) as *const u64);
         if thread == 0 { return 0; }
-        match read_unaligned((irp + 0x46) as *const u8) {
+        match read_unaligned((irp + 0x40) as *const u8) {
             0 => s_io_thread_to_process(thread),
             1 => read_unaligned((thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_PROCESS as u64) as *const u64),
             _ => 0,
@@ -58171,9 +58171,11 @@ unsafe fn dispatch_irp_for_instance_exact(
     // in-image wall), demand-caps at 256, all win32k caps false — degenerate to today's inline loop
     // EXACTLY. `component_pump` bumps `HARNESS_IRP_DISPATCHES` per serviced dispatch (the
     // `exec_fsd_on_shared_harness` proof). Status is read at SH_REQ_STATUS(0x70) by kind=Irp.
+    let ingress_route = hosted_ingress_sources::primary_route(dispatch_index)?;
+    let reply_cap = crate::spawn_hosts::shared_ingress::owner::runtime::current_reply(ingress_route).ok()?;
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: ep,
-        ingress_route: hosted_ingress_sources::primary_route(dispatch_index),
+        ingress_route: Some(ingress_route),
         pml4,
         physical_domain: instance_domain_identity(d),
         code_va: 0,
@@ -58190,7 +58192,7 @@ unsafe fn dispatch_irp_for_instance_exact(
         // block, so the executive can never wedge on a component that is not receiving.
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
         tcb: d.tcb,
-        reply_cap: d.reply_cap,
+        reply_cap,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
