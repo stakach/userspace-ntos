@@ -38,6 +38,8 @@ enum HostedCompletion {
 enum ExistingMutationKind {
     SetValue,
     DeleteValue,
+    SetSecurity,
+    DeleteKey,
 }
 
 #[path = "registry_mutation_provider.rs"]
@@ -211,6 +213,8 @@ pub(crate) unsafe fn submit_hosted_existing(
     let kind = match &mutation {
         SystemHiveMutation::SetValue { .. } => ExistingMutationKind::SetValue,
         SystemHiveMutation::DeleteValue { .. } => ExistingMutationKind::DeleteValue,
+        SystemHiveMutation::SetKeySecurity { .. } => ExistingMutationKind::SetSecurity,
+        SystemHiveMutation::DeleteKey { .. } => ExistingMutationKind::DeleteKey,
         _ => return Err(0xC000_000Du32),
     };
     let tcb = handler.hosted_thread_tcb(handler.current_tid).ok_or(0xC000_0008u32)?;
@@ -531,6 +535,12 @@ unsafe fn advance(
                         }
                         ExistingMutationKind::DeleteValue => {
                             CM_RUNTIME_SYSTEM_DELETE_VALUES.fetch_add(1, Ordering::Relaxed);
+                        }
+                        ExistingMutationKind::SetSecurity => {
+                            CM_RUNTIME_SYSTEM_SET_SECURITY.fetch_add(1, Ordering::Relaxed);
+                        }
+                        ExistingMutationKind::DeleteKey => {
+                            CM_RUNTIME_SYSTEM_DELETE_KEYS.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }

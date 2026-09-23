@@ -7277,7 +7277,6 @@ impl ExecNtHandler {
         &mut self,
         target: KeyRef,
         descriptor: &[u8],
-        expected_generation: u64,
     ) -> Result<(), u32> {
         if target == MACHINE_ROOT_KEY {
             self.registry_machine_root_security_descriptor = descriptor.to_vec();
@@ -7297,20 +7296,6 @@ impl ExecNtHandler {
         }
         if let Some(path) = self.cm_runtime_key_target(target) {
             return unsafe { crate::config_manager_runtime_key_operation(path.key, nt_config_abi::runtime_key_op::SET_SECURITY, 0, "", 0, descriptor) }.map(|_| ()).map_err(|status| status as u32);
-        }
-        if let Some(target) = self.cm_system_key_target(target) {
-            let information = unsafe { crate::config_manager_query_leased_system_hive_key_information(target.lease) }
-                .map_err(|status| status as u32)?;
-            if information.mount_generation != expected_generation { return Err(0xC000_022D); }
-            self.persist_and_publish_system_mutations(
-                expected_generation,
-                &[OwnedSystemHiveMutation::SetKeySecurity {
-                    path: information.path,
-                    descriptor: descriptor.to_vec(),
-                }],
-                SystemHiveMutationOrigin::Runtime,
-            )?;
-            return Ok(());
         }
         if let Some(key) = self.mutable_key_handle(target) {
             if key.hive == HIVE_SEL_SYSTEM {
@@ -32272,10 +32257,7 @@ impl ExecNtHandler {
                 if key == MACHINE_ROOT_KEY || key == USER_ROOT_KEY {
                     return STATUS_CANNOT_DELETE;
                 }
-                if let Some((lease, path)) = self
-                    .cm_system_key_target(key)
-                    .map(|target| (target.lease, target.physical_path.clone()))
-                {
+                if let Some(lease) = self.cm_system_key_target(key).map(|target| target.lease) {
                     let information = match unsafe {
                         crate::config_manager_query_leased_system_hive_key_information(lease)
                     } {
@@ -32285,14 +32267,15 @@ impl ExecNtHandler {
                     if information.subkey_count != 0 {
                         return STATUS_CANNOT_DELETE;
                     }
-                    if let Err(status) = self.persist_and_publish_system_mutations(
-                        information.mount_generation,
-                        &[OwnedSystemHiveMutation::DeleteKey { path }],
-                        SystemHiveMutationOrigin::Runtime,
-                    ) {
-                        return status;
-                    }
-                    return 0;
+                    return match unsafe { crate::registry_mutation_work::submit_hosted_existing(
+                        self, key, information.mount_generation,
+                        nt_config_client::SystemHiveMutation::DeleteKey {
+                            path: &information.path,
+                        },
+                    ) } {
+                        Ok(()) => 0x103,
+                        Err(status) => status,
+                    };
                 }
                 let stats = match self.registry_key_stats(key) {
                     Ok(stats) => stats,
@@ -36413,7 +36396,24 @@ impl ExecNtHandler {
                     Ok(descriptor) => descriptor,
                     Err(status) => return status,
                 };
-                match self.set_registry_key_security_descriptor(key, &updated, expected_generation) {
+                if let Some(lease) = self.cm_system_key_target(key).map(|target| target.lease) {
+                    let information = match unsafe { crate::config_manager_query_leased_system_hive_key_information(lease) } {
+                        Ok(information) if information.mount_generation == expected_generation => information,
+                        Ok(_) => return 0xC000_022D,
+                        Err(status) => return status as u32,
+                    };
+                    return match unsafe { crate::registry_mutation_work::submit_hosted_existing(
+                        self, key, expected_generation,
+                        nt_config_client::SystemHiveMutation::SetKeySecurity {
+                            path: &information.path,
+                            descriptor: &updated,
+                        },
+                    ) } {
+                        Ok(()) => 0x103,
+                        Err(status) => status,
+                    };
+                }
+                match self.set_registry_key_security_descriptor(key, &updated) {
                     Ok(()) => 0,
                     Err(status) => status,
                 }
