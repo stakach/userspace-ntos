@@ -40,6 +40,119 @@ fn case(attributes: ObjAttrFlags) -> CaseSensitivity {
     }
 }
 
+/// Pack canonical directory names and type names into NT x64
+/// OBJECT_DIRECTORY_INFORMATION records. `output_base` relocates pointers in
+/// the records but is never dereferenced.
+pub fn pack_directory_entries(
+    entries: &[(UnicodeString, UnicodeString)],
+    context: u32,
+    restart: bool,
+    single: bool,
+    output_base: u64,
+    output: &mut [u8],
+) -> Result<DirectoryQuery, NtStatus> {
+    if output.len() > u32::MAX as usize {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    output_base
+        .checked_add(output.len() as u64)
+        .ok_or(NtStatus::INVALID_PARAMETER)?;
+
+    let start = if restart { 0 } else { context };
+    let mut accepted = 0usize;
+    let mut total = RECORD_SIZE;
+    let mut status = NO_MORE_ENTRIES;
+    for (name, type_name) in entries.iter().skip(start as usize) {
+        let name_len = name
+            .len()
+            .checked_mul(2)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let type_len = type_name
+            .len()
+            .checked_mul(2)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if name_len > u16::MAX as usize - 2 || type_len > u16::MAX as usize - 2 {
+            return Err(NtStatus::OBJECT_NAME_INVALID);
+        }
+        let needed = RECORD_SIZE
+            .checked_add(name_len)
+            .and_then(|n| n.checked_add(type_len))
+            .and_then(|n| n.checked_add(4))
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let next_total = total
+            .checked_add(needed)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if next_total > output.len() {
+            status = if single {
+                total = next_total;
+                NtStatus::BUFFER_TOO_SMALL
+            } else {
+                MORE_ENTRIES
+            };
+            break;
+        }
+        total = next_total;
+        accepted += 1;
+        status = NtStatus::SUCCESS;
+        if single {
+            break;
+        }
+    }
+    let return_length = u32::try_from(total).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+    let next_context = if status.is_success() {
+        start
+            .checked_add(u32::try_from(accepted).map_err(|_| NtStatus::INVALID_PARAMETER)?)
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+    } else {
+        context
+    };
+    if status == NO_MORE_ENTRIES && total <= output.len() {
+        output[..total].fill(0);
+        return Ok(DirectoryQuery {
+            status,
+            context: next_context,
+            return_length,
+            written: return_length,
+        });
+    }
+    if total > output.len() || !status.is_success() {
+        return Ok(DirectoryQuery {
+            status,
+            context: next_context,
+            return_length,
+            written: 0,
+        });
+    }
+    output[..total].fill(0);
+    let mut string_offset = (accepted + 1) * RECORD_SIZE;
+    for (index, (name, type_name)) in entries
+        .iter()
+        .skip(start as usize)
+        .take(accepted)
+        .enumerate()
+    {
+        for (field, value) in [name, type_name].into_iter().enumerate() {
+            let length = (value.len() * 2) as u16;
+            let record = index * RECORD_SIZE + field * 16;
+            output[record..record + 2].copy_from_slice(&length.to_le_bytes());
+            output[record + 2..record + 4].copy_from_slice(&(length + 2).to_le_bytes());
+            output[record + 8..record + 16]
+                .copy_from_slice(&(output_base + string_offset as u64).to_le_bytes());
+            for unit in value.as_units() {
+                output[string_offset..string_offset + 2].copy_from_slice(&unit.to_le_bytes());
+                string_offset += 2;
+            }
+            string_offset += 2;
+        }
+    }
+    Ok(DirectoryQuery {
+        status,
+        context: next_context,
+        return_length,
+        written: total as u32,
+    })
+}
+
 impl ObjectManager {
     fn directory_attributes(
         &self,
@@ -208,104 +321,18 @@ impl ObjectManager {
             self.directory_type(),
             rights::directory::QUERY,
         )?;
-        let start = if restart { 0 } else { context };
         object.with_body(|body| {
             let ObjectBody::Directory(directory) = body else {
                 return Err(NtStatus::OBJECT_TYPE_MISMATCH);
             };
             let mut entries = Vec::new();
-            let mut total = RECORD_SIZE;
-            let mut status = NO_MORE_ENTRIES;
-            for (name, child) in directory.children().skip(start as usize) {
+            for (name, child) in directory.children() {
                 let ty = self
                     .object_type(child.type_id())
                     .ok_or(NtStatus::OBJECT_TYPE_MISMATCH)?;
-                let type_name = UnicodeString::from_str(ty.name());
-                let name_len = name
-                    .len()
-                    .checked_mul(2)
-                    .ok_or(NtStatus::INVALID_PARAMETER)?;
-                let type_len = type_name
-                    .len()
-                    .checked_mul(2)
-                    .ok_or(NtStatus::INVALID_PARAMETER)?;
-                if name_len > u16::MAX as usize - 2 || type_len > u16::MAX as usize - 2 {
-                    return Err(NtStatus::OBJECT_NAME_INVALID);
-                }
-                let needed = RECORD_SIZE
-                    .checked_add(name_len)
-                    .and_then(|n| n.checked_add(type_len))
-                    .and_then(|n| n.checked_add(4))
-                    .ok_or(NtStatus::INVALID_PARAMETER)?;
-                let next_total = total
-                    .checked_add(needed)
-                    .ok_or(NtStatus::INVALID_PARAMETER)?;
-                if next_total > output.len() {
-                    status = if single {
-                        total = next_total;
-                        NtStatus::BUFFER_TOO_SMALL
-                    } else {
-                        MORE_ENTRIES
-                    };
-                    break;
-                }
-                total = next_total;
-                entries.push((name, type_name));
-                status = NtStatus::SUCCESS;
-                if single {
-                    break;
-                }
+                entries.push((name.clone(), UnicodeString::from_str(ty.name())));
             }
-            let return_length = u32::try_from(total).map_err(|_| NtStatus::INVALID_PARAMETER)?;
-            let accepted = u32::try_from(entries.len()).map_err(|_| NtStatus::INVALID_PARAMETER)?;
-            let next_context = if status.is_success() {
-                start
-                    .checked_add(accepted)
-                    .ok_or(NtStatus::INVALID_PARAMETER)?
-            } else {
-                context
-            };
-            if status == NO_MORE_ENTRIES && total <= output.len() {
-                output[..total].fill(0);
-                return Ok(DirectoryQuery {
-                    status,
-                    context: next_context,
-                    return_length,
-                    written: return_length,
-                });
-            }
-            if total > output.len() || !status.is_success() {
-                return Ok(DirectoryQuery {
-                    status,
-                    context: next_context,
-                    return_length,
-                    written: 0,
-                });
-            }
-            output[..total].fill(0);
-            let mut string_offset = (entries.len() + 1) * RECORD_SIZE;
-            for (index, (name, type_name)) in entries.iter().enumerate() {
-                for (field, value) in [*name, type_name].into_iter().enumerate() {
-                    let length = (value.len() * 2) as u16;
-                    let record = index * RECORD_SIZE + field * 16;
-                    output[record..record + 2].copy_from_slice(&length.to_le_bytes());
-                    output[record + 2..record + 4].copy_from_slice(&(length + 2).to_le_bytes());
-                    output[record + 8..record + 16]
-                        .copy_from_slice(&(output_base + string_offset as u64).to_le_bytes());
-                    for unit in value.as_units() {
-                        output[string_offset..string_offset + 2]
-                            .copy_from_slice(&unit.to_le_bytes());
-                        string_offset += 2;
-                    }
-                    string_offset += 2;
-                }
-            }
-            Ok(DirectoryQuery {
-                status,
-                context: next_context,
-                return_length,
-                written: total as u32,
-            })
+            pack_directory_entries(&entries, context, restart, single, output_base, output)
         })
     }
 }
@@ -333,6 +360,92 @@ mod tests {
         )
         .unwrap()
         .handle
+    }
+
+    #[test]
+    fn pure_packer_preserves_empty_and_zero_length_probe_contract() {
+        let mut absent = [];
+        let empty = pack_directory_entries(&[], 7, true, false, 0, &mut absent).unwrap();
+        assert_eq!(
+            empty,
+            DirectoryQuery {
+                status: NO_MORE_ENTRIES,
+                context: 7,
+                return_length: 32,
+                written: 0,
+            }
+        );
+        let mut terminator = [0xa5; 32];
+        let empty = pack_directory_entries(&[], 7, true, false, 0x1000, &mut terminator).unwrap();
+        assert_eq!(empty.written, 32);
+        assert_eq!(terminator, [0; 32]);
+
+        let name = UnicodeString::from_str("A");
+        let entries = [(name, UnicodeString::from_str("Directory"))];
+        let probe = pack_directory_entries(&entries, 7, true, false, 0, &mut absent).unwrap();
+        assert_eq!(probe.status, MORE_ENTRIES);
+        assert_eq!(probe.context, 0);
+        assert_eq!(probe.return_length, 32);
+        assert_eq!(probe.written, 0);
+        let single = pack_directory_entries(&entries, 7, true, true, 0, &mut absent).unwrap();
+        assert_eq!(single.status, NtStatus::BUFFER_TOO_SMALL);
+        assert_eq!(single.context, 7);
+        assert_eq!(single.return_length, 88);
+        assert_eq!(single.written, 0);
+    }
+
+    #[test]
+    fn pure_packer_short_buffer_is_unchanged_and_relocates_pointers() {
+        let name = UnicodeString::from_str("A");
+        let entries = [(name, UnicodeString::from_str("Directory"))];
+        let mut short = [0xa5; 87];
+        let result = pack_directory_entries(&entries, 0, false, true, 0x1000, &mut short).unwrap();
+        assert_eq!(result.status, NtStatus::BUFFER_TOO_SMALL);
+        assert_eq!(result.return_length, 88);
+        assert_eq!(short, [0xa5; 87]);
+
+        let mut packed = [0xa5; 96];
+        let result = pack_directory_entries(&entries, 0, false, true, 0x2000, &mut packed).unwrap();
+        assert_eq!(result.status, NtStatus::SUCCESS);
+        assert_eq!(result.context, 1);
+        assert_eq!(result.written, 88);
+        assert_eq!(
+            u64::from_le_bytes(packed[8..16].try_into().unwrap()),
+            0x2040
+        );
+        assert_eq!(
+            u64::from_le_bytes(packed[24..32].try_into().unwrap()),
+            0x2044
+        );
+        assert_eq!(packed[88], 0xa5);
+        assert_eq!(
+            pack_directory_entries(&entries, 0, false, true, u64::MAX, &mut packed),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn pure_packer_restart_and_cursor_walk_entries() {
+        let a = UnicodeString::from_str("a");
+        let b = UnicodeString::from_str("b");
+        let entries = [
+            (a, UnicodeString::from_str("Directory")),
+            (b, UnicodeString::from_str("Directory")),
+        ];
+        let mut output = [0xa5; 88];
+        let first = pack_directory_entries(&entries, 9, true, false, 0, &mut output).unwrap();
+        assert_eq!(first.status, MORE_ENTRIES);
+        assert_eq!(first.context, 1);
+        assert_eq!(output[64], b'a');
+        let second =
+            pack_directory_entries(&entries, first.context, false, true, 0, &mut output).unwrap();
+        assert_eq!(second.status, NtStatus::SUCCESS);
+        assert_eq!(second.context, 2);
+        assert_eq!(output[64], b'b');
+        let end =
+            pack_directory_entries(&entries, second.context, false, false, 0, &mut output).unwrap();
+        assert_eq!(end.status, NO_MORE_ENTRIES);
+        assert_eq!(end.context, 2);
     }
 
     #[test]
@@ -435,7 +548,10 @@ mod tests {
                 .id(),
             first_id
         );
-        assert_eq!(om.close_handle(creator, opened), Err(NtStatus::INVALID_HANDLE));
+        assert_eq!(
+            om.close_handle(creator, opened),
+            Err(NtStatus::INVALID_HANDLE)
+        );
         om.close_handle(peer, opened).unwrap();
         assert_eq!(om.close_handle(peer, opened), Err(NtStatus::INVALID_HANDLE));
         assert!(matches!(
