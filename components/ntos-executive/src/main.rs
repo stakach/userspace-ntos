@@ -22278,7 +22278,6 @@ const SEMAPHORE_HANDLE_TAG: u64 = 0x5345_4D41_0000_0000;
 const SEMAPHORE_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 const MUTANT_HANDLE_TAG: u64 = 0x4D55_544E_0000_0000;
 const MUTANT_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
-const DIRECTORY_OBJECT_HANDLE_TAG: u64 = 0x4449_524F_0000_0000;
 const SYMBOLIC_LINK_HANDLE_TAG: u64 = 0x5359_4D4C_0000_0000;
 const KEYEDEVENT_HANDLE_TAG: u64 = 0x4B45_5956_0000_0000;
 const OBJECT_NAMESPACE_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
@@ -22312,6 +22311,7 @@ const OBJ_NAME_CAP: usize = 128;
 const OBJ_PARENT_ROOT: usize = usize::MAX;
 const OBJ_PARENT_ANONYMOUS: usize = usize::MAX - 1;
 static OBJ_NS_GROWTHS: AtomicU64 = AtomicU64::new(0);
+static NEXT_OBJ_NS_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 fn mark_object_namespace_growth(old_capacity: usize, new_capacity: usize, len: usize) {
     let n = OBJ_NS_GROWTHS.fetch_add(1, Ordering::Relaxed);
@@ -22335,6 +22335,7 @@ fn mark_object_namespace_growth(old_capacity: usize, new_capacity: usize, len: u
 /// unlinked when their final body reference goes away.
 #[derive(Clone, Copy)]
 struct ObjEntry {
+    identity: u64,
     name: [u8; OBJ_NAME_CAP], // leaf name, lowercased ASCII (len in name_len)
     name_len: u8,
     parent: usize, // index of the parent directory; OBJ_PARENT_ROOT = the root itself
@@ -22348,6 +22349,9 @@ struct ObjEntry {
 }
 impl ObjEntry {
     fn push_zeroed(entries: &mut alloc::vec::Vec<Self>) -> Option<usize> {
+        let identity = NEXT_OBJ_NS_IDENTITY
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+            .ok()?;
         if entries.len() == entries.capacity() {
             let old_capacity = entries.capacity();
             entries.try_reserve(64).ok()?;
@@ -22358,6 +22362,7 @@ impl ObjEntry {
         }
         let index = entries.len();
         entries.push(Self {
+            identity,
             name: [0; OBJ_NAME_CAP],
             name_len: 0,
             parent: 0,

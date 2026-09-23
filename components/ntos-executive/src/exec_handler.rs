@@ -1161,6 +1161,7 @@ fn trace_handle_object_for(nt: &ExecNtHandler, handle: u64) {
         }
         Some(nt_process::HandleObject::DiskFile { .. }) => print_str(b"disk-file"),
         Some(nt_process::HandleObject::Directory { .. }) => print_str(b"directory"),
+        Some(nt_process::HandleObject::ObjectDirectory(_)) => print_str(b"object-directory"),
         Some(nt_process::HandleObject::IoCompletion(_)) => print_str(b"io-completion"),
         Some(nt_process::HandleObject::RegistryKey(_)) => print_str(b"registry-key"),
         Some(nt_process::HandleObject::Process(_)) => print_str(b"process"),
@@ -9814,7 +9815,6 @@ impl ExecNtHandler {
 
     fn object_namespace_handle_tag(kind: u8, index: usize) -> Option<u64> {
         let tag = match kind {
-            OBJ_KIND_DIRECTORY => DIRECTORY_OBJECT_HANDLE_TAG,
             OBJ_KIND_SYMBOLIC_LINK => SYMBOLIC_LINK_HANDLE_TAG,
             OBJ_KIND_SEMAPHORE => SEMAPHORE_HANDLE_TAG,
             OBJ_KIND_MUTANT => MUTANT_HANDLE_TAG,
@@ -9826,7 +9826,6 @@ impl ExecNtHandler {
 
     fn object_namespace_tag_kind(tag: u64) -> Option<u8> {
         match tag & OBJECT_NAMESPACE_HANDLE_TAG_MASK {
-            DIRECTORY_OBJECT_HANDLE_TAG => Some(OBJ_KIND_DIRECTORY),
             SYMBOLIC_LINK_HANDLE_TAG => Some(OBJ_KIND_SYMBOLIC_LINK),
             _ => None,
         }
@@ -9847,10 +9846,60 @@ impl ExecNtHandler {
 
     fn object_namespace_mapped_access(kind: u8, desired_access: u32) -> Option<u32> {
         match kind {
-            OBJ_KIND_DIRECTORY => Some(Self::map_directory_object_access(desired_access)),
             OBJ_KIND_SYMBOLIC_LINK => Some(Self::map_symbolic_link_object_access(desired_access)),
             _ => None,
         }
+    }
+
+    fn directory_namespace_index_for_identity(&self, identity: u64) -> Result<usize, u32> {
+        self.obj_ns
+            .iter()
+            .position(|entry| {
+                entry.identity == identity && entry.is_live() && entry.kind == OBJ_KIND_DIRECTORY
+            })
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)
+    }
+
+    fn native_directory_caller(
+        &self,
+        previous_mode: nt_syscall::ProcessorMode,
+    ) -> Result<nt_process::native_handle::NativeHandleCaller, u32> {
+        let thread = self
+            .pm
+            .thread_lifetime(self.current_tid as nt_process::ThreadId)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        if Some(thread.process_id()) != self.pm_pid_for_pi(self.pi) {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        let mode = match previous_mode {
+            nt_syscall::ProcessorMode::KernelMode => nt_types::AccessMode::KernelMode,
+            nt_syscall::ProcessorMode::UserMode => nt_types::AccessMode::UserMode,
+        };
+        self.pm.capture_native_handle_caller(thread, mode)
+    }
+
+    fn native_directory_root_and_path<'a>(
+        &self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        root: u64,
+        path: &'a [u8],
+    ) -> Result<(usize, &'a [u8]), u32> {
+        if root == 0 {
+            return if path.first() == Some(&b'\\') {
+                Ok((0, path))
+            } else {
+                Err(0xC000_0033) // STATUS_OBJECT_NAME_INVALID
+            };
+        }
+        if path.first() == Some(&b'\\') {
+            return Err(0xC000_0033);
+        }
+        let identity = self.pm.lookup_native_object_directory_handle(
+            caller,
+            root,
+            DIRECTORY_TRAVERSE_ACCESS,
+        )?;
+        Ok((self.directory_namespace_index_for_identity(identity)?, path))
     }
 
     fn mint_object_namespace_handle(&mut self, index: usize, desired_access: u32) -> Option<u64> {
@@ -9892,6 +9941,19 @@ impl ExecNtHandler {
         let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
         let handle = handle as nt_process::Handle;
         let tag = match self.pm.lookup_handle(pid, handle) {
+            Some(nt_process::HandleObject::ObjectDirectory(identity)) => {
+                if required_kind.is_some_and(|kind| kind != OBJ_KIND_DIRECTORY) {
+                    return Err(STATUS_OBJECT_TYPE_MISMATCH);
+                }
+                let granted = self
+                    .pm
+                    .handle_access(pid, handle)
+                    .ok_or(STATUS_INVALID_HANDLE)?;
+                if required_access != 0 && granted & required_access != required_access {
+                    return Err(STATUS_ACCESS_DENIED);
+                }
+                return self.directory_namespace_index_for_identity(identity);
+            }
             Some(nt_process::HandleObject::Opaque(tag)) => tag,
             Some(_) => return Err(STATUS_OBJECT_TYPE_MISMATCH),
             None => return Err(STATUS_INVALID_HANDLE),
@@ -16496,6 +16558,7 @@ impl ExecNtHandler {
                 | nt_process::HandleObject::OverlayFile(_) => b"File",
                 nt_process::HandleObject::IoCompletion(_) => b"IoCompletion",
                 nt_process::HandleObject::RegistryKey(_) => b"Key",
+                nt_process::HandleObject::ObjectDirectory(_) => b"Directory",
                 nt_process::HandleObject::Token(_) | nt_process::HandleObject::TokenObject(_) => {
                     b"Token"
                 }
@@ -16515,11 +16578,6 @@ impl ExecNtHandler {
                     if tag & TIMER_HANDLE_TAG_MASK == TIMER_HANDLE_TAG =>
                 {
                     b"Timer"
-                }
-                nt_process::HandleObject::Opaque(tag)
-                    if tag & OBJECT_NAMESPACE_HANDLE_TAG_MASK == DIRECTORY_OBJECT_HANDLE_TAG =>
-                {
-                    b"Directory"
                 }
                 nt_process::HandleObject::Opaque(tag)
                     if tag & OBJECT_NAMESPACE_HANDLE_TAG_MASK == SYMBOLIC_LINK_HANDLE_TAG =>
@@ -16548,6 +16606,9 @@ impl ExecNtHandler {
         }
         if let nt_process::HandleObject::IoCompletion(id) = object {
             return self.io_completion_namespace_index(id);
+        }
+        if let nt_process::HandleObject::ObjectDirectory(identity) = object {
+            return self.directory_namespace_index_for_identity(identity).ok();
         }
         if let nt_process::HandleObject::Job(id) = object {
             return self.job_namespace_index(id);
@@ -20158,6 +20219,9 @@ impl ExecNtHandler {
             nt_process::HandleObject::Opaque(tag) => {
                 self.release_opaque_namespace_reference(tag);
             }
+            nt_process::HandleObject::ObjectDirectory(identity) => {
+                self.release_directory_namespace_reference(identity);
+            }
             nt_process::HandleObject::RegistryKey(target) => {
                 self.release_registry_key_target(target);
             }
@@ -23172,7 +23236,8 @@ impl ExecNtHandler {
             .lookup_handle(pid, root as nt_process::Handle)
             .ok_or(STATUS_INVALID_HANDLE)?;
         match object {
-            nt_process::HandleObject::Opaque(_) => {
+            nt_process::HandleObject::Opaque(_)
+            | nt_process::HandleObject::ObjectDirectory(_) => {
                 let index = self.object_namespace_index_for_handle(
                     root,
                     Some(OBJ_KIND_DIRECTORY),
@@ -24397,6 +24462,19 @@ impl ExecNtHandler {
         if self
             .pm
             .handle_object_count(nt_process::HandleObject::Opaque(tag))
+            == 0
+        {
+            self.obj_delete_name_check(index);
+        }
+    }
+
+    fn release_directory_namespace_reference(&mut self, identity: u64) {
+        let Ok(index) = self.directory_namespace_index_for_identity(identity) else {
+            return;
+        };
+        if self
+            .pm
+            .handle_object_count(nt_process::HandleObject::ObjectDirectory(identity))
             == 0
         {
             self.obj_delete_name_check(index);
@@ -31651,6 +31729,53 @@ impl ExecNtHandler {
             // benign for the hosted boot path. A win32k USER-object handle is closed through that
             // owning table so a duplicated desktop handle has an independent lifetime.
             NativeService::NtClose => {
+                let tagged_kernel = args[0] & nt_process::native_handle::KERNEL_HANDLE_TAG
+                    == nt_process::native_handle::KERNEL_HANDLE_TAG;
+                if tagged_kernel && ctx.previous_mode == nt_syscall::ProcessorMode::UserMode {
+                    return nt_process::STATUS_INVALID_HANDLE;
+                }
+                let local_directory = self.pm_pid_for_pi(self.pi).is_some_and(|pid| {
+                    nt_process::Handle::try_from(args[0]).is_ok_and(|handle| {
+                        matches!(
+                            self.pm.lookup_handle(pid, handle),
+                            Some(nt_process::HandleObject::ObjectDirectory(_))
+                        )
+                    })
+                });
+                if local_directory || tagged_kernel {
+                    let caller = match self.native_directory_caller(ctx.previous_mode) {
+                        Ok(caller) => caller,
+                        Err(status) => return status,
+                    };
+                    let (owner, handle) = match self.pm.decode_native_handle(caller, args[0]) {
+                        Ok(nt_process::native_handle::NativeHandleScope::Table {
+                            owner, handle, ..
+                        }) => (owner, handle),
+                        Ok(_) => return nt_process::STATUS_INVALID_HANDLE,
+                        Err(status) => return status,
+                    };
+                    if !matches!(
+                        self.pm.lookup_handle(owner, handle),
+                        Some(nt_process::HandleObject::ObjectDirectory(_))
+                    ) {
+                        return nt_process::STATUS_INVALID_HANDLE;
+                    }
+                    let identity = match self
+                        .pm
+                        .close_native_object_directory_handle(caller, args[0])
+                    {
+                        Ok(identity) => identity,
+                        Err(nt_process::native_handle::NativePsCloseError::Status(status)) => {
+                            return status;
+                        }
+                        Err(nt_process::native_handle::NativePsCloseError::BugCheck { .. }) => {
+                            panic!("protected kernel directory handle close");
+                        }
+                    };
+                    self.release_directory_namespace_reference(identity);
+                    PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
+                    return 0;
+                }
                 let mut closed = false;
                 let pid = self.pm_pid_for_pi(self.pi);
                 if let (Some(pid), Ok(handle)) = (pid, nt_process::Handle::try_from(args[0])) {
@@ -36934,37 +37059,29 @@ impl ExecNtHandler {
                     return 0xC000_0033;
                 };
                 let permanent = captured.attributes & OBJ_PERMANENT != 0;
-                let (root_idx, path) = match self.event_root_and_path(captured.root, path) {
-                    Ok(resolved) => resolved,
+                let caller = match self.native_directory_caller(ctx.previous_mode) {
+                    Ok(caller) => caller,
                     Err(status) => return status,
                 };
-                let mut created = false;
+                let (root_idx, path) =
+                    match self.native_directory_root_and_path(caller, captured.root, path) {
+                        Ok(resolved) => resolved,
+                        Err(status) => return status,
+                    };
                 let mut opened_existing = false;
-                let index = if ctx.service == NativeService::NtCreateDirectoryObject {
+                let existing = if ctx.service == NativeService::NtCreateDirectoryObject {
                     match self.obj_resolve(path, root_idx) {
                         Some(index) if self.obj_ns[index].kind == OBJ_KIND_DIRECTORY => {
                             if captured.attributes & 0x80 == 0 {
                                 return 0xC000_0035; // STATUS_OBJECT_NAME_COLLISION
                             }
                             opened_existing = true;
-                            index
+                            Some(index)
                         }
                         Some(_) => {
                             return 0xC000_0024;
                         } // STATUS_OBJECT_TYPE_MISMATCH
-                        None => match self.obj_create(
-                            path,
-                            root_idx,
-                            OBJ_KIND_DIRECTORY,
-                            &[],
-                            permanent,
-                        ) {
-                            Some(index) => {
-                                created = true;
-                                index
-                            }
-                            None => return 0xC000_003A, // STATUS_OBJECT_PATH_NOT_FOUND
-                        },
+                        None => None,
                     }
                 } else {
                     let Some(index) = self.obj_resolve(path, root_idx) else {
@@ -36973,23 +37090,57 @@ impl ExecNtHandler {
                     if self.obj_ns[index].kind != OBJ_KIND_DIRECTORY {
                         return 0xC000_0024; // STATUS_OBJECT_TYPE_MISMATCH
                     }
-                    index
+                    Some(index)
                 };
-                let Some(handle) = self.mint_object_namespace_handle(index, desired_access) else {
+                let handle_attributes = captured.attributes
+                    & (nt_process::native_handle::OBJ_KERNEL_HANDLE | 0x2);
+                let cap_before = self.pm.handle_capacity(caller.effective_process());
+                let mut publication = match self
+                    .pm
+                    .reserve_native_object_directory_handle(caller, handle_attributes)
+                {
+                    Ok(publication) => publication,
+                    Err(status) => return status,
+                };
+                let created = existing.is_none();
+                let index = if let Some(index) = existing {
+                    index
+                } else if let Some(index) = self.obj_create(
+                    path,
+                    root_idx,
+                    OBJ_KIND_DIRECTORY,
+                    &[],
+                    permanent,
+                ) {
+                    index
+                } else {
+                    assert_eq!(publication.abort(&mut self.pm), Ok(None));
+                    return 0xC000_003A; // STATUS_OBJECT_PATH_NOT_FOUND
+                };
+                let identity = self.obj_ns[index].identity;
+                let access = Self::map_directory_object_access(desired_access);
+                if let Err(status) = publication.bind(&mut self.pm, identity, access) {
+                    assert_eq!(publication.abort(&mut self.pm), Ok(None));
                     if created {
                         self.rollback_new_namespace_object(index);
                     }
-                    return 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
-                };
-                if !self.xas_write_u64(out, handle) {
-                    if let Some(pid) = self.pm_pid_for_pi(self.pi) {
-                        let _ = self.close_process_handle(pid, handle);
-                    }
+                    return status;
+                }
+                if !self.xas_write_u64(out, publication.value()) {
+                    assert_eq!(publication.abort(&mut self.pm), Ok(Some(identity)));
                     if created {
                         self.rollback_new_namespace_object(index);
                     }
                     return 0xC000_0005;
                 }
+                if let Err(status) = publication.publish(&mut self.pm) {
+                    assert_eq!(publication.abort(&mut self.pm), Ok(Some(identity)));
+                    if created {
+                        self.rollback_new_namespace_object(index);
+                    }
+                    return status;
+                }
+                self.record_process_handle_insert(publication.process_id(), cap_before);
                 if opened_existing {
                     0x4000_0000 // STATUS_OBJECT_NAME_EXISTS
                 } else {
@@ -37013,11 +37164,15 @@ impl ExecNtHandler {
                 let restart_scan = nt_boolean_arg(args[4]);
                 let context_ptr = args[5];
                 let retlen_ptr = args[6];
-                let dir_idx = match self.object_namespace_index_for_handle(
-                    dir_handle,
-                    Some(OBJ_KIND_DIRECTORY),
-                    DIRECTORY_QUERY_ACCESS,
-                ) {
+                let dir_idx = match self.native_directory_caller(ctx.previous_mode).and_then(|caller| {
+                    self.pm
+                        .lookup_native_object_directory_handle(
+                            caller,
+                            dir_handle,
+                            DIRECTORY_QUERY_ACCESS,
+                        )
+                        .and_then(|identity| self.directory_namespace_index_for_identity(identity))
+                }) {
                     Ok(index) => index,
                     Err(status) => return status,
                 };
