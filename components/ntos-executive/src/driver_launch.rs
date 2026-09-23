@@ -58,6 +58,8 @@ pub(crate) mod hosted_add_device_rollback;
 mod hosted_file_dispatch;
 #[path = "hosted_file_owners.rs"]
 mod hosted_file_owners;
+#[path = "hosted_file_lifecycle_owners.rs"]
+mod hosted_file_lifecycle_owners;
 #[path = "hosted_file_retirements.rs"]
 mod hosted_file_retirements;
 #[path = "hosted_file_objects.rs"]
@@ -37467,7 +37469,10 @@ fn io_manager_mut() -> &'static mut ExecutiveIoManager {
         let init = core::ptr::addr_of_mut!(DRIVER_IO_MANAGER_INIT);
         let slot = core::ptr::addr_of_mut!(DRIVER_IO_MANAGER);
         if !read_volatile(init) {
-            (*slot).write(IoManager::new(ExecutiveObjectManagerPort));
+            let mut io = IoManager::new(ExecutiveObjectManagerPort);
+            io.enable_owned_peer_file_lifecycle()
+                .expect("fresh I/O manager must admit owned File lifecycle");
+            (*slot).write(io);
             write_volatile(init, true);
         }
         (*slot).assume_init_mut()
@@ -41539,6 +41544,7 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
     let pumped = pump_io_manager();
     pumped
         .saturating_add(hosted_file_owners::drain())
+        .saturating_add(hosted_file_lifecycle_owners::retire())
         .saturating_add(unsafe { drain_hosted_acpi_pci_route_indeterminate_irps() })
         .saturating_add(unsafe { drain_hosted_device_retirements() })
         .saturating_add(unsafe { hosted_add_device_rollback::drain() })
@@ -59143,6 +59149,24 @@ pub(crate) fn release_hosted_file(file_id: u64) -> Result<(), u32> {
     release_hosted_file_with_provenance(file_id, b"final-handle")
 }
 
+pub(crate) fn reserve_hosted_file_lifecycle(
+    file_id: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
+    requestor: nt_process::native_handle::NativeThreadProcessReference,
+) -> Result<(), (nt_status::NtStatus, nt_process::native_handle::NativeThreadProcessReference)> {
+    hosted_file_lifecycle_owners::reserve(FileId(file_id), caller, requestor)
+}
+
+pub(crate) fn cancel_hosted_file_lifecycle_reservation(file_id: u64) -> bool {
+    hosted_file_lifecycle_owners::cancel(FileId(file_id))
+}
+
+pub(crate) fn pump_hosted_file_lifecycle(
+    executor: nt_process::native_handle::NativeHandleCaller,
+) -> usize {
+    hosted_file_lifecycle_owners::pump(executor)
+}
+
 /// Abandon a canonical File whose process-handle publication never committed.
 /// This shares the manager state machine with final-handle release, but remains
 /// a distinct integration boundary so a rollback cannot masquerade as CLEANUP.
@@ -59174,7 +59198,7 @@ fn release_hosted_file_with_provenance(file_id: u64, provenance: &[u8]) -> Resul
         print_str(b" state=missing");
     }
     let client = ClientId(IO_MANAGER_COMPONENT_ID);
-    let result = match io.release_external_file(client, FileId(file_id)) {
+    let result = match io.queue_external_file_release(client, FileId(file_id)) {
         Err(nt_status::NtStatus::DELETE_PENDING)
             if io.file(FileId(file_id)).is_some_and(|file| {
                 matches!(file.state, FileState::Allocated | FileState::Closed)

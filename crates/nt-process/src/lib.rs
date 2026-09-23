@@ -5220,6 +5220,21 @@ impl ProcessManager {
             .iter_mut()
             .find_map(|entry| entry.take_entry().map(|entry| entry.object))
     }
+    /// Snapshot live handle objects before a caller commits process rundown. The snapshot does
+    /// not remove table references; hosts can reserve object-specific close owners first.
+    pub fn snapshot_process_handle_objects(
+        &self,
+        pid: ProcessId,
+    ) -> Result<Vec<HandleObject>, u32> {
+        let proc = self.processes.get(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        let count = proc.handles.iter().filter_map(HandleSlot::entry).count();
+        let mut objects = Vec::new();
+        objects
+            .try_reserve_exact(count)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        objects.extend(proc.handles.iter().filter_map(HandleSlot::entry).map(|entry| entry.object));
+        Ok(objects)
+    }
     /// Close the first handle in `pid`'s table whose entry refers to `object` (spec §8.1), freeing
     /// the slot; returns whether one was found. A host that assigns its own handle VALUES (outside
     /// this table's `(slot+1)*4` scheme) records each with the value in a [`HandleObject::Opaque`]
