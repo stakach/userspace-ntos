@@ -61,6 +61,7 @@ mod mock_driver;
 mod object_port;
 mod open;
 mod owned_file_metadata;
+pub mod owned_file_lifecycle;
 mod pending_io;
 mod pending_set_file_name;
 mod pipe;
