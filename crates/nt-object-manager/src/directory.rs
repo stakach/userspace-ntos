@@ -399,6 +399,140 @@ mod tests {
     }
 
     #[test]
+    fn temporary_directory_survives_creator_close_while_another_client_holds_it() {
+        let (mut om, creator) = setup();
+        let peer = om.register_client(ClientKind::ExecutiveService, AccessMode::KernelMode);
+        let name = UnicodeString::from_str("\\Device\\SharedDirectory");
+        let path = NtPath::parse(name.as_units()).unwrap();
+        let created = om
+            .create_directory_handle(
+                creator,
+                None,
+                &name,
+                rights::directory::QUERY,
+                ObjAttrFlags::empty(),
+            )
+            .unwrap();
+        let opened = om
+            .open_directory_handle(
+                peer,
+                None,
+                &name,
+                rights::directory::QUERY,
+                ObjAttrFlags::empty(),
+            )
+            .unwrap();
+        let object = om
+            .reference_by_handle(peer, opened, om.directory_type(), AccessMask::empty())
+            .unwrap();
+        let first_id = object.id();
+        drop(object);
+
+        om.close_handle(creator, created.handle).unwrap();
+        assert_eq!(
+            om.lookup_path(&path, CaseSensitivity::CaseSensitive)
+                .unwrap()
+                .id(),
+            first_id
+        );
+        assert_eq!(om.close_handle(creator, opened), Err(NtStatus::INVALID_HANDLE));
+        om.close_handle(peer, opened).unwrap();
+        assert_eq!(om.close_handle(peer, opened), Err(NtStatus::INVALID_HANDLE));
+        assert!(matches!(
+            om.lookup_path(&path, CaseSensitivity::CaseSensitive),
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+        ));
+
+        let recreated = om
+            .create_directory_handle(
+                creator,
+                None,
+                &name,
+                rights::directory::QUERY,
+                ObjAttrFlags::empty(),
+            )
+            .unwrap();
+        assert!(recreated.created);
+        assert_ne!(
+            om.reference_by_handle(
+                creator,
+                recreated.handle,
+                om.directory_type(),
+                AccessMask::empty(),
+            )
+            .unwrap()
+            .id(),
+            first_id
+        );
+        assert!(matches!(
+            om.reference_by_handle(creator, created.handle, None, AccessMask::empty()),
+            Err(NtStatus::INVALID_HANDLE)
+        ));
+    }
+
+    #[test]
+    fn directory_kernel_handle_and_openif_access_admission_leave_no_partial_handles() {
+        let (mut om, kernel) = setup();
+        let user = om.register_client(ClientKind::NativeUser, AccessMode::UserMode);
+        let name = UnicodeString::from_str("\\Device\\KernelDirectory");
+        let path = NtPath::parse(name.as_units()).unwrap();
+        let user_count = om.open_handle_count(user).unwrap();
+        assert_eq!(
+            om.create_directory_handle(
+                user,
+                None,
+                &name,
+                rights::directory::QUERY,
+                ObjAttrFlags::KERNEL_HANDLE,
+            ),
+            Err(NtStatus::ACCESS_DENIED)
+        );
+        assert_eq!(om.open_handle_count(user).unwrap(), user_count);
+        assert!(matches!(
+            om.lookup_path(&path, CaseSensitivity::CaseSensitive),
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+        ));
+
+        let created = om
+            .create_directory_handle(
+                kernel,
+                None,
+                &name,
+                rights::directory::QUERY,
+                ObjAttrFlags::KERNEL_HANDLE,
+            )
+            .unwrap();
+        assert!(created.created);
+        assert_eq!(
+            om.create_directory_handle(
+                user,
+                None,
+                &name,
+                AccessMask::from_bits_retain(0x8000),
+                ObjAttrFlags::OPEN_IF,
+            ),
+            Err(NtStatus::ACCESS_DENIED)
+        );
+        assert_eq!(om.open_handle_count(user).unwrap(), user_count);
+        assert_eq!(
+            om.open_directory_handle(
+                user,
+                None,
+                &name,
+                rights::directory::QUERY,
+                ObjAttrFlags::KERNEL_HANDLE,
+            ),
+            Err(NtStatus::ACCESS_DENIED)
+        );
+        assert_eq!(om.open_handle_count(user).unwrap(), user_count);
+        om.close_handle(kernel, created.handle).unwrap();
+        assert!(matches!(
+            om.lookup_path(&path, CaseSensitivity::CaseSensitive),
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+        ));
+    }
+
+    #[test]
     fn failed_access_does_not_publish_name_or_handle() {
         let (mut om, _) = setup();
         let client = om.register_client(ClientKind::NativeUser, AccessMode::UserMode);
