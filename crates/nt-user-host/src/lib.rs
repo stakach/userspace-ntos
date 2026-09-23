@@ -28,6 +28,7 @@ mod profile;
 pub mod process_identity;
 pub mod provider_alias_bank;
 pub mod provider_finalization;
+pub mod provider_file_close;
 pub mod native_call_owner;
 pub mod gui_exit;
 pub mod provider_kernel_activation;
