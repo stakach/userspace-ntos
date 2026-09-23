@@ -500,6 +500,11 @@ impl Default for ObHandleTable {
 }
 
 impl ObHandleTable {
+    /// Classify the disjoint USER handle value space without asserting that a slot is live.
+    pub fn is_handle_namespace_value(handle: u64) -> bool {
+        Self::canonical_index(handle).is_some() || Self::alias_index(handle).is_some()
+    }
+
     fn canonical_index(handle: u64) -> Option<usize> {
         let offset = handle.checked_sub(OB_HANDLE_BASE)?;
         if offset & 3 != 0 || offset >= (OB_TABLE_LEN as u64) * 4 {
@@ -1069,6 +1074,9 @@ mod tests {
         let canonical = t.register(ObKind::Desktop, 0xD00D_0000);
         let alias = t.duplicate(canonical).unwrap();
         assert_eq!(alias, OB_ALIAS_HANDLE_BASE);
+        assert!(ObHandleTable::is_handle_namespace_value(canonical));
+        assert!(ObHandleTable::is_handle_namespace_value(alias));
+        assert!(ObHandleTable::is_handle_namespace_value(canonical + 4));
         for forged in [
             4,
             0x8000_0000,
@@ -1083,6 +1091,7 @@ mod tests {
             u64::MAX,
         ] {
             assert_eq!(t.lookup(forged), None, "forged handle {forged:#x}");
+            assert!(!ObHandleTable::is_handle_namespace_value(forged));
             assert!(!t.close(forged), "forged alias {forged:#x}");
             assert_eq!(t.granted_access(forged), None);
             assert_eq!(t.security_descriptor(forged), None);
