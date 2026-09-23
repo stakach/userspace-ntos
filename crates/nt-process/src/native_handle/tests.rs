@@ -1075,3 +1075,257 @@ fn closing_terminated_target_releases_handle_without_faking_object_retirement() 
     assert!(pm.process_object_delete_ready(pid));
     assert!(pm.delete_process_object_if_unreferenced(pid).is_some());
 }
+
+#[test]
+fn generic_native_close_returns_each_removed_object_to_its_host_owner() {
+    let (mut pm, user, _, pid, tid) = fixture();
+    let token = nt_security::TokenId::from_raw(22).unwrap();
+    let debug = pm.create_debug_object(0).unwrap();
+    let job = pm.create_job(0).unwrap();
+    let objects = [
+        HandleObject::Process(pid),
+        HandleObject::Thread(tid),
+        HandleObject::Section(7),
+        HandleObject::Event(nt_types::ObjectId(8)),
+        HandleObject::File(9),
+        HandleObject::RoutedFile {
+            file_id: 10,
+            device_id: 11,
+        },
+        HandleObject::DiskFile {
+            first_cluster: 12,
+            size: 13,
+            object_id: 14,
+        },
+        HandleObject::Directory {
+            first_cluster: 15,
+            object_id: 16,
+        },
+        HandleObject::OverlayFile(17),
+        HandleObject::IoCompletion(18),
+        HandleObject::RegistryKey(19),
+        HandleObject::ObjectDirectory(20),
+        HandleObject::Token(pid),
+        HandleObject::TokenObject(token),
+        HandleObject::DebugObject(debug),
+        HandleObject::Job(job),
+        HandleObject::Opaque(21),
+    ];
+    for (index, object) in objects.into_iter().enumerate() {
+        let handle = pm.insert_handle(pid, object, 0x200 + index as u32).unwrap();
+        pm.set_handle_flags(
+            pid,
+            handle,
+            HandleFlags {
+                inherit: true,
+                protect_from_close: false,
+            },
+        )
+        .unwrap();
+        let target = pm.inspect_native_close_target(user, u64::from(handle) | 3).unwrap();
+        assert_eq!(target.table_owner(), pid);
+        assert_eq!(target.handle(), handle);
+        assert_eq!(target.object(), object);
+        assert_eq!(
+            target.information(),
+            NativeHandleInformation {
+                attributes: OBJ_INHERIT,
+                granted_access: Some(0x200 + index as u32),
+            }
+        );
+        let completion = pm.close_native_handle(user, u64::from(handle) | 3).unwrap();
+        assert_eq!(completion.table_owner(), pid);
+        assert_eq!(completion.handle(), handle);
+        assert_eq!(completion.object(), object);
+        assert_eq!(completion.information(), target.information());
+        assert_eq!(completion.into_object(), object);
+        assert_eq!(pm.lookup_handle(pid, handle), None);
+    }
+}
+
+#[test]
+fn generic_native_close_uses_only_the_authenticated_native_table() {
+    let (mut pm, user, kernel, pid, _) = fixture();
+    let system = pm.initial_system_identity().unwrap().process_id();
+    let local = pm.insert_handle(pid, HandleObject::File(31), 0).unwrap();
+    let global = pm
+        .insert_handle(system, HandleObject::RegistryKey(32), 0)
+        .unwrap();
+    assert_eq!(local, global);
+    let tagged = KERNEL_HANDLE_TAG | u64::from(global);
+    assert_eq!(
+        pm.inspect_native_close_target(user, tagged),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        pm.close_native_handle(user, tagged).unwrap_err(),
+        NativeCloseError::Status(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        pm.close_native_handle(kernel, tagged | 2)
+            .unwrap()
+            .into_object(),
+        HandleObject::RegistryKey(32)
+    );
+    assert_eq!(pm.lookup_handle(pid, local), Some(HandleObject::File(31)));
+    assert_eq!(
+        pm.close_native_handle(kernel, u64::from(local))
+            .unwrap()
+            .into_object(),
+        HandleObject::File(31)
+    );
+}
+
+#[test]
+fn generic_native_close_protects_any_object_type_without_mutation() {
+    let (mut pm, user, kernel, pid, _) = fixture();
+    let handle = pm.insert_handle(pid, HandleObject::File(41), 0).unwrap();
+    pm.set_handle_flags(
+        pid,
+        handle,
+        HandleFlags {
+            inherit: false,
+            protect_from_close: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pm.close_native_handle(user, u64::from(handle)).unwrap_err(),
+        NativeCloseError::Status(crate::STATUS_HANDLE_NOT_CLOSABLE)
+    );
+    assert_eq!(
+        pm.close_native_handle(kernel, u64::from(handle) | 1)
+            .unwrap_err(),
+        NativeCloseError::BugCheck {
+            code: INVALID_KERNEL_HANDLE_BUGCHECK,
+            parameters: [u64::from(handle) | 1, 0, 0, 0],
+        }
+    );
+    assert_eq!(pm.lookup_handle(pid, handle), Some(HandleObject::File(41)));
+    let system = pm.initial_system_identity().unwrap().process_id();
+    let global = pm
+        .insert_handle(system, HandleObject::ObjectDirectory(42), 0)
+        .unwrap();
+    pm.set_handle_flags(
+        system,
+        global,
+        HandleFlags {
+            inherit: false,
+            protect_from_close: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pm.close_native_handle(kernel, KERNEL_HANDLE_TAG | u64::from(global) | 2)
+            .unwrap_err(),
+        NativeCloseError::BugCheck {
+            code: INVALID_KERNEL_HANDLE_BUGCHECK,
+            parameters: [u64::from(global) | 2, 0, 0, 0],
+        }
+    );
+    assert_eq!(
+        pm.lookup_handle(system, global),
+        Some(HandleObject::ObjectDirectory(42))
+    );
+}
+
+#[test]
+fn generic_native_close_rejects_pseudo_reserved_bound_stale_and_foreign_slots() {
+    let (mut pm, user, _, pid, _) = fixture();
+    for value in [u64::MAX, u64::MAX - 1, 0, 0x1_0000_0004, 0x8000_0004] {
+        assert_eq!(
+            pm.close_native_handle(user, value).unwrap_err(),
+            NativeCloseError::Status(STATUS_INVALID_HANDLE)
+        );
+    }
+    let reservation = pm.try_reserve_handle_slot(pid).unwrap();
+    assert_eq!(
+        pm.close_native_handle(user, u64::from(reservation.handle))
+            .unwrap_err(),
+        NativeCloseError::Status(STATUS_INVALID_HANDLE)
+    );
+    pm.bind_reserved_handle(reservation, HandleObject::File(51), 0)
+        .unwrap();
+    assert_eq!(
+        pm.close_native_handle(user, u64::from(reservation.handle))
+            .unwrap_err(),
+        NativeCloseError::Status(STATUS_INVALID_HANDLE)
+    );
+    pm.cancel_bound_handle(reservation).unwrap();
+    let handle = pm.insert_handle(pid, HandleObject::File(52), 0).unwrap();
+    let (foreign, foreign_user, _, _, _) = fixture();
+    assert_eq!(
+        foreign.inspect_native_close_target(user, u64::from(handle)),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        pm.inspect_native_close_target(foreign_user, u64::from(handle)),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(pm.lookup_handle(pid, handle), Some(HandleObject::File(52)));
+    assert_eq!(
+        pm.close_native_handle(user, u64::from(handle))
+            .unwrap()
+            .into_object(),
+        HandleObject::File(52)
+    );
+    assert_eq!(
+        pm.close_native_handle(user, u64::from(handle)).unwrap_err(),
+        NativeCloseError::Status(STATUS_INVALID_HANDLE)
+    );
+}
+
+#[test]
+fn generic_native_close_removes_only_one_alias_and_reused_slot_is_a_new_reference() {
+    let (mut pm, user, _, pid, _) = fixture();
+    let object = HandleObject::ObjectDirectory(61);
+    let first = pm.insert_handle(pid, object, 0).unwrap();
+    let second = pm.insert_handle(pid, object, 0).unwrap();
+    assert_ne!(first, second);
+    assert_eq!(
+        pm.close_native_handle(user, u64::from(first))
+            .unwrap()
+            .into_object(),
+        object
+    );
+    assert_eq!(pm.lookup_handle(pid, second), Some(object));
+    let reused = pm.insert_handle(pid, HandleObject::File(62), 0).unwrap();
+    assert_eq!(reused, first);
+    assert_eq!(
+        pm.close_native_handle(user, u64::from(second))
+            .unwrap()
+            .into_object(),
+        object
+    );
+    assert_eq!(pm.lookup_handle(pid, reused), Some(HandleObject::File(62)));
+}
+
+#[test]
+fn typed_close_mismatches_remain_non_mutating_after_generic_refactor() {
+    let (mut pm, user, _, pid, _) = fixture();
+    let handle = pm.insert_handle(pid, HandleObject::File(71), 0).unwrap();
+    for error in [
+        pm.close_native_ps_handle(user, u64::from(handle)).unwrap_err(),
+        pm.close_native_registry_key_handle(user, u64::from(handle))
+            .unwrap_err(),
+        pm.close_native_object_directory_handle(user, u64::from(handle))
+            .unwrap_err(),
+    ] {
+        assert_eq!(
+            error,
+            NativeCloseError::Status(STATUS_OBJECT_TYPE_MISMATCH)
+        );
+        assert_eq!(pm.lookup_handle(pid, handle), Some(HandleObject::File(71)));
+    }
+    for pseudo in [u64::MAX, u64::MAX - 1] {
+        assert_eq!(
+            pm.close_native_registry_key_handle(user, pseudo).unwrap_err(),
+            NativeCloseError::Status(STATUS_INVALID_HANDLE)
+        );
+        assert_eq!(
+            pm.close_native_object_directory_handle(user, pseudo)
+                .unwrap_err(),
+            NativeCloseError::Status(STATUS_INVALID_HANDLE)
+        );
+    }
+}

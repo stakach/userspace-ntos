@@ -2,10 +2,13 @@
 
 use super::*;
 use crate::native_handle::{
-    NativeHandleCaller, NativeHandleScope, NativePsCloseError, INVALID_KERNEL_HANDLE_BUGCHECK,
-    KERNEL_HANDLE_TAG, OBJ_KERNEL_HANDLE, STATUS_OBJECT_TYPE_MISMATCH,
+    NativeHandleCaller, NativeHandleScope, NativePsCloseError, KERNEL_HANDLE_TAG,
+    OBJ_KERNEL_HANDLE, STATUS_OBJECT_TYPE_MISMATCH,
 };
 use nt_types::AccessMode;
+
+#[cfg(test)]
+use crate::native_handle::INVALID_KERNEL_HANDLE_BUGCHECK;
 
 const OBJ_INHERIT: u32 = 2;
 
@@ -74,45 +77,14 @@ impl ProcessManager {
         caller: NativeHandleCaller,
         value: u64,
     ) -> Result<u64, NativePsCloseError> {
-        let NativeHandleScope::Table {
-            owner,
-            handle,
-            kernel,
-        } = self
-            .decode_native_handle(caller, value)
-            .map_err(NativePsCloseError::Status)?
-        else {
-            return Err(NativePsCloseError::Status(STATUS_INVALID_HANDLE));
+        let target = self
+            .inspect_native_close_target(caller, value)
+            .map_err(NativePsCloseError::Status)?;
+        let HandleObject::ObjectDirectory(directory) = target.object() else {
+            return Err(NativePsCloseError::Status(STATUS_OBJECT_TYPE_MISMATCH));
         };
-        let directory = self
-            .lookup_native_object_directory_handle(caller, value, 0)
-            .map_err(NativePsCloseError::Status)?;
-        let flags = self
-            .handle_flags(owner, handle)
-            .ok_or(NativePsCloseError::Status(STATUS_INVALID_HANDLE))?;
-        if flags.protect_from_close {
-            return Err(if caller.mode() == AccessMode::KernelMode {
-                NativePsCloseError::BugCheck {
-                    code: INVALID_KERNEL_HANDLE_BUGCHECK,
-                    parameters: [
-                        if kernel {
-                            value & !KERNEL_HANDLE_TAG
-                        } else {
-                            value
-                        },
-                        0,
-                        0,
-                        0,
-                    ],
-                }
-            } else {
-                NativePsCloseError::Status(crate::STATUS_HANDLE_NOT_CLOSABLE)
-            });
-        }
-        let removed = self
-            .take_handle(owner, handle)
-            .map_err(NativePsCloseError::Status)?;
-        debug_assert_eq!(removed, HandleObject::ObjectDirectory(directory));
+        let removed = self.close_native_handle(caller, value)?;
+        debug_assert_eq!(removed.into_object(), HandleObject::ObjectDirectory(directory));
         Ok(directory)
     }
 }

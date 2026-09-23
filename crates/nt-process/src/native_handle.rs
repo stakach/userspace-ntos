@@ -70,10 +70,13 @@ pub struct NativeHandleInformation {
 /// A protected kernel-mode close is a kernel contract violation, not a successful close or a
 /// recoverable STATUS_HANDLE_NOT_CLOSABLE. Native adapters must propagate this terminal action.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NativePsCloseError {
+pub enum NativeCloseError {
     Status(u32),
     BugCheck { code: u32, parameters: [u64; 4] },
 }
+
+/// Compatibility name for existing typed Process/Thread, Key, and Directory close callers.
+pub type NativePsCloseError = NativeCloseError;
 
 /// Completion of one removed Ps handle-table reference. This owns the close completion, not a
 /// new pointer reference: the table reference has already been released. The native host must
@@ -86,6 +89,57 @@ pub struct ClosedNativePsHandle {
     object: HandleObject,
     target_process: ProcessId,
     information: NativeHandleInformation,
+}
+
+/// A visible native table entry inspected before host-side close preflight. This is not a
+/// reservation: the adapter must perform preflight and close in the same serialized dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeCloseTarget {
+    table_owner: ProcessId,
+    handle: Handle,
+    object: HandleObject,
+    information: NativeHandleInformation,
+}
+
+impl NativeCloseTarget {
+    pub const fn table_owner(self) -> ProcessId {
+        self.table_owner
+    }
+    pub const fn handle(self) -> Handle {
+        self.handle
+    }
+    pub const fn object(self) -> HandleObject {
+        self.object
+    }
+    pub const fn information(self) -> NativeHandleInformation {
+        self.information
+    }
+}
+
+/// One removed native table reference. The host remains responsible for object-specific close
+/// completion; removing the handle never implicitly retires its backing resource.
+#[must_use = "complete the removed handle's object-specific close in the native host"]
+#[derive(Debug)]
+pub struct ClosedNativeHandle {
+    target: NativeCloseTarget,
+}
+
+impl ClosedNativeHandle {
+    pub const fn table_owner(&self) -> ProcessId {
+        self.target.table_owner
+    }
+    pub const fn handle(&self) -> Handle {
+        self.target.handle
+    }
+    pub const fn object(&self) -> HandleObject {
+        self.target.object
+    }
+    pub const fn information(&self) -> NativeHandleInformation {
+        self.target.information
+    }
+    pub fn into_object(self) -> HandleObject {
+        self.target.object
+    }
 }
 
 impl ClosedNativePsHandle {
@@ -364,6 +418,77 @@ impl NativePsHandlePublication {
 }
 
 impl ProcessManager {
+    /// Inspect one visible entry in the caller's canonical native table without changing it.
+    /// The host may use this for resource preflight only within the same serialized dispatch as
+    /// `close_native_handle`; it is not a retained reference across callbacks or IPC.
+    pub fn inspect_native_close_target(
+        &self,
+        caller: NativeHandleCaller,
+        value: u64,
+    ) -> Result<NativeCloseTarget, u32> {
+        let NativeHandleScope::Table { owner, handle, .. } =
+            self.decode_native_handle(caller, value)?
+        else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        let slot = crate::handle_to_slot(handle).ok_or(STATUS_INVALID_HANDLE)?;
+        let entry = self
+            .process(owner)
+            .and_then(|process| process.handles.get(slot))
+            .and_then(crate::HandleSlot::entry)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        Ok(NativeCloseTarget {
+            table_owner: owner,
+            handle,
+            object: entry.object,
+            information: NativeHandleInformation {
+                attributes: u32::from(entry.flags.inherit) * OBJ_INHERIT,
+                granted_access: Some(entry.granted_access),
+            },
+        })
+    }
+
+    /// Remove exactly one visible reference from the decoded native table, irrespective of
+    /// object type. Caller admission, kernel-handle scope, and protect-close are canonical here;
+    /// all object-specific close effects remain owned by the native host.
+    pub fn close_native_handle(
+        &mut self,
+        caller: NativeHandleCaller,
+        value: u64,
+    ) -> Result<ClosedNativeHandle, NativeCloseError> {
+        let target = self
+            .inspect_native_close_target(caller, value)
+            .map_err(NativeCloseError::Status)?;
+        let flags = self
+            .handle_flags(target.table_owner, target.handle)
+            .ok_or(NativeCloseError::Status(STATUS_INVALID_HANDLE))?;
+        if flags.protect_from_close {
+            return Err(if caller.mode == AccessMode::KernelMode {
+                NativeCloseError::BugCheck {
+                    code: INVALID_KERNEL_HANDLE_BUGCHECK,
+                    parameters: [
+                        if value & KERNEL_HANDLE_TAG == KERNEL_HANDLE_TAG {
+                            value & !KERNEL_HANDLE_TAG
+                        } else {
+                            value
+                        },
+                        0,
+                        0,
+                        0,
+                    ],
+                }
+            } else {
+                NativeCloseError::Status(crate::STATUS_HANDLE_NOT_CLOSABLE)
+            });
+        }
+        // No callback or IPC separates the validated target from this one removal.
+        let removed = self
+            .take_handle(target.table_owner, target.handle)
+            .map_err(NativeCloseError::Status)?;
+        debug_assert_eq!(removed, target.object);
+        Ok(ClosedNativeHandle { target })
+    }
+
     /// Close only a Process/Thread handle in its single canonical native scope. Reserved and
     /// Bound entries are never visible to this operation; exact publication abort owns them.
     /// Caller admission is required even in KernelMode, so this is not a teardown bypass.
@@ -376,26 +501,10 @@ impl ProcessManager {
         caller: NativeHandleCaller,
         value: u64,
     ) -> Result<ClosedNativePsHandle, NativePsCloseError> {
-        let scope = self
-            .decode_native_handle(caller, value)
+        let target = self
+            .inspect_native_close_target(caller, value)
             .map_err(NativePsCloseError::Status)?;
-        let NativeHandleScope::Table {
-            owner,
-            handle,
-            kernel,
-        } = scope
-        else {
-            return Err(NativePsCloseError::Status(STATUS_INVALID_HANDLE));
-        };
-        let slot = crate::handle_to_slot(handle)
-            .ok_or(NativePsCloseError::Status(STATUS_INVALID_HANDLE))?;
-        let entry = self
-            .process(owner)
-            .and_then(|process| process.handles.get(slot))
-            .and_then(crate::HandleSlot::entry)
-            .ok_or(NativePsCloseError::Status(STATUS_INVALID_HANDLE))?;
-        let object = entry.object;
-        let target_process = match object {
+        let target_process = match target.object {
             HandleObject::Process(pid) => self.process(pid).map(|_| pid),
             HandleObject::Thread(tid) => self
                 .thread(tid)
@@ -403,41 +512,13 @@ impl ProcessManager {
             _ => return Err(NativePsCloseError::Status(STATUS_OBJECT_TYPE_MISMATCH)),
         }
         .ok_or(NativePsCloseError::Status(STATUS_INVALID_HANDLE))?;
-        if entry.flags.protect_from_close {
-            return Err(if caller.mode == AccessMode::KernelMode {
-                // NT decodes the kernel-table flag before ObpCloseHandleTableEntry, but preserves
-                // the caller's application tag bits when reporting a protected handle.
-                NativePsCloseError::BugCheck {
-                    code: INVALID_KERNEL_HANDLE_BUGCHECK,
-                    parameters: [
-                        if kernel {
-                            value & !KERNEL_HANDLE_TAG
-                        } else {
-                            value
-                        },
-                        0,
-                        0,
-                        0,
-                    ],
-                }
-            } else {
-                NativePsCloseError::Status(crate::STATUS_HANDLE_NOT_CLOSABLE)
-            });
-        }
-        let information = NativeHandleInformation {
-            attributes: u32::from(entry.flags.inherit) * OBJ_INHERIT,
-            granted_access: Some(entry.granted_access),
-        };
-        // No callback or IPC separates the validated snapshot from this one removal.
-        let removed = self
-            .take_handle(owner, handle)
-            .map_err(NativePsCloseError::Status)?;
-        debug_assert_eq!(removed, object);
+        let completion = self.close_native_handle(caller, value)?;
+        debug_assert_eq!(completion.object(), target.object);
         Ok(ClosedNativePsHandle {
-            table_owner: owner,
-            object,
+            table_owner: completion.table_owner(),
+            object: completion.into_object(),
             target_process,
-            information,
+            information: target.information,
         })
     }
 
