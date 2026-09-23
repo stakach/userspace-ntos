@@ -42,6 +42,58 @@ enum ExistingMutationKind {
     DeleteKey,
 }
 
+#[must_use = "release the exact Key reservation or transfer it to retained mutation work"]
+pub(crate) struct HostedExistingKey {
+    key: KeyRef,
+    target: CmSystemKeyTarget,
+    owner: Option<RegistryKeyHandlePublication>,
+}
+
+impl HostedExistingKey {
+    pub(crate) fn lease(&self) -> nt_config_client::SystemHiveKeyLease {
+        self.target.lease
+    }
+
+    pub(crate) fn validate(&self, information: &nt_config_client::LeasedHiveKeyInformation) -> Result<(), u32> {
+        let current = registry_key_targets::system(self.key).ok_or(0xC000_0008u32)?;
+        if current.lease != self.target.lease
+            || current.physical_path != self.target.physical_path
+            || nt_hive_core::canon_path(&information.path)
+                != nt_hive_core::canon_path(&self.target.physical_path)
+        {
+            return Err(0xC000_0008);
+        }
+        Ok(())
+    }
+
+    pub(crate) unsafe fn information(&self) -> Result<nt_config_client::LeasedHiveKeyInformation, u32> {
+        let information = config_manager_query_leased_system_hive_key_information(self.lease())
+            .map_err(|status| status as u32)?;
+        self.validate(&information)?;
+        Ok(information)
+    }
+
+    pub(crate) fn abort(mut self, handler: &mut ExecNtHandler) {
+        if let Some(target) = self.owner.take().unwrap().abort(&mut handler.pm)
+            .expect("retained existing Key admission") {
+            handler.release_registry_key_target(target);
+        }
+    }
+}
+
+/// Bind a hidden PM reference before any CM query can reenter the executive.
+pub(crate) fn retain_hosted_existing(handler: &mut ExecNtHandler, key: KeyRef) -> Result<HostedExistingKey, u32> {
+    let target = registry_key_targets::system(key).ok_or(0xC000_0008u32)?;
+    let lifetime = handler.pm.thread_lifetime(handler.current_tid as u32).ok_or(0xC000_0008u32)?;
+    let caller = handler.pm.capture_native_handle_caller(lifetime, nt_types::AccessMode::UserMode)?;
+    let mut owner = handler.pm.reserve_native_registry_key_handle(caller, 0)?;
+    if let Err(status) = owner.bind(&mut handler.pm, key, 0) {
+        owner.abort(&mut handler.pm).expect("unbound existing Key reservation");
+        return Err(status);
+    }
+    Ok(HostedExistingKey { key, target, owner: Some(owner) })
+}
+
 #[path = "registry_mutation_provider.rs"]
 mod provider;
 pub(crate) use provider::{submit_provider, ProviderRegistryResult};
@@ -205,7 +257,7 @@ pub(crate) unsafe fn submit_hosted(
 /// A failed admission has made no CM request and releases every reservation before returning.
 pub(crate) unsafe fn submit_hosted_existing(
     handler: &mut ExecNtHandler,
-    key: KeyRef,
+    mut retained: HostedExistingKey,
     expected_generation: u64,
     mutation: SystemHiveMutation<'_>,
 ) -> Result<(), u32> {
@@ -215,50 +267,47 @@ pub(crate) unsafe fn submit_hosted_existing(
         SystemHiveMutation::DeleteValue { .. } => ExistingMutationKind::DeleteValue,
         SystemHiveMutation::SetKeySecurity { .. } => ExistingMutationKind::SetSecurity,
         SystemHiveMutation::DeleteKey { .. } => ExistingMutationKind::DeleteKey,
-        _ => return Err(0xC000_000Du32),
+        _ => {
+            retained.abort(handler);
+            return Err(0xC000_000Du32);
+        }
     };
-    let tcb = handler.hosted_thread_tcb(handler.current_tid).ok_or(0xC000_0008u32)?;
-    let logical = handler.capture_provider_logical_caller(
-        handler.pi, handler.current_tid, handler.current_badge, tcb,
-    ).ok_or(0xC000_0008u32)?;
-    let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT.ok_or(0xC000_00A3u32)?;
-    let park = root_reply_park::RootReplyPark::prepare().ok_or(0xC000_009Au32)?;
-    let rows = &mut *core::ptr::addr_of_mut!(WORK);
-    let index = rows.iter().enumerate().find_map(|(index, row)|
-        (row.is_none() && EXECUTING_INDEX.load(Ordering::Relaxed) != index as u64)
-            .then_some(index));
-    if index.is_none() { rows.try_reserve(1).map_err(|_| 0xC000_009Au32)?; }
-    let requestor = handler.pm.capture_native_handle_caller(
-        logical.thread(), nt_types::AccessMode::KernelMode,
-    )?;
-    let mut reference = handler.pm.reference_native_requestor(requestor)?;
-    let caller = handler.pm.capture_native_handle_caller(
-        logical.thread(), nt_types::AccessMode::UserMode,
-    );
-    let mut key_owner = match caller.and_then(|caller| handler.pm.reserve_native_registry_key_handle(caller, 0)) {
-        Ok(owner) => owner,
+    let mut reference = None;
+    let admitted = (|| {
+        let tcb = handler.hosted_thread_tcb(handler.current_tid).ok_or(0xC000_0008u32)?;
+        let logical = handler.capture_provider_logical_caller(
+            handler.pi, handler.current_tid, handler.current_badge, tcb,
+        ).ok_or(0xC000_0008u32)?;
+        if logical.thread().thread_id() != handler.current_tid as u32 {
+            return Err(0xC000_0008u32);
+        }
+        let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT.ok_or(0xC000_00A3u32)?;
+        let park = root_reply_park::RootReplyPark::prepare().ok_or(0xC000_009Au32)?;
+        let rows = &mut *core::ptr::addr_of_mut!(WORK);
+        let index = rows.iter().enumerate().find_map(|(index, row)|
+            (row.is_none() && EXECUTING_INDEX.load(Ordering::Relaxed) != index as u64)
+                .then_some(index));
+        if index.is_none() { rows.try_reserve(1).map_err(|_| 0xC000_009Au32)?; }
+        let requestor = handler.pm.capture_native_handle_caller(
+            logical.thread(), nt_types::AccessMode::KernelMode,
+        )?;
+        reference = Some(handler.pm.reference_native_requestor(requestor)?);
+        let attempt = (&mut *core::ptr::addr_of_mut!(ATTEMPTS))
+            .reserve(mount, expected_generation, &[mutation], ())
+            .map_err(|(status, ())| status as u32)?;
+        Ok::<_, u32>((park, index, logical, attempt))
+    })();
+    let (park, index, logical, attempt) = match admitted {
+        Ok(admitted) => admitted,
         Err(status) => {
-            reference.release(&mut handler.pm).expect("unsubmitted registry caller");
+            if let Some(mut reference) = reference {
+                reference.release(&mut handler.pm).expect("unsubmitted registry caller");
+            }
+            retained.abort(handler);
             return Err(status);
         }
     };
-    if let Err(status) = key_owner.bind(&mut handler.pm, key, 0) {
-        key_owner.abort(&mut handler.pm).expect("unbound existing Key reservation");
-        reference.release(&mut handler.pm).expect("unsubmitted registry caller");
-        return Err(status);
-    }
-    let attempt = match (&mut *core::ptr::addr_of_mut!(ATTEMPTS))
-        .reserve(mount, expected_generation, &[mutation], ())
-    {
-        Ok(attempt) => attempt,
-        Err((status, ())) => {
-            if let Some(target) = key_owner.abort(&mut handler.pm).expect("unsubmitted existing Key") {
-                handler.release_registry_key_target(target);
-            }
-            reference.release(&mut handler.pm).expect("unsubmitted registry caller");
-            return Err(status as u32);
-        }
-    };
+    let key_owner = retained.owner.take().expect("retained existing Key owner");
     let hosted = HostedCaller {
         completion: HostedCompletion::Existing { key_owner, kind },
         pi: handler.pi,
@@ -266,7 +315,7 @@ pub(crate) unsafe fn submit_hosted_existing(
         badge: handler.current_badge,
         reply: REPLY_MAIN_SLOT.load(Ordering::Relaxed),
         logical,
-        reference,
+        reference: reference.take().expect("retained registry caller"),
         _continuation: if handler.current_native_call_transport {
             UserApcContinuation::NativeCall
         } else {
@@ -283,6 +332,7 @@ pub(crate) unsafe fn submit_hosted_existing(
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
     });
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
     match index {
         Some(index) => rows[index] = work,
         None => rows.push(work),
