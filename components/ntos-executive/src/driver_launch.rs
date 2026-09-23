@@ -374,6 +374,9 @@ const _: () = assert!(FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000 <= FSD_STACK_VAD
 // its own VSpace while the executive loaded its bytes at a distinct window.
 pub const FSD_EXEC_BASE: u64 = 0x0000_0100_5000_0000;
 pub const FSD_EXEC_LIMIT: u64 = 0x0000_0101_5000_0000;
+const HOSTED_KUSER_SCRATCH_VA: u64 = FSD_EXEC_LIMIT;
+static HOSTED_KUSER_FRAME: AtomicU64 = AtomicU64::new(0);
+static HOSTED_KUSER_SCRATCH_CAP: AtomicU64 = AtomicU64::new(0);
 pub const FSD_EXEC_STRIDE: u64 = 0x0000_0000_0100_0000; // 16 MiB per instance window
 const _: () = assert!(FSD_EXEC_BASE >= crate::PRIVATE_VM_LIMIT);
 const _: () = assert!(FSD_EXEC_BASE & 0x1f_ffff == 0);
@@ -36680,6 +36683,11 @@ unsafe fn load_driver_reserved(
             ..EMPTY_INSTANCE
         },
     );
+    let kuser_map_cap = install_hosted_kuser_alias(
+        pml4,
+        instance_domain_identity(domain).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?,
+    )?;
+    driver_instances_mut()[instance].kuser_map_cap = kuser_map_cap;
     let route = hosted_ingress_sources::enroll_primary(instance)
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
     driver_thread_projection::bootstrap(route, caller)
@@ -36967,6 +36975,56 @@ unsafe fn spawn_fsd_component(
     crate::spawn_hosts::spawn_component_suspended(&d)
 }
 
+unsafe fn hosted_kuser_frame() -> Result<u64, nt_status::NtStatus> {
+    let existing = HOSTED_KUSER_FRAME.load(Ordering::Acquire);
+    if existing != 0 {
+        debug_assert_ne!(HOSTED_KUSER_SCRATCH_CAP.load(Ordering::Acquire), 0);
+        return Ok(existing);
+    }
+    if !crate::ensure_executive_paging(HOSTED_KUSER_SCRATCH_VA) {
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
+    let frame = alloc_frame();
+    let scratch_cap = copy_cap(frame);
+    if page_map_r(
+        scratch_cap,
+        HOSTED_KUSER_SCRATCH_VA,
+        RW_NX,
+        CAP_INIT_THREAD_VSPACE,
+    ) != 0 {
+        let _ = cnode_delete_recycle_r(scratch_cap);
+        let _ = cnode_delete_recycle_r(frame);
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
+    crate::img_spawn::initialize_kuser_snapshot(HOSTED_KUSER_SCRATCH_VA);
+    if !crate::kuser_kernel_alias_register(HOSTED_KUSER_SCRATCH_VA) {
+        let _ = page_unmap_r(scratch_cap);
+        let _ = cnode_delete_recycle_r(scratch_cap);
+        let _ = cnode_delete_recycle_r(frame);
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
+    HOSTED_KUSER_SCRATCH_CAP.store(scratch_cap, Ordering::Release);
+    HOSTED_KUSER_FRAME.store(frame, Ordering::Release);
+    Ok(frame)
+}
+
+unsafe fn install_hosted_kuser_alias(
+    pml4: u64,
+    domain: HostedDomainIdentity,
+) -> Result<u64, nt_status::NtStatus> {
+    let frame = hosted_kuser_frame()?;
+    let address = nt_ntdll_layout::kuser::KERNEL_ALIAS_VA;
+    if !ensure_paging(address, pml4, domain) {
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
+    let cap = copy_cap(frame);
+    if page_map_r(cap, address, RO_NX, pml4) != 0 {
+        let _ = cnode_delete_recycle_r(cap);
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
+    Ok(cap)
+}
+
 const HOSTED_PAGING_LEVEL_PDPT: u8 = 1;
 const HOSTED_PAGING_LEVEL_PD: u8 = 2;
 const HOSTED_PAGING_LEVEL_PT: u8 = 3;
@@ -37066,6 +37124,10 @@ unsafe fn ensure_hosted_paging_level(
 
     let map = paging_struct_map_r(cap, map_label, base, pml4);
     let stored_cap = if map == SEL4_DELETE_FIRST {
+        if nt_ntdll_layout::kuser::kernel_alias_offset(page).is_some() {
+            let _ = cnode_delete_recycle_r(cap);
+            return false;
+        }
         if cnode_delete_recycle_r(cap) == 0 {
             0
         } else {
@@ -51086,6 +51148,7 @@ pub(crate) struct DriverInstance {
     pub sched_context: u64,
     pub map_cap_bank: crate::spawn_hosts::ComponentMapCapBank,
     pub reply_cap: u64,
+    pub kuser_map_cap: u64,
     pub hosted_domain_id: u64,
     pub hosted_domain_cookie: u64,
     pub driver_id: u64,
@@ -51126,6 +51189,7 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     sched_context: 0,
     map_cap_bank: crate::spawn_hosts::ComponentMapCapBank { owner: 0, count: 0 },
     reply_cap: 0,
+    kuser_map_cap: 0,
     hosted_domain_id: 0,
     hosted_domain_cookie: 0,
     driver_id: 0,
@@ -51873,6 +51937,15 @@ fn register_instance(dc: &DriverComponent) {
     while t.len() <= dc.instance {
         t.push(EMPTY_INSTANCE);
     }
+    let kuser_map_cap = if t[dc.instance].used
+        && t[dc.instance].pml4 == dc.pml4
+        && t[dc.instance].hosted_domain_id == dc.hosted_domain_id
+        && t[dc.instance].hosted_domain_cookie == dc.hosted_domain_cookie
+    {
+        t[dc.instance].kuser_map_cap
+    } else {
+        0
+    };
     t[dc.instance] = DriverInstance {
         fault_ep: dc.fault_ep,
         pml4: dc.pml4,
@@ -51899,6 +51972,7 @@ fn register_instance(dc: &DriverComponent) {
         sched_context: dc.sched_context,
         map_cap_bank: dc.map_cap_bank,
         reply_cap: dc.reply_cap,
+        kuser_map_cap,
         hosted_domain_id: dc.hosted_domain_id,
         hosted_domain_cookie: dc.hosted_domain_cookie,
         driver_id: dc.driver_id,

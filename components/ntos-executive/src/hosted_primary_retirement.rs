@@ -87,6 +87,10 @@ unsafe fn prepare(
         effects.push(Effect::ClearHeader(inst.exec_shared_va));
     }
     effects.push(Effect::MapBank(inst.map_cap_bank));
+    if inst.kuser_map_cap != 0 {
+        effects.push(Effect::Unmap(inst.kuser_map_cap));
+        delete(&mut effects, inst.kuser_map_cap);
+    }
     if let Some(caps) = exec {
         for &cap in caps {
             if cap != 0 {
