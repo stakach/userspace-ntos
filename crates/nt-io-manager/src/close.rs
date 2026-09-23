@@ -23,6 +23,17 @@ enum LifecycleDispatch {
 }
 
 impl<P: ObjectManagerPort> IoManager<P> {
+    pub(crate) fn lifecycle_uses_driver_peer(
+        &self,
+        file_id: FileId,
+        major: u8,
+    ) -> Result<bool, NtStatus> {
+        let device_id = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?.device_id;
+        let driver_id = self.device(device_id).ok_or(NtStatus::INVALID_PARAMETER)?.driver_id;
+        let driver = self.driver(driver_id).ok_or(NtStatus::INVALID_PARAMETER)?;
+        Ok(driver.dispatch.get(major).driver_peer_id().is_some())
+    }
+
     /// Transfer retry ownership of an unopened external File to the canonical close pump.
     /// Unlike a refused `release_external_file`, success promises deferred retirement once
     /// projection bindings and pointer owners drain. This only sets latches: no backend entry,
@@ -103,6 +114,53 @@ impl<P: ObjectManagerPort> IoManager<P> {
         if self.finish_deferred_file_close(file_id).is_err() {
             self.schedule_deferred_file_close(file_id);
         }
+        Ok(())
+    }
+
+    /// Start an external File's release without entering a driver backend.
+    /// The caller must drive the queued lifecycle after releasing its manager borrow.
+    /// Unlike `release_external_file`, even an unopened File is retired by the
+    /// deferred-close pump so this operation has no external side effects.
+    pub fn queue_external_file_release(
+        &mut self,
+        client: ClientId,
+        file_id: FileId,
+    ) -> Result<(), NtStatus> {
+        let state = {
+            let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
+            if file.client_id != client {
+                return Err(NtStatus::INVALID_HANDLE);
+            }
+            file.state
+        };
+        if state == FileState::CreateIrpDispatched {
+            let create_irp = self
+                .irps
+                .iter()
+                .find(|(_, irp)| {
+                    irp.file_id == Some(file_id) && crate::is_create_major(irp.origin_major)
+                })
+                .map(|(irp_id, _)| irp_id);
+            if let Some(irp_id) = create_irp {
+                self.queue_abandon_irp_delivery(client, irp_id)?;
+            }
+        }
+        let file = self.file_mut(file_id).expect("validated external File");
+        match state {
+            FileState::Open => {
+                assert!(file.transition(FileState::CleanupPending));
+            }
+            FileState::CreateIrpDispatched => {
+                assert!(file.transition(FileState::ClosePending));
+            }
+            FileState::Allocated
+            | FileState::Closed
+            | FileState::CleanupPending
+            | FileState::CleanupComplete
+            | FileState::ClosePending => {}
+        }
+        file.close_deferred = true;
+        self.queue_deferred_file_close(file_id);
         Ok(())
     }
 
@@ -190,6 +248,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 (file.client_id, file.device_id, file.cleanup_dispatched)
             };
             if !dispatched {
+                if self.owned_peer_file_lifecycle
+                    && self.lifecycle_uses_driver_peer(file_id, major::IRP_MJ_CLEANUP)?
+                {
+                    return Err(NtStatus::PENDING);
+                }
                 match self.dispatch_lifecycle_irp_once(
                     client,
                     device_id,
@@ -240,6 +303,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
 
         if close_dispatched {
             return self.release_file_record(file_id);
+        }
+
+        if self.owned_peer_file_lifecycle
+            && self.lifecycle_uses_driver_peer(file_id, major::IRP_MJ_CLOSE)?
+        {
+            return Err(NtStatus::PENDING);
         }
 
         self.file_mut(file_id)
@@ -456,3 +525,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "close/queued_release_tests.rs"]
+mod queued_release_tests;

@@ -171,6 +171,53 @@ impl FileLifecycleAckInvocation {
 }
 
 impl<P: ObjectManagerPort> IoManager<P> {
+    /// Take one ready hosted lifecycle operation without entering its backend.
+    /// The returned preparation owns the exact File/IRP until it is begun or
+    /// explicitly requeued; a second pump cannot select the same File.
+    pub fn prepare_next_queued_peer_file_lifecycle(
+        &mut self,
+    ) -> Result<Option<PreparedFileLifecycle>, NtStatus> {
+        if !self.owned_peer_file_lifecycle {
+            return Ok(None);
+        }
+        let mut ready = None;
+        for (file_id, file) in self.files.iter() {
+            if !file.close_retry_queued || !file.close_deferred {
+                continue;
+            }
+            let major = match file.state {
+                FileState::CleanupPending if !file.cleanup_dispatched => major::IRP_MJ_CLEANUP,
+                FileState::ClosePending
+                    if !file.close_dispatched
+                        && file.outstanding_irp_refs == 0
+                        && self.file_reference_count(file_id) == 0 => major::IRP_MJ_CLOSE,
+                _ => continue,
+            };
+            if self.lifecycle_uses_driver_peer(file_id, major)? {
+                ready = Some((file.client_id, file_id));
+                break;
+            }
+        }
+        let Some((client, file_id)) = ready else {
+            return Ok(None);
+        };
+        let prepared = self.prepare_file_lifecycle_owned(client, file_id)?;
+        assert!(self.take_deferred_file_close(file_id));
+        Ok(Some(prepared))
+    }
+
+    /// Give a preparation back to the close pump when native dispatch could
+    /// not reserve its owner or physical route before driver entry.
+    pub fn requeue_prepared_file_lifecycle(
+        &mut self,
+        prepared: PreparedFileLifecycle,
+    ) -> Result<(), FileLifecycleRejection<PreparedFileLifecycle>> {
+        let file_id = prepared.file_id();
+        self.discard_prepared_file_lifecycle(prepared)?;
+        self.queue_deferred_file_close(file_id);
+        Ok(())
+    }
+
     /// Reserve one exact lifecycle IRP. The caller must begin it before yielding
     /// control; preparation itself performs no external driver effect.
     pub fn prepare_file_lifecycle_owned(

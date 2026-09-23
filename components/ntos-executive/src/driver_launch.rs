@@ -37474,7 +37474,8 @@ fn io_manager_mut() -> &'static mut ExecutiveIoManager {
     }
 }
 
-fn pump_io_manager(io: &mut ExecutiveIoManager) -> usize {
+fn pump_io_manager() -> usize {
+    let io = io_manager_mut();
     hosted_file_capture::redrive(io);
     let progress = io.pump_with_report().progress;
     if progress != 0 {
@@ -37491,7 +37492,7 @@ fn copy_completed_external_irp_by_id(
     irp_id: IrpId,
     with_output: bool,
 ) -> Option<(nt_io_manager::CompletedIrp, Vec<u8>)> {
-    pump_io_manager(io_manager_mut());
+    pump_io_manager();
     let completion = if hosted_file_owners::contains(irp_id) {
         hosted_file_owners::completion(irp_id).ok()?
     } else {
@@ -37544,7 +37545,7 @@ pub(crate) unsafe fn completed_irp_exact(irp_id: u64) -> Option<HostedCompletedI
     if irp_id == 0 {
         return None;
     }
-    pump_io_manager(io_manager_mut());
+    pump_io_manager();
     let completion = if hosted_file_owners::contains(IrpId(irp_id)) {
         hosted_file_owners::completion(IrpId(irp_id)).ok()?
     } else {
@@ -37569,7 +37570,7 @@ pub(crate) unsafe fn copy_completed_irp_output_exact(
     if irp_id == 0 {
         return Err(STATUS_INVALID_PARAMETER as u32);
     }
-    pump_io_manager(io_manager_mut());
+    pump_io_manager();
     if hosted_file_owners::contains(IrpId(irp_id)) {
         hosted_file_owners::copy_output(IrpId(irp_id), offset, output)
     } else {
@@ -37581,9 +37582,8 @@ pub(crate) unsafe fn completed_irp_copy_requires_retry(irp_id: u64) -> bool {
     if irp_id == 0 {
         return false;
     }
-    let io = io_manager_mut();
-    pump_io_manager(io);
-    io.irp(IrpId(irp_id))
+    pump_io_manager();
+    io_manager_mut().irp(IrpId(irp_id))
         .is_some_and(|irp| irp.state == nt_io_manager::IrpState::Completed)
 }
 
@@ -37591,7 +37591,7 @@ pub(crate) unsafe fn acknowledge_completed_irp(irp_id: u64) -> Result<(), u32> {
     if irp_id == 0 {
         return Err(STATUS_INVALID_PARAMETER as u32);
     }
-    pump_io_manager(io_manager_mut());
+    pump_io_manager();
     if hosted_file_owners::contains(IrpId(irp_id)) {
         hosted_file_owners::acknowledge(IrpId(irp_id))
     } else {
@@ -37606,7 +37606,7 @@ pub(crate) unsafe fn cancel_irp_if_pending(irp_id: u64) -> Result<bool, u32> {
     let selected = io_manager_mut()
         .cancel_if_pending(ClientId(IO_MANAGER_COMPONENT_ID), IrpId(irp_id))
         .map_err(|status| status.raw() as u32)?;
-    pump_io_manager(io_manager_mut());
+    pump_io_manager();
     hosted_file_owners::drain();
     Ok(selected)
 }
@@ -37626,7 +37626,7 @@ pub(crate) unsafe fn cancel_file_thread_io(
         requestor_tid,
     )
     .map_err(|status| status.raw() as u32)?;
-    pump_io_manager(io_manager_mut());
+    pump_io_manager();
     hosted_file_owners::drain();
     Ok(io_manager_mut().file_thread_io_drain_state(
         ClientId(IO_MANAGER_COMPONENT_ID),
@@ -41536,7 +41536,7 @@ unsafe fn drain_hosted_filter_requirements_transactions() -> usize {
 }
 
 pub(crate) fn pump_hosted_io_completions() -> usize {
-    let pumped = pump_io_manager(io_manager_mut());
+    let pumped = pump_io_manager();
     pumped
         .saturating_add(hosted_file_owners::drain())
         .saturating_add(unsafe { drain_hosted_acpi_pci_route_indeterminate_irps() })
@@ -42043,7 +42043,7 @@ pub(crate) unsafe fn abandon_pending_irp(irp_id: u64) -> Result<(), u32> {
     }
     io_manager_mut().abandon_irp_delivery(ClientId(IO_MANAGER_COMPONENT_ID), IrpId(irp_id))
         .map_err(|status| status.raw() as u32)?;
-    pump_io_manager(io_manager_mut());
+    pump_io_manager();
     hosted_file_owners::drain();
     Ok(())
 }
