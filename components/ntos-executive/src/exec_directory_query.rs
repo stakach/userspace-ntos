@@ -4,6 +4,58 @@ use super::*;
 use nt_object_manager::directory::pack_directory_entries;
 
 impl ExecNtHandler {
+    pub(crate) fn snapshot_provider_directory_entries(
+        &self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        handle: u64,
+    ) -> Result<alloc::vec::Vec<(nt_types::UnicodeString, nt_types::UnicodeString)>, u32> {
+        let identity = self.pm.lookup_native_object_directory_handle(
+            caller,
+            handle,
+            DIRECTORY_QUERY_ACCESS,
+        )?;
+        let dir_idx = self.directory_namespace_index_for_identity(identity)?;
+        self.snapshot_directory_entries(dir_idx)
+    }
+
+    fn snapshot_directory_entries(
+        &self,
+        dir_idx: usize,
+    ) -> Result<alloc::vec::Vec<(nt_types::UnicodeString, nt_types::UnicodeString)>, u32> {
+        let mut entries = alloc::vec::Vec::new();
+        entries
+            .try_reserve(self.obj_ns.len())
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        for entry in self
+            .obj_ns
+            .iter()
+            .filter(|entry| entry.is_live() && entry.parent == dir_idx)
+        {
+            let type_name = match entry.kind {
+                OBJ_KIND_DIRECTORY => "Directory",
+                OBJ_KIND_EVENT => "Event",
+                OBJ_KIND_SYMBOLIC_LINK => "SymbolicLink",
+                OBJ_KIND_SEMAPHORE => "Semaphore",
+                OBJ_KIND_MUTANT => "Mutant",
+                OBJ_KIND_LPC_PORT => "Port",
+                OBJ_KIND_TIMER => "Timer",
+                OBJ_KIND_IO_COMPLETION => "IoCompletion",
+                OBJ_KIND_JOB => "Job",
+                _ => return Err(STATUS_OBJECT_TYPE_MISMATCH),
+            };
+            let mut name = alloc::vec::Vec::new();
+            name.try_reserve_exact(entry.name().len())
+                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+            name.extend(entry.name().iter().map(|byte| u16::from(*byte)));
+            entries.push((
+                nt_types::UnicodeString::from_owned_units(name),
+                nt_types::UnicodeString::try_from_str(type_name)
+                    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?,
+            ));
+        }
+        Ok(entries)
+    }
+
     pub(super) unsafe fn nt_query_directory_object(
         &mut self,
         ctx: &NativeCallContext,
@@ -71,33 +123,10 @@ impl ExecNtHandler {
         };
 
         let _transient = allocator::enter_transient();
-        let mut entries = alloc::vec::Vec::new();
-        if entries.try_reserve(self.obj_ns.len()).is_err() {
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        for entry in self
-            .obj_ns
-            .iter()
-            .filter(|entry| entry.is_live() && entry.parent == dir_idx)
-        {
-            let name: alloc::vec::Vec<u16> =
-                entry.name().iter().map(|byte| u16::from(*byte)).collect();
-            let type_name = match entry.kind {
-                OBJ_KIND_EVENT => "Event",
-                OBJ_KIND_SYMBOLIC_LINK => "SymbolicLink",
-                OBJ_KIND_SEMAPHORE => "Semaphore",
-                OBJ_KIND_MUTANT => "Mutant",
-                OBJ_KIND_LPC_PORT => "Port",
-                OBJ_KIND_TIMER => "Timer",
-                OBJ_KIND_IO_COMPLETION => "IoCompletion",
-                OBJ_KIND_JOB => "Job",
-                _ => "Directory",
-            };
-            entries.push((
-                nt_types::UnicodeString::from_units(&name),
-                nt_types::UnicodeString::from_str(type_name),
-            ));
-        }
+        let entries = match self.snapshot_directory_entries(dir_idx) {
+            Ok(entries) => entries,
+            Err(status) => return status,
+        };
 
         let Some(max_length) = entries.iter().try_fold(32usize, |total, (name, ty)| {
             total

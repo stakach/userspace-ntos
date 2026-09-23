@@ -2,10 +2,15 @@
 
 use alloc::vec::Vec;
 use nt_component_suspension::{peer_registry::PeerRoute, LaneDispatchIdentity};
+use nt_object_manager::directory::{plan_directory_entries, DirectoryPackPlan};
 use nt_process::native_handle::NativeHandleCaller;
+use nt_types::UnicodeString;
 use nt_user_host::provider_directory_name::{
     DirectoryNameMetadata, DirectoryNameUploads, DirectoryUploadError, DirectoryUploadOwner,
     DirectoryUploadPhase,
+};
+use nt_user_host::provider_directory_query::{
+    DirectoryQueryError, DirectoryQueryOwner, DirectoryQuerySnapshots,
 };
 
 use crate::exec_handler::directory_object::ReservedProviderDirectoryObject;
@@ -25,6 +30,12 @@ struct Pending {
     phase: PendingPhase,
 }
 
+struct QuerySnapshot {
+    entries: Vec<(UnicodeString, UnicodeString)>,
+    plan: DirectoryPackPlan,
+    next_offset: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PendingPhase {
     Reserved,
@@ -38,6 +49,8 @@ struct Broker {
     uploads: DirectoryNameUploads<PeerRoute, (LaneDispatchIdentity, u64), NativeHandleCaller>,
     kinds: Vec<(PeerRoute, LaneDispatchIdentity, u64, bool)>,
     pending: Vec<Pending>,
+    queries:
+        DirectoryQuerySnapshots<PeerRoute, LaneDispatchIdentity, NativeHandleCaller, QuerySnapshot>,
     failed_commits: Vec<Owner>,
     next_token: u64,
 }
@@ -48,6 +61,7 @@ impl Broker {
             uploads: DirectoryNameUploads::new(),
             kinds: Vec::new(),
             pending: Vec::new(),
+            queries: DirectoryQuerySnapshots::new(),
             failed_commits: Vec::new(),
             next_token: 1,
         }
@@ -72,6 +86,20 @@ impl Broker {
         Ok(token)
     }
 
+    fn query_owner(
+        route: PeerRoute,
+        dispatch: LaneDispatchIdentity,
+        caller: NativeHandleCaller,
+        token: u64,
+    ) -> DirectoryQueryOwner<PeerRoute, LaneDispatchIdentity, NativeHandleCaller> {
+        DirectoryQueryOwner {
+            route,
+            dispatch,
+            caller,
+            token,
+        }
+    }
+
     fn dispatch(
         &mut self,
         handler: &mut ExecNtHandler,
@@ -82,7 +110,7 @@ impl Broker {
         m1: u64,
         m2: u64,
         m3: u64,
-    ) -> Result<(u32, u64), u32> {
+    ) -> Result<(u32, u64, u64, u64), u32> {
         match op {
             1 | 2 => {
                 let total = usize::try_from(m3).map_err(|_| STATUS_OBJECT_NAME_INVALID)?;
@@ -106,7 +134,7 @@ impl Broker {
                     .map_err(upload_status)?;
                 // The operation kind is retained separately from the upload metadata.
                 self.kinds.push((route, dispatch, token, op == 1));
-                Ok((0, token))
+                Ok((0, token, 0, 0))
             }
             3 => {
                 let token = m1;
@@ -132,7 +160,7 @@ impl Broker {
                         &chunk[..count],
                     )
                     .map_err(upload_status)?;
-                Ok((0, 0))
+                Ok((0, 0, 0, 0))
             }
             4 => {
                 let token = m1;
@@ -174,7 +202,7 @@ impl Broker {
                     staged,
                     phase: PendingPhase::Reserved,
                 });
-                Ok((0, value))
+                Ok((0, value, 0, 0))
             }
             5 | 6 | 8 => {
                 if m3 != 0 {
@@ -187,7 +215,7 @@ impl Broker {
                             self.uploads.abort(owner).map_err(upload_status)?;
                             self.kinds
                                 .retain(|&(r, d, t, _)| r != route || d != dispatch || t != m1);
-                            return Ok((0, 0));
+                            return Ok((0, 0, 0, 0));
                         }
                         Some(DirectoryUploadPhase::Committed) => {
                             let index = self
@@ -197,7 +225,7 @@ impl Broker {
                                 .ok_or(STATUS_INVALID_HANDLE)?;
                             self.failed_commits.swap_remove(index);
                             self.uploads.retire_definite(owner).map_err(upload_status)?;
-                            return Ok((0, 0));
+                            return Ok((0, 0, 0, 0));
                         }
                         _ => return Err(STATUS_INVALID_HANDLE),
                     }
@@ -217,7 +245,7 @@ impl Broker {
                     ) {
                         Ok(status) => {
                             self.pending[position].phase = PendingPhase::PublishedUnacknowledged;
-                            Ok((status, 0))
+                            Ok((status, 0, 0, 0))
                         }
                         Err(status) => {
                             self.pending[position].phase = PendingPhase::Aborted;
@@ -232,7 +260,7 @@ impl Broker {
                         .retire_definite(owner)
                         .expect("acknowledged directory upload remains committed");
                     self.pending[position].phase = PendingPhase::Acknowledged;
-                    Ok((0, 0))
+                    Ok((0, 0, 0, 0))
                 } else {
                     if !matches!(
                         self.pending[position].phase,
@@ -247,7 +275,7 @@ impl Broker {
                     self.uploads
                         .retire_definite(owner)
                         .expect("aborted directory upload remains committed");
-                    Ok((0, 0))
+                    Ok((0, 0, 0, 0))
                 }
             }
             7 => {
@@ -255,7 +283,77 @@ impl Broker {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
                 handler.close_provider_directory_object(caller, m1)?;
-                Ok((0, 0))
+                Ok((0, 0, 0, 0))
+            }
+            9..=12 => {
+                let length = m3 as u32 as usize;
+                let context = (m3 >> 32) as u32;
+                let restart = op == 10 || op == 12;
+                let single = op == 11 || op == 12;
+                let entries = handler.snapshot_provider_directory_entries(caller, m1)?;
+                let plan = plan_directory_entries(&entries, context, restart, single, m2, length)
+                    .map_err(|status| status.raw() as u32)?;
+                let query = plan.query();
+                let token = if query.written != 0 {
+                    let token = self.next_token()?;
+                    self.queries
+                        .begin(
+                            Self::query_owner(route, dispatch, caller, token),
+                            QuerySnapshot {
+                                entries,
+                                plan,
+                                next_offset: 0,
+                            },
+                        )
+                        .map_err(query_status)?;
+                    token
+                } else {
+                    0
+                };
+                let lengths = (u64::from(query.return_length) << 32) | u64::from(query.written);
+                Ok((
+                    query.status.raw() as u32,
+                    token,
+                    lengths,
+                    u64::from(query.context),
+                ))
+            }
+            13 => {
+                let offset = usize::try_from(m2).map_err(|_| STATUS_INVALID_PARAMETER)?;
+                let count = usize::try_from(m3).map_err(|_| STATUS_INVALID_PARAMETER)?;
+                if m1 == 0 || !(1..=24).contains(&count) {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                let owner = Self::query_owner(route, dispatch, caller, m1);
+                let snapshot = self.queries.get_mut(owner).map_err(query_status)?;
+                let end = offset.checked_add(count).ok_or(STATUS_INVALID_PARAMETER)?;
+                if offset != snapshot.next_offset || end > snapshot.plan.query().written as usize {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                let mut bytes = [0u8; 24];
+                snapshot
+                    .plan
+                    .read_range(&snapshot.entries, offset, &mut bytes[..count])
+                    .map_err(|status| status.raw() as u32)?;
+                snapshot.next_offset = end;
+                Ok((
+                    0,
+                    u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+                    u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+                    u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+                ))
+            }
+            14 => {
+                if m1 == 0 || m2 != 0 || m3 != 0 {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                let owner = Self::query_owner(route, dispatch, caller, m1);
+                let snapshot = self.queries.get(owner).map_err(query_status)?;
+                if snapshot.next_offset != snapshot.plan.query().written as usize {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                self.queries.ack(owner).map_err(query_status)?;
+                Ok((0, 0, 0, 0))
             }
             _ => Err(STATUS_INVALID_PARAMETER),
         }
@@ -293,6 +391,8 @@ impl Broker {
             .retain(|&(r, d, _, _)| r != route || d != dispatch);
         self.failed_commits
             .retain(|owner| owner.route != route || owner.dispatch.0 != dispatch);
+        self.queries
+            .retire_matching(|owner| owner.route == route && owner.dispatch == dispatch);
         let uncertain = self
             .pending
             .iter()
@@ -323,6 +423,15 @@ fn upload_status(error: DirectoryUploadError) -> u32 {
     }
 }
 
+fn query_status(error: DirectoryQueryError) -> u32 {
+    match error {
+        DirectoryQueryError::NoMemory => STATUS_INSUFFICIENT_RESOURCES,
+        DirectoryQueryError::RouteOccupied
+        | DirectoryQueryError::WrongOwner
+        | DirectoryQueryError::AlreadyAcknowledged => STATUS_INVALID_HANDLE,
+    }
+}
+
 static mut BROKER: Broker = Broker::new();
 
 pub(crate) unsafe fn dispatch(
@@ -338,7 +447,7 @@ pub(crate) unsafe fn dispatch(
     let _durable = crate::allocator::enter_durable();
     let broker = &mut *core::ptr::addr_of_mut!(BROKER);
     match broker.dispatch(handler, route, identity, caller, op, m1, m2, m3) {
-        Ok((status, value)) => (status as i32, value, 0, 0),
+        Ok((status, out1, out2, out3)) => (status as i32, out1, out2, out3),
         Err(status) => (status as i32, 0, 0, 0),
     }
 }
