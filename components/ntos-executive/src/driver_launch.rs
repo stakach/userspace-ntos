@@ -329,15 +329,11 @@ const FSD_DATA_LOADER_ACPI_NODE_VA: u64 = FSD_DATA_VADDR + FSD_DATA_LOADER_ACPI_
 const FSD_DATA_LOADER_ACPI_IDENTIFIER_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_LOADER_ACPI_IDENTIFIER_OFF;
 const FSD_DATA_LOADER_ACPI_CONFIG_VA: u64 = FSD_DATA_VADDR + FSD_DATA_LOADER_ACPI_CONFIG_OFF;
-const FSD_DATA_IRP_DISPATCH_REQUEST_OFF: u64 = 0x1000;
 const _: () =
     assert!(FSD_DATA_SE_SID_POOL_OFF + nt_security::se_exports::SID_POOL_SIZE as u64 <= 0x1000);
 const _: () =
     assert!(FSD_DATA_LOADER_ACPI_CONFIG_OFF + FSD_DATA_LOADER_CONFIG_CAPACITY as u64 <= 0x3000);
 const _: () = assert!(FSD_DATA_PHYSICAL_MAP_CAPACITY > 0);
-const _: () = assert!(
-    FSD_DATA_IRP_DISPATCH_REQUEST_OFF + core::mem::size_of::<IrpDispatchRequest>() as u64 <= 0x2000
-);
 const FSD_HOSTED_SYSTEM_RANGE_START: u64 = FSD_CODE_VA;
 
 /// Shared handoff arena (executive ↔ host): entry rva in, verdict + MajorFunction table + device
@@ -1435,9 +1431,13 @@ const FSD_COMPLETION_SEQ_OFF: u64 = FSD_RUNTIME_TABLES_OFF;
 const FSD_PENDING_IRP_CAP: usize = 256;
 const FSD_PENDING_IRP_HEAD_OFF: u64 = FSD_RUNTIME_TABLES_OFF + 0x08;
 const FSD_PENDING_IRPS_OFF: u64 = align_up_u64(FSD_RUNTIME_TABLES_OFF + 0x10, 8);
-const _: () = assert!(
+const FSD_DATA_IRP_DISPATCH_REQUEST_OFF: u64 = align_up_u64(
     FSD_PENDING_IRPS_OFF
-        + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64
+        + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64,
+    0x1000,
+);
+const _: () = assert!(
+    FSD_DATA_IRP_DISPATCH_REQUEST_OFF + core::mem::size_of::<IrpDispatchRequest>() as u64
         <= FSD_DATA_PHYSICAL_MAP_OFF
 );
 
