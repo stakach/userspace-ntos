@@ -23,6 +23,17 @@ enum LifecycleDispatch {
 }
 
 impl<P: ObjectManagerPort> IoManager<P> {
+    pub(crate) fn lifecycle_uses_driver_peer(
+        &self,
+        file_id: FileId,
+        major: u8,
+    ) -> Result<bool, NtStatus> {
+        let device_id = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?.device_id;
+        let driver_id = self.device(device_id).ok_or(NtStatus::INVALID_PARAMETER)?.driver_id;
+        let driver = self.driver(driver_id).ok_or(NtStatus::INVALID_PARAMETER)?;
+        Ok(driver.dispatch.get(major).driver_peer_id().is_some())
+    }
+
     /// Transfer retry ownership of an unopened external File to the canonical close pump.
     /// Unlike a refused `release_external_file`, success promises deferred retirement once
     /// projection bindings and pointer owners drain. This only sets latches: no backend entry,
@@ -237,6 +248,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 (file.client_id, file.device_id, file.cleanup_dispatched)
             };
             if !dispatched {
+                if self.owned_peer_file_lifecycle
+                    && self.lifecycle_uses_driver_peer(file_id, major::IRP_MJ_CLEANUP)?
+                {
+                    return Err(NtStatus::PENDING);
+                }
                 match self.dispatch_lifecycle_irp_once(
                     client,
                     device_id,
@@ -287,6 +303,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
 
         if close_dispatched {
             return self.release_file_record(file_id);
+        }
+
+        if self.owned_peer_file_lifecycle
+            && self.lifecycle_uses_driver_peer(file_id, major::IRP_MJ_CLOSE)?
+        {
+            return Err(NtStatus::PENDING);
         }
 
         self.file_mut(file_id)

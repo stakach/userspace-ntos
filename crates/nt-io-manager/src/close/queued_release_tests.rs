@@ -5,9 +5,11 @@ use nt_types::{NtPath, UnicodeString};
 
 use crate::{
     CreateOptions, CreateParameters, DeviceCharacteristics, DeviceFlags, DeviceType,
-    DispatchContext, DispatchOutcome, DriverCompletion, DriverDispatchBackend,
-    ExternalDispatchResult, IrpProjection, MockObjectPort, ShareAccess,
+    DispatchContext, DispatchOutcome, DispatchTarget, DriverCompletion, DriverDispatchBackend,
+    DriverPeerId, ExternalDispatchResult, IrpProjection, MajorFunctionTable, MockObjectPort,
+    ShareAccess,
 };
+use crate::owned_file_lifecycle::FileLifecycleOutcome;
 
 struct RecordingBackend {
     majors: Rc<RefCell<Vec<u8>>>,
@@ -48,6 +50,7 @@ impl DriverDispatchBackend for RecordingBackend {
 
 fn external_file(
     pending_create: bool,
+    peer: bool,
 ) -> (
     IoManager<MockObjectPort>,
     ClientId,
@@ -60,16 +63,21 @@ fn external_file(
     let client = io.register_client();
     let majors = Rc::new(RefCell::new(Vec::new()));
     let cancels = Rc::new(Cell::new(0));
-    let driver = io
-        .create_driver(
-            &NtPath::parse_str(r"\Driver\QueuedRelease").unwrap(),
-            Box::new(RecordingBackend {
-                majors: majors.clone(),
-                cancels: cancels.clone(),
-                pending_create,
-            }),
-        )
-        .unwrap();
+    let backend = Box::new(RecordingBackend {
+        majors: majors.clone(),
+        cancels: cancels.clone(),
+        pending_create,
+    });
+    let name = NtPath::parse_str(r"\Driver\QueuedRelease").unwrap();
+    let driver = if peer {
+        io.enable_owned_peer_file_lifecycle().unwrap();
+        let mut dispatch = MajorFunctionTable::new();
+        dispatch.set_all(DispatchTarget::DriverPeer(DriverPeerId(0)));
+        io.create_driver_peer_with_major_table(&name, backend, dispatch)
+            .unwrap()
+    } else {
+        io.create_driver(&name, backend).unwrap()
+    };
     let device = io
         .create_device(
             driver,
@@ -113,7 +121,7 @@ fn external_file(
 
 #[test]
 fn final_external_file_release_queues_cleanup_without_backend_entry() {
-    let (mut io, client, file, majors, cancels, create) = external_file(false);
+    let (mut io, client, file, majors, cancels, create) = external_file(false, false);
     assert!(matches!(
         create,
         ExternalDispatchResult::Completed {
@@ -144,7 +152,7 @@ fn final_external_file_release_queues_cleanup_without_backend_entry() {
 
 #[test]
 fn pending_external_create_queues_abandonment_without_inline_cancel() {
-    let (mut io, client, file, majors, cancels, create) = external_file(true);
+    let (mut io, client, file, majors, cancels, create) = external_file(true, false);
     let irp_id = match create {
         ExternalDispatchResult::Pending { irp_id } => irp_id,
         other => panic!("expected pending CREATE, got {other:?}"),
@@ -167,4 +175,37 @@ fn pending_external_create_queues_abandonment_without_inline_cancel() {
         io.prepare_file_lifecycle_owned(client, file).unwrap_err(),
         NtStatus::DELETE_PENDING
     );
+}
+
+#[test]
+fn owned_lifecycle_mode_cannot_change_with_live_file() {
+    let (mut io, _, file, _, _, _) = external_file(false, false);
+    assert!(io.file(file).is_some());
+    assert_eq!(io.enable_owned_peer_file_lifecycle(), Err(NtStatus::DELETE_PENDING));
+}
+
+#[test]
+fn peer_lifecycle_pump_never_enters_backend_inline() {
+    let (mut io, client, file, majors, _, create) = external_file(false, true);
+    assert!(matches!(create, ExternalDispatchResult::Completed { status: NtStatus::SUCCESS, .. }));
+    io.queue_external_file_release(client, file).unwrap();
+    io.pump_with_report();
+    assert_eq!(&*majors.borrow(), &[major::IRP_MJ_CREATE]);
+    assert_eq!(io.file(file).unwrap().state, FileState::CleanupPending);
+    let prepared = io.prepare_next_queued_peer_file_lifecycle().unwrap().unwrap();
+    assert_eq!(prepared.file_id(), file);
+    assert_eq!(prepared.projection().major, major::IRP_MJ_CLEANUP);
+    assert!(io.prepare_next_queued_peer_file_lifecycle().unwrap().is_none());
+    io.requeue_prepared_file_lifecycle(prepared).unwrap();
+    let prepared = io.prepare_next_queued_peer_file_lifecycle().unwrap().unwrap();
+    let invocation = io.begin_prepared_file_lifecycle(prepared).unwrap();
+    io.finish_file_lifecycle(invocation.returned(FileLifecycleOutcome::Returned {
+        status: NtStatus::SUCCESS,
+        information: 0,
+    })).unwrap();
+    io.pump_with_report();
+    let close = io.prepare_next_queued_peer_file_lifecycle().unwrap().unwrap();
+    assert_eq!(close.projection().major, major::IRP_MJ_CLOSE);
+    io.requeue_prepared_file_lifecycle(close).unwrap();
+    assert_eq!(&*majors.borrow(), &[major::IRP_MJ_CREATE]);
 }

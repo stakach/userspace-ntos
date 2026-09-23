@@ -259,6 +259,7 @@ pub struct IoManager<P> {
     rejected_completion_acks: Vec<(usize, IrpId)>,
     deferred_file_close_cursor: u64,
     deferred_file_close_queued: usize,
+    owned_peer_file_lifecycle: bool,
     disconnected_client_retries: Vec<ClientId>,
     port: P,
     backends: Vec<Box<dyn DriverDispatchBackend>>,
@@ -282,6 +283,7 @@ impl<P> IoManager<P> {
             rejected_completion_acks: Vec::new(),
             deferred_file_close_cursor: 0,
             deferred_file_close_queued: 0,
+            owned_peer_file_lifecycle: false,
             disconnected_client_retries: Vec::new(),
             port,
             backends: Vec::new(),
@@ -295,6 +297,16 @@ impl<P> IoManager<P> {
     /// Mutably borrow the Object Manager port.
     pub fn port_mut(&mut self) -> &mut P {
         &mut self.port
+    }
+
+    /// Route DriverPeer CLEANUP/CLOSE through owned preparations so an external
+    /// host can execute them after its mutable manager borrow ends.
+    pub fn enable_owned_peer_file_lifecycle(&mut self) -> Result<(), NtStatus> {
+        if self.files.iter().next().is_some() || self.irps.iter().next().is_some() {
+            return Err(NtStatus::DELETE_PENDING);
+        }
+        self.owned_peer_file_lifecycle = true;
+        Ok(())
     }
 
     /// Register a dispatch backend, returning its registry index.
