@@ -55,6 +55,9 @@ mod registry_reads;
 #[path = "exec_directory_query.rs"]
 mod directory_query;
 
+#[path = "exec_directory_object.rs"]
+mod directory_object;
+
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
 pub(crate) const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
@@ -37058,97 +37061,35 @@ impl ExecNtHandler {
                     Ok(captured) => captured,
                     Err(status) => return status,
                 };
-                let Some(path) = captured.path() else {
-                    return 0xC000_0033;
-                };
-                let permanent = captured.attributes & OBJ_PERMANENT != 0;
+                if captured.path().is_none() {
+                    return 0xC000_0033; // STATUS_OBJECT_NAME_INVALID
+                }
                 let caller = match self.native_directory_caller(ctx.previous_mode) {
                     Ok(caller) => caller,
                     Err(status) => return status,
                 };
-                let (root_idx, path) =
-                    match self.native_directory_root_and_path(caller, captured.root, path) {
-                        Ok(resolved) => resolved,
-                        Err(status) => return status,
-                    };
-                let mut opened_existing = false;
-                let existing = if ctx.service == NativeService::NtCreateDirectoryObject {
-                    match self.obj_resolve(path, root_idx) {
-                        Some(index) if self.obj_ns[index].kind == OBJ_KIND_DIRECTORY => {
-                            if captured.attributes & 0x80 == 0 {
-                                return 0xC000_0035; // STATUS_OBJECT_NAME_COLLISION
-                            }
-                            opened_existing = true;
-                            Some(index)
-                        }
-                        Some(_) => {
-                            return 0xC000_0024;
-                        } // STATUS_OBJECT_TYPE_MISMATCH
-                        None => None,
-                    }
-                } else {
-                    let Some(index) = self.obj_resolve(path, root_idx) else {
-                        return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
-                    };
-                    if self.obj_ns[index].kind != OBJ_KIND_DIRECTORY {
-                        return 0xC000_0024; // STATUS_OBJECT_TYPE_MISMATCH
-                    }
-                    Some(index)
-                };
-                let handle_attributes = captured.attributes
-                    & (nt_process::native_handle::OBJ_KERNEL_HANDLE | 0x2);
-                let cap_before = self.pm.handle_capacity(caller.effective_process());
-                let mut publication = match self
-                    .pm
-                    .reserve_native_object_directory_handle(caller, handle_attributes)
-                {
-                    Ok(publication) => publication,
+                let mut staged = match self.stage_native_directory_object_open(
+                    &captured,
+                    caller,
+                    desired_access,
+                    ctx.service == NativeService::NtCreateDirectoryObject,
+                ) {
+                    Ok(staged) => staged,
                     Err(status) => return status,
                 };
-                let created = existing.is_none();
-                let index = if let Some(index) = existing {
-                    index
-                } else if let Some(index) = self.obj_create(
-                    path,
-                    root_idx,
-                    OBJ_KIND_DIRECTORY,
-                    &[],
-                    permanent,
-                ) {
-                    index
-                } else {
-                    assert_eq!(publication.abort(&mut self.pm), Ok(None));
-                    return 0xC000_003A; // STATUS_OBJECT_PATH_NOT_FOUND
-                };
-                let identity = self.obj_ns[index].identity;
-                let access = Self::map_directory_object_access(desired_access);
-                if let Err(status) = publication.bind(&mut self.pm, identity, access) {
-                    assert_eq!(publication.abort(&mut self.pm), Ok(None));
-                    if created {
-                        self.rollback_new_namespace_object(index);
-                    }
-                    return status;
-                }
-                if !self.xas_write_u64(out, publication.value()) {
-                    assert_eq!(publication.abort(&mut self.pm), Ok(Some(identity)));
-                    if created {
-                        self.rollback_new_namespace_object(index);
-                    }
+                if !self.xas_write_u64(out, staged.publication.value()) {
+                    self.abort_staged_directory_object_open(&mut staged);
                     return 0xC000_0005;
                 }
-                if let Err(status) = publication.publish(&mut self.pm) {
-                    assert_eq!(publication.abort(&mut self.pm), Ok(Some(identity)));
-                    if created {
-                        self.rollback_new_namespace_object(index);
-                    }
+                if let Err(status) = staged.publication.publish(&mut self.pm) {
+                    self.abort_staged_directory_object_open(&mut staged);
                     return status;
                 }
-                self.record_process_handle_insert(publication.process_id(), cap_before);
-                if opened_existing {
-                    0x4000_0000 // STATUS_OBJECT_NAME_EXISTS
-                } else {
-                    0
-                }
+                self.record_process_handle_insert(
+                    staged.publication.process_id(),
+                    staged.cap_before,
+                );
+                staged.status
             },
             // Enumerate the canonical namespace through the shared NT x64 packing contract.
             NativeService::NtQueryDirectoryObject => unsafe {
