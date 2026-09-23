@@ -3089,12 +3089,6 @@ pub(super) fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
     ] {
         ObjEntry::push_dir(&mut v, d, 0, true).expect("initial object directory");
     }
-    let windows = v
-        .iter()
-        .position(|entry| entry.parent == 0 && entry.name() == b"windows")
-        .expect("pre-created Windows object directory");
-    ObjEntry::push_dir(&mut v, b"windowstations", windows, true)
-        .expect("initial WindowStations directory");
     let bno = v
         .iter()
         .position(|entry| entry.parent == 0 && entry.name() == b"basenamedobjects")
@@ -36945,9 +36939,16 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 let mut created = false;
+                let mut opened_existing = false;
                 let index = if ctx.service == NativeService::NtCreateDirectoryObject {
                     match self.obj_resolve(path, root_idx) {
-                        Some(index) if self.obj_ns[index].kind == OBJ_KIND_DIRECTORY => index,
+                        Some(index) if self.obj_ns[index].kind == OBJ_KIND_DIRECTORY => {
+                            if captured.attributes & 0x80 == 0 {
+                                return 0xC000_0035; // STATUS_OBJECT_NAME_COLLISION
+                            }
+                            opened_existing = true;
+                            index
+                        }
                         Some(_) => {
                             return 0xC000_0024;
                         } // STATUS_OBJECT_TYPE_MISMATCH
@@ -36989,7 +36990,11 @@ impl ExecNtHandler {
                     }
                     return 0xC000_0005;
                 }
-                0
+                if opened_existing {
+                    0x4000_0000 // STATUS_OBJECT_NAME_EXISTS
+                } else {
+                    0
+                }
             },
             // NtQueryDirectoryObject captured args: DirectoryHandle=args[0], Buffer=args[1],
             // Length=args[2], ReturnSingleEntry=args[3], RestartScan=args[4], *Context=args[5],
