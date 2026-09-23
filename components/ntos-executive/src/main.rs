@@ -31040,18 +31040,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     win32k_subsystem::WIN32K_KUSER_SHARED_DATA_VA,
                     sc.pml4,
                 ) {
-                    print_str(b"[win32k-host] KUSER sparse paging setup failed\n");
+                    panic!("win32k KUSER paging setup failed");
                 }
+                let kuser_map_cap = copy_cap(kuser_frame);
                 let kuser_map = page_map_r(
-                    copy_cap(kuser_frame),
+                    kuser_map_cap,
                     win32k_subsystem::WIN32K_KUSER_SHARED_DATA_VA,
                     2 | PAGE_EXECUTE_NEVER,
                     sc.pml4,
                 );
                 if kuser_map != 0 {
-                    print_str(b"[win32k-host] KUSER map failed error=");
-                    print_u64(kuser_map);
-                    print_str(b"\n");
+                    let _ = cnode_delete_recycle_r(kuser_map_cap);
+                    panic!("win32k KUSER mapping failed");
                 }
                 // Stash the globals the demand-map fault loop + per-client attach need. The stack frame
                 // base is the first FreshZeroed frame of the dedicated stack.
