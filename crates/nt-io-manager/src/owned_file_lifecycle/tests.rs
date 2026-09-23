@@ -72,7 +72,7 @@ impl Fixture {
     fn begin(&mut self, file_id: FileId) -> FileLifecycleInvocation {
         let prepared = self
             .io
-            .prepare_file_lifecycle_owned(self.client, file_id)
+            .prepare_file_lifecycle_owned(self.client, file_id, 42)
             .unwrap();
         self.io.begin_prepared_file_lifecycle(prepared).unwrap()
     }
@@ -97,7 +97,7 @@ fn two_same_driver_files_can_be_in_flight_before_either_returns() {
         IrpState::Dispatched
     );
     assert_eq!(
-        f.io.prepare_file_lifecycle_owned(f.client, first)
+        f.io.prepare_file_lifecycle_owned(f.client, first, 42)
             .unwrap_err(),
         NtStatus::DELETE_PENDING
     );
@@ -172,14 +172,14 @@ fn stale_file_and_irp_generations_do_not_authorize_a_new_effect() {
     f.driver("Generation");
     let (_, file_id) = f.file("Generation");
     let prepared =
-        f.io.prepare_file_lifecycle_owned(f.client, file_id)
+        f.io.prepare_file_lifecycle_owned(f.client, file_id, 42)
             .unwrap();
     let stale_irp = prepared.irp_id();
     f.io.irp_mut(stale_irp).unwrap().detached_file_owner = false;
     f.io.free_irp(stale_irp).unwrap();
     let (_, replacement_file) = f.file("Generation");
     let replacement =
-        f.io.prepare_file_lifecycle_owned(f.client, replacement_file)
+        f.io.prepare_file_lifecycle_owned(f.client, replacement_file, 42)
             .unwrap();
     assert_eq!(replacement.irp_id().slot(), stale_irp.slot());
     assert_ne!(replacement.irp_id(), stale_irp);
@@ -190,7 +190,7 @@ fn stale_file_and_irp_generations_do_not_authorize_a_new_effect() {
     // An unknown generation never resolves to the new File body.
     let stale_file = FileId::new(file_id.generation().wrapping_add(1), file_id.slot());
     assert_eq!(
-        f.io.prepare_file_lifecycle_owned(f.client, stale_file)
+        f.io.prepare_file_lifecycle_owned(f.client, stale_file, 42)
             .unwrap_err(),
         NtStatus::INVALID_HANDLE
     );
@@ -231,7 +231,7 @@ fn proven_nonentry_can_retry_but_indeterminate_entry_cannot() {
     assert_eq!(f.io.irp(first_irp).unwrap().state, IrpState::Indeterminate);
     assert!(f.io.file(first).unwrap().cleanup_dispatched);
     assert_eq!(
-        f.io.prepare_file_lifecycle_owned(f.client, first)
+        f.io.prepare_file_lifecycle_owned(f.client, first, 42)
             .unwrap_err(),
         NtStatus::DELETE_PENDING
     );
@@ -248,7 +248,7 @@ fn owner_from_another_manager_is_rejected_without_mutation() {
     let (_, file_id) = first.file("Local");
     let prepared = first
         .io
-        .prepare_file_lifecycle_owned(first.client, file_id)
+        .prepare_file_lifecycle_owned(first.client, file_id, 42)
         .unwrap();
     let mut second = Fixture::new();
     second.driver("Local");
