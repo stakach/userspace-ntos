@@ -338,8 +338,11 @@ pub const OB_ALIASES_LEN: usize = 32;
 pub const OB_NAMED_DESKTOPS_LEN: usize = 32;
 /// Maximum ASCII desktop leaf name retained for open-by-name lookups.
 pub const OB_NAMED_DESKTOP_NAME_MAX: usize = 48;
-/// Keep duplicate aliases disjoint from both native EPROCESS handles and win32k's dense Ob handles.
-pub const OB_ALIAS_HANDLE_BASE: u64 = 0x7FF0_0000;
+/// USER handles are above native 32-bit and virtual-registry handle ranges, but below the
+/// executive's 0x2_0000_0000 pseudo-object range.
+pub const OB_HANDLE_BASE: u64 = 0x1_0000_0000;
+/// Duplicate aliases occupy a separate, bounded USER-handle range.
+pub const OB_ALIAS_HANDLE_BASE: u64 = 0x1_0001_0000;
 /// Maximum self-relative security descriptor bytes stored for one modeled USER object.
 pub const OB_SECURITY_DESCRIPTOR_MAX: usize = 1024;
 
@@ -470,10 +473,9 @@ impl NamedDesktopEntry {
 
 /// A fixed-size handle → (type, body) registry for win32k's DESKTOP / WINDOWSTATION objects.
 ///
-/// Handles are minted densely from 1; the client-visible `HANDLE` is `idx << 2` (a real Ob handle
-/// carries tag bits in the low two bits, so shifting keeps them clear), always non-null and
-/// distinguishable from any handle *not* in the table (e.g. win32k's process-connect handle, which
-/// the caller resolves via an `EPROCESS` fallback). Single-threaded host: a plain struct suffices.
+/// Canonical handles are `OB_HANDLE_BASE + idx * 4`; aliases have their own bounded range. The
+/// low two tag bits remain clear, and native ProcessManager handles cannot share these values.
+/// Single-threaded host: a plain struct suffices.
 pub struct ObHandleTable {
     slots: [Option<ObjectEntry>; OB_TABLE_LEN],
     next: usize,
@@ -498,6 +500,23 @@ impl Default for ObHandleTable {
 }
 
 impl ObHandleTable {
+    fn canonical_index(handle: u64) -> Option<usize> {
+        let offset = handle.checked_sub(OB_HANDLE_BASE)?;
+        if offset & 3 != 0 || offset >= (OB_TABLE_LEN as u64) * 4 {
+            return None;
+        }
+        let index = (offset / 4) as usize;
+        (index != 0).then_some(index)
+    }
+
+    fn alias_index(handle: u64) -> Option<usize> {
+        let offset = handle.checked_sub(OB_ALIAS_HANDLE_BASE)?;
+        if offset & 3 != 0 || offset >= (OB_ALIASES_LEN as u64) * 4 {
+            return None;
+        }
+        Some((offset / 4) as usize)
+    }
+
     /// An empty table (usable as a `static` initializer).
     pub const fn new() -> Self {
         Self {
@@ -524,7 +543,7 @@ impl ObHandleTable {
         let kind = entry.kind;
         let body = entry.body;
         self.slots[idx] = Some(entry);
-        let handle = (idx as u64) << 2;
+        let handle = OB_HANDLE_BASE + (idx as u64) * 4;
         if cache_window_station && kind == ObKind::WindowStation {
             self.winsta_handle = handle;
             self.winsta_body = body;
@@ -546,8 +565,8 @@ impl ObHandleTable {
     }
 
     /// Register `body` under `kind` at a fresh slot and return its client-visible `HANDLE`
-    /// (`idx << 2`), or 0 if the table is full. A `WindowStation` registration is also cached as
-    /// the single input window station.
+    /// (`OB_HANDLE_BASE + idx * 4`), or 0 if the table is full. A `WindowStation` registration is
+    /// also cached as the single input window station.
     pub fn register(&mut self, kind: ObKind, body: u64) -> u64 {
         self.register_inner(kind, body, true, None)
     }
@@ -588,7 +607,7 @@ impl ObHandleTable {
         }
         for (idx, slot) in self.slots.iter().enumerate().skip(1) {
             if slot.is_some_and(|entry| entry.kind == kind && entry.body == body) {
-                return Some((idx as u64) << 2);
+                return Some(OB_HANDLE_BASE + (idx as u64) * 4);
             }
         }
         None
@@ -600,8 +619,7 @@ impl ObHandleTable {
         self.duplicate(handle)
     }
 
-    /// Create a distinct high-range handle alias for an existing win32k object. Keeping aliases out
-    /// of the dense range prevents a USER handle from colliding with an EPROCESS-native handle.
+    /// Create a distinct alias for an existing win32k object.
     pub fn duplicate(&mut self, handle: u64) -> Option<u64> {
         let (kind, body) = self.lookup(handle)?;
         let index = self.aliases.iter().position(Option::is_none)?;
@@ -620,10 +638,9 @@ impl ObHandleTable {
     /// Close an alias created by [`duplicate`](Self::duplicate). Object bodies come from win32k's
     /// session-lifetime pool, so closing removes only this alias; the original remains valid.
     pub fn close(&mut self, handle: u64) -> bool {
-        if handle < OB_ALIAS_HANDLE_BASE || handle & 0b11 != 0 {
+        let Some(index) = Self::alias_index(handle) else {
             return false;
-        }
-        let index = ((handle - OB_ALIAS_HANDLE_BASE) >> 2) as usize;
+        };
         let Some((kind, body)) = self.aliases.get(index).copied().flatten() else {
             return false;
         };
@@ -643,22 +660,17 @@ impl ObHandleTable {
     }
 
     /// Resolve a handle to its `(kind, body)`, or `None` if it is not a registered win32k object
-    /// handle. Checks the dense `idx << 2` object slots (Desktop/WindowStation/Other), then the
-    /// externally minted aliases.
+    /// handle. Only values in the exact canonical or alias ranges can resolve.
     pub fn lookup(&self, handle: u64) -> Option<(ObKind, u64)> {
-        if handle >= OB_ALIAS_HANDLE_BASE && handle & 0b11 == 0 {
-            let index = ((handle - OB_ALIAS_HANDLE_BASE) >> 2) as usize;
-            if let Some(entry) = self.aliases.get(index).copied().flatten() {
-                return Some(entry);
-            }
+        if let Some(index) = Self::alias_index(handle) {
+            return self.aliases[index];
         }
-        let idx = (handle >> 2) as usize;
-        if idx != 0 && idx < self.next {
-            if let Some(entry) = self.slots.get(idx).copied().flatten() {
-                return Some(entry.pair());
-            }
-        }
-        None
+        let index = Self::canonical_index(handle)?;
+        self.slots
+            .get(index)
+            .copied()
+            .flatten()
+            .map(ObjectEntry::pair)
     }
 
     /// Resolve a handle to its body, or 0 if it is not a registered win32k object handle.
@@ -747,9 +759,8 @@ impl ObHandleTable {
     }
 
     fn canonical_slot_index(&self, handle: u64) -> Option<usize> {
-        if handle >= OB_ALIAS_HANDLE_BASE && handle & 0b11 == 0 {
-            let index = ((handle - OB_ALIAS_HANDLE_BASE) >> 2) as usize;
-            let (kind, body) = self.aliases.get(index).copied().flatten()?;
+        if let Some(index) = Self::alias_index(handle) {
+            let (kind, body) = self.aliases[index]?;
             return self
                 .slots
                 .iter()
@@ -760,8 +771,8 @@ impl ObHandleTable {
                 })
                 .map(|(idx, _)| idx);
         }
-        let idx = (handle >> 2) as usize;
-        if idx != 0 && idx < self.next && self.slots.get(idx)?.is_some() {
+        let idx = Self::canonical_index(handle)?;
+        if idx < self.next && self.slots.get(idx)?.is_some() {
             Some(idx)
         } else {
             None
@@ -1016,8 +1027,8 @@ mod tests {
         let mut t = ObHandleTable::new();
         let desk = t.register(ObKind::Desktop, 0xD00D_0000);
         let winsta = t.register(ObKind::WindowStation, 0x5700_0000);
-        assert_eq!(desk, 1 << 2);
-        assert_eq!(winsta, 2 << 2);
+        assert_eq!(desk, OB_HANDLE_BASE + 4);
+        assert_eq!(winsta, OB_HANDLE_BASE + 8);
         assert_eq!(t.lookup(desk), Some((ObKind::Desktop, 0xD00D_0000)));
         assert_eq!(t.lookup(winsta), Some((ObKind::WindowStation, 0x5700_0000)));
         assert_eq!(t.lookup_body(desk), 0xD00D_0000);
@@ -1027,18 +1038,57 @@ mod tests {
     }
 
     #[test]
-    fn handles_are_dense_and_unique_with_clear_tag_bits() {
+    fn handles_are_disjoint_and_unique_with_clear_tag_bits() {
         let mut t = ObHandleTable::new();
         let a = t.register(ObKind::Desktop, 0x1000);
         let b = t.register(ObKind::Desktop, 0x2000);
         let c = t.register(ObKind::Desktop, 0x3000);
-        assert_eq!((a, b, c), (4, 8, 12));
+        assert_eq!(
+            (a, b, c),
+            (OB_HANDLE_BASE + 4, OB_HANDLE_BASE + 8, OB_HANDLE_BASE + 12)
+        );
         assert_ne!(a, b);
         assert_ne!(b, c);
         for h in [a, b, c] {
             assert_eq!(h & 0b11, 0, "low tag bits must be clear");
+            assert!(
+                h > u32::MAX as u64,
+                "native and registry handles stay disjoint"
+            );
+            assert!(
+                h < 0x2_0000_0000,
+                "executive pseudo-object handles stay disjoint"
+            );
         }
         assert_eq!(t.lookup_body(b), 0x2000);
+    }
+
+    #[test]
+    fn only_exact_minted_user_handles_resolve() {
+        let mut t = ObHandleTable::new();
+        let canonical = t.register(ObKind::Desktop, 0xD00D_0000);
+        let alias = t.duplicate(canonical).unwrap();
+        assert_eq!(alias, OB_ALIAS_HANDLE_BASE);
+        for forged in [
+            4,
+            0x8000_0000,
+            canonical - 4,
+            canonical | 1,
+            canonical | 0x2_0000_0000,
+            OB_HANDLE_BASE + (OB_TABLE_LEN as u64) * 4,
+            alias | 2,
+            alias | 0x2_0000_0000,
+            OB_ALIAS_HANDLE_BASE + (OB_ALIASES_LEN as u64) * 4,
+            0x2_0000_0000,
+            u64::MAX,
+        ] {
+            assert_eq!(t.lookup(forged), None, "forged handle {forged:#x}");
+            assert!(!t.close(forged), "forged alias {forged:#x}");
+            assert_eq!(t.granted_access(forged), None);
+            assert_eq!(t.security_descriptor(forged), None);
+        }
+        assert_eq!(t.lookup(canonical), Some((ObKind::Desktop, 0xD00D_0000)));
+        assert_eq!(t.lookup(alias), Some((ObKind::Desktop, 0xD00D_0000)));
     }
 
     #[test]
