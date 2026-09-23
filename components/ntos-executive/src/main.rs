@@ -31,6 +31,7 @@ mod registry_mutation_work;
 mod registry_key_targets;
 mod registry_security_audit;
 mod provider_registry_caller;
+mod provider_directory_broker;
 mod cm_snapshot_ownership;
 mod io_server;
 mod lpc_server;

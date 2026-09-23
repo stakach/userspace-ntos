@@ -906,6 +906,7 @@ pub(crate) unsafe fn complete(
             )
             .map_err(|_| Error::Protocol)?;
         (&mut *core::ptr::addr_of_mut!(NATIVE_PEERS))[index].bootstrap = false;
+        crate::service_sec_image::retire_win32k_directory_route(route, dispatch);
         crate::provider_registry_caller::retire_completed(route, dispatch);
         return Ok(());
     }
@@ -914,6 +915,7 @@ pub(crate) unsafe fn complete(
             resolve(route, false)
         })
         .map_err(|_| Error::Protocol)?;
+    crate::service_sec_image::retire_win32k_directory_route(route, dispatch);
     crate::provider_registry_caller::retire_completed(route, dispatch);
     Ok(())
 }
@@ -960,6 +962,7 @@ pub(crate) unsafe fn complete_protocol(
             |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
         )
         .map_err(|_| Error::Protocol)?;
+    crate::service_sec_image::retire_win32k_directory_route(route, dispatch);
     crate::provider_registry_caller::retire_completed(route, dispatch);
     Ok(())
 }

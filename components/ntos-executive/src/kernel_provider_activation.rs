@@ -325,6 +325,23 @@ pub(super) unsafe fn service_event(
     result.unwrap_or_else(|status| (status as i32, 0, 0, 0))
 }
 
+pub(super) unsafe fn validate_directory_service_call(
+    channel: &spawn_hosts::PumpChannel,
+    envelope: nt_user_host::provider_kernel_activation::KernelProviderServiceEnvelope,
+) -> Result<(), u32> {
+    let caller = authenticated_channel_caller(channel)?;
+    with_provider_process_manager(|pm| {
+        (&*core::ptr::addr_of!(ACTIVATIONS)).validate_service_call(
+            caller,
+            pm,
+            &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+            &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
+            envelope,
+            (win32k_subsystem::W32_DIRECTORY_LABEL << 12) | 4,
+        )
+    })
+}
+
 /// Authenticate the current bound call while borrowing dispatcher state. Polling retains the
 /// Running activation and cannot publish a suspension or deliver another lane's continuation.
 pub(super) unsafe fn service_event_poll(

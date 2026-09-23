@@ -216,3 +216,21 @@ fn repeated_dispatches_keep_only_one_generation_per_route() {
     }
     assert_eq!(uploads.phase(owner()), None);
 }
+
+#[test]
+fn retirement_removes_only_the_completed_dispatch() {
+    let mut uploads = DirectoryNameUploads::new();
+    let other = DirectoryUploadOwner {
+        route: 2,
+        ..owner()
+    };
+    uploads.begin(owner(), metadata(1)).unwrap();
+    uploads.begin(other, metadata(1)).unwrap();
+    uploads.retire_matching(|candidate| {
+        candidate.route == owner().route && candidate.dispatch == owner().dispatch
+    });
+    assert_eq!(uploads.phase(owner()), None);
+    assert_eq!(uploads.phase(other), Some(DirectoryUploadPhase::Uploading));
+    uploads.append(other, 0, &[1]).unwrap();
+    assert_eq!(uploads.commit(other).unwrap().name, [1]);
+}

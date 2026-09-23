@@ -1170,6 +1170,8 @@ pub const W32_ATOM_OP_ADD_INTEGER: u64 = 2;
 pub const W32_MM_SECURE_LABEL: u64 = 0x77F;
 pub const W32_DEVICE_PROPERTY_LABEL: u64 = 0x780;
 pub const W32_DEVICE_POINTER_LABEL: u64 = 0x781;
+/// Pointer-free staged Object Manager directory requests.
+pub const W32_DIRECTORY_LABEL: u64 = 0x782;
 /// Root-authenticated kernel activation handoff before entering provider code.
 pub const W32_KERNEL_ACTIVATION_LABEL: u64 = 0x78E;
 pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
@@ -3489,6 +3491,7 @@ use nt_object_manager::win32k_ob::{
 static mut OBJ_TABLE: ObHandleTable = ObHandleTable::new();
 
 mod object_security;
+mod directory_object;
 pub(crate) use object_security::census as object_security_census;
 
 /// Duplicate a handle owned by win32k's USER object table. Native `NtDuplicateObject` calls this
