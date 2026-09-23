@@ -7277,7 +7277,6 @@ impl ExecNtHandler {
         &mut self,
         target: KeyRef,
         descriptor: &[u8],
-        expected_generation: u64,
     ) -> Result<(), u32> {
         if target == MACHINE_ROOT_KEY {
             self.registry_machine_root_security_descriptor = descriptor.to_vec();
@@ -7297,20 +7296,6 @@ impl ExecNtHandler {
         }
         if let Some(path) = self.cm_runtime_key_target(target) {
             return unsafe { crate::config_manager_runtime_key_operation(path.key, nt_config_abi::runtime_key_op::SET_SECURITY, 0, "", 0, descriptor) }.map(|_| ()).map_err(|status| status as u32);
-        }
-        if let Some(target) = self.cm_system_key_target(target) {
-            let information = unsafe { crate::config_manager_query_leased_system_hive_key_information(target.lease) }
-                .map_err(|status| status as u32)?;
-            if information.mount_generation != expected_generation { return Err(0xC000_022D); }
-            self.persist_and_publish_system_mutations(
-                expected_generation,
-                &[OwnedSystemHiveMutation::SetKeySecurity {
-                    path: information.path,
-                    descriptor: descriptor.to_vec(),
-                }],
-                SystemHiveMutationOrigin::Runtime,
-            )?;
-            return Ok(());
         }
         if let Some(key) = self.mutable_key_handle(target) {
             if key.hive == HIVE_SEL_SYSTEM {
@@ -32272,27 +32257,28 @@ impl ExecNtHandler {
                 if key == MACHINE_ROOT_KEY || key == USER_ROOT_KEY {
                     return STATUS_CANNOT_DELETE;
                 }
-                if let Some((lease, path)) = self
-                    .cm_system_key_target(key)
-                    .map(|target| (target.lease, target.physical_path.clone()))
-                {
-                    let information = match unsafe {
-                        crate::config_manager_query_leased_system_hive_key_information(lease)
-                    } {
+                if self.cm_system_key_target(key).is_some() {
+                    let retained = match crate::registry_mutation_work::retain_hosted_existing(self, key) {
+                        Ok(retained) => retained,
+                        Err(status) => return status,
+                    };
+                    let information = match unsafe { retained.information() } {
                         Ok(information) => information,
-                        Err(status) => return status as u32,
+                        Err(status) => { retained.abort(self); return status; }
                     };
                     if information.subkey_count != 0 {
+                        retained.abort(self);
                         return STATUS_CANNOT_DELETE;
                     }
-                    if let Err(status) = self.persist_and_publish_system_mutations(
-                        information.mount_generation,
-                        &[OwnedSystemHiveMutation::DeleteKey { path }],
-                        SystemHiveMutationOrigin::Runtime,
-                    ) {
-                        return status;
-                    }
-                    return 0;
+                    return match unsafe { crate::registry_mutation_work::submit_hosted_existing(
+                        self, retained, information.mount_generation,
+                        nt_config_client::SystemHiveMutation::DeleteKey {
+                            path: &information.path,
+                        },
+                    ) } {
+                        Ok(()) => 0x103,
+                        Err(status) => status,
+                    };
                 }
                 let stats = match self.registry_key_stats(key) {
                     Ok(stats) => stats,
@@ -36391,29 +36377,58 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
-                let memory = ExecClientMemory { handler: self };
-                let modification =
-                    match nt_security::capture_security_descriptor_bytes(&memory, args[2]) {
-                        Ok(descriptor) => descriptor,
-                        Err(status) => return status,
-                    };
                 let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-                let current = match self.registry_key_security_descriptor(key) {
-                    Ok(Some(descriptor)) => descriptor,
-                    Ok(None) => {
-                        alloc::vec::Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..])
+                let mut retained = if self.cm_system_key_target(key).is_some() {
+                    match crate::registry_mutation_work::retain_hosted_existing(self, key) {
+                        Ok(retained) => Some(retained),
+                        Err(status) => return status,
                     }
-                    Err(status) => return status,
+                } else {
+                    None
                 };
-                let updated = match nt_security::set_security_descriptor_bytes(
-                    &current,
-                    security_information,
-                    &modification,
-                ) {
-                    Ok(descriptor) => descriptor,
-                    Err(status) => return status,
+                let prepared = (|| -> Result<_, u32> {
+                    let memory = ExecClientMemory { handler: self };
+                    let modification = nt_security::capture_security_descriptor_bytes(&memory, args[2])?;
+                    let information = match retained.as_ref() {
+                        Some(owner) => {
+                            let information = unsafe { owner.information() }?;
+                            if information.mount_generation != expected_generation {
+                                return Err(0xC000_022D);
+                            }
+                            Some(information)
+                        }
+                        None => None,
+                    };
+                    let current = if let Some(information) = &information {
+                        information.security_descriptor.clone()
+                    } else {
+                        self.registry_key_security_descriptor(key)?
+                    }.unwrap_or_else(|| alloc::vec::Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]));
+                    let updated = nt_security::set_security_descriptor_bytes(
+                        &current, security_information, &modification,
+                    )?;
+                    Ok((information, updated))
+                })();
+                let (information, updated) = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(status) => {
+                        if let Some(owner) = retained.take() { owner.abort(self); }
+                        return status;
+                    }
                 };
-                match self.set_registry_key_security_descriptor(key, &updated, expected_generation) {
+                if let Some(information) = information {
+                    return match unsafe { crate::registry_mutation_work::submit_hosted_existing(
+                        self, retained.take().unwrap(), expected_generation,
+                        nt_config_client::SystemHiveMutation::SetKeySecurity {
+                            path: &information.path,
+                            descriptor: &updated,
+                        },
+                    ) } {
+                        Ok(()) => 0x103,
+                        Err(status) => status,
+                    };
+                }
+                match self.set_registry_key_security_descriptor(key, &updated) {
                     Ok(()) => 0,
                     Err(status) => status,
                 }

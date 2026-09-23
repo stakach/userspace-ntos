@@ -96,6 +96,51 @@ fn lost_commit_and_ack_replies_preserve_exact_publication_and_durable_replay() {
 }
 
 #[test]
+fn existing_key_mutations_replay_commit_and_ack_without_reapplying() {
+    let mut client = client(1);
+    let key = alloc::format!("{PARENT}\\Child");
+    let created = prepare(&mut client, 1, "Child");
+    let created_receipt = client.commit_system_hive_mutation_retained(&created).unwrap();
+    let _ = client.acknowledge_system_hive_mutation_commit(created_receipt).unwrap();
+    let opened = crate::retained_test_keys::open(&mut client, &key);
+    let operations = [
+        SystemHiveMutation::SetValue {
+            path: &key, name: "Setting", value_type: 4, data: &7u32.to_le_bytes(),
+        },
+        SystemHiveMutation::SetKeySecurity {
+            path: &key, descriptor: b"replacement security",
+        },
+        SystemHiveMutation::DeleteValue { path: &key, name: "Setting" },
+        SystemHiveMutation::DeleteKey { path: &key },
+    ];
+    let mut generation = 2;
+    for (index, mutation) in operations.iter().enumerate() {
+        let prepared = client.prepare_system_hive_mutation(generation, core::slice::from_ref(mutation)).unwrap();
+        let journal = prepared.durable_journal().to_vec();
+        client.backend.corrupt = Some((operation::COMMIT, 0));
+        assert_eq!(client.commit_system_hive_mutation_retained(&prepared), Err(STATUS_INVALID_PARAMETER));
+        assert_eq!(prepared.durable_journal(), journal);
+        let receipt = client.commit_system_hive_mutation_retained(&prepared).unwrap();
+        assert_eq!(receipt.outcome().generation, generation + 1);
+        assert_eq!(client.commit_system_hive_mutation_retained(&prepared), Ok(receipt));
+        client.backend.corrupt = Some((operation::ACKNOWLEDGE, 0));
+        assert_eq!(client.acknowledge_system_hive_mutation_commit(receipt), Err(STATUS_INVALID_PARAMETER));
+        assert_eq!(
+            client.acknowledge_system_hive_mutation_commit(receipt).unwrap().disposition(),
+            SystemHiveMutationAcknowledgementDisposition::AlreadyAcknowledged,
+        );
+        generation += 1;
+        match index {
+            0 => assert_eq!(client.query_leased_system_hive_value(opened.lease, "Setting").unwrap().data, 7u32.to_le_bytes()),
+            1 => assert_eq!(client.query_leased_system_hive_key_information(opened.lease).unwrap().security_descriptor.as_deref(), Some(b"replacement security".as_slice())),
+            2 => assert_eq!(client.query_leased_system_hive_value(opened.lease, "Setting"), Err(crate::STATUS_OBJECT_NAME_NOT_FOUND)),
+            _ => assert_eq!(client.query_system_hive_key(&key), Err(crate::STATUS_OBJECT_NAME_NOT_FOUND)),
+        }
+    }
+    crate::retained_test_keys::close(&mut client, opened.lease).unwrap();
+}
+
+#[test]
 fn malformed_commit_success_retries_without_reapplying_child_creation() {
     let mut client = client(1);
     let prepared = prepare(&mut client, 1, "Child");

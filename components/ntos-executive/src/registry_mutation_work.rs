@@ -10,11 +10,7 @@ use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
 use nt_thread_start::amd64_context::UserApcContinuation;
 
 struct HostedCaller {
-    publication: HostedRegistryPublication,
-    parent_owner: RegistryKeyHandlePublication,
-    parent: KeyRef,
-    leaf: String,
-    grant: u32,
+    completion: HostedCompletion,
     pi: usize,
     tid: u64,
     badge: u64,
@@ -22,6 +18,81 @@ struct HostedCaller {
     logical: ProviderLogicalCaller,
     reference: NativeThreadProcessReference,
     _continuation: UserApcContinuation,
+}
+
+enum HostedCompletion {
+    Create {
+        publication: HostedRegistryPublication,
+        parent_owner: RegistryKeyHandlePublication,
+        parent: KeyRef,
+        leaf: String,
+        grant: u32,
+    },
+    Existing {
+        key_owner: RegistryKeyHandlePublication,
+        kind: ExistingMutationKind,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ExistingMutationKind {
+    SetValue,
+    DeleteValue,
+    SetSecurity,
+    DeleteKey,
+}
+
+#[must_use = "release the exact Key reservation or transfer it to retained mutation work"]
+pub(crate) struct HostedExistingKey {
+    key: KeyRef,
+    target: CmSystemKeyTarget,
+    owner: Option<RegistryKeyHandlePublication>,
+}
+
+impl HostedExistingKey {
+    pub(crate) fn lease(&self) -> nt_config_client::SystemHiveKeyLease {
+        self.target.lease
+    }
+
+    pub(crate) fn validate(&self, information: &nt_config_client::LeasedHiveKeyInformation) -> Result<(), u32> {
+        let current = registry_key_targets::system(self.key).ok_or(0xC000_0008u32)?;
+        if current.lease != self.target.lease
+            || current.physical_path != self.target.physical_path
+            || nt_hive_core::canon_path(&information.path)
+                != nt_hive_core::canon_path(&self.target.physical_path)
+        {
+            return Err(0xC000_0008);
+        }
+        Ok(())
+    }
+
+    pub(crate) unsafe fn information(&self) -> Result<nt_config_client::LeasedHiveKeyInformation, u32> {
+        let information = config_manager_query_leased_system_hive_key_information(self.lease())
+            .map_err(|status| status as u32)?;
+        self.validate(&information)?;
+        Ok(information)
+    }
+
+    pub(crate) fn abort(mut self, handler: &mut ExecNtHandler) {
+        if let Some(target) = self.owner.take().unwrap().abort(&mut handler.pm)
+            .expect("retained existing Key admission") {
+            handler.release_registry_key_target(target);
+        }
+    }
+}
+
+/// Bind a hidden PM reference before any CM query can reenter the executive.
+pub(crate) fn retain_hosted_existing(handler: &mut ExecNtHandler, key: KeyRef) -> Result<HostedExistingKey, u32> {
+    let target = registry_key_targets::system(key).ok_or(0xC000_0008u32)?;
+    let tid = u32::try_from(handler.current_tid).map_err(|_| 0xC000_0008u32)?;
+    let lifetime = handler.pm.thread_lifetime(tid).ok_or(0xC000_0008u32)?;
+    let caller = handler.pm.capture_native_handle_caller(lifetime, nt_types::AccessMode::UserMode)?;
+    let mut owner = handler.pm.reserve_native_registry_key_handle(caller, 0)?;
+    if let Err(status) = owner.bind(&mut handler.pm, key, 0) {
+        owner.abort(&mut handler.pm).expect("unbound existing Key reservation");
+        return Err(status);
+    }
+    Ok(HostedExistingKey { key, target, owner: Some(owner) })
 }
 
 #[path = "registry_mutation_provider.rs"]
@@ -43,7 +114,8 @@ impl Caller {
 
     fn leaf(&self) -> &str {
         match self {
-            Self::Hosted(caller) => &caller.leaf,
+            Self::Hosted(HostedCaller { completion: HostedCompletion::Create { leaf, .. }, .. }) => leaf,
+            Self::Hosted(_) => unreachable!("existing-key mutation does not open a child"),
             Self::Provider(caller) => &caller.admission.leaf,
         }
     }
@@ -125,7 +197,11 @@ pub(crate) unsafe fn submit_hosted(
             (row.is_none() && EXECUTING_INDEX.load(Ordering::Relaxed) != index as u64)
                 .then_some(index));
         if index.is_none() { rows.try_reserve(1).map_err(|_| 0xC000_009Au32)?; }
-        let mut reference = handler.pm.reference_native_requestor(publication.subject.caller())?;
+        let actor = publication.subject.caller().original_thread();
+        let requestor = handler.pm.capture_native_handle_caller(
+            actor, nt_types::AccessMode::KernelMode,
+        )?;
+        let mut reference = handler.pm.reference_native_requestor(requestor)?;
         let attempt = match (&mut *core::ptr::addr_of_mut!(ATTEMPTS))
             .reserve(mount, expected_generation, &[mutation], ())
         {
@@ -142,7 +218,7 @@ pub(crate) unsafe fn submit_hosted(
         Err(status) => return Err((status, publication, parent_owner)),
     };
     let caller = HostedCaller {
-        publication, parent_owner, parent, leaf, grant,
+        completion: HostedCompletion::Create { publication, parent_owner, parent, leaf, grant },
         pi: handler.pi,
         tid: handler.current_tid,
         badge: handler.current_badge,
@@ -171,6 +247,97 @@ pub(crate) unsafe fn submit_hosted(
         None => rows.push(work),
     }
     // The row owns the live Reply before ingress can select a replacement.
+    park.commit();
+    PENDING.fetch_add(1, Ordering::Release);
+    NEXT.store(monotonic_time_100ns(), Ordering::Release);
+    assert!(!TRANSFERRED.swap(true, Ordering::AcqRel));
+    Ok(())
+}
+
+/// The existing Key remains referenced by an invisible handle until exact ACK and caller reply.
+/// A failed admission has made no CM request and releases every reservation before returning.
+pub(crate) unsafe fn submit_hosted_existing(
+    handler: &mut ExecNtHandler,
+    mut retained: HostedExistingKey,
+    expected_generation: u64,
+    mutation: SystemHiveMutation<'_>,
+) -> Result<(), u32> {
+    let _durable = allocator::enter_durable();
+    let kind = match &mutation {
+        SystemHiveMutation::SetValue { .. } => ExistingMutationKind::SetValue,
+        SystemHiveMutation::DeleteValue { .. } => ExistingMutationKind::DeleteValue,
+        SystemHiveMutation::SetKeySecurity { .. } => ExistingMutationKind::SetSecurity,
+        SystemHiveMutation::DeleteKey { .. } => ExistingMutationKind::DeleteKey,
+        _ => {
+            retained.abort(handler);
+            return Err(0xC000_000Du32);
+        }
+    };
+    let mut reference = None;
+    let admitted = (|| {
+        let tcb = handler.hosted_thread_tcb(handler.current_tid).ok_or(0xC000_0008u32)?;
+        let logical = handler.capture_provider_logical_caller(
+            handler.pi, handler.current_tid, handler.current_badge, tcb,
+        ).ok_or(0xC000_0008u32)?;
+        if u64::from(logical.thread().thread_id()) != handler.current_tid {
+            return Err(0xC000_0008u32);
+        }
+        let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT.ok_or(0xC000_00A3u32)?;
+        let park = root_reply_park::RootReplyPark::prepare().ok_or(0xC000_009Au32)?;
+        let rows = &mut *core::ptr::addr_of_mut!(WORK);
+        let index = rows.iter().enumerate().find_map(|(index, row)|
+            (row.is_none() && EXECUTING_INDEX.load(Ordering::Relaxed) != index as u64)
+                .then_some(index));
+        if index.is_none() { rows.try_reserve(1).map_err(|_| 0xC000_009Au32)?; }
+        let requestor = handler.pm.capture_native_handle_caller(
+            logical.thread(), nt_types::AccessMode::KernelMode,
+        )?;
+        reference = Some(handler.pm.reference_native_requestor(requestor)?);
+        let attempt = (&mut *core::ptr::addr_of_mut!(ATTEMPTS))
+            .reserve(mount, expected_generation, &[mutation], ())
+            .map_err(|(status, ())| status as u32)?;
+        Ok::<_, u32>((park, index, logical, attempt))
+    })();
+    let (park, index, logical, attempt) = match admitted {
+        Ok(admitted) => admitted,
+        Err(status) => {
+            if let Some(mut reference) = reference {
+                reference.release(&mut handler.pm).expect("unsubmitted registry caller");
+            }
+            retained.abort(handler);
+            return Err(status);
+        }
+    };
+    let key_owner = retained.owner.take().expect("retained existing Key owner");
+    let hosted = HostedCaller {
+        completion: HostedCompletion::Existing { key_owner, kind },
+        pi: handler.pi,
+        tid: handler.current_tid,
+        badge: handler.current_badge,
+        reply: REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+        logical,
+        reference: reference.take().expect("retained registry caller"),
+        _continuation: if handler.current_native_call_transport {
+            UserApcContinuation::NativeCall
+        } else {
+            UserApcContinuation::Fault {
+                resume_ip: handler.current_resume_ip,
+                resume_sp: handler.current_sp,
+                resume_flags: handler.current_flags,
+            }
+        },
+    };
+    assert_ne!(hosted.reply, 0);
+    let work = Some(Work {
+        caller: Caller::Hosted(hosted), phase: Phase::Begin(attempt), prepared: None, journal: None,
+        receipt: None, opening: None, status: 0,
+        cancelled: false, commit_entered: false, published: false,
+    });
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
+    match index {
+        Some(index) => rows[index] = work,
+        None => rows.push(work),
+    }
     park.commit();
     PENDING.fetch_add(1, Ordering::Release);
     NEXT.store(monotonic_time_100ns(), Ordering::Release);
@@ -411,23 +578,53 @@ unsafe fn advance(
             let receipt = cm_mutation_transport::commit(work.prepared.as_ref().unwrap())?;
             let outcome = receipt.outcome();
             CM_RUNTIME_SYSTEM_MUTATION_COMMITS.fetch_add(1, Ordering::Relaxed);
-            CM_RUNTIME_SYSTEM_CREATE_KEYS.fetch_add(1, Ordering::Relaxed);
+            match &work.caller {
+                Caller::Hosted(HostedCaller { completion: HostedCompletion::Existing { kind, .. }, .. }) => {
+                    match kind {
+                        ExistingMutationKind::SetValue => {
+                            CM_RUNTIME_SYSTEM_SET_VALUES.fetch_add(1, Ordering::Relaxed);
+                        }
+                        ExistingMutationKind::DeleteValue => {
+                            CM_RUNTIME_SYSTEM_DELETE_VALUES.fetch_add(1, Ordering::Relaxed);
+                        }
+                        ExistingMutationKind::SetSecurity => {
+                            CM_RUNTIME_SYSTEM_SET_SECURITY.fetch_add(1, Ordering::Relaxed);
+                        }
+                        ExistingMutationKind::DeleteKey => {
+                            CM_RUNTIME_SYSTEM_DELETE_KEYS.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                _ => { CM_RUNTIME_SYSTEM_CREATE_KEYS.fetch_add(1, Ordering::Relaxed); }
+            }
             LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(outcome.generation, Ordering::AcqRel);
             if outcome.has_pending_device_action {
-                CONFIG_DEVICE_ACTION_PENDING.store(true, Ordering::Release);
+                if !CONFIG_DEVICE_ACTION_PENDING.swap(true, Ordering::AcqRel) {
+                    config_manager_request_device_action_wake();
+                }
             }
             work.receipt = Some(receipt);
             work.phase = Phase::Open;
         }
         Phase::Open => {
+            if matches!(&work.caller, Caller::Hosted(HostedCaller {
+                completion: HostedCompletion::Existing { .. }, ..
+            })) {
+                work.published = !work.cancelled;
+                work.phase = Phase::Acknowledge;
+                return Ok(false);
+            }
             if work.cancelled && work.opening.is_none() {
                 work.phase = Phase::Acknowledge;
                 return Ok(false);
             }
             if work.opening.is_none() {
                 let lease = match &work.caller {
-                    Caller::Hosted(caller) => registry_key_targets::system(caller.parent)
+                    Caller::Hosted(HostedCaller {
+                        completion: HostedCompletion::Create { parent, .. }, ..
+                    }) => registry_key_targets::system(*parent)
                         .expect("retained SYSTEM parent disappeared").lease,
+                    Caller::Hosted(_) => unreachable!("existing Key does not open a child"),
                     Caller::Provider(caller) => caller.admission.parent_lease,
                 };
                 work.opening = Some(cm_key_ownership::reserve_publication_open(lease, work.caller.leaf())?);
@@ -502,12 +699,22 @@ unsafe fn advance(
             match &mut work.caller {
                 Caller::Hosted(caller) => {
                     let handler = &mut *context.as_mut().unwrap().0;
-                    if !work.published {
-                        handler.abort_hosted_registry_publication(&mut caller.publication);
-                    }
-                    if let Some(target) = caller.parent_owner.abort(&mut handler.pm)
-                        .expect("retained registry create parent") {
-                        handler.release_registry_key_target(target);
+                    match &mut caller.completion {
+                        HostedCompletion::Create { publication, parent_owner, .. } => {
+                            if !work.published {
+                                handler.abort_hosted_registry_publication(publication);
+                            }
+                            if let Some(target) = parent_owner.abort(&mut handler.pm)
+                                .expect("retained registry create parent") {
+                                handler.release_registry_key_target(target);
+                            }
+                        }
+                        HostedCompletion::Existing { key_owner, .. } => {
+                            if let Some(target) = key_owner.abort(&mut handler.pm)
+                                .expect("retained existing Key") {
+                                handler.release_registry_key_target(target);
+                            }
+                        }
                     }
                 }
                 Caller::Provider(caller) => {
@@ -593,10 +800,13 @@ unsafe fn publish_target(context: &mut HostedContext<'_>, caller: &mut Caller, t
                 handler.release_registry_key_target(target);
                 return Err(0xC000_004B);
             }
+            let HostedCompletion::Create { publication, grant, .. } = &mut caller.completion else {
+                unreachable!("existing Key has no target publication")
+            };
             let saved_pi = handler.pi;
             handler.pi = caller.pi;
             let result = handler.finish_hosted_registry_publication(
-                &mut caller.publication, target, caller.grant, true,
+                publication, target, *grant, true,
             );
             handler.pi = saved_pi;
             result
