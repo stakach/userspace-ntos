@@ -561,12 +561,6 @@ enum OwnedSystemHiveMutation {
     },
 }
 
-#[derive(Clone, Copy)]
-enum SystemHiveMutationOrigin {
-    Setup,
-    Runtime,
-}
-
 impl OwnedSystemHiveMutation {
     fn as_client_mutation(&self) -> nt_config_client::SystemHiveMutation<'_> {
         match self {
@@ -979,6 +973,8 @@ const CM_BOOT_FLAG_SETUP: u32 = 1;
 const CM_BOOT_FLAG_ACCEPTED: u32 = 2;
 const CM_BOOT_FLAG_MAX: u32 = CM_BOOT_FLAG_ACCEPTED + 999;
 static NT_SYSTEM_DEFAULT_LOCALE: AtomicU32 = AtomicU32::new(NT_DEFAULT_LOCALE_ID);
+static NT_SYSTEM_DEFAULT_LOCALE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static NT_SYSTEM_DEFAULT_LOCALE_PUBLISHING: AtomicBool = AtomicBool::new(false);
 static NT_SESSION_DEFAULT_LOCALE: AtomicU32 = AtomicU32::new(NT_DEFAULT_LOCALE_ID);
 static NT_INSTALL_UI_LANGUAGE: AtomicU32 = AtomicU32::new(NT_DEFAULT_LOCALE_ID);
 static NT_DEFAULT_UI_LANGUAGE: AtomicU32 = AtomicU32::new(NT_DEFAULT_LOCALE_ID);
@@ -989,6 +985,21 @@ pub(crate) fn default_locale_id(user_profile: bool) -> u32 {
     } else {
         NT_SYSTEM_DEFAULT_LOCALE.load(Ordering::Acquire)
     }
+}
+
+pub(crate) fn publish_system_default_locale(locale_id: u32, generation: u64) {
+    while NT_SYSTEM_DEFAULT_LOCALE_PUBLISHING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    if generation >= NT_SYSTEM_DEFAULT_LOCALE_GENERATION.load(Ordering::Acquire) {
+        NT_SYSTEM_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
+        NT_DEFAULT_UI_LANGUAGE.store(locale_id & 0xffff, Ordering::Relaxed);
+        NT_SYSTEM_DEFAULT_LOCALE_GENERATION.store(generation, Ordering::Release);
+    }
+    NT_SYSTEM_DEFAULT_LOCALE_PUBLISHING.store(false, Ordering::Release);
 }
 
 static NT_PENDING_UI_LANGUAGE: AtomicU32 = AtomicU32::new(0);
@@ -4410,7 +4421,7 @@ impl ExecNtHandler {
             return Ok(outcome);
         }
         let generation =
-            self.persist_and_publish_system_mutations(expected_generation, &mutations, SystemHiveMutationOrigin::Setup)?;
+            self.persist_and_publish_system_mutations(expected_generation, &mutations)?;
         print_str(b"[timezone-setup] ReactOS timezone index=");
         print_u64(selected_index as u64);
         print_str(b" selected from ");
@@ -4432,22 +4443,14 @@ impl ExecNtHandler {
         &mut self,
         expected_generation: u64,
         mutations: &[OwnedSystemHiveMutation],
-        origin: SystemHiveMutationOrigin,
     ) -> Result<u64, u32> {
         let client_mutations: alloc::vec::Vec<_> = mutations
             .iter()
             .map(OwnedSystemHiveMutation::as_client_mutation)
             .collect();
-        let outcome =
-            match unsafe { crate::persist_and_publish_system_hive_mutation(expected_generation, &client_mutations) } {
-                Ok(outcome) => outcome,
-                Err(status) => {
-                    if matches!(origin, SystemHiveMutationOrigin::Runtime) {
-                        CM_RUNTIME_SYSTEM_MUTATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                    }
-                    return Err(status);
-                }
-            };
+        let outcome = unsafe {
+            crate::persist_and_publish_system_hive_mutation(expected_generation, &client_mutations)
+        }?;
         if outcome.wake_device_action {
             unsafe { self.pnp_signal_pending_action() };
         }
@@ -4456,28 +4459,6 @@ impl ExecNtHandler {
                 None,
                 mutations.len().min(u32::MAX as usize) as u32,
             );
-        }
-        if matches!(origin, SystemHiveMutationOrigin::Runtime) {
-            CM_RUNTIME_SYSTEM_MUTATION_COMMITS.fetch_add(1, Ordering::Relaxed);
-            for mutation in mutations {
-                match mutation {
-                    OwnedSystemHiveMutation::CreateKey { .. } => {
-                        CM_RUNTIME_SYSTEM_CREATE_KEYS.fetch_add(1, Ordering::Relaxed);
-                    }
-                    OwnedSystemHiveMutation::SetValue { .. } => {
-                        CM_RUNTIME_SYSTEM_SET_VALUES.fetch_add(1, Ordering::Relaxed);
-                    }
-                    OwnedSystemHiveMutation::DeleteValue { .. } => {
-                        CM_RUNTIME_SYSTEM_DELETE_VALUES.fetch_add(1, Ordering::Relaxed);
-                    }
-                    OwnedSystemHiveMutation::DeleteKey { .. } => {
-                        CM_RUNTIME_SYSTEM_DELETE_KEYS.fetch_add(1, Ordering::Relaxed);
-                    }
-                    OwnedSystemHiveMutation::SetKeySecurity { .. } => {
-                        CM_RUNTIME_SYSTEM_SET_SECURITY.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
         }
         Ok(outcome.generation)
     }
@@ -4557,7 +4538,7 @@ impl ExecNtHandler {
             return;
         }
         let generation = match self
-            .persist_and_publish_system_mutations(expected_generation, &mutations, SystemHiveMutationOrigin::Setup)
+            .persist_and_publish_system_mutations(expected_generation, &mutations)
         {
             Ok(generation) => generation,
             Err(status) => {
@@ -4655,7 +4636,7 @@ impl ExecNtHandler {
             return;
         }
         let generation = match self
-            .persist_and_publish_system_mutations(expected_generation, &mutations, SystemHiveMutationOrigin::Setup)
+            .persist_and_publish_system_mutations(expected_generation, &mutations)
         {
             Ok(generation) => generation,
             Err(status) => {
@@ -4931,7 +4912,7 @@ impl ExecNtHandler {
             None
         } else {
             match self
-                .persist_and_publish_system_mutations(expected_generation, &mutations, SystemHiveMutationOrigin::Setup)
+                .persist_and_publish_system_mutations(expected_generation, &mutations)
             {
                 Ok(generation) => {
                     Some(generation)
@@ -7502,32 +7483,37 @@ impl ExecNtHandler {
         }
     }
 
-    fn locale_id_from_registry_value(&self, user_profile: bool) -> Result<u32, u32> {
+    fn locale_id_from_registry_value(&self, user_profile: bool) -> Result<(u32, u64), u32> {
         const REG_DWORD: u32 = 4;
         const REG_SZ: u32 = 1;
         let (path, value_name) = self.locale_registry_path_and_value(user_profile);
-        let (ty, data) = if user_profile {
-            self.mutable_registry_value_by_path(&path, value_name)
+        let (ty, data, generation) = if user_profile {
+            let (ty, data) = self.mutable_registry_value_by_path(&path, value_name)
                 .or_else(|| {
                     let key = self.resolve_key(&path)?;
                     self.registry_value(key, value_name)
                 })
-                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?
+                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+            (ty, data, 0)
         } else {
-            query_system_hive_value(&path, value_name)?
-                .map(|(value_type, data)| (value_type as u32, data))
-                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?
+            with_system_hive_key_lease(&path, |lease| {
+                let lease = lease.ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+                let value = unsafe { config_manager_query_leased_system_hive_value(lease, value_name) }
+                    .map_err(|status| status as u32)?;
+                Ok((value.value_type, value.data, value.mount_generation))
+            })?
         };
-        if ty == REG_DWORD && data.len() == core::mem::size_of::<u32>() {
-            Ok(u32::from_le_bytes(data[..4].try_into().unwrap()))
+        let locale_id = if ty == REG_DWORD && data.len() == core::mem::size_of::<u32>() {
+            u32::from_le_bytes(data[..4].try_into().unwrap())
         } else if ty == REG_SZ {
-            parse_utf16le_ascii_hex_u32(&data).ok_or(STATUS_UNSUCCESSFUL)
+            parse_utf16le_ascii_hex_u32(&data).ok_or(STATUS_UNSUCCESSFUL)?
         } else {
-            Err(STATUS_UNSUCCESSFUL)
-        }
+            return Err(STATUS_UNSUCCESSFUL);
+        };
+        Ok((locale_id, generation))
     }
 
-    fn persist_default_locale(&mut self, user_profile: bool, locale_id: u32) -> Result<(), u32> {
+    fn persist_default_locale(&mut self, user_profile: bool, locale_id: u32) -> Result<Option<u64>, u32> {
         const REG_SZ: u32 = 1;
         let (path, value_name) = self.locale_registry_path_and_value(user_profile);
         let mut ascii8 = [0u8; 8];
@@ -7542,33 +7528,49 @@ impl ExecNtHandler {
         let mut data = [0u8; 18];
         let len = utf16le_ascii_z(ascii, &mut data).ok_or(STATUS_INVALID_PARAMETER)?;
         if !user_profile {
-            let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-            let value_type = nt_hive_core::RegistryValueType::Sz;
-            if !system_hive_key_exists(&path)? {
-                return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+            let opened = unsafe { config_manager_open_system_hive_key(&path) }
+                .map_err(|status| status as u32)?;
+            let lease = opened.lease;
+            let current = (|| {
+                let information = unsafe { config_manager_query_leased_system_hive_key_information(lease) }
+                    .map_err(|status| status as u32)?;
+                let generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+                if information.mount_generation != generation
+                    || nt_hive_core::canon_path(&information.path)
+                        != nt_hive_core::canon_path(&opened.physical_path)
+                {
+                    return Err(0xC000_022D);
+                }
+                let unchanged = match unsafe { config_manager_query_leased_system_hive_value(lease, value_name) } {
+                    Ok(value) => value.mount_generation == generation
+                        && value.value_type == REG_SZ && value.data == &data[..len],
+                    Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => false,
+                    Err(status) => return Err(status as u32),
+                };
+                Ok((generation, information.path, unchanged))
+            })();
+            let (generation, physical_path, unchanged) = match current {
+                Ok(current) => current,
+                Err(status) => {
+                    let _ = unsafe { config_manager_retire_system_hive_key(lease) };
+                    return Err(status);
+                }
+            };
+            if unchanged {
+                unsafe { config_manager_retire_system_hive_key(lease) }
+                    .map_err(|status| status as u32)?;
+                return Ok(Some(generation));
             }
-            if query_system_hive_value(&path, value_name)?.is_some_and(
-                |(existing_type, existing)| existing_type == value_type && existing == &data[..len],
-            ) {
-                return Ok(());
-            }
-            self.persist_and_publish_system_mutations(
-                expected_generation,
-                &[OwnedSystemHiveMutation::SetValue {
-                    path,
-                    name: value_name.into(),
-                    value_type,
-                    data: data[..len].to_vec(),
-                }],
-                SystemHiveMutationOrigin::Runtime,
-            )?;
-            return Ok(());
+            unsafe { crate::registry_mutation_work::submit_hosted_system_locale(
+                self, lease, generation, &physical_path, value_name, &data[..len], locale_id,
+            ) }?;
+            return Ok(None);
         }
         if self.mutable_registry_key_by_path(&path).is_none() {
             return Err(STATUS_OBJECT_NAME_NOT_FOUND);
         }
         self.ensure_mutable_registry_value_by_path(&path, value_name, REG_SZ, &data[..len])
-            .map(|_| ())
+            .map(|_| Some(0))
             .ok_or(STATUS_UNSUCCESSFUL)
     }
 
@@ -7576,19 +7578,32 @@ impl ExecNtHandler {
         if locale_id & NT_BOGUS_LOCALE_ID != 0 {
             return STATUS_INVALID_PARAMETER;
         }
+        let mut generation = 0;
         if locale_id == 0 {
             match self.locale_id_from_registry_value(user_profile) {
-                Ok(found) => locale_id = found,
+                Ok((found, observed_generation)) => {
+                    locale_id = found;
+                    generation = observed_generation;
+                }
                 Err(status) => return status,
             }
-        } else if let Err(status) = self.persist_default_locale(user_profile, locale_id) {
-            return status;
+        } else {
+            match self.persist_default_locale(user_profile, locale_id) {
+                Ok(None) => return 0x103,
+                Ok(Some(observed_generation)) => generation = observed_generation,
+                Err(status) => return status,
+            }
         }
         if user_profile {
             NT_SESSION_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
         } else {
-            NT_SYSTEM_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
-            NT_DEFAULT_UI_LANGUAGE.store(locale_id & 0xffff, Ordering::Relaxed);
+            if generation != crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) {
+                return 0xC000_022D;
+            }
+            if crate::registry_mutation_work::system_locale_pending() {
+                return 0xC000_022D;
+            }
+            publish_system_default_locale(locale_id, generation);
         }
         0
     }

@@ -23,31 +23,8 @@ impl ExecNtHandler {
             .err()
             .map_or(0, |status| status as u32);
         }
-        if let Some(target) = self.cm_system_key_target(key) {
-            let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(value_type) else {
-                return STATUS_INVALID_PARAMETER;
-            };
-            let generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-            let information = match crate::config_manager_query_leased_system_hive_key_information(
-                target.lease,
-            ) {
-                Ok(information) if information.mount_generation == generation => information,
-                Ok(_) => return 0xC000_022D,
-                Err(status) => return status as u32,
-            };
-            return self
-                .persist_and_publish_system_mutations(
-                    generation,
-                    &[OwnedSystemHiveMutation::SetValue {
-                        path: information.path,
-                        name: name.into(),
-                        value_type,
-                        data: data.to_vec(),
-                    }],
-                    SystemHiveMutationOrigin::Runtime,
-                )
-                .err()
-                .unwrap_or(0);
+        if self.cm_system_key_target(key).is_some() {
+            unreachable!("SYSTEM value SET requires retained mutation work");
         }
         if let Some(index) = overlay_key_idx(key) {
             return if self
@@ -85,26 +62,8 @@ impl ExecNtHandler {
             .err()
             .map_or(0, |status| status as u32);
         }
-        if let Some(target) = self.cm_system_key_target(key) {
-            let generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-            let information = match crate::config_manager_query_leased_system_hive_key_information(
-                target.lease,
-            ) {
-                Ok(information) if information.mount_generation == generation => information,
-                Ok(_) => return 0xC000_022D,
-                Err(status) => return status as u32,
-            };
-            return self
-                .persist_and_publish_system_mutations(
-                    generation,
-                    &[OwnedSystemHiveMutation::DeleteValue {
-                        path: information.path,
-                        name: name.into(),
-                    }],
-                    SystemHiveMutationOrigin::Runtime,
-                )
-                .err()
-                .unwrap_or(0);
+        if self.cm_system_key_target(key).is_some() {
+            unreachable!("SYSTEM value DELETE requires retained mutation work");
         }
         if let Some(index) = overlay_key_idx(key) {
             if self.overlay.path(index).is_none() {

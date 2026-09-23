@@ -32,6 +32,7 @@ enum HostedCompletion {
         key_owner: RegistryKeyHandlePublication,
         kind: ExistingMutationKind,
     },
+    SystemLocale { lease: SystemHiveKeyLease, locale_id: u32 },
 }
 
 #[derive(Clone, Copy)]
@@ -118,7 +119,7 @@ impl Caller {
     fn leaf(&self) -> &str {
         match self {
             Self::Hosted(HostedCaller { completion: HostedCompletion::Create { leaf, .. }, .. }) => leaf,
-            Self::Hosted(_) => unreachable!("existing-key mutation does not open a child"),
+            Self::Hosted(_) => unreachable!("non-create mutation does not open a child"),
             Self::Provider(provider::ProviderCaller {
                 admission: provider::ProviderAdmission::Create(admission), ..
             }) => &admission.leaf,
@@ -169,6 +170,7 @@ static mut ATTEMPTS: CmMutationBeginAttempts = CmMutationBeginAttempts::new();
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static PENDING: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_LOCALE_PENDING: AtomicU64 = AtomicU64::new(0);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 static TRANSFERRED: AtomicBool = AtomicBool::new(false);
@@ -260,6 +262,48 @@ pub(crate) unsafe fn submit_hosted(
     Ok(())
 }
 
+type HostedMutationAdmission = (
+    root_reply_park::RootReplyPark,
+    Option<usize>,
+    ProviderLogicalCaller,
+    NativeThreadProcessReference,
+    CmMutationBeginAttempt<()>,
+);
+
+unsafe fn admit_hosted_mutation(
+    handler: &mut ExecNtHandler,
+    expected_generation: u64,
+    mutation: SystemHiveMutation<'_>,
+) -> Result<HostedMutationAdmission, u32> {
+    let tcb = handler.hosted_thread_tcb(handler.current_tid).ok_or(0xC000_0008u32)?;
+    let logical = handler.capture_provider_logical_caller(
+        handler.pi, handler.current_tid, handler.current_badge, tcb,
+    ).ok_or(0xC000_0008u32)?;
+    if u64::from(logical.thread().thread_id()) != handler.current_tid {
+        return Err(0xC000_0008);
+    }
+    let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT.ok_or(0xC000_00A3u32)?;
+    let park = root_reply_park::RootReplyPark::prepare().ok_or(0xC000_009Au32)?;
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
+    let index = rows.iter().enumerate().find_map(|(index, row)|
+        (row.is_none() && EXECUTING_INDEX.load(Ordering::Relaxed) != index as u64)
+            .then_some(index));
+    if index.is_none() { rows.try_reserve(1).map_err(|_| 0xC000_009Au32)?; }
+    let requestor = handler.pm.capture_native_handle_caller(
+        logical.thread(), nt_types::AccessMode::KernelMode,
+    )?;
+    let mut reference = handler.pm.reference_native_requestor(requestor)?;
+    let attempt = match (&mut *core::ptr::addr_of_mut!(ATTEMPTS))
+        .reserve(mount, expected_generation, &[mutation], ()) {
+        Ok(attempt) => attempt,
+        Err((status, ())) => {
+            reference.release(&mut handler.pm).expect("unsubmitted registry caller");
+            return Err(status as u32);
+        }
+    };
+    Ok((park, index, logical, reference, attempt))
+}
+
 /// The existing Key remains referenced by an invisible handle until exact ACK and caller reply.
 /// A failed admission has made no CM request and releases every reservation before returning.
 pub(crate) unsafe fn submit_hosted_existing(
@@ -279,37 +323,11 @@ pub(crate) unsafe fn submit_hosted_existing(
             return Err(0xC000_000Du32);
         }
     };
-    let mut reference = None;
-    let admitted = (|| {
-        let tcb = handler.hosted_thread_tcb(handler.current_tid).ok_or(0xC000_0008u32)?;
-        let logical = handler.capture_provider_logical_caller(
-            handler.pi, handler.current_tid, handler.current_badge, tcb,
-        ).ok_or(0xC000_0008u32)?;
-        if u64::from(logical.thread().thread_id()) != handler.current_tid {
-            return Err(0xC000_0008u32);
-        }
-        let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT.ok_or(0xC000_00A3u32)?;
-        let park = root_reply_park::RootReplyPark::prepare().ok_or(0xC000_009Au32)?;
-        let rows = &mut *core::ptr::addr_of_mut!(WORK);
-        let index = rows.iter().enumerate().find_map(|(index, row)|
-            (row.is_none() && EXECUTING_INDEX.load(Ordering::Relaxed) != index as u64)
-                .then_some(index));
-        if index.is_none() { rows.try_reserve(1).map_err(|_| 0xC000_009Au32)?; }
-        let requestor = handler.pm.capture_native_handle_caller(
-            logical.thread(), nt_types::AccessMode::KernelMode,
-        )?;
-        reference = Some(handler.pm.reference_native_requestor(requestor)?);
-        let attempt = (&mut *core::ptr::addr_of_mut!(ATTEMPTS))
-            .reserve(mount, expected_generation, &[mutation], ())
-            .map_err(|(status, ())| status as u32)?;
-        Ok::<_, u32>((park, index, logical, attempt))
-    })();
-    let (park, index, logical, attempt) = match admitted {
+    let (park, index, logical, reference, attempt) = match admit_hosted_mutation(
+        handler, expected_generation, mutation,
+    ) {
         Ok(admitted) => admitted,
         Err(status) => {
-            if let Some(mut reference) = reference {
-                reference.release(&mut handler.pm).expect("unsubmitted registry caller");
-            }
             retained.abort(handler);
             return Err(status);
         }
@@ -322,7 +340,7 @@ pub(crate) unsafe fn submit_hosted_existing(
         badge: handler.current_badge,
         reply: REPLY_MAIN_SLOT.load(Ordering::Relaxed),
         logical,
-        reference: reference.take().expect("retained registry caller"),
+        reference,
         _continuation: if handler.current_native_call_transport {
             UserApcContinuation::NativeCall
         } else {
@@ -351,8 +369,70 @@ pub(crate) unsafe fn submit_hosted_existing(
     Ok(())
 }
 
+/// The exact SYSTEM key lease and caller Reply remain owned until CM acknowledgement.
+pub(crate) unsafe fn submit_hosted_system_locale(
+    handler: &mut ExecNtHandler,
+    lease: SystemHiveKeyLease,
+    expected_generation: u64,
+    path: &str,
+    name: &str,
+    data: &[u8],
+    locale_id: u32,
+) -> Result<(), u32> {
+    let _durable = allocator::enter_durable();
+    let mutation = SystemHiveMutation::SetValue { path, name, value_type: 1, data };
+    let (park, index, logical, reference, attempt) = match admit_hosted_mutation(
+        handler, expected_generation, mutation,
+    ) {
+        Ok(admitted) => admitted,
+        Err(status) => {
+            let _ = config_manager_retire_system_hive_key(lease);
+            return Err(status);
+        }
+    };
+    let caller = HostedCaller {
+        completion: HostedCompletion::SystemLocale { lease, locale_id },
+        pi: handler.pi,
+        tid: handler.current_tid,
+        badge: handler.current_badge,
+        reply: REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+        logical,
+        reference,
+        _continuation: if handler.current_native_call_transport {
+            UserApcContinuation::NativeCall
+        } else {
+            UserApcContinuation::Fault {
+                resume_ip: handler.current_resume_ip,
+                resume_sp: handler.current_sp,
+                resume_flags: handler.current_flags,
+            }
+        },
+    };
+    assert_ne!(caller.reply, 0);
+    let work = Some(Work {
+        caller: Caller::Hosted(caller), phase: Phase::Begin(attempt), prepared: None, journal: None,
+        receipt: None, opening: None, status: 0,
+        cancelled: false, commit_entered: false, published: false,
+    });
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
+    match index {
+        Some(index) => rows[index] = work,
+        None => rows.push(work),
+    }
+    park.commit();
+    SYSTEM_LOCALE_PENDING.fetch_add(1, Ordering::Release);
+    PENDING.fetch_add(1, Ordering::Release);
+    NEXT.store(monotonic_time_100ns(), Ordering::Release);
+    assert!(!TRANSFERRED.swap(true, Ordering::AcqRel));
+    Ok(())
+}
+
 pub(crate) fn take_transferred() -> bool {
     TRANSFERRED.swap(false, Ordering::AcqRel)
+}
+
+pub(crate) fn system_locale_pending() -> bool {
+    SYSTEM_LOCALE_PENDING.load(Ordering::Acquire) != 0
 }
 
 pub(crate) fn has_thread(tid: u64) -> bool {
@@ -601,6 +681,9 @@ unsafe fn advance(
                         }
                     }
                 }
+                Caller::Hosted(HostedCaller { completion: HostedCompletion::SystemLocale { .. }, .. }) => {
+                    CM_RUNTIME_SYSTEM_SET_VALUES.fetch_add(1, Ordering::Relaxed);
+                }
                 Caller::Provider(provider::ProviderCaller {
                     admission: provider::ProviderAdmission::Existing(admission), ..
                 }) => match &admission.mutation {
@@ -624,7 +707,7 @@ unsafe fn advance(
         }
         Phase::Open => {
             if matches!(&work.caller, Caller::Hosted(HostedCaller {
-                completion: HostedCompletion::Existing { .. }, ..
+                completion: HostedCompletion::Existing { .. } | HostedCompletion::SystemLocale { .. }, ..
             }) | Caller::Provider(provider::ProviderCaller {
                 admission: provider::ProviderAdmission::Existing(_), ..
             })) {
@@ -642,7 +725,7 @@ unsafe fn advance(
                         completion: HostedCompletion::Create { parent, .. }, ..
                     }) => registry_key_targets::system(*parent)
                         .expect("retained SYSTEM parent disappeared").lease,
-                    Caller::Hosted(_) => unreachable!("existing Key does not open a child"),
+                    Caller::Hosted(_) => unreachable!("non-create mutation does not open a child"),
                     Caller::Provider(provider::ProviderCaller {
                         admission: provider::ProviderAdmission::Create(admission), ..
                     }) => admission.parent_lease,
@@ -688,6 +771,13 @@ unsafe fn advance(
                         return Err(0xC000_000Du32 as i32);
                     }
                 }
+            }
+            if let Caller::Hosted(HostedCaller {
+                completion: HostedCompletion::SystemLocale { locale_id, .. }, ..
+            }) = &work.caller {
+                crate::exec_handler::publish_system_default_locale(
+                    *locale_id, work.receipt.unwrap().outcome().generation,
+                );
             }
             work.phase = Phase::Complete;
         }
@@ -735,6 +825,11 @@ unsafe fn advance(
                                 .expect("retained existing Key") {
                                 handler.release_registry_key_target(target);
                             }
+                        }
+                        HostedCompletion::SystemLocale { lease, .. } => {
+                            // Failed close effects remain owned by the CM lease journal.
+                            let _ = config_manager_retire_system_hive_key(*lease);
+                            SYSTEM_LOCALE_PENDING.fetch_sub(1, Ordering::AcqRel);
                         }
                     }
                 }
