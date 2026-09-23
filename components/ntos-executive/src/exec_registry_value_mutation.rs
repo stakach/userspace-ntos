@@ -143,6 +143,30 @@ impl ExecNtHandler {
                 return status;
             }
         }
+        if let Some(target) = self.cm_system_key_target(key) {
+            if nt_hive_core::RegistryValueType::from_u32(nt_ulong_arg(args[3])).is_none() {
+                return STATUS_INVALID_PARAMETER;
+            }
+            let generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+            let information = match crate::config_manager_query_leased_system_hive_key_information(target.lease) {
+                Ok(information) if information.mount_generation == generation => information,
+                Ok(_) => return 0xC000_022D,
+                Err(status) => return status as u32,
+            };
+            return match crate::registry_mutation_work::submit_hosted_existing(
+                self, key, generation,
+                nt_config_client::SystemHiveMutation::SetValue {
+                    path: &information.path,
+                    name: &name,
+                    value_type: nt_ulong_arg(args[3]),
+                    data: &data,
+                },
+                crate::registry_mutation_work::ExistingMutationKind::SetValue,
+            ) {
+                Ok(()) => 0x103,
+                Err(status) => status,
+            };
+        }
         self.registry_target_set_value(key, &name, nt_ulong_arg(args[3]), &data)
     }
 
@@ -155,6 +179,25 @@ impl ExecNtHandler {
             Ok(name) => name,
             Err(status) => return status,
         };
+        if let Some(target) = self.cm_system_key_target(key) {
+            let generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+            let information = match crate::config_manager_query_leased_system_hive_key_information(target.lease) {
+                Ok(information) if information.mount_generation == generation => information,
+                Ok(_) => return 0xC000_022D,
+                Err(status) => return status as u32,
+            };
+            return match crate::registry_mutation_work::submit_hosted_existing(
+                self, key, generation,
+                nt_config_client::SystemHiveMutation::DeleteValue {
+                    path: &information.path,
+                    name: &name,
+                },
+                crate::registry_mutation_work::ExistingMutationKind::DeleteValue,
+            ) {
+                Ok(()) => 0x103,
+                Err(status) => status,
+            };
+        }
         self.registry_target_delete_value(key, &name)
     }
 }
