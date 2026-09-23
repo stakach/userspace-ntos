@@ -1,6 +1,6 @@
 //! Owned UTF-16 strings and the NT path parser (`alloc` only).
 
-use alloc::vec::Vec;
+use alloc::{collections::TryReserveError, vec::Vec};
 use nt_status::NtStatus;
 
 /// The NT path separator (`\`).
@@ -24,6 +24,19 @@ impl UnicodeString {
         Self {
             units: units.to_vec(),
         }
+    }
+
+    /// Take ownership of UTF-16 code units without copying them.
+    pub fn from_owned_units(units: Vec<u16>) -> Self {
+        Self { units }
+    }
+
+    /// Build from UTF-8 while reporting allocation failure to the caller.
+    pub fn try_from_str(s: &str) -> Result<Self, TryReserveError> {
+        let mut units = Vec::new();
+        units.try_reserve_exact(s.encode_utf16().count())?;
+        units.extend(s.encode_utf16());
+        Ok(Self { units })
     }
 
     /// Build from a Rust `&str` (UTF-8 → UTF-16). Handy for tests and static
@@ -235,6 +248,7 @@ impl NtPath {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
     use super::*;
 
     fn p(s: &str) -> Result<NtPath, NtStatus> {
@@ -277,6 +291,26 @@ mod tests {
         assert!(a.eq_ignore_ascii_case(&b));
         assert_eq!(a.to_ascii_folded(), UnicodeString::from_str("event"));
         assert_ne!(a, b); // exact comparison still distinguishes
+    }
+
+    #[test]
+    fn owned_units_reuse_the_original_allocation() {
+        let units = vec![b'A' as u16, 0x03a9, 0xd83d, 0xde00];
+        let original = units.as_ptr();
+        let text = UnicodeString::from_owned_units(units);
+        assert_eq!(text.as_units().as_ptr(), original);
+        assert_eq!(text.as_units(), &[b'A' as u16, 0x03a9, 0xd83d, 0xde00]);
+    }
+
+    #[test]
+    fn fallible_utf8_conversion_preserves_utf16_units() {
+        for text in ["", "ASCII", "Ω", "A😀Z"] {
+            let converted = UnicodeString::try_from_str(text).unwrap();
+            assert_eq!(
+                converted.as_units(),
+                text.encode_utf16().collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

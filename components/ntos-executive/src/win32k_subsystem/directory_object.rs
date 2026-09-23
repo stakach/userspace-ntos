@@ -11,9 +11,19 @@ const PUBLISH: u64 = 5;
 const ABORT: u64 = 6;
 const CLOSE: u64 = 7;
 const ACK: u64 = 8;
+const QUERY_MULTI_CONTINUE: u64 = 9;
+const QUERY_MULTI_RESTART: u64 = 10;
+const QUERY_SINGLE_CONTINUE: u64 = 11;
+const QUERY_SINGLE_RESTART: u64 = 12;
+const QUERY_READ: u64 = 13;
+const QUERY_ACK: u64 = 14;
 const MAX_NAME_UNITS: usize = 1024;
 const MAX_COMPONENT_UNITS: usize = 128;
 const STATUS_OBJECT_NAME_INVALID: i32 = 0xC000_0033u32 as i32;
+const STATUS_DATATYPE_MISALIGNMENT: i32 = 0x8000_0002u32 as i32;
+const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001au32 as i32;
+const STATUS_MORE_ENTRIES: i32 = 0x0000_0105;
+const QUERY_CHUNK_BYTES: usize = 24;
 
 struct DirectoryName {
     root: u64,
@@ -191,4 +201,110 @@ pub(super) extern "win64" fn open(
 
 pub(super) unsafe fn close(handle: u64) -> i32 {
     call(CLOSE, handle, 0, 0, false).0
+}
+
+unsafe fn query_call(op: u64, first: u64, second: u64, third: u64) -> (i32, u64, u64, u64) {
+    let (info, raw, out1, out2, out3) =
+        crate::driver_launch::call_on4_raw((LABEL << 12) | 4, op, first, second, third);
+    let canonical_status = raw == raw as u32 as u64 || raw == raw as u32 as i32 as i64 as u64;
+    if info != 4 || !canonical_status {
+        crate::provider_bugcheck::report(0xc4, [LABEL, op, info, raw]);
+    }
+    (raw as u32 as i32, out1, out2, out3)
+}
+
+/// Unbound until native name, security, and typed-close contracts are ready for import cutover.
+#[allow(dead_code)]
+pub(super) extern "win64" fn query(
+    handle: u64,
+    buffer: *mut u8,
+    length: u32,
+    single: u8,
+    restart: u8,
+    context: *mut u32,
+    return_length: *mut u32,
+) -> i32 {
+    unsafe {
+        if context.is_null() || (length != 0 && buffer.is_null()) {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+        if (context as usize) & 3 != 0
+            || (!return_length.is_null() && (return_length as usize) & 3 != 0)
+            || (length != 0 && (buffer as usize) & 1 != 0)
+        {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        let operation = match (single != 0, restart != 0) {
+            (false, false) => QUERY_MULTI_CONTINUE,
+            (false, true) => QUERY_MULTI_RESTART,
+            (true, false) => QUERY_SINGLE_CONTINUE,
+            (true, true) => QUERY_SINGLE_RESTART,
+        };
+        let current = if restart != 0 { 0 } else { read_unaligned(context) };
+        let request = (u64::from(current) << 32) | u64::from(length);
+        let (status, token, lengths, next_context) =
+            query_call(operation, handle, buffer as u64, request);
+        if !matches!(
+            status,
+            0 | STATUS_MORE_ENTRIES | STATUS_NO_MORE_ENTRIES | STATUS_BUFFER_TOO_SMALL_I32
+        ) {
+            if token != 0 || lengths != 0 || next_context != 0 {
+                crate::provider_bugcheck::report(0xc4, [LABEL, operation, token, lengths]);
+            }
+            return status;
+        }
+        let written = lengths as u32 as usize;
+        let required = (lengths >> 32) as u32;
+        let valid_result = match status {
+            0 => written >= 32 && required as usize == written,
+            STATUS_MORE_ENTRIES => written == 0 && required >= 32,
+            STATUS_NO_MORE_ENTRIES => {
+                required == 32 && written == if length >= 32 { 32 } else { 0 }
+            }
+            STATUS_BUFFER_TOO_SMALL_I32 => written == 0 && required > length,
+            _ => false,
+        };
+        if next_context > u32::MAX as u64
+            || written > length as usize
+            || (written == 0) != (token == 0)
+            || !valid_result
+        {
+            crate::provider_bugcheck::report(0xc4, [LABEL, operation, token, lengths]);
+        }
+        for offset in (0..written).step_by(QUERY_CHUNK_BYTES) {
+            let count = (written - offset).min(QUERY_CHUNK_BYTES);
+            let (read_status, a, b, c) =
+                query_call(QUERY_READ, token, offset as u64, count as u64);
+            if read_status != 0 {
+                crate::provider_bugcheck::report(
+                    0xc4,
+                    [LABEL, QUERY_READ, token, read_status as u32 as u64],
+                );
+            }
+            let mut bytes = [0u8; QUERY_CHUNK_BYTES];
+            bytes[..8].copy_from_slice(&a.to_le_bytes());
+            bytes[8..16].copy_from_slice(&b.to_le_bytes());
+            bytes[16..24].copy_from_slice(&c.to_le_bytes());
+            if bytes[count..].iter().any(|&byte| byte != 0) {
+                crate::provider_bugcheck::report(0xc4, [LABEL, QUERY_READ, token, count as u64]);
+            }
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.add(offset), count);
+        }
+        if status >= 0 {
+            write_unaligned(context, next_context as u32);
+        }
+        if !return_length.is_null() {
+            write_unaligned(return_length, required);
+        }
+        if token != 0 {
+            let (ack_status, a, b, c) = query_call(QUERY_ACK, token, 0, 0);
+            if ack_status != 0 || a != 0 || b != 0 || c != 0 {
+                crate::provider_bugcheck::report(
+                    0xc4,
+                    [LABEL, QUERY_ACK, token, ack_status as u32 as u64],
+                );
+            }
+        }
+        status
+    }
 }
