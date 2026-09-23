@@ -35,7 +35,7 @@ enum HostedCompletion {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum ExistingMutationKind {
+enum ExistingMutationKind {
     SetValue,
     DeleteValue,
 }
@@ -206,9 +206,13 @@ pub(crate) unsafe fn submit_hosted_existing(
     key: KeyRef,
     expected_generation: u64,
     mutation: SystemHiveMutation<'_>,
-    kind: ExistingMutationKind,
 ) -> Result<(), u32> {
     let _durable = allocator::enter_durable();
+    let kind = match &mutation {
+        SystemHiveMutation::SetValue { .. } => ExistingMutationKind::SetValue,
+        SystemHiveMutation::DeleteValue { .. } => ExistingMutationKind::DeleteValue,
+        _ => return Err(0xC000_000Du32),
+    };
     let tcb = handler.hosted_thread_tcb(handler.current_tid).ok_or(0xC000_0008u32)?;
     let logical = handler.capture_provider_logical_caller(
         handler.pi, handler.current_tid, handler.current_badge, tcb,

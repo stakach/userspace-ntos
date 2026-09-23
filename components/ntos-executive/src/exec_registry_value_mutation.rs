@@ -161,7 +161,6 @@ impl ExecNtHandler {
                     value_type: nt_ulong_arg(args[3]),
                     data: &data,
                 },
-                crate::registry_mutation_work::ExistingMutationKind::SetValue,
             ) {
                 Ok(()) => 0x103,
                 Err(status) => status,
@@ -192,7 +191,6 @@ impl ExecNtHandler {
                     path: &information.path,
                     name: &name,
                 },
-                crate::registry_mutation_work::ExistingMutationKind::DeleteValue,
             ) {
                 Ok(()) => 0x103,
                 Err(status) => status,
