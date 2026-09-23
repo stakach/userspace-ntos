@@ -281,3 +281,9 @@ diagnosis-free failure.
   receive checkpoint, outside memory-only retirement transactions.
 - Nested worker startup needs the same parent execution hold as nested dispatch. Do not restore
   the parent after failed startup until the child has acknowledged stop and completed its drain.
+
+## Verify microkernel semantics before tightening them
+- An occupied same-size x86 page leaf is not necessarily an illegal map. Upstream seL4 permits a
+  different frame cap to replace a 4 KiB PTE, and rust-micro tests that behavior. When two services
+  disagree about a shared frame after a map, audit the executive's VA allocation and frame ownership
+  first; do not change the microkernel's map contract based on the collision symptom alone.
