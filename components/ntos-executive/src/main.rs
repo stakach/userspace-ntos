@@ -1164,7 +1164,12 @@ const NT_HIVE_IMAGE_MAGIC_LE: u64 = 0x3145_5649_4854_4E55; // "UNTHIVE1"
 /// NtAllocateLocallyUniqueId — line 16 of `sysfuncs.lst` (0-based index 15). msgina's `MyLogonUser`
 /// calls it (via `AllocateLocallyUniqueId`) to mint the interactive logon session's LUID.
 pub const SSN_NT_ALLOCATE_LOCALLY_UNIQUE_ID: u64 = 15;
-pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_1052_0000;
+/// Dedicated executive-only window for the small PE loader selftest. It must not
+/// alias the shared service rings or any hosted process scratch mapping.
+pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_4800_0000;
+pub const PE_SCRATCH_BYTES: u64 = 0x20_0000;
+const _: () = assert!(PE_SCRATCH_VADDR >= PRIVATE_VM_LIMIT);
+const _: () = assert!(PE_SCRATCH_VADDR + PE_SCRATCH_BYTES <= driver_launch::FSD_EXEC_BASE);
 /// The loaded PE's Windows environment: TEB + PEB (in the PE's existing PT) and
 /// KUSER_SHARED_DATA at its fixed low VA (its own PT chain). The thread's GS base is set to
 /// TEB_VA so `GS:[0x30]` is the TEB self-pointer (NtCurrentTeb).
@@ -29419,6 +29424,1057 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     shared_ingress_selftest::run();
 
+    let installed_state = exec_handler::provision_reactos_installed_boot_state()
+        .unwrap_or_else(|status| {
+            print_str(b"[setup-state] installed-boot transaction failed status=0x");
+            print_hex(status);
+            print_str(b"\n");
+            panic!("commit ReactOS installed state before SCM selection");
+        });
+    match installed_state.generation {
+        Some(generation) => {
+            print_str(b"[setup-state] ReactOS installed-boot values committed setup/service=");
+            print_u64(installed_state.stats.setup_values as u64);
+            print_str(b"/");
+            print_u64(installed_state.stats.service_values as u64);
+            print_str(b" through CM generation ");
+            print_u64(generation);
+            print_str(b" before SCM selection; pending durable records=");
+            print_u64(installed_state.journal_records as u64);
+            print_str(b"\n");
+        }
+        None => print_str(b"[setup-state] installed SYSTEM state canonical before SCM selection\n"),
+    }
+
+    if let Err(status) = publish_acpi_root_devnode_from_registry_policy() {
+        print_str(b"[acpi-platform] root devnode publication failed status=");
+        print_hex(status.raw() as u32);
+        print_str(b"\n");
+        panic!("publish registry-selected ACPI root devnode");
+    }
+
+    let boot_driver_snapshot = config_manager_query_driver_launch_plan(
+        nt_config_abi::launch_plan_kind::BOOT_SYSTEM_DRIVERS,
+    )
+    .expect("query live boot/system driver launch plan");
+    let demand_driver_snapshot =
+        config_manager_query_driver_launch_plan(nt_config_abi::launch_plan_kind::DEMAND_DRIVERS)
+            .expect("query live demand driver launch plan");
+    let auto_win32_service_snapshot = config_manager_query_win32_service_launch_plan(
+        nt_config_abi::win32_service_plan_kind::AUTO_START,
+    )
+    .expect("query live auto-start Win32 service launch plan");
+    let demand_win32_service_snapshot = config_manager_query_win32_service_launch_plan(
+        nt_config_abi::win32_service_plan_kind::DEMAND_START,
+    )
+    .expect("query live demand-start Win32 service launch plan");
+    let plugplay_auto = auto_win32_service_snapshot
+        .launches
+        .iter()
+        .any(|launch| launch.service_name.eq_ignore_ascii_case("PlugPlay"));
+    let plugplay_demand = demand_win32_service_snapshot
+        .launches
+        .iter()
+        .any(|launch| launch.service_name.eq_ignore_ascii_case("PlugPlay"));
+    print_str(b"[scm-select] PlugPlay auto/demand=");
+    print_u64(plugplay_auto as u64);
+    print_str(b"/");
+    print_u64(plugplay_demand as u64);
+    print_str(b" from installed SYSTEM generation\n");
+    if installed_state.generation.is_some() {
+        assert!(
+            plugplay_auto && !plugplay_demand,
+            "installed-state transition must classify PlugPlay as auto-start before SCM selection"
+        );
+    }
+    let proof_driver_spec = config_hive_boot_system_driver_launch_spec(&boot_driver_snapshot);
+    let system_boot_driver_plan = system_hive_boot_driver_launch_plan(&boot_driver_snapshot);
+    let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan(&boot_driver_snapshot);
+    let config_demand_pnp_plan = config_hive_demand_pnp_driver_launch_plan(&demand_driver_snapshot);
+    let replyless_device_service_count = system_boot_driver_plan
+        .as_slice()
+        .iter()
+        .chain(config_pnp_plan.as_slice())
+        .chain(config_demand_pnp_plan.as_slice())
+        .filter(|spec| spec.class == driver_launch::DriverClass::Device && spec.devnode_count != 0)
+        .count();
+    let mut driver_start_bootstrap = DriverStartBootstrap::with_capacity(
+        PENDING_DRIVER_LOAD_INITIAL_CAPACITY.saturating_add(replyless_device_service_count),
+    );
+    let scm_service_selection = system_hive_service_selection_report(
+        &auto_win32_service_snapshot,
+        &demand_win32_service_snapshot,
+        &demand_driver_snapshot,
+    );
+    print_str(b"[scm-select] auto-win32 count=");
+    print_u64(scm_service_selection.auto_win32_count);
+    print_str(b" first=");
+    print_str(scm_service_selection.auto_win32_name.as_bytes());
+    print_str(b" image=");
+    print_str(scm_service_selection.auto_win32_image_path.as_bytes());
+    print_str(b" nt-image=");
+    print_str(scm_service_selection.auto_win32_nt_image_path.as_bytes());
+    print_str(b" cmd=");
+    print_str(scm_service_selection.auto_win32_command_line.as_bytes());
+    print_str(b" kind=");
+    print_str(win32_service_process_kind_label(
+        scm_service_selection.auto_win32_process_kind,
+    ));
+    print_str(b" interactive=");
+    print_str(if scm_service_selection.auto_win32_interactive {
+        b"1"
+    } else {
+        b"0"
+    });
+    print_str(b"\n");
+    print_str(b"[scm-select] demand-win32 count=");
+    print_u64(scm_service_selection.demand_win32_count);
+    print_str(b" first=");
+    print_str(scm_service_selection.demand_win32_name.as_bytes());
+    print_str(b" image=");
+    print_str(scm_service_selection.demand_win32_image_path.as_bytes());
+    print_str(b" nt-image=");
+    print_str(scm_service_selection.demand_win32_nt_image_path.as_bytes());
+    print_str(b" cmd=");
+    print_str(scm_service_selection.demand_win32_command_line.as_bytes());
+    print_str(b" kind=");
+    print_str(win32_service_process_kind_label(
+        scm_service_selection.demand_win32_process_kind,
+    ));
+    print_str(b" interactive=");
+    print_str(if scm_service_selection.demand_win32_interactive {
+        b"1"
+    } else {
+        b"0"
+    });
+    print_str(b"\n");
+    print_str(b"[scm-select] demand-driver count=");
+    print_u64(scm_service_selection.demand_driver_count);
+    print_str(b" first=");
+    print_str(scm_service_selection.demand_driver_name.as_bytes());
+    print_str(b" image=");
+    print_str(scm_service_selection.demand_driver_image_path.as_bytes());
+    print_str(b" object=");
+    print_str(scm_service_selection.demand_driver_object_path.as_bytes());
+    print_str(b"\n");
+    check(
+        b"exec_scm_autostart_win32_launch_spec_from_registry",
+        scm_service_selection.auto_win32_ready(),
+        &mut passed,
+    );
+    check(
+        b"exec_scm_demandstart_win32_launch_spec_from_registry",
+        scm_service_selection.demand_win32_ready(),
+        &mut passed,
+    );
+    check(
+        b"exec_ntloaddriver_demand_driver_selected_from_registry",
+        scm_service_selection.demand_driver_ready(),
+        &mut passed,
+    );
+    let mut hosted_pci_hardware_grants = Vec::new();
+    let hosted_pci_grant_discovery = discover_hosted_pci_hardware_grants_for_launch_plans(
+        bi,
+        &pci_devices,
+        &[
+            system_boot_driver_plan,
+            config_pnp_plan,
+            config_demand_pnp_plan,
+        ],
+        &mut hosted_pci_hardware_grants,
+    );
+    print_str(b"[driver-launch] hosted PCI grant discovery selected=");
+    print_u64(hosted_pci_grant_discovery.selected_devnodes);
+    print_str(b" existing=");
+    print_u64(hosted_pci_grant_discovery.existing_grants);
+    print_str(b" claimed=");
+    print_u64(hosted_pci_grant_discovery.claimed_grants);
+    print_str(b" missing-mmio=");
+    print_u64(hosted_pci_grant_discovery.missing_memory_bar);
+    print_str(b" claim-failures=");
+    print_u64(hosted_pci_grant_discovery.claim_failures);
+    print_str(b"\n");
+    check(
+        b"exec_hosted_pci_grants_discovered_from_registry",
+        hosted_pci_grant_discovery.selected_devnodes
+            == hosted_pci_grant_discovery.existing_grants
+                + hosted_pci_grant_discovery.claimed_grants
+            && hosted_pci_grant_discovery.missing_memory_bar == 0
+            && hosted_pci_grant_discovery.claim_failures == 0,
+        &mut passed,
+    );
+    let hosted_pci_window_publish = publish_hosted_pnp_context_for_launch_plans(
+        &pci_devices,
+        &[
+            system_boot_driver_plan,
+            config_pnp_plan,
+            config_demand_pnp_plan,
+        ],
+        hosted_pci_hardware_grants.as_slice(),
+        acpi_platform_authority,
+    );
+    print_str(b"[driver-launch] hosted resource windows pci-selected=");
+    print_u64(hosted_pci_window_publish.selected_devnodes);
+    print_str(b" pci-published=");
+    print_u64(hosted_pci_window_publish.published_windows);
+    print_str(b" pci-missing-grants=");
+    print_u64(hosted_pci_window_publish.missing_grants);
+    print_str(b" pci-va-exhausted=");
+    print_u64(hosted_pci_window_publish.pci_va_exhausted as u64);
+    print_str(b" platform-selected=");
+    print_u64(hosted_pci_window_publish.selected_platform_devnodes);
+    print_str(b" platform-published=");
+    print_u64(hosted_pci_window_publish.published_platform_windows);
+    print_str(b" platform-missing-grants=");
+    print_u64(hosted_pci_window_publish.missing_platform_grants);
+    print_str(b"\n");
+    check(
+        b"exec_hosted_pci_windows_selected_from_registry",
+        hosted_pci_window_publish.published_windows != 0
+            && hosted_pci_window_publish.missing_grants == 0
+            && !hosted_pci_window_publish.pci_va_exhausted,
+        &mut passed,
+    );
+    check(
+        b"exec_hosted_acpi_platform_selected_from_registry",
+        hosted_pci_window_publish.selected_platform_devnodes == 1
+            && hosted_pci_window_publish.published_platform_windows == 1
+            && hosted_pci_window_publish.missing_platform_grants == 0,
+        &mut passed,
+    );
+
+    // --- SERVICE 9: the GENERAL DYNAMIC driver-launch path. The SYSTEM hive is imported into
+    // Config Manager metadata, ordered by ServiceGroupOrder, then narrowed by mechanism: FSD-class
+    // services use the persistent IRP host directly; device-class services are selected from
+    // imported Enum devnodes, plus the no-devnode NT5 network wrapper/transport groups while that
+    // stack is being activated. The named-pipe provider is discovered by the DEVICE_OBJECT it
+    // publishes, not by a compiled-in service or image name.
+    if let Some(fs) = exec_fs() {
+        let mut named_pipe_provider = None;
+        let mut remaining_boot_services = system_boot_driver_plan.as_slice().iter();
+        for spec in remaining_boot_services.by_ref() {
+            let spec_devnodes = system_boot_driver_plan.devnodes_for(spec);
+            if driver_launch::driver_id_by_name(spec.driver_object_path.as_str()).is_some() {
+                print_str(b"[driver-launch] boot/system service already loaded ");
+                print_str(spec.service_name.as_bytes());
+                print_str(b"\n");
+                continue;
+            }
+            print_str(b"[driver-launch] launching boot/system service ");
+            print_str(spec.service_name.as_bytes());
+            print_str(b" path=");
+            print_str(spec.image_path.as_bytes());
+            if spec.devnode_count != 0 {
+                print_str(b" devnodes=");
+                print_u64(spec.devnode_count as u64);
+                if let Some(first) = spec_devnodes.first() {
+                    print_str(b" first=");
+                    print_str(first.instance_id.as_bytes());
+                }
+            }
+            print_str(b"\n");
+            if let Some((dc, _)) = launch_boot_driver_service(
+                &fs,
+                spec,
+                system_boot_driver_plan,
+                HostedPnpStartOptions::boot_service(),
+                &mut driver_start_bootstrap,
+            ) {
+                let named_pipe_device = c
+                    .query_object("\\Device\\NamedPipe", true)
+                    .ok()
+                    .is_some_and(|info| {
+                        info.route_kind == 2
+                            && info.owner_component == driver_launch::IO_MANAGER_COMPONENT_ID
+                            && driver_launch::device_owned_by_driver(
+                                info.owner_local_id,
+                                dc.driver_id,
+                            )
+                    });
+                if named_pipe_device {
+                    named_pipe_provider = Some((dc, spec.driver_object_path));
+                    break;
+                }
+                print_str(b"[driver-launch] service ");
+                print_str(spec.service_name.as_bytes());
+                print_str(b" did not own \\Device\\NamedPipe\n");
+            } else {
+                print_str(b"[driver-launch] boot/system service ");
+                print_str(spec.service_name.as_bytes());
+                print_str(b" load failed\n");
+            }
+        }
+        if let Some((dc, driver_object_path)) = named_pipe_provider {
+            publish_npfs_io_objects(&mut *c, &dc, driver_object_path.as_str(), &mut passed);
+            // C1 checks: the general dynamic path loaded npfs isolated + ran its DriverEntry.
+            check(
+                b"npfs_driver_entry_entered",
+                (dc.verdict & V_ENTERED) != 0,
+                &mut passed,
+            );
+            check(
+                b"npfs_device_created",
+                (dc.verdict & V_DEVICE) != 0 && driver_launch::driver_has_live_device(dc.driver_id),
+                &mut passed,
+            );
+            check(
+                b"npfs_driver_entry_success",
+                (dc.verdict & V_SUCCESS) != 0,
+                &mut passed,
+            );
+            check(
+                b"npfs_major_function_table",
+                (dc.verdict & V_MJ) != 0,
+                &mut passed,
+            );
+            // Isolation proof: npfs runs in its OWN VSpace (a distinct PML4 cap != the executive's).
+            check(
+                b"npfs_isolated_vspace",
+                dc.pml4 != 0 && dc.pml4 != CAP_INIT_THREAD_VSPACE,
+                &mut passed,
+            );
+            if dc.finished && (dc.verdict & V_MJ) != 0 {
+                // C2 round-trip: dispatch a REAL IRP_MJ_CREATE_NAMED_PIPE (major 1) to the live
+                // component with a private probe pipe (UTF-16 "\ntstest") — exercising npfs's REAL
+                // NpFsdCreateNamedPipe through a real FILE_OBJECT + IO_STACK_LOCATION. Proves the
+                // routing path is real without consuming the live SCM `\ntsvcs` server instance.
+                let name16: [u8; 16] = *b"\\\0n\0t\0s\0t\0e\0s\0t\0";
+                let name_units = [
+                    b'\\' as u16,
+                    b'n' as u16,
+                    b't' as u16,
+                    b's' as u16,
+                    b't' as u16,
+                    b'e' as u16,
+                    b's' as u16,
+                    b't' as u16,
+                ];
+                let npfs_device_id = driver_launch::device_id_by_name("\\Device\\NamedPipe");
+                let r = npfs_device_id
+                    .and_then(|device_id| {
+                        driver_launch::allocate_hosted_file(
+                            device_id,
+                            0x001f_01ff,
+                            3,
+                            0,
+                            &name_units,
+                        )
+                        .ok()
+                    })
+                    .and_then(|file_id| {
+                        match driver_launch::dispatch_hosted_file_create_irp_result_exact(
+                            file_id,
+                            1, /* IRP_MJ_CREATE_NAMED_PIPE */
+                            initial_system_driver_caller(),
+                            CreateParameters {
+                                opened_case_sensitive: false,
+                                desired_access: AccessMask::from_bits_retain(0x001f_01ff),
+                                share_access: ShareAccess::from_bits_retain(3),
+                                create_options: CreateOptions::empty(),
+                                create_disposition: 3, /* FILE_OPEN_IF */
+                                file_attributes: 0,
+                                ea_length: 0,
+                                related_file: None,
+                            },
+                            &name16,
+                        ) {
+                            Ok((status, information, _, context)) => {
+                                Some((status, information, file_id, context.unwrap_or(0)))
+                            }
+                            Err(_) => {
+                                let _ = driver_launch::release_hosted_file(file_id);
+                                None
+                            }
+                        }
+                    });
+                if let Some((st, info, srv_fid, srv_context)) = r {
+                    print_str(
+                        b"[npfs-svc] C2 dispatch IRP_MJ_CREATE_NAMED_PIPE(\\ntstest) -> status=0x",
+                    );
+                    print_hex(st as u32);
+                    print_str(b" info=");
+                    print_u64(info);
+                    print_str(b" fsctx=0x");
+                    print_hex(srv_context as u32);
+                    print_str(b"\n");
+                    check(b"npfs_dispatch_roundtrip", true, &mut passed);
+                    // C-a: NpFsdCreateNamedPipe COMPLETED — SUCCESS + FILE_CREATED(2) + a real CCB-backed
+                    // FsContext. The VCB prefix-tree/ERESOURCE/security trampolines ran for real.
+                    check(
+                        b"npfs_create_named_pipe_complete",
+                        st == 0 && info == 2 && srv_fid != 0 && srv_context != 0,
+                        &mut passed,
+                    );
+                    // C-a: create-then-CONNECT — a client IRP_MJ_CREATE(\ntstest) must find the FCB via the
+                    // real prefix tree and return a connected client-end FILE_OBJECT (proves Insert+Find work).
+                    let client_create = npfs_device_id
+                        .and_then(|device_id| {
+                            match driver_launch::allocate_hosted_file(
+                                device_id,
+                                0x001f_01ff,
+                                3,
+                                0,
+                                &name_units,
+                            ) {
+                                Ok(file_id) => Some(file_id),
+                                Err(status) => {
+                                    print_str(b"[npfs-svc] client File allocation failed status=0x");
+                                    print_hex(status);
+                                    print_str(b"\n");
+                                    None
+                                }
+                            }
+                        })
+                        .and_then(|file_id| {
+                            match driver_launch::dispatch_hosted_file_create_irp_result_exact(
+                                file_id,
+                                0, /* IRP_MJ_CREATE */
+                                initial_system_driver_caller(),
+                                CreateParameters {
+                                    opened_case_sensitive: false,
+                                    desired_access: AccessMask::from_bits_retain(0x001f_01ff),
+                                    share_access: ShareAccess::from_bits_retain(3),
+                                    create_options: CreateOptions::empty(),
+                                    create_disposition: 1, /* FILE_OPEN */
+                                    file_attributes: 0,
+                                    ea_length: 0,
+                                    related_file: None,
+                                },
+                                &name16,
+                            ) {
+                                Ok((status, information, _, context)) => {
+                                    Some((status, information, file_id, context.unwrap_or(0)))
+                                }
+                                Err(status) => {
+                                    print_str(b"[npfs-svc] client CREATE dispatch failed status=0x");
+                                    print_hex(status);
+                                    print_str(b"\n");
+                                    let _ = driver_launch::release_hosted_file(file_id);
+                                    None
+                                }
+                            }
+                        });
+                    let mut client_lifecycle_ok = false;
+                    if let Some((cst, _cinfo, cli_fid, cli_context)) = client_create {
+                        print_str(b"[npfs-svc] C-a connect IRP_MJ_CREATE(\\ntstest) -> status=0x");
+                        print_hex(cst as u32);
+                        print_str(b" fsctx=0x");
+                        print_hex(cli_context as u32);
+                        print_str(b"\n");
+                        check(
+                            b"npfs_client_connect_finds_fcb",
+                            cst == 0 && cli_fid != 0 && cli_context != 0,
+                            &mut passed,
+                        );
+                        check(
+                            b"npfs_client_server_endpoint_ids_distinct",
+                            cst == 0 && srv_fid != 0 && cli_fid != 0 && srv_fid != cli_fid,
+                            &mut passed,
+                        );
+                        if cst == 0 && cli_fid != 0 {
+                            let boot_caller = initial_system_driver_caller();
+                            let npfs_dispatch_irp = |major, fsctl, file_id, input: &[u8], output: &mut [u8]| {
+                                driver_launch::npfs_dispatch_irp(major, fsctl, file_id, input, output, boot_caller)
+                            };
+                            let pipe_info = [1u8, 0, 0, 0, 0, 0, 0, 0];
+                            let mut set_out = [];
+                            if let Some((sst, sinfo)) = npfs_dispatch_irp(
+                                6,  /* IRP_MJ_SET_INFORMATION */
+                                23, /* FilePipeInformation */
+                                cli_fid,
+                                &pipe_info,
+                                &mut set_out,
+                            ) {
+                                print_str(b"[npfs-svc] C-b IRP_MJ_SET_INFORMATION(FilePipeInformation) -> status=0x");
+                                print_hex(sst as u32);
+                                print_str(b" info=");
+                                print_u64(sinfo);
+                                print_str(b"\n");
+                                check(
+                                    b"npfs_set_pipe_information",
+                                    sst == 0 && sinfo == 0,
+                                    &mut passed,
+                                );
+                            }
+
+                            // ★ C-c: the CONNECTION DATA PLANE. With a real connected server<->client
+                            // pair (srv_fid + cli_fid on \ntstest), prove REAL cross-end data flow:
+                            // IRP_MJ_WRITE on the SERVER end must land in the CLIENT end's read queue
+                            // (server->client / OUTBOUND), and vice versa. This is the load-bearing
+                            // rpcrt4 Ndr transport (a REAL connection object, not a synthetic mint).
+                            let payload = *b"NDR-PLANE"; // 9 bytes, exact write length
+                            let mut wnone = [];
+                            let srv_write = npfs_dispatch_irp(
+                                4, /* IRP_MJ_WRITE */
+                                0, srv_fid, &payload, &mut wnone,
+                            );
+                            let mut rbuf = [0u8; 16];
+                            let cli_read = npfs_dispatch_irp(
+                                3, /* IRP_MJ_READ */
+                                0,
+                                cli_fid,
+                                &[],
+                                &mut rbuf,
+                            );
+                            let mut s2c_ok = false;
+                            if let (Some((wst, winfo)), Some((rst, rinfo))) = (srv_write, cli_read)
+                            {
+                                print_str(b"[npfs-svc] C-c DATA-PLANE srv-write status=0x");
+                                print_hex(wst as u32);
+                                print_str(b" wrote=");
+                                print_u64(winfo);
+                                print_str(b" | cli-read status=0x");
+                                print_hex(rst as u32);
+                                print_str(b" read=");
+                                print_u64(rinfo);
+                                print_str(b" bytes=");
+                                for &b in rbuf.iter().take(9) {
+                                    print_hex(b as u32);
+                                }
+                                print_str(b"\n");
+                                // server->client: client read back exactly what server wrote.
+                                s2c_ok =
+                                    wst == 0 && rst == 0 && rinfo == 9 && rbuf[..9] == payload[..9];
+                            }
+                            check(
+                                b"exec_pipe_data_plane_server_to_client",
+                                s2c_ok,
+                                &mut passed,
+                            );
+
+                            // client->server: reverse direction (INBOUND) through the same connection.
+                            let creq = *b"RPC-REQ"; // 7 bytes, exact write length
+                            let mut cwnone = [];
+                            let cli_write = npfs_dispatch_irp(
+                                4, /* IRP_MJ_WRITE */
+                                0,
+                                cli_fid,
+                                &creq,
+                                &mut cwnone,
+                            );
+                            let mut sbuf = [0u8; 16];
+                            let srv_read = npfs_dispatch_irp(
+                                3, /* IRP_MJ_READ */
+                                0,
+                                srv_fid,
+                                &[],
+                                &mut sbuf,
+                            );
+                            let mut c2s_ok = false;
+                            if let (Some((wst2, _)), Some((rst2, rinfo2))) = (cli_write, srv_read) {
+                                c2s_ok =
+                                    wst2 == 0 && rst2 == 0 && rinfo2 == 7 && sbuf[..7] == creq[..7];
+                            }
+                            check(
+                                b"exec_pipe_data_plane_client_to_server",
+                                c2s_ok,
+                                &mut passed,
+                            );
+
+                            // ★ C-d: a REAL flush-behind-queued-write that npfs PENDS. NpCommonFlushBuffers
+                            // (npfs/flushbuf.c) inspects the pipe end's DataQueue: a FLUSH on the SERVER end
+                            // checks DataQueue[OUTBOUND], on the CLIENT end DataQueue[INBOUND]. If that queue
+                            // is in state WriteEntries (queued write data no reader has drained yet), the
+                            // flush IRP is QUEUED behind the writes (NpAddDataQueueEntry) → STATUS_PENDING;
+                            // an empty queue returns SUCCESS synchronously. So: WRITE a payload onto one end
+                            // (it sits in that end's write queue — no matching read yet), then FLUSH the SAME
+                            // end BEFORE draining → npfs genuinely returns 0x103. Do it in BOTH directions so
+                            // a real flush pends TWICE, then drain the queues (the matching reads) to complete
+                            // the pended flush IRPs. This is the real npfs write-blocks-flush semantics, driven
+                            // through the isolated npfs.sys IRP path — not a modeled shortcut.
+                            let mut fnone = [];
+                            // Direction 1 — server end: queue an OUTBOUND write, flush before the client reads.
+                            let _ = npfs_dispatch_irp(
+                                4, /* WRITE */
+                                0, srv_fid, b"FLUSH-A", &mut fnone,
+                            );
+                            let mut fout1 = [];
+                            let srv_flush = driver_launch::npfs_dispatch_irp_exact(
+                                9, /* IRP_MJ_FLUSH_BUFFERS */
+                                0,
+                                srv_fid,
+                                &[],
+                                &mut fout1,
+                                boot_caller,
+                            );
+                            let srv_flush_pended = matches!(
+                                srv_flush,
+                                Some((st, _, irp_id))
+                                    if st as u32 == 0x0000_0103 && irp_id != 0
+                            );
+                            if srv_flush_pended {
+                                NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
+                            }
+                            // Drain direction 1 (the client read completes the queued write + the pended flush).
+                            let mut fdrain1 = [0u8; 16];
+                            let _ =
+                                npfs_dispatch_irp(3 /* READ */, 0, cli_fid, &[], &mut fdrain1);
+                            let srv_flush_delivered = srv_flush
+                                .and_then(|(_, _, irp_id)| {
+                                    driver_launch::copy_completed_irp(irp_id, false)
+                                        .map(|completion| (irp_id, completion))
+                                })
+                                .is_some_and(|(irp_id, (st, info, bytes))| {
+                                    st == 0
+                                        && info == 0
+                                        && bytes.is_empty()
+                                        && driver_launch::acknowledge_completed_irp(irp_id).is_ok()
+                                });
+
+                            // Direction 2 — client end: queue an INBOUND write, flush before the server reads.
+                            let _ = npfs_dispatch_irp(
+                                4, /* WRITE */
+                                0, cli_fid, b"FLUSH-B", &mut fnone,
+                            );
+                            let mut fout2 = [];
+                            let cli_flush = driver_launch::npfs_dispatch_irp_exact(
+                                9, /* IRP_MJ_FLUSH_BUFFERS */
+                                0,
+                                cli_fid,
+                                &[],
+                                &mut fout2,
+                                boot_caller,
+                            );
+                            let cli_flush_pended = matches!(
+                                cli_flush,
+                                Some((st, _, irp_id))
+                                    if st as u32 == 0x0000_0103 && irp_id != 0
+                            );
+                            if cli_flush_pended {
+                                NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let mut fdrain2 = [0u8; 16];
+                            let _ =
+                                npfs_dispatch_irp(3 /* READ */, 0, srv_fid, &[], &mut fdrain2);
+                            let cli_flush_delivered = cli_flush
+                                .and_then(|(_, _, irp_id)| {
+                                    driver_launch::copy_completed_irp(irp_id, false)
+                                        .map(|completion| (irp_id, completion))
+                                })
+                                .is_some_and(|(irp_id, (st, info, bytes))| {
+                                    st == 0
+                                        && info == 0
+                                        && bytes.is_empty()
+                                        && driver_launch::acknowledge_completed_irp(irp_id).is_ok()
+                                });
+
+                            print_str(b"[npfs-svc] C-d FLUSH-PENDING srv_pended=");
+                            print_u64(srv_flush_pended as u64);
+                            print_str(b" cli_pended=");
+                            print_u64(cli_flush_pended as u64);
+                            print_str(b" exact-delivery=");
+                            print_u64((srv_flush_delivered && cli_flush_delivered) as u64);
+                            print_str(b" pend_count=");
+                            print_u64(NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.load(Ordering::Relaxed));
+                            print_str(b"\n");
+                            check(
+                                b"exec_npfs_flush_pending_exact_completion",
+                                srv_flush_pended
+                                    && cli_flush_pended
+                                    && srv_flush_delivered
+                                    && cli_flush_delivered,
+                                &mut passed,
+                            );
+
+                            // ★ C-e: TWO CONCURRENT IRPs ON ONE FILE_OBJECT — the ordinary rpcrt4
+                            // server shape, and the exact shape that used to HANG the hosted
+                            // npfs.sys. `RPCRT4_io_thread` keeps a READ pending on the connection
+                            // while `RPCRT4_worker_thread` WRITES the response on the SAME handle.
+                            // Drive precisely that here and assert the BYTES both ways:
+                            //   1. the server end issues a READ npfs must PEND (inbound queue empty),
+                            //   2. with that read still outstanding, the server end WRITES a 48-byte
+                            //      response — the second live IRP on the same FILE_OBJECT,
+                            //   3. the client reads exactly those 48 bytes,
+                            //   4. the client writes, which COMPLETES the server's still-pending read
+                            //      (npfs' `NpWriteDataQueue` → `IofCompleteRequest`) and the delivered
+                            //      payload must be byte-exact in the completion stash.
+                            let mut pend_out = [0u8; 64];
+                            let srv_pending = driver_launch::npfs_dispatch_irp_exact(
+                                3, /* READ */
+                                0,
+                                srv_fid,
+                                &[],
+                                &mut pend_out,
+                                boot_caller,
+                            );
+                            let srv_read_pended = matches!(
+                                srv_pending,
+                                Some((st, _, irp_id)) if st as u32 == 0x0000_0103 && irp_id != 0
+                            );
+                            let mut response = [0u8; 48];
+                            for (i, slot) in response.iter_mut().enumerate() {
+                                *slot = 0x40u8.wrapping_add(i as u8);
+                            }
+                            let mut cnone = [];
+                            let concur_write = npfs_dispatch_irp(
+                                4, /* WRITE */
+                                0, srv_fid, &response, &mut cnone,
+                            );
+                            let mut resp_in = [0u8; 64];
+                            let concur_read =
+                                npfs_dispatch_irp(3 /* READ */, 0, cli_fid, &[], &mut resp_in);
+                            let response_ok = matches!(concur_write, Some((0, 48)))
+                                && matches!(concur_read, Some((0, 48)))
+                                && resp_in[..48] == response[..48];
+                            // Now wake the server's STILL-pending read from the other end.
+                            let wake = *b"WAKE-PENDING-READ";
+                            let cli_wake = npfs_dispatch_irp(
+                                4, /* WRITE */
+                                0, cli_fid, &wake, &mut cnone,
+                            );
+                            let stash = srv_pending.and_then(|(_, _, irp_id)| {
+                                driver_launch::copy_completed_irp(irp_id, true)
+                            });
+                            let stash_acked = srv_pending
+                                .map(|(_, _, irp_id)| {
+                                    driver_launch::acknowledge_completed_irp(irp_id).is_ok()
+                                })
+                                .unwrap_or(false);
+                            let pending_delivered = match &stash {
+                                Some((st, info, bytes)) => {
+                                    *st == 0
+                                        && *info == wake.len() as u64
+                                        && bytes.len() == wake.len()
+                                        && bytes[..] == wake[..]
+                                }
+                                None => false,
+                            };
+                            print_str(b"[npfs-svc] C-e CONCURRENT-IRP pended=");
+                            print_u64(srv_read_pended as u64);
+                            print_str(b" response_ok=");
+                            print_u64(response_ok as u64);
+                            print_str(b" wake_written=");
+                            print_u64(matches!(cli_wake, Some((0, _))) as u64);
+                            print_str(b" pending_delivered=");
+                            print_u64(pending_delivered as u64);
+                            print_str(b" fo_reused=");
+                            print_u64(driver_launch::FSD_FO_REUSED.load(Ordering::Relaxed));
+                            print_str(b" queue_repairs=");
+                            print_u64(driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed));
+                            print_str(b"\n");
+                            // A pending read AND a write on ONE FILE_OBJECT both complete with the
+                            // right bytes, npfs' queues stayed consistent (zero repairs), and the
+                            // write actually reused the open's FILE_OBJECT rather than a fresh one.
+                            check(
+                                b"exec_npfs_concurrent_irp_read_and_write",
+                                srv_read_pended
+                                    && response_ok
+                                    && pending_delivered
+                                    && stash_acked
+                                    && driver_launch::FSD_FO_REUSED.load(Ordering::Relaxed) >= 4
+                                    && driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed)
+                                        == 0,
+                                &mut passed,
+                            );
+
+                            // ★ C-f: the FILE_OBJECT LIFETIME proof. npfs stores our FILE_OBJECT in
+                            // `Ccb->FileObject[NamedPipeEnd]` (create.c:645/772, statesup.c:51) and
+                            // WRITES THROUGH it on disconnect. `audit_ccb` therefore re-validates
+                            // every FSD-held FILE_OBJECT pointer before each IRP: it must still be
+                            // one of our live per-open objects AND still CONTAIN a FILE_OBJECT
+                            // (`Type == IO_TYPE_FILE`, `Size == 0x100`). With the old per-IRP
+                            // lifetime the pool had already recycled those blocks into npfs' own
+                            // `NP_DATA_QUEUE_ENTRY`/`NP_CCB` allocations, so both checks fail.
+                            let fo_checks =
+                                driver_launch::FSD_FO_LIVE_CHECKS.load(Ordering::Relaxed);
+                            let fo_dangling =
+                                driver_launch::FSD_FO_DANGLING.load(Ordering::Relaxed);
+                            let fo_corrupt =
+                                driver_launch::FSD_FO_CORRUPTED.load(Ordering::Relaxed);
+                            let fo_opens = driver_launch::FSD_FO_OPENS.load(Ordering::Relaxed);
+                            print_str(b"[npfs-svc] C-f FO-LIFETIME opens=");
+                            print_u64(fo_opens);
+                            print_str(b" held-checks=");
+                            print_u64(fo_checks);
+                            print_str(b" dangling=");
+                            print_u64(fo_dangling);
+                            print_str(b" corrupted=");
+                            print_u64(fo_corrupt);
+                            print_str(b" audits=");
+                            print_u64(driver_launch::FSD_QUEUE_AUDITS.load(Ordering::Relaxed));
+                            print_str(b"\n");
+                            check(
+                                b"exec_npfs_file_object_lifetime",
+                                fo_opens >= 2
+                                    && fo_checks >= 4
+                                    && fo_dangling == 0
+                                    && fo_corrupt == 0,
+                                &mut passed,
+                            );
+
+                            // ★ C-h: the rpcrt4 HEADER-THEN-BODY shape — a 48-byte write against a
+                            // SMALLER (16-byte) pending read. This is byte-for-byte the shape the LSA
+                            // self-RPC response takes (`rpcrt4_conn_np_read` reads the 16-byte PDU
+                            // header first, so the reader's queued entry is 16 bytes while the server
+                            // writes the whole 48-byte response), and it is the dispatch that used to
+                            // never return from npfs. npfs must complete the reader with
+                            // STATUS_BUFFER_OVERFLOW + 16 bytes and queue the 32-byte remainder.
+                            let mut hdr_in = [0u8; 16];
+                            let hdr_pend = driver_launch::npfs_dispatch_irp_exact(
+                                3,
+                                /* READ */ 0,
+                                cli_fid,
+                                &[],
+                                &mut hdr_in,
+                                boot_caller,
+                            );
+                            let hdr_pended = matches!(
+                                hdr_pend,
+                                Some((st, _, irp_id)) if st as u32 == 0x0000_0103 && irp_id != 0
+                            );
+                            print_str(b"[npfs-svc] C-h HDR-READ pended=");
+                            print_u64(hdr_pended as u64);
+                            print_str(b" -> now writing 48 over a 16-byte pending read\n");
+                            let body_write = npfs_dispatch_irp(
+                                4, /* WRITE */
+                                0, srv_fid, &response, &mut cnone,
+                            );
+                            let hdr_stash = hdr_pend.and_then(|(_, _, irp_id)| {
+                                driver_launch::copy_completed_irp(irp_id, true)
+                            });
+                            let hdr_stash_acked = hdr_pend
+                                .map(|(_, _, irp_id)| {
+                                    driver_launch::acknowledge_completed_irp(irp_id).is_ok()
+                                })
+                                .unwrap_or(false);
+                            let hdr_ok = match &hdr_stash {
+                                Some((st, info, bytes)) => {
+                                    *st == 0x8000_0005
+                                        && *info == 16
+                                        && bytes.len() == 16
+                                        && bytes[..] == response[..16]
+                                }
+                                None => false,
+                            };
+                            // The remaining 32 bytes stay queued; drain them with a second read.
+                            let mut rest_in = [0u8; 64];
+                            let rest_read =
+                                npfs_dispatch_irp(3 /* READ */, 0, cli_fid, &[], &mut rest_in);
+                            let rest_ok = matches!(rest_read, Some((0, 32)))
+                                && rest_in[..32] == response[16..48];
+                            print_str(b"[npfs-svc] C-h SPLIT-WRITE write=");
+                            print_hex(match body_write {
+                                Some((st, _)) => st as u32,
+                                None => 0xFFFF_FFFF,
+                            });
+                            print_str(b" hdr_ok=");
+                            print_u64(hdr_ok as u64);
+                            print_str(b" rest_ok=");
+                            print_u64(rest_ok as u64);
+                            print_str(b" repairs=");
+                            print_u64(driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed));
+                            print_str(b"\n");
+                            check(
+                                b"exec_npfs_write_split_across_pending_read",
+                                hdr_pended
+                                    && body_write.is_some()
+                                    && hdr_ok
+                                    && hdr_stash_acked
+                                    && rest_ok
+                                    && driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed)
+                                        == 0,
+                                &mut passed,
+                            );
+
+                            // ★ C-i: THE RESULT A DISPATCH RETURNS IS ITS OWN — the behavioural leg
+                            // of `exec_irp_transport_call_bound`. Run three IRPs whose results are
+                            // mutually DISTINGUISHABLE: (1) queue an 11-byte payload the client has
+                            // not read, (2) a SET_INFORMATION whose completion is (0, 0), (3) a READ
+                            // whose completion is (0, 11, payload). Under the old Send/Recv transport
+                            // a `done` queued for an earlier cycle could satisfy the pump's Recv, so
+                            // the READ could return the SET's (0, 0); a fault injector had to
+                            // manufacture that slip to prove the sequence handshake caught it. Under
+                            // the `Call` transport the component is BlockedOnReply between its Call
+                            // and our reply, so it cannot publish a second completion at all — the
+                            // misordering is unrepresentable and needs no injector, only this proof
+                            // that each completion is the one its own request provoked.
+                            let slip_payload = *b"PHASE-SLIP!";
+                            let mut snone = [];
+                            let slip_write = npfs_dispatch_irp(
+                                4, /* WRITE */
+                                0,
+                                srv_fid,
+                                &slip_payload,
+                                &mut snone,
+                            );
+                            let mut set_out2 = [];
+                            let slip_set = npfs_dispatch_irp(
+                                6,  /* IRP_MJ_SET_INFORMATION */
+                                23, /* FilePipeInformation */
+                                cli_fid,
+                                &[1u8, 0, 0, 0, 0, 0, 0, 0],
+                                &mut set_out2,
+                            );
+                            let mut slip_in = [0u8; 32];
+                            let slip_read =
+                                npfs_dispatch_irp(3 /* READ */, 0, cli_fid, &[], &mut slip_in);
+                            let slip_ok = matches!(slip_write, Some((0, 11)))
+                                && matches!(slip_set, Some((0, 0)))
+                                && matches!(slip_read, Some((0, 11)))
+                                && slip_in[..11] == slip_payload[..];
+                            TRANSPORT_IRP_ROUNDTRIP.store(slip_ok, Ordering::Relaxed);
+                            print_str(b"[npfs-svc] C-i per-request completions distinct: read=");
+                            print_hex(match slip_read {
+                                Some((st, _)) => st as u32,
+                                None => 0xFFFF_FFFF,
+                            });
+                            print_str(b" info=");
+                            print_u64(match slip_read {
+                                Some((_, n)) => n,
+                                None => 0,
+                            });
+                            print_str(b" bytes_ok=");
+                            print_u64((slip_in[..11] == slip_payload[..]) as u64);
+                            print_str(b"\n");
+                        }
+                        let client_released = driver_launch::release_hosted_file(cli_fid).is_ok();
+                        let _ = driver_launch::pump_hosted_io_completions();
+                        client_lifecycle_ok =
+                            client_released && !driver_launch::hosted_file_exists(cli_fid);
+                    }
+                    let server_released = driver_launch::release_hosted_file(srv_fid).is_ok();
+                    let _ = driver_launch::pump_hosted_io_completions();
+                    let server_lifecycle_ok =
+                        server_released && !driver_launch::hosted_file_exists(srv_fid);
+                    check(
+                        b"exec_npfs_canonical_file_lifecycle",
+                        client_lifecycle_ok && server_lifecycle_ok,
+                        &mut passed,
+                    );
+                }
+            }
+        } else {
+            print_str(b"[driver-launch] no boot/system service published \\Device\\NamedPipe\n");
+        }
+
+        for spec in remaining_boot_services {
+            if driver_launch::driver_id_by_name(spec.driver_object_path.as_str()).is_some() {
+                continue;
+            }
+            print_str(b"[driver-launch] launching boot/system service ");
+            print_str(spec.service_name.as_bytes());
+            print_str(b" path=");
+            print_str(spec.image_path.as_bytes());
+            print_str(b"\n");
+            if launch_boot_driver_service(
+                &fs,
+                spec,
+                system_boot_driver_plan,
+                HostedPnpStartOptions::boot_service(),
+                &mut driver_start_bootstrap,
+            )
+            .is_none()
+            {
+                print_str(b"[driver-launch] boot/system service ");
+                print_str(spec.service_name.as_bytes());
+                print_str(b" load failed\n");
+            }
+        }
+
+        // --- G3: service-selected driver lifecycle through the same general driver path. The
+        // generated SYSTEM.DAT hive declares a boot/system service; the executive imports the
+        // service subtree into Config Manager metadata, selects the boot/system driver candidate,
+        // then proves load -> DriverEntry -> unload -> object teardown without probing a compiled-in
+        // service identity. This driver creates no DEVICE_OBJECT, so it must not receive a fabricated
+        // CREATE request merely to exercise the transport.
+        if let Some(proof_driver_spec) = proof_driver_spec {
+            print_str(b"[driver-launch] launching service ");
+            print_str(proof_driver_spec.service_name.as_bytes());
+            print_str(b" from config hive path=");
+            print_str(&proof_driver_spec.image_path);
+            print_str(b" object=");
+            print_str(proof_driver_spec.driver_object_path.as_bytes());
+            print_str(b"\n");
+            if let Ok(dc) = load_driver(
+                &fs,
+                &proof_driver_spec.image_path,
+                proof_driver_spec.class,
+                &proof_driver_spec.driver_object_path,
+                initial_system_driver_caller(),
+            ) {
+                let driver_ready = dc.finished && (dc.verdict & V_MJ) != 0;
+                driver_launch::register_driver_ready(dc.driver_id, driver_ready);
+                let driver_object_registered = driver_object_route_registered(
+                    &mut *c,
+                    &dc,
+                    &proof_driver_spec.driver_object_path,
+                );
+                check(
+                    b"exec_driver_lifecycle_object_registered",
+                    driver_object_registered,
+                    &mut passed,
+                );
+
+                // Isolation: the service-selected driver runs in its OWN VSpace — a PML4 distinct
+                // from the named-pipe provider AND the executive's.
+                let npfs_pml4 = driver_launch::npfs_pml4();
+                let proof_pml4 = driver_launch::driver_pml4(dc.driver_id);
+                let distinct_pml4 = proof_pml4 != 0
+                    && proof_pml4 != CAP_INIT_THREAD_VSPACE
+                    && proof_pml4 != npfs_pml4;
+
+                print_str(b"[driver-launch] lifecycle driver-id=");
+                print_u64(dc.driver_id);
+                print_str(b" DriverEntry-ready=");
+                print_u64(driver_ready as u64);
+                print_str(b" distinct_pml4=");
+                print_u64(distinct_pml4 as u64);
+                print_str(b"\n");
+                check(
+                    b"exec_driver_lifecycle_isolated_load",
+                    (dc.verdict & V_ENTERED) != 0
+                        && (dc.verdict & V_MJ) != 0
+                        && distinct_pml4
+                        && driver_ready
+                        && driver_object_registered,
+                    &mut passed,
+                );
+
+                let lifecycle_driver_id = dc.driver_id;
+                let unload_entry_present = dc.driver_unload != 0;
+                let unload_status =
+                    driver_launch::unload_driver_by_name(&proof_driver_spec.driver_object_path);
+                let unload_ok = unload_status.is_ok();
+                let route_removed =
+                    driver_launch::driver_id_by_name(&proof_driver_spec.driver_object_path)
+                        .is_none();
+                let object_removed = c
+                    .query_object(&proof_driver_spec.driver_object_path, true)
+                    .is_err();
+                let instance_removed = driver_launch::driver_pml4(lifecycle_driver_id) == 0;
+                print_str(b"[driver-launch] lifecycle unload service=");
+                print_str(proof_driver_spec.service_name.as_bytes());
+                print_str(b" status=0x");
+                print_hex(match unload_status {
+                    Ok(()) => 0,
+                    Err(status) => status.raw() as u32,
+                });
+                print_str(b" route_removed=");
+                print_u64(route_removed as u64);
+                print_str(b" object_removed=");
+                print_u64(object_removed as u64);
+                print_str(b" instance_removed=");
+                print_u64(instance_removed as u64);
+                print_str(b"\n");
+                check(
+                    b"exec_driver_lifecycle_unload_teardown",
+                    unload_entry_present
+                        && unload_ok
+                        && route_removed
+                        && object_removed
+                        && instance_removed,
+                    &mut passed,
+                );
+            } else {
+                print_str(
+                    b"[driver-launch] service-selected driver launch returned None (not staged / load failed)\n",
+                );
+            }
+        } else {
+            print_str(b"[driver-launch] config hive has no boot/system driver service ImagePath\n");
+        }
+    }
+
     // --- Phase 2b (graphics): LOAD the real ReactOS win32k.sys into an ISOLATED win32k-service
     // component and RUN its DriverEntry as far as it goes. The storage host staged the 2.1 MiB
     // image into WIN32KBUF; the executive parses+relocates+IAT-patches it into a run of frames at
@@ -30306,1022 +31362,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     &mut passed,
                 );
             }
-        }
-    }
-
-    let installed_state = exec_handler::provision_reactos_installed_boot_state()
-        .unwrap_or_else(|status| {
-            print_str(b"[setup-state] installed-boot transaction failed status=0x");
-            print_hex(status);
-            print_str(b"\n");
-            panic!("commit ReactOS installed state before SCM selection");
-        });
-    match installed_state.generation {
-        Some(generation) => {
-            print_str(b"[setup-state] ReactOS installed-boot values committed setup/service=");
-            print_u64(installed_state.stats.setup_values as u64);
-            print_str(b"/");
-            print_u64(installed_state.stats.service_values as u64);
-            print_str(b" through CM generation ");
-            print_u64(generation);
-            print_str(b" before SCM selection; pending durable records=");
-            print_u64(installed_state.journal_records as u64);
-            print_str(b"\n");
-        }
-        None => print_str(b"[setup-state] installed SYSTEM state canonical before SCM selection\n"),
-    }
-
-    if let Err(status) = publish_acpi_root_devnode_from_registry_policy() {
-        print_str(b"[acpi-platform] root devnode publication failed status=");
-        print_hex(status.raw() as u32);
-        print_str(b"\n");
-        panic!("publish registry-selected ACPI root devnode");
-    }
-
-    let boot_driver_snapshot = config_manager_query_driver_launch_plan(
-        nt_config_abi::launch_plan_kind::BOOT_SYSTEM_DRIVERS,
-    )
-    .expect("query live boot/system driver launch plan");
-    let demand_driver_snapshot =
-        config_manager_query_driver_launch_plan(nt_config_abi::launch_plan_kind::DEMAND_DRIVERS)
-            .expect("query live demand driver launch plan");
-    let auto_win32_service_snapshot = config_manager_query_win32_service_launch_plan(
-        nt_config_abi::win32_service_plan_kind::AUTO_START,
-    )
-    .expect("query live auto-start Win32 service launch plan");
-    let demand_win32_service_snapshot = config_manager_query_win32_service_launch_plan(
-        nt_config_abi::win32_service_plan_kind::DEMAND_START,
-    )
-    .expect("query live demand-start Win32 service launch plan");
-    let plugplay_auto = auto_win32_service_snapshot
-        .launches
-        .iter()
-        .any(|launch| launch.service_name.eq_ignore_ascii_case("PlugPlay"));
-    let plugplay_demand = demand_win32_service_snapshot
-        .launches
-        .iter()
-        .any(|launch| launch.service_name.eq_ignore_ascii_case("PlugPlay"));
-    print_str(b"[scm-select] PlugPlay auto/demand=");
-    print_u64(plugplay_auto as u64);
-    print_str(b"/");
-    print_u64(plugplay_demand as u64);
-    print_str(b" from installed SYSTEM generation\n");
-    if installed_state.generation.is_some() {
-        assert!(
-            plugplay_auto && !plugplay_demand,
-            "installed-state transition must classify PlugPlay as auto-start before SCM selection"
-        );
-    }
-    let proof_driver_spec = config_hive_boot_system_driver_launch_spec(&boot_driver_snapshot);
-    let system_boot_driver_plan = system_hive_boot_driver_launch_plan(&boot_driver_snapshot);
-    let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan(&boot_driver_snapshot);
-    let config_demand_pnp_plan = config_hive_demand_pnp_driver_launch_plan(&demand_driver_snapshot);
-    let replyless_device_service_count = system_boot_driver_plan
-        .as_slice()
-        .iter()
-        .chain(config_pnp_plan.as_slice())
-        .chain(config_demand_pnp_plan.as_slice())
-        .filter(|spec| spec.class == driver_launch::DriverClass::Device && spec.devnode_count != 0)
-        .count();
-    let mut driver_start_bootstrap = DriverStartBootstrap::with_capacity(
-        PENDING_DRIVER_LOAD_INITIAL_CAPACITY.saturating_add(replyless_device_service_count),
-    );
-    let scm_service_selection = system_hive_service_selection_report(
-        &auto_win32_service_snapshot,
-        &demand_win32_service_snapshot,
-        &demand_driver_snapshot,
-    );
-    print_str(b"[scm-select] auto-win32 count=");
-    print_u64(scm_service_selection.auto_win32_count);
-    print_str(b" first=");
-    print_str(scm_service_selection.auto_win32_name.as_bytes());
-    print_str(b" image=");
-    print_str(scm_service_selection.auto_win32_image_path.as_bytes());
-    print_str(b" nt-image=");
-    print_str(scm_service_selection.auto_win32_nt_image_path.as_bytes());
-    print_str(b" cmd=");
-    print_str(scm_service_selection.auto_win32_command_line.as_bytes());
-    print_str(b" kind=");
-    print_str(win32_service_process_kind_label(
-        scm_service_selection.auto_win32_process_kind,
-    ));
-    print_str(b" interactive=");
-    print_str(if scm_service_selection.auto_win32_interactive {
-        b"1"
-    } else {
-        b"0"
-    });
-    print_str(b"\n");
-    print_str(b"[scm-select] demand-win32 count=");
-    print_u64(scm_service_selection.demand_win32_count);
-    print_str(b" first=");
-    print_str(scm_service_selection.demand_win32_name.as_bytes());
-    print_str(b" image=");
-    print_str(scm_service_selection.demand_win32_image_path.as_bytes());
-    print_str(b" nt-image=");
-    print_str(scm_service_selection.demand_win32_nt_image_path.as_bytes());
-    print_str(b" cmd=");
-    print_str(scm_service_selection.demand_win32_command_line.as_bytes());
-    print_str(b" kind=");
-    print_str(win32_service_process_kind_label(
-        scm_service_selection.demand_win32_process_kind,
-    ));
-    print_str(b" interactive=");
-    print_str(if scm_service_selection.demand_win32_interactive {
-        b"1"
-    } else {
-        b"0"
-    });
-    print_str(b"\n");
-    print_str(b"[scm-select] demand-driver count=");
-    print_u64(scm_service_selection.demand_driver_count);
-    print_str(b" first=");
-    print_str(scm_service_selection.demand_driver_name.as_bytes());
-    print_str(b" image=");
-    print_str(scm_service_selection.demand_driver_image_path.as_bytes());
-    print_str(b" object=");
-    print_str(scm_service_selection.demand_driver_object_path.as_bytes());
-    print_str(b"\n");
-    check(
-        b"exec_scm_autostart_win32_launch_spec_from_registry",
-        scm_service_selection.auto_win32_ready(),
-        &mut passed,
-    );
-    check(
-        b"exec_scm_demandstart_win32_launch_spec_from_registry",
-        scm_service_selection.demand_win32_ready(),
-        &mut passed,
-    );
-    check(
-        b"exec_ntloaddriver_demand_driver_selected_from_registry",
-        scm_service_selection.demand_driver_ready(),
-        &mut passed,
-    );
-    let mut hosted_pci_hardware_grants = Vec::new();
-    let hosted_pci_grant_discovery = discover_hosted_pci_hardware_grants_for_launch_plans(
-        bi,
-        &pci_devices,
-        &[
-            system_boot_driver_plan,
-            config_pnp_plan,
-            config_demand_pnp_plan,
-        ],
-        &mut hosted_pci_hardware_grants,
-    );
-    print_str(b"[driver-launch] hosted PCI grant discovery selected=");
-    print_u64(hosted_pci_grant_discovery.selected_devnodes);
-    print_str(b" existing=");
-    print_u64(hosted_pci_grant_discovery.existing_grants);
-    print_str(b" claimed=");
-    print_u64(hosted_pci_grant_discovery.claimed_grants);
-    print_str(b" missing-mmio=");
-    print_u64(hosted_pci_grant_discovery.missing_memory_bar);
-    print_str(b" claim-failures=");
-    print_u64(hosted_pci_grant_discovery.claim_failures);
-    print_str(b"\n");
-    check(
-        b"exec_hosted_pci_grants_discovered_from_registry",
-        hosted_pci_grant_discovery.selected_devnodes
-            == hosted_pci_grant_discovery.existing_grants
-                + hosted_pci_grant_discovery.claimed_grants
-            && hosted_pci_grant_discovery.missing_memory_bar == 0
-            && hosted_pci_grant_discovery.claim_failures == 0,
-        &mut passed,
-    );
-    let hosted_pci_window_publish = publish_hosted_pnp_context_for_launch_plans(
-        &pci_devices,
-        &[
-            system_boot_driver_plan,
-            config_pnp_plan,
-            config_demand_pnp_plan,
-        ],
-        hosted_pci_hardware_grants.as_slice(),
-        acpi_platform_authority,
-    );
-    print_str(b"[driver-launch] hosted resource windows pci-selected=");
-    print_u64(hosted_pci_window_publish.selected_devnodes);
-    print_str(b" pci-published=");
-    print_u64(hosted_pci_window_publish.published_windows);
-    print_str(b" pci-missing-grants=");
-    print_u64(hosted_pci_window_publish.missing_grants);
-    print_str(b" pci-va-exhausted=");
-    print_u64(hosted_pci_window_publish.pci_va_exhausted as u64);
-    print_str(b" platform-selected=");
-    print_u64(hosted_pci_window_publish.selected_platform_devnodes);
-    print_str(b" platform-published=");
-    print_u64(hosted_pci_window_publish.published_platform_windows);
-    print_str(b" platform-missing-grants=");
-    print_u64(hosted_pci_window_publish.missing_platform_grants);
-    print_str(b"\n");
-    check(
-        b"exec_hosted_pci_windows_selected_from_registry",
-        hosted_pci_window_publish.published_windows != 0
-            && hosted_pci_window_publish.missing_grants == 0
-            && !hosted_pci_window_publish.pci_va_exhausted,
-        &mut passed,
-    );
-    check(
-        b"exec_hosted_acpi_platform_selected_from_registry",
-        hosted_pci_window_publish.selected_platform_devnodes == 1
-            && hosted_pci_window_publish.published_platform_windows == 1
-            && hosted_pci_window_publish.missing_platform_grants == 0,
-        &mut passed,
-    );
-
-    // --- SERVICE 9: the GENERAL DYNAMIC driver-launch path. The SYSTEM hive is imported into
-    // Config Manager metadata, ordered by ServiceGroupOrder, then narrowed by mechanism: FSD-class
-    // services use the persistent IRP host directly; device-class services are selected from
-    // imported Enum devnodes, plus the no-devnode NT5 network wrapper/transport groups while that
-    // stack is being activated. The named-pipe provider is discovered by the DEVICE_OBJECT it
-    // publishes, not by a compiled-in service or image name.
-    if let Some(fs) = exec_fs() {
-        let mut named_pipe_provider = None;
-        for spec in system_boot_driver_plan.as_slice() {
-            let spec_devnodes = system_boot_driver_plan.devnodes_for(spec);
-            if driver_launch::driver_id_by_name(spec.driver_object_path.as_str()).is_some() {
-                print_str(b"[driver-launch] boot/system service already loaded ");
-                print_str(spec.service_name.as_bytes());
-                print_str(b"\n");
-                continue;
-            }
-            print_str(b"[driver-launch] launching boot/system service ");
-            print_str(spec.service_name.as_bytes());
-            print_str(b" path=");
-            print_str(spec.image_path.as_bytes());
-            if spec.devnode_count != 0 {
-                print_str(b" devnodes=");
-                print_u64(spec.devnode_count as u64);
-                if let Some(first) = spec_devnodes.first() {
-                    print_str(b" first=");
-                    print_str(first.instance_id.as_bytes());
-                }
-            }
-            print_str(b"\n");
-            if let Some((dc, _)) = launch_boot_driver_service(
-                &fs,
-                spec,
-                system_boot_driver_plan,
-                HostedPnpStartOptions::boot_service(),
-                &mut driver_start_bootstrap,
-            ) {
-                let named_pipe_device = c
-                    .query_object("\\Device\\NamedPipe", true)
-                    .ok()
-                    .is_some_and(|info| {
-                        info.route_kind == 2
-                            && info.owner_component == driver_launch::IO_MANAGER_COMPONENT_ID
-                            && driver_launch::device_owned_by_driver(
-                                info.owner_local_id,
-                                dc.driver_id,
-                            )
-                    });
-                if named_pipe_device {
-                    named_pipe_provider = Some((dc, spec.driver_object_path));
-                    continue;
-                }
-                print_str(b"[driver-launch] service ");
-                print_str(spec.service_name.as_bytes());
-                print_str(b" did not own \\Device\\NamedPipe\n");
-            } else {
-                print_str(b"[driver-launch] boot/system service ");
-                print_str(spec.service_name.as_bytes());
-                print_str(b" load failed\n");
-            }
-        }
-        if let Some((dc, driver_object_path)) = named_pipe_provider {
-            publish_npfs_io_objects(&mut *c, &dc, driver_object_path.as_str(), &mut passed);
-            // C1 checks: the general dynamic path loaded npfs isolated + ran its DriverEntry.
-            check(
-                b"npfs_driver_entry_entered",
-                (dc.verdict & V_ENTERED) != 0,
-                &mut passed,
-            );
-            check(
-                b"npfs_device_created",
-                (dc.verdict & V_DEVICE) != 0 && driver_launch::driver_has_live_device(dc.driver_id),
-                &mut passed,
-            );
-            check(
-                b"npfs_driver_entry_success",
-                (dc.verdict & V_SUCCESS) != 0,
-                &mut passed,
-            );
-            check(
-                b"npfs_major_function_table",
-                (dc.verdict & V_MJ) != 0,
-                &mut passed,
-            );
-            // Isolation proof: npfs runs in its OWN VSpace (a distinct PML4 cap != the executive's).
-            check(
-                b"npfs_isolated_vspace",
-                dc.pml4 != 0 && dc.pml4 != CAP_INIT_THREAD_VSPACE,
-                &mut passed,
-            );
-            if dc.finished && (dc.verdict & V_MJ) != 0 {
-                // C2 round-trip: dispatch a REAL IRP_MJ_CREATE_NAMED_PIPE (major 1) to the live
-                // component with a private probe pipe (UTF-16 "\ntstest") — exercising npfs's REAL
-                // NpFsdCreateNamedPipe through a real FILE_OBJECT + IO_STACK_LOCATION. Proves the
-                // routing path is real without consuming the live SCM `\ntsvcs` server instance.
-                let name16: [u8; 16] = *b"\\\0n\0t\0s\0t\0e\0s\0t\0";
-                let name_units = [
-                    b'\\' as u16,
-                    b'n' as u16,
-                    b't' as u16,
-                    b's' as u16,
-                    b't' as u16,
-                    b'e' as u16,
-                    b's' as u16,
-                    b't' as u16,
-                ];
-                let npfs_device_id = driver_launch::device_id_by_name("\\Device\\NamedPipe");
-                let r = npfs_device_id
-                    .and_then(|device_id| {
-                        driver_launch::allocate_hosted_file(
-                            device_id,
-                            0x001f_01ff,
-                            3,
-                            0,
-                            &name_units,
-                        )
-                        .ok()
-                    })
-                    .and_then(|file_id| {
-                        match driver_launch::dispatch_hosted_file_create_irp_result_exact(
-                            file_id,
-                            1, /* IRP_MJ_CREATE_NAMED_PIPE */
-                            initial_system_driver_caller(),
-                            CreateParameters {
-                                opened_case_sensitive: false,
-                                desired_access: AccessMask::from_bits_retain(0x001f_01ff),
-                                share_access: ShareAccess::from_bits_retain(3),
-                                create_options: CreateOptions::empty(),
-                                create_disposition: 3, /* FILE_OPEN_IF */
-                                file_attributes: 0,
-                                ea_length: 0,
-                                related_file: None,
-                            },
-                            &name16,
-                        ) {
-                            Ok((status, information, _, context)) => {
-                                Some((status, information, file_id, context.unwrap_or(0)))
-                            }
-                            Err(_) => {
-                                let _ = driver_launch::release_hosted_file(file_id);
-                                None
-                            }
-                        }
-                    });
-                if let Some((st, info, srv_fid, srv_context)) = r {
-                    print_str(
-                        b"[npfs-svc] C2 dispatch IRP_MJ_CREATE_NAMED_PIPE(\\ntstest) -> status=0x",
-                    );
-                    print_hex(st as u32);
-                    print_str(b" info=");
-                    print_u64(info);
-                    print_str(b" fsctx=0x");
-                    print_hex(srv_context as u32);
-                    print_str(b"\n");
-                    check(b"npfs_dispatch_roundtrip", true, &mut passed);
-                    // C-a: NpFsdCreateNamedPipe COMPLETED — SUCCESS + FILE_CREATED(2) + a real CCB-backed
-                    // FsContext. The VCB prefix-tree/ERESOURCE/security trampolines ran for real.
-                    check(
-                        b"npfs_create_named_pipe_complete",
-                        st == 0 && info == 2 && srv_fid != 0 && srv_context != 0,
-                        &mut passed,
-                    );
-                    // C-a: create-then-CONNECT — a client IRP_MJ_CREATE(\ntstest) must find the FCB via the
-                    // real prefix tree and return a connected client-end FILE_OBJECT (proves Insert+Find work).
-                    let client_create = npfs_device_id
-                        .and_then(|device_id| {
-                            driver_launch::allocate_hosted_file(
-                                device_id,
-                                0x001f_01ff,
-                                3,
-                                0,
-                                &name_units,
-                            )
-                            .ok()
-                        })
-                        .and_then(|file_id| {
-                            match driver_launch::dispatch_hosted_file_create_irp_result_exact(
-                                file_id,
-                                0, /* IRP_MJ_CREATE */
-                                initial_system_driver_caller(),
-                                CreateParameters {
-                                    opened_case_sensitive: false,
-                                    desired_access: AccessMask::from_bits_retain(0x001f_01ff),
-                                    share_access: ShareAccess::from_bits_retain(3),
-                                    create_options: CreateOptions::empty(),
-                                    create_disposition: 1, /* FILE_OPEN */
-                                    file_attributes: 0,
-                                    ea_length: 0,
-                                    related_file: None,
-                                },
-                                &name16,
-                            ) {
-                                Ok((status, information, _, context)) => {
-                                    Some((status, information, file_id, context.unwrap_or(0)))
-                                }
-                                Err(_) => {
-                                    let _ = driver_launch::release_hosted_file(file_id);
-                                    None
-                                }
-                            }
-                        });
-                    let mut client_lifecycle_ok = false;
-                    if let Some((cst, _cinfo, cli_fid, cli_context)) = client_create {
-                        print_str(b"[npfs-svc] C-a connect IRP_MJ_CREATE(\\ntstest) -> status=0x");
-                        print_hex(cst as u32);
-                        print_str(b" fsctx=0x");
-                        print_hex(cli_context as u32);
-                        print_str(b"\n");
-                        check(
-                            b"npfs_client_connect_finds_fcb",
-                            cst == 0 && cli_fid != 0 && cli_context != 0,
-                            &mut passed,
-                        );
-                        check(
-                            b"npfs_client_server_endpoint_ids_distinct",
-                            cst == 0 && srv_fid != 0 && cli_fid != 0 && srv_fid != cli_fid,
-                            &mut passed,
-                        );
-                        if cst == 0 && cli_fid != 0 {
-                            let boot_caller = initial_system_driver_caller();
-                            let npfs_dispatch_irp = |major, fsctl, file_id, input: &[u8], output: &mut [u8]| {
-                                driver_launch::npfs_dispatch_irp(major, fsctl, file_id, input, output, boot_caller)
-                            };
-                            let pipe_info = [1u8, 0, 0, 0, 0, 0, 0, 0];
-                            let mut set_out = [];
-                            if let Some((sst, sinfo)) = npfs_dispatch_irp(
-                                6,  /* IRP_MJ_SET_INFORMATION */
-                                23, /* FilePipeInformation */
-                                cli_fid,
-                                &pipe_info,
-                                &mut set_out,
-                            ) {
-                                print_str(b"[npfs-svc] C-b IRP_MJ_SET_INFORMATION(FilePipeInformation) -> status=0x");
-                                print_hex(sst as u32);
-                                print_str(b" info=");
-                                print_u64(sinfo);
-                                print_str(b"\n");
-                                check(
-                                    b"npfs_set_pipe_information",
-                                    sst == 0 && sinfo == 0,
-                                    &mut passed,
-                                );
-                            }
-
-                            // ★ C-c: the CONNECTION DATA PLANE. With a real connected server<->client
-                            // pair (srv_fid + cli_fid on \ntstest), prove REAL cross-end data flow:
-                            // IRP_MJ_WRITE on the SERVER end must land in the CLIENT end's read queue
-                            // (server->client / OUTBOUND), and vice versa. This is the load-bearing
-                            // rpcrt4 Ndr transport (a REAL connection object, not a synthetic mint).
-                            let payload = *b"NDR-PLANE"; // 9 bytes, exact write length
-                            let mut wnone = [];
-                            let srv_write = npfs_dispatch_irp(
-                                4, /* IRP_MJ_WRITE */
-                                0, srv_fid, &payload, &mut wnone,
-                            );
-                            let mut rbuf = [0u8; 16];
-                            let cli_read = npfs_dispatch_irp(
-                                3, /* IRP_MJ_READ */
-                                0,
-                                cli_fid,
-                                &[],
-                                &mut rbuf,
-                            );
-                            let mut s2c_ok = false;
-                            if let (Some((wst, winfo)), Some((rst, rinfo))) = (srv_write, cli_read)
-                            {
-                                print_str(b"[npfs-svc] C-c DATA-PLANE srv-write status=0x");
-                                print_hex(wst as u32);
-                                print_str(b" wrote=");
-                                print_u64(winfo);
-                                print_str(b" | cli-read status=0x");
-                                print_hex(rst as u32);
-                                print_str(b" read=");
-                                print_u64(rinfo);
-                                print_str(b" bytes=");
-                                for &b in rbuf.iter().take(9) {
-                                    print_hex(b as u32);
-                                }
-                                print_str(b"\n");
-                                // server->client: client read back exactly what server wrote.
-                                s2c_ok =
-                                    wst == 0 && rst == 0 && rinfo == 9 && rbuf[..9] == payload[..9];
-                            }
-                            check(
-                                b"exec_pipe_data_plane_server_to_client",
-                                s2c_ok,
-                                &mut passed,
-                            );
-
-                            // client->server: reverse direction (INBOUND) through the same connection.
-                            let creq = *b"RPC-REQ"; // 7 bytes, exact write length
-                            let mut cwnone = [];
-                            let cli_write = npfs_dispatch_irp(
-                                4, /* IRP_MJ_WRITE */
-                                0,
-                                cli_fid,
-                                &creq,
-                                &mut cwnone,
-                            );
-                            let mut sbuf = [0u8; 16];
-                            let srv_read = npfs_dispatch_irp(
-                                3, /* IRP_MJ_READ */
-                                0,
-                                srv_fid,
-                                &[],
-                                &mut sbuf,
-                            );
-                            let mut c2s_ok = false;
-                            if let (Some((wst2, _)), Some((rst2, rinfo2))) = (cli_write, srv_read) {
-                                c2s_ok =
-                                    wst2 == 0 && rst2 == 0 && rinfo2 == 7 && sbuf[..7] == creq[..7];
-                            }
-                            check(
-                                b"exec_pipe_data_plane_client_to_server",
-                                c2s_ok,
-                                &mut passed,
-                            );
-
-                            // ★ C-d: a REAL flush-behind-queued-write that npfs PENDS. NpCommonFlushBuffers
-                            // (npfs/flushbuf.c) inspects the pipe end's DataQueue: a FLUSH on the SERVER end
-                            // checks DataQueue[OUTBOUND], on the CLIENT end DataQueue[INBOUND]. If that queue
-                            // is in state WriteEntries (queued write data no reader has drained yet), the
-                            // flush IRP is QUEUED behind the writes (NpAddDataQueueEntry) → STATUS_PENDING;
-                            // an empty queue returns SUCCESS synchronously. So: WRITE a payload onto one end
-                            // (it sits in that end's write queue — no matching read yet), then FLUSH the SAME
-                            // end BEFORE draining → npfs genuinely returns 0x103. Do it in BOTH directions so
-                            // a real flush pends TWICE, then drain the queues (the matching reads) to complete
-                            // the pended flush IRPs. This is the real npfs write-blocks-flush semantics, driven
-                            // through the isolated npfs.sys IRP path — not a modeled shortcut.
-                            let mut fnone = [];
-                            // Direction 1 — server end: queue an OUTBOUND write, flush before the client reads.
-                            let _ = npfs_dispatch_irp(
-                                4, /* WRITE */
-                                0, srv_fid, b"FLUSH-A", &mut fnone,
-                            );
-                            let mut fout1 = [];
-                            let srv_flush = driver_launch::npfs_dispatch_irp_exact(
-                                9, /* IRP_MJ_FLUSH_BUFFERS */
-                                0,
-                                srv_fid,
-                                &[],
-                                &mut fout1,
-                                boot_caller,
-                            );
-                            let srv_flush_pended = matches!(
-                                srv_flush,
-                                Some((st, _, irp_id))
-                                    if st as u32 == 0x0000_0103 && irp_id != 0
-                            );
-                            if srv_flush_pended {
-                                NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
-                            }
-                            // Drain direction 1 (the client read completes the queued write + the pended flush).
-                            let mut fdrain1 = [0u8; 16];
-                            let _ =
-                                npfs_dispatch_irp(3 /* READ */, 0, cli_fid, &[], &mut fdrain1);
-                            let srv_flush_delivered = srv_flush
-                                .and_then(|(_, _, irp_id)| {
-                                    driver_launch::copy_completed_irp(irp_id, false)
-                                        .map(|completion| (irp_id, completion))
-                                })
-                                .is_some_and(|(irp_id, (st, info, bytes))| {
-                                    st == 0
-                                        && info == 0
-                                        && bytes.is_empty()
-                                        && driver_launch::acknowledge_completed_irp(irp_id).is_ok()
-                                });
-
-                            // Direction 2 — client end: queue an INBOUND write, flush before the server reads.
-                            let _ = npfs_dispatch_irp(
-                                4, /* WRITE */
-                                0, cli_fid, b"FLUSH-B", &mut fnone,
-                            );
-                            let mut fout2 = [];
-                            let cli_flush = driver_launch::npfs_dispatch_irp_exact(
-                                9, /* IRP_MJ_FLUSH_BUFFERS */
-                                0,
-                                cli_fid,
-                                &[],
-                                &mut fout2,
-                                boot_caller,
-                            );
-                            let cli_flush_pended = matches!(
-                                cli_flush,
-                                Some((st, _, irp_id))
-                                    if st as u32 == 0x0000_0103 && irp_id != 0
-                            );
-                            if cli_flush_pended {
-                                NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
-                            }
-                            let mut fdrain2 = [0u8; 16];
-                            let _ =
-                                npfs_dispatch_irp(3 /* READ */, 0, srv_fid, &[], &mut fdrain2);
-                            let cli_flush_delivered = cli_flush
-                                .and_then(|(_, _, irp_id)| {
-                                    driver_launch::copy_completed_irp(irp_id, false)
-                                        .map(|completion| (irp_id, completion))
-                                })
-                                .is_some_and(|(irp_id, (st, info, bytes))| {
-                                    st == 0
-                                        && info == 0
-                                        && bytes.is_empty()
-                                        && driver_launch::acknowledge_completed_irp(irp_id).is_ok()
-                                });
-
-                            print_str(b"[npfs-svc] C-d FLUSH-PENDING srv_pended=");
-                            print_u64(srv_flush_pended as u64);
-                            print_str(b" cli_pended=");
-                            print_u64(cli_flush_pended as u64);
-                            print_str(b" exact-delivery=");
-                            print_u64((srv_flush_delivered && cli_flush_delivered) as u64);
-                            print_str(b" pend_count=");
-                            print_u64(NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.load(Ordering::Relaxed));
-                            print_str(b"\n");
-                            check(
-                                b"exec_npfs_flush_pending_exact_completion",
-                                srv_flush_pended
-                                    && cli_flush_pended
-                                    && srv_flush_delivered
-                                    && cli_flush_delivered,
-                                &mut passed,
-                            );
-
-                            // ★ C-e: TWO CONCURRENT IRPs ON ONE FILE_OBJECT — the ordinary rpcrt4
-                            // server shape, and the exact shape that used to HANG the hosted
-                            // npfs.sys. `RPCRT4_io_thread` keeps a READ pending on the connection
-                            // while `RPCRT4_worker_thread` WRITES the response on the SAME handle.
-                            // Drive precisely that here and assert the BYTES both ways:
-                            //   1. the server end issues a READ npfs must PEND (inbound queue empty),
-                            //   2. with that read still outstanding, the server end WRITES a 48-byte
-                            //      response — the second live IRP on the same FILE_OBJECT,
-                            //   3. the client reads exactly those 48 bytes,
-                            //   4. the client writes, which COMPLETES the server's still-pending read
-                            //      (npfs' `NpWriteDataQueue` → `IofCompleteRequest`) and the delivered
-                            //      payload must be byte-exact in the completion stash.
-                            let mut pend_out = [0u8; 64];
-                            let srv_pending = driver_launch::npfs_dispatch_irp_exact(
-                                3, /* READ */
-                                0,
-                                srv_fid,
-                                &[],
-                                &mut pend_out,
-                                boot_caller,
-                            );
-                            let srv_read_pended = matches!(
-                                srv_pending,
-                                Some((st, _, irp_id)) if st as u32 == 0x0000_0103 && irp_id != 0
-                            );
-                            let mut response = [0u8; 48];
-                            for (i, slot) in response.iter_mut().enumerate() {
-                                *slot = 0x40u8.wrapping_add(i as u8);
-                            }
-                            let mut cnone = [];
-                            let concur_write = npfs_dispatch_irp(
-                                4, /* WRITE */
-                                0, srv_fid, &response, &mut cnone,
-                            );
-                            let mut resp_in = [0u8; 64];
-                            let concur_read =
-                                npfs_dispatch_irp(3 /* READ */, 0, cli_fid, &[], &mut resp_in);
-                            let response_ok = matches!(concur_write, Some((0, 48)))
-                                && matches!(concur_read, Some((0, 48)))
-                                && resp_in[..48] == response[..48];
-                            // Now wake the server's STILL-pending read from the other end.
-                            let wake = *b"WAKE-PENDING-READ";
-                            let cli_wake = npfs_dispatch_irp(
-                                4, /* WRITE */
-                                0, cli_fid, &wake, &mut cnone,
-                            );
-                            let stash = srv_pending.and_then(|(_, _, irp_id)| {
-                                driver_launch::copy_completed_irp(irp_id, true)
-                            });
-                            let stash_acked = srv_pending
-                                .map(|(_, _, irp_id)| {
-                                    driver_launch::acknowledge_completed_irp(irp_id).is_ok()
-                                })
-                                .unwrap_or(false);
-                            let pending_delivered = match &stash {
-                                Some((st, info, bytes)) => {
-                                    *st == 0
-                                        && *info == wake.len() as u64
-                                        && bytes.len() == wake.len()
-                                        && bytes[..] == wake[..]
-                                }
-                                None => false,
-                            };
-                            print_str(b"[npfs-svc] C-e CONCURRENT-IRP pended=");
-                            print_u64(srv_read_pended as u64);
-                            print_str(b" response_ok=");
-                            print_u64(response_ok as u64);
-                            print_str(b" wake_written=");
-                            print_u64(matches!(cli_wake, Some((0, _))) as u64);
-                            print_str(b" pending_delivered=");
-                            print_u64(pending_delivered as u64);
-                            print_str(b" fo_reused=");
-                            print_u64(driver_launch::FSD_FO_REUSED.load(Ordering::Relaxed));
-                            print_str(b" queue_repairs=");
-                            print_u64(driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed));
-                            print_str(b"\n");
-                            // A pending read AND a write on ONE FILE_OBJECT both complete with the
-                            // right bytes, npfs' queues stayed consistent (zero repairs), and the
-                            // write actually reused the open's FILE_OBJECT rather than a fresh one.
-                            check(
-                                b"exec_npfs_concurrent_irp_read_and_write",
-                                srv_read_pended
-                                    && response_ok
-                                    && pending_delivered
-                                    && stash_acked
-                                    && driver_launch::FSD_FO_REUSED.load(Ordering::Relaxed) >= 4
-                                    && driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed)
-                                        == 0,
-                                &mut passed,
-                            );
-
-                            // ★ C-f: the FILE_OBJECT LIFETIME proof. npfs stores our FILE_OBJECT in
-                            // `Ccb->FileObject[NamedPipeEnd]` (create.c:645/772, statesup.c:51) and
-                            // WRITES THROUGH it on disconnect. `audit_ccb` therefore re-validates
-                            // every FSD-held FILE_OBJECT pointer before each IRP: it must still be
-                            // one of our live per-open objects AND still CONTAIN a FILE_OBJECT
-                            // (`Type == IO_TYPE_FILE`, `Size == 0x100`). With the old per-IRP
-                            // lifetime the pool had already recycled those blocks into npfs' own
-                            // `NP_DATA_QUEUE_ENTRY`/`NP_CCB` allocations, so both checks fail.
-                            let fo_checks =
-                                driver_launch::FSD_FO_LIVE_CHECKS.load(Ordering::Relaxed);
-                            let fo_dangling =
-                                driver_launch::FSD_FO_DANGLING.load(Ordering::Relaxed);
-                            let fo_corrupt =
-                                driver_launch::FSD_FO_CORRUPTED.load(Ordering::Relaxed);
-                            let fo_opens = driver_launch::FSD_FO_OPENS.load(Ordering::Relaxed);
-                            print_str(b"[npfs-svc] C-f FO-LIFETIME opens=");
-                            print_u64(fo_opens);
-                            print_str(b" held-checks=");
-                            print_u64(fo_checks);
-                            print_str(b" dangling=");
-                            print_u64(fo_dangling);
-                            print_str(b" corrupted=");
-                            print_u64(fo_corrupt);
-                            print_str(b" audits=");
-                            print_u64(driver_launch::FSD_QUEUE_AUDITS.load(Ordering::Relaxed));
-                            print_str(b"\n");
-                            check(
-                                b"exec_npfs_file_object_lifetime",
-                                fo_opens >= 2
-                                    && fo_checks >= 4
-                                    && fo_dangling == 0
-                                    && fo_corrupt == 0,
-                                &mut passed,
-                            );
-
-                            // ★ C-h: the rpcrt4 HEADER-THEN-BODY shape — a 48-byte write against a
-                            // SMALLER (16-byte) pending read. This is byte-for-byte the shape the LSA
-                            // self-RPC response takes (`rpcrt4_conn_np_read` reads the 16-byte PDU
-                            // header first, so the reader's queued entry is 16 bytes while the server
-                            // writes the whole 48-byte response), and it is the dispatch that used to
-                            // never return from npfs. npfs must complete the reader with
-                            // STATUS_BUFFER_OVERFLOW + 16 bytes and queue the 32-byte remainder.
-                            let mut hdr_in = [0u8; 16];
-                            let hdr_pend = driver_launch::npfs_dispatch_irp_exact(
-                                3,
-                                /* READ */ 0,
-                                cli_fid,
-                                &[],
-                                &mut hdr_in,
-                                boot_caller,
-                            );
-                            let hdr_pended = matches!(
-                                hdr_pend,
-                                Some((st, _, irp_id)) if st as u32 == 0x0000_0103 && irp_id != 0
-                            );
-                            print_str(b"[npfs-svc] C-h HDR-READ pended=");
-                            print_u64(hdr_pended as u64);
-                            print_str(b" -> now writing 48 over a 16-byte pending read\n");
-                            let body_write = npfs_dispatch_irp(
-                                4, /* WRITE */
-                                0, srv_fid, &response, &mut cnone,
-                            );
-                            let hdr_stash = hdr_pend.and_then(|(_, _, irp_id)| {
-                                driver_launch::copy_completed_irp(irp_id, true)
-                            });
-                            let hdr_stash_acked = hdr_pend
-                                .map(|(_, _, irp_id)| {
-                                    driver_launch::acknowledge_completed_irp(irp_id).is_ok()
-                                })
-                                .unwrap_or(false);
-                            let hdr_ok = match &hdr_stash {
-                                Some((st, info, bytes)) => {
-                                    *st == 0x8000_0005
-                                        && *info == 16
-                                        && bytes.len() == 16
-                                        && bytes[..] == response[..16]
-                                }
-                                None => false,
-                            };
-                            // The remaining 32 bytes stay queued; drain them with a second read.
-                            let mut rest_in = [0u8; 64];
-                            let rest_read =
-                                npfs_dispatch_irp(3 /* READ */, 0, cli_fid, &[], &mut rest_in);
-                            let rest_ok = matches!(rest_read, Some((0, 32)))
-                                && rest_in[..32] == response[16..48];
-                            print_str(b"[npfs-svc] C-h SPLIT-WRITE write=");
-                            print_hex(match body_write {
-                                Some((st, _)) => st as u32,
-                                None => 0xFFFF_FFFF,
-                            });
-                            print_str(b" hdr_ok=");
-                            print_u64(hdr_ok as u64);
-                            print_str(b" rest_ok=");
-                            print_u64(rest_ok as u64);
-                            print_str(b" repairs=");
-                            print_u64(driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed));
-                            print_str(b"\n");
-                            check(
-                                b"exec_npfs_write_split_across_pending_read",
-                                hdr_pended
-                                    && body_write.is_some()
-                                    && hdr_ok
-                                    && hdr_stash_acked
-                                    && rest_ok
-                                    && driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed)
-                                        == 0,
-                                &mut passed,
-                            );
-
-                            // ★ C-i: THE RESULT A DISPATCH RETURNS IS ITS OWN — the behavioural leg
-                            // of `exec_irp_transport_call_bound`. Run three IRPs whose results are
-                            // mutually DISTINGUISHABLE: (1) queue an 11-byte payload the client has
-                            // not read, (2) a SET_INFORMATION whose completion is (0, 0), (3) a READ
-                            // whose completion is (0, 11, payload). Under the old Send/Recv transport
-                            // a `done` queued for an earlier cycle could satisfy the pump's Recv, so
-                            // the READ could return the SET's (0, 0); a fault injector had to
-                            // manufacture that slip to prove the sequence handshake caught it. Under
-                            // the `Call` transport the component is BlockedOnReply between its Call
-                            // and our reply, so it cannot publish a second completion at all — the
-                            // misordering is unrepresentable and needs no injector, only this proof
-                            // that each completion is the one its own request provoked.
-                            let slip_payload = *b"PHASE-SLIP!";
-                            let mut snone = [];
-                            let slip_write = npfs_dispatch_irp(
-                                4, /* WRITE */
-                                0,
-                                srv_fid,
-                                &slip_payload,
-                                &mut snone,
-                            );
-                            let mut set_out2 = [];
-                            let slip_set = npfs_dispatch_irp(
-                                6,  /* IRP_MJ_SET_INFORMATION */
-                                23, /* FilePipeInformation */
-                                cli_fid,
-                                &[1u8, 0, 0, 0, 0, 0, 0, 0],
-                                &mut set_out2,
-                            );
-                            let mut slip_in = [0u8; 32];
-                            let slip_read =
-                                npfs_dispatch_irp(3 /* READ */, 0, cli_fid, &[], &mut slip_in);
-                            let slip_ok = matches!(slip_write, Some((0, 11)))
-                                && matches!(slip_set, Some((0, 0)))
-                                && matches!(slip_read, Some((0, 11)))
-                                && slip_in[..11] == slip_payload[..];
-                            TRANSPORT_IRP_ROUNDTRIP.store(slip_ok, Ordering::Relaxed);
-                            print_str(b"[npfs-svc] C-i per-request completions distinct: read=");
-                            print_hex(match slip_read {
-                                Some((st, _)) => st as u32,
-                                None => 0xFFFF_FFFF,
-                            });
-                            print_str(b" info=");
-                            print_u64(match slip_read {
-                                Some((_, n)) => n,
-                                None => 0,
-                            });
-                            print_str(b" bytes_ok=");
-                            print_u64((slip_in[..11] == slip_payload[..]) as u64);
-                            print_str(b"\n");
-                        }
-                        let client_released = driver_launch::release_hosted_file(cli_fid).is_ok();
-                        let _ = driver_launch::pump_hosted_io_completions();
-                        client_lifecycle_ok =
-                            client_released && !driver_launch::hosted_file_exists(cli_fid);
-                    }
-                    let server_released = driver_launch::release_hosted_file(srv_fid).is_ok();
-                    let _ = driver_launch::pump_hosted_io_completions();
-                    let server_lifecycle_ok =
-                        server_released && !driver_launch::hosted_file_exists(srv_fid);
-                    check(
-                        b"exec_npfs_canonical_file_lifecycle",
-                        client_lifecycle_ok && server_lifecycle_ok,
-                        &mut passed,
-                    );
-                }
-            }
-        } else {
-            print_str(b"[driver-launch] no boot/system service published \\Device\\NamedPipe\n");
-        }
-
-        // --- G3: service-selected driver lifecycle through the same general driver path. The
-        // generated SYSTEM.DAT hive declares a boot/system service; the executive imports the
-        // service subtree into Config Manager metadata, selects the boot/system driver candidate,
-        // then proves load -> DriverEntry -> unload -> object teardown without probing a compiled-in
-        // service identity. This driver creates no DEVICE_OBJECT, so it must not receive a fabricated
-        // CREATE request merely to exercise the transport.
-        if let Some(proof_driver_spec) = proof_driver_spec {
-            print_str(b"[driver-launch] launching service ");
-            print_str(proof_driver_spec.service_name.as_bytes());
-            print_str(b" from config hive path=");
-            print_str(&proof_driver_spec.image_path);
-            print_str(b" object=");
-            print_str(proof_driver_spec.driver_object_path.as_bytes());
-            print_str(b"\n");
-            if let Ok(dc) = load_driver(
-                &fs,
-                &proof_driver_spec.image_path,
-                proof_driver_spec.class,
-                &proof_driver_spec.driver_object_path,
-                initial_system_driver_caller(),
-            ) {
-                let driver_ready = dc.finished && (dc.verdict & V_MJ) != 0;
-                driver_launch::register_driver_ready(dc.driver_id, driver_ready);
-                let driver_object_registered = driver_object_route_registered(
-                    &mut *c,
-                    &dc,
-                    &proof_driver_spec.driver_object_path,
-                );
-                check(
-                    b"exec_driver_lifecycle_object_registered",
-                    driver_object_registered,
-                    &mut passed,
-                );
-
-                // Isolation: the service-selected driver runs in its OWN VSpace — a PML4 distinct
-                // from the named-pipe provider AND the executive's.
-                let npfs_pml4 = driver_launch::npfs_pml4();
-                let proof_pml4 = driver_launch::driver_pml4(dc.driver_id);
-                let distinct_pml4 = proof_pml4 != 0
-                    && proof_pml4 != CAP_INIT_THREAD_VSPACE
-                    && proof_pml4 != npfs_pml4;
-
-                print_str(b"[driver-launch] lifecycle driver-id=");
-                print_u64(dc.driver_id);
-                print_str(b" DriverEntry-ready=");
-                print_u64(driver_ready as u64);
-                print_str(b" distinct_pml4=");
-                print_u64(distinct_pml4 as u64);
-                print_str(b"\n");
-                check(
-                    b"exec_driver_lifecycle_isolated_load",
-                    (dc.verdict & V_ENTERED) != 0
-                        && (dc.verdict & V_MJ) != 0
-                        && distinct_pml4
-                        && driver_ready
-                        && driver_object_registered,
-                    &mut passed,
-                );
-
-                let lifecycle_driver_id = dc.driver_id;
-                let unload_entry_present = dc.driver_unload != 0;
-                let unload_status =
-                    driver_launch::unload_driver_by_name(&proof_driver_spec.driver_object_path);
-                let unload_ok = unload_status.is_ok();
-                let route_removed =
-                    driver_launch::driver_id_by_name(&proof_driver_spec.driver_object_path)
-                        .is_none();
-                let object_removed = c
-                    .query_object(&proof_driver_spec.driver_object_path, true)
-                    .is_err();
-                let instance_removed = driver_launch::driver_pml4(lifecycle_driver_id) == 0;
-                print_str(b"[driver-launch] lifecycle unload service=");
-                print_str(proof_driver_spec.service_name.as_bytes());
-                print_str(b" status=0x");
-                print_hex(match unload_status {
-                    Ok(()) => 0,
-                    Err(status) => status.raw() as u32,
-                });
-                print_str(b" route_removed=");
-                print_u64(route_removed as u64);
-                print_str(b" object_removed=");
-                print_u64(object_removed as u64);
-                print_str(b" instance_removed=");
-                print_u64(instance_removed as u64);
-                print_str(b"\n");
-                check(
-                    b"exec_driver_lifecycle_unload_teardown",
-                    unload_entry_present
-                        && unload_ok
-                        && route_removed
-                        && object_removed
-                        && instance_removed,
-                    &mut passed,
-                );
-            } else {
-                print_str(
-                    b"[driver-launch] service-selected driver launch returned None (not staged / load failed)\n",
-                );
-            }
-        } else {
-            print_str(b"[driver-launch] config hive has no boot/system driver service ImagePath\n");
         }
     }
 

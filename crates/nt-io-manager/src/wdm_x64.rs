@@ -368,8 +368,8 @@ pub fn write_wdm_irp(bytes: &mut [u8], init: WdmIrpInit) -> Result<(), WdmLayout
     put_u8(bytes, 0x42, init.stack_count);
     put_u8(bytes, 0x43, init.current_location);
     put_u64(bytes, 0x70, init.user_buffer);
-    put_u64(bytes, 0xa8, init.thread);
-    put_u64(bytes, 0xb0, init.auxiliary_buffer);
+    put_u64(bytes, 0x98, init.thread);
+    put_u64(bytes, 0xa0, init.auxiliary_buffer);
     put_u64(bytes, 0xb8, init.current_stack_location);
     Ok(())
 }

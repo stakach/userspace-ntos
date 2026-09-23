@@ -7631,8 +7631,9 @@ mod tests {
         assert_eq!(irp[0x42], 1);
         assert_eq!(irp[0x43], 1);
         assert_eq!(le_u64(&irp, 0x70), 0x2222);
-        assert_eq!(le_u64(&irp, 0xa8), 0x4444);
-        assert_eq!(le_u64(&irp, 0xb0), 0x5555);
+        assert_eq!(le_u64(&irp, 0x98), 0x4444);
+        assert_eq!(le_u64(&irp, 0xa0), 0x5555);
+        assert_eq!(le_u64(&irp, 0xa8), 0);
         assert_eq!(le_u64(&irp, 0xb8), 0x3333);
 
         assert_eq!(

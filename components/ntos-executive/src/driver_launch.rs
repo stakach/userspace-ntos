@@ -329,15 +329,11 @@ const FSD_DATA_LOADER_ACPI_NODE_VA: u64 = FSD_DATA_VADDR + FSD_DATA_LOADER_ACPI_
 const FSD_DATA_LOADER_ACPI_IDENTIFIER_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_LOADER_ACPI_IDENTIFIER_OFF;
 const FSD_DATA_LOADER_ACPI_CONFIG_VA: u64 = FSD_DATA_VADDR + FSD_DATA_LOADER_ACPI_CONFIG_OFF;
-const FSD_DATA_IRP_DISPATCH_REQUEST_OFF: u64 = 0x1000;
 const _: () =
     assert!(FSD_DATA_SE_SID_POOL_OFF + nt_security::se_exports::SID_POOL_SIZE as u64 <= 0x1000);
 const _: () =
     assert!(FSD_DATA_LOADER_ACPI_CONFIG_OFF + FSD_DATA_LOADER_CONFIG_CAPACITY as u64 <= 0x3000);
 const _: () = assert!(FSD_DATA_PHYSICAL_MAP_CAPACITY > 0);
-const _: () = assert!(
-    FSD_DATA_IRP_DISPATCH_REQUEST_OFF + core::mem::size_of::<IrpDispatchRequest>() as u64 <= 0x2000
-);
 const FSD_HOSTED_SYSTEM_RANGE_START: u64 = FSD_CODE_VA;
 
 /// Shared handoff arena (executive ↔ host): entry rva in, verdict + MajorFunction table + device
@@ -1435,9 +1431,13 @@ const FSD_COMPLETION_SEQ_OFF: u64 = FSD_RUNTIME_TABLES_OFF;
 const FSD_PENDING_IRP_CAP: usize = 256;
 const FSD_PENDING_IRP_HEAD_OFF: u64 = FSD_RUNTIME_TABLES_OFF + 0x08;
 const FSD_PENDING_IRPS_OFF: u64 = align_up_u64(FSD_RUNTIME_TABLES_OFF + 0x10, 8);
-const _: () = assert!(
+const FSD_DATA_IRP_DISPATCH_REQUEST_OFF: u64 = align_up_u64(
     FSD_PENDING_IRPS_OFF
-        + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64
+        + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64,
+    0x1000,
+);
+const _: () = assert!(
+    FSD_DATA_IRP_DISPATCH_REQUEST_OFF + core::mem::size_of::<IrpDispatchRequest>() as u64
         <= FSD_DATA_PHYSICAL_MAP_OFF
 );
 
@@ -7850,7 +7850,7 @@ extern "win64" fn s_io_build_device_io_control_request(
         write_unaligned((irp + 0x48) as *mut u64, io_status_block);
         write_unaligned((irp + 0x50) as *mut u64, event);
         write_unaligned((irp + 0x70) as *mut u64, user_buffer);
-        write_unaligned((irp + 0xa8) as *mut u64, s_current_thread());
+        write_unaligned((irp + 0x98) as *mut u64, s_current_thread());
     }
     irp
 }
@@ -13943,9 +13943,9 @@ extern "win64" fn s_io_thread_to_process(thread: u64) -> u64 {
 /// Requestor identity belongs to the retained IRP thread, not the thread completing its I/O.
 extern "win64" fn s_io_get_requestor_process(irp: u64) -> u64 {
     unsafe {
-        let thread = read_unaligned((irp + 0xa8) as *const u64);
+        let thread = read_unaligned((irp + 0x98) as *const u64);
         if thread == 0 { return 0; }
-        match read_unaligned((irp + 0x46) as *const u8) {
+        match read_unaligned((irp + 0x40) as *const u8) {
             0 => s_io_thread_to_process(thread),
             1 => read_unaligned((thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_PROCESS as u64) as *const u64),
             _ => 0,
@@ -58171,9 +58171,11 @@ unsafe fn dispatch_irp_for_instance_exact(
     // in-image wall), demand-caps at 256, all win32k caps false — degenerate to today's inline loop
     // EXACTLY. `component_pump` bumps `HARNESS_IRP_DISPATCHES` per serviced dispatch (the
     // `exec_fsd_on_shared_harness` proof). Status is read at SH_REQ_STATUS(0x70) by kind=Irp.
+    let ingress_route = hosted_ingress_sources::primary_route(dispatch_index)?;
+    let reply_cap = crate::spawn_hosts::shared_ingress::owner::runtime::current_reply(ingress_route).ok()?;
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: ep,
-        ingress_route: hosted_ingress_sources::primary_route(dispatch_index),
+        ingress_route: Some(ingress_route),
         pml4,
         physical_domain: instance_domain_identity(d),
         code_va: 0,
@@ -58190,7 +58192,7 @@ unsafe fn dispatch_irp_for_instance_exact(
         // block, so the executive can never wedge on a component that is not receiving.
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
         tcb: d.tcb,
-        reply_cap: d.reply_cap,
+        reply_cap,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
