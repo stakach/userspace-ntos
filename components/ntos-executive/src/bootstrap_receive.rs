@@ -29,7 +29,7 @@ pub(crate) unsafe fn drive<T: Copy + Eq>(
             scope.service_irq_yield(0);
         }
         registry_mutation_work::redrive_provider();
-        if ingress::resume_acknowledged_registry_services()
+        if ingress::resume_acknowledged_retained_services()
             .map_err(|_| nt_process::STATUS_UNSUCCESSFUL)?
         {
             continue;
