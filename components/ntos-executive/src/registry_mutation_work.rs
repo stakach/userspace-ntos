@@ -456,7 +456,7 @@ fn has_matching(predicate: impl Fn(ProviderLogicalCaller) -> bool) -> bool {
 pub(crate) fn next_deadline() -> Option<u64> {
     let work = (PENDING.load(Ordering::Acquire) != 0).then(|| NEXT.load(Ordering::Acquire));
     let service = unsafe {
-        spawn_hosts::shared_ingress::owner::runtime::registry_service_resume_next_deadline()
+        spawn_hosts::shared_ingress::owner::runtime::retained_service_resume_next_deadline()
     };
     match (work, service) {
         (Some(work), Some(service)) => Some(work.min(service)),

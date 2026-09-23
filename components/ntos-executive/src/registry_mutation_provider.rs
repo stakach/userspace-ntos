@@ -210,7 +210,7 @@ unsafe fn submit_provider_inner(
         None => { let index = rows.len(); rows.push(work); index }
     };
     // Publish all semantic owners before changing the exact physical service lane.
-    if runtime::park_registry_service(route, token).is_err() {
+    if runtime::park_retained_service(route, token).is_err() {
         let mut work = (&mut *core::ptr::addr_of_mut!(WORK))[index].take().unwrap();
         let Caller::Provider(caller) = &mut work.caller else { unreachable!() };
         caller.cleanup(false).expect("unparked provider registry cleanup");
@@ -236,7 +236,7 @@ impl ProviderCaller {
     }
 
     unsafe fn service_cancelled(&self) -> bool {
-        runtime::registry_service_cancelled(self.admission.dispatch().route(),
+        runtime::retained_service_cancelled(self.admission.dispatch().route(),
             self.admission.dispatch().dispatch(), self.reply, self.token)
     }
 
@@ -298,11 +298,11 @@ impl ProviderCaller {
 
     pub(super) unsafe fn finish(&mut self, status: u32, publish: bool) -> Result<bool, i32> {
         let dispatch = self.admission.dispatch();
-        if self.reply_entered && runtime::reconcile_registry_service_reply(
+        if self.reply_entered && runtime::reconcile_retained_service_reply(
             dispatch.route(), dispatch.dispatch(), self.reply, self.token,
         ).map_err(|_| 0xC000_00A3u32 as i32)? {
             self.admission.release_existing()?;
-            runtime::retire_stopped_acknowledged_registry_service(
+            runtime::retire_stopped_acknowledged_retained_service(
                 dispatch.route(), dispatch.dispatch(), self.reply, self.token,
             ).map_err(|_| 0xC000_00A3u32 as i32)?;
             with_provider_process_manager(|pm| self.reference.release(pm))
@@ -319,7 +319,7 @@ impl ProviderCaller {
                 self.admission.abort_child()?;
             }
             self.admission.release_existing()?;
-            runtime::acknowledge_registry_service_cancellation(dispatch.route(),
+            runtime::acknowledge_retained_service_cancellation(dispatch.route(),
                 dispatch.dispatch(), self.reply, self.token)
                 .map_err(|_| 0xC000_00A3u32 as i32)?;
             with_provider_process_manager(|pm| self.reference.release(pm))
@@ -339,7 +339,7 @@ impl ProviderCaller {
             u64::from(status == 0 && matches!(&self.admission, ProviderAdmission::Create(_))))
             .map_err(|_| 0xC000_00A3u32 as i32)?;
         self.admission.release_existing()?;
-        runtime::retire_stopped_acknowledged_registry_service(
+        runtime::retire_stopped_acknowledged_retained_service(
             dispatch.route(), dispatch.dispatch(), self.reply, self.token,
         ).map_err(|_| 0xC000_00A3u32 as i32)?;
         with_provider_process_manager(|pm| self.reference.release(pm))

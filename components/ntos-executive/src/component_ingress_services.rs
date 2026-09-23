@@ -14,6 +14,11 @@ enum WaitPhase {
     Cancelled,
     Finished,
 }
+#[derive(Clone, Copy, PartialEq)]
+enum WaitKind {
+    Ordinary,
+    RetainedSemantic,
+}
 struct Wait {
     route: PeerRoute,
     dispatch: LaneDispatchIdentity,
@@ -21,7 +26,7 @@ struct Wait {
     token: u64,
     phase: WaitPhase,
     completion: Option<ServiceCompletion>,
-    registry: bool,
+    kind: WaitKind,
     autonomous: bool,
     resume_retry_at: u64,
     semantic_retired: bool,
@@ -68,14 +73,14 @@ unsafe fn wait_exact(
 }
 
 pub(crate) unsafe fn park_service(route: PeerRoute, token: u64) -> Result<(), Error> {
-    park(route, token, false)
+    park(route, token, WaitKind::Ordinary)
 }
 
-pub(crate) unsafe fn park_registry_service(route: PeerRoute, token: u64) -> Result<(), Error> {
-    park(route, token, true)
+pub(crate) unsafe fn park_retained_service(route: PeerRoute, token: u64) -> Result<(), Error> {
+    park(route, token, WaitKind::RetainedSemantic)
 }
 
-unsafe fn park(route: PeerRoute, token: u64, registry: bool) -> Result<(), Error> {
+unsafe fn park(route: PeerRoute, token: u64, kind: WaitKind) -> Result<(), Error> {
     let source = physical_source(route)?;
     if !matches!(
         source.kind,
@@ -109,7 +114,7 @@ unsafe fn park(route: PeerRoute, token: u64, registry: bool) -> Result<(), Error
             token,
             phase: WaitPhase::Entering,
             completion: None,
-            registry,
+            kind,
             autonomous,
             resume_retry_at: 0,
             semantic_retired: false,
@@ -123,7 +128,7 @@ unsafe fn park(route: PeerRoute, token: u64, registry: bool) -> Result<(), Error
         token,
         phase: WaitPhase::Entering,
         completion: None,
-        registry,
+        kind,
         autonomous,
         resume_retry_at: 0,
         semantic_retired: false,
@@ -180,7 +185,7 @@ pub(crate) unsafe fn wake_registry_service(
 
 /// A send may have consumed the physical Reply even if its wrapper returned an error.
 /// Reconcile from the retained Call's acknowledgement bit; never invoke the Reply again.
-pub(crate) unsafe fn reconcile_registry_service_reply(
+pub(crate) unsafe fn reconcile_retained_service_reply(
     route: PeerRoute,
     dispatch: LaneDispatchIdentity,
     reply: u64,
@@ -189,7 +194,7 @@ pub(crate) unsafe fn reconcile_registry_service_reply(
     let wait = (&*core::ptr::addr_of!(WAITS))
         .iter()
         .find(|row| {
-            row.registry
+            row.kind == WaitKind::RetainedSemantic
                 && row.route == route
                 && row.dispatch == dispatch
                 && row.reply == reply
@@ -291,14 +296,14 @@ unsafe fn wake_service_inner(
     Ok(())
 }
 
-/// Complete one acknowledged autonomous registry service by its retained route and token.
+/// Complete one acknowledged autonomous semantic service by its retained route and token.
 /// A busy lane remains owned and is retried by the normal timer source.
-pub(crate) unsafe fn resume_acknowledged_registry_services() -> Result<bool, Error> {
+pub(crate) unsafe fn resume_acknowledged_retained_services() -> Result<bool, Error> {
     let now = crate::monotonic_time_100ns();
     let route = (&*core::ptr::addr_of!(WAITS))
         .iter()
         .find(|wait| {
-            wait.registry
+            wait.kind == WaitKind::RetainedSemantic
                 && wait.autonomous
                 && matches!(wait.phase, WaitPhase::Acknowledged | WaitPhase::Resumed)
                 && wait.resume_retry_at <= now
@@ -314,7 +319,7 @@ pub(crate) unsafe fn resume_acknowledged_registry_services() -> Result<bool, Err
             // The external token is already retired. Retain the acknowledged Call and retry
             // only its physical completion after the query becomes available.
             if !(&*core::ptr::addr_of!(WAITS)).iter().any(|wait| {
-                wait.registry
+                wait.kind == WaitKind::RetainedSemantic
                     && wait.autonomous
                     && wait.route == route
                     && wait.phase == WaitPhase::Resumed
@@ -326,7 +331,7 @@ pub(crate) unsafe fn resume_acknowledged_registry_services() -> Result<bool, Err
     let wait = (&mut *core::ptr::addr_of_mut!(WAITS))
         .iter_mut()
         .find(|wait| {
-            wait.registry
+            wait.kind == WaitKind::RetainedSemantic
                 && wait.autonomous
                 && wait.route == route
                 && matches!(wait.phase, WaitPhase::Acknowledged | WaitPhase::Resumed)
@@ -336,11 +341,11 @@ pub(crate) unsafe fn resume_acknowledged_registry_services() -> Result<bool, Err
     Ok(false)
 }
 
-pub(crate) unsafe fn registry_service_resume_next_deadline() -> Option<u64> {
+pub(crate) unsafe fn retained_service_resume_next_deadline() -> Option<u64> {
     (&*core::ptr::addr_of!(WAITS))
         .iter()
         .filter(|wait| {
-            wait.registry
+            wait.kind == WaitKind::RetainedSemantic
                 && wait.autonomous
                 && matches!(wait.phase, WaitPhase::Acknowledged | WaitPhase::Resumed)
         })
@@ -387,7 +392,7 @@ pub(crate) unsafe fn resume_service(route: PeerRoute) -> Result<bool, Error> {
     if wait.phase != WaitPhase::Resumed {
         return Err(Error::Retirement);
     }
-    wait.phase = if wait.registry && !wait.semantic_retired {
+    wait.phase = if wait.kind == WaitKind::RetainedSemantic && !wait.semantic_retired {
         WaitPhase::CompletedAcknowledged
     } else {
         WaitPhase::Finished
@@ -426,7 +431,7 @@ pub(crate) unsafe fn cancel_parked_service(route: PeerRoute) -> Result<(), Error
     if resolve(route, true).is_none() {
         return Err(Error::PhysicalIdentity);
     }
-    let Some((dispatch, reply, token, phase, registry)) = (&*core::ptr::addr_of!(WAITS))
+    let Some((dispatch, reply, token, phase, kind)) = (&*core::ptr::addr_of!(WAITS))
         .iter()
         .find(|row| row.route == route && row.phase != WaitPhase::Finished)
         .map(|wait| {
@@ -435,7 +440,7 @@ pub(crate) unsafe fn cancel_parked_service(route: PeerRoute) -> Result<(), Error
                 wait.reply,
                 wait.token,
                 wait.phase,
-                wait.registry,
+                wait.kind,
             )
         })
     else {
@@ -480,7 +485,7 @@ pub(crate) unsafe fn cancel_parked_service(route: PeerRoute) -> Result<(), Error
         };
         return Ok(());
     }
-    let acknowledged = if registry {
+    let acknowledged = if kind == WaitKind::RetainedSemantic {
         match phase {
             WaitPhase::Acknowledged => true,
             WaitPhase::ReplyEntered => owner
@@ -506,7 +511,7 @@ pub(crate) unsafe fn cancel_parked_service(route: PeerRoute) -> Result<(), Error
     if wait.phase != phase {
         return Err(Error::Retirement);
     }
-    wait.phase = if registry {
+    wait.phase = if kind == WaitKind::RetainedSemantic {
         if acknowledged {
             if wait.semantic_retired {
                 WaitPhase::Finished
@@ -523,14 +528,14 @@ pub(crate) unsafe fn cancel_parked_service(route: PeerRoute) -> Result<(), Error
 }
 
 /// A sealed stop/drain cancellation receipt, not inference from a missing route or Reply.
-pub(crate) unsafe fn registry_service_cancelled(
+pub(crate) unsafe fn retained_service_cancelled(
     route: PeerRoute,
     dispatch: LaneDispatchIdentity,
     reply: u64,
     token: u64,
 ) -> bool {
     (&*core::ptr::addr_of!(WAITS)).iter().any(|wait| {
-        wait.registry
+        wait.kind == WaitKind::RetainedSemantic
             && wait.route == route
             && wait.dispatch == dispatch
             && wait.reply == reply
@@ -539,7 +544,7 @@ pub(crate) unsafe fn registry_service_cancelled(
     })
 }
 
-pub(crate) unsafe fn acknowledge_registry_service_cancellation(
+pub(crate) unsafe fn acknowledge_retained_service_cancellation(
     route: PeerRoute,
     dispatch: LaneDispatchIdentity,
     reply: u64,
@@ -548,7 +553,7 @@ pub(crate) unsafe fn acknowledge_registry_service_cancellation(
     let wait = (&mut *core::ptr::addr_of_mut!(WAITS))
         .iter_mut()
         .find(|wait| {
-            wait.registry
+            wait.kind == WaitKind::RetainedSemantic
                 && wait.route == route
                 && wait.dispatch == dispatch
                 && wait.reply == reply
@@ -562,7 +567,7 @@ pub(crate) unsafe fn acknowledge_registry_service_cancellation(
 
 /// The Reply was already acknowledged when a stopped route consumed its external token.
 /// Release this tombstone only after the semantic owner finishes its own cleanup.
-pub(crate) unsafe fn retire_stopped_acknowledged_registry_service(
+pub(crate) unsafe fn retire_stopped_acknowledged_retained_service(
     route: PeerRoute,
     dispatch: LaneDispatchIdentity,
     reply: u64,
@@ -571,7 +576,7 @@ pub(crate) unsafe fn retire_stopped_acknowledged_registry_service(
     let wait = (&mut *core::ptr::addr_of_mut!(WAITS))
         .iter_mut()
         .find(|wait| {
-            wait.registry
+            wait.kind == WaitKind::RetainedSemantic
                 && wait.route == route
                 && wait.dispatch == dispatch
                 && wait.reply == reply
