@@ -279,6 +279,19 @@ impl Work {
         crate::service_sec_image::with_provider_process_manager(|pm| self.actor.release(pm))
     }
 
+    /// A rejected or pre-entry canceled Call has no provider terminal to await. Keep its
+    /// exact source and requestor owners until both releases succeed; the service tombstone
+    /// must remain available for a later pass if either release is temporarily refused.
+    unsafe fn release_unentered_owners(&mut self) -> bool {
+        if !self.source_released {
+            if self.source.release().is_err() {
+                return false;
+            }
+            self.source_released = true;
+        }
+        !self.actor.is_held() || self.actor_release().is_ok()
+    }
+
     fn cancelled(&self) -> bool {
         unsafe {
             runtime::retained_service_cancelled(self.route, self.dispatch, self.reply, self.token)
@@ -676,6 +689,9 @@ impl Work {
             if !acked || self.terminal.is_some() {
                 return false;
             }
+            if !self.release_unentered_owners() {
+                return false;
+            }
             runtime::retire_stopped_acknowledged_retained_service(
                 self.route,
                 self.dispatch,
@@ -683,11 +699,6 @@ impl Work {
                 self.token,
             )
             .expect("rejected query-path service retirement");
-            self.source
-                .release()
-                .expect("rejected query-path source release");
-            self.actor_release()
-                .expect("rejected query-path actor release");
             return true;
         }
         if self.abort_pending {
@@ -704,6 +715,9 @@ impl Work {
                 && self.terminal.is_none()
                 && self.canonical_irp.is_none()
             {
+                if !self.release_unentered_owners() {
+                    return false;
+                }
                 runtime::acknowledge_retained_service_cancellation(
                     self.route,
                     self.dispatch,
@@ -711,11 +725,6 @@ impl Work {
                     self.token,
                 )
                 .expect("unentered query-path cancellation");
-                self.source
-                    .release()
-                    .expect("unentered query-path cancelled source");
-                self.actor_release()
-                    .expect("unentered query-path cancelled actor");
                 return true;
             }
             return self.advance_stopped_source();
