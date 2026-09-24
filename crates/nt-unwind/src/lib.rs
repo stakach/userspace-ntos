@@ -31,6 +31,7 @@ pub mod exception_snapshot;
 pub mod exception_walk;
 pub mod raw_context;
 pub mod raw_exception;
+pub mod seh_linkage_image;
 
 // =================================================================================================
 // EXCEPTION_RECORD / dispositions

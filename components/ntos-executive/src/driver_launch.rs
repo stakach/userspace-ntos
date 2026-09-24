@@ -36425,6 +36425,10 @@ unsafe fn load_hosted_auxiliary_image(
     if mapped.bytes.len() != plan.auxiliary_image_len as usize {
         return None;
     }
+    if nt_unwind::seh_linkage_image::admit(&pe, &mapped).is_err() {
+        print_str(b"[driver-launch] SEH support export admission refused\n");
+        return None;
+    }
     let frame_rights = rights.get_mut(frame_offset as usize..(frame_offset + frame_count) as usize)?;
     frame_rights.fill(RO_NX);
     for section in pe.sections() {
