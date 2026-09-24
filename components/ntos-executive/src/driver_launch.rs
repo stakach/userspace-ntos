@@ -37,6 +37,8 @@ mod hosted_exception_images;
 #[path = "hosted_exception_stack.rs"]
 #[allow(dead_code)] // KeRaiseStatus has not entered the native exception dispatcher yet.
 mod hosted_exception_stack;
+#[path = "hosted_c_specific_handler.rs"]
+mod hosted_c_specific_handler;
 
 /// Negative-only ingress gate. It retains no handler continuation and must never authorize a
 /// Reply; the pump walls the owning IRP after recording the admission result.
@@ -4486,13 +4488,19 @@ extern "win64" fn s_probe_for_read(_address: u64, _length: u64, _alignment: u64)
 extern "win64" fn s_probe_for_write(_address: u64, _length: u64, _alignment: u64) {}
 
 extern "win64" fn s_c_specific_handler(
-    _exception_record: u64,
-    _establisher_frame: u64,
-    _context_record: u64,
-    _dispatcher_context: u64,
-) -> ! {
-    print_str(b"[fsd-seh] __C_specific_handler invoked before native SEH is available\n");
-    panic!("hosted driver exception dispatch requires native SEH")
+    exception_record: u64,
+    establisher_frame: u64,
+    context_record: u64,
+    dispatcher_context: u64,
+) -> i32 {
+    unsafe {
+        hosted_c_specific_handler::dispatch(
+            exception_record,
+            establisher_frame,
+            context_record,
+            dispatcher_context,
+        )
+    }
 }
 
 const STATUS_SUCCESS: i32 = 0;
