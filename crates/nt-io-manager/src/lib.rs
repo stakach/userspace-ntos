@@ -84,6 +84,7 @@ mod store;
 mod synchronous_io;
 mod volume_information;
 mod wdm_x64;
+mod wdm_security_x64;
 
 pub use banked_transfer::{BankedTransferCursor, BankedTransferError};
 pub use bounded_file_read::{BoundedFileReadCompletion, BoundedFileReadPlan};
@@ -238,6 +239,13 @@ pub use wdm_x64::{
     WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
     WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_DEVICE,
     WDM_X64_IO_TYPE_DRIVER, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
+};
+pub use wdm_security_x64::{
+    write_wdm_access_state, write_wdm_create_security_graph,
+    write_wdm_io_security_context, write_wdm_security_subject_context,
+    WdmAccessStateInit, WdmIoSecurityContextInit, WdmSecuritySubjectContext,
+    WDM_X64_ACCESS_STATE_SIZE, WDM_X64_IO_SECURITY_CONTEXT_SIZE,
+    WDM_X64_SECURITY_SUBJECT_CONTEXT_SIZE,
 };
 
 #[cfg(feature = "object-manager")]
