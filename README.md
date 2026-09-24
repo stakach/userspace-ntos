@@ -138,9 +138,12 @@ self-contained launcher that:
    hosts the ReactOS processes), the verified `nt-seh-linkage.dll` support image,
    and the kernel, then packs the FAT32/UEFI disk image. The support image is
    mapped into hosted driver domains. The native SEH bridge runs driver C filters,
-   termination handlers, and explicit target unwinds on the interrupted component thread; verify its isolated
-   fixture with `bash scripts/run-seh-driver-integration.sh`; pass `--desktop`
-   to also require the full Explorer gate.
+   termination handlers, explicit target and collided unwinds, and provider CPU-fault
+   handlers on the interrupted component thread. Verify these paths with
+   `bash scripts/run-seh-driver-integration.sh`,
+   `bash scripts/run-seh-terminal-integration.sh`, and
+   `bash scripts/run-seh-fault-integration.sh`; pass `--desktop` to also require
+   the full Explorer gate.
 5. **Boots QEMU.**
 
 ### Historical boot output
