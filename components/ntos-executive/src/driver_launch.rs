@@ -34,6 +34,9 @@ mod hosted_thread_resources;
 mod hosted_primary_retirement;
 #[path = "hosted_exception_images.rs"]
 mod hosted_exception_images;
+#[path = "hosted_exception_stack.rs"]
+#[allow(dead_code)] // KeRaiseStatus has not entered the native exception dispatcher yet.
+mod hosted_exception_stack;
 
 #[path = "component_scheduler.rs"]
 mod component_scheduler;
