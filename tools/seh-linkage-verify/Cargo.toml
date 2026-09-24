@@ -1,0 +1,12 @@
+[package]
+name = "seh-linkage-verify"
+description = "Static PE and unwind verifier for the hosted SEH linkage frame image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-pe-loader.workspace = true
+nt-unwind.workspace = true
