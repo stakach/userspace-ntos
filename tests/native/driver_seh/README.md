@@ -38,3 +38,16 @@ requires exact native evidence for the nonreturning raise, FINALLY execution, an
 exception handler, then stops QEMU after the driver-emitted completion marker. Pass `--desktop`
 to also require genuine Explorer paint and the QEMU sentinel. The boot readiness timeout defaults
 to 900 seconds and cannot exceed the one-hour limit enforced by `run.sh`.
+
+The two terminal cases use separate fixture images and hive profiles. Each executes the same
+verified raise, target-unwind, and collided-unwind prefix before `DriverEntry` issues either an
+unhandled `ExRaiseStatus` or an exit `RtlUnwindEx`. Run both serially with:
+
+```sh
+bash scripts/run-seh-terminal-integration.sh
+```
+
+This gate stops QEMU only after the provider bugcheck is logged. It requires the native trigger,
+exception code, reporting-thread suspension, and terminal state. A timeout, returned terminal
+call, failed prefix, or successful DriverEntry completion fails. Neither terminal fixture is
+staged in the production image.

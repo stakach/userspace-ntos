@@ -9,6 +9,10 @@ typedef int32_t NTSTATUS;
 #define EXCEPTION_EXECUTE_HANDLER 1
 #define EXCEPTION_CONTINUE_SEARCH 0
 
+#if defined(SEH_TERMINAL_UNHANDLED) && defined(SEH_TERMINAL_EXIT)
+#error "select exactly one terminal SEH case"
+#endif
+
 __declspec(dllimport) void __stdcall ExRaiseStatus(NTSTATUS status);
 __declspec(dllimport) void __stdcall RtlUnwindEx(void *target_frame, void *target_ip,
     void *exception_record, void *return_value, void *context_record, void *history_table);
@@ -127,7 +131,20 @@ NTSTATUS __stdcall DriverEntry(void *driver_object, void *registry_path)
         DbgPrint("[seh-collision-proof] finally=%u inner-after=%u outer-after=%u landed=%u\n",
                  SehFixtureEvidence.collided_finally, SehFixtureEvidence.collided_inner_after,
                  SehFixtureEvidence.collided_outer_after, SehFixtureEvidence.collided_landed);
+#if defined(SEH_TERMINAL_UNHANDLED)
+        DbgPrint("[seh-terminal-trigger] kind=unhandled code=0xc0000022\n");
+        ExRaiseStatus(STATUS_ACCESS_DENIED);
+        DbgPrint("[seh-terminal-unexpected-return]\n");
+        return STATUS_UNSUCCESSFUL;
+#elif defined(SEH_TERMINAL_EXIT)
+        __declspec(align(16)) unsigned char exit_context[0x4d0];
+        DbgPrint("[seh-terminal-trigger] kind=exit code=0xc0000027\n");
+        RtlUnwindEx(0, 0, (void *)&UnwindRecord, 0, exit_context, 0);
+        DbgPrint("[seh-terminal-unexpected-return]\n");
+        return STATUS_UNSUCCESSFUL;
+#else
         DbgPrint("[seh-native-proof-complete]\n");
+#endif
     }
     return status;
 }
