@@ -11,6 +11,7 @@ use core::mem::{align_of, offset_of, size_of};
 pub const RAW_CONTEXT_SIZE: usize = 0x4d0;
 const FLAGS_OFFSET: usize = 0x30;
 const MXCSR_OFFSET: usize = 0x34;
+const SEGMENTS_OFFSET: usize = 0x38;
 const EFLAGS_OFFSET: usize = 0x44;
 const GPR_OFFSET: usize = 0x78;
 const RIP_OFFSET: usize = 0xf8;
@@ -19,6 +20,7 @@ const XMM_OFFSET: usize = 0x1a0;
 
 /// Control, integer, and floating-point state in the NT AMD64 `ContextFlags` field.
 pub const CONTEXT_AMD64_FULL: u32 = 0x0010_000b;
+pub const CONTEXT_AMD64_FULL_SEGMENTS: u32 = CONTEXT_AMD64_FULL | 0x4;
 
 /// Opaque native record. No Rust reference to a typed register field is formed from raw bytes.
 #[repr(C, align(16))]
@@ -51,6 +53,7 @@ const _: () = {
     assert!(align_of::<Nt5ContextLayout>() == 16);
     assert!(offset_of!(Nt5ContextLayout, flags) == FLAGS_OFFSET);
     assert!(offset_of!(Nt5ContextLayout, mxcsr) == MXCSR_OFFSET);
+    assert!(offset_of!(Nt5ContextLayout, segments) == SEGMENTS_OFFSET);
     assert!(offset_of!(Nt5ContextLayout, eflags) == EFLAGS_OFFSET);
     assert!(offset_of!(Nt5ContextLayout, gpr) == GPR_OFFSET);
     assert!(offset_of!(Nt5ContextLayout, rip) == RIP_OFFSET);
@@ -103,6 +106,19 @@ impl RawContext {
 
     pub fn set_eflags(&mut self, value: u32) {
         self.write_u32(EFLAGS_OFFSET, value);
+    }
+
+    /// Segment index `0=CS, 1=DS, 2=ES, 3=FS, 4=GS, 5=SS`.
+    pub fn segment(&self, index: usize) -> Option<u16> {
+        (index < 6).then(|| self.read_u16(SEGMENTS_OFFSET + index * 2))
+    }
+
+    pub fn set_segment(&mut self, index: usize, value: u16) -> bool {
+        if index >= 6 {
+            return false;
+        }
+        self.write_u16(SEGMENTS_OFFSET + index * 2, value);
+        true
     }
 
     /// ABI register index `0=RAX .. 15=R15`.
@@ -176,6 +192,16 @@ impl RawContext {
         u32::from_le_bytes(value)
     }
 
+    fn read_u16(&self, offset: usize) -> u16 {
+        let mut value = [0; 2];
+        value.copy_from_slice(&self.bytes[offset..offset + 2]);
+        u16::from_le_bytes(value)
+    }
+
+    fn write_u16(&mut self, offset: usize, value: u16) {
+        self.bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
     fn write_u32(&mut self, offset: usize, value: u32) {
         self.bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
@@ -224,6 +250,23 @@ mod tests {
         assert_eq!(raw.xmm(16), None);
         assert!(!raw.set_gpr(16, 1));
         assert!(!raw.set_xmm(16, [1, 2]));
+    }
+
+    #[test]
+    fn segment_fields_are_byte_exact_and_separate_from_full_flags() {
+        let mut raw = RawContext::zeroed();
+        raw.set_context_flags(CONTEXT_AMD64_FULL_SEGMENTS);
+        for index in 0..6 {
+            assert!(raw.set_segment(index, 0x20 + index as u16));
+            assert_eq!(raw.segment(index), Some(0x20 + index as u16));
+            assert_eq!(
+                &raw.as_bytes()[SEGMENTS_OFFSET + index * 2..SEGMENTS_OFFSET + index * 2 + 2],
+                &(0x20 + index as u16).to_le_bytes()
+            );
+        }
+        assert_eq!(raw.context_flags(), 0x0010_000f);
+        assert_eq!(raw.segment(6), None);
+        assert!(!raw.set_segment(6, 0));
     }
 
     #[test]
