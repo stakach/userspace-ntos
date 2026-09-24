@@ -68,6 +68,23 @@ fn parse_error(bytes: &[u8]) -> SnapshotError {
     }
 }
 
+fn view_error(bytes: &[u8]) -> SnapshotError {
+    match SealedExceptionView::parse(bytes) {
+        Ok(_) => panic!("unexpectedly admitted malformed snapshot view"),
+        Err(error) => error,
+    }
+}
+
+fn scoped_pe() -> alloc::vec::Vec<u8> {
+    let mut bytes = mapped_pe();
+    put32(&mut bytes, 0x1100, 1);
+    put32(&mut bytes, 0x1104, 0x1000);
+    put32(&mut bytes, 0x1108, 0x1080);
+    put32(&mut bytes, 0x110c, 1);
+    put32(&mut bytes, 0x1110, 0x1080);
+    bytes
+}
+
 #[test]
 fn roundtrip_two_images_uses_exact_bases_and_no_allocating_parser() {
     let first = mapped_pe();
@@ -95,6 +112,80 @@ fn roundtrip_two_images_uses_exact_bases_and_no_allocating_parser() {
         catalog.read_c_scope_table(BASE + 1, BASE + 0x1000).err(),
         Some(ScopeTableError::UnknownImage)
     );
+}
+
+#[test]
+fn sealed_view_matches_slot_catalog_across_images_and_gap() {
+    let first = mapped_pe();
+    let second = scoped_pe();
+    let encoded = encode_two(&first, &second);
+    let mut slots = [None, None];
+    let catalog = SealedExceptionCatalog::parse(&encoded, &mut slots).unwrap();
+    let view = SealedExceptionView::parse(&encoded).unwrap();
+    assert_eq!(view.image_count(), catalog.image_count());
+    for pc in [
+        BASE + 0x1000,
+        BASE + 0x11ff,
+        BASE + 0x2000,
+        BASE + 0x9000,
+        BASE + 0x11000,
+        BASE + 0x111ff,
+    ] {
+        assert_eq!(
+            view.lookup_exception_function(pc),
+            catalog.lookup_exception_function(pc)
+        );
+    }
+    for base in [BASE, BASE + 1, BASE + 0x10000] {
+        assert_eq!(view.read_u8(base, 0x1000), catalog.read_u8(base, 0x1000));
+    }
+    let second_base = BASE + 0x10000;
+    assert_eq!(
+        view.read_c_scope_table(second_base, second_base + 0x1100)
+            .unwrap()
+            .collect::<alloc::vec::Vec<_>>(),
+        catalog
+            .read_c_scope_table(second_base, second_base + 0x1100)
+            .unwrap()
+            .collect::<alloc::vec::Vec<_>>(),
+    );
+    assert!(view.validate_collision_scope(second_base, second_base + 0x1100, 1));
+    assert!(!view.validate_collision_scope(second_base, second_base + 0x1100, 2));
+    assert!(!view.validate_collision_scope(second_base + 1, second_base + 0x1100, 0));
+    assert!(matches!(
+        view.read_c_scope_table(second_base + 1, second_base + 0x1100),
+        Err(ScopeTableError::UnknownImage),
+    ));
+}
+
+#[test]
+fn sealed_view_and_slot_catalog_reject_same_malformed_envelopes() {
+    let first = mapped_pe();
+    let second = mapped_pe();
+    let encoded = encode_two(&first, &second);
+    let mut cases = alloc::vec::Vec::new();
+    let mut wrong_magic = encoded.clone();
+    wrong_magic[0] ^= 1;
+    cases.push(wrong_magic);
+    let mut slack = encoded.clone();
+    slack.push(0);
+    cases.push(slack);
+    let mut gap = encoded.clone();
+    put_u64(
+        &mut gap,
+        HEADER_SIZE + 8,
+        (HEADER_SIZE + 2 * DESCRIPTOR_SIZE + 1) as u64,
+    );
+    cases.push(gap);
+    let mut overlap = encoded.clone();
+    put_u64(&mut overlap, HEADER_SIZE + DESCRIPTOR_SIZE, BASE + 0x1000);
+    cases.push(overlap);
+    let mut invalid_pe = encoded.clone();
+    invalid_pe[HEADER_SIZE + 2 * DESCRIPTOR_SIZE] = 0;
+    cases.push(invalid_pe);
+    for bytes in cases {
+        assert_eq!(view_error(&bytes), parse_error(&bytes));
+    }
 }
 
 #[test]

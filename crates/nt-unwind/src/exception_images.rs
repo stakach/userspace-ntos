@@ -67,6 +67,7 @@ pub struct AdmittedExceptionImage {
 pub struct BorrowedExceptionImage<'a> {
     base: u64,
     end: u64,
+    bytes: &'a [u8],
     pe: PeFile<'a>,
 }
 
@@ -222,7 +223,12 @@ impl<'a> BorrowedExceptionImage<'a> {
                 previous_end = function.end;
             }
         }
-        Ok(Self { base, end, pe })
+        Ok(Self {
+            base,
+            end,
+            bytes,
+            pe,
+        })
     }
 
     pub fn base(&self) -> u64 {
@@ -236,10 +242,10 @@ impl<'a> BorrowedExceptionImage<'a> {
     pub fn read_c_scope_table(
         &self,
         handler_data: u64,
-    ) -> Result<ScopeCursor<'_>, ScopeTableError> {
+    ) -> Result<ScopeCursor<'a>, ScopeTableError> {
         read_scope_cursor(
             self.base,
-            self.pe.bytes(),
+            self.bytes,
             handler_data,
             |rva| section_containing(self.pe.sections(), rva),
             |range| covers_pe_executable(self.pe.sections(), range),
