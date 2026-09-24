@@ -8,9 +8,38 @@ use alloc::vec::Vec;
 use nt_status::NtStatus;
 
 use crate::{
-    FileReference, FileState, HostedDevicePointerRegistration, HostedFileIdentity,
+    DeviceId, FileId, FileReference, FileState, HostedDevicePointerRegistration, HostedFileIdentity,
     HostedFileUnbindOutcome, IoManager,
 };
+
+/// Fields that can be copied into a consumer-domain FILE_OBJECT. FsContext and the related
+/// File are provider-owned state and must be recovered through the canonical File identity.
+pub struct ConsumerFileMetadata {
+    pub file_name: Vec<u16>,
+    pub create_options: u32,
+    pub opened_case_sensitive: bool,
+}
+
+pub fn consumer_file_metadata<P>(
+    io: &IoManager<P>,
+    file_id: FileId,
+    device_id: DeviceId,
+) -> Result<ConsumerFileMetadata, NtStatus> {
+    let file = io.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
+    if file.device_id != device_id || file.state != FileState::Open {
+        return Err(NtStatus::INVALID_HANDLE);
+    }
+    let units = file.file_name.as_units();
+    let mut file_name = Vec::new();
+    file_name.try_reserve_exact(units.len())
+        .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+    file_name.extend_from_slice(units);
+    Ok(ConsumerFileMetadata {
+        file_name,
+        create_options: file.create_options.bits(),
+        opened_case_sensitive: file.opened_case_sensitive(),
+    })
+}
 
 #[derive(Debug)]
 #[must_use = "retain the projection until its handle and pointer references are released"]
@@ -222,6 +251,49 @@ mod tests {
         let registration = io.bind_hosted_device_pointer(domain, 0x6000, device).unwrap();
         let identity = io.bind_hosted_file_identity(domain, 0x5000, file).unwrap();
         (io, identity, registration)
+    }
+
+    #[test]
+    fn provider_context_is_opaque_to_consumer_file_metadata() {
+        let (mut io, identity, device) = opened();
+        io.file_mut(identity.file_id()).unwrap().driver_context = Some(0xdead_beef);
+        let metadata = consumer_file_metadata(&io, identity.file_id(), device.device_id()).unwrap();
+        assert!(!metadata.file_name.is_empty());
+        assert_eq!(metadata.create_options, CreateOptions::empty().bits());
+        assert_eq!(io.file(identity.file_id()).unwrap().driver_context, Some(0xdead_beef));
+
+        let mut projection = ConsumerFileProjection::new(&mut io, identity, device).unwrap();
+        assert_eq!(projection.reference_by_handle(&mut io, identity), Ok(identity.address()));
+        projection.handle_closed(identity).unwrap();
+        assert!(!projection.is_ready_to_retire());
+        projection.dereference(&mut io, identity).unwrap();
+        projection.retire(&mut io).unwrap();
+    }
+
+    #[test]
+    fn stale_file_binding_cannot_authorize_consumer_projection() {
+        let (mut io, stale, device) = opened();
+        assert_eq!(
+            io.unbind_hosted_file_identity(stale),
+            Ok(HostedFileUnbindOutcome::Removed),
+        );
+        let current = io.bind_hosted_file_identity(
+            stale.domain(), stale.address(), stale.file_id(),
+        ).unwrap();
+        assert_ne!(stale, current);
+        assert_eq!(
+            ConsumerFileProjection::new(&mut io, stale, device).err(),
+            Some(NtStatus::INVALID_PARAMETER),
+        );
+        assert_eq!(io.hosted_device_pointer_count(device), Ok(0));
+        assert_eq!(
+            consumer_file_metadata(&io, FileId::NULL, device.device_id()).err(),
+            Some(NtStatus::INVALID_HANDLE),
+        );
+        assert_eq!(
+            consumer_file_metadata(&io, current.file_id(), DeviceId::NULL).err(),
+            Some(NtStatus::INVALID_HANDLE),
+        );
     }
 
     #[test]

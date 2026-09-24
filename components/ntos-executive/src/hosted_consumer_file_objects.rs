@@ -5,7 +5,7 @@
 
 use super::*;
 use nt_io_manager::{
-    consumer_file_projection::ConsumerFileProjection, DeviceId, FileId, FileState,
+    consumer_file_projection::{consumer_file_metadata, ConsumerFileProjection}, DeviceId, FileId,
     HostedDevicePointerRegistration, HostedDomainIdentity, HostedFileIdentity,
     HostedFileUnbindOutcome, WdmOpenDeviceProjectionInit,
     WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE,
@@ -49,7 +49,6 @@ struct Metadata {
     device_stack_size: u8,
     file_create_options: u32,
     file_opened_case_sensitive: bool,
-    file_context: u64,
 }
 
 static mut ROWS: Vec<Row> = Vec::new();
@@ -90,15 +89,7 @@ fn copy_units(source: &[u16]) -> Result<Vec<u16>, i32> {
 
 fn metadata(file_id: FileId, device_id: DeviceId) -> Result<Metadata, i32> {
     let io = io_manager_mut();
-    let file = io.file(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-    if file.device_id != device_id
-        || file.state != FileState::Open
-        || file.related_file.is_some()
-        || file.driver_context.is_some_and(|context| context != 0)
-    {
-        return Err(STATUS_NOT_SUPPORTED);
-    }
-    let file_name = copy_units(file.file_name.as_units())?;
+    let file = consumer_file_metadata(io, file_id, device_id).map_err(|status| status.raw())?;
     let device = io.device(device_id).ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
     if device.delete_pending || device.stack_size == 0 {
         return Err(STATUS_INVALID_DEVICE_REQUEST);
@@ -107,15 +98,14 @@ fn metadata(file_id: FileId, device_id: DeviceId) -> Result<Metadata, i32> {
     let driver_name = copy_units(&driver.name.to_units())?;
     Ok(Metadata {
         driver_name,
-        file_name,
+        file_name: file.file_name,
         driver_id: device.driver_id,
         device_type: device.device_type.0,
         device_flags: device.flags.bits(),
         device_characteristics: device.characteristics.bits(),
         device_stack_size: device.stack_size,
-        file_create_options: file.create_options.bits(),
-        file_opened_case_sensitive: file.opened_case_sensitive(),
-        file_context: 0,
+        file_create_options: file.create_options,
+        file_opened_case_sensitive: file.opened_case_sensitive,
     })
 }
 
@@ -179,7 +169,8 @@ unsafe fn build(id: u64, metadata: &Metadata) -> Result<(), i32> {
             driver_name_max_len: driver_max,
             driver_name_buffer: driver_name,
             device_object: device,
-            file_object_context: metadata.file_context,
+            // FsContext is an address in the provider's VSpace, not this consumer's.
+            file_object_context: 0,
             device_type: metadata.device_type,
             device_flags: metadata.device_flags,
             device_characteristics: metadata.device_characteristics,
