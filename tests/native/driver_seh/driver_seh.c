@@ -89,11 +89,13 @@ void BareTargetUnwind(void);
 void CollidedTargetUnwind(void);
 
 #if defined(SEH_FAULT_UD2)
+void Ud2Instruction(void);
+
 __declspec(noinline) static void CatchIllegalInstruction(void)
 {
     __try {
         SehFixtureEvidence.fault_entered++;
-        __asm__ __volatile__("ud2");
+        Ud2Instruction();
         SehFixtureEvidence.fault_after_instruction++;
     } __except (__exception_code() == (uint32_t)STATUS_ILLEGAL_INSTRUCTION
                     ? EXCEPTION_EXECUTE_HANDLER

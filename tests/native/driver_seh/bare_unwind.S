@@ -27,6 +27,16 @@ BareTargetUnwind:
     retq
     .seh_endproc
 
+/* External call target keeps a real compiler-emitted handler scope around its caller.
+   The fault occurs in a PE frame, then virtual unwind reaches the C __except scope. */
+    .globl Ud2Instruction
+    .seh_proc Ud2Instruction
+Ud2Instruction:
+    .seh_endprologue
+    ud2
+    retq
+    .seh_endproc
+
 /* The compiler's outlined ?fin$ helper has no pdata even when it allocates a frame.
    Keep both the C scope and the nested finalizer in explicitly unwindable COFF frames. */
     .globl CollidedTargetUnwind

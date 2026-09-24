@@ -41,6 +41,10 @@ fi
     /subsystem:native,5.2 /osversion:5.2 /nodefaultlib /dynamicbase /nxcompat /timestamp:0 \
     /export:SehFixtureEvidence,DATA "/out:$OUT/driver_seh.sys" \
     "$OUT/driver_seh.obj" "$OUT/bare_unwind.obj" "$OUT/ntoskrnl.lib"
+VERIFY_ARGS=()
+if [[ "$VARIANT" == fault-ud2 ]]; then
+    VERIFY_ARGS=(--fault-ud2)
+fi
 cargo run --manifest-path "$ROOT/Cargo.toml" -p seh-linkage-verify \
-    --bin seh-driver-fixture-verify -- "$OUT/driver_seh.sys" "$OUT/driver_seh.obj"
+    --bin seh-driver-fixture-verify -- "$OUT/driver_seh.sys" "$OUT/driver_seh.obj" "${VERIFY_ARGS[@]}"
 printf 'Verified native SEH fixture (%s): %s/driver_seh.sys (not staged or executed)\n' "$VARIANT" "$OUT"

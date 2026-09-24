@@ -52,8 +52,11 @@ exception code, reporting-thread suspension, and terminal state. A timeout, retu
 call, failed prefix, or successful DriverEntry completion fails. Neither terminal fixture is
 staged in the production image.
 
-The CPU-fault case rebuilds the isolated `seh-driver` image with a `ud2` instruction inside a
-compiler-emitted `__try/__except`. It requires the real fault to reach the handler as
+The CPU-fault case rebuilds the isolated `seh-driver` image with a compiler-emitted
+`__try/__except` call into a separate PE `ud2` function. Keeping the faulting instruction in an
+external call preserves the caller's exception scope at optimization level 2; the static gate
+requires that extra scope and an x64 runtime-function row covering `ud2`. The runtime gate
+requires the real fault to reach the handler as
 `STATUS_ILLEGAL_INSTRUCTION` exactly once; the instruction after `ud2` must not run. Run it
 separately from the regular image gate:
 

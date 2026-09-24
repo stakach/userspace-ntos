@@ -92,7 +92,7 @@ fn verify_position_independent_object(bytes: &[u8]) -> Result<usize, String> {
     Ok(relocations)
 }
 
-fn verify(path: &str, object_path: &str) -> Result<(), String> {
+fn verify(path: &str, object_path: &str, fault_ud2: bool) -> Result<(), String> {
     let object = fs::read(object_path).map_err(|error| format!("read {object_path}: {error}"))?;
     let relocation_count = verify_position_independent_object(&object)?;
     let bytes = fs::read(path).map_err(|error| format!("read {path}: {error}"))?;
@@ -170,11 +170,18 @@ fn verify(path: &str, object_path: &str) -> Result<(), String> {
     }
     let mut except_scopes = 0u32;
     let mut finally_scopes = 0u32;
+    let mut runtime_functions = Vec::new();
     for index in 0..directory.size / 12 {
         let row = directory
             .virtual_address
             .checked_add(index * 12)
             .ok_or("runtime function RVA overflow")? as usize;
+        let begin = u32_at(&mapped.bytes, row)?;
+        let end = u32_at(&mapped.bytes, row + 4)?;
+        if begin >= end {
+            return Err("invalid runtime function bounds".into());
+        }
+        runtime_functions.push((begin, end));
         let unwind_rva = u32_at(&mapped.bytes, row + 8)?;
         if unwind_rva & 1 != 0 {
             continue;
@@ -210,6 +217,33 @@ fn verify(path: &str, object_path: &str) -> Result<(), String> {
             "missing compiler-emitted C exception/finally scopes: except={except_scopes} finally={finally_scopes}"
         ));
     }
+    if fault_ud2 {
+        if except_scopes < 2 {
+            return Err(format!(
+                "fault variant needs an additional compiler-emitted exception scope: {except_scopes}"
+            ));
+        }
+        let admitted_ud2 = pe.sections().iter().filter(|section| section.is_executable()).any(
+            |section| {
+                let start = section.virtual_address as usize;
+                let end = start.saturating_add(
+                    section.virtual_size.max(section.size_of_raw_data) as usize,
+                );
+                mapped.bytes.get(start..end).is_some_and(|code| {
+                    code.windows(2).enumerate().any(|(offset, instruction)| {
+                        instruction == [0x0f, 0x0b]
+                            && runtime_functions.iter().any(|&(begin, end)| {
+                                u64::from(begin) <= (start + offset) as u64
+                                    && (start + offset) as u64 + 2 <= u64::from(end)
+                            })
+                    })
+                })
+            },
+        );
+        if !admitted_ud2 {
+            return Err("fault variant needs a UD2 covered by an x64 runtime function".into());
+        }
+    }
     println!(
         "driver_seh.sys admitted at 0x{COMPONENT_LOAD_BASE:x}: except-scopes={except_scopes} finally-scopes={finally_scopes} imports={names:?} coff-relocations={relocation_count}"
     );
@@ -226,11 +260,12 @@ fn main() -> ExitCode {
         eprintln!("missing compiled COFF object path");
         return ExitCode::FAILURE;
     };
-    if args.next().is_some() {
-        eprintln!("expected exactly one fixture path");
+    let variant = args.next();
+    if !matches!(variant.as_deref(), None | Some("--fault-ud2")) || args.next().is_some() {
+        eprintln!("usage: seh-driver-fixture-verify <driver_seh.sys> <driver_seh.obj> [--fault-ud2]");
         return ExitCode::FAILURE;
     }
-    match verify(&path, &object_path) {
+    match verify(&path, &object_path, variant.is_some()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("SEH driver fixture verification failed: {error}");
