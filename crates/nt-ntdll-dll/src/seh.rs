@@ -475,6 +475,27 @@ struct DispatcherContext {
 /// -> EXCEPTION_DISPOSITION`.
 type ExceptionRoutine = unsafe extern "C" fn(*mut c_void, u64, *mut u8, *mut c_void) -> i32;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum LiveSearchReturn {
+    Handled,
+    Continue,
+    Unhandled,
+}
+
+fn classify_live_search_return(raw: i32) -> LiveSearchReturn {
+    match ex::Disposition::try_from_raw(raw) {
+        Some(ex::Disposition::ContinueExecution) => LiveSearchReturn::Handled,
+        Some(ex::Disposition::ContinueSearch) => LiveSearchReturn::Continue,
+        // NestedException needs nested-region state; CollidedUnwind needs an outer dispatcher
+        // snapshot. This live loop has neither, so it cannot advance as ContinueSearch.
+        _ => LiveSearchReturn::Unhandled,
+    }
+}
+
+fn live_unwind_handler_completed(raw: i32) -> bool {
+    ex::Disposition::try_from_raw(raw) == Some(ex::Disposition::ContinueSearch)
+}
+
 unsafe fn finish_vectored_dispatch(record: *mut c_void, context: *mut u8, handled: bool) -> bool {
     // SAFETY: record/context remain valid for the duration of the dispatch entry.
     unsafe {
@@ -599,15 +620,17 @@ pub unsafe fn rtl_dispatch_exception(record: *mut c_void, context: *mut u8) -> b
                     &mut disp as *mut _ as *mut c_void,
                 )
             };
-            match ex::Disposition::from_raw(disp_ret) {
-                ex::Disposition::ContinueExecution => {
+            match classify_live_search_return(disp_ret) {
+                LiveSearchReturn::Handled => {
                     // The handler fixed the fault: resume the original context.
                     return unsafe { finish_vectored_dispatch(record, context, true) };
                 }
-                ex::Disposition::ContinueSearch => { /* keep walking up */ }
-                // Nested/collided unwind: treat as continue-search for the software path (the full
-                // collision handling is the RtlUnwindEx pass's job, driven by the handler).
-                ex::Disposition::NestedException | ex::Disposition::CollidedUnwind => {}
+                LiveSearchReturn::Continue => { /* ContinueSearch. */ }
+                // This live walker cannot restore the outer dispatcher context. A collision or
+                // invalid disposition is unhandled, never a successful continuation.
+                LiveSearchReturn::Unhandled => {
+                    return unsafe { finish_vectored_dispatch(record, context, false) };
+                }
             }
         }
         // NOTE: if the frame had NO handler, `rtl_virtual_unwind` already advanced `work` to the
@@ -875,13 +898,18 @@ unsafe fn rtl_unwind_ex_from_context(
             // SAFETY: valid EXCEPTION_ROUTINE.
             let routine: ExceptionRoutine = unsafe { core::mem::transmute(handler) };
             // SAFETY: calling the termination handler; it runs the __finally blocks.
-            unsafe {
+            let disposition = unsafe {
                 routine(
                     record,
                     establisher,
                     work_ptr,
                     &mut disp as *mut _ as *mut c_void,
-                );
+                )
+            };
+            if !live_unwind_handler_completed(disposition) {
+                // This live loop has no collided-unwind dispatcher restoration. A failed handler
+                // cannot fall through to the target `NtContinue` as if unwind had completed.
+                unsafe { nt_raise_exception(record, context_record, 0) };
             }
         }
     }

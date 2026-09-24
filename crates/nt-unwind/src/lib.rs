@@ -47,6 +47,18 @@ pub enum Disposition {
 }
 
 impl Disposition {
+    /// Decode a language-handler return without treating an unknown value as ContinueSearch.
+    /// Live dispatchers must reject an invalid disposition before advancing the frame.
+    pub const fn try_from_raw(v: i32) -> Option<Disposition> {
+        match v {
+            0 => Some(Disposition::ContinueExecution),
+            1 => Some(Disposition::ContinueSearch),
+            2 => Some(Disposition::NestedException),
+            3 => Some(Disposition::CollidedUnwind),
+            _ => None,
+        }
+    }
+
     /// The raw `EXCEPTION_DISPOSITION` integer a language handler returns.
     pub fn from_raw(v: i32) -> Disposition {
         match v {
@@ -2203,6 +2215,12 @@ mod tests {
         assert_eq!(Disposition::from_raw(2), Disposition::NestedException);
         assert_eq!(Disposition::from_raw(3), Disposition::CollidedUnwind);
         assert_eq!(Disposition::from_raw(99), Disposition::ContinueSearch);
+        assert_eq!(Disposition::try_from_raw(0), Some(Disposition::ContinueExecution));
+        assert_eq!(Disposition::try_from_raw(1), Some(Disposition::ContinueSearch));
+        assert_eq!(Disposition::try_from_raw(2), Some(Disposition::NestedException));
+        assert_eq!(Disposition::try_from_raw(3), Some(Disposition::CollidedUnwind));
+        assert_eq!(Disposition::try_from_raw(4), None);
+        assert_eq!(Disposition::try_from_raw(-1), None);
     }
 
     #[test]
