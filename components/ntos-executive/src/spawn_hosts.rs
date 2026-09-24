@@ -2944,6 +2944,23 @@ unsafe fn component_pump_loop(
             let (info, words) = command.encode();
             msg = pump_reply_recv_retained_seh(ch, *reply_cap, info, words);
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_SOURCE_IRP_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, ticket, generation) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4)
+            {
+                unsafe {
+                    crate::driver_launch::service_hosted_source_irp_lifetime(
+                        ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                    )
+                }
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 3,
+                status as u32 as u64, ticket, generation, 0);
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_IO_CREATE_FILE_LABEL
             && ch.caps.kind == ReqKind::Irp
         {

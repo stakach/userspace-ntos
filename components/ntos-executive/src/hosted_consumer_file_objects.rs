@@ -6,8 +6,8 @@
 use super::*;
 use nt_io_manager::{
     consumer_file_projection::{consumer_file_metadata, ConsumerFileProjection}, DeviceId, FileId,
-    HostedDevicePointerRegistration, HostedDomainIdentity, HostedFileIdentity,
-    HostedFileUnbindOutcome, WdmOpenDeviceProjectionInit,
+    FileReference, HostedDevicePointerRegistration, HostedDomainIdentity, HostedFileIdentity,
+    HostedFilePublicationLease, HostedFileUnbindOutcome, WdmOpenDeviceProjectionInit,
     WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE,
     WDM_X64_FILE_OBJECT_SIZE,
 };
@@ -53,6 +53,46 @@ struct Metadata {
 
 static mut ROWS: Vec<Row> = Vec::new();
 static mut NEXT_ROW_ID: u64 = 1;
+
+#[must_use = "release the source File and projection lease after forwarding retires"]
+pub(super) struct ForwardFileOwner {
+    identity: HostedFileIdentity,
+    device: HostedDevicePointerRegistration,
+    reference: FileReference,
+    lease: HostedFilePublicationLease,
+}
+
+impl ForwardFileOwner {
+    pub(super) fn file_id(&self) -> FileId { self.identity.file_id() }
+    pub(super) fn device_id(&self) -> DeviceId { self.device.device_id() }
+
+    pub(super) fn validate(&self) -> Result<(), i32> {
+        let io = io_manager_mut();
+        if io.hosted_file_identity_at(
+            self.identity.domain(), self.identity.file_id(), self.identity.address(),
+        ).map_err(|status| status.raw())? != Some(self.identity)
+            || io.hosted_device_pointer_registration(self.device.domain(), self.device.address())
+                != Some(self.device)
+            || io.file(self.identity.file_id())
+                .is_none_or(|file| file.device_id != self.device.device_id())
+        {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        Ok(())
+    }
+
+    pub(super) fn release(&mut self) -> Result<(), i32> {
+        self.validate()?;
+        let io = io_manager_mut();
+        if self.reference.is_held() {
+            io.release_file_reference(&mut self.reference).map_err(|status| status.raw())?;
+        }
+        if self.lease.is_held() {
+            io.release_hosted_file_publication(&mut self.lease).map_err(|status| status.raw())?;
+        }
+        Ok(())
+    }
+}
 
 fn rows() -> &'static mut Vec<Row> {
     // The executive serializes hosted service work. No reference crosses provider IPC.
@@ -251,6 +291,39 @@ unsafe fn authenticate(
     let (_, inst) = instance_for_pump_channel(ch, reply_cap).ok_or(STATUS_ACCESS_DENIED)?;
     let domain = instance_domain_identity(inst).ok_or(STATUS_ACCESS_DENIED)?;
     Ok((inst, domain))
+}
+
+/// Capture the exact source FILE_OBJECT and its registered related DEVICE_OBJECT before a
+/// cross-domain forward. The source driver must still own a pointer reference to the File.
+pub(super) unsafe fn capture_forward_file(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    file_address: u64,
+    device_address: u64,
+) -> Result<ForwardFileOwner, i32> {
+    let (_, domain) = authenticate(ch, reply_cap)?;
+    let id = row_for_pointer(domain, file_address).ok_or(STATUS_INVALID_HANDLE)?;
+    let owner = row(id);
+    let projection = owner.projection.as_ref().ok_or(STATUS_INVALID_HANDLE)?;
+    if projection.pointer_reference_count() == 0
+        || projection.related_device_address(io_manager_mut()).map_err(|status| status.raw())?
+            != device_address
+    {
+        return Err(STATUS_INVALID_HANDLE);
+    }
+    let identity = projection.identity();
+    let device = projection.device_registration();
+    let io = io_manager_mut();
+    let mut lease = io.lease_hosted_file_identity(identity).map_err(|status| status.raw())?;
+    let reference = match io.retain_file_reference(identity.file_id()) {
+        Ok(reference) => reference,
+        Err(status) => {
+            io.release_hosted_file_publication(&mut lease)
+                .expect("captured File lease rollback");
+            return Err(status.raw());
+        }
+    };
+    Ok(ForwardFileOwner { identity, device, reference, lease })
 }
 
 /// One call is never replayed after an uncertain Reply. Repeated, distinct calls share a single

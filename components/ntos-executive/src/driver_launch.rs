@@ -78,6 +78,10 @@ mod hosted_file_owners;
 mod hosted_file_lifecycle_owners;
 #[path = "hosted_file_retirements.rs"]
 mod hosted_file_retirements;
+#[path = "hosted_source_irp_ledger.rs"]
+mod hosted_source_irp_ledger;
+#[path = "driver_hosted_token_projection.rs"]
+mod driver_hosted_token_projection;
 #[path = "hosted_file_objects.rs"]
 mod hosted_file_objects;
 #[path = "hosted_consumer_file_objects.rs"]
@@ -792,6 +796,7 @@ pub const FSD_SERVICE_DMA_ADAPTER_LABEL: u64 = 0x78B;
 pub const FSD_SERVICE_MDL_LABEL: u64 = 0x78C;
 pub const FSD_SERVICE_FILE_LABEL: u64 = 0x78D;
 pub const FSD_SERVICE_IO_CREATE_FILE_LABEL: u64 = 0x78E;
+pub const FSD_SERVICE_SOURCE_IRP_LABEL: u64 = 0x78F;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
@@ -7722,13 +7727,37 @@ extern "win64" fn s_io_allocate_irp(stack_size: u8, _charge_quota: u8) -> u64 {
             (irp + 0xb8) as *mut u64,
             stack_base + stack_count * WDM_X64_IO_STACK_LOCATION_SIZE as u64,
         );
+        let (_, status, ticket, generation, _) = call_on4(
+            (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
+            1,
+            irp,
+            total,
+            stack_count,
+        );
+        if status as u32 as i32 != STATUS_SUCCESS || ticket == 0 || generation == 0 {
+            pool_free(irp);
+            return 0;
+        }
         irp
     }
 }
 
 /// `VOID IoFreeIrp(PIRP)`.
 extern "win64" fn s_io_free_irp(irp: u64) {
+    if irp == 0 {
+        return;
+    }
     unsafe {
+        let (_, status, _, _, _) = call_on4(
+            (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
+            2,
+            irp,
+            0,
+            0,
+        );
+        if status as u32 as i32 != STATUS_SUCCESS {
+            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 2, irp, status]);
+        }
         pool_free(irp);
     }
 }
@@ -7771,7 +7800,7 @@ extern "win64" fn s_io_build_device_io_control_request(
                 if length != 0 {
                     system_buffer = pool_alloc_zeroed(length);
                     if system_buffer == 0 {
-                        pool_free(irp);
+                        s_io_free_irp(irp);
                         return 0;
                     }
                     if input_buffer != 0 && input_buffer_length != 0 {
@@ -7793,7 +7822,7 @@ extern "win64" fn s_io_build_device_io_control_request(
                 if input_buffer != 0 && input_buffer_length != 0 {
                     system_buffer = pool_alloc(input_buffer_length as u64);
                     if system_buffer == 0 {
-                        pool_free(irp);
+                        s_io_free_irp(irp);
                         return 0;
                     }
                     core::ptr::copy_nonoverlapping(
@@ -7809,7 +7838,7 @@ extern "win64" fn s_io_build_device_io_control_request(
                         if system_buffer != 0 {
                             pool_free(system_buffer);
                         }
-                        pool_free(irp);
+                        s_io_free_irp(irp);
                         return 0;
                     }
                 }
@@ -7830,7 +7859,7 @@ extern "win64" fn s_io_build_device_io_control_request(
             if system_buffer != 0 {
                 pool_free(system_buffer);
             }
-            pool_free(irp);
+            s_io_free_irp(irp);
             return 0;
         }
         let major = if internal_device_io_control != 0 {
@@ -7865,7 +7894,7 @@ extern "win64" fn s_io_build_device_io_control_request(
             if system_buffer != 0 {
                 pool_free(system_buffer);
             }
-            pool_free(irp);
+            s_io_free_irp(irp);
             return 0;
         }
         write_unaligned((irp + 0x08) as *mut u64, mdl);
@@ -10617,7 +10646,7 @@ unsafe fn finish_driver_local_irp(irp: u64) {
     if mdl != 0 && component_pool_allocation_capacity(mdl).is_some() {
         s_io_free_mdl(mdl);
     }
-    pool_free(irp);
+    s_io_free_irp(irp);
 }
 
 /// `void IoCompleteRequest(PIRP, CCHAR)`. Every raw WDM IRP uses the same native completion-stack
@@ -55114,6 +55143,26 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
         print_str(b"\n");
     }
     (STATUS_SUCCESS, handle)
+}
+
+pub(crate) fn service_hosted_source_irp_lifetime(
+    ch: &crate::spawn_hosts::PumpChannel,
+    op: u64,
+    component_address: u64,
+    bytes: u64,
+    stack_count: u64,
+    caller_badge: u64,
+    active_reply_cap: u64,
+) -> (i32, u64, u64) {
+    hosted_source_irp_ledger::service(
+        ch,
+        op,
+        component_address,
+        bytes,
+        stack_count,
+        caller_badge,
+        active_reply_cap,
+    )
 }
 
 pub(crate) fn service_hosted_driver_ps_get_current_thread_id(
