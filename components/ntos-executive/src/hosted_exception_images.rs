@@ -23,6 +23,8 @@ static mut CATALOGS: Option<Vec<Option<Row>>> = None;
 fn admission_error_name(error: ImageAdmissionError) -> &'static [u8] {
     match error {
         ImageAdmissionError::Pe(_) => b"Pe",
+        ImageAdmissionError::EmptyCatalog => b"EmptyCatalog",
+        ImageAdmissionError::ImageOrder => b"ImageOrder",
         ImageAdmissionError::NotExecutable => b"NotExecutable",
         ImageAdmissionError::SnapshotSize => b"SnapshotSize",
         ImageAdmissionError::AddressRange => b"AddressRange",
