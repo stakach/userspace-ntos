@@ -84,6 +84,23 @@ fn retained_client_wins_over_primary_and_replacement() {
     let (effective, level) = resolved.effective_token();
     assert_eq!(effective.user, AccessToken::user(42).user);
     assert_eq!(level, Some(SecurityImpersonationLevel::Identification));
+    assert_eq!(
+        owner.token_ids(&store, ticket, key).unwrap(),
+        (
+            primary,
+            Some(SubjectClientIdentity {
+                token: client,
+                level: SecurityImpersonationLevel::Identification,
+            }),
+        )
+    );
+    assert!(owner
+        .token_ids(
+            &store,
+            ticket,
+            SourceCreateSecurityKey::new(11, 2, 19, 6, 0x1000,).unwrap()
+        )
+        .is_err());
     owner.mark_pending();
     owner.mark_indeterminate();
     assert!(owner.release(&mut store).is_err());
@@ -93,6 +110,7 @@ fn retained_client_wins_over_primary_and_replacement() {
     assert!(store.get(client).is_none());
     assert!(owner.release(&mut store).is_err());
     assert!(owner.resolve(&store, ticket, key).is_err());
+    assert!(owner.token_ids(&store, ticket, key).is_err());
 }
 
 #[test]
@@ -120,6 +138,11 @@ fn another_token_store_cannot_resolve_or_release_owner() {
     let mut owner =
         SourceCreateSecurityOwner::capture(&mut store, ticket, key, primary, None, 0).unwrap();
     assert!(owner.resolve(&other, ticket, key).is_err());
+    assert!(owner.token_ids(&other, ticket, key).is_err());
+    assert_eq!(
+        owner.token_ids(&store, ticket, key).unwrap(),
+        (primary, None)
+    );
     owner.mark_terminal();
     assert!(owner.release(&mut other).is_err());
     assert_eq!(owner.phase(), SourceCreateSecurityPhase::Terminal);

@@ -137,6 +137,21 @@ impl SourceCreateSecurityOwner {
         self.subject.resolve(tokens)
     }
 
+    pub fn token_ids(
+        &self,
+        tokens: &TokenStore,
+        ticket: SourceCreateSecurityTicket,
+        key: SourceCreateSecurityKey,
+    ) -> Result<(TokenId, Option<SubjectClientIdentity>), u32> {
+        if self.phase == SourceCreateSecurityPhase::Released
+            || ticket != self.ticket
+            || key != self.key
+        {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        self.subject.token_ids(tokens)
+    }
+
     pub fn mark_pending(&mut self) {
         if self.phase == SourceCreateSecurityPhase::Captured {
             self.phase = SourceCreateSecurityPhase::Pending;
