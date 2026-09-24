@@ -153,6 +153,12 @@ pub struct HandlerInvocation {
 }
 
 impl HandlerInvocation {
+    /// The virtually unwound Previous context for the dispatcher argument of an unwind handler.
+    /// This is a copy of register state, not access to the one-shot continuation.
+    pub fn dispatcher_unwound(&self) -> Context {
+        self.continuation.previous
+    }
+
     /// Package actual handler outputs. Native adapters must first copy back mutations, including
     /// the dispatcher establisher used by `ExceptionNestedException`.
     pub fn returned(self, disposition: i32) -> Result<WalkStep, WalkError> {

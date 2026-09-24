@@ -8,6 +8,9 @@ pub const PREPARE_LABEL: u64 = 0x790;
 pub const HANDLER_RESULT_LABEL: u64 = 0x791;
 pub const PREPARE_COMMAND_LABEL: u64 = 0x792;
 pub const INVOKE_COMMAND_LABEL: u64 = 0x793;
+pub const RESTORE_COMMAND_LABEL: u64 = 0x794;
+pub const SECOND_CHANCE_COMMAND_LABEL: u64 = 0x795;
+pub const UNWIND_REQUEST_LABEL: u64 = 0x796;
 
 pub const fn message_info(label: u64, length: u64) -> u64 {
     (label << 12) | length
@@ -28,10 +31,16 @@ pub enum SehCall {
         packet_va: u64,
         disposition: i32,
     },
+    UnwindRequest {
+        token: u64,
+        target_frame: u64,
+        target_ip: u64,
+        packet_va: u64,
+    },
 }
 
 impl SehCall {
-    pub fn parse(info: u64, words: [u64; 3]) -> Option<Self> {
+    pub fn parse(info: u64, words: [u64; 4]) -> Option<Self> {
         match info {
             x if x == message_info(RAISE_LABEL, 2) => Some(Self::Raise {
                 context_va: aligned_nonzero(words[0])?,
@@ -46,17 +55,23 @@ impl SehCall {
                 packet_va: aligned_nonzero(words[1])?,
                 disposition: u32::try_from(words[2]).ok()? as i32,
             }),
+            x if x == message_info(UNWIND_REQUEST_LABEL, 4) => Some(Self::UnwindRequest {
+                token: nonzero(words[0])?,
+                target_frame: aligned_or_zero(words[1])?,
+                target_ip: words[2],
+                packet_va: aligned_nonzero(words[3])?,
+            }),
             _ => None,
         }
     }
 
-    pub const fn encode(self) -> (u64, [u64; 3]) {
+    pub const fn encode(self) -> (u64, [u64; 4]) {
         match self {
             Self::Raise { context_va, status } => {
-                (message_info(RAISE_LABEL, 2), [context_va, status as u64, 0])
+                (message_info(RAISE_LABEL, 2), [context_va, status as u64, 0, 0])
             }
             Self::Prepare { token, packet_va } => {
-                (message_info(PREPARE_LABEL, 2), [token, packet_va, 0])
+                (message_info(PREPARE_LABEL, 2), [token, packet_va, 0, 0])
             }
             Self::HandlerResult {
                 token,
@@ -64,7 +79,11 @@ impl SehCall {
                 disposition,
             } => (
                 message_info(HANDLER_RESULT_LABEL, 3),
-                [token, packet_va, disposition as u32 as u64],
+                [token, packet_va, disposition as u32 as u64, 0],
+            ),
+            Self::UnwindRequest { token, target_frame, target_ip, packet_va } => (
+                message_info(UNWIND_REQUEST_LABEL, 4),
+                [token, target_frame, target_ip, packet_va],
             ),
         }
     }
@@ -74,22 +93,31 @@ impl SehCall {
 pub enum SehCommand {
     Prepare { token: u64 },
     Invoke { token: u64 },
+    Restore { token: u64, context_va: u64 },
+    SecondChance { token: u64 },
 }
 
 impl SehCommand {
-    pub fn parse(info: u64, word: u64) -> Option<Self> {
-        let token = nonzero(word)?;
+    pub fn parse(info: u64, words: [u64; 2]) -> Option<Self> {
+        let token = nonzero(words[0])?;
         match info {
             x if x == message_info(PREPARE_COMMAND_LABEL, 1) => Some(Self::Prepare { token }),
             x if x == message_info(INVOKE_COMMAND_LABEL, 1) => Some(Self::Invoke { token }),
+            x if x == message_info(RESTORE_COMMAND_LABEL, 2) => Some(Self::Restore {
+                token,
+                context_va: aligned_nonzero(words[1])?,
+            }),
+            x if x == message_info(SECOND_CHANCE_COMMAND_LABEL, 1) => Some(Self::SecondChance { token }),
             _ => None,
         }
     }
 
-    pub const fn encode(self) -> (u64, u64) {
+    pub const fn encode(self) -> (u64, [u64; 2]) {
         match self {
-            Self::Prepare { token } => (message_info(PREPARE_COMMAND_LABEL, 1), token),
-            Self::Invoke { token } => (message_info(INVOKE_COMMAND_LABEL, 1), token),
+            Self::Prepare { token } => (message_info(PREPARE_COMMAND_LABEL, 1), [token, 0]),
+            Self::Invoke { token } => (message_info(INVOKE_COMMAND_LABEL, 1), [token, 0]),
+            Self::Restore { token, context_va } => (message_info(RESTORE_COMMAND_LABEL, 2), [token, context_va]),
+            Self::SecondChance { token } => (message_info(SECOND_CHANCE_COMMAND_LABEL, 1), [token, 0]),
         }
     }
 }
@@ -100,6 +128,10 @@ fn nonzero(word: u64) -> Option<u64> {
 
 fn aligned_nonzero(word: u64) -> Option<u64> {
     (word != 0 && word & 15 == 0).then_some(word)
+}
+
+fn aligned_or_zero(word: u64) -> Option<u64> {
+    (word & 15 == 0).then_some(word)
 }
 
 #[cfg(test)]
@@ -122,6 +154,12 @@ mod tests {
                 packet_va: 0x2000,
                 disposition: -1,
             },
+            SehCall::UnwindRequest {
+                token: 7,
+                target_frame: 0x3000,
+                target_ip: 0x1234,
+                packet_va: 0x2000,
+            },
         ] {
             let (info, words) = call.encode();
             assert_eq!(SehCall::parse(info, words), Some(call));
@@ -129,19 +167,27 @@ mod tests {
             assert_eq!(SehCall::parse(info | (1 << 7), words), None);
         }
         assert_eq!(
-            SehCall::parse(message_info(RAISE_LABEL, 2), [0x1000, 0x1_c000_0022, 0]),
+            SehCall::parse(message_info(RAISE_LABEL, 2), [0x1000, 0x1_c000_0022, 0, 0]),
             None
         );
         assert_eq!(
-            SehCall::parse(message_info(RAISE_LABEL, 2), [0x1008, 1, 0]),
+            SehCall::parse(message_info(RAISE_LABEL, 2), [0x1008, 1, 0, 0]),
             None
         );
         assert_eq!(
-            SehCall::parse(message_info(PREPARE_LABEL, 2), [0, 0x2000, 0]),
+            SehCall::parse(message_info(PREPARE_LABEL, 2), [0, 0x2000, 0, 0]),
             None
         );
         assert_eq!(
-            SehCall::parse(message_info(HANDLER_RESULT_LABEL, 3), [7, 0x2000, u64::MAX]),
+            SehCall::parse(message_info(HANDLER_RESULT_LABEL, 3), [7, 0x2000, u64::MAX, 0]),
+            None
+        );
+        assert_eq!(
+            SehCall::parse(message_info(UNWIND_REQUEST_LABEL, 4), [7, 0x3008, 0x1234, 0x2000]),
+            None
+        );
+        assert_eq!(
+            SehCall::parse(message_info(UNWIND_REQUEST_LABEL, 3), [7, 0x3000, 0x1234, 0x2000]),
             None
         );
     }
@@ -151,11 +197,17 @@ mod tests {
         for command in [
             SehCommand::Prepare { token: 9 },
             SehCommand::Invoke { token: 9 },
+            SehCommand::Restore { token: 9, context_va: 0x2000 },
+            SehCommand::SecondChance { token: 9 },
         ] {
-            let (info, word) = command.encode();
-            assert_eq!(SehCommand::parse(info, word), Some(command));
-            assert_eq!(SehCommand::parse(info + 1, word), None);
-            assert_eq!(SehCommand::parse(info, 0), None);
+            let (info, words) = command.encode();
+            assert_eq!(SehCommand::parse(info, words), Some(command));
+            assert_eq!(SehCommand::parse(info + 1, words), None);
+            assert_eq!(SehCommand::parse(info, [0, words[1]]), None);
         }
+        assert_eq!(
+            SehCommand::parse(message_info(RESTORE_COMMAND_LABEL, 2), [9, 0x2008]),
+            None
+        );
     }
 }
