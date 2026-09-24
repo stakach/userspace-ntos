@@ -219,6 +219,70 @@ pub struct ExceptionWalk {
     pending_collision: Option<CollisionDispatcher>,
 }
 
+/// An admitted x64 software raise at a naked `ExRaiseStatus` entry. The captured context still
+/// describes that entry; the return slot identifies the caller's control PC. Admission does not
+/// inspect or invoke a language handler.
+#[derive(Debug)]
+pub struct SoftwareRaiseSite {
+    caller_rip: u64,
+    caller_rsp: u64,
+    captured: Context,
+    stack_low: u64,
+    stack_high: u64,
+}
+
+impl SoftwareRaiseSite {
+    /// Validate the Win64 entry stack and require affirmative executable-image admission for the
+    /// return address. NT5 dispatches the return address itself, not that address minus one.
+    pub fn admit(
+        captured: Context,
+        stack_low: u64,
+        stack_high: u64,
+        image: &dyn ExceptionImageReader,
+        stack: &dyn StackReader,
+    ) -> Result<Self, WalkError> {
+        if stack_low >= stack_high {
+            return Err(WalkError::InvalidStackBounds);
+        }
+        let entry_rsp = captured.rsp();
+        let caller_rsp = entry_rsp.checked_add(8).ok_or(WalkError::BadStack)?;
+        if entry_rsp < stack_low || caller_rsp > stack_high || entry_rsp & 15 != 8 {
+            return Err(WalkError::BadStack);
+        }
+        let caller_rip = stack.read_u64(entry_rsp).ok_or(WalkError::StackRead)?;
+        image
+            .lookup_exception_function(caller_rip)
+            .map_err(WalkError::ImageLookup)?;
+        Ok(Self {
+            caller_rip,
+            caller_rsp,
+            captured,
+            stack_low,
+            stack_high,
+        })
+    }
+
+    /// Construct the first-pass search. The caller's return slot is consumed exactly as a `ret`
+    /// would consume it; the original exception context is never a synthetic handler result.
+    pub fn into_search(mut self, status: u32, frame_limit: usize) -> Result<ExceptionWalk, WalkError> {
+        self.captured.rip = self.caller_rip;
+        self.captured.set_rsp(self.caller_rsp);
+        ExceptionWalk::new(
+            WalkMode::Search,
+            ExceptionRecord {
+                code: status,
+                flags: EXCEPTION_NONCONTINUABLE,
+                address: self.caller_rip,
+                information: Default::default(),
+            },
+            self.captured,
+            self.stack_low,
+            self.stack_high,
+            frame_limit,
+        )
+    }
+}
+
 /// Control state has no exception-record owner. Suspending a handler moves the real record into
 /// its invocation instead of cloning a parameter buffer or manufacturing an empty replacement.
 #[derive(Debug)]

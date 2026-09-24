@@ -146,6 +146,81 @@ fn unwind(target: Option<u64>) -> WalkMode {
     }
 }
 
+fn raise_context(entry_rsp: u64) -> Context {
+    let mut captured = Context::default();
+    captured.rip = BASE + 0x444;
+    captured.set_rsp(entry_rsp);
+    captured.gpr[REG_RBX] = 0x34;
+    captured
+}
+
+#[test]
+fn software_raise_admits_exact_caller_and_builds_noncontinuable_search() {
+    let mut fixture = Fixture::new(0);
+    fixture.stack.insert(LOW + 8, BASE + 0x110);
+    let walk = SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture)
+        .unwrap()
+        .into_search(0xc000_0005, 3)
+        .unwrap();
+    assert_eq!(fixture.stack_reads.get(), 1);
+    assert_eq!(walk.exception.code, 0xc000_0005);
+    assert_eq!(walk.exception.flags, EXCEPTION_NONCONTINUABLE);
+    assert_eq!(walk.exception.address, BASE + 0x110);
+    assert!(walk.exception.information.is_empty());
+    assert_eq!(walk.state.mode, WalkMode::Search);
+    assert_eq!(walk.state.original.rip, BASE + 0x110);
+    assert_eq!(walk.state.original.rsp(), LOW + 0x10);
+    assert_eq!(walk.state.original.gpr[REG_RBX], 0x34);
+    assert_eq!(walk.state.frames_left, 3);
+}
+
+#[test]
+fn software_raise_rejects_unreadable_or_unadmitted_caller() {
+    let mut fixture = Fixture::new(0);
+    assert!(matches!(
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture),
+        Err(WalkError::StackRead)
+    ));
+    fixture.stack.insert(LOW + 8, BASE - 1);
+    assert!(matches!(
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture),
+        Err(WalkError::ImageLookup(ExceptionImageError::UnknownImage))
+    ));
+    fixture.stack.insert(LOW + 8, BASE + 0x110);
+    fixture.image_error = Some(ExceptionImageError::UnreadableImage);
+    assert!(matches!(
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture),
+        Err(WalkError::ImageLookup(ExceptionImageError::UnreadableImage))
+    ));
+}
+
+#[test]
+fn software_raise_rejects_invalid_stack_before_reading_it() {
+    let fixture = Fixture::new(0);
+    for (entry_rsp, low, high, expected) in [
+        (LOW + 8, HIGH, LOW, WalkError::InvalidStackBounds),
+        (LOW, LOW, HIGH, WalkError::BadStack),
+        (LOW + 8, LOW + 0x10, HIGH, WalkError::BadStack),
+        (LOW + 0x38, LOW, HIGH - 1, WalkError::BadStack),
+        (u64::MAX, LOW, HIGH, WalkError::BadStack),
+    ] {
+        assert!(matches!(
+            SoftwareRaiseSite::admit(raise_context(entry_rsp), low, high, &fixture, &fixture),
+            Err(error) if error == expected
+        ));
+    }
+    assert_eq!(fixture.stack_reads.get(), 0);
+}
+
+#[test]
+fn software_raise_rejects_zero_frame_budget() {
+    let mut fixture = Fixture::new(0);
+    fixture.stack.insert(LOW + 8, BASE + 0x110);
+    let site = SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture)
+        .unwrap();
+    assert!(matches!(site.into_search(0xc000_0005, 0), Err(WalkError::InvalidBudget)));
+}
+
 #[test]
 fn search_has_original_and_distinct_unwound_contexts() {
     let fixture = Fixture::new(unw_flag::EHANDLER);
