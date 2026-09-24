@@ -29,6 +29,7 @@ mod epilogue;
 pub mod exception_images;
 pub mod exception_snapshot;
 pub mod exception_walk;
+pub mod raw_context;
 
 // =================================================================================================
 // EXCEPTION_RECORD / dispositions
