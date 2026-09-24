@@ -35237,6 +35237,9 @@ pub(crate) struct DriverComponent {
     /// provider images.
     pub image_frames: u64,
     pub image_frame_base: u64,
+    pub exception_snapshot_frame_base: u64,
+    pub exception_snapshot_frames: u64,
+    pub exception_snapshot_bytes: u64,
     pub pool_frame_base: u64,
     pub data_frame_base: u64,
     pub shared_frame_base: u64,
@@ -36383,7 +36386,13 @@ pub(crate) unsafe fn load_driver(
 
     let loaded = load_driver_reserved(fs, path, driver_object_path, instance, caller);
     if loaded.is_err() {
-        let _ = clear_instance(instance);
+        if let Err(status) = clear_instance(instance) {
+            print_str(b"[driver-launch] failed launch retained for retirement inst=");
+            print_u64(instance as u64);
+            print_str(b" status=0x");
+            print_hex(status.raw() as u32);
+            print_str(b"\n");
+        }
     }
     loaded
 }
@@ -36797,6 +36806,11 @@ unsafe fn load_driver_reserved(
     driver_instances_mut()[instance].kuser_map_cap = kuser_map_cap;
     let route = hosted_ingress_sources::enroll_primary(instance)
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
+    hosted_exception_images::project_sealed(
+        instance,
+        instance_domain_identity(domain).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?,
+        &exception_catalog,
+    )?;
     driver_thread_projection::bootstrap(route, caller)
         .map_err(|status| nt_status::NtStatus(status as i32))?;
     hosted_exception_images::publish(
@@ -36954,6 +36968,7 @@ unsafe fn load_driver_reserved(
         return Err(status);
     }
     driver_instances_mut()[instance].driver_object = drvobj;
+    let retained = driver_instances_mut()[instance];
     let dc = DriverComponent {
         pml4,
         fault_ep,
@@ -36968,6 +36983,9 @@ unsafe fn load_driver_reserved(
         exec_arg_va: win.arg_va,
         image_frames: img_frames,
         image_frame_base,
+        exception_snapshot_frame_base: retained.exception_snapshot_frame_base,
+        exception_snapshot_frames: retained.exception_snapshot_frames,
+        exception_snapshot_bytes: retained.exception_snapshot_bytes,
         pool_frame_base: pool_base,
         data_frame_base: data_base,
         shared_frame_base: shared_base,
@@ -36987,7 +37005,7 @@ unsafe fn load_driver_reserved(
         cnode,
         raw_cnode,
         sched_context,
-        map_cap_bank,
+        map_cap_bank: retained.map_cap_bank,
         reply_cap: active_reply_cap,
     };
     let device_count = match validate_hosted_driver_device_projections(&dc) {
@@ -51249,6 +51267,9 @@ pub(crate) struct DriverInstance {
     pub exec_arg_va: u64,
     pub image_frames: u64,
     pub image_frame_base: u64,
+    pub exception_snapshot_frame_base: u64,
+    pub exception_snapshot_frames: u64,
+    pub exception_snapshot_bytes: u64,
     pub pool_frame_base: u64,
     pub data_frame_base: u64,
     pub shared_frame_base: u64,
@@ -51290,6 +51311,9 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     exec_arg_va: 0,
     image_frames: 0,
     image_frame_base: 0,
+    exception_snapshot_frame_base: 0,
+    exception_snapshot_frames: 0,
+    exception_snapshot_bytes: 0,
     pool_frame_base: 0,
     data_frame_base: 0,
     shared_frame_base: 0,
@@ -52073,6 +52097,9 @@ fn register_instance(dc: &DriverComponent) {
         exec_arg_va: dc.exec_arg_va,
         image_frames: dc.image_frames,
         image_frame_base: dc.image_frame_base,
+        exception_snapshot_frame_base: dc.exception_snapshot_frame_base,
+        exception_snapshot_frames: dc.exception_snapshot_frames,
+        exception_snapshot_bytes: dc.exception_snapshot_bytes,
         pool_frame_base: dc.pool_frame_base,
         data_frame_base: dc.data_frame_base,
         shared_frame_base: dc.shared_frame_base,

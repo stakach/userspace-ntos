@@ -344,6 +344,10 @@ impl Iterator for ScopeCursor<'_> {
 }
 
 impl AdmittedExceptionImage {
+    pub fn mapped_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Consume, rather than copy, a complete mapped-image snapshot. Sections are interpreted by RVA;
     /// `PointerToRawData` is deliberately not a source of bytes in this layout.
     pub fn from_mapped_image(base: u64, bytes: Box<[u8]>) -> Result<Self, ImageAdmissionError> {
@@ -520,6 +524,10 @@ pub struct ExceptionImageCatalog {
 }
 
 impl ExceptionImageCatalog {
+    pub fn images(&self) -> &[AdmittedExceptionImage] {
+        &self.images
+    }
+
     pub fn new(mut images: Vec<AdmittedExceptionImage>) -> Result<Self, ImageAdmissionError> {
         images.sort_unstable_by_key(|image| image.base);
         if images.windows(2).any(|pair| pair[0].end > pair[1].base) {

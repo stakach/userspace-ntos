@@ -442,7 +442,7 @@ unsafe fn component_map_cap_bank_create(count: u64) -> ComponentMapCapBank {
     }
 }
 
-unsafe fn component_map_cap_bank_store(bank: &mut ComponentMapCapBank, root_cap: u64) {
+pub(crate) unsafe fn component_map_cap_bank_store(bank: &mut ComponentMapCapBank, root_cap: u64) {
     if bank.owner == 0 {
         component_spawn_fail(b"component-bank-owner", root_cap, 0);
     }
@@ -3094,17 +3094,17 @@ unsafe fn pump_map_root_image_page(
         crate::print_str(b"\n");
         return false;
     }
+    if !component_map_cap_bank_tag(ch.root_image_map_owner, cap) {
+        crate::print_str(b"[component-image-fault] owner tag failed cap=0x");
+        crate::print_hex(cap as u32);
+        crate::print_str(b" owner=");
+        crate::print_u64(ch.root_image_map_owner as u64);
+        crate::print_str(b"\n");
+        // An unowned cap is not safe to map or recycle after an uncertain copy result.
+        crate::park();
+    }
     let map = crate::page_map_r(cap, page, rights, ch.pml4);
     if map == 0 {
-        if !component_map_cap_bank_tag(ch.root_image_map_owner, cap) {
-            crate::print_str(b"[component-image-fault] owner tag failed cap=0x");
-            crate::print_hex(cap as u32);
-            crate::print_str(b" owner=");
-            crate::print_u64(ch.root_image_map_owner as u64);
-            crate::print_str(b"\n");
-            let _ = crate::cnode_delete_recycle_r(cap);
-            return false;
-        }
         let trace = COMPONENT_ROOT_IMAGE_DEMAND_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
         if trace < COMPONENT_ROOT_IMAGE_DEMAND_TRACE_CAP {
             crate::print_str(b"[component-image-fault] mapped index=");
@@ -3131,8 +3131,9 @@ unsafe fn pump_map_root_image_page(
     crate::print_str(b" error=");
     crate::print_u64(map);
     crate::print_str(b"\n");
-    let _ = crate::cnode_delete_recycle_r(cap);
-    false
+    // The map result may be uncertain. The tagged cap remains owned for retirement, and this
+    // executive cannot redrive a fault against the same page without resolving that effect.
+    crate::park();
 }
 
 #[inline(never)]
