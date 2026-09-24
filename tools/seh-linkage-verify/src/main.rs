@@ -6,12 +6,64 @@ use nt_pe_loader::{ExportedSymbol, PeFile, DIRECTORY_ENTRY_TLS};
 use nt_unwind::{
     exception_images::BorrowedExceptionImage,
     exception_walk::{ExceptionFunction, ExceptionImageReader},
-    UnwindInfoHeader,
+    unw_flag, UnwindInfoHeader,
 };
 
-const EXPORTS: [&str; 2] = ["SehCallFilter", "SehCallFinally"];
+const EXPORTS: [&str; 4] = [
+    "SehCallFilter",
+    "SehCallFinally",
+    "SehExecuteHandlerForException",
+    "SehExecuteHandlerForUnwind",
+];
 const IMAGE_FILE_DLL: u16 = 0x2000;
 const DIRECTORY_ENTRY_DELAY_IMPORT: usize = 13;
+const CALL_FRAME: [u8; 4] = [0x48, 0x83, 0xec, 0x28];
+const UNWIND_ALLOC_40: [u8; 2] = [4, 0x42];
+const EXECUTE_BODY: [u8; 15] = [
+    0x4c, 0x89, 0x4c, 0x24, 0x20, // mov [rsp+32], r9
+    0x41, 0xff, 0x51, 0x30, // call qword ptr [r9+48]
+    0x90, // return site must be in the function body, not its epilogue
+    0x48, 0x83, 0xc4, 0x28, 0xc3, // add rsp,40; ret
+];
+const FILTER_BODY: [u8; 22] = [
+    0x4c, 0x89, 0x4c, 0x24, 0x20, // save dispatcher context R9 at [rsp+32]
+    0x48, 0x89, 0xc8, // mov rax,rcx
+    0x48, 0x89, 0xd1, // mov rcx,rdx
+    0x4c, 0x89, 0xc2, // mov rdx,r8
+    0xff, 0xd0, // call rax
+    0x90, // keep callback return site out of the epilogue
+    0x48, 0x83, 0xc4, 0x28, 0xc3, // add rsp,40; ret
+];
+const FINALLY_BODY: [u8; 21] = [
+    0x4c, 0x89, 0x44, 0x24, 0x20, // save dispatcher context R8 at [rsp+32]
+    0x48, 0x89, 0xc8, // mov rax,rcx
+    0xb9, 1, 0, 0, 0, // mov ecx,1
+    0xff, 0xd0, // call rax
+    0x90, // keep callback return site out of the epilogue
+    0x48, 0x83, 0xc4, 0x28, 0xc3, // add rsp,40; ret
+];
+const NESTED_HANDLER: [u8; 32] = [
+    0xb8, 1, 0, 0, 0, // ExceptionContinueSearch
+    0xf7, 0x41, 4, 0x66, 0, 0, 0, // reject unwind/exit/target/collided flags
+    0x75, 0x11, // skip the state update on those flags
+    0x48, 0x8b, 0x42, 0x20, // DispatcherContext from establisher home slot
+    0x48, 0x8b, 0x40, 0x18, // parent EstablisherFrame
+    0x49, 0x89, 0x41, 0x18, // child EstablisherFrame
+    0xb8, 2, 0, 0, 0, // ExceptionNestedException
+    0xc3,
+];
+const COLLIDED_HANDLER: [u8; 72] = [
+    0x48, 0x8b, 0x42, 0x20, // parent dispatcher from home slot
+    0x4c, 0x8b, 0x10, 0x4d, 0x89, 0x11, // ControlPc
+    0x4c, 0x8b, 0x50, 0x08, 0x4d, 0x89, 0x51, 0x08, // ImageBase
+    0x4c, 0x8b, 0x50, 0x10, 0x4d, 0x89, 0x51, 0x10, // FunctionEntry
+    0x4c, 0x8b, 0x50, 0x18, 0x4d, 0x89, 0x51, 0x18, // EstablisherFrame
+    0x4c, 0x8b, 0x50, 0x28, 0x4d, 0x89, 0x51, 0x28, // ContextRecord
+    0x4c, 0x8b, 0x50, 0x30, 0x4d, 0x89, 0x51, 0x30, // LanguageHandler
+    0x4c, 0x8b, 0x50, 0x38, 0x4d, 0x89, 0x51, 0x38, // HandlerData
+    0x4c, 0x8b, 0x50, 0x40, 0x4d, 0x89, 0x51, 0x40, // HistoryTable
+    0xb8, 3, 0, 0, 0, 0xc3, // ExceptionCollidedUnwind
+];
 
 fn exact_exports(exports: &[ExportedSymbol]) -> bool {
     exports.len() == EXPORTS.len()
@@ -30,7 +82,73 @@ fn frame_encoding_is_exact(bytes: &[u8], function_rva: u32, unwind_rva: u32) -> 
     let Some(unwind) = bytes.get(unwind_rva as usize + 4..unwind_rva as usize + 6) else {
         return false;
     };
-    function == [0x48, 0x83, 0xec, 0x28] && unwind == [4, 0x42]
+    function == CALL_FRAME && unwind == UNWIND_ALLOC_40
+}
+
+fn body_is_exact(bytes: &[u8], function_rva: u32, expected: &[u8]) -> bool {
+    let Some(body_start) = (function_rva as usize).checked_add(CALL_FRAME.len()) else {
+        return false;
+    };
+    let Some(body_end) = body_start.checked_add(expected.len()) else {
+        return false;
+    };
+    let Some(body) = bytes.get(body_start..body_end) else {
+        return false;
+    };
+    body == expected
+}
+
+fn nested_handler_is_exact(bytes: &[u8], rva: u32) -> bool {
+    let start = rva as usize;
+    start
+        .checked_add(NESTED_HANDLER.len())
+        .and_then(|end| bytes.get(start..end))
+        == Some(NESTED_HANDLER.as_slice())
+}
+
+fn collided_handler_is_exact(bytes: &[u8], rva: u32) -> bool {
+    let start = rva as usize;
+    start
+        .checked_add(COLLIDED_HANDLER.len())
+        .and_then(|end| bytes.get(start..end))
+        == Some(COLLIDED_HANDLER.as_slice())
+}
+
+fn section_contains(section: &nt_pe_loader::Section, rva: u32, length: usize) -> bool {
+    let start = u64::from(section.virtual_address);
+    let end = start + u64::from(section.virtual_size.max(section.size_of_raw_data));
+    let rva = u64::from(rva);
+    rva >= start
+        && rva
+            .checked_add(length as u64)
+            .is_some_and(|last| last <= end)
+}
+
+fn expected_flags(name: &str) -> u8 {
+    match name {
+        "SehCallFilter" | "SehExecuteHandlerForException" => unw_flag::EHANDLER,
+        "SehCallFinally" | "SehExecuteHandlerForUnwind" => unw_flag::UHANDLER,
+        _ => unreachable!("the export set was already checked"),
+    }
+}
+
+fn expected_body(name: &str) -> &'static [u8] {
+    match name {
+        "SehCallFilter" => &FILTER_BODY,
+        "SehCallFinally" => &FINALLY_BODY,
+        "SehExecuteHandlerForException" | "SehExecuteHandlerForUnwind" => &EXECUTE_BODY,
+        _ => unreachable!("the export set was already checked"),
+    }
+}
+
+fn valid_unwind_header(header: UnwindInfoHeader, flags: u8) -> bool {
+    header.version == 1
+        && header.flags == flags
+        && !header.is_chained()
+        && header.size_of_prolog == 4
+        && header.count_of_codes == 1
+        && header.frame_register == 0
+        && header.frame_offset == 0
 }
 
 fn verify(path: &str) -> Result<(), String> {
@@ -75,7 +193,10 @@ fn verify(path: &str) -> Result<(), String> {
         .map_err(|error| format!("map: {error:?}"))?;
     let image = BorrowedExceptionImage::from_mapped_image(mapped.load_base, &mapped.bytes)
         .map_err(|error| format!("exception admission: {error:?}"))?;
+    let mut nested_handler = None;
+    let mut collided_handler = None;
     for export in exports {
+        let expected_flags = expected_flags(&export.name);
         let pc = mapped
             .load_base
             .checked_add(u64::from(export.rva))
@@ -99,11 +220,13 @@ fn verify(path: &str) -> Result<(), String> {
             .try_into()
             .map_err(|_| format!("{} invalid unwind header", export.name))?;
         let header = UnwindInfoHeader::parse(&header_bytes);
+        let function_len = function
+            .end
+            .checked_sub(function.begin)
+            .ok_or_else(|| format!("{} has reversed runtime function", export.name))?
+            as usize;
         if !pe.sections().iter().any(|section| {
-            let start = section.virtual_address;
-            let end = start.saturating_add(section.virtual_size.max(section.size_of_raw_data));
-            function.unwind_info >= start
-                && function.unwind_info < end
+            section_contains(section, function.unwind_info, 12)
                 && section.is_readable()
                 && !section.is_writable()
                 && !section.is_executable()
@@ -113,14 +236,7 @@ fn verify(path: &str) -> Result<(), String> {
                 export.name
             ));
         }
-        if header.version != 1
-            || header.has_handler()
-            || header.is_chained()
-            || header.size_of_prolog != 4
-            || header.count_of_codes != 1
-            || header.frame_register != 0
-            || header.frame_offset != 0
-        {
+        if !valid_unwind_header(header, expected_flags) {
             return Err(format!(
                 "{} has unsupported linkage unwind header: {header:?}",
                 export.name
@@ -129,10 +245,80 @@ fn verify(path: &str) -> Result<(), String> {
         if !frame_encoding_is_exact(&mapped.bytes, export.rva, function.unwind_info) {
             return Err(format!("{} prologue and unwind code disagree", export.name));
         }
+        if !pe.sections().iter().any(|section| {
+            section.name_str() == ".text"
+                && section_contains(section, export.rva, function_len)
+                && section.is_readable()
+                && section.is_executable()
+                && !section.is_writable()
+        }) {
+            return Err(format!("{} does not have an RX .text body", export.name));
+        }
+        let expected_body = expected_body(&export.name);
+        if function_len != CALL_FRAME.len() + expected_body.len()
+            || !body_is_exact(&mapped.bytes, export.rva, expected_body)
+        {
+            return Err(format!("{} has unexpected linkage code", export.name));
+        }
+        {
+            let tail = (function.unwind_info as usize)
+                .checked_add(header.tail_offset())
+                .ok_or_else(|| format!("{} handler tail overflow", export.name))?;
+            let handler_bytes = tail
+                .checked_add(4)
+                .and_then(|end| mapped.bytes.get(tail..end))
+                .ok_or_else(|| format!("{} missing private handler RVA", export.name))?;
+            let handler_rva = u32::from_le_bytes(
+                handler_bytes
+                    .try_into()
+                    .map_err(|_| format!("{} has invalid private handler RVA", export.name))?,
+            );
+            let correct_code = if expected_flags == unw_flag::EHANDLER {
+                nested_handler_is_exact(&mapped.bytes, handler_rva)
+            } else {
+                collided_handler_is_exact(&mapped.bytes, handler_rva)
+            };
+            let handler_len = if expected_flags == unw_flag::EHANDLER {
+                NESTED_HANDLER.len()
+            } else {
+                COLLIDED_HANDLER.len()
+            };
+            if handler_rva == 0
+                || !correct_code
+                || !pe.sections().iter().any(|section| {
+                    section.name_str() == ".text"
+                        && section_contains(section, handler_rva, handler_len)
+                        && section.is_readable()
+                        && section.is_executable()
+                        && !section.is_writable()
+                })
+                || (function.begin..function.end).contains(&handler_rva)
+            {
+                return Err(format!("{} has invalid private handler", export.name));
+            }
+            let shared_handler = if expected_flags == unw_flag::EHANDLER {
+                &mut nested_handler
+            } else {
+                &mut collided_handler
+            };
+            if let Some(prior) = *shared_handler {
+                if prior != handler_rva {
+                    return Err(format!(
+                        "{} does not share its private handler",
+                        export.name
+                    ));
+                }
+            } else {
+                *shared_handler = Some(handler_rva);
+            }
+        }
         println!(
-            "{} RVA=0x{:x} unwind=0x{:x}",
-            export.name, export.rva, function.unwind_info
+            "{} RVA=0x{:x} unwind=0x{:x} flags={}",
+            export.name, export.rva, function.unwind_info, header.flags
         );
+    }
+    if nested_handler == collided_handler {
+        return Err("nested and collided handler RVAs must differ".into());
     }
     Ok(())
 }
@@ -151,10 +337,19 @@ mod tests {
 
     #[test]
     fn export_set_rejects_duplicates_and_extra_names() {
-        assert!(exact_exports(&[export(EXPORTS[0]), export(EXPORTS[1])]));
-        assert!(!exact_exports(&[export(EXPORTS[0]), export(EXPORTS[0])]));
-        assert!(!exact_exports(&[export(EXPORTS[0]), export("Unexpected")]));
-        assert!(!exact_exports(&[export(EXPORTS[0])]));
+        let all: Vec<_> = EXPORTS.iter().map(|name| export(name)).collect();
+        assert!(exact_exports(&all));
+        for index in 0..EXPORTS.len() {
+            let mut missing = all.clone();
+            missing.remove(index);
+            assert!(!exact_exports(&missing));
+        }
+        let mut duplicate = all.clone();
+        duplicate[3] = duplicate[2].clone();
+        assert!(!exact_exports(&duplicate));
+        let mut extra = all;
+        extra[3] = export("Unexpected");
+        assert!(!exact_exports(&extra));
     }
 
     #[test]
@@ -170,6 +365,68 @@ mod tests {
         }
         assert!(!frame_encoding_is_exact(&bytes, 61, 32));
         assert!(!frame_encoding_is_exact(&bytes, 8, 63));
+    }
+
+    #[test]
+    fn wrapper_bodies_reject_home_slot_call_and_return_site_mutations() {
+        for body in [&FILTER_BODY[..], &FINALLY_BODY[..], &EXECUTE_BODY[..]] {
+            let mut bytes = [0u8; 64];
+            bytes[8..12].copy_from_slice(&CALL_FRAME);
+            bytes[12..12 + body.len()].copy_from_slice(body);
+            assert!(body_is_exact(&bytes, 8, body));
+            for offset in 12..12 + body.len() {
+                bytes[offset] ^= 1;
+                assert!(!body_is_exact(&bytes, 8, body), "offset {offset}");
+                bytes[offset] ^= 1;
+            }
+            assert!(!body_is_exact(&bytes, 63, body));
+        }
+    }
+
+    #[test]
+    fn handler_flags_are_exact_and_mutations_fail() {
+        for (name, flags) in [
+            (EXPORTS[0], unw_flag::EHANDLER),
+            (EXPORTS[1], unw_flag::UHANDLER),
+            (EXPORTS[2], unw_flag::EHANDLER),
+            (EXPORTS[3], unw_flag::UHANDLER),
+        ] {
+            assert_eq!(expected_flags(name), flags);
+            let bytes = [(flags << 3) | 1, 4, 1, 0];
+            assert!(valid_unwind_header(UnwindInfoHeader::parse(&bytes), flags));
+            for replacement in [0, unw_flag::EHANDLER, unw_flag::UHANDLER, 3, 4] {
+                if replacement != flags {
+                    let mut mutated = bytes;
+                    mutated[0] = (replacement << 3) | 1;
+                    assert!(!valid_unwind_header(
+                        UnwindInfoHeader::parse(&mutated),
+                        flags
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn private_handler_opcode_mutations_fail() {
+        let mut nested = NESTED_HANDLER.to_vec();
+        assert!(nested_handler_is_exact(&nested, 0));
+        for offset in 0..nested.len() {
+            nested[offset] ^= 1;
+            assert!(!nested_handler_is_exact(&nested, 0), "nested {offset}");
+            nested[offset] ^= 1;
+        }
+
+        let mut collided = COLLIDED_HANDLER.to_vec();
+        assert!(collided_handler_is_exact(&collided, 0));
+        for offset in 0..collided.len() {
+            collided[offset] ^= 1;
+            assert!(
+                !collided_handler_is_exact(&collided, 0),
+                "collided {offset}"
+            );
+            collided[offset] ^= 1;
+        }
     }
 }
 

@@ -17,6 +17,7 @@ mkdir -p "$OUT"
 "$RUST_LLD" -flavor link /machine:x64 /dll /noentry /nodefaultlib \
     /dynamicbase /nxcompat /timestamp:0 \
     /export:SehCallFilter /export:SehCallFinally \
+    /export:SehExecuteHandlerForException /export:SehExecuteHandlerForUnwind \
     "/out:$OUT/nt-seh-linkage.dll" "$OUT/seh_linkage.obj"
 cargo run --manifest-path "$ROOT/Cargo.toml" -p seh-linkage-verify -- \
     "$OUT/nt-seh-linkage.dll"
