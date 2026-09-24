@@ -296,6 +296,29 @@ pub(super) unsafe fn query(
     metadata
 }
 
+pub(super) unsafe fn next_bound_for_source(
+    source_inst: DriverInstance,
+    ticket: SourceCreateSecurityTicket,
+    key: SourceCreateSecurityKey,
+) -> Result<Option<(DriverInstance, u64)>, i32> {
+    let row = (&*core::ptr::addr_of!(ROWS)).iter().find(|row| {
+        row.source_ticket == ticket
+            && row.source_key == key
+            && row.source_pml4 == source_inst.pml4
+            && row.source_pool == source_inst.exec_pool_va
+    });
+    let Some(row) = row else { return Ok(None); };
+    if row.retiring || row.projection.is_none() {
+        return Err(STATUS_DEVICE_BUSY_LOCAL);
+    }
+    let (_, provider) = instance_by_driver_id(row.provider_driver_id)
+        .ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
+    if !provider_matches(row, provider) {
+        return Err(STATUS_INVALID_HANDLE_LOCAL);
+    }
+    Ok(Some((provider, row.address)))
+}
+
 pub(super) unsafe fn verify_bound(
     provider_inst: DriverInstance,
     projected: ProjectedToken,
@@ -340,8 +363,8 @@ pub(super) unsafe fn verify_bound(
     result
 }
 
-/// Quiesce a projection only after genuine terminal completion. This phase retains the row but
-/// removes token authority without a provider IPC or pool operation.
+/// Quiesce a projection only after the outer CREATE is terminal. A nested query-path terminal
+/// releases its provider-local graph, but the retained source subject still owns token bindings.
 pub(super) unsafe fn retire_binding(
     source_inst: DriverInstance,
     provider_inst: DriverInstance,
@@ -351,10 +374,43 @@ pub(super) unsafe fn retire_binding(
     address: u64,
     tokens: &mut TokenStore,
 ) -> Result<RetiringTokenProjection, i32> {
+    retire_binding_in_phase(source_inst, provider_inst, source, ticket, key, address,
+        false, tokens)
+}
+
+/// Only the graph builder may use this before native dispatch entry. It is not an alternative
+/// terminal path for a provider operation whose entry is uncertain.
+pub(super) unsafe fn abort_unentered_binding(
+    source_inst: DriverInstance,
+    provider_inst: DriverInstance,
+    source: &SourceCreateSecurityOwner,
+    ticket: SourceCreateSecurityTicket,
+    key: SourceCreateSecurityKey,
+    address: u64,
+    tokens: &mut TokenStore,
+) -> Result<RetiringTokenProjection, i32> {
+    retire_binding_in_phase(source_inst, provider_inst, source, ticket, key, address,
+        true, tokens)
+}
+
+unsafe fn retire_binding_in_phase(
+    source_inst: DriverInstance,
+    provider_inst: DriverInstance,
+    source: &SourceCreateSecurityOwner,
+    ticket: SourceCreateSecurityTicket,
+    key: SourceCreateSecurityKey,
+    address: u64,
+    proven_unentered: bool,
+    tokens: &mut TokenStore,
+) -> Result<RetiringTokenProjection, i32> {
     if !source_matches(source_inst, key)
         || source.ticket() != ticket
         || source.key() != key
-        || source.phase() != SourceCreateSecurityPhase::Terminal
+        || if proven_unentered {
+            !matches!(source.phase(), SourceCreateSecurityPhase::Captured | SourceCreateSecurityPhase::Pending)
+        } else {
+            source.phase() != SourceCreateSecurityPhase::Terminal
+        }
     {
         return Err(STATUS_INVALID_HANDLE_LOCAL);
     }

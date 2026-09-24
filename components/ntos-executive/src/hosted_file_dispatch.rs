@@ -233,7 +233,7 @@ pub(super) fn control(
         };
     }
     let storage_instance = hosted_completion_storage_instance(instance_index);
-    unsafe {
+    let result = unsafe {
         let caller = crate::initial_system_driver_caller();
         dispatch_irp_for_instance_exact(
             storage_instance,
@@ -253,7 +253,25 @@ pub(super) fn control(
     }
     .unwrap_or(HostedIrpTransportResult::NotDispatched {
         status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
-    })
+    });
+    if operation == FSD_DISPATCH_ACK_COMPLETION
+        && matches!(result, HostedIrpTransportResult::Returned {
+            status: nt_status::NtStatus::SUCCESS,
+            information: 0,
+            file_context: 0,
+        })
+    {
+        if let Some(source) = instance(instance_index) {
+            if let Some(identity) = hosted_source_create_security::lookup_retained_irp(source, irp_id) {
+                hosted_create_subject_registration::finish(
+                    source,
+                    identity,
+                    hosted_create_subject_registration::SourceCreateCompletion::AcknowledgedTerminal,
+                );
+            }
+        }
+    }
+    result
 }
 
 pub(super) fn execute(

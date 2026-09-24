@@ -9,7 +9,7 @@ use nt_io_manager::{
     hosted_forward_target::HostedForwardTarget,
     redir_query_path::{
         capture_query_path, CapturedQueryPath, QueryPathError, QueryPathStack,
-        SourceSecurityContext, QUERY_PATH_REQUEST_X64_SIZE,
+        QUERY_PATH_REQUEST_X64_SIZE,
     },
     retained_query_path_forward::{
         PreparedQueryPathForward, QueryPathForwardIdentity, SourceIrpTicket,
@@ -65,6 +65,9 @@ impl CapturedSourceForward {
     pub(super) fn source_ticket(&self) -> SourceIrpTicket {
         self.source
     }
+    pub(super) fn source_irp_address(&self) -> u64 {
+        self.allocation.component_address
+    }
     pub(super) fn file_id(&self) -> nt_io_manager::FileId {
         self.source_file
             .as_ref()
@@ -85,6 +88,17 @@ impl CapturedSourceForward {
     }
     pub(super) fn source_output_address(&self) -> u64 {
         self.output_buffer
+    }
+
+    pub(super) fn arm_callback_free(&self) -> Result<(), CaptureError> {
+        self.validate_source()?;
+        hosted_source_irp_ledger::arm_deferred_free(self.source)
+            .then_some(())
+            .ok_or(CaptureError::InvalidSourceIrp)
+    }
+
+    pub(super) fn callback_requested_free(&self) -> bool {
+        hosted_source_irp_ledger::deferred_free_requested(self.source)
     }
 
     pub(super) unsafe fn source_output_exec(&self) -> Result<u64, CaptureError> {
@@ -151,7 +165,35 @@ impl CapturedSourceForward {
         nt_io_manager::redir_query_path::QueryPathCompletion,
         (CaptureError, TerminalQueryPathForward),
     > {
-        if self.forward_identity != Some(terminal.identity()) || self.target_retired {
+        if self.forward_identity != Some(terminal.identity())
+            || self.target_retired
+            || !self.callback_requested_free()
+        {
+            return Err((CaptureError::InvalidTarget, terminal));
+        }
+        match terminal.retire(io_manager_mut()) {
+            Ok(completion) => {
+                self.target_retired = true;
+                Ok(completion)
+            }
+            Err((_, terminal)) => Err((CaptureError::InvalidTarget, terminal)),
+        }
+    }
+
+    /// A sealed stop of the parked source Call prevents its local completion routine from
+    /// running. The caller must hold that exact cancellation receipt and a provider terminal;
+    /// no source-domain output or IRP status may be published on this path.
+    pub(super) fn retire_target_after_source_stop(
+        &mut self,
+        terminal: TerminalQueryPathForward,
+    ) -> Result<
+        nt_io_manager::redir_query_path::QueryPathCompletion,
+        (CaptureError, TerminalQueryPathForward),
+    > {
+        if self.forward_identity != Some(terminal.identity())
+            || self.target_retired
+            || self.callback_requested_free()
+        {
             return Err((CaptureError::InvalidTarget, terminal));
         }
         match terminal.retire(io_manager_mut()) {
@@ -214,25 +256,19 @@ unsafe fn source_stack(
     Ok((irp, stack_exec))
 }
 
-/// Capture only an authenticated source-domain `IofCallDriver` invocation. The `security`
-/// argument must be resolved from the retained outer CREATE; the request's raw pointer cannot
-/// establish that owner, and absence is an explicit dependency rather than a fabricated context.
+/// Capture only an authenticated source-domain `IofCallDriver` invocation. The request's raw
+/// security pointer is only a lookup key for the retained outer CREATE owner; absence is an
+/// explicit dependency rather than a fabricated context.
 pub(super) unsafe fn capture(
     ch: &crate::spawn_hosts::PumpChannel,
     reply_cap: u64,
     source_irp_address: u64,
     target_device_address: u64,
-    security: Option<SourceSecurityContext>,
 ) -> Result<CapturedSourceForward, CaptureError> {
-    let security = security.ok_or(CaptureError::MissingSecurityContext)?;
     let (instance_index, inst) =
         instance_for_pump_channel(ch, reply_cap).ok_or(CaptureError::InvalidCaller)?;
     let domain: HostedDomainIdentity =
         instance_domain_identity(inst).ok_or(CaptureError::InvalidCaller)?;
-    if hosted_source_create_security::lookup_context(inst, security.address.get()) != Some(security)
-    {
-        return Err(CaptureError::MissingSecurityContext);
-    }
     let (source, allocation) =
         hosted_source_irp_ledger::pin(instance_index, domain, source_irp_address)
             .ok_or(CaptureError::InvalidSourceIrp)?;
@@ -263,6 +299,9 @@ pub(super) unsafe fn capture(
             output_buffer_length: output_len,
         };
         let bytes = core::slice::from_raw_parts(input_exec as *const u8, input_len as usize);
+        let security_address = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let security = hosted_source_create_security::lookup_context(inst, security_address)
+            .ok_or(CaptureError::MissingSecurityContext)?;
         let request = capture_query_path(stack_descriptor, bytes, Some(security))
             .map_err(CaptureError::QueryPath)?;
         let stack_device = read_unaligned((stack + STACK_DEVICE_OFFSET) as *const u64);

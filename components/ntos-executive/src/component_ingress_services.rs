@@ -35,6 +35,7 @@ struct Wait {
 #[derive(Clone, Copy)]
 enum ServiceCompletion {
     Status(i32),
+    QueryPath { status: i32, accepted: bool },
     FileCreate(nt_io_manager::io_create_file_reply::IoCreateFileReply),
     Registry {
         status: i32,
@@ -47,6 +48,9 @@ impl ServiceCompletion {
     fn words(self) -> (u64, [u64; 4]) {
         match self {
             Self::Status(status) => (1, [status as u32 as u64, 0, 0, 0]),
+            Self::QueryPath { status, accepted } => {
+                (2, [status as u32 as u64, u64::from(accepted), 0, 0])
+            }
             Self::FileCreate(reply) => (4, reply.words().expect("terminal File create reply")),
             Self::Registry {
                 status,
@@ -182,6 +186,32 @@ pub(crate) unsafe fn wake_registry_service(
             handle,
             disposition,
         },
+    )
+}
+
+pub(crate) unsafe fn wake_query_path_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    status: i32,
+) -> Result<(), Error> {
+    wake_with_completion(
+        route, dispatch, reply, token,
+        ServiceCompletion::QueryPath { status, accepted: true },
+    )
+}
+
+pub(crate) unsafe fn wake_query_path_rejected_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    status: i32,
+) -> Result<(), Error> {
+    wake_with_completion(
+        route, dispatch, reply, token,
+        ServiceCompletion::QueryPath { status, accepted: false },
     )
 }
 

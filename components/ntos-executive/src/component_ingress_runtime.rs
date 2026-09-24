@@ -22,7 +22,8 @@ pub(crate) use services::{
     retained_service_cancelled, retained_service_resume_next_deadline,
     resume_acknowledged_retained_services, resume_service,
     retire_stopped_acknowledged_retained_service,
-    wake_file_create_service, wake_registry_service, wake_service,
+    wake_file_create_service, wake_query_path_rejected_service, wake_query_path_service,
+    wake_registry_service, wake_service,
 };
 
 #[path = "component_ingress_retirement.rs"]

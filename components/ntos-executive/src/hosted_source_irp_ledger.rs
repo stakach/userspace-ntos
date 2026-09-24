@@ -3,7 +3,7 @@
 use super::*;
 use nt_io_manager::retained_query_path_forward::SourceIrpTicket;
 use nt_io_manager::source_irp_ledger::{
-    SourceIrpAllocation, SourceIrpLedger, SourceIrpLedgerError,
+    SourceIrpAllocation, SourceIrpLedger, SourceIrpLedgerError, SourceIrpRetirement,
 };
 
 static LOCK: AtomicU64 = AtomicU64::new(0);
@@ -47,9 +47,8 @@ fn allocation(
     if bytes != expected || expected > u16::MAX as u64 {
         return None;
     }
-    let exec_address = unsafe {
-        hosted_instance_pool_allocation_exec_if_live(inst, component_address, bytes)?
-    };
+    let exec_address =
+        unsafe { hosted_instance_pool_allocation_exec_if_live(inst, component_address, bytes)? };
     let valid_header = unsafe {
         read_unaligned(exec_address as *const u16) == WDM_X64_IO_TYPE_IRP
             && read_unaligned((exec_address + 2) as *const u16) as u64 == bytes
@@ -88,20 +87,17 @@ pub(super) fn service(
             let Some(stack_count) = u8::try_from(stack_count).ok() else {
                 return (STATUS_INVALID_PARAMETER, 0, 0);
             };
-            let Some(allocation) = allocation(
-                instance_index,
-                inst,
-                component_address,
-                bytes,
-                stack_count,
-            ) else {
+            let Some(allocation) =
+                allocation(instance_index, inst, component_address, bytes, stack_count)
+            else {
                 return (STATUS_INVALID_PARAMETER, 0, 0);
             };
             let _guard = lock();
             match ledger().register(allocation) {
                 Ok(ticket) => (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get()),
-                Err(SourceIrpLedgerError::AlreadyLive) =>
-                    (nt_status::NtStatus::OBJECT_NAME_COLLISION.raw(), 0, 0),
+                Err(SourceIrpLedgerError::AlreadyLive) => {
+                    (nt_status::NtStatus::OBJECT_NAME_COLLISION.raw(), 0, 0)
+                }
                 Err(SourceIrpLedgerError::Exhausted) => (STATUS_INSUFFICIENT_RESOURCES, 0, 0),
                 Err(_) => (STATUS_INVALID_PARAMETER, 0, 0),
             }
@@ -115,15 +111,28 @@ pub(super) fn service(
             else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
-            if allocation(instance_index, inst, component_address, owner.bytes, owner.stack_count)
-                != Some(owner)
+            if allocation(
+                instance_index,
+                inst,
+                component_address,
+                owner.bytes,
+                owner.stack_count,
+            ) != Some(owner)
             {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             }
-            match ledger().retire(instance_index, domain, component_address) {
-                Ok(ticket) => (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get()),
-                Err(SourceIrpLedgerError::Pinned) =>
-                    (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0),
+            match ledger().request_free(instance_index, domain, component_address) {
+                Ok(SourceIrpRetirement::Retired(ticket)) => {
+                    (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get())
+                }
+                Ok(SourceIrpRetirement::Deferred(ticket)) => (
+                    nt_status::NtStatus::PENDING.raw(),
+                    ticket.id.get(),
+                    ticket.generation.get(),
+                ),
+                Err(SourceIrpLedgerError::Pinned) => {
+                    (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0)
+                }
                 Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
             }
         }
@@ -141,9 +150,16 @@ pub(super) fn pin(
         return None;
     }
     let _guard = lock();
-    let (ticket, owner) = ledger().pin(instance_index, domain, component_address).ok()?;
-    if allocation(instance_index, inst, component_address, owner.bytes, owner.stack_count)
-        != Some(owner)
+    let (ticket, owner) = ledger()
+        .pin(instance_index, domain, component_address)
+        .ok()?;
+    if allocation(
+        instance_index,
+        inst,
+        component_address,
+        owner.bytes,
+        owner.stack_count,
+    ) != Some(owner)
     {
         let _ = ledger().unpin(ticket);
         return None;
@@ -163,6 +179,16 @@ pub(super) fn matches(
 pub(super) fn unpin(ticket: SourceIrpTicket) -> bool {
     let _guard = lock();
     ledger().unpin(ticket).is_ok()
+}
+
+pub(super) fn arm_deferred_free(ticket: SourceIrpTicket) -> bool {
+    let _guard = lock();
+    ledger().arm_deferred_free(ticket).is_ok()
+}
+
+pub(super) fn deferred_free_requested(ticket: SourceIrpTicket) -> bool {
+    let _guard = lock();
+    ledger().deferred_free_requested(ticket)
 }
 
 pub(super) fn live_for_instance(instance_index: usize, domain: HostedDomainIdentity) -> usize {

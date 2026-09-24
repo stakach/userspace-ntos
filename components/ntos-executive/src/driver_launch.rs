@@ -84,8 +84,16 @@ mod hosted_source_irp_ledger;
 mod hosted_source_create_security;
 #[path = "hosted_query_path_capture.rs"]
 mod hosted_query_path_capture;
+#[path = "hosted_query_path_work.rs"]
+mod hosted_query_path_work;
 #[path = "driver_hosted_token_projection.rs"]
 mod driver_hosted_token_projection;
+#[path = "hosted_token_query.rs"]
+mod hosted_token_query;
+#[path = "hosted_create_subject_registration.rs"]
+mod hosted_create_subject_registration;
+#[path = "hosted_create_security_graph.rs"]
+mod hosted_create_security_graph;
 #[path = "hosted_file_objects.rs"]
 mod hosted_file_objects;
 #[path = "hosted_consumer_file_objects.rs"]
@@ -96,6 +104,8 @@ mod hosted_io_create_file_adapter;
 mod hosted_io_create_file_ingress;
 #[path = "hosted_io_create_file_work.rs"]
 mod hosted_io_create_file_work;
+#[path = "hosted_kernel_file_control.rs"]
+mod hosted_kernel_file_control;
 #[path = "driver_share_access.rs"]
 mod driver_share_access;
 use hosted_file_objects::{
@@ -801,6 +811,33 @@ pub const FSD_SERVICE_MDL_LABEL: u64 = 0x78C;
 pub const FSD_SERVICE_FILE_LABEL: u64 = 0x78D;
 pub const FSD_SERVICE_IO_CREATE_FILE_LABEL: u64 = 0x78E;
 pub const FSD_SERVICE_SOURCE_IRP_LABEL: u64 = 0x78F;
+pub const FSD_SERVICE_QUERY_PATH_FORWARD_LABEL: u64 = 0x791;
+pub const FSD_SERVICE_TOKEN_QUERY_LABEL: u64 = 0x792;
+pub const FSD_SERVICE_CREATE_SUBJECT_LABEL: u64 = 0x794;
+
+pub(crate) fn service_hosted_token_query(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    caller_badge: u64,
+    token_address: u64,
+    selector: u64,
+) -> (i32, u64) {
+    hosted_token_query::service(channel, reply_cap, caller_badge, token_address, selector)
+}
+
+pub(crate) unsafe fn service_hosted_create_subject_registration(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    caller_badge: u64,
+    source_irp: u64,
+    security_context: u64,
+) -> (i32, u64, u64) {
+    hosted_create_subject_registration::service(
+        channel, reply_cap, caller_badge, source_irp, security_context,
+    )
+}
+pub const FSD_SERVICE_ZW_FS_CONTROL_FILE_LABEL: u64 = 0x790;
+pub const FSD_SERVICE_ZW_WAIT_FILE_LABEL: u64 = 0x793;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
@@ -7759,6 +7796,11 @@ extern "win64" fn s_io_free_irp(irp: u64) {
             0,
             0,
         );
+        if status as u32 == STATUS_PENDING {
+            // An explicitly armed cross-domain forward still owns this source allocation.
+            // Its caller frees it after the local completion callback and exact terminal ACK.
+            return;
+        }
         if status as u32 as i32 != STATUS_SUCCESS {
             crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 2, irp, status]);
         }
@@ -8228,6 +8270,54 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     as *const u64,
             );
             if handler == 0 {
+                if major == IRP_MJ_DEVICE_CONTROL {
+                    let (reply_label, status, accepted, _, _) = call_on4(
+                        (FSD_SERVICE_QUERY_PATH_FORWARD_LABEL << 12) | 4,
+                        1,
+                        device,
+                        irp,
+                        0,
+                    );
+                    if reply_label != 0 || accepted > 1 {
+                        crate::provider_bugcheck::report(
+                            0xc4,
+                            [FSD_SERVICE_QUERY_PATH_FORWARD_LABEL, 1, irp, reply_label],
+                        );
+                    }
+                    if accepted == 0 {
+                        return status as u32 as i32;
+                    }
+                    write_unaligned(
+                        (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+                        current_location_after_forward,
+                    );
+                    write_unaligned((irp + 0xb8) as *mut u64, next);
+                    write_unaligned(
+                        (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
+                        device,
+                    );
+                    s_io_complete_request(irp, 0);
+                    let (ack_label, ack_status, _, _, _) = call_on4(
+                        (FSD_SERVICE_QUERY_PATH_FORWARD_LABEL << 12) | 4,
+                        2,
+                        irp,
+                        0,
+                        0,
+                    );
+                    if ack_label != 0 || ack_status as u32 as i32 != STATUS_SUCCESS {
+                        crate::provider_bugcheck::report(
+                            0xc4,
+                            [FSD_SERVICE_QUERY_PATH_FORWARD_LABEL, 2, irp, ack_status],
+                        );
+                    }
+                    s_io_free_irp(irp);
+                    print_str(b"[wdm-forward-final-free] irp=");
+                    print_hex64(irp);
+                    print_str(b" status=");
+                    print_hex(status as u32);
+                    print_str(b"\n");
+                    return status as u32 as i32;
+                }
                 return 0xC000_0010u32 as i32;
             }
             write_unaligned(
@@ -13737,6 +13827,40 @@ extern "win64" fn s_se_access_check(
 extern "win64" fn s_se_lock_subject_context(_subject_context: u64) {}
 
 extern "win64" fn s_se_unlock_subject_context(_subject_context: u64) {}
+
+/// Query a retained provider-local token projection. The executive resolves its exact receipt;
+/// the component pointer is only an address in the authenticated provider VSpace.
+extern "win64" fn s_se_query_session_id_token(token: u64, session_id: u64) -> i32 {
+    if session_id == 0 {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let (info, status, value, _, _) = unsafe {
+        call_on4((FSD_SERVICE_TOKEN_QUERY_LABEL << 12) | 2, token, 1, 0, 0)
+    };
+    if info != 2 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if status as u32 as i32 == STATUS_SUCCESS {
+        unsafe { write_unaligned(session_id as *mut u32, value as u32) };
+    }
+    status as u32 as i32
+}
+
+extern "win64" fn s_se_query_authentication_id_token(token: u64, logon_id: u64) -> i32 {
+    if logon_id == 0 {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let (info, status, value, _, _) = unsafe {
+        call_on4((FSD_SERVICE_TOKEN_QUERY_LABEL << 12) | 2, token, 2, 0, 0)
+    };
+    if info != 2 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if status as u32 as i32 == STATUS_SUCCESS {
+        unsafe { write_unaligned(logon_id as *mut u64, value) };
+    }
+    status as u32 as i32
+}
 
 extern "win64" fn s_se_open_object_audit_alarm(
     _object_type_name: u64,
@@ -32222,6 +32346,14 @@ fn register_fsd_trampolines() -> bool {
         hosted_io_create_file_adapter::s_zw_create_file as *const () as usize as u64,
     );
     reg.bind(
+        "ZwFsControlFile",
+        hosted_kernel_file_control::s_zw_fs_control_file as *const () as usize as u64,
+    );
+    reg.bind(
+        "ZwWaitForSingleObject",
+        hosted_kernel_file_control::s_zw_wait_for_single_object as *const () as usize as u64,
+    );
+    reg.bind(
         "ZwQueryInformationFile",
         s_zw_query_information_file as *const () as usize as u64,
     );
@@ -32489,6 +32621,14 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "SeUnlockSubjectContext",
         s_se_unlock_subject_context as *const () as usize as u64,
+    );
+    reg.bind(
+        "SeQuerySessionIdToken",
+        s_se_query_session_id_token as *const () as usize as u64,
+    );
+    reg.bind(
+        "SeQueryAuthenticationIdToken",
+        s_se_query_authentication_id_token as *const () as usize as u64,
     );
     reg.bind(
         "SeOpenObjectAuditAlarm",
@@ -34324,7 +34464,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 }
                 return (0xC000_009Au32 as i32, 0);
             }
-            create_access_state = pool_alloc(0x80); // ACCESS_STATE
+            create_access_state = pool_alloc(0xa0); // NT5 x64 ACCESS_STATE
             if create_access_state == 0 {
                 pool_free_irp_auxiliary_graph(0, create_security_context, 0, 0);
                 pool_free(irp);
@@ -34335,7 +34475,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 return (0xC000_009Au32 as i32, 0);
             }
             zero(create_security_context, 0x20);
-            zero(create_access_state, 0x80);
+            zero(create_access_state, 0xa0);
             write_unaligned(
                 (create_security_context + 0x08) as *mut u64,
                 create_access_state,
@@ -34851,6 +34991,37 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         data_len,
     );
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_FILE_OBJECT) as *mut u64, fo);
+
+    if is_create && requestor_tid != 0 {
+        let (info, status, ticket, generation, _) = call_on4_raw(
+            (FSD_SERVICE_CREATE_SUBJECT_LABEL << 12) | 2,
+            irp,
+            create_security_context,
+            0,
+            0,
+        );
+        if info != 3 || status as u32 as i32 != STATUS_SUCCESS || ticket == 0 || generation == 0 {
+            write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IRP) as *mut u64, 0);
+            write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IOSL) as *mut u64, 0);
+            write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DATA) as *mut u64, 0);
+            write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DATA_CAP) as *mut u64, 0);
+            write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_FILE_OBJECT) as *mut u64, 0);
+            let state = pending_irp_owner_state(owner_node).load(Ordering::Acquire);
+            let consuming = hosted_irp_state_with_kind(state, HOSTED_IRP_CONSUMING);
+            pending_irp_owner_state(owner_node).store(consuming, Ordering::Release);
+            if owns_fo {
+                fo_release(canonical_file_id);
+            }
+            let entry = read_volatile(pending_irp_entry_address(owner_node) as *const PendingIrp);
+            release_pending_irp_graph_component(entry);
+            tombstone_pending_irp_owner(owner_node, consuming);
+            return (if status as u32 as i32 == STATUS_SUCCESS {
+                STATUS_INVALID_HANDLE
+            } else {
+                status as u32 as i32
+            }, 0);
+        }
+    }
 
     // Call the driver's MajorFunction handler THROUGH the bugcheck escape: if the driver raises its
     // own consistency bugcheck (`NpBugCheck` → `KeBugCheckEx`) we unwind back here and fail THIS
@@ -51532,6 +51703,9 @@ static mut DRIVER_INSTANCE_THUNK_SLOTS: Option<
 struct ActiveHostedIrpTransfer {
     shared_va: u64,
     transfer_id: u64,
+    source_instance: usize,
+    requestor_thread: Option<nt_process::ThreadLifetime>,
+    create_subject: Option<hosted_source_create_security::SourceSecurityIdentity>,
     /// Executive-validated CREATE File and physical provider address space.
     file_create: Option<(FileId, HostedDomainIdentity)>,
     input: u64,
@@ -51576,6 +51750,8 @@ impl Drop for ActiveHostedIrpTransferGuard {
 unsafe fn enter_active_hosted_irp_transfer(
     shared_va: u64,
     transfer_id: u64,
+    source_instance: usize,
+    requestor_thread: Option<nt_process::ThreadLifetime>,
     file_create: Option<(FileId, HostedDomainIdentity)>,
     input: &[u8],
     output: &mut [u8],
@@ -51592,6 +51768,9 @@ unsafe fn enter_active_hosted_irp_transfer(
     transfers.push(ActiveHostedIrpTransfer {
         shared_va,
         transfer_id,
+        source_instance,
+        requestor_thread,
+        create_subject: None,
         file_create,
         input: input.as_ptr() as u64,
         output: output.as_mut_ptr() as u64,
@@ -53906,6 +54085,54 @@ pub(crate) unsafe fn redrive_hosted_driver_io_create_file(handler: &mut ExecNtHa
     hosted_io_create_file_work::redrive(handler);
 }
 
+pub(crate) unsafe fn service_hosted_driver_zw_fs_control_file(
+    ch: &crate::spawn_hosts::PumpChannel,
+    packet: u64,
+    packet_length: u64,
+    handle: u64,
+    active_reply_cap: u64,
+) -> Option<i32> {
+    hosted_kernel_file_control::submit(ch, packet, packet_length, handle, active_reply_cap)
+}
+
+pub(crate) unsafe fn redrive_hosted_driver_zw_fs_control_file(handler: &mut ExecNtHandler) {
+    hosted_kernel_file_control::redrive(handler);
+    hosted_kernel_file_control::redrive_waits(handler);
+}
+
+pub(crate) unsafe fn service_hosted_query_path_forward(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    operation: u64,
+    address: u64,
+    irp: u64,
+) -> Option<(i32, bool)> {
+    match operation {
+        1 => hosted_query_path_work::submit(ch, irp, address, badge, reply_cap)
+            .map(|status| (status, false)),
+        2 if irp == 0 => hosted_query_path_work::acknowledge(ch, reply_cap, badge, address)
+            .map(|status| (status, false)),
+        _ => Some((STATUS_INVALID_PARAMETER, false)),
+    }
+}
+
+pub(crate) unsafe fn redrive_hosted_query_path_forward(handler: &mut ExecNtHandler) {
+    hosted_query_path_work::redrive(handler);
+}
+
+pub(crate) unsafe fn service_hosted_driver_zw_wait_file(
+    ch: &crate::spawn_hosts::PumpChannel,
+    handle: u64,
+    timeout_code: u64,
+    timeout_arg: u64,
+    active_reply_cap: u64,
+) -> Option<i32> {
+    hosted_kernel_file_control::submit_wait(
+        ch, handle, timeout_code, timeout_arg, active_reply_cap,
+    )
+}
+
 fn service_hosted_driver_registry_sync(
     ch: &crate::spawn_hosts::PumpChannel,
     op: u64,
@@ -54192,8 +54419,18 @@ unsafe fn spawn_hosted_driver_worker_thread(
     let kpcr_exec_va = exec_base.checked_add(FSD_WORKER_KPCR_OFFSET)?;
 
     let domain = instance_domain_identity(inst)?;
-    let construction = hosted_thread_resources::begin(instance, handle, domain, inst.pml4)?;
-    hosted_thread_resources::initialize_actor(construction, start_routine, start_context).ok()?;
+    let Some(construction) = hosted_thread_resources::begin(instance, handle, domain, inst.pml4) else {
+        print_str(b"[driver-thread] construction reservation failed\n");
+        return None;
+    };
+    if let Err(status) = hosted_thread_resources::initialize_actor(
+        construction, start_routine, start_context,
+    ) {
+        print_str(b"[driver-thread] actor setup failed status=0x");
+        print_hex(status);
+        print_str(b"\n");
+        return None;
+    }
     if !ensure_paging(stack_base, inst.pml4, domain) || !crate::ensure_executive_paging(exec_base) {
         return None;
     }
@@ -54231,7 +54468,14 @@ unsafe fn spawn_hosted_driver_worker_thread(
     if page_map_r(kpcr, kpcr_va, RW_NX, inst.pml4) != 0 { return None; }
     hosted_thread_resources::mapping(construction, kpcr_exec);
     if page_map_r(kpcr_exec, kpcr_exec_va, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 { return None; }
-    hosted_thread_resources::initialize_kpcr(construction, inst, kpcr_va, kpcr_exec_va).ok()?;
+    if let Err(status) = hosted_thread_resources::initialize_kpcr(
+        construction, inst, kpcr_va, kpcr_exec_va,
+    ) {
+        print_str(b"[driver-thread] KPCR setup failed status=0x");
+        print_hex(status);
+        print_str(b"\n");
+        return None;
+    }
 
     let ipcbuf = alloc_frame();
     hosted_thread_resources::root(construction, ipcbuf);
@@ -58737,6 +58981,26 @@ unsafe fn dispatch_irp_for_instance_exact(
             });
         }
     }
+    let requestor_thread = if major::is_create_major(major as u8) && requestor_tid != 0 {
+        match crate::service_sec_image::with_provider_process_manager(|pm| {
+            if let Some(caller) = caller {
+                pm.validate_native_handle_caller(caller)?;
+            }
+            let thread = pm.thread_lifetime(requestor_tid as nt_process::ThreadId)
+                .ok_or(STATUS_INVALID_HANDLE as u32)?;
+            if caller.is_some_and(|caller| caller.original_thread() != thread) {
+                return Err(STATUS_INVALID_HANDLE as u32);
+            }
+            Ok(thread)
+        }) {
+            Ok(thread) => Some(thread),
+            Err(status) => return Some(HostedIrpTransportResult::NotDispatched {
+                status: nt_status::NtStatus(status as i32),
+            }),
+        }
+    } else {
+        None
+    };
     let file_create = dispatch_request
         .filter(|request| major::is_create_major(request.major) && request.file_id != 0)
         .map(|request| {
@@ -58746,7 +59010,7 @@ unsafe fn dispatch_irp_for_instance_exact(
             )
         });
     let Some(transfer_guard) =
-        enter_active_hosted_irp_transfer(sh, canonical_irp_id, file_create, in_data, out)
+        enter_active_hosted_irp_transfer(sh, canonical_irp_id, dispatch_index, requestor_thread, file_create, in_data, out)
     else {
         return Some(HostedIrpTransportResult::NotDispatched {
             status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
@@ -58790,6 +59054,22 @@ unsafe fn dispatch_irp_for_instance_exact(
         Some(caller) => component_scheduler::hosted_component_pump_with_caller(&ch, caller),
         None => hosted_component_pump(&ch),
     };
+    let guarded_abort = FSD_BUGCHECKS.load(Ordering::Relaxed) != bugchecks_before;
+    let source_subject = active_hosted_irp_transfer_mut(sh, canonical_irp_id)
+        .and_then(|active| active.create_subject.take());
+    if let Some(identity) = source_subject {
+        hosted_create_subject_registration::finish(
+            d,
+            identity,
+            if pr.completed && !guarded_abort {
+                hosted_create_subject_registration::SourceCreateCompletion::Returned(
+                    nt_status::NtStatus(pr.status),
+                )
+            } else {
+                hosted_create_subject_registration::SourceCreateCompletion::Indeterminate
+            },
+        );
+    }
     drop(transfer_guard);
     drop(active_dispatch);
     if trace_dispatch {
@@ -58807,7 +59087,6 @@ unsafe fn dispatch_irp_for_instance_exact(
     }
     // Attribute any bugcheck the component raised to THIS instance — the executive is the only side
     // that knows which hosted component it just drove.
-    let guarded_abort = FSD_BUGCHECKS.load(Ordering::Relaxed) != bugchecks_before;
     if guarded_abort {
         FSD_BUGCHECK_INSTANCE.store(dispatch_index as u64 + 1, Ordering::Relaxed);
         print_str(b"[fsd-bugcheck] raised by hosted driver instance=");

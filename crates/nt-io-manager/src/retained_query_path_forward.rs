@@ -243,10 +243,9 @@ fn finish_completion(
     response: &[u8],
 ) -> QueryPathForwardResult {
     match capture_completion(&owner.request, status, information, response) {
-        Ok(completion) => QueryPathForwardResult::Terminal(TerminalQueryPathForward {
-            owner,
-            completion,
-        }),
+        Ok(completion) => {
+            QueryPathForwardResult::Terminal(TerminalQueryPathForward { owner, completion })
+        }
         Err(error) => QueryPathForwardResult::Rejected {
             error: QueryPathForwardError::Completion(error),
             retained: RetainedQueryPathForward {
@@ -302,7 +301,10 @@ impl TerminalQueryPathForward {
 
     /// Call only after the source-domain completion routine has consumed this result. A failed
     /// checked release returns the same owner for redrive; it cannot free the native IRP.
-    pub fn retire<P>(mut self, io: &mut IoManager<P>) -> Result<QueryPathCompletion, (NtStatus, Self)> {
+    pub fn retire<P>(
+        mut self,
+        io: &mut IoManager<P>,
+    ) -> Result<QueryPathCompletion, (NtStatus, Self)> {
         if let Err(status) = self.owner.target.release(io) {
             return Err((status, self));
         }
@@ -313,36 +315,42 @@ impl TerminalQueryPathForward {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::boxed::Box;
     use crate::{
         redir_query_path::{capture_query_path, QueryPathStack, SourceSecurityContext},
         DeviceCharacteristics, DeviceFlags, DeviceType, MockDriverBackend, MockObjectPort,
     };
+    use alloc::boxed::Box;
     use nt_types::NtPath;
 
     fn fixture() -> (IoManager<MockObjectPort>, PreparedQueryPathForward) {
         let mut io = IoManager::new(MockObjectPort::new());
-        let driver = io.create_driver(
-            &NtPath::parse_str(r"\Driver\QueryPath").unwrap(),
-            Box::new(MockDriverBackend::new()),
-        ).unwrap();
-        let device = io.create_device(
-            driver,
-            Some(&NtPath::parse_str(r"\Device\QueryPath").unwrap()),
-            DeviceType::UNKNOWN,
-            DeviceCharacteristics::empty(),
-            DeviceFlags::BUFFERED_IO,
-            0,
-        ).unwrap();
+        let driver = io
+            .create_driver(
+                &NtPath::parse_str(r"\Driver\QueryPath").unwrap(),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        let device = io
+            .create_device(
+                driver,
+                Some(&NtPath::parse_str(r"\Device\QueryPath").unwrap()),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
         let domain = io.register_hosted_domain();
-        io.bind_hosted_device_pointer(domain, 0x5000, device).unwrap();
+        io.bind_hosted_device_pointer(domain, 0x5000, device)
+            .unwrap();
         let target = HostedForwardTarget::capture(&mut io, domain, 0x5000).unwrap();
         let ticket = RetainedSecurityContextTicket::new(7, 3).unwrap();
         let mut input = alloc::vec![0u8; 32];
         input[0..4].copy_from_slice(&8u32.to_le_bytes());
         input[8..16].copy_from_slice(&0x6000u64.to_le_bytes());
         for (index, unit) in [b'\\' as u16, b'a' as u16, b'b' as u16, b'c' as u16]
-            .into_iter().enumerate()
+            .into_iter()
+            .enumerate()
         {
             input[16 + index * 2..18 + index * 2].copy_from_slice(&unit.to_le_bytes());
         }
@@ -360,7 +368,8 @@ mod tests {
                 address: NonZeroU64::new(0x6000).unwrap(),
                 ticket,
             }),
-        ).unwrap();
+        )
+        .unwrap();
         let source = SourceIrpTicket::new(domain, 42, 9).unwrap();
         (io, PreparedQueryPathForward::new(source, target, request))
     }
@@ -373,10 +382,13 @@ mod tests {
         let prepared = prepared.begin(&io, wrong).err().unwrap().1;
         let mut wrong = prepared.identity();
         let other_domain = io.register_hosted_domain();
-        wrong.target = io.bind_hosted_device_pointer(
-            other_domain, 0x7000, wrong.target.device_id(),
-        ).unwrap();
-        assert!(matches!(prepared.begin(&io, wrong), Err((QueryPathForwardError::WrongIdentity, _))));
+        wrong.target = io
+            .bind_hosted_device_pointer(other_domain, 0x7000, wrong.target.device_id())
+            .unwrap();
+        assert!(matches!(
+            prepared.begin(&io, wrong),
+            Err((QueryPathForwardError::WrongIdentity, _))
+        ));
     }
 
     #[test]
@@ -398,7 +410,10 @@ mod tests {
         let (io, prepared) = fixture();
         let identity = prepared.identity();
         let invocation = prepared.begin(&io, identity).unwrap();
-        let retained = match invocation.returned(QueryPathForwardOutcome::Pending).finish(&io, identity) {
+        let retained = match invocation
+            .returned(QueryPathForwardOutcome::Pending)
+            .finish(&io, identity)
+        {
             QueryPathForwardResult::Retained(retained) => retained,
             _ => panic!("pending must retain"),
         };
@@ -406,18 +421,29 @@ mod tests {
         let mut wrong = identity;
         wrong.source.generation = NonZeroU64::new(10).unwrap();
         let retained = match retained.complete(&io, wrong, 0, 0, &4u32.to_le_bytes()) {
-            QueryPathForwardResult::Rejected { error: QueryPathForwardError::WrongIdentity, retained } => retained,
+            QueryPathForwardResult::Rejected {
+                error: QueryPathForwardError::WrongIdentity,
+                retained,
+            } => retained,
             _ => panic!("wrong completion must retain"),
         };
-        assert!(matches!(retained.complete(&io, identity, 0x103, 0, &[]),
-            QueryPathForwardResult::Rejected { error: QueryPathForwardError::Completion(QueryPathError::Pending), .. }));
+        assert!(matches!(
+            retained.complete(&io, identity, 0x103, 0, &[]),
+            QueryPathForwardResult::Rejected {
+                error: QueryPathForwardError::Completion(QueryPathError::Pending),
+                ..
+            }
+        ));
 
         let (io, prepared) = fixture();
         let identity = prepared.identity();
         let invocation = prepared.begin(&io, identity).unwrap();
-        let retained = match invocation.returned(
-            QueryPathForwardOutcome::Indeterminate(NtStatus::DEVICE_BUSY),
-        ).finish(&io, identity) {
+        let retained = match invocation
+            .returned(QueryPathForwardOutcome::Indeterminate(
+                NtStatus::DEVICE_BUSY,
+            ))
+            .finish(&io, identity)
+        {
             QueryPathForwardResult::Retained(retained) => retained,
             _ => panic!("uncertain effect must retain"),
         };
@@ -432,7 +458,10 @@ mod tests {
         let device = identity.target.device_id();
         let held = io.device_reference_count(device);
         let invocation = prepared.begin(&io, identity).unwrap();
-        let retained = match invocation.returned(QueryPathForwardOutcome::Pending).finish(&io, identity) {
+        let retained = match invocation
+            .returned(QueryPathForwardOutcome::Pending)
+            .finish(&io, identity)
+        {
             QueryPathForwardResult::Retained(retained) => retained,
             _ => panic!("pending must retain"),
         };
@@ -443,6 +472,47 @@ mod tests {
         assert_eq!(terminal.completion().length_accepted, 4);
         assert_eq!(io.device_reference_count(device), held);
         assert_eq!(terminal.retire(&mut io).unwrap().status, 0);
+        assert_eq!(io.device_reference_count(device), held - 1);
+    }
+
+    #[test]
+    fn malformed_synchronous_return_can_be_reconciled_as_terminal_failure_without_replay() {
+        let (mut io, prepared) = fixture();
+        let identity = prepared.identity();
+        let device = identity.target.device_id();
+        let held = io.device_reference_count(device);
+        let invocation = prepared.begin(&io, identity).unwrap();
+        let retained = match invocation
+            .returned(QueryPathForwardOutcome::Returned {
+                status: 0,
+                information: 0,
+                response: 5u32.to_le_bytes().to_vec(),
+            })
+            .finish(&io, identity)
+        {
+            QueryPathForwardResult::Rejected {
+                error: QueryPathForwardError::Completion(QueryPathError::InvalidPath),
+                retained,
+            } => retained,
+            _ => panic!("malformed synchronous return must preserve the entered owner"),
+        };
+        assert!(retained.is_indeterminate());
+        let terminal = match retained.complete(
+            &io,
+            identity,
+            NtStatus::INVALID_DEVICE_REQUEST.raw() as u32,
+            0,
+            &[],
+        ) {
+            QueryPathForwardResult::Terminal(terminal) => terminal,
+            _ => panic!("local protocol failure must terminate without another dispatch"),
+        };
+        assert_eq!(
+            terminal.completion().status,
+            NtStatus::INVALID_DEVICE_REQUEST.raw() as u32
+        );
+        assert_eq!(io.device_reference_count(device), held);
+        terminal.retire(&mut io).unwrap();
         assert_eq!(io.device_reference_count(device), held - 1);
     }
 }

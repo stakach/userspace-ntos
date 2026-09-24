@@ -8453,6 +8453,8 @@ pub(crate) unsafe fn service_sec_image(
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
             crate::driver_launch::redrive_hosted_driver_io_create_file(&mut nt_handler);
+            crate::driver_launch::redrive_hosted_query_path_forward(&mut nt_handler);
+            crate::driver_launch::redrive_hosted_driver_zw_fs_control_file(&mut nt_handler);
             crate::hosted_routed_file_close_work::redrive(&mut nt_handler);
             crate::driver_launch::hosted_consumer_file_objects::redrive();
             crate::current_apc::redrive(&mut nt_handler);

@@ -77,7 +77,7 @@ fn row_index(inst: DriverInstance, identity: SourceSecurityIdentity) -> Option<u
     }
 }
 
-unsafe fn live_context(inst: DriverInstance, address: u64) -> bool {
+pub(super) unsafe fn live_context(inst: DriverInstance, address: u64) -> bool {
     if address == 0 || address & 7 != 0 {
         return false;
     }
@@ -111,7 +111,8 @@ unsafe fn live_context(inst: DriverInstance, address: u64) -> bool {
 
 /// Called only while the canonical CREATE owner and its authenticated subject are retained.
 /// `irp_generation` must come from that owner, not from the pointer or a badge. The source
-/// context and ACCESS_STATE allocations must already exist in this exact hosted instance.
+/// context and ACCESS_STATE allocations must have been checked with `live_context` before this
+/// memory-only call; no provider pool lock or IPC may be taken under the TokenStore borrow.
 pub(super) unsafe fn capture(
     source: DriverInstance,
     irp_id: u64,
@@ -122,7 +123,7 @@ pub(super) unsafe fn capture(
     process_audit_id: u64,
     tokens: &mut TokenStore,
 ) -> Result<SourceSecurityIdentity, u32> {
-    if !live_source(source) || !live_context(source, security_context_address) {
+    if !live_source(source) {
         return Err(STATUS_INVALID_HANDLE_LOCAL);
     }
     let serial = NEXT_TICKET
@@ -168,14 +169,17 @@ pub(super) unsafe fn lookup(
     source: DriverInstance,
     security_context_address: u64,
 ) -> Option<SourceSecurityIdentity> {
-    let identity = (&*core::ptr::addr_of!(ROWS)).iter().find(|row| {
-        row_matches(row, source)
-            && row.identity.key.security_context_address() == security_context_address
-            && !matches!(
-                row.owner.phase(),
-                SourceCreateSecurityPhase::Terminal | SourceCreateSecurityPhase::Released
-            )
-    })?.identity;
+    let identity = (&*core::ptr::addr_of!(ROWS))
+        .iter()
+        .find(|row| {
+            row_matches(row, source)
+                && row.identity.key.security_context_address() == security_context_address
+                && !matches!(
+                    row.owner.phase(),
+                    SourceCreateSecurityPhase::Terminal | SourceCreateSecurityPhase::Released
+                )
+        })?
+        .identity;
     live_context(source, security_context_address).then_some(identity)
 }
 
@@ -191,6 +195,47 @@ pub(super) unsafe fn lookup_context(
             identity.ticket.generation(),
         )?,
     })
+}
+
+pub(super) unsafe fn lookup_ticket(
+    source: DriverInstance,
+    ticket: RetainedSecurityContextTicket,
+) -> Option<SourceSecurityIdentity> {
+    let identity = (&*core::ptr::addr_of!(ROWS))
+        .iter()
+        .find(|row| {
+            row_matches(row, source)
+                && row.identity.ticket.id() == ticket.id()
+                && row.identity.ticket.generation() == ticket.generation()
+                && !matches!(
+                    row.owner.phase(),
+                    SourceCreateSecurityPhase::Terminal | SourceCreateSecurityPhase::Released
+                )
+        })?
+        .identity;
+    live_context(source, identity.key.security_context_address()).then_some(identity)
+}
+
+/// The raw security allocation may already be gone when a completed pending CREATE receives its
+/// exact backend completion ACK. Its retained source ticket is still keyed by canonical IrpId.
+pub(super) fn lookup_retained_irp(
+    source: DriverInstance,
+    irp_id: nt_io_abi::IrpId,
+) -> Option<SourceSecurityIdentity> {
+    if irp_id.is_null() || irp_id.generation() == 0 {
+        return None;
+    }
+    unsafe {
+        (&*core::ptr::addr_of!(ROWS))
+            .iter()
+            .find(|row| {
+                row_matches(row, source)
+                    && row.identity.key.irp_id() == irp_id.raw()
+                    && row.identity.key.irp_generation() == u64::from(irp_id.generation())
+                    && row.owner.phase() == SourceCreateSecurityPhase::Pending
+            })
+            .map(|row| row.identity)
+    }
 }
 
 fn token_luid(tokens: &TokenStore, id: TokenId) -> Option<u64> {
@@ -269,6 +314,26 @@ pub(super) unsafe fn retire_projection_binding(
     let index = row_index(source, identity).ok_or(STATUS_INVALID_HANDLE_LOCAL as i32)?;
     let row = &(&*core::ptr::addr_of!(ROWS))[index];
     driver_hosted_token_projection::retire_binding(
+        source,
+        provider,
+        &row.owner,
+        identity.ticket,
+        identity.key,
+        address,
+        tokens,
+    )
+}
+
+pub(super) unsafe fn abort_unentered_projection_binding(
+    source: DriverInstance,
+    provider: DriverInstance,
+    identity: SourceSecurityIdentity,
+    address: u64,
+    tokens: &mut TokenStore,
+) -> Result<RetiringTokenProjection, i32> {
+    let index = row_index(source, identity).ok_or(STATUS_INVALID_HANDLE_LOCAL as i32)?;
+    let row = &(&*core::ptr::addr_of!(ROWS))[index];
+    driver_hosted_token_projection::abort_unentered_binding(
         source,
         provider,
         &row.owner,
