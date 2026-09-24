@@ -17,6 +17,7 @@
  * void SehResumeContext(void *validated_raw_context);  // does not return
  * uint64_t SehForeignCall2(uint64_t (*target)(uint64_t, uint64_t),
  *                          uint64_t arg1, uint64_t arg2);
+ * uint64_t SehForeignCall16(uint64_t target, const uint64_t *args, uint64_t count);
  */
 
     .text
@@ -256,6 +257,70 @@ SehForeignCall2:
     nop
     addq $40, %rsp
     retq
+    .seh_endproc
+
+    /* Fixed-width Win64 callback boundary: 32 bytes of shadow space plus twelve
+       stack arguments. The post-call NOP keeps the return PC inside this row. */
+    .globl SehForeignCall16
+    .seh_proc SehForeignCall16
+SehForeignCall16:
+    subq $0x88, %rsp
+    .seh_stackalloc 0x88
+    .seh_endprologue
+    testq %rcx, %rcx
+    jz .Lforeign16_invalid
+    cmpq $16, %r8
+    ja .Lforeign16_invalid
+    testq %r8, %r8
+    jz .Lforeign16_ready
+    testq %rdx, %rdx
+    jz .Lforeign16_invalid
+.Lforeign16_ready:
+    movq %rcx, %r10
+    movq %rdx, %r11
+    movq %r8, %r9
+    movl $4, %eax
+.Lforeign16_zero:
+    cmpq $16, %rax
+    jae .Lforeign16_copy_start
+    movq $0, (%rsp,%rax,8)
+    incq %rax
+    jmp .Lforeign16_zero
+.Lforeign16_copy_start:
+    movl $4, %eax
+.Lforeign16_copy:
+    cmpq %r9, %rax
+    jae .Lforeign16_registers
+    movq (%r11,%rax,8), %rdx
+    movq %rdx, (%rsp,%rax,8)
+    incq %rax
+    jmp .Lforeign16_copy
+.Lforeign16_registers:
+    xorl %ecx, %ecx
+    xorl %edx, %edx
+    xorl %r8d, %r8d
+    testq %r9, %r9
+    jz .Lforeign16_zero_r9
+    movq (%r11), %rcx
+    cmpq $1, %r9
+    je .Lforeign16_zero_r9
+    movq 8(%r11), %rdx
+    cmpq $2, %r9
+    je .Lforeign16_zero_r9
+    movq 16(%r11), %r8
+    cmpq $3, %r9
+    jbe .Lforeign16_zero_r9
+    movq 24(%r11), %r9
+    jmp .Lforeign16_call
+.Lforeign16_zero_r9:
+    xorl %r9d, %r9d
+.Lforeign16_call:
+    callq *%r10
+    nop
+    addq $0x88, %rsp
+    retq
+.Lforeign16_invalid:
+    ud2
     .seh_endproc
 
     .globl SehExecuteHandlerForException

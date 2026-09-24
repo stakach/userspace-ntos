@@ -10,7 +10,7 @@ use nt_unwind::{
 };
 use sha2::{Digest, Sha256};
 
-const EXPORTS: [&str; 10] = [
+const EXPORTS: [&str; 11] = [
     "SehCallFilter",
     "SehCallFinally",
     "SehExecuteHandlerForException",
@@ -21,6 +21,7 @@ const EXPORTS: [&str; 10] = [
     "SehUnwindEx",
     "SehUnwindDispatch",
     "SehForeignCall2",
+    "SehForeignCall16",
 ];
 const RAISE_PROLOGUE: [u8; 8] = [0x9c, 0x48, 0x81, 0xec, 0xf0, 0x04, 0x00, 0x00];
 const RAISE_UNWIND_CODES: [u8; 6] = [8, 1, 0x9e, 0, 1, 2];
@@ -81,6 +82,14 @@ const FOREIGN_CALL2_BODY: [u8; 17] = [
     0xff, 0xd0, // call rax
     0x90, // the return PC must precede the epilogue
     0x48, 0x83, 0xc4, 0x28, 0xc3, // add rsp,40; ret
+];
+const FOREIGN_CALL16_PROLOGUE: [u8; 7] = [0x48, 0x81, 0xec, 0x88, 0, 0, 0];
+const FOREIGN_CALL16_UNWIND_CODES: [u8; 4] = [7, 1, 0x11, 0];
+// Reviewed fixed-width Win64 callback call frame, argument bounds, and fail-closed guards.
+const FOREIGN_CALL16_FUNCTION_LEN: u32 = 156;
+const FOREIGN_CALL16_CODE_SHA256: [u8; 32] = [
+    0x6e, 0x87, 0x20, 0x6b, 0x31, 0x6d, 0x89, 0x46, 0x78, 0xc9, 0x86, 0xee, 0x88, 0x6e, 0x3c, 0x41,
+    0xed, 0x6d, 0xc2, 0xc5, 0xcc, 0xa7, 0xb0, 0x58, 0x89, 0x7b, 0xcd, 0x15, 0x77, 0xb1, 0x0d, 0x8c,
 ];
 const NESTED_HANDLER: [u8; 32] = [
     0xb8, 1, 0, 0, 0, // ExceptionContinueSearch
@@ -528,6 +537,78 @@ fn verify_foreign_call2(
     Ok(())
 }
 
+fn verify_foreign_call16(
+    pe: &PeFile<'_>,
+    mapped: &nt_pe_loader::MappedImage,
+    image: &BorrowedExceptionImage<'_>,
+    export: &ExportedSymbol,
+) -> Result<(), String> {
+    let pc = mapped
+        .load_base
+        .checked_add(u64::from(export.rva))
+        .ok_or("foreign callback16 VA overflow")?;
+    let function = match image.lookup_exception_function(pc) {
+        Ok(ExceptionFunction::Function {
+            image_base,
+            function,
+        }) if image_base == mapped.load_base && function.begin == export.rva => function,
+        other => {
+            return Err(format!(
+                "foreign callback16 lacks exact runtime function: {other:?}"
+            ))
+        }
+    };
+    let header: [u8; 4] = mapped
+        .bytes
+        .get(function.unwind_info as usize..function.unwind_info as usize + 4)
+        .ok_or("foreign callback16 unwind header outside image")?
+        .try_into()
+        .map_err(|_| "foreign callback16 unwind header malformed")?;
+    let header = UnwindInfoHeader::parse(&header);
+    let code = mapped
+        .bytes
+        .get(function.begin as usize..function.end as usize)
+        .ok_or("foreign callback16 body outside image")?;
+    let digest = Sha256::digest(code);
+    if header.version != 1
+        || header.flags != 0
+        || header.is_chained()
+        || header.size_of_prolog != FOREIGN_CALL16_PROLOGUE.len() as u8
+        || header.count_of_codes != 2
+        || header.frame_register != 0
+        || header.frame_offset != 0
+        || function.end - function.begin != FOREIGN_CALL16_FUNCTION_LEN
+        || code.get(..FOREIGN_CALL16_PROLOGUE.len()) != Some(FOREIGN_CALL16_PROLOGUE.as_slice())
+        || mapped.bytes.get(
+            function.unwind_info as usize + 4..function.unwind_info as usize + 8,
+        ) != Some(FOREIGN_CALL16_UNWIND_CODES.as_slice())
+        || digest.as_slice() != FOREIGN_CALL16_CODE_SHA256
+        || !pe.sections().iter().any(|section| {
+            section.name_str() == ".text"
+                && section_contains(section, export.rva, code.len())
+                && section.is_readable()
+                && section.is_executable()
+                && !section.is_writable()
+        })
+        || !pe.sections().iter().any(|section| {
+            section_contains(section, function.unwind_info, 8)
+                && section.is_readable()
+                && !section.is_writable()
+                && !section.is_executable()
+        })
+    {
+        return Err(format!(
+            "foreign callback16 code or unwind metadata invalid: len={} sha256={digest:x}",
+            code.len()
+        ));
+    }
+    println!(
+        "{} RVA=0x{:x} unwind=0x{:x} flags={}",
+        export.name, export.rva, function.unwind_info, header.flags
+    );
+    Ok(())
+}
+
 fn verify(path: &str) -> Result<(), String> {
     let bytes = fs::read(path).map_err(|error| format!("read {path}: {error}"))?;
     let pe = PeFile::parse(&bytes).map_err(|error| format!("PE parse: {error:?}"))?;
@@ -574,6 +655,10 @@ fn verify(path: &str) -> Result<(), String> {
         }
         if export.name == "SehForeignCall2" {
             verify_foreign_call2(&pe, &mapped, &image, &export)?;
+            continue;
+        }
+        if export.name == "SehForeignCall16" {
+            verify_foreign_call16(&pe, &mapped, &image, &export)?;
             continue;
         }
         let expected_flags = expected_flags(&export.name);
