@@ -18,6 +18,8 @@ const RIP_OFFSET: usize = 0xf8;
 const FXSAVE_MXCSR_OFFSET: usize = 0x118;
 const FXSAVE_MXCSR_MASK_OFFSET: usize = 0x11c;
 const XMM_OFFSET: usize = 0x1a0;
+const FXSAVE_OFFSET: usize = 0x100;
+const DEBUG_OFFSET: usize = 0x48;
 
 /// Control, integer, and floating-point state in the NT AMD64 `ContextFlags` field.
 pub const CONTEXT_AMD64_FULL: u32 = 0x0010_000b;
@@ -29,6 +31,14 @@ pub enum RawContextCaptureError {
     OutOfBounds,
     Unreadable,
     InvalidFlags,
+}
+
+/// An invalid atomic x86-64 legacy-context snapshot from the microkernel.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LegacyContextError {
+    ReservedRegisters,
+    Eflags,
+    Mxcsr,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -108,10 +118,54 @@ impl RawContext {
                 .ok_or(RawContextCaptureError::Unreadable)?;
             word.copy_from_slice(&value.to_le_bytes());
         }
-        if context.context_flags() & CONTEXT_AMD64_FULL_SEGMENTS != CONTEXT_AMD64_FULL_SEGMENTS {
+        if context.context_flags() & CONTEXT_AMD64_FULL != CONTEXT_AMD64_FULL {
             return Err(RawContextCaptureError::InvalidFlags);
         }
         Ok(context)
+    }
+
+    /// Convert one atomic seL4 x86-64 legacy-context read to an NT CONTEXT. The kernel reports
+    /// public registers in seL4 order, an exact FXSAVE64 image, and DR0-3/DR6/DR7. It does not
+    /// report segment selectors, so this record advertises FULL, not SEGMENTS; no selector is
+    /// guessed from the executive's own thread.
+    pub fn from_legacy_snapshot(
+        registers: &[u64; 20],
+        floating_point: &[u8; 0x200],
+        debug: &[u64; 6],
+    ) -> Result<Self, LegacyContextError> {
+        if registers[18] != 0 || registers[19] != 0 {
+            return Err(LegacyContextError::ReservedRegisters);
+        }
+        if registers[2] >> 32 != 0 || registers[2] & 2 == 0 {
+            return Err(LegacyContextError::Eflags);
+        }
+        let mxcsr = u32::from_le_bytes(floating_point[24..28].try_into().unwrap());
+        let reported_mask = u32::from_le_bytes(floating_point[28..32].try_into().unwrap());
+        let mask = if reported_mask == 0 {
+            0xffbf
+        } else {
+            reported_mask
+        };
+        if mxcsr & !mask != 0 {
+            return Err(LegacyContextError::Mxcsr);
+        }
+        let mut raw = Self::zeroed();
+        raw.set_context_flags(CONTEXT_AMD64_FULL);
+        raw.set_eflags(registers[2] as u32);
+        raw.bytes[FXSAVE_OFFSET..FXSAVE_OFFSET + floating_point.len()]
+            .copy_from_slice(floating_point);
+        raw.write_u32(MXCSR_OFFSET, mxcsr);
+        for (index, value) in debug.iter().enumerate() {
+            raw.write_u64(DEBUG_OFFSET + index * 8, *value);
+        }
+        // seL4 UserContext order: RIP, RSP, RFLAGS, RAX, RBX, RCX, RDX, RSI, RDI, RBP,
+        // R8..R15. NT's ABI register indices instead follow the AMD64 unwind numbering.
+        let abi_to_legacy = [3, 5, 6, 4, 1, 9, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17];
+        for (abi_index, legacy_index) in abi_to_legacy.into_iter().enumerate() {
+            raw.set_gpr(abi_index, registers[legacy_index]);
+        }
+        raw.set_rip(registers[0]);
+        Ok(raw)
     }
 
     pub const fn zeroed() -> Self {
@@ -246,7 +300,7 @@ impl RawContext {
         stack_high: u64,
         admitted_pc: impl FnOnce(u64) -> bool,
     ) -> Result<(), RawContextRestoreError> {
-        if self.context_flags() & CONTEXT_AMD64_FULL_SEGMENTS != CONTEXT_AMD64_FULL_SEGMENTS
+        if self.context_flags() & CONTEXT_AMD64_FULL != CONTEXT_AMD64_FULL
             || self.context_flags() != captured.context_flags()
         {
             return Err(RawContextRestoreError::InvalidFlags);
@@ -266,7 +320,9 @@ impl RawContext {
         if rip >> 48 != sign_extension || !admitted_pc(rip) {
             return Err(RawContextRestoreError::InstructionAddress);
         }
-        if (0..6).any(|index| self.segment(index) != captured.segment(index)) {
+        if captured.context_flags() & 0x4 != 0
+            && (0..6).any(|index| self.segment(index) != captured.segment(index))
+        {
             return Err(RawContextRestoreError::Segments);
         }
         // POPFQ may update arithmetic status flags. Keep direction, interrupt, trap, IOPL,
@@ -394,14 +450,98 @@ mod tests {
     }
 
     #[test]
-    fn bounded_capture_requires_full_integer_float_and_segment_flags() {
+    fn bounded_capture_requires_full_integer_and_float_flags() {
         let mut stack = mock_stack();
         stack.bytes[FLAGS_OFFSET..FLAGS_OFFSET + 4]
-            .copy_from_slice(&CONTEXT_AMD64_FULL.to_le_bytes());
+            .copy_from_slice(&0x0010_0009u32.to_le_bytes());
         assert_eq!(
             RawContext::capture_bounded(&stack, 0x2000, 0x2000, 0x24d0),
             Err(RawContextCaptureError::InvalidFlags)
         );
+        stack.bytes[FLAGS_OFFSET..FLAGS_OFFSET + 4]
+            .copy_from_slice(&CONTEXT_AMD64_FULL.to_le_bytes());
+        assert!(RawContext::capture_bounded(&stack, 0x2000, 0x2000, 0x24d0).is_ok());
+    }
+
+    #[test]
+    fn legacy_snapshot_maps_every_register_and_preserves_exact_fx_and_debug_state() {
+        let mut registers = [0u64; 20];
+        for (index, value) in registers[..18].iter_mut().enumerate() {
+            *value = 0x1000 + index as u64;
+        }
+        registers[2] = 0x246;
+        let mut fx = [0u8; 0x200];
+        fx[..2].copy_from_slice(&0x37fu16.to_le_bytes());
+        fx[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        fx[28..32].copy_from_slice(&0xffbfu32.to_le_bytes());
+        for (index, byte) in fx[32..].iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let debug = [0x11, 0x22, 0x33, 0x44, 0x66, 0x77];
+        let raw = RawContext::from_legacy_snapshot(&registers, &fx, &debug).unwrap();
+        assert_eq!(raw.context_flags(), CONTEXT_AMD64_FULL);
+        assert!(raw.as_bytes()[SEGMENTS_OFFSET..SEGMENTS_OFFSET + 12].iter().all(|b| *b == 0));
+        assert_eq!(raw.rip(), registers[0]);
+        assert_eq!(raw.eflags(), 0x246);
+        assert_eq!(raw.mxcsr(), 0x1f80);
+        assert_eq!(
+            &raw.as_bytes()[FXSAVE_OFFSET..FXSAVE_OFFSET + 0x200],
+            &fx
+        );
+        for (index, value) in debug.iter().enumerate() {
+            assert_eq!(raw.read_u64(DEBUG_OFFSET + index * 8), *value);
+        }
+        for (abi_index, legacy_index) in
+            [3, 5, 6, 4, 1, 9, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17]
+                .into_iter()
+                .enumerate()
+        {
+            assert_eq!(raw.gpr(abi_index), Some(registers[legacy_index]));
+        }
+        for index in 0..16 {
+            let offset = 0xa0 + index * 16;
+            assert_eq!(
+                raw.xmm(index).unwrap()[0],
+                u64::from_le_bytes(fx[offset..offset + 8].try_into().unwrap())
+            );
+            assert_eq!(
+                raw.xmm(index).unwrap()[1],
+                u64::from_le_bytes(fx[offset + 8..offset + 16].try_into().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_snapshot_rejects_malformed_control_state_without_mutation() {
+        let mut registers = [0u64; 20];
+        registers[2] = 0x202;
+        let mut fx = [0u8; 0x200];
+        fx[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        let debug = [0u64; 6];
+        let original_fx = fx;
+        registers[18] = 1;
+        assert_eq!(
+            RawContext::from_legacy_snapshot(&registers, &fx, &debug),
+            Err(LegacyContextError::ReservedRegisters)
+        );
+        registers[18] = 0;
+        registers[2] = 0x200;
+        assert_eq!(
+            RawContext::from_legacy_snapshot(&registers, &fx, &debug),
+            Err(LegacyContextError::Eflags)
+        );
+        registers[2] = 0x1_0000_0202;
+        assert_eq!(
+            RawContext::from_legacy_snapshot(&registers, &fx, &debug),
+            Err(LegacyContextError::Eflags)
+        );
+        registers[2] = 0x202;
+        fx[24..28].copy_from_slice(&0x1_0000u32.to_le_bytes());
+        assert_eq!(
+            RawContext::from_legacy_snapshot(&registers, &fx, &debug),
+            Err(LegacyContextError::Mxcsr)
+        );
+        assert_eq!(fx[28..32], original_fx[28..32]);
     }
 
     #[test]
@@ -562,6 +702,27 @@ mod tests {
         assert_eq!(
             validate_fixture(&restored, &captured),
             Err(RawContextRestoreError::Mxcsr)
+        );
+    }
+
+    #[test]
+    fn restore_accepts_valid_full_context_without_claiming_segment_selectors() {
+        let mut captured = restore_fixture();
+        captured.set_context_flags(CONTEXT_AMD64_FULL);
+        let mut restored = captured.clone();
+        restored.set_gpr(0, 0x1234);
+        restored.set_segment(0, 0x99);
+        assert_eq!(validate_fixture(&restored, &captured), Ok(()));
+        restored.set_context_flags(CONTEXT_AMD64_FULL_SEGMENTS);
+        assert_eq!(
+            validate_fixture(&restored, &captured),
+            Err(RawContextRestoreError::InvalidFlags)
+        );
+        let mut invalid = captured.clone();
+        invalid.set_context_flags(0x0010_0009);
+        assert_eq!(
+            validate_fixture(&invalid, &invalid),
+            Err(RawContextRestoreError::InvalidFlags)
         );
     }
 }

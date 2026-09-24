@@ -29,6 +29,7 @@ mod epilogue;
 pub mod exception_images;
 pub mod exception_snapshot;
 pub mod exception_walk;
+pub mod hardware_fault;
 pub mod raw_context;
 pub mod raw_exception;
 pub mod seh_linkage_image;
