@@ -64,6 +64,10 @@ mod hosted_file_lifecycle_owners;
 mod hosted_file_retirements;
 #[path = "hosted_file_objects.rs"]
 mod hosted_file_objects;
+#[path = "hosted_io_create_file_adapter.rs"]
+mod hosted_io_create_file_adapter;
+#[path = "hosted_io_create_file_ingress.rs"]
+mod hosted_io_create_file_ingress;
 #[path = "driver_share_access.rs"]
 mod driver_share_access;
 use hosted_file_objects::{
@@ -765,6 +769,7 @@ pub const FSD_SERVICE_FLUSH_DPCS_LABEL: u64 = 0x78A;
 pub const FSD_SERVICE_DMA_ADAPTER_LABEL: u64 = 0x78B;
 pub const FSD_SERVICE_MDL_LABEL: u64 = 0x78C;
 pub const FSD_SERVICE_FILE_LABEL: u64 = 0x78D;
+pub const FSD_SERVICE_IO_CREATE_FILE_LABEL: u64 = 0x78E;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
