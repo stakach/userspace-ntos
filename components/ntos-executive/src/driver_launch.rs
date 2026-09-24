@@ -32052,6 +32052,10 @@ fn register_fsd_trampolines() -> bool {
     // never skipped. Previously an unresolved import resolved to a generic success no-op.
     if crate::KEBUGCHECK_BOUND {
         reg.bind(
+            "KeBugCheck",
+            crate::provider_bugcheck::ke_bug_check as *const () as usize as u64,
+        );
+        reg.bind(
             "KeBugCheckEx",
             s_ke_bug_check_ex as *const () as usize as u64,
         );
