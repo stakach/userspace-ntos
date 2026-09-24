@@ -2871,6 +2871,33 @@ unsafe fn component_pump_loop(
                 }
             }
             continue;
+        } else if label == nt_unwind::seh_transport::RAISE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let raise = nt_unwind::seh_transport::SehCall::parse(
+                msg.mi,
+                [msg.m0, msg.m1, msg.m2],
+            );
+            if let Some(nt_unwind::seh_transport::SehCall::Raise { context_va, status }) = raise {
+                let admitted = crate::driver_launch::inspect_hosted_seh_raise(
+                    ch,
+                    *reply_cap,
+                    msg.badge,
+                    context_va,
+                    status,
+                );
+                crate::print_str(if admitted {
+                    b"[fsd-seh] owned raise first pass; handler command unavailable\n"
+                } else {
+                    b"[fsd-seh] raise admission refused\n"
+                });
+            } else {
+                crate::print_str(b"[fsd-seh] malformed raise message\n");
+            }
+            // A status Reply would return into the nonreturning raise entry. The exact Reply and
+            // parent IRP remain owned by the wall until a handler-command continuation exists.
+            outcome.wall(msg);
+            break;
         } else if label == crate::driver_launch::FSD_SERVICE_IO_CREATE_FILE_LABEL
             && ch.caps.kind == ReqKind::Irp
         {

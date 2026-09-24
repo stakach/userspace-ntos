@@ -38,6 +38,27 @@ mod hosted_exception_images;
 #[allow(dead_code)] // KeRaiseStatus has not entered the native exception dispatcher yet.
 mod hosted_exception_stack;
 
+/// Negative-only ingress gate. It retains no handler continuation and must never authorize a
+/// Reply; the pump walls the owning IRP after recording the admission result.
+pub(crate) fn inspect_hosted_seh_raise(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    context_va: u64,
+    status: u32,
+) -> bool {
+    matches!(
+        hosted_exception_stack::capture_raise_first_step(
+            channel,
+            reply_cap,
+            badge,
+            context_va,
+            u64::from(status),
+        ),
+        Some(Ok(_))
+    )
+}
+
 #[path = "component_scheduler.rs"]
 mod component_scheduler;
 #[path = "hosted_dpc_scheduler.rs"]
