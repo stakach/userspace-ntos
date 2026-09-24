@@ -189,6 +189,71 @@ fn mapped_headers_and_directories_use_rvas_not_raw_file_offsets() {
 }
 
 #[test]
+fn borrowed_mapped_image_matches_owned_lookup_and_scope_records() {
+    let bytes = scope_table_pe();
+    let borrowed = BorrowedExceptionImage::from_mapped_image(BASE, &bytes).unwrap();
+    let owned = catalog(bytes.clone()).unwrap();
+    assert_eq!(borrowed.base(), BASE);
+    assert_eq!(borrowed.size(), bytes.len());
+    for rva in [
+        0x1000, 0x1010, 0x107f, 0x1080, 0x10ff, 0x1100, 0x11ff, 0x2000,
+    ] {
+        assert_eq!(
+            borrowed.lookup_exception_function(BASE + rva),
+            owned.lookup_exception_function(BASE + rva),
+        );
+    }
+    assert_eq!(borrowed.read_u8(BASE, 0x3000), owned.read_u8(BASE, 0x3000));
+    assert_eq!(borrowed.read_u8(BASE + 1, 0x3000), None);
+    assert_eq!(
+        borrowed
+            .read_c_scope_table(BASE + 0x3030)
+            .unwrap()
+            .collect::<Vec<_>>(),
+        owned.read_c_scope_table(BASE, BASE + 0x3030).unwrap(),
+    );
+    assert!(borrowed.validate_collision_scope(BASE, BASE + 0x3030, 2));
+    assert!(!borrowed.validate_collision_scope(BASE, BASE + 0x3030, 3));
+    assert!(!borrowed.validate_collision_scope(BASE + 1, BASE + 0x3030, 0));
+}
+
+#[test]
+fn borrowed_admission_rejects_the_same_malformed_images() {
+    for mutate in [
+        (0x2000, 0x1100), // Function begins after its end.
+        (0x200c, 0x1070), // Function table overlaps the previous row.
+        (0x3010, 0x0006), // Unsupported unwind opcode.
+    ] {
+        let mut bytes = mapped_pe();
+        if mutate.0 == 0x3010 {
+            bytes[0x3010] = 1;
+            bytes[0x3011] = 0;
+            bytes[0x3012] = 1;
+            bytes[0x3013] = 0;
+            bytes[0x3014] = 0;
+            bytes[0x3015] = mutate.1 as u8;
+        } else {
+            put32(&mut bytes, mutate.0, mutate.1);
+        }
+        assert_eq!(
+            BorrowedExceptionImage::from_mapped_image(BASE, &bytes).err(),
+            AdmittedExceptionImage::from_mapped_image(BASE, bytes).err(),
+        );
+    }
+}
+
+#[test]
+fn borrowed_scope_cursor_rejects_invalid_rows_without_allocating() {
+    let mut bytes = scope_table_pe();
+    put32(&mut bytes, 0x3034 + 12, 0x3000);
+    let borrowed = BorrowedExceptionImage::from_mapped_image(BASE, &bytes).unwrap();
+    assert!(matches!(
+        borrowed.read_c_scope_table(BASE + 0x3030),
+        Err(ScopeTableError::InvalidTarget)
+    ));
+}
+
+#[test]
 fn owned_snapshot_is_not_copied_or_publicly_mutable() {
     let bytes = mapped_pe();
     let original_allocation = bytes.as_ptr();
