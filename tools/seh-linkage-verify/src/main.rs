@@ -2,7 +2,7 @@
 
 use std::{env, fs, process::ExitCode};
 
-use nt_pe_loader::{ExportedSymbol, PeFile, DIRECTORY_ENTRY_TLS};
+use nt_pe_loader::{immutable_support_image, ExportedSymbol, PeFile};
 use nt_unwind::{
     exception_images::BorrowedExceptionImage,
     exception_walk::{ExceptionFunction, ExceptionImageReader},
@@ -15,8 +15,6 @@ const EXPORTS: [&str; 4] = [
     "SehExecuteHandlerForException",
     "SehExecuteHandlerForUnwind",
 ];
-const IMAGE_FILE_DLL: u16 = 0x2000;
-const DIRECTORY_ENTRY_DELAY_IMPORT: usize = 13;
 const CALL_FRAME: [u8; 4] = [0x48, 0x83, 0xec, 0x28];
 const UNWIND_ALLOC_40: [u8; 2] = [4, 0x42];
 const EXECUTE_BODY: [u8; 15] = [
@@ -154,25 +152,8 @@ fn valid_unwind_header(header: UnwindInfoHeader, flags: u8) -> bool {
 fn verify(path: &str) -> Result<(), String> {
     let bytes = fs::read(path).map_err(|error| format!("read {path}: {error}"))?;
     let pe = PeFile::parse(&bytes).map_err(|error| format!("PE parse: {error:?}"))?;
-    if pe.headers().characteristics & IMAGE_FILE_DLL == 0 || !pe.headers().is_executable() {
-        return Err("linkage image must be an executable PE DLL".into());
-    }
-    let tls = pe.headers().data_directory(DIRECTORY_ENTRY_TLS);
-    let delay_import = pe.headers().data_directory(DIRECTORY_ENTRY_DELAY_IMPORT);
-    if pe.entry_point_rva() != 0
-        || !pe
-            .imports()
-            .map_err(|e| format!("imports: {e:?}"))?
-            .is_empty()
-        || tls.virtual_address != 0
-        || tls.size != 0
-        || delay_import.virtual_address != 0
-        || delay_import.size != 0
-    {
-        return Err(
-            "linkage image must have no entry point, imports, delay imports, or TLS".into(),
-        );
-    }
+    immutable_support_image::validate(&pe)
+        .map_err(|error| format!("support-image admission: {error:?}"))?;
     for name in [".text", ".pdata"] {
         if !pe
             .sections()
