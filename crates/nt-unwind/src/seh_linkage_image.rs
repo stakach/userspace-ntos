@@ -1,5 +1,6 @@
 //! Admission of the per-instance SEH linkage PE before hosted driver imports are resolved.
 
+use crate::exception_walk::{ExceptionFunction, ExceptionImageError, ExceptionImageReader};
 use nt_pe_loader::{
     immutable_support_image, DataDirectory, ExportedSymbol, MappedImage, PeFile, Section,
     DIRECTORY_ENTRY_EXPORT,
@@ -25,13 +26,44 @@ pub enum SehLinkageImageError {
     SectionRights,
     DispatchSlot,
     AddressOverflow,
+    ExceptionMetadata,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SehLinkageImage {
+    pub image_base: u64,
     pub raise_va: u64,
     pub resume_va: u64,
     pub dispatch_slot_rva: u32,
+}
+
+fn exact_function(
+    result: Result<ExceptionFunction, ExceptionImageError>,
+    pc: u64,
+    image_base: u64,
+) -> bool {
+    let Some(expected_rva) = pc.checked_sub(image_base) else {
+        return false;
+    };
+    matches!(result,
+        Ok(ExceptionFunction::Function { image_base: found_base, function })
+            if found_base == image_base && u64::from(function.begin) == expected_rva
+    )
+}
+
+impl SehLinkageImage {
+    /// Both entry PCs must start real runtime-function rows in this exact admitted image.
+    pub fn validate_catalog(
+        &self,
+        catalog: &dyn ExceptionImageReader,
+    ) -> Result<(), SehLinkageImageError> {
+        for pc in [self.raise_va, self.resume_va] {
+            if !exact_function(catalog.lookup_exception_function(pc), pc, self.image_base) {
+                return Err(SehLinkageImageError::ExceptionMetadata);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn section_covers(section: &Section, rva: u32, length: u32) -> bool {
@@ -129,6 +161,7 @@ pub fn admit(
         .checked_add(u64::from(resume))
         .ok_or(SehLinkageImageError::AddressOverflow)?;
     Ok(SehLinkageImage {
+        image_base: mapped.load_base,
         raise_va,
         resume_va,
         dispatch_slot_rva: slot,
@@ -142,6 +175,7 @@ fn slot_is_zero(source: Option<&[u8]>, mapped: Option<&[u8]>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RuntimeFunction;
     use alloc::vec::Vec;
     const EXECUTE: u32 = 0x2000_0000;
     const READ: u32 = 0x4000_0000;
@@ -249,6 +283,28 @@ mod tests {
         assert!(!slot_is_zero(
             Some(&[0; 8]),
             Some(&[1, 0, 0, 0, 0, 0, 0, 0])
+        ));
+    }
+
+    #[test]
+    fn exact_exception_function_requires_same_image_and_entry_start() {
+        let function = RuntimeFunction {
+            begin: 0x1000,
+            end: 0x112a,
+            unwind_info: 0x2000,
+        };
+        let exact = Ok(ExceptionFunction::Function {
+            image_base: 0x4000,
+            function,
+        });
+        assert!(exact_function(exact, 0x5000, 0x4000));
+        assert!(!exact_function(exact, 0x5001, 0x4000));
+        assert!(!exact_function(exact, 0x5000, 0x3000));
+        assert!(!exact_function(Ok(ExceptionFunction::Leaf), 0x5000, 0x4000));
+        assert!(!exact_function(
+            Err(ExceptionImageError::UnknownImage),
+            0x5000,
+            0x4000
         ));
     }
 }

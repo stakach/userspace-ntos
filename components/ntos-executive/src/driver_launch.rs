@@ -35249,6 +35249,7 @@ pub(crate) struct DriverComponent {
     pub exception_snapshot_frame_base: u64,
     pub exception_snapshot_frames: u64,
     pub exception_snapshot_bytes: u64,
+    pub seh_linkage: nt_unwind::seh_linkage_image::SehLinkageImage,
     pub pool_frame_base: u64,
     pub data_frame_base: u64,
     pub shared_frame_base: u64,
@@ -36405,7 +36406,10 @@ unsafe fn load_hosted_auxiliary_image(
     run_va: u64,
     image_frames: u64,
     rights: &mut [u64],
-) -> Option<nt_unwind::exception_images::AdmittedExceptionImage> {
+) -> Option<(
+    nt_unwind::exception_images::AdmittedExceptionImage,
+    nt_unwind::seh_linkage_image::SehLinkageImage,
+)> {
     let source = core::slice::from_raw_parts(
         plan.auxiliary_src_va as *const u8,
         plan.auxiliary_src_size as usize,
@@ -36425,10 +36429,13 @@ unsafe fn load_hosted_auxiliary_image(
     if mapped.bytes.len() != plan.auxiliary_image_len as usize {
         return None;
     }
-    if nt_unwind::seh_linkage_image::admit(&pe, &mapped).is_err() {
-        print_str(b"[driver-launch] SEH support export admission refused\n");
-        return None;
-    }
+    let linkage = match nt_unwind::seh_linkage_image::admit(&pe, &mapped) {
+        Ok(linkage) => linkage,
+        Err(_) => {
+            print_str(b"[driver-launch] SEH support export admission refused\n");
+            return None;
+        }
+    };
     let frame_rights = rights.get_mut(frame_offset as usize..(frame_offset + frame_count) as usize)?;
     frame_rights.fill(RO_NX);
     for section in pe.sections() {
@@ -36449,7 +36456,9 @@ unsafe fn load_hosted_auxiliary_image(
         }
     }
     copy_bytes(exec_va, mapped.bytes.as_ptr() as u64, mapped.bytes.len() as u64);
-    hosted_exception_images::capture(instance, exec_va, component_va, plan.auxiliary_image_len)
+    let image =
+        hosted_exception_images::capture(instance, exec_va, component_va, plan.auxiliary_image_len)?;
+    Some((image, linkage))
 }
 
 /// GENERAL dynamic driver launch: load the `.sys` at `path` by-path from the FS, IAT-patch it, spawn
@@ -36681,7 +36690,7 @@ unsafe fn load_driver_reserved(
     exception_images
         .try_reserve_exact(exception_image_count)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    let auxiliary_exception_image = load_hosted_auxiliary_image(
+    let (auxiliary_exception_image, seh_linkage) = load_hosted_auxiliary_image(
         &planned_images,
         instance,
         code_va,
@@ -36735,6 +36744,9 @@ unsafe fn load_driver_reserved(
     exception_images.push(auxiliary_exception_image);
     let exception_catalog = hosted_exception_images::catalog(instance, exception_images)
         .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?;
+    seh_linkage
+        .validate_catalog(&exception_catalog)
+        .map_err(|_| nt_status::NtStatus::INVALID_IMAGE_FORMAT)?;
     let _ = register_system_module(path, primary_exec_va, image_len);
     print_str(b"[driver-launch] DriverEntry rva=0x");
     print_hex(entry_rva);
@@ -36896,6 +36908,7 @@ unsafe fn load_driver_reserved(
             exec_arg_va: win.arg_va,
             image_frames: img_frames,
             image_frame_base,
+            seh_linkage: Some(seh_linkage),
             pool_frame_base: pool_base,
             data_frame_base: data_base,
             shared_frame_base: shared_base,
@@ -37104,6 +37117,7 @@ unsafe fn load_driver_reserved(
         exception_snapshot_frame_base: retained.exception_snapshot_frame_base,
         exception_snapshot_frames: retained.exception_snapshot_frames,
         exception_snapshot_bytes: retained.exception_snapshot_bytes,
+        seh_linkage,
         pool_frame_base: pool_base,
         data_frame_base: data_base,
         shared_frame_base: shared_base,
@@ -51388,6 +51402,7 @@ pub(crate) struct DriverInstance {
     pub exception_snapshot_frame_base: u64,
     pub exception_snapshot_frames: u64,
     pub exception_snapshot_bytes: u64,
+    pub seh_linkage: Option<nt_unwind::seh_linkage_image::SehLinkageImage>,
     pub pool_frame_base: u64,
     pub data_frame_base: u64,
     pub shared_frame_base: u64,
@@ -51432,6 +51447,7 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     exception_snapshot_frame_base: 0,
     exception_snapshot_frames: 0,
     exception_snapshot_bytes: 0,
+    seh_linkage: None,
     pool_frame_base: 0,
     data_frame_base: 0,
     shared_frame_base: 0,
@@ -52218,6 +52234,7 @@ fn register_instance(dc: &DriverComponent) {
         exception_snapshot_frame_base: dc.exception_snapshot_frame_base,
         exception_snapshot_frames: dc.exception_snapshot_frames,
         exception_snapshot_bytes: dc.exception_snapshot_bytes,
+        seh_linkage: Some(dc.seh_linkage),
         pool_frame_base: dc.pool_frame_base,
         data_frame_base: dc.data_frame_base,
         shared_frame_base: dc.shared_frame_base,
