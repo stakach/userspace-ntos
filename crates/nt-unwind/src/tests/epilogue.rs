@@ -147,6 +147,59 @@ fn direct_jump_to_a_different_function_is_a_return_epilogue() {
 }
 
 #[test]
+fn indirect_tail_jumps_pop_the_real_caller_after_stack_restore() {
+    for code in [
+        vec![0xff, 0x25, 0x10, 0, 0, 0], // JMP [RIP+16]
+        vec![0x48, 0xff, 0xe0],          // JMP RAX
+        vec![0x48, 0xff, 0xe7],          // JMP RDI
+    ] {
+        let mut stack = MockStack::new();
+        stack.put(0x9020, 0x1400_2222);
+        let mut ctx = Context::default();
+        ctx.set_rsp(0x9020);
+        assert_eq!(run(&code, 0, &mut ctx, &stack), Some(true));
+        assert_eq!(ctx.rip, 0x1400_2222);
+        assert_eq!(ctx.rsp(), 0x9028);
+    }
+}
+
+#[test]
+fn unrelated_or_truncated_indirect_jump_encodings_are_not_return_epilogues() {
+    for code in [
+        vec![0xff, 0xd0],       // CALL RAX
+        vec![0xff, 0xe0],       // non-canonical JMP RAX without REX.W
+        vec![0x49, 0xff, 0xe0], // REX.B is not the canonical register tail jump
+    ] {
+        let mut ctx = Context::default();
+        ctx.set_rsp(0x9020);
+        let before = ctx;
+        let result = run(&code, 0, &mut ctx, &NoStackReads);
+        assert!(matches!(result, Some(false) | None));
+        assert_eq!(ctx, before);
+    }
+    let mut image = img_with_unwind(&[], 1, 0, 0, 0);
+    image.write(0x1050, &[0xff, 0x25, 1, 2, 3]);
+    image.bytes.remove(&0x1055);
+    let mut ctx = Context::default();
+    ctx.set_rsp(0x9020);
+    let before = ctx;
+    assert_eq!(
+        crate::epilogue::unwind_return(
+            image.base,
+            0x1050,
+            covering(0x1100),
+            0,
+            &mut ctx,
+            &image,
+            &NoStackReads,
+            &mut ContextPointers::default(),
+        ),
+        None
+    );
+    assert_eq!(ctx, before);
+}
+
+#[test]
 fn add_immediates_are_sign_extended() {
     for (code, return_slot) in [
         (vec![0x48, 0x83, 0xc4, 0x20, 0xc3], 0x9020),

@@ -141,7 +141,9 @@ fn decode(
     }
     let pops_end = cursor;
     let mut opcode = code.byte(cursor)?;
+    let mut terminal_rex = 0;
     if opcode & 0xf0 == 0x40 {
+        terminal_rex = opcode;
         cursor = cursor.checked_add(1)?;
         opcode = code.byte(cursor)?;
     }
@@ -159,6 +161,15 @@ fn decode(
         0xeb => {
             let displacement = code.byte(cursor.checked_add(1)?)? as i8 as i64;
             if !code.exits_function(cursor.checked_add(2)?, displacement, function)? {
+                return Some(None);
+            }
+            0
+        }
+        0xff => {
+            let modrm = code.byte(cursor.checked_add(1)?)?;
+            if modrm == 0x25 && matches!(terminal_rex, 0 | 0x48) {
+                code.dword(cursor.checked_add(2)?)?; // Complete RIP-relative operand.
+            } else if terminal_rex != 0x48 || modrm & 0xf8 != 0xe0 {
                 return Some(None);
             }
             0
