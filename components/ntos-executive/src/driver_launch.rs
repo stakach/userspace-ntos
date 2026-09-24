@@ -64,6 +64,8 @@ mod hosted_file_lifecycle_owners;
 mod hosted_file_retirements;
 #[path = "hosted_file_objects.rs"]
 mod hosted_file_objects;
+#[path = "driver_share_access.rs"]
+mod driver_share_access;
 use hosted_file_objects::{
     fo_bind, fo_is_registered, fo_lookup, fo_register, fo_release, fo_reserve_new_slot,
 };
@@ -31638,6 +31640,22 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "IoCreateDevice",
         s_io_create_device as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoCheckShareAccess",
+        driver_share_access::check as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoSetShareAccess",
+        driver_share_access::set as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoUpdateShareAccess",
+        driver_share_access::update as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoRemoveShareAccess",
+        driver_share_access::remove as *const () as usize as u64,
     );
     reg.bind(
         "IoDeleteDevice",

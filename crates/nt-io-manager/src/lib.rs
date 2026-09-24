@@ -57,6 +57,7 @@ pub mod inline_file_retirement;
 mod irp;
 mod lock_control;
 mod set_information_completion;
+pub mod share_access;
 mod mock_driver;
 mod object_port;
 mod open;
