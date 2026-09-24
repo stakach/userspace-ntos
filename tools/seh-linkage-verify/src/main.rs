@@ -42,9 +42,12 @@ const RAISE_CODE_SHA256: [u8; 32] = [
 ];
 const UNWIND_PROLOGUE: [u8; 8] = [0x9c, 0x48, 0x81, 0xec, 0x30, 0x05, 0x00, 0x00];
 const UNWIND_UNWIND_CODES: [u8; 6] = [8, 1, 0xa6, 0, 1, 2];
-// Derived from the reviewed mapped .text body after the validation-owner build.
-const UNWIND_FUNCTION_LEN: u32 = 0;
-const UNWIND_CODE_SHA256: [u8; 32] = [0; 32];
+// Reviewed Win64 six-argument capture, caller CONTEXT copy and fail-closed dispatch body.
+const UNWIND_FUNCTION_LEN: u32 = 0x1a4;
+const UNWIND_CODE_SHA256: [u8; 32] = [
+    0x66, 0x62, 0x30, 0xec, 0xce, 0xef, 0xc1, 0xf6, 0xdb, 0x71, 0xdf, 0x36, 0xaa, 0xd6, 0x33, 0x3a,
+    0x94, 0xd1, 0xf5, 0x19, 0xf2, 0xad, 0x23, 0xa5, 0xba, 0xf2, 0xb2, 0x21, 0x67, 0xb4, 0x1e, 0xd1,
+];
 const CALL_FRAME: [u8; 4] = [0x48, 0x83, 0xec, 0x28];
 const UNWIND_ALLOC_40: [u8; 2] = [4, 0x42];
 const EXECUTE_BODY: [u8; 15] = [
@@ -751,6 +754,30 @@ mod tests {
         }
         bytes[0x2007] = 1;
         assert!(!raise_dispatch_slot_is_zero(&bytes, 0x2000));
+    }
+
+    #[test]
+    fn unwind_entry_rejects_prologue_epilogue_and_unwind_mutations() {
+        let mut bytes = vec![0u8; 0x2300];
+        let begin = 0x1000;
+        let end = begin + UNWIND_FUNCTION_LEN;
+        let unwind = 0x2100;
+        bytes[begin as usize..begin as usize + UNWIND_PROLOGUE.len()]
+            .copy_from_slice(&UNWIND_PROLOGUE);
+        bytes[end as usize - 2..end as usize].copy_from_slice(&[0x0f, 0x0b]);
+        bytes[unwind as usize + 4..unwind as usize + 10]
+            .copy_from_slice(&UNWIND_UNWIND_CODES);
+        assert!(unwind_layout_is_exact(&bytes, begin, end, unwind));
+        assert!(!unwind_encoding_is_exact(&bytes, begin, end, unwind));
+        assert!(!unwind_layout_is_exact(&bytes, begin, end + 1, unwind));
+        for offset in (begin as usize..begin as usize + UNWIND_PROLOGUE.len())
+            .chain(end as usize - 2..end as usize)
+            .chain(unwind as usize + 4..unwind as usize + 10)
+        {
+            bytes[offset] ^= 1;
+            assert!(!unwind_layout_is_exact(&bytes, begin, end, unwind));
+            bytes[offset] ^= 1;
+        }
     }
 
     #[test]
