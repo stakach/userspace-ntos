@@ -1,5 +1,64 @@
 use super::*;
 
+#[test]
+fn initial_create_access_state_retains_desired_access() {
+    let access = initial_create_access_state(0x0012_0089);
+    assert_eq!(access.remaining_desired_access, 0x0012_0089);
+    assert_eq!(access.original_desired_access, 0x0012_0089);
+    assert_eq!(access.previously_granted_access, 0);
+    assert_eq!(access.subject_security_context, SecuritySubjectContext::default());
+    let bytes = bytemuck::bytes_of(&access);
+    assert_eq!(&bytes[0x10..0x14], &0x0012_0089u32.to_le_bytes());
+    assert_eq!(&bytes[0x18..0x1c], &0x0012_0089u32.to_le_bytes());
+}
+
+#[test]
+fn pointer_free_access_capture_preserves_distinct_masks_and_audit_flags() {
+    let mut source = initial_create_access_state(0x0012_0089);
+    source.operation_id = Luid { low_part: 7, high_part: 2 };
+    source.security_evaluated = 1;
+    source.generate_audit = 1;
+    source.flags = 0x80;
+    source.remaining_desired_access = 0x89;
+    source.previously_granted_access = 0x20000;
+    source.audit_privileges = 1;
+    source.privileges.privilege_count = 1;
+    let captured = capture_pointer_free_access_state(source).unwrap();
+    assert_eq!(captured.operation_id, source.operation_id);
+    assert_eq!(captured.remaining_desired_access, 0x89);
+    assert_eq!(captured.previously_granted_access, 0x20000);
+    assert_eq!(captured.original_desired_access, 0x0012_0089);
+    assert!(captured.security_evaluated);
+    assert!(captured.generate_audit);
+    assert!(captured.audit_privileges);
+    assert_eq!(captured.privileges.privilege_count, 1);
+}
+
+#[test]
+fn pointer_free_access_capture_refuses_unowned_nested_memory() {
+    let mut source = initial_create_access_state(1);
+    source.security_descriptor = GuestAddr(0x1000);
+    assert_eq!(capture_pointer_free_access_state(source), Err(CreateSecurityEncodingError::InvalidAccessState));
+    source.security_descriptor = GuestAddr::NULL;
+    source.aux_data = GuestAddr(0x2000);
+    assert_eq!(capture_pointer_free_access_state(source), Err(CreateSecurityEncodingError::InvalidAccessState));
+    source.aux_data = GuestAddr::NULL;
+    source.privileges_allocated = 1;
+    assert_eq!(capture_pointer_free_access_state(source), Err(CreateSecurityEncodingError::InvalidAccessState));
+}
+
+#[test]
+fn qos_capture_checks_nt5_shape() {
+    let mut source = SecurityQualityOfService::default();
+    source.length = core::mem::size_of::<SecurityQualityOfService>() as u32;
+    source.impersonation_level = 2;
+    source.context_tracking_mode = 1;
+    let captured = capture_create_qos(source).unwrap();
+    assert_eq!(captured.impersonation_level, 2);
+    source.context_tracking_mode = 2;
+    assert_eq!(capture_create_qos(source), Err(CreateSecurityEncodingError::InvalidQos));
+}
+
 fn proof() -> SourceSecurityProof {
     SourceSecurityProof {
         ticket_id: 5,

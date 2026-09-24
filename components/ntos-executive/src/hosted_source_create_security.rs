@@ -9,7 +9,11 @@ use super::driver_hosted_token_projection::{
 };
 use super::*;
 use nt_io_manager::redir_query_path::{RetainedSecurityContextTicket, SourceSecurityContext};
-use nt_kernel_abi::security_create_x64::SourceSecurityProof;
+use nt_kernel_abi::security_client_x64::SecurityQualityOfService;
+use nt_kernel_abi::security_create_x64::{
+    capture_create_qos, capture_pointer_free_access_state, AccessState, AccessStateFields,
+    CreateQosFields, IoSecurityContext, SourceSecurityProof,
+};
 use nt_security::{
     source_create_security::{
         SourceCreateSecurityKey, SourceCreateSecurityOwner, SourceCreateSecurityPhase,
@@ -19,7 +23,16 @@ use nt_security::{
 };
 
 const STATUS_INVALID_HANDLE_LOCAL: u32 = 0xc000_0008;
+const STATUS_INVALID_PARAMETER_LOCAL: u32 = 0xc000_000d;
 const STATUS_INSUFFICIENT_RESOURCES_LOCAL: u32 = 0xc000_009a;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CapturedCreateAccess {
+    pub desired_access: u32,
+    pub full_create_options: u32,
+    pub qos: Option<CreateQosFields>,
+    pub access: AccessStateFields,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SourceSecurityIdentity {
@@ -33,6 +46,7 @@ pub(super) struct SourceSecuritySubject {
     pub client: Option<SubjectClientIdentity>,
     pub process_audit_id: u64,
     pub proof: SourceSecurityProof,
+    pub create_access: CapturedCreateAccess,
 }
 
 struct Row {
@@ -41,6 +55,7 @@ struct Row {
     source_pool: u64,
     source_driver_id: u64,
     owner: SourceCreateSecurityOwner,
+    create_access: CapturedCreateAccess,
     retiring_projection: Option<RetiringTokenProjection>,
     cleanup_active: bool,
 }
@@ -124,6 +139,52 @@ pub(super) unsafe fn live_context(inst: DriverInstance, address: u64) -> bool {
     }
 }
 
+unsafe fn capture_create_access(
+    source: DriverInstance,
+    context_address: u64,
+) -> Result<CapturedCreateAccess, u32> {
+    if !live_context(source, context_address) {
+        return Err(STATUS_INVALID_HANDLE_LOCAL);
+    }
+    let context_exec = hosted_instance_pool_allocation_exec_if_live(
+        source,
+        context_address,
+        nt_kernel_abi::security_create_x64::IO_SECURITY_CONTEXT_SIZE as u64,
+    ).ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
+    let context = read_unaligned(context_exec as *const IoSecurityContext);
+    let access_address = context.access_state.0;
+    if access_address == 0 || access_address & 7 != 0 {
+        return Err(STATUS_INVALID_HANDLE_LOCAL);
+    }
+    let access_exec = hosted_instance_pool_allocation_exec_if_live(
+        source,
+        access_address,
+        nt_kernel_abi::security_create_x64::ACCESS_STATE_SIZE as u64,
+    ).ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
+    let access = capture_pointer_free_access_state(read_unaligned(access_exec as *const AccessState))
+        .map_err(|_| STATUS_INVALID_PARAMETER_LOCAL)?;
+    let qos = if context.security_qos.is_null() {
+        None
+    } else {
+        if context.security_qos.0 & 3 != 0 {
+            return Err(STATUS_INVALID_PARAMETER_LOCAL);
+        }
+        let qos_exec = hosted_instance_pool_allocation_exec_if_live(
+            source,
+            context.security_qos.0,
+            core::mem::size_of::<SecurityQualityOfService>() as u64,
+        ).ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
+        Some(capture_create_qos(read_unaligned(qos_exec as *const SecurityQualityOfService))
+            .map_err(|_| STATUS_INVALID_PARAMETER_LOCAL)?)
+    };
+    Ok(CapturedCreateAccess {
+        desired_access: context.desired_access,
+        full_create_options: context.full_create_options,
+        qos,
+        access,
+    })
+}
+
 /// Called only while the canonical CREATE owner and its authenticated subject are retained.
 /// `irp_generation` must come from that owner, not from the pointer or a badge. The source
 /// context and ACCESS_STATE allocations must have been checked with `live_context` before this
@@ -141,6 +202,7 @@ pub(super) unsafe fn capture(
     if !live_source(source) {
         return Err(STATUS_INVALID_HANDLE_LOCAL);
     }
+    let create_access = capture_create_access(source, security_context_address)?;
     let serial = NEXT_TICKET
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             next.checked_add(1)
@@ -174,6 +236,7 @@ pub(super) unsafe fn capture(
         source_pool: source.exec_pool_va,
         source_driver_id: source.driver_id,
         owner,
+        create_access,
         retiring_projection: None,
         cleanup_active: false,
     });
@@ -296,6 +359,7 @@ pub(super) fn subject(
         client,
         process_audit_id: subject.process_audit_id,
         proof,
+        create_access: row.create_access,
     })
 }
 

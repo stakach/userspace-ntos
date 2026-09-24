@@ -34464,7 +34464,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 }
                 return (0xC000_009Au32 as i32, 0);
             }
-            create_access_state = pool_alloc(0xa0); // NT5 x64 ACCESS_STATE
+            create_access_state =
+                pool_alloc(nt_kernel_abi::security_create_x64::ACCESS_STATE_SIZE as u64);
             if create_access_state == 0 {
                 pool_free_irp_auxiliary_graph(0, create_security_context, 0, 0);
                 pool_free(irp);
@@ -34475,7 +34476,12 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 return (0xC000_009Au32 as i32, 0);
             }
             zero(create_security_context, 0x20);
-            zero(create_access_state, 0xa0);
+            write_unaligned(
+                create_access_state as *mut nt_kernel_abi::security_create_x64::AccessState,
+                nt_kernel_abi::security_create_x64::initial_create_access_state(
+                    request.create_desired_access,
+                ),
+            );
             write_unaligned(
                 (create_security_context + 0x08) as *mut u64,
                 create_access_state,

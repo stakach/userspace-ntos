@@ -75,6 +75,15 @@ pub struct AccessState {
     pub object_type_name: UnicodeString,
 }
 
+/// Initial access state for a CREATE before access checks change the remaining or granted mask.
+pub fn initial_create_access_state(desired_access: u32) -> AccessState {
+    AccessState {
+        remaining_desired_access: desired_access,
+        original_desired_access: desired_access,
+        ..AccessState::default()
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct CreateSecurityGraph {
@@ -209,6 +218,60 @@ pub enum CreateSecurityEncodingError {
     InvalidTokenProjection,
     InvalidAccessState,
     InvalidQos,
+}
+
+/// Capture scalar ACCESS_STATE data without carrying source-domain pointers into a provider.
+/// Pointer-bearing fields need separately owned, provider-local projections before admission.
+pub fn capture_pointer_free_access_state(
+    source: AccessState,
+) -> Result<AccessStateFields, CreateSecurityEncodingError> {
+    if source.security_evaluated > 1
+        || source.generate_audit > 1
+        || source.generate_on_close > 1
+        || source.privileges_allocated != 0
+        || source.audit_privileges > 1
+        || source.privileges.privilege_count > 3
+        || !source.security_descriptor.is_null()
+        || !source.aux_data.is_null()
+        || source.object_name != UnicodeString::default()
+        || source.object_type_name != UnicodeString::default()
+    {
+        return Err(CreateSecurityEncodingError::InvalidAccessState);
+    }
+    Ok(AccessStateFields {
+        operation_id: source.operation_id,
+        security_evaluated: source.security_evaluated != 0,
+        generate_audit: source.generate_audit != 0,
+        generate_on_close: source.generate_on_close != 0,
+        flags: source.flags,
+        remaining_desired_access: source.remaining_desired_access,
+        previously_granted_access: source.previously_granted_access,
+        original_desired_access: source.original_desired_access,
+        security_descriptor: GuestAddr::NULL,
+        aux_data: GuestAddr::NULL,
+        privileges: source.privileges,
+        audit_privileges: source.audit_privileges != 0,
+        object_name: UnicodeString::default(),
+        object_type_name: UnicodeString::default(),
+    })
+}
+
+pub fn capture_create_qos(
+    source: SecurityQualityOfService,
+) -> Result<CreateQosFields, CreateSecurityEncodingError> {
+    if source.length != size_of::<SecurityQualityOfService>() as u32
+        || source.impersonation_level > 3
+        || source.context_tracking_mode > 1
+        || source.effective_only > 1
+    {
+        return Err(CreateSecurityEncodingError::InvalidQos);
+    }
+    Ok(CreateQosFields {
+        length: source.length,
+        impersonation_level: source.impersonation_level,
+        context_tracking_mode: source.context_tracking_mode,
+        effective_only: source.effective_only,
+    })
 }
 
 fn valid_unicode(value: UnicodeString) -> bool {

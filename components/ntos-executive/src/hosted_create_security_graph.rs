@@ -3,10 +3,9 @@
 use super::*;
 use nt_kernel_abi::{
     security_create_x64::{
-        encode_create_security_graph, AccessStateFields, CreateSecurityFields,
-        InitialPrivilegeSet, CREATE_SECURITY_GRAPH_SIZE,
+        encode_create_security_graph, CreateSecurityFields, CREATE_SECURITY_GRAPH_SIZE,
     },
-    GuestAddr, UnicodeString,
+    GuestAddr,
 };
 
 const STATUS_INVALID_HANDLE_LOCAL: i32 = 0xc000_0008u32 as i32;
@@ -130,13 +129,6 @@ pub(super) unsafe fn materialize(
     let subject = crate::with_provider_security_managers(|_, tokens| {
         hosted_source_create_security::subject(source, identity, tokens)
     }).map_err(|status| status as i32)?;
-    let source_context = hosted_instance_pool_allocation_exec_if_live(
-        source,
-        identity.key.security_context_address(),
-        nt_kernel_abi::security_create_x64::IO_SECURITY_CONTEXT_SIZE as u64,
-    ).ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
-    let desired_access = read_unaligned((source_context + 0x10) as *const u32);
-    let full_create_options = read_unaligned((source_context + 0x14) as *const u32);
     let graph_address = hosted_instance_pool_alloc(provider, CREATE_SECURITY_GRAPH_SIZE as u64)
         .ok_or(STATUS_INSUFFICIENT_RESOURCES_LOCAL)?;
     let graph_exec = match hosted_pool_allocation_exec_va(
@@ -253,28 +245,13 @@ pub(super) unsafe fn materialize(
         provider_domain_cookie: provider.hosted_domain_cookie,
         primary_token: primary,
         client_token: client.zip(subject.client).map(|(token, client)| (token, client.level as u32)),
-        // The source owner records a canonical ProcessId, not a provider-local EPROCESS pointer.
-        // Null is the only faithful projection until Ps exports an exact provider process object.
-        process_audit_id: GuestAddr::NULL,
-        desired_access,
-        full_create_options,
-        qos: None,
-        access: AccessStateFields {
-            operation_id: Default::default(),
-            security_evaluated: false,
-            generate_audit: false,
-            generate_on_close: false,
-            flags: 0,
-            remaining_desired_access: desired_access,
-            previously_granted_access: 0,
-            original_desired_access: desired_access,
-            security_descriptor: GuestAddr::NULL,
-            aux_data: GuestAddr::NULL,
-            privileges: InitialPrivilegeSet::default(),
-            audit_privileges: false,
-            object_name: UnicodeString::default(),
-            object_type_name: UnicodeString::default(),
-        },
+        // ProcessAuditId is an opaque audit identity. This source owner captured the canonical
+        // requestor PID, so preserve that value rather than treating it as an EPROCESS pointer.
+        process_audit_id: GuestAddr(subject.process_audit_id),
+        desired_access: subject.create_access.desired_access,
+        full_create_options: subject.create_access.full_create_options,
+        qos: subject.create_access.qos,
+        access: subject.create_access.access,
     };
     let output = core::slice::from_raw_parts_mut(
         graph_exec as *mut u8, CREATE_SECURITY_GRAPH_SIZE,
