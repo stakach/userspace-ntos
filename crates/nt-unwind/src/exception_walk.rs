@@ -472,7 +472,11 @@ impl ExceptionWalk {
                     &bounded,
                 )
                 .ok_or(WalkError::UnwindData)?;
-                self.validate_frame(result.establisher_frame)?;
+                if result.handler_rva == 0 {
+                    self.validate_context_rsp(result.establisher_frame)?;
+                } else {
+                    self.validate_frame(result.establisher_frame)?;
+                }
                 self.validate_context(previous)?;
                 if let WalkMode::Unwind {
                     target_frame: Some(target),
@@ -690,15 +694,16 @@ impl ExceptionWalk {
         }
     }
 
-    fn validate_context(&self, context: Context) -> Result<(), WalkError> {
-        if context.rsp() < self.state.low
-            || context.rsp() > self.state.high
-            || context.rsp() & 7 != 0
-        {
+    fn validate_context_rsp(&self, rsp: u64) -> Result<(), WalkError> {
+        if rsp < self.state.low || rsp > self.state.high || rsp & 7 != 0 {
             Err(WalkError::BadStack)
         } else {
             Ok(())
         }
+    }
+
+    fn validate_context(&self, context: Context) -> Result<(), WalkError> {
+        self.validate_context_rsp(context.rsp())
     }
 
     fn advance(

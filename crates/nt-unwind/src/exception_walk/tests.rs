@@ -905,6 +905,27 @@ fn leaf_frames_are_bounded_and_do_not_invent_a_target_handler_frame() {
 }
 
 #[test]
+fn zero_code_no_handler_pdata_frame_accepts_call_entry_stack_alignment() {
+    let mut fixture = Fixture::new(0);
+    fixture.functions.clear();
+    fixture.functions.push(RuntimeFunction {
+        begin: 0x500,
+        end: 0x510,
+        unwind_info: 0x1000,
+    });
+    fixture.image[0x1000..0x1004].copy_from_slice(&[1, 0, 0, 0]);
+    fixture.stack.insert(LOW + 8, BASE + 0x110);
+    let mut current = Context::default();
+    current.rip = BASE + 0x500;
+    current.set_rsp(LOW + 8);
+    let walk = ExceptionWalk::new(WalkMode::Search, record(), current, LOW, HIGH, 8).unwrap();
+    let walk = continued(walk.step(&fixture, &fixture).unwrap());
+    assert_eq!(walk.state.current.rip, BASE + 0x110);
+    assert_eq!(walk.state.current.rsp(), LOW + 0x10);
+    assert_eq!(fixture.stack_reads.get(), 1);
+}
+
+#[test]
 fn unreadable_leaf_return_is_explicit_failure() {
     let mut fixture = Fixture::new(0);
     fixture.functions.clear();
