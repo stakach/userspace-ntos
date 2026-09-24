@@ -28,6 +28,7 @@ mod cm_server;
 mod cm_key_ownership;
 mod cm_mutation_transport;
 mod registry_mutation_work;
+mod hosted_routed_file_close_work;
 mod registry_key_targets;
 mod registry_security_audit;
 mod provider_registry_caller;

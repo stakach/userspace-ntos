@@ -53486,6 +53486,22 @@ pub(crate) fn service_hosted_driver_registry(
     active_reply_cap: u64,
 ) -> crate::registry_mutation_work::ProviderRegistryResult {
     use crate::registry_mutation_work::ProviderRegistryResult;
+    if op == HOSTED_REGISTRY_OP_CLOSE {
+        let caller = match unsafe { crate::provider_registry_caller::resolve(ch) } {
+            Ok(caller) => caller,
+            Err(status) => return ProviderRegistryResult::Ready((status as i32, 0, 0)),
+        };
+        match unsafe { crate::hosted_routed_file_close_work::submit(ch, caller, a1) } {
+            crate::hosted_routed_file_close_work::SubmitResult::Ready(status)
+                if status as u32 == nt_process::native_handle::STATUS_OBJECT_TYPE_MISMATCH => {}
+            crate::hosted_routed_file_close_work::SubmitResult::Ready(status) => {
+                return ProviderRegistryResult::Ready((status, 0, 0));
+            }
+            crate::hosted_routed_file_close_work::SubmitResult::Deferred => {
+                return ProviderRegistryResult::Deferred;
+            }
+        }
+    }
     if let Some(result) = unsafe {
         driver_registry_deferred_value::route(ch, op, a1, a2, a3, active_reply_cap)
     } {
@@ -58595,6 +58611,16 @@ pub(crate) fn hosted_file_route(file_id: u64) -> Option<(u64, u64)> {
 
 pub(crate) fn hosted_file_exists(file_id: u64) -> bool {
     io_manager_mut().file(FileId(file_id)).is_some()
+}
+
+/// A final-handle close waits for CLEANUP, not for pointer-held final CLOSE.
+pub(crate) fn hosted_file_cleanup_terminal(file_id: u64) -> bool {
+    io_manager_mut().file(FileId(file_id)).is_none_or(|file| {
+        matches!(
+            file.state,
+            FileState::CleanupComplete | FileState::ClosePending | FileState::Closed
+        )
+    })
 }
 
 /// The caller retains an authenticated File capture or an adopted Busy/reference grant.
