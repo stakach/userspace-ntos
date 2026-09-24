@@ -4469,8 +4469,9 @@ extern "win64" fn s_c_specific_handler(
     _establisher_frame: u64,
     _context_record: u64,
     _dispatcher_context: u64,
-) -> i32 {
-    0
+) -> ! {
+    print_str(b"[fsd-seh] __C_specific_handler invoked before native SEH is available\n");
+    panic!("hosted driver exception dispatch requires native SEH")
 }
 
 const STATUS_SUCCESS: i32 = 0;
