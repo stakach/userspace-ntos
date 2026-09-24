@@ -12,6 +12,7 @@
  * int32_t SehExecuteHandlerForUnwind(void *exception_record, void *establisher_frame,
  *                                    void *context_record, void *dispatcher_context);
  * void SehRaiseStatus(uint32_t status);  // not bound until native dispatch and restore exist
+ * void SehResumeContext(void *validated_raw_context);  // does not return
  */
 
     .text
@@ -80,6 +81,51 @@ SehRaiseStatus:
     movl 0xa0(%rsp), %edx
     callq *%rax
 .Lraise_unbound:
+    ud2
+    .seh_endproc
+
+    .globl SehResumeContext
+    .seh_proc SehResumeContext
+SehResumeContext:
+    subq $8, %rsp
+    .seh_stackalloc 8
+    .seh_endprologue
+    testq %rcx, %rcx
+    jz .Lresume_invalid
+    testq $15, %rcx
+    jnz .Lresume_invalid
+
+    /* The caller already authenticated this owned CONTEXT, its destination stack
+       and the target PC. Preserve the pointer until the final register load. */
+    movq %rcx, %r11
+    movq 0x98(%r11), %rdx
+    movq 0x88(%r11), %r9
+    movq %r9, -32(%rdx)
+    movl 0x44(%r11), %eax
+    movq %rax, -24(%rdx)
+    movq 0xf8(%r11), %r8
+    movq %r8, -16(%rdx)
+
+    fxrstor 0x100(%r11)
+    movq 0x90(%r11), %rbx
+    movq 0xa0(%r11), %rbp
+    movq 0xa8(%r11), %rsi
+    movq 0xb0(%r11), %rdi
+    movq 0xb8(%r11), %r8
+    movq 0xc0(%r11), %r9
+    movq 0xc8(%r11), %r10
+    movq 0xd8(%r11), %r12
+    movq 0xe0(%r11), %r13
+    movq 0xe8(%r11), %r14
+    movq 0xf0(%r11), %r15
+    movq 0x78(%r11), %rax
+    movq 0x80(%r11), %rcx
+    movq 0xd0(%r11), %r11
+    leaq -32(%rdx), %rsp
+    popq %rdx
+    popfq
+    retq $8
+.Lresume_invalid:
     ud2
     .seh_endproc
 

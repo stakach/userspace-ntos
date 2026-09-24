@@ -10,17 +10,28 @@ use nt_unwind::{
 };
 use sha2::{Digest, Sha256};
 
-const EXPORTS: [&str; 6] = [
+const EXPORTS: [&str; 7] = [
     "SehCallFilter",
     "SehCallFinally",
     "SehExecuteHandlerForException",
     "SehExecuteHandlerForUnwind",
     "SehRaiseStatus",
+    "SehResumeContext",
     "SehRaiseDispatch",
 ];
 const RAISE_PROLOGUE: [u8; 8] = [0x9c, 0x48, 0x81, 0xec, 0xf0, 0x04, 0x00, 0x00];
 const RAISE_UNWIND_CODES: [u8; 6] = [8, 1, 0x9e, 0, 1, 2];
 const RAISE_FUNCTION_LEN: u32 = 0x12a;
+const RESUME_PROLOGUE: [u8; 4] = [0x48, 0x83, 0xec, 0x08];
+const RESUME_UNWIND_CODES: [u8; 2] = [4, 2];
+const RESUME_TRANSFER: [u8; 11] = [
+    0x48, 0x8d, 0x62, 0xe0, 0x5a, 0x9d, 0xc2, 0x08, 0, 0x0f, 0x0b,
+];
+const RESUME_FUNCTION_LEN: u32 = 0xb4;
+const RESUME_CODE_SHA256: [u8; 32] = [
+    0x38, 0xe2, 0x78, 0xe1, 0xc3, 0x86, 0xb3, 0x2a, 0xa0, 0x9f, 0x0f, 0x1b, 0xcd, 0x1e, 0x70, 0x0b,
+    0x7e, 0x34, 0x5c, 0xeb, 0x0b, 0x6e, 0x83, 0x21, 0xee, 0x67, 0x67, 0x1d, 0xd1, 0xb6, 0x65, 0xd6,
+];
 // Reviewed Win64 capture body, including all GPR stores, FXSAVE, selectors and the fail-closed
 // dispatcher call. A changed digest requires disassembly review before native admission.
 const RAISE_CODE_SHA256: [u8; 32] = [
@@ -183,6 +194,24 @@ fn raise_dispatch_slot_is_zero(bytes: &[u8], rva: u32) -> bool {
     rva & 7 == 0 && bytes.get(rva as usize..rva as usize + 8) == Some(&[0; 8])
 }
 
+fn resume_layout_is_exact(bytes: &[u8], begin: u32, end: u32, unwind: u32) -> bool {
+    begin.checked_add(RESUME_FUNCTION_LEN) == Some(end)
+        && bytes.get(begin as usize..begin as usize + RESUME_PROLOGUE.len())
+            == Some(RESUME_PROLOGUE.as_slice())
+        && bytes.get(unwind as usize + 4..unwind as usize + 6)
+            == Some(RESUME_UNWIND_CODES.as_slice())
+        && bytes.get(end as usize - RESUME_TRANSFER.len()..end as usize)
+            == Some(RESUME_TRANSFER.as_slice())
+}
+
+fn resume_encoding_is_exact(bytes: &[u8], begin: u32, end: u32, unwind: u32) -> bool {
+    let Some(code) = bytes.get(begin as usize..end as usize) else {
+        return false;
+    };
+    resume_layout_is_exact(bytes, begin, end, unwind)
+        && Sha256::digest(code).as_slice() == RESUME_CODE_SHA256
+}
+
 fn verify_raise_entry(
     pe: &PeFile<'_>,
     mapped: &nt_pe_loader::MappedImage,
@@ -269,6 +298,73 @@ fn verify_raise_dispatch_slot(
     Ok(())
 }
 
+fn verify_resume_entry(
+    pe: &PeFile<'_>,
+    mapped: &nt_pe_loader::MappedImage,
+    image: &BorrowedExceptionImage<'_>,
+    export: &ExportedSymbol,
+) -> Result<(), String> {
+    let pc = mapped
+        .load_base
+        .checked_add(u64::from(export.rva))
+        .ok_or("resume entry VA overflow")?;
+    let function = match image.lookup_exception_function(pc) {
+        Ok(ExceptionFunction::Function {
+            image_base,
+            function,
+        }) if image_base == mapped.load_base && function.begin == export.rva => function,
+        other => {
+            return Err(format!(
+                "resume entry lacks exact runtime function: {other:?}"
+            ))
+        }
+    };
+    let header: [u8; 4] = mapped
+        .bytes
+        .get(function.unwind_info as usize..function.unwind_info as usize + 4)
+        .ok_or("resume entry unwind header outside image")?
+        .try_into()
+        .map_err(|_| "resume entry unwind header malformed")?;
+    let header = UnwindInfoHeader::parse(&header);
+    let function_len = function
+        .end
+        .checked_sub(function.begin)
+        .ok_or("resume entry reversed")?;
+    if header.version != 1
+        || header.flags != 0
+        || header.is_chained()
+        || header.size_of_prolog != RESUME_PROLOGUE.len() as u8
+        || header.count_of_codes != 1
+        || header.frame_register != 0
+        || !resume_encoding_is_exact(
+            &mapped.bytes,
+            function.begin,
+            function.end,
+            function.unwind_info,
+        )
+        || !pe.sections().iter().any(|section| {
+            section.name_str() == ".text"
+                && section_contains(section, export.rva, function_len as usize)
+                && section.is_readable()
+                && section.is_executable()
+                && !section.is_writable()
+        })
+        || !pe.sections().iter().any(|section| {
+            section_contains(section, function.unwind_info, 8)
+                && section.is_readable()
+                && !section.is_writable()
+                && !section.is_executable()
+        })
+    {
+        return Err("resume entry code or unwind metadata invalid".into());
+    }
+    println!(
+        "{} RVA=0x{:x} unwind=0x{:x} flags={}",
+        export.name, export.rva, function.unwind_info, header.flags
+    );
+    Ok(())
+}
+
 fn verify(path: &str) -> Result<(), String> {
     let bytes = fs::read(path).map_err(|error| format!("read {path}: {error}"))?;
     let pe = PeFile::parse(&bytes).map_err(|error| format!("PE parse: {error:?}"))?;
@@ -303,6 +399,10 @@ fn verify(path: &str) -> Result<(), String> {
         }
         if export.name == "SehRaiseStatus" {
             verify_raise_entry(&pe, &mapped, &image, &export)?;
+            continue;
+        }
+        if export.name == "SehResumeContext" {
+            verify_resume_entry(&pe, &mapped, &image, &export)?;
             continue;
         }
         let expected_flags = expected_flags(&export.name);
@@ -556,6 +656,22 @@ mod tests {
         }
         bytes[0x2007] = 1;
         assert!(!raise_dispatch_slot_is_zero(&bytes, 0x2000));
+    }
+
+    #[test]
+    fn resume_entry_rejects_unwind_and_transfer_mutations() {
+        let mut bytes = vec![0u8; 0x2200];
+        bytes[0x112a..0x112e].copy_from_slice(&RESUME_PROLOGUE);
+        bytes[0x11d3..0x11de].copy_from_slice(&RESUME_TRANSFER);
+        bytes[0x2120..0x2122].copy_from_slice(&RESUME_UNWIND_CODES);
+        assert!(resume_layout_is_exact(&bytes, 0x112a, 0x11de, 0x211c));
+        assert!(!resume_encoding_is_exact(&bytes, 0x112a, 0x11de, 0x211c));
+        assert!(!resume_layout_is_exact(&bytes, 0x112a, 0x11df, 0x211c));
+        for offset in (0x112a..0x112e).chain(0x11d3..0x11de).chain(0x2120..0x2122) {
+            bytes[offset] ^= 1;
+            assert!(!resume_layout_is_exact(&bytes, 0x112a, 0x11de, 0x211c));
+            bytes[offset] ^= 1;
+        }
     }
 }
 

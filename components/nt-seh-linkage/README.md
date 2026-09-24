@@ -16,6 +16,7 @@ int32_t SehCallFilter(int32_t (*filter)(void *, void *), void *exception_pointer
 void SehCallFinally(void (*finally)(unsigned char, void *), void *establisher_frame,
                     void *dispatcher_context);
 void SehRaiseStatus(uint32_t status); /* unbound; traps without a dispatcher */
+void SehResumeContext(void *validated_raw_context); /* nonreturning, unbound */
 ```
 
 Build and statically verify it with:
@@ -31,5 +32,7 @@ first argument; `CLANG` and `RUST_LLD` select the cross compiler and linker.
 
 The executive build stages the verified DLL in the OS image and maps it RX/RO_NX into each hosted
 driver domain. The raise entry is still **unbound**: runtime acceptance requires an authenticated
-retained dispatcher, context writeback and nonreturning restore, then a compiled driver fixture
-proving a caught raise and `__finally` execution.
+retained dispatcher, validated context writeback and live use of the nonreturning restore, then
+a compiled driver fixture proving a caught raise and `__finally` execution.
+The restore entry accepts only an owned, prevalidated same-thread context; it does not validate
+target stack, instruction address, flags, MXCSR, or selectors by itself.
