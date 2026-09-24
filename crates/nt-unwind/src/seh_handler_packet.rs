@@ -42,6 +42,10 @@ pub struct SehHandlerPacket {
     /// Validated entrypoints in this instance's sealed SEH support image, not handler input.
     pub filter_wrapper: u64,
     pub finally_wrapper: u64,
+    pub search_wrapper: u64,
+    pub unwind_wrapper: u64,
+    pub token: u64,
+    pub resume_va: u64,
 }
 
 impl SehHandlerPacket {
@@ -136,16 +140,38 @@ impl SehHandlerPacket {
             function_padding: 0,
             filter_wrapper: 0,
             finally_wrapper: 0,
+            search_wrapper: 0,
+            unwind_wrapper: 0,
+            token: 0,
+            resume_va: 0,
         })
     }
 
     /// Supply wrapper VAs only after the caller has admitted them in this exact support image.
-    pub fn set_wrappers(&mut self, filter: u64, finally: u64) -> Result<(), HandlerPacketError> {
-        if filter == 0 || finally == 0 {
+    pub fn set_wrappers(
+        &mut self,
+        filter: u64,
+        finally: u64,
+        search: u64,
+        unwind: u64,
+        resume: u64,
+    ) -> Result<(), HandlerPacketError> {
+        if filter == 0 || finally == 0 || search == 0 || unwind == 0 || resume == 0 {
             return Err(HandlerPacketError::Address);
         }
         self.filter_wrapper = filter;
         self.finally_wrapper = finally;
+        self.search_wrapper = search;
+        self.unwind_wrapper = unwind;
+        self.resume_va = resume;
+        Ok(())
+    }
+
+    pub fn set_token(&mut self, token: u64) -> Result<(), HandlerPacketError> {
+        if token == 0 {
+            return Err(HandlerPacketError::Address);
+        }
+        self.token = token;
         Ok(())
     }
 
@@ -168,6 +194,10 @@ impl SehHandlerPacket {
         }
         if returned.filter_wrapper != self.filter_wrapper
             || returned.finally_wrapper != self.finally_wrapper
+            || returned.search_wrapper != self.search_wrapper
+            || returned.unwind_wrapper != self.unwind_wrapper
+            || returned.token != self.token
+            || returned.resume_va != self.resume_va
             || returned.exception_pointers_padding != 0
             || returned.function_padding != 0
         {
@@ -275,7 +305,7 @@ fn read_collision_function(
 }
 
 const _: () = {
-    assert!(size_of::<SehHandlerPacket>() == 0xac0);
+    assert!(size_of::<SehHandlerPacket>() == 0xae0);
     assert!(offset_of!(SehHandlerPacket, exception) == 0);
     assert!(offset_of!(SehHandlerPacket, exception_pointers) == 0x98);
     assert!(offset_of!(SehHandlerPacket, exception_pointers_padding) == 0xa8);
@@ -286,6 +316,10 @@ const _: () = {
     assert!(offset_of!(SehHandlerPacket, function_padding) == 0xaac);
     assert!(offset_of!(SehHandlerPacket, filter_wrapper) == 0xab0);
     assert!(offset_of!(SehHandlerPacket, finally_wrapper) == 0xab8);
+    assert!(offset_of!(SehHandlerPacket, search_wrapper) == 0xac0);
+    assert!(offset_of!(SehHandlerPacket, unwind_wrapper) == 0xac8);
+    assert!(offset_of!(SehHandlerPacket, token) == 0xad0);
+    assert!(offset_of!(SehHandlerPacket, resume_va) == 0xad8);
 };
 
 #[cfg(test)]
@@ -371,13 +405,23 @@ mod tests {
     #[test]
     fn ordinary_return_publishes_mutations_but_rejects_pointer_redirects() {
         let mut invocation = invocation(WalkMode::Search);
-        let packet = SehHandlerPacket::prepare_search(&capture(), &invocation, 0x8000).unwrap();
+        let mut packet = SehHandlerPacket::prepare_search(&capture(), &invocation, 0x8000).unwrap();
+        assert_eq!(packet.set_wrappers(0, 2, 3, 4, 5), Err(HandlerPacketError::Address));
+        assert_eq!(packet.set_token(0), Err(HandlerPacketError::Address));
+        packet.set_wrappers(0x1100, 0x1200, 0x1300, 0x1400, 0x1500).unwrap();
+        packet.set_token(9).unwrap();
         let mut changed = packet.clone();
         changed.dispatcher.context_record = 0x9000;
         assert_eq!(packet.apply_return(&changed, &mut invocation, 1, &Frame, LOW, HIGH), Err(HandlerPacketError::ChangedDispatcher));
         changed = packet.clone();
         changed.exception_pointers.context_record = 0x9000;
         assert_eq!(packet.apply_return(&changed, &mut invocation, 1, &Frame, LOW, HIGH), Err(HandlerPacketError::ChangedPointers));
+        changed = packet.clone();
+        changed.search_wrapper = 0x1500;
+        assert_eq!(packet.apply_return(&changed, &mut invocation, 1, &Frame, LOW, HIGH), Err(HandlerPacketError::ChangedDispatcher));
+        changed = packet.clone();
+        changed.token = 10;
+        assert_eq!(packet.apply_return(&changed, &mut invocation, 1, &Frame, LOW, HIGH), Err(HandlerPacketError::ChangedDispatcher));
         changed = packet.clone();
         changed.original_context.set_rip(BASE + 0x120);
         changed.unwound_context.set_gpr(REG_RBX, 0x77);
