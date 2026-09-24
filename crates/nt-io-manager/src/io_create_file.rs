@@ -1,5 +1,6 @@
 //! Scalar policy for the 14-argument kernel IoCreateFile entry point.
 
+use alloc::vec::Vec;
 use nt_types::AccessMode;
 
 pub const IO_FORCE_ACCESS_CHECK: u32 = 0x1;
@@ -37,6 +38,88 @@ pub struct IoCreateFilePolicy {
     pub create_options: u32,
     pub io_options: u32,
     pub create_stack_flags: u8,
+}
+
+/// Input data copied out of a driver's address space before an IoCreateFile request is sent.
+/// Output pointers and the reply capability remain owned by the caller-side transaction.
+pub struct IoCreateFileInput<'a> {
+    pub scalars: IoCreateFileScalars,
+    pub previous_mode: AccessMode,
+    pub object_attributes: u32,
+    pub root_directory: u64,
+    pub name: &'a [u16],
+    pub allocation_size: Option<i64>,
+    pub ea: &'a [u8],
+    pub security_descriptor: Option<&'a [u8]>,
+    pub security_qos: Option<&'a [u8]>,
+    pub extra_create_parameters: Option<&'a [u8]>,
+}
+
+/// No field in this request is a pointer into the hosted driver's memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedIoCreateFileRequest {
+    pub policy: IoCreateFilePolicy,
+    pub desired_access: u32,
+    pub file_attributes: u32,
+    pub share_access: u32,
+    pub disposition: u32,
+    pub object_attributes: u32,
+    pub root_directory: u64,
+    pub name: Vec<u16>,
+    pub allocation_size: Option<i64>,
+    pub ea: Vec<u8>,
+    pub security_descriptor: Option<Vec<u8>>,
+    pub security_qos: Option<Vec<u8>>,
+    pub extra_create_parameters: Option<Vec<u8>>,
+}
+
+fn copy_bytes(source: &[u8]) -> Result<Vec<u8>, u32> {
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(source.len())
+        .map_err(|_| 0xc000_009au32)?; // STATUS_INSUFFICIENT_RESOURCES
+    owned.extend_from_slice(source);
+    Ok(owned)
+}
+
+fn copy_optional_bytes(source: Option<&[u8]>) -> Result<Option<Vec<u8>>, u32> {
+    source.map(copy_bytes).transpose()
+}
+
+/// Build the transfer owner only after the driver adapter has probed and copied each pointed-to
+/// structure. The adapter must not send raw OA, EA, or security pointers to the executive.
+pub fn capture(input: IoCreateFileInput<'_>) -> Result<OwnedIoCreateFileRequest, u32> {
+    const STATUS_INVALID_PARAMETER: u32 = 0xc000_000d;
+    const STATUS_EA_LIST_INCONSISTENT: u32 = 0x8000_0014;
+    if input.name.len() > (u16::MAX as usize / 2)
+        || input.allocation_size.is_some_and(|size| size < 0)
+        || input.scalars.extra_create_parameters_present != input.extra_create_parameters.is_some()
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let policy = classify(input.scalars, input.previous_mode)?;
+    if !input.ea.is_empty() && super::validate_ea_buffer(input.ea).is_err() {
+        return Err(STATUS_EA_LIST_INCONSISTENT);
+    }
+    let mut name = Vec::new();
+    name.try_reserve_exact(input.name.len())
+        .map_err(|_| 0xc000_009au32)?;
+    name.extend_from_slice(input.name);
+    Ok(OwnedIoCreateFileRequest {
+        policy,
+        desired_access: input.scalars.desired_access,
+        file_attributes: input.scalars.file_attributes,
+        share_access: input.scalars.share_access,
+        disposition: input.scalars.disposition,
+        object_attributes: input.object_attributes,
+        root_directory: input.root_directory,
+        name,
+        allocation_size: input.allocation_size,
+        ea: copy_bytes(input.ea)?,
+        security_descriptor: copy_optional_bytes(input.security_descriptor)?,
+        security_qos: copy_optional_bytes(input.security_qos)?,
+        extra_create_parameters: copy_optional_bytes(input.extra_create_parameters)?,
+    })
 }
 
 /// Classify the scalar kernel entry contract. This does not capture pointers, authorize a name,
@@ -115,6 +198,68 @@ mod tests {
         }
     }
 
+    fn mup_input<'a>(name: &'a [u16], ea: &'a [u8]) -> IoCreateFileInput<'a> {
+        IoCreateFileInput {
+            scalars: mup(),
+            previous_mode: AccessMode::UserMode,
+            object_attributes: 0x240,
+            root_directory: 0,
+            name,
+            allocation_size: None,
+            ea,
+            security_descriptor: None,
+            security_qos: None,
+            extra_create_parameters: None,
+        }
+    }
+
+    #[test]
+    fn captured_mup_request_owns_name_and_optional_data() {
+        let mut name = [b'\\' as u16, b'D' as u16, b'e' as u16, b'v' as u16];
+        let mut security = [1u8, 2, 3, 4];
+        let mut qos = [8u8, 9];
+        let mut input = mup_input(&name, &[]);
+        input.security_descriptor = Some(&security);
+        input.security_qos = Some(&qos);
+        let captured = capture(input).unwrap();
+        name.fill(0);
+        security.fill(0);
+        qos.fill(0);
+        assert_eq!(
+            captured.name,
+            [b'\\' as u16, b'D' as u16, b'e' as u16, b'v' as u16]
+        );
+        assert_eq!(
+            captured.security_descriptor.as_deref(),
+            Some(&[1, 2, 3, 4][..])
+        );
+        assert_eq!(captured.security_qos.as_deref(), Some(&[8, 9][..]));
+        assert_eq!(captured.policy.access_mode, AccessMode::KernelMode);
+        assert_eq!(captured.object_attributes, 0x240);
+    }
+
+    #[test]
+    fn capture_rejects_invalid_optional_inputs_before_transfer() {
+        let mut input = mup_input(&[b'X' as u16], &[]);
+        input.allocation_size = Some(-1);
+        assert!(matches!(capture(input), Err(0xc000_000d)));
+
+        let mut input = mup_input(&[b'X' as u16], &[]);
+        input.scalars.extra_create_parameters_present = true;
+        assert!(matches!(capture(input), Err(0xc000_000d)));
+
+        let input = mup_input(&[b'X' as u16], &[0; 7]);
+        assert!(matches!(capture(input), Err(0x8000_0014)));
+    }
+
+    #[test]
+    fn capture_keeps_io_options_distinct_from_create_options() {
+        let input = mup_input(&[b'X' as u16], &[]);
+        let captured = capture(input).unwrap();
+        assert_eq!(captured.policy.io_options, IO_NO_PARAMETER_CHECKING);
+        assert_eq!(captured.policy.create_options, 0);
+    }
+
     #[test]
     fn mup_kernel_open_keeps_io_options_separate_from_create_options() {
         let policy = classify(mup(), AccessMode::UserMode).unwrap();
@@ -131,9 +276,11 @@ mod tests {
     fn checked_user_or_explicit_kernel_call_validates_ordinary_create() {
         let mut args = mup();
         args.share_access = 8;
-        assert!(!classify(args, AccessMode::UserMode)
-            .unwrap()
-            .check_parameters);
+        assert!(
+            !classify(args, AccessMode::UserMode)
+                .unwrap()
+                .check_parameters
+        );
         args.io_options = 0;
         assert_eq!(classify(args, AccessMode::UserMode), Err(0xc000_000d));
         assert!(
