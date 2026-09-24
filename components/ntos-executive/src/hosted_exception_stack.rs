@@ -7,9 +7,8 @@
 use nt_component_suspension::{peer_registry::PeerRoute, LaneDispatchIdentity};
 use nt_io_manager::HostedDomainIdentity;
 use nt_unwind::{
-    exception_walk::{FirstRaiseStep, WalkError},
     raw_context::{RawContext, RawContextCaptureError},
-    seh_linkage_image::SehRaiseIngressError,
+    seh_linkage_image::{SehRaiseFirstPass, SehRaiseIngressError},
     StackReader,
 };
 
@@ -194,7 +193,6 @@ pub(super) fn capture_raw_context(
 pub(super) enum RaiseCaptureError {
     Context(RawContextCaptureError),
     Admission(SehRaiseIngressError),
-    Walk(WalkError),
 }
 
 /// Advance a software raise to the first owned handler invocation or terminal result while its
@@ -205,7 +203,7 @@ pub(super) fn capture_raise_first_step(
     badge: u64,
     context_address: u64,
     status_word: u64,
-) -> Option<Result<FirstRaiseStep, RaiseCaptureError>> {
+) -> Option<Result<SehRaiseFirstPass, RaiseCaptureError>> {
     let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
     let domain = instance_domain_identity(inst)?;
     let linkage = inst.seh_linkage?;
@@ -213,11 +211,9 @@ pub(super) fn capture_raise_first_step(
         super::hosted_exception_images::with_catalog(instance, domain, |catalog| {
             let raw = RawContext::capture_bounded(reader, context_address, low, high)
                 .map_err(RaiseCaptureError::Context)?;
-            let site = linkage
-                .admit_raise(&raw, status_word, low, high, catalog, reader)
-                .map_err(RaiseCaptureError::Admission)?;
-            site.search_to_first_handler(status_word as u32, 64, catalog, reader)
-                .map_err(RaiseCaptureError::Walk)
+            linkage
+                .admit_first_pass(raw, status_word, low, high, catalog, reader, 64)
+                .map_err(RaiseCaptureError::Admission)
         })
     })?
 }

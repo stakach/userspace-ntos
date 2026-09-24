@@ -2,7 +2,8 @@
 
 use crate::{
     exception_walk::{
-        ExceptionFunction, ExceptionImageError, ExceptionImageReader, SoftwareRaiseSite, WalkError,
+        ExceptionFunction, ExceptionImageError, ExceptionImageReader, FirstRaiseStep,
+        SoftwareRaiseSite, WalkError,
     },
     raw_context::{RawContext, CONTEXT_AMD64_FULL_SEGMENTS},
     StackReader, REG_RCX,
@@ -50,6 +51,14 @@ pub enum SehRaiseIngressError {
     StatusMismatch,
     WrongEntry,
     Site(WalkError),
+    Walk(WalkError),
+}
+
+/// The unmodelled native register state remains owned beside the one-shot walk continuation.
+#[derive(Debug)]
+pub struct SehRaiseFirstPass {
+    pub captured: RawContext,
+    pub step: FirstRaiseStep,
 }
 
 fn exact_function(
@@ -67,6 +76,26 @@ fn exact_function(
 }
 
 impl SehLinkageImage {
+    pub fn admit_first_pass(
+        &self,
+        raw: RawContext,
+        status_word: u64,
+        stack_low: u64,
+        stack_high: u64,
+        image: &dyn ExceptionImageReader,
+        stack: &dyn StackReader,
+        frame_limit: usize,
+    ) -> Result<SehRaiseFirstPass, SehRaiseIngressError> {
+        let site = self.admit_raise(&raw, status_word, stack_low, stack_high, image, stack)?;
+        let step = site
+            .search_to_first_handler(status_word as u32, frame_limit, image, stack)
+            .map_err(SehRaiseIngressError::Walk)?;
+        Ok(SehRaiseFirstPass {
+            captured: raw,
+            step,
+        })
+    }
+
     /// Admit the first Call from the native raise entry without treating its component pointer
     /// as authority. The caller must first copy `raw` under the exact physical stack lease.
     pub fn admit_raise(
@@ -380,7 +409,7 @@ mod tests {
     impl StackReader for RaiseFixture {
         fn read_u64(&self, address: u64) -> Option<u64> {
             self.reads.set(self.reads.get() + 1);
-            (address == 0x1008).then_some(self.caller)
+            matches!(address, 0x1008 | 0x1010).then_some(self.caller)
         }
     }
 
@@ -420,6 +449,25 @@ mod tests {
             .unwrap();
         assert!(site.into_search(0xc000_0022, 4).is_ok());
         assert_eq!(fixture.reads.get(), 1);
+    }
+
+    #[test]
+    fn first_pass_retains_unmodelled_native_context_until_handler_or_terminal_outcome() {
+        let fixture = RaiseFixture {
+            caller: 0x5200,
+            reads: Cell::new(0),
+        };
+        let mut raw = raise_context();
+        raw.as_bytes_mut()[0x4a0] = 0x5a;
+        let first = raise_linkage()
+            .admit_first_pass(raw, 0xc000_0022, 0x1000, 0x1018, &fixture, &fixture, 4)
+            .unwrap();
+        assert_eq!(first.captured.as_bytes()[0x4a0], 0x5a);
+        assert!(matches!(
+            first.step,
+            FirstRaiseStep::Complete(crate::exception_walk::WalkOutcome::Unhandled { .. })
+        ));
+        assert_eq!(fixture.reads.get(), 2);
     }
 
     #[test]
