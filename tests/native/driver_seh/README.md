@@ -6,6 +6,12 @@ outer `__try/__except`, and returns success only if the finalizer and exception 
 and control did not return from `ExRaiseStatus`. `SehFixtureEvidence` is an exported volatile data
 record, and emits the checked counters through the real `DbgPrint` provider import.
 
+The fixture also targets `RtlUnwindEx` directly and then starts a nested unwind from an active
+termination callback. That collided path uses an assembly C scope and finalizer with explicit
+`.pdata`/`.xdata`: the compiler's outlined finalizer can allocate a frame without emitting unwind
+metadata. The nested unwind must cross `SehCallFinally`, resume the saved dispatcher exactly once,
+and reach the target without returning from either unwind call.
+
 Build and statically verify the image with:
 
 ```sh
