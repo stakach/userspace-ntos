@@ -378,8 +378,8 @@ pub(super) unsafe fn retire_binding(
         false, tokens)
 }
 
-/// Only the graph builder may use this before native dispatch entry. It is not an alternative
-/// terminal path for a provider operation whose entry is uncertain.
+/// Only a retained graph with pre-entry proof may use this. Outer CREATE may have reached
+/// Terminal before a failed no-entry cleanup is redriven; Indeterminate is never admitted.
 pub(super) unsafe fn abort_unentered_binding(
     source_inst: DriverInstance,
     provider_inst: DriverInstance,
@@ -407,7 +407,10 @@ unsafe fn retire_binding_in_phase(
         || source.ticket() != ticket
         || source.key() != key
         || if proven_unentered {
-            !matches!(source.phase(), SourceCreateSecurityPhase::Captured | SourceCreateSecurityPhase::Pending)
+            !matches!(source.phase(),
+                SourceCreateSecurityPhase::Captured
+                    | SourceCreateSecurityPhase::Pending
+                    | SourceCreateSecurityPhase::Terminal)
         } else {
             source.phase() != SourceCreateSecurityPhase::Terminal
         }

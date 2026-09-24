@@ -125,13 +125,6 @@ pub(super) fn finish(
     identity: hosted_source_create_security::SourceSecurityIdentity,
     completion: SourceCreateCompletion,
 ) {
-    if matches!(completion, SourceCreateCompletion::Returned(value) if value != nt_status::NtStatus::PENDING)
-        || matches!(completion, SourceCreateCompletion::AcknowledgedTerminal)
-    {
-        assert!(unsafe {
-            hosted_create_security_graph::retry_preentry_for_source(source, identity)
-        }.is_ok(), "terminal CREATE still has a retained pre-entry rollback");
-    }
     let changed = match completion {
         SourceCreateCompletion::Indeterminate =>
             hosted_source_create_security::mark_indeterminate(source, identity),
@@ -143,30 +136,85 @@ pub(super) fn finish(
     assert!(changed, "canonical CREATE subject lost before provider return");
     if matches!(completion, SourceCreateCompletion::Returned(value) if value != nt_status::NtStatus::PENDING)
         || matches!(completion, SourceCreateCompletion::AcknowledgedTerminal) {
-        // Nested query graphs retire on their own terminal; their token bindings retain the
-        // canonical subject until this outer CREATE has itself become terminal.
-        loop {
-            let next = unsafe {
-                driver_hosted_token_projection::next_bound_for_source(
-                    source, identity.ticket, identity.key,
-                )
-            }.expect("terminal CREATE has a stale provider token projection");
-            let Some((provider, address)) = next else { break; };
-            let retiring = unsafe {
-                crate::with_provider_security_managers(|_, tokens| {
-                    hosted_source_create_security::retire_projection_binding(
-                        source, provider, identity, address, tokens,
-                    ).map_err(|status| status as u32)
-                })
-            }.expect("terminal CREATE token binding must retire");
-            assert!(unsafe { driver_hosted_token_projection::free_retired(retiring) }.is_ok(),
-                "terminal CREATE token storage must retire");
+        let _ = unsafe { retire_terminal_step(source, identity) };
+    }
+}
+
+struct CleanupGuard {
+    source: DriverInstance,
+    identity: hosted_source_create_security::SourceSecurityIdentity,
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        hosted_source_create_security::end_terminal_cleanup(self.source, self.identity);
+    }
+}
+
+/// Retry only cleanup of a genuinely terminal outer CREATE. A failed pool free keeps its exact
+/// RetiringTokenProjection receipt in the source row; no provider dispatch or bind is replayed.
+unsafe fn retire_terminal_step(
+    source: DriverInstance,
+    identity: hosted_source_create_security::SourceSecurityIdentity,
+) -> Result<(), i32> {
+    if !hosted_source_create_security::begin_terminal_cleanup(source, identity) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
+    }
+    let _guard = CleanupGuard { source, identity };
+    hosted_create_security_graph::retry_preentry_for_source(source, identity)?;
+    for _ in 0..64 {
+        if let Some(retiring) =
+            hosted_source_create_security::take_retiring_projection(source, identity)
+        {
+            match driver_hosted_token_projection::free_retired(retiring) {
+                Ok(()) => continue,
+                Err((status, retiring)) => {
+                    hosted_source_create_security::retain_retiring_projection(
+                        source, identity, retiring,
+                    );
+                    return Err(status);
+                }
+            }
         }
-        let released = unsafe {
-            crate::with_provider_security_managers(|_, tokens| {
+        let next = driver_hosted_token_projection::next_bound_for_source(
+            source, identity.ticket, identity.key,
+        )?;
+        let Some((provider, address)) = next else {
+            return crate::with_provider_security_managers(|_, tokens| {
                 hosted_source_create_security::release(source, identity, tokens)
-            })
+            }).map_err(|status| status as i32);
         };
-        assert!(released.is_ok(), "terminal CREATE subject still has provider references");
+        let retiring = crate::with_provider_security_managers(|_, tokens| {
+            hosted_source_create_security::retire_projection_binding(
+                source, provider, identity, address, tokens,
+            ).map_err(|status| status as u32)
+        }).map_err(|status| status as i32)?;
+        match driver_hosted_token_projection::free_retired(retiring) {
+            Ok(()) => {},
+            Err((status, retiring)) => {
+                hosted_source_create_security::retain_retiring_projection(
+                    source, identity, retiring,
+                );
+                return Err(status);
+            }
+        }
+    }
+    Err(nt_status::NtStatus::DEVICE_BUSY.raw())
+}
+
+static TERMINAL_REDRIVE_CURSOR: AtomicU64 = AtomicU64::new(0);
+
+pub(super) unsafe fn redrive_terminal() {
+    let count = hosted_source_create_security::row_count();
+    if count == 0 {
+        return;
+    }
+    let start = TERMINAL_REDRIVE_CURSOR.fetch_add(1, Ordering::Relaxed) as usize % count;
+    for offset in 0..count {
+        let index = (start + offset) % count;
+        if let Some((source, identity)) = hosted_source_create_security::terminal_at(index) {
+            let _ = retire_terminal_step(source, identity);
+            return;
+        }
     }
 }

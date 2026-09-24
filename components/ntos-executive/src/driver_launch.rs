@@ -54119,6 +54119,7 @@ pub(crate) unsafe fn service_hosted_query_path_forward(
 
 pub(crate) unsafe fn redrive_hosted_query_path_forward(handler: &mut ExecNtHandler) {
     hosted_query_path_work::redrive(handler);
+    hosted_create_subject_registration::redrive_terminal();
 }
 
 pub(crate) unsafe fn service_hosted_driver_zw_wait_file(

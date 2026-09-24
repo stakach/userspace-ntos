@@ -41,6 +41,8 @@ struct Row {
     source_pool: u64,
     source_driver_id: u64,
     owner: SourceCreateSecurityOwner,
+    retiring_projection: Option<RetiringTokenProjection>,
+    cleanup_active: bool,
 }
 
 static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
@@ -74,6 +76,19 @@ fn row_index(inst: DriverInstance, identity: SourceSecurityIdentity) -> Option<u
         (&*core::ptr::addr_of!(ROWS))
             .iter()
             .position(|row| row.identity == identity && row_matches(row, inst))
+    }
+}
+
+fn row_storage_index(inst: DriverInstance, identity: SourceSecurityIdentity) -> Option<usize> {
+    unsafe {
+        (&*core::ptr::addr_of!(ROWS)).iter().position(|row| {
+            row.identity == identity
+                && row.source_pml4 == inst.pml4
+                && row.source_pool == inst.exec_pool_va
+                && row.source_driver_id == inst.driver_id
+                && row.identity.key.domain_id() == inst.hosted_domain_id
+                && row.identity.key.domain_cookie() == inst.hosted_domain_cookie
+        })
     }
 }
 
@@ -159,6 +174,8 @@ pub(super) unsafe fn capture(
         source_pool: source.exec_pool_va,
         source_driver_id: source.driver_id,
         owner,
+        retiring_projection: None,
+        cleanup_active: false,
     });
     Ok(identity)
 }
@@ -382,6 +399,62 @@ pub(super) fn mark_terminal(source: DriverInstance, identity: SourceSecurityIden
     true
 }
 
+pub(super) fn take_retiring_projection(
+    source: DriverInstance,
+    identity: SourceSecurityIdentity,
+) -> Option<RetiringTokenProjection> {
+    let index = row_index(source, identity)?;
+    unsafe { (&mut *core::ptr::addr_of_mut!(ROWS))[index].retiring_projection.take() }
+}
+
+pub(super) fn retain_retiring_projection(
+    source: DriverInstance,
+    identity: SourceSecurityIdentity,
+    retiring: RetiringTokenProjection,
+) {
+    let index = row_storage_index(source, identity)
+        .expect("terminal cleanup owns the exact source row");
+    let row = unsafe { &mut (&mut *core::ptr::addr_of_mut!(ROWS))[index] };
+    assert!(row.cleanup_active && row.owner.phase() == SourceCreateSecurityPhase::Terminal);
+    assert!(row.retiring_projection.is_none());
+    row.retiring_projection = Some(retiring);
+}
+
+pub(super) fn row_count() -> usize {
+    unsafe { (&*core::ptr::addr_of!(ROWS)).len() }
+}
+
+pub(super) fn begin_terminal_cleanup(
+    source: DriverInstance,
+    identity: SourceSecurityIdentity,
+) -> bool {
+    let Some(index) = row_index(source, identity) else { return false; };
+    let row = unsafe { &mut (&mut *core::ptr::addr_of_mut!(ROWS))[index] };
+    if row.owner.phase() != SourceCreateSecurityPhase::Terminal || row.cleanup_active {
+        return false;
+    }
+    row.cleanup_active = true;
+    true
+}
+
+pub(super) fn end_terminal_cleanup(
+    source: DriverInstance,
+    identity: SourceSecurityIdentity,
+) {
+    if let Some(index) = row_storage_index(source, identity) {
+        unsafe { (&mut *core::ptr::addr_of_mut!(ROWS))[index].cleanup_active = false; }
+    }
+}
+
+pub(super) fn terminal_at(index: usize) -> Option<(DriverInstance, SourceSecurityIdentity)> {
+    let row = unsafe { (&*core::ptr::addr_of!(ROWS)).get(index)? };
+    if row.owner.phase() != SourceCreateSecurityPhase::Terminal || row.cleanup_active {
+        return None;
+    }
+    let (_, source) = instance_by_driver_id(row.source_driver_id)?;
+    row_matches(row, source).then_some((source, row.identity))
+}
+
 pub(super) fn release(
     source: DriverInstance,
     identity: SourceSecurityIdentity,
@@ -390,6 +463,9 @@ pub(super) fn release(
     let index = row_index(source, identity).ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
     unsafe {
         let rows = &mut *core::ptr::addr_of_mut!(ROWS);
+        if rows[index].retiring_projection.is_some() {
+            return Err(STATUS_INVALID_HANDLE_LOCAL);
+        }
         rows[index].owner.release(tokens)?;
         rows.swap_remove(index);
     }
