@@ -46,6 +46,7 @@ enum GeneratedHiveProfile {
     Production,
     PendingStartIntegration,
     LiveDeviceActionIntegration,
+    SehDriverIntegration,
 }
 
 fn generated_hive_profile_from_name(name: &str) -> Option<GeneratedHiveProfile> {
@@ -53,6 +54,7 @@ fn generated_hive_profile_from_name(name: &str) -> Option<GeneratedHiveProfile> 
         "production" => Some(GeneratedHiveProfile::Production),
         "pending-start" => Some(GeneratedHiveProfile::PendingStartIntegration),
         "live-device-action" => Some(GeneratedHiveProfile::LiveDeviceActionIntegration),
+        "seh-driver" => Some(GeneratedHiveProfile::SehDriverIntegration),
         _ => None,
     }
 }
@@ -61,7 +63,7 @@ fn generated_hive_profile_from_env() -> GeneratedHiveProfile {
     match std::env::var("NTOS_IMAGE_PROFILE") {
         Ok(value) => generated_hive_profile_from_name(&value).unwrap_or_else(|| {
             panic!(
-                "unsupported NTOS_IMAGE_PROFILE '{value}'; supported: production, pending-start, live-device-action"
+                "unsupported NTOS_IMAGE_PROFILE '{value}'; supported: production, pending-start, live-device-action, seh-driver"
             )
         }),
         Err(std::env::VarError::NotPresent) => GeneratedHiveProfile::Production,
@@ -1161,8 +1163,29 @@ fn build_hive_with_configuration(
         );
     }
 
+    if profile == GeneratedHiveProfile::SehDriverIntegration {
+        let seh_driver = hive.create_key(r"ControlSet001\Services\SehDriverTest");
+        hive.set_value(
+            seh_driver,
+            "ImagePath",
+            RegistryValueType::ExpandSz,
+            utf16le_sz(r"system32\drivers\driver_seh.sys"),
+        );
+        hive.set_dword(seh_driver, "Type", SERVICE_FILE_SYSTEM_DRIVER);
+        hive.set_dword(seh_driver, "Start", SERVICE_SYSTEM_START);
+        hive.set_dword(seh_driver, "ErrorControl", 0x1);
+        hive.set_value(
+            seh_driver,
+            "Group",
+            RegistryValueType::Sz,
+            utf16le_sz("File System"),
+        );
+    }
+
     let initial_network_devnodes = match profile {
-        GeneratedHiveProfile::Production | GeneratedHiveProfile::PendingStartIntegration => {
+        GeneratedHiveProfile::Production
+        | GeneratedHiveProfile::PendingStartIntegration
+        | GeneratedHiveProfile::SehDriverIntegration => {
             network_adapters.len()
         }
         GeneratedHiveProfile::LiveDeviceActionIntegration => {
@@ -1252,6 +1275,10 @@ mod tests {
             generated_hive_profile_from_name("live-device-action"),
             Some(GeneratedHiveProfile::LiveDeviceActionIntegration)
         );
+        assert_eq!(
+            generated_hive_profile_from_name("seh-driver"),
+            Some(GeneratedHiveProfile::SehDriverIntegration)
+        );
         assert_eq!(generated_hive_profile_from_name("pending"), None);
         assert_eq!(generated_hive_profile_from_name(""), None);
     }
@@ -1301,6 +1328,39 @@ mod tests {
                 ))
                 .is_none());
         }
+    }
+
+    #[test]
+    fn seh_driver_profile_declares_only_its_native_driver_service() {
+        let production = build_hive();
+        assert!(production
+            .open_key(r"ControlSet001\Services\SehDriverTest")
+            .is_none());
+
+        let hive = build_hive_with_configuration(
+            generated_e1000_adapters(1),
+            GeneratedDisplayMode::DEFAULT,
+            GeneratedHiveProfile::SehDriverIntegration,
+        );
+        let key = hive
+            .open_key(r"ControlSet001\Services\SehDriverTest")
+            .expect("native SEH driver service");
+        assert_eq!(hive.query_dword(key, "Type"), Some(SERVICE_FILE_SYSTEM_DRIVER));
+        assert_eq!(hive.query_dword(key, "Start"), Some(SERVICE_SYSTEM_START));
+        assert_eq!(
+            hive.query_value(key, "ImagePath"),
+            Some((
+                RegistryValueType::ExpandSz,
+                utf16le_sz(r"system32\drivers\driver_seh.sys").as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(key, "Group"),
+            Some((RegistryValueType::Sz, utf16le_sz("File System").as_slice()))
+        );
+        assert!(hive
+            .open_key(r"ControlSet001\Services\PendingStartTest")
+            .is_none());
     }
 
     #[test]
@@ -1996,6 +2056,7 @@ mod tests {
             (GeneratedHiveProfile::Production, 1),
             (GeneratedHiveProfile::PendingStartIntegration, 1),
             (GeneratedHiveProfile::LiveDeviceActionIntegration, 2),
+            (GeneratedHiveProfile::SehDriverIntegration, 1),
         ] {
             let bytes = encode_image(&build_hive_with_configuration(
                 generated_e1000_adapters(count),

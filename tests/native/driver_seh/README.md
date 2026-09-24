@@ -20,6 +20,15 @@ scope tables, and `nt-unwind` image admission at a nonpreferred component load b
 checks the compiled COFF object's relocations so a build with absolute address references cannot
 silently pass despite having no PE base-relocation directory.
 
-This is **not** a runtime pass. The fixture is not added to the boot image or registered as a
-service. A native gate must later load and call this real DriverEntry, read the evidence, and prove
-the nonreturning context transfer and FINALLY execution before claiming SEH integration.
+The production image does not contain this fixture. For the isolated runtime profile, run:
+
+```sh
+bash scripts/run-seh-driver-integration.sh
+```
+
+This compiles and verifies the PE, stages it only under `NTOS_IMAGE_PROFILE=seh-driver`, and
+registers it as a system-start file-system driver through generated hive metadata. The gate
+requires exact native evidence for the nonreturning raise, FINALLY execution, matching exception
+handler, genuine desktop paint, and the QEMU sentinel. `--desktop` can be passed through to show
+the display window. The boot readiness timeout defaults to 900 seconds and cannot exceed the
+one-hour limit enforced by `run.sh`.
