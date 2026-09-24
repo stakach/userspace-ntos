@@ -22,6 +22,8 @@ pub(crate) mod shared_ingress;
 
 #[path = "component_shared_pump.rs"]
 mod shared_pump;
+#[path = "hosted_seh_pump.rs"]
+mod hosted_seh_pump;
 
 const SEL4_RETYPE_FAN_OUT_LIMIT: u64 = 256;
 
@@ -678,7 +680,9 @@ pub(crate) unsafe fn spawn_shared_component_worker_suspended(
         tcb,
         tcb_set_ipc_buffer_r(tcb, d.ipc_buffer_va, ipc_buffer_frame),
     );
-    let stack_top = d.stack_base + d.stack_frames * 0x1000 - 16;
+    // A resumed TCB jumps to a function entry without a CALL. Supply the absent return slot so
+    // its SysV/Win64 prologue sees the required entry RSP mod 16 == 8.
+    let stack_top = d.stack_base + d.stack_frames * 0x1000 - 8;
     component_expect(
         b"worker-tcb-write-registers",
         tcb,
@@ -816,7 +820,7 @@ unsafe fn spawn_component_inner(d: &ComponentDescriptor, resume: bool) -> Spawne
     let error = tcb_set_ipc_buffer_r(tcb, IPCBUF_VADDR, ipcbuf);
     component_expect(b"tcb-set-ipcbuf", tcb, error);
     component_map_cap_bank_store(&mut map_cap_bank, ipcbuf);
-    let stack_top = d.stack_base + d.stack_frames * 0x1000 - 16;
+    let stack_top = d.stack_base + d.stack_frames * 0x1000 - 8;
     let error = tcb_write_registers_r(tcb, d.entry as u64, stack_top, heap_frames);
     component_expect(b"tcb-write-registers", tcb, error);
     component_expect(b"tcb-set-priority", tcb, tcb_set_priority_r(tcb, d.prio));
@@ -1679,9 +1683,37 @@ impl PumpLoopOutcome {
 #[inline(never)]
 unsafe fn pump_recv(ch: &PumpChannel, _reply_cap: u64) -> PumpMessage {
     match shared_ingress::owner::runtime::channel_route(ch) {
-        Ok(Some(route)) => shared_pump::receive(ch, route),
-        Err(_) | Ok(None) => PumpMessage::transport_wall(),
+        Ok(Some(route)) => shared_pump::receive(ch, route, false),
+        Err(_) | Ok(None) => {
+            crate::print_str(b"[pump-ingress] channel route unavailable\n");
+            PumpMessage::transport_wall()
+        }
     }
+}
+
+/// A handler exchange cannot shed its one-shot walk or its parent IRP at a scheduler checkpoint.
+/// Continue receiving on the exact route until that exchange reaches a restore or a fault wall.
+unsafe fn pump_recv_retained_seh(ch: &PumpChannel) -> PumpMessage {
+    match shared_ingress::owner::runtime::channel_route(ch) {
+        Ok(Some(route)) => shared_pump::receive(ch, route, true),
+        Err(_) | Ok(None) => {
+            crate::print_str(b"[pump-ingress] retained SEH route unavailable\n");
+            PumpMessage::transport_wall()
+        }
+    }
+}
+
+unsafe fn pump_reply_recv_retained_seh(
+    ch: &PumpChannel,
+    reply_cap: u64,
+    reply_msginfo: u64,
+    reply_r0: u64,
+    reply_r1: u64,
+) -> PumpMessage {
+    if !shared_pump::reply_seh(ch, reply_cap, reply_msginfo, [reply_r0, reply_r1, 0, 0]) {
+        return PumpMessage::transport_wall();
+    }
+    pump_recv_retained_seh(ch)
 }
 
 /// Acknowledge the component's outstanding Call before entering the receive-only path.
@@ -2218,6 +2250,7 @@ unsafe fn component_pump_loop(
     let ch = &mut channel;
     let mut msg = first;
     let mut outcome = PumpLoopOutcome::new();
+    let mut seh = hosted_seh_pump::SehPump::new();
     outcome.accounting = accounting;
     loop {
         if let Some(reply) = msg.shared_reply {
@@ -2230,6 +2263,10 @@ unsafe fn component_pump_loop(
         }
         msg.restore_received();
         if msg.scheduler_yield {
+            if seh.retained() {
+                msg = pump_recv_retained_seh(ch);
+                continue;
+            }
             outcome.scheduler_yielded = true;
             break;
         }
@@ -2250,6 +2287,10 @@ unsafe fn component_pump_loop(
                 }
             }
         } else if label == ch.dispatch_label {
+            if seh.retained() {
+                outcome.wall(msg);
+                break;
+            }
             let starting = ch.caps.kind == ReqKind::Syscall
                 && ch.initial == InitialAction::RecvFirst
                 && crate::win32k_glue::win32k_physical_lane_for_channel(
@@ -2871,33 +2912,28 @@ unsafe fn component_pump_loop(
                 }
             }
             continue;
-        } else if label == nt_unwind::seh_transport::RAISE_LABEL
+        } else if matches!(
+            label,
+            nt_unwind::seh_transport::RAISE_LABEL
+                | nt_unwind::seh_transport::PREPARE_LABEL
+                | nt_unwind::seh_transport::HANDLER_RESULT_LABEL
+                | nt_unwind::seh_transport::UNWIND_REQUEST_LABEL
+        )
             && ch.caps.kind == ReqKind::Irp
         {
-            let raise = nt_unwind::seh_transport::SehCall::parse(
+            let call = nt_unwind::seh_transport::SehCall::parse(
                 msg.mi,
-                [msg.m0, msg.m1, msg.m2],
+                [msg.m0, msg.m1, msg.m2, msg.m3],
             );
-            if let Some(nt_unwind::seh_transport::SehCall::Raise { context_va, status }) = raise {
-                let admitted = crate::driver_launch::inspect_hosted_seh_raise(
-                    ch,
-                    *reply_cap,
-                    msg.badge,
-                    context_va,
-                    status,
-                );
-                crate::print_str(if admitted {
-                    b"[fsd-seh] owned raise first pass; handler command unavailable\n"
-                } else {
-                    b"[fsd-seh] raise admission refused\n"
-                });
-            } else {
-                crate::print_str(b"[fsd-seh] malformed raise message\n");
-            }
-            // A status Reply would return into the nonreturning raise entry. The exact Reply and
-            // parent IRP remain owned by the wall until a handler-command continuation exists.
-            outcome.wall(msg);
-            break;
+            let Some(command) = call.and_then(|call| seh.call(ch, *reply_cap, msg.badge, call))
+            else {
+                crate::print_str(b"[fsd-seh] physical handler exchange refused\n");
+                outcome.wall(msg);
+                break;
+            };
+            let (info, words) = command.encode();
+            msg = pump_reply_recv_retained_seh(ch, *reply_cap, info, words[0], words[1]);
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_IO_CREATE_FILE_LABEL
             && ch.caps.kind == ReqKind::Irp
         {

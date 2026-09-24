@@ -3,6 +3,9 @@
     .globl ExRaiseStatus
 ExRaiseStatus:
     ud2
+    .globl DbgPrint
+DbgPrint:
+    ud2
     .globl __C_specific_handler
 __C_specific_handler:
     ud2

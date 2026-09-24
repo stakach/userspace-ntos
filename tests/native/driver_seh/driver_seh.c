@@ -10,6 +10,7 @@ typedef int32_t NTSTATUS;
 #define EXCEPTION_CONTINUE_SEARCH 0
 
 __declspec(dllimport) void __stdcall ExRaiseStatus(NTSTATUS status);
+__declspec(dllimport) int __cdecl DbgPrint(const char *format, ...);
 
 struct SehFixtureEvidence {
     uint32_t entered;
@@ -48,11 +49,20 @@ NTSTATUS __stdcall DriverEntry(void *driver_object, void *registry_path)
         SehFixtureEvidence.caught_code = __exception_code();
     }
 
+    NTSTATUS status = STATUS_SUCCESS;
     if (SehFixtureEvidence.entered != 1 || SehFixtureEvidence.after_raise != 0 ||
         SehFixtureEvidence.finally_calls != 1 || SehFixtureEvidence.caught != 1 ||
         SehFixtureEvidence.caught_code != (uint32_t)STATUS_ACCESS_DENIED ||
         SehFixtureEvidence.driver_entry_returned != 0) {
-        return STATUS_UNSUCCESSFUL;
+        status = STATUS_UNSUCCESSFUL;
     }
-    return STATUS_SUCCESS;
+    DbgPrint("[seh-native-proof] status=0x%08x entered=%u after-raise=%u finally=%u caught=%u caught-code=0x%08x returned-before-catch=%u\n",
+             (uint32_t)status, SehFixtureEvidence.entered,
+             SehFixtureEvidence.after_raise, SehFixtureEvidence.finally_calls,
+             SehFixtureEvidence.caught, SehFixtureEvidence.caught_code,
+             SehFixtureEvidence.driver_entry_returned);
+    if (status == STATUS_SUCCESS) {
+        DbgPrint("[seh-native-proof-complete]\n");
+    }
+    return status;
 }

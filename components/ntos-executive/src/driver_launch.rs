@@ -35,30 +35,18 @@ mod hosted_primary_retirement;
 #[path = "hosted_exception_images.rs"]
 mod hosted_exception_images;
 #[path = "hosted_exception_stack.rs"]
-#[allow(dead_code)] // KeRaiseStatus has not entered the native exception dispatcher yet.
-mod hosted_exception_stack;
+pub(crate) mod hosted_exception_stack;
 #[path = "hosted_c_specific_handler.rs"]
 mod hosted_c_specific_handler;
+#[path = "hosted_seh_component.rs"]
+mod hosted_seh_component;
 
-/// Negative-only ingress gate. It retains no handler continuation and must never authorize a
-/// Reply; the pump walls the owning IRP after recording the admission result.
-pub(crate) fn inspect_hosted_seh_raise(
+pub(crate) fn hosted_seh_linkage(
     channel: &crate::spawn_hosts::PumpChannel,
     reply_cap: u64,
-    badge: u64,
-    context_va: u64,
-    status: u32,
-) -> bool {
-    matches!(
-        hosted_exception_stack::capture_raise_first_step(
-            channel,
-            reply_cap,
-            badge,
-            context_va,
-            u64::from(status),
-        ),
-        Some(Ok(_))
-    )
+) -> Option<nt_unwind::seh_linkage_image::SehLinkageImage> {
+    let (_, instance) = instance_for_pump_channel(channel, reply_cap)?;
+    instance.seh_linkage
 }
 
 #[path = "component_scheduler.rs"]
@@ -32918,6 +32906,7 @@ pub fn fsd_export_addr(dll: &str, name: &str) -> Option<u64> {
 
 struct HostedProviderImportResolver<'a> {
     thunks: Option<&'a mut HostedExecutableThunkWriter>,
+    seh_raise_va: Option<u64>,
 }
 
 impl DriverImportResolver for HostedProviderImportResolver<'_> {
@@ -32926,6 +32915,9 @@ impl DriverImportResolver for HostedProviderImportResolver<'_> {
         request: DriverImportRequest<'_>,
     ) -> Option<DriverImportResolution> {
         let _ = request.iat_slot_rva;
+        if hosted_kernel_provider_dll(request.dll) && request.name == "ExRaiseStatus" {
+            return Some(DriverImportResolution::DirectVa(self.seh_raise_va?));
+        }
         if hosted_dependency_provider_dll(request.dll) {
             unsafe {
                 if let Some(plan) =
@@ -36382,6 +36374,7 @@ unsafe fn load_hosted_dependency_images(
         let dep_run_va = run_va + dep_offset;
         let mut resolver = HostedProviderImportResolver {
             thunks: executable_thunks.as_deref_mut(),
+            seh_raise_va: None,
         };
         let (dep_entry_rva, dep_image_len) = load_pe_into(
             planned.src_va,
@@ -36485,6 +36478,14 @@ unsafe fn load_hosted_auxiliary_image(
         }
     }
     copy_bytes(exec_va, mapped.bytes.as_ptr() as u64, mapped.bytes.len() as u64);
+    let slot_exec_va = exec_va.checked_add(u64::from(linkage.dispatch_slot_rva))?;
+    if read_volatile(slot_exec_va as *const u64) != 0 {
+        return None;
+    }
+    write_volatile(
+        slot_exec_va as *mut u64,
+        hosted_seh_component::raise_dispatch as *const () as usize as u64,
+    );
     let image =
         hosted_exception_images::capture(instance, exec_va, component_va, plan.auxiliary_image_len)?;
     Some((image, linkage))
@@ -36756,6 +36757,7 @@ unsafe fn load_driver_reserved(
     let primary_rights = &mut rights[primary_frame_offset as usize..];
     let mut resolver = HostedProviderImportResolver {
         thunks: executable_thunk_writer.as_mut(),
+        seh_raise_va: Some(seh_linkage.raise_va),
     };
     let (entry_rva, image_len) = load_pe_into(
         src_va,
@@ -47455,7 +47457,7 @@ unsafe fn build_hosted_irq_lane(
         {
             return None;
         }
-        let stack_top = component_base + FSD_WORKER_STACK_FRAMES * 0x1000 - 16;
+        let stack_top = component_base + FSD_WORKER_STACK_FRAMES * 0x1000 - 8;
         if tcb_write_registers_r(lane.tcb, tramp_va, stack_top, 0) != 0 {
             return None;
         }
@@ -54284,7 +54286,7 @@ unsafe fn spawn_hosted_driver_worker_thread(
     } else {
         u64::MAX
     };
-    let stack_top = stack_base + FSD_WORKER_STACK_FRAMES * 0x1000 - 16;
+    let stack_top = stack_base + FSD_WORKER_STACK_FRAMES * 0x1000 - 8;
     let set_regs = if tcb_retype == 0 && set_space == 0 && set_ipc == 0 {
         tcb_write_registers_r(tcb, tramp_va, stack_top, 0)
     } else {

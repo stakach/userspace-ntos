@@ -362,8 +362,8 @@ mod tests {
     impl StackReader for Frame {
         fn read_u64(&self, address: u64) -> Option<u64> {
             match address {
-                LOW + 0x10 => Some(0x55),
-                LOW + 0x18 => Some(BASE + 0x210),
+                address if address == LOW + 0x10 => Some(0x55),
+                address if address == LOW + 0x18 => Some(BASE + 0x210),
                 _ => None,
             }
         }

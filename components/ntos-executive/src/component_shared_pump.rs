@@ -4,24 +4,32 @@ use super::shared_ingress::owner::runtime;
 use super::*;
 use nt_component_suspension::peer_registry::PeerRoute;
 
-pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute) -> PumpMessage {
+pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: bool) -> PumpMessage {
     loop {
         crate::registry_mutation_work::redrive_provider();
         match runtime::resume_acknowledged_retained_services() {
             Ok(true) => continue,
             Ok(false) => {}
-            Err(_) => return PumpMessage::transport_wall(),
+            Err(_) => {
+                crate::print_str(b"[pump-ingress] retained-service resume failed\n");
+                return PumpMessage::transport_wall();
+            }
         }
         if runtime::resume_service(route).is_err() {
+            crate::print_str(b"[pump-ingress] route resume failed\n");
             return PumpMessage::transport_wall();
         }
         let next = match runtime::next_message(route) {
             Ok(next) => next,
-            Err(_) => return PumpMessage::transport_wall(),
+            Err(_) => {
+                crate::print_str(b"[pump-ingress] next-message failed\n");
+                return PumpMessage::transport_wall();
+            }
         };
         if let Some((reply, message)) = next {
             let completion = message.info() >> 12 == ch.dispatch_label;
             if !completion && runtime::adopt(route, reply).is_err() {
+                crate::print_str(b"[pump-ingress] Call adoption failed\n");
                 return PumpMessage::transport_wall();
             }
             let mut message = PumpMessage::from_received(message);
@@ -40,17 +48,23 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute) -> PumpMessage 
                     continue;
                 }
                 Ok(None) => {}
-                Err(_) => return PumpMessage::transport_wall(),
+                Err(_) => {
+                    crate::print_str(b"[pump-ingress] autonomous selection failed\n");
+                    return PumpMessage::transport_wall();
+                }
             }
         }
-        if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
+        if !retained_seh && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
             && crate::dispatcher_bootstrap::timer_work_pending()
         {
             return PumpMessage::scheduler_yield();
         }
         let execution = match runtime::receive_owner(route) {
             Ok(execution) => execution,
-            Err(_) => return PumpMessage::transport_wall(),
+            Err(_) => {
+                crate::print_str(b"[pump-ingress] receive owner failed\n");
+                return PumpMessage::transport_wall();
+            }
         };
         match runtime::receive(execution, ch.tcb, true) {
             Ok(runtime::Arrival::Hosted) => {}
@@ -66,11 +80,14 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute) -> PumpMessage 
                 if pump_deadman_tripped() {
                     return PumpMessage::deadman_wall();
                 }
-                if pump_scheduler_work_pending(ch, irq) {
+                if !retained_seh && pump_scheduler_work_pending(ch, irq) {
                     return PumpMessage::scheduler_yield();
                 }
             }
-            Err(_) => return PumpMessage::transport_wall(),
+            Err(_) => {
+                crate::print_str(b"[pump-ingress] physical receive failed\n");
+                return PumpMessage::transport_wall();
+            }
         }
     }
 }
@@ -133,21 +150,40 @@ unsafe fn autonomous_failure_diag(route: PeerRoute, stage: &[u8]) {
 }
 
 pub(super) unsafe fn reply(ch: &PumpChannel, reply: u64, info: u64, words: [u64; 4]) -> bool {
-    // Replies are label-zero, capability-free payloads. Capture the entire IPC bank before any
+    reply_with_info(ch, reply, info, words, false)
+}
+
+pub(super) unsafe fn reply_seh(ch: &PumpChannel, reply: u64, info: u64, words: [u64; 4]) -> bool {
+    if nt_unwind::seh_transport::SehCommand::parse(info, [words[0], words[1]]).is_none() {
+        crate::print_str(b"[fsd-seh] malformed command reply\n");
+        PUMP_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    reply_with_info(ch, reply, info, words, true)
+}
+
+unsafe fn reply_with_info(ch: &PumpChannel, reply: u64, info: u64, words: [u64; 4], labeled: bool) -> bool {
+    // Capture the entire IPC bank before any
     // binding probe can overwrite MR4+, then pass an owned payload to the retained reply owner.
-    if info > 120 {
+    if info & 0xf80 != 0 || (info >> 12 != 0 && !labeled) || (info & 0x7f) > 120 {
+        if labeled { crate::print_str(b"[fsd-seh] reply info refused\n"); }
         PUMP_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     let captured = crate::ipc_message::capture_received(0, info, words);
-    let len = info as usize;
+    let len = (info & 0x7f) as usize;
     let mut payload = [0u64; 120];
     for (index, word) in payload[..len].iter_mut().enumerate() {
         *word = captured.word(index).expect("validated Reply length");
     }
     match runtime::channel_route(ch) {
-        Ok(Some(route)) => runtime::reply(route, reply, &payload[..len]).is_ok(),
+        Ok(Some(route)) => {
+            let result = runtime::reply_with_info(route, reply, info, &payload[..len]);
+            if labeled && result.is_err() { crate::print_str(b"[fsd-seh] retained reply refused\n"); }
+            result.is_ok()
+        }
         Ok(None) | Err(_) => {
+            if labeled { crate::print_str(b"[fsd-seh] reply route refused\n"); }
             PUMP_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed);
             false
         }

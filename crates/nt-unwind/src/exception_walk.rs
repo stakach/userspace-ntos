@@ -144,7 +144,7 @@ pub struct HandlerInvocation {
     pub handler: u64,
     pub handler_data: u64,
     pub target_ip: u64,
-    /// A fresh frame starts at scope zero. Resuming a collided scope is not implemented.
+    /// Fresh frames start at zero; a validated collided dispatcher resumes its saved scope.
     pub scope_index: u32,
     pub contexts: HandlerContexts,
     /// Required only for `ExceptionCollidedUnwind` (3).

@@ -400,13 +400,14 @@ impl NativeSharedIngress {
         ).map_err(super::ReceiveError::Admit)
     }
 
-    /// Captured label-zero reply. Invocation ACK consumes the Call but does not prove
+    /// Captured reply. Invocation ACK consumes the Call but does not prove
     /// provider completion; ordinary scheduling may run the provider before this function returns.
     pub(crate) unsafe fn reply<C, R, T>(
         &mut self,
         lanes: &ComponentSuspensionLanes<C, R, T>,
         route: PeerRoute,
         dispatch: nt_component_suspension::LaneDispatchIdentity,
+        info: u64,
         words: &[u64],
         resolve_caller: impl FnOnce(PeerRoute) -> Option<u64>,
     ) -> Result<nt_component_suspension::IngressReplyObservation, super::ReceiveError> {
@@ -415,7 +416,7 @@ impl NativeSharedIngress {
                 nt_component_suspension::ReservedReceiveError::InvalidPhase,
             ));
         }
-        if words.len() > 120 {
+        if words.len() > 120 || info & 0x7f != words.len() as u64 || info & 0xf80 != 0 {
             return Err(super::ReceiveError::InvalidReplyLength);
         }
         let _saved = crate::ipc_message::SavedMessageBuffer::capture();
@@ -437,7 +438,7 @@ impl NativeSharedIngress {
                 for (index, word) in words.iter().enumerate().skip(4) {
                     core::ptr::write_volatile(base.add(index + 1), *word);
                 }
-                let error = crate::reply_on(reply, words.len() as u64,
+                let error = crate::reply_on(reply, info,
                     registers[0], registers[1], registers[2], registers[3]);
                 if error == 0 {
                     nt_component_suspension::IngressReplyObservation::Acknowledged
