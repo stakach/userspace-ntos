@@ -508,6 +508,7 @@ pub const SH_DPC_DELIVERIES: u64 = 0x488; // out: deferred routines called
 pub const SH_SEH_FOREIGN_CALL2_VA: u64 = 0x490; // in: admitted PE boundary for two-argument callbacks
 pub const SH_SUPPORT_ENTRY_COUNT: u64 = 0x498; // in: dependency support records to initialize
 pub const SH_SUPPORT_ENTRY_CAPACITY: u64 = 0x4A0; // in: dependency support record capacity
+pub const SH_SEH_FOREIGN_CALL16_VA: u64 = 0x4A8; // in: admitted PE boundary for variable-arity callbacks
 pub const SH_SUPPORT_ENTRY_RVA: u64 = 0x4B0; // in: first support DriverEntry RVA, legacy mirror
 pub const SH_SUPPORT_DE_STATUS: u64 = 0x4B8; // out: aggregate support DriverEntry NTSTATUS
 pub const SH_SUPPORT_VERDICT: u64 = 0x4C0; // out: aggregate support DriverEntry verdict bits
@@ -4207,7 +4208,7 @@ static mut BUGCHECK_JB: [u64; 3] = [0; 3];
 
 // The setjmp/longjmp pair. Written in assembly on purpose: the escape abandons npfs' frames, so no
 // Rust value may be live across it. `fsd_guarded_call` saves every Win64 callee-saved GPR, records
-// (pop-base, resume-address) in the jump buffer, then calls `handler(devobj, irp)` with a forced
+// (pop-base, resume-address) in the jump buffer, then calls the admitted PE boundary with a forced
 // Win64 call frame (`rsp` 16-byte aligned before `call`, plus 32 bytes of shadow space). Normal
 // returns restore the saved pop-base from that owned call frame; the longjmp path restores it from
 // the explicit jump buffer. That keeps the epilogue independent of any hosted-driver preservation of
@@ -4215,7 +4216,7 @@ static mut BUGCHECK_JB: [u64; 3] = [0; 3];
 core::arch::global_asm!(
     ".text",
     ".globl fsd_guarded_call",
-    "fsd_guarded_call:", // rcx = handler, rdx = devobj, r8 = irp, r9 = jump buffer
+    "fsd_guarded_call:", // rcx = handler, rdx = devobj, r8 = irp, r9 = jump buffer, stack = PE boundary
     "push rbp",
     "push rbx",
     "push rsi",
@@ -4229,9 +4230,7 @@ core::arch::global_asm!(
     "lea rax, [rip + 11f]",
     "mov [r15], r11",
     "mov [r15 + 8], rax",
-    "mov r10, rcx",
-    "mov rcx, rdx",
-    "mov rdx, r8",
+    "mov r10, [rsp + 0x68]",
     "and rsp, -16",
     "sub rsp, 0x30",
     "mov [rsp + 0x20], r11",
@@ -4255,8 +4254,8 @@ core::arch::global_asm!(
     "mov r15, rcx",
     "mov rsp, [rcx]",
     "jmp qword ptr [rcx + 8]",
-    ".globl fsd_guarded_call_tail8",
-    "fsd_guarded_call_tail8:", // rcx = handler, rdx/r8/r9/stack = args, stack = tail/jump buffer
+    ".globl fsd_guarded_call_vector",
+    "fsd_guarded_call_vector:", // rcx = handler, rdx = args, r8 = count, r9 = jump buffer, stack = PE boundary
     "push rbp",
     "push rbx",
     "push rsi",
@@ -4266,38 +4265,16 @@ core::arch::global_asm!(
     "push r14",
     "push r15",
     "mov r11, rsp",
-    "mov r14, [rsp + 0x68]",
-    "mov r13, [rsp + 0x70]",
-    "mov r15, [rsp + 0x78]",
+    "mov r15, r9",
     "lea rax, [rip + 21f]",
     "mov [r15], r11",
     "mov [r15 + 8], rax",
-    "mov r10, rcx",
-    "mov rcx, rdx",
-    "mov rdx, r8",
-    "mov r8, r9",
-    "mov r9, r14",
+    "mov r10, [rsp + 0x68]",
     "and rsp, -16",
-    "sub rsp, 0x70",
-    "mov rax, [r13]",
-    "mov [rsp + 0x20], rax",
-    "mov rax, [r13 + 0x08]",
-    "mov [rsp + 0x28], rax",
-    "mov rax, [r13 + 0x10]",
-    "mov [rsp + 0x30], rax",
-    "mov rax, [r13 + 0x18]",
-    "mov [rsp + 0x38], rax",
-    "mov rax, [r13 + 0x20]",
-    "mov [rsp + 0x40], rax",
-    "mov rax, [r13 + 0x28]",
-    "mov [rsp + 0x48], rax",
-    "mov rax, [r13 + 0x30]",
-    "mov [rsp + 0x50], rax",
-    "mov rax, [r13 + 0x38]",
-    "mov [rsp + 0x58], rax",
-    "mov [rsp + 0x60], r11",
+    "sub rsp, 0x30",
+    "mov [rsp + 0x20], r11",
     "call r10",
-    "mov rsp, [rsp + 0x60]",
+    "mov rsp, [rsp + 0x20]",
     "jmp 22f",
     "21:",
     "mov rsp, [r15]",
@@ -4314,17 +4291,24 @@ core::arch::global_asm!(
 );
 
 extern "win64" {
-    fn fsd_guarded_call(handler: u64, devobj: u64, irp: u64, jb: *mut u64) -> i32;
-    fn fsd_guarded_call_tail8(
+    fn fsd_guarded_call(handler: u64, devobj: u64, irp: u64, jb: *mut u64, boundary: u64) -> i32;
+    fn fsd_guarded_call_vector(
         handler: u64,
-        arg0: u64,
-        arg1: u64,
-        arg2: u64,
-        arg3: u64,
-        tail_base: u64,
+        args: *const u64,
+        count: u64,
         jb: *mut u64,
+        boundary: u64,
     ) -> u64;
     fn fsd_guarded_longjmp(jb: *mut u64) -> !;
+}
+
+pub(crate) unsafe fn call_hosted_pe(target: u64, args: &[u64]) -> u64 {
+    assert!(target != 0 && args.len() <= 16, "invalid hosted PE callback");
+    let boundary = read_volatile((FSD_SHARED_VADDR + SH_SEH_FOREIGN_CALL16_VA) as *const u64);
+    assert_ne!(boundary, 0, "hosted PE callback lacks its admitted boundary");
+    let call: unsafe extern "win64" fn(u64, *const u64, u64) -> u64 =
+        core::mem::transmute(boundary as *const ());
+    call(target, args.as_ptr(), args.len() as u64)
 }
 
 /// `DECLSPEC_NORETURN void KeBugCheckEx(ULONG Code, ULONG_PTR P1, P2, P3, P4)`. Report the driver's
@@ -7919,8 +7903,7 @@ extern "win64" fn s_io_cancel_irp(irp: u64) -> u8 {
             } else {
                 0
             };
-            let f: extern "win64" fn(u64, u64) = core::mem::transmute(routine as *const ());
-            f(device, irp);
+            call_hosted_pe(routine, &[device, irp]);
             return 1;
         }
         IO_CANCEL_SPIN_LOCK.store(0, Ordering::Release);
@@ -8050,8 +8033,7 @@ unsafe fn csq_acquire(csq: u64) -> u8 {
     let acquire = read_unaligned((csq + IO_CSQ_ACQUIRE_LOCK_OFFSET) as *const u64);
     let mut irql = 0u8;
     if acquire != 0 {
-        let f: extern "win64" fn(u64, u64) = core::mem::transmute(acquire as *const ());
-        f(csq, (&mut irql as *mut u8) as u64);
+        call_hosted_pe(acquire, &[csq, (&mut irql as *mut u8) as u64]);
     }
     irql
 }
@@ -8059,8 +8041,7 @@ unsafe fn csq_acquire(csq: u64) -> u8 {
 unsafe fn csq_release(csq: u64, irql: u8) {
     let release = read_unaligned((csq + IO_CSQ_RELEASE_LOCK_OFFSET) as *const u64);
     if release != 0 {
-        let f: extern "win64" fn(u64, u8) = core::mem::transmute(release as *const ());
-        f(csq, irql);
+        call_hosted_pe(release, &[csq, u64::from(irql)]);
     }
 }
 
@@ -8134,8 +8115,7 @@ extern "win64" fn s_io_csq_insert_irp(csq: u64, irp: u64, context: u64) {
             return;
         }
         let irql = csq_acquire(csq);
-        let f: extern "win64" fn(u64, u64) = core::mem::transmute(insert as *const ());
-        f(csq, irp);
+        call_hosted_pe(insert, &[csq, irp]);
         csq_release(csq, irql);
     }
 }
@@ -8155,8 +8135,7 @@ extern "win64" fn s_io_csq_remove_irp(csq: u64, context: u64) -> u64 {
             return 0;
         }
         let irql = csq_acquire(csq);
-        let f: extern "win64" fn(u64, u64) = core::mem::transmute(remove as *const ());
-        f(csq, irp);
+        call_hosted_pe(remove, &[csq, irp]);
         csq_clear_irp_context(irp);
         csq_release(csq, irql);
         irp
@@ -8175,12 +8154,9 @@ extern "win64" fn s_io_csq_remove_next_irp(csq: u64, peek_context: u64) -> u64 {
             return 0;
         }
         let irql = csq_acquire(csq);
-        let peek_fn: extern "win64" fn(u64, u64, u64) -> u64 =
-            core::mem::transmute(peek as *const ());
-        let irp = peek_fn(csq, 0, peek_context);
+        let irp = call_hosted_pe(peek, &[csq, 0, peek_context]);
         if irp != 0 {
-            let remove_fn: extern "win64" fn(u64, u64) = core::mem::transmute(remove as *const ());
-            remove_fn(csq, irp);
+            call_hosted_pe(remove, &[csq, irp]);
             csq_clear_irp_context(irp);
         }
         csq_release(csq, irql);
@@ -8239,9 +8215,7 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                 forwarded_minor,
                 STATUS_PENDING as i32,
             );
-            let dispatch: extern "win64" fn(u64, u64) -> i32 =
-                core::mem::transmute(handler as *const ());
-            return dispatch(device, irp);
+            return call_hosted_pe(handler, &[device, irp]) as u32 as i32;
         }
 
         if major != IRP_MJ_PNP {
@@ -8480,10 +8454,10 @@ unsafe fn unwind_hosted_irp(irp: u64) -> Result<HostedIrpUnwindOutcome, ()> {
             context,
         );
         if frame.invoke_routine {
-            let routine: extern "win64" fn(u64, u64, u64) -> i32 =
-                core::mem::transmute(completion as *const ());
             let disposition = nt_io_manager::CompletionRoutineDisposition::from_status(
-                nt_status::NtStatus(routine(device_object, irp, context)),
+                nt_status::NtStatus(
+                    call_hosted_pe(completion, &[device_object, irp, context]) as u32 as i32,
+                ),
             );
             if disposition == nt_io_manager::CompletionRoutineDisposition::Stop {
                 return Ok(HostedIrpUnwindOutcome::MoreProcessingRequired);
@@ -10411,9 +10385,7 @@ extern "win64" fn s_dma_get_scatter_gather_list(
             return status;
         }
 
-        let routine: extern "win64" fn(u64, u64, u64, u64) =
-            core::mem::transmute(execution_routine as *const ());
-        routine(device_object, 0, sg_list, context);
+        call_hosted_pe(execution_routine, &[device_object, 0, sg_list, context]);
         trace_hosted_dma_sg(
             b"get",
             b"routine-returned",
@@ -10489,9 +10461,7 @@ extern "win64" fn s_dma_build_scatter_gather_list(
         if status != 0 {
             return status;
         }
-        let routine: extern "win64" fn(u64, u64, u64, u64) =
-            core::mem::transmute(execution_routine as *const ());
-        routine(device_object, 0, scatter_gather_buffer, context);
+        call_hosted_pe(execution_routine, &[device_object, 0, scatter_gather_buffer, context]);
         0
     }
 }
@@ -11147,9 +11117,10 @@ extern "win64" fn s_rtl_query_registry_values(
             }
 
             if (flags & RTL_QUERY_REGISTRY_NOVALUE) != 0 && routine != 0 {
-                let f: extern "win64" fn(u64, u32, u64, u32, u64, u64) -> i32 =
-                    core::mem::transmute(routine as *const ());
-                let status = f(0, REG_NONE, 0, 0, context, entry_context);
+                let status = call_hosted_pe(
+                    routine,
+                    &[0, u64::from(REG_NONE), 0, 0, context, entry_context],
+                ) as u32 as i32;
                 if status < 0 {
                     return status;
                 }
@@ -11158,19 +11129,12 @@ extern "win64" fn s_rtl_query_registry_values(
             }
 
             if routine != 0 && name != 0 {
-                let f: extern "win64" fn(u64, u32, u64, u32, u64, u64) -> i32 =
-                    core::mem::transmute(routine as *const ());
                 let status = if default_data != 0 || default_length != 0 {
-                    f(
-                        name,
-                        default_type,
-                        default_data,
-                        default_length,
-                        context,
-                        entry_context,
-                    )
+                    call_hosted_pe(routine, &[name, u64::from(default_type), default_data,
+                        u64::from(default_length), context, entry_context]) as u32 as i32
                 } else {
-                    f(name, REG_NONE, 0, 0, context, entry_context)
+                    call_hosted_pe(routine, &[name, u64::from(REG_NONE), 0, 0, context,
+                        entry_context]) as u32 as i32
                 };
                 if status < 0 {
                     return status;
@@ -33102,15 +33066,16 @@ unsafe fn component_dispatch_provider_export() -> (i32, u64) {
     jb[0] = 0;
     jb[1] = 0;
     jb[2] = 0;
-    let result = fsd_guarded_call_tail8(
-        export,
-        arg0,
-        arg1,
-        arg2,
-        arg3,
-        FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_STACK_BASE,
-        jb.as_mut_ptr(),
-    );
+    let mut args = [0u64; 12];
+    args[..4].copy_from_slice(&[arg0, arg1, arg2, arg3]);
+    for index in 0..8 {
+        args[index + 4] = read_volatile(
+            (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_STACK_BASE + (index as u64) * 8) as *const u64,
+        );
+    }
+    let boundary = read_volatile((FSD_SHARED_VADDR + SH_SEH_FOREIGN_CALL16_VA) as *const u64);
+    assert_ne!(boundary, 0, "hosted provider export lacks its admitted PE boundary");
+    let result = fsd_guarded_call_vector(export, args.as_ptr(), 12, jb.as_mut_ptr(), boundary);
     let bugchecked = jb[2] != 0;
     jb[1] = 0;
     jb[2] = 0;
@@ -33133,15 +33098,16 @@ unsafe fn component_dispatch_provider_callback() -> (i32, u64) {
     jb[0] = 0;
     jb[1] = 0;
     jb[2] = 0;
-    let result = fsd_guarded_call_tail8(
-        target,
-        arg0,
-        arg1,
-        arg2,
-        arg3,
-        FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_STACK_BASE,
-        jb.as_mut_ptr(),
-    );
+    let mut args = [0u64; 12];
+    args[..4].copy_from_slice(&[arg0, arg1, arg2, arg3]);
+    for index in 0..8 {
+        args[index + 4] = read_volatile(
+            (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_STACK_BASE + (index as u64) * 8) as *const u64,
+        );
+    }
+    let boundary = read_volatile((FSD_SHARED_VADDR + SH_SEH_FOREIGN_CALL16_VA) as *const u64);
+    assert_ne!(boundary, 0, "hosted provider callback lacks its admitted PE boundary");
+    let result = fsd_guarded_call_vector(target, args.as_ptr(), 12, jb.as_mut_ptr(), boundary);
     let bugchecked = jb[2] != 0;
     jb[1] = 0;
     jb[2] = 0;
@@ -33278,8 +33244,7 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
         if unload == 0 {
             return (0xC000_0010u32 as i32, 0); // STATUS_INVALID_DEVICE_REQUEST
         }
-        let f: extern "win64" fn(u64) = core::mem::transmute(unload as *const ());
-        f(request_drv);
+        call_hosted_pe(unload, &[request_drv]);
         return (0, 0);
     }
     if major == FSD_DISPATCH_CANCEL_IRP {
@@ -33368,8 +33333,7 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
             previous_device_head,
         );
         write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DEVICE_OBJECT) as *mut u64, 0);
-        let add: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(add_device as *const ());
-        let status = add(request_drv, pdo);
+        let status = call_hosted_pe(add_device, &[request_drv, pdo]) as u32 as i32;
         return (
             status,
             crate::hosted_driver_projection::hosted_attached_device(pdo),
@@ -33407,15 +33371,10 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
             Err(status) => return (status, 0),
         };
         let mut again = 0u8;
-        let find: extern "win64" fn(u64, u64, u64, u64, u64) -> u32 =
-            core::mem::transmute(find_adapter as *const ());
-        let status = find(
-            hw_extension,
-            hw_context,
-            0,
-            FSD_ARG_VADDR,
-            (&mut again as *mut u8) as u64,
-        );
+        let status = call_hosted_pe(
+            find_adapter,
+            &[hw_extension, hw_context, 0, FSD_ARG_VADDR, (&mut again as *mut u8) as u64],
+        ) as u32;
         hosted_video_port_control::finish_find_adapter(device, status == VP_NO_ERROR);
         let calls = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_FIND_ADAPTER_CALLS) as *const u64);
         write_volatile(
@@ -34888,7 +34847,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     jb[0] = 0;
     jb[1] = 0;
     jb[2] = 0;
-    let ret = fsd_guarded_call(handler, devobj, irp, jb.as_mut_ptr());
+    let boundary = read_volatile((FSD_SHARED_VADDR + SH_SEH_FOREIGN_CALL2_VA) as *const u64);
+    assert_ne!(boundary, 0, "hosted driver callback lacks its admitted PE boundary");
+    let ret = fsd_guarded_call(handler, devobj, irp, jb.as_mut_ptr(), boundary);
     let post_call_irp_status =
         read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const u32);
     let post_call_irp_information = read_unaligned((irp + 0x38) as *const u64);
@@ -36746,6 +36707,10 @@ unsafe fn load_driver_reserved(
     write_volatile(
         (win.shared_va + SH_SEH_FOREIGN_CALL2_VA) as *mut u64,
         seh_linkage.foreign_call2_va,
+    );
+    write_volatile(
+        (win.shared_va + SH_SEH_FOREIGN_CALL16_VA) as *mut u64,
+        seh_linkage.foreign_call16_va,
     );
     let support_images = load_hosted_dependency_images(
         &planned_images,
