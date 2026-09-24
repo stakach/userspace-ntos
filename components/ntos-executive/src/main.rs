@@ -14193,7 +14193,8 @@ unsafe fn map_boot_proof_alias(frame: u64) -> (u64, u64) {
 /// Map the page tables backing one hosted process's 64 MiB demand-fault scratch window
 /// (`*_SCRATCH_BASE`) in the executive's own VSpace. Each demand fill takes a UNIQUE monotonic
 /// scratch slot within this window (`scratch_base + faults*0x1000`), so it must cover FAULT_CAP
-/// pages; 16 PTs = 8192 pages > FAULT_CAP (6000). Called once per process at spawn.
+/// pages; 32 PTs cover the full window. Initial System's window is mapped before boot drivers;
+/// later process windows are mapped when those processes spawn.
 pub(crate) unsafe fn map_demand_scratch_pts(base: u64) {
     // 32 PTs × 2 MiB = the FULL 64 MiB DEMAND_SCRATCH_WINDOW (16384 scratch slots). Raised from 16
     // (32 MiB / 8192 slots) for (A) EAGER IMAGE-MAP: an eager whole-image fill front-loads every
@@ -29616,6 +29617,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         &mut passed,
     );
 
+    // Boot drivers may create System threads during DriverEntry. Their canonical thread bodies
+    // use the same retained scratch alias as later process demand fills, so its page tables must
+    // exist before the first driver executes rather than only when SMSS starts.
+    map_demand_scratch_pts(SMSS_SCRATCH_BASE);
+
     // --- SERVICE 9: the GENERAL DYNAMIC driver-launch path. The SYSTEM hive is imported into
     // Config Manager metadata, ordered by ServiceGroupOrder, then narrowed by mechanism: FSD-class
     // services use the persistent IRP host directly; device-class services are selected from
@@ -31726,10 +31732,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // Demand-fault scratch: each filled image/ntdll page keeps a persistent
                     // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
                     // so the region grows one page per fault. BATCH 22: smss now uses its own 64 MiB
-                    // demand-scratch window (SMSS_SCRATCH_BASE) with 16 pre-mapped PTs, matching the
-                    // widened per-process layout — clear of every other executive mapping.
+                    // demand-scratch window (SMSS_SCRATCH_BASE), already mapped before boot
+                    // driver execution and clear of every other executive mapping.
                     const SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE;
-                    map_demand_scratch_pts(SCRATCH_BASE);
                     // The demand-fault router fills ntdll's pages from THIS PE — pass OUR ntdll when
                     // substituting so smss's ntdll pages (incl. OUR LdrpInitialize .text) fault in
                     // from OUR DLL's bytes; otherwise the real ntdll (fallback).

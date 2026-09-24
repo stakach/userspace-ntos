@@ -61,7 +61,9 @@ typedef struct _DEVICE_OBJECT {
 } DEVICE_OBJECT;
 
 typedef struct {
-    uint8_t Reserved[0x58];
+    uint8_t Reserved0[0x18];
+    void *FsContext;
+    uint8_t Reserved1[0x38];
     UNICODE_STRING FileName;
 } FILE_OBJECT;
 
@@ -138,6 +140,7 @@ _Static_assert(offsetof(DRIVER_OBJECT, DriverUnload) == 0x68, "driver unload x64
 _Static_assert(offsetof(DRIVER_OBJECT, MajorFunction) == 0x70, "driver dispatch x64 ABI");
 _Static_assert(offsetof(DEVICE_OBJECT, Flags) == 0x30, "device flags x64 ABI");
 _Static_assert(offsetof(FILE_OBJECT, FileName) == 0x58, "file name x64 ABI");
+_Static_assert(offsetof(FILE_OBJECT, FsContext) == 0x18, "file context x64 ABI");
 _Static_assert(sizeof(MUP_PROVIDER_REGISTRATION_INFO) == 20, "Mup registration ABI");
 _Static_assert(offsetof(QUERY_PATH_REQUEST, FilePathName) == 16, "query path ABI");
 
@@ -152,11 +155,15 @@ __declspec(dllimport) NTSTATUS __stdcall ZwFsControlFile(HANDLE, HANDLE, void *,
     IO_STATUS_BLOCK *, uint32_t, void *, uint32_t, void *, uint32_t);
 __declspec(dllimport) NTSTATUS __stdcall ZwWaitForSingleObject(HANDLE, uint8_t, int64_t *);
 __declspec(dllimport) NTSTATUS __stdcall ZwClose(HANDLE);
+__declspec(dllimport) NTSTATUS __stdcall PsCreateSystemThread(HANDLE *, uint32_t,
+    OBJECT_ATTRIBUTES *, HANDLE, void *, void (__stdcall *)(void *), void *);
+__declspec(dllimport) void __stdcall PsTerminateSystemThread(NTSTATUS);
 __declspec(dllimport) int __cdecl DbgPrint(const char *, ...);
 
 struct MupProviderEvidence {
     uint32_t driver_entry;
     uint32_t device_created;
+    uint32_t registration_worker_created;
     uint32_t mup_opened;
     uint32_t registration_sent;
     uint32_t registration_status;
@@ -165,6 +172,9 @@ struct MupProviderEvidence {
     uint32_t create_count;
     uint32_t cleanup_count;
     uint32_t close_count;
+    uint32_t probe_file_created;
+    uint32_t probe_file_cleaned;
+    uint32_t probe_file_closed;
     uint32_t query_count;
     uint32_t query_accepted;
     uint32_t query_rejected;
@@ -176,6 +186,7 @@ struct MupProviderEvidence {
 volatile struct MupProviderEvidence MupProviderEvidence;
 static DEVICE_OBJECT *ProviderDevice;
 static HANDLE MupRegistrationHandle;
+static HANDLE RegistrationWorkerHandle;
 
 static WCHAR ProviderName[] = {
     '\\', 'D', 'e', 'v', 'i', 'c', 'e', '\\', 'N', 't', 'o', 's', 'U', 'n', 'c', 'P',
@@ -193,6 +204,21 @@ static WCHAR ProbeName[] = {
 static const WCHAR AcceptedPrefix[] = {
     '\\', 'n', 't', 'o', 's', '-', 'p', 'r', 'o', 'b', 'e'
 };
+static const WCHAR ProbeRelativeName[] = {
+    '\\', 'n', 't', 'o', 's', '-', 'p', 'r', 'o', 'b', 'e',
+    '\\', 's', 'h', 'a', 'r', 'e'
+};
+
+static int IsProbeFileName(const UNICODE_STRING *name)
+{
+    if (name->Length != sizeof(ProbeRelativeName) || name->Buffer == NULL) return 0;
+    for (uint32_t i = 0; i < sizeof(ProbeRelativeName) / sizeof(WCHAR); i++) {
+        WCHAR c = name->Buffer[i];
+        if (c >= 'A' && c <= 'Z') c = (WCHAR)(c + ('a' - 'A'));
+        if (c != ProbeRelativeName[i]) return 0;
+    }
+    return 1;
+}
 
 static NTSTATUS Complete(IRP *irp, NTSTATUS status, uintptr_t information)
 {
@@ -207,17 +233,28 @@ static NTSTATUS __stdcall ProviderCreate(DEVICE_OBJECT *device, IRP *irp)
     (void)device;
     MupProviderEvidence.create_count++;
     IO_STACK_LOCATION *stack = irp->CurrentStackLocation;
-    if (stack == NULL || stack->FileObject == NULL ||
-        ((FILE_OBJECT *)stack->FileObject)->FileName.Length != 0) {
+    if (stack == NULL || stack->FileObject == NULL) {
         return Complete(irp, STATUS_BAD_NETWORK_NAME, 0);
     }
-    return Complete(irp, STATUS_SUCCESS, 0);
+    FILE_OBJECT *file = (FILE_OBJECT *)stack->FileObject;
+    if (file->FileName.Length == 0) return Complete(irp, STATUS_SUCCESS, 1);
+    if (!IsProbeFileName(&file->FileName)) {
+        return Complete(irp, STATUS_BAD_NETWORK_NAME, 0);
+    }
+    file->FsContext = file;
+    MupProviderEvidence.probe_file_created++;
+    return Complete(irp, STATUS_SUCCESS, 1);
 }
 
 static NTSTATUS __stdcall ProviderCleanup(DEVICE_OBJECT *device, IRP *irp)
 {
     (void)device;
     MupProviderEvidence.cleanup_count++;
+    IO_STACK_LOCATION *stack = irp->CurrentStackLocation;
+    if (stack != NULL && stack->FileObject != NULL) {
+        FILE_OBJECT *file = (FILE_OBJECT *)stack->FileObject;
+        if (file->FsContext == file) MupProviderEvidence.probe_file_cleaned++;
+    }
     return Complete(irp, STATUS_SUCCESS, 0);
 }
 
@@ -225,6 +262,14 @@ static NTSTATUS __stdcall ProviderClose(DEVICE_OBJECT *device, IRP *irp)
 {
     (void)device;
     MupProviderEvidence.close_count++;
+    IO_STACK_LOCATION *stack = irp->CurrentStackLocation;
+    if (stack != NULL && stack->FileObject != NULL) {
+        FILE_OBJECT *file = (FILE_OBJECT *)stack->FileObject;
+        if (file->FsContext == file) {
+            file->FsContext = NULL;
+            MupProviderEvidence.probe_file_closed++;
+        }
+    }
     return Complete(irp, STATUS_SUCCESS, 0);
 }
 
@@ -297,25 +342,10 @@ static void __stdcall ProviderUnload(void *driver_object)
     }
 }
 
-NTSTATUS __stdcall DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *registry_path)
+static void __stdcall RegistrationWorker(void *context)
 {
-    (void)registry_path;
-    MupProviderEvidence.driver_entry++;
-    UNICODE_STRING provider_name = {
-        (uint16_t)(sizeof(ProviderName) - sizeof(WCHAR)),
-        (uint16_t)sizeof(ProviderName), ProviderName
-    };
-    NTSTATUS status = IoCreateDevice(driver, 0, &provider_name,
-                                     FILE_DEVICE_NETWORK_FILE_SYSTEM, 0, 0,
-                                     &ProviderDevice);
-    if (!NT_SUCCESS(status)) return status;
-    MupProviderEvidence.device_created++;
-    driver->MajorFunction[IRP_MJ_CREATE] = ProviderCreate;
-    driver->MajorFunction[IRP_MJ_CLEANUP] = ProviderCleanup;
-    driver->MajorFunction[IRP_MJ_CLOSE] = ProviderClose;
-    driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = ProviderDeviceControl;
-    driver->DriverUnload = ProviderUnload;
-    ProviderDevice->Flags &= ~DO_DEVICE_INITIALIZING;
+    (void)context;
+    DbgPrint("[mup-provider-stage] opening-mup\n");
 
     UNICODE_STRING mup_name = {
         (uint16_t)(sizeof(MupName) - sizeof(WCHAR)),
@@ -324,11 +354,16 @@ NTSTATUS __stdcall DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *registry_p
     OBJECT_ATTRIBUTES attrs = {sizeof(attrs), NULL, &mup_name,
                                 OBJ_CASE_INSENSITIVE, NULL, NULL};
     IO_STATUS_BLOCK iosb = {0};
-    status = ZwCreateFile(&MupRegistrationHandle, FILE_TRAVERSE | SYNCHRONIZE, &attrs, &iosb,
+    NTSTATUS status = ZwCreateFile(&MupRegistrationHandle, FILE_TRAVERSE | SYNCHRONIZE, &attrs, &iosb,
                           NULL, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
                           FILE_OPEN, FILE_DIRECTORY_FILE, NULL, 0);
+    DbgPrint("[mup-provider-stage] open-mup status=0x%08x\n", (uint32_t)status);
     if (!NT_SUCCESS(status)) goto fail;
     MupProviderEvidence.mup_opened++;
+    UNICODE_STRING provider_name = {
+        (uint16_t)(sizeof(ProviderName) - sizeof(WCHAR)),
+        (uint16_t)sizeof(ProviderName), ProviderName
+    };
 
     struct {
         MUP_PROVIDER_REGISTRATION_INFO Info;
@@ -340,9 +375,11 @@ NTSTATUS __stdcall DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *registry_p
         registration.Name[i] = ProviderName[i];
     }
     MupProviderEvidence.registration_sent++;
+    DbgPrint("[mup-provider-stage] registering\n");
     status = ZwFsControlFile(MupRegistrationHandle, NULL, NULL, NULL, &iosb,
                              FSCTL_MUP_REGISTER_PROVIDER, &registration,
                              sizeof(registration), NULL, 0);
+    DbgPrint("[mup-provider-stage] register-return status=0x%08x\n", (uint32_t)status);
     if (status == STATUS_PENDING) {
         status = ZwWaitForSingleObject(MupRegistrationHandle, 0, NULL);
     }
@@ -371,13 +408,49 @@ NTSTATUS __stdcall DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *registry_p
             if (probe_handle != NULL) ZwClose(probe_handle);
         }
         MupProviderEvidence.probe_status = (uint32_t)probe_status;
-        DbgPrint("[mup-provider-probe] status=0x%08x queries=%u accepted=%u\n",
+        DbgPrint("[mup-provider-probe] status=0x%08x queries=%u accepted=%u file-created=%u cleaned=%u closed=%u\n",
                  (uint32_t)probe_status, MupProviderEvidence.query_count,
-                 MupProviderEvidence.query_accepted);
-        return STATUS_SUCCESS;
+                 MupProviderEvidence.query_accepted,
+                 MupProviderEvidence.probe_file_created,
+                 MupProviderEvidence.probe_file_cleaned,
+                 MupProviderEvidence.probe_file_closed);
+        PsTerminateSystemThread(STATUS_SUCCESS);
+        return;
     }
 
 fail:
-    ProviderUnload(driver);
-    return status;
+    DbgPrint("[mup-provider-stage] registration-failed status=0x%08x\n", (uint32_t)status);
+    PsTerminateSystemThread(status);
+}
+
+NTSTATUS __stdcall DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *registry_path)
+{
+    (void)registry_path;
+    MupProviderEvidence.driver_entry++;
+    DbgPrint("[mup-provider-stage] entry\n");
+    UNICODE_STRING provider_name = {
+        (uint16_t)(sizeof(ProviderName) - sizeof(WCHAR)),
+        (uint16_t)sizeof(ProviderName), ProviderName
+    };
+    NTSTATUS status = IoCreateDevice(driver, 0, &provider_name,
+                                     FILE_DEVICE_NETWORK_FILE_SYSTEM, 0, 0,
+                                     &ProviderDevice);
+    DbgPrint("[mup-provider-stage] create-device status=0x%08x\n", (uint32_t)status);
+    if (!NT_SUCCESS(status)) return status;
+    MupProviderEvidence.device_created++;
+    driver->MajorFunction[IRP_MJ_CREATE] = ProviderCreate;
+    driver->MajorFunction[IRP_MJ_CLEANUP] = ProviderCleanup;
+    driver->MajorFunction[IRP_MJ_CLOSE] = ProviderClose;
+    driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = ProviderDeviceControl;
+    driver->DriverUnload = ProviderUnload;
+    ProviderDevice->Flags &= ~DO_DEVICE_INITIALIZING;
+    status = PsCreateSystemThread(&RegistrationWorkerHandle, 0, NULL, NULL, NULL,
+                                  RegistrationWorker, NULL);
+    if (!NT_SUCCESS(status)) {
+        ProviderUnload(driver);
+        return status;
+    }
+    MupProviderEvidence.registration_worker_created++;
+    DbgPrint("[mup-provider-stage] worker-started status=0x%08x\n", (uint32_t)status);
+    return STATUS_SUCCESS;
 }

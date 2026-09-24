@@ -7,4 +7,6 @@ EXPORTS
     ZwFsControlFile
     ZwWaitForSingleObject
     ZwClose
+    PsCreateSystemThread
+    PsTerminateSystemThread
     DbgPrint

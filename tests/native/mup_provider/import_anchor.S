@@ -21,6 +21,12 @@ ZwWaitForSingleObject:
 .globl ZwClose
 ZwClose:
     ud2
+.globl PsCreateSystemThread
+PsCreateSystemThread:
+    ud2
+.globl PsTerminateSystemThread
+PsTerminateSystemThread:
+    ud2
 .globl DbgPrint
 DbgPrint:
     ud2
