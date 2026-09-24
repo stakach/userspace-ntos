@@ -254,6 +254,79 @@ fn borrowed_scope_cursor_rejects_invalid_rows_without_allocating() {
 }
 
 #[test]
+fn borrowed_catalog_routes_two_images_and_rejects_gap_or_wrong_base() {
+    const SECOND: u64 = BASE + 0x8000;
+    let first_bytes = mapped_pe();
+    let second_bytes = scope_table_pe();
+    let images = [
+        BorrowedExceptionImage::from_mapped_image(BASE, &first_bytes).unwrap(),
+        BorrowedExceptionImage::from_mapped_image(SECOND, &second_bytes).unwrap(),
+    ];
+    let catalog = BorrowedExceptionCatalog::new(&images).unwrap();
+    assert_eq!(catalog.image_count(), 2);
+    assert_eq!(
+        catalog.lookup_exception_function(BASE + 0x1010),
+        images[0].lookup_exception_function(BASE + 0x1010),
+    );
+    assert_eq!(
+        catalog.lookup_exception_function(SECOND + 0x1080),
+        images[1].lookup_exception_function(SECOND + 0x1080),
+    );
+    assert_eq!(
+        catalog.lookup_exception_function(BASE + 0x5000),
+        Err(ExceptionImageError::UnknownImage),
+    );
+    assert_eq!(catalog.read_u8(SECOND, 0x3000), Some(1));
+    assert_eq!(catalog.read_u8(SECOND + 1, 0x3000), None);
+    assert_eq!(
+        catalog
+            .read_c_scope_table(SECOND, SECOND + 0x3030)
+            .unwrap()
+            .len(),
+        2,
+    );
+    assert!(matches!(
+        catalog.read_c_scope_table(SECOND + 1, SECOND + 0x3030),
+        Err(ScopeTableError::UnknownImage),
+    ));
+    assert!(!catalog.validate_collision_scope(SECOND + 1, SECOND + 0x3030, 0));
+}
+
+#[test]
+fn borrowed_catalog_rejects_empty_unsorted_duplicate_and_overlap() {
+    assert!(matches!(
+        BorrowedExceptionCatalog::new(&[]),
+        Err(ImageAdmissionError::EmptyCatalog),
+    ));
+    let first_bytes = mapped_pe();
+    let second_bytes = mapped_pe();
+    let unsorted = [
+        BorrowedExceptionImage::from_mapped_image(BASE + 0x8000, &first_bytes).unwrap(),
+        BorrowedExceptionImage::from_mapped_image(BASE, &second_bytes).unwrap(),
+    ];
+    assert!(matches!(
+        BorrowedExceptionCatalog::new(&unsorted),
+        Err(ImageAdmissionError::ImageOrder),
+    ));
+    let duplicate = [
+        BorrowedExceptionImage::from_mapped_image(BASE, &first_bytes).unwrap(),
+        BorrowedExceptionImage::from_mapped_image(BASE, &second_bytes).unwrap(),
+    ];
+    assert!(matches!(
+        BorrowedExceptionCatalog::new(&duplicate),
+        Err(ImageAdmissionError::ImageOrder),
+    ));
+    let overlap = [
+        BorrowedExceptionImage::from_mapped_image(BASE, &first_bytes).unwrap(),
+        BorrowedExceptionImage::from_mapped_image(BASE + 0x3000, &second_bytes).unwrap(),
+    ];
+    assert!(matches!(
+        BorrowedExceptionCatalog::new(&overlap),
+        Err(ImageAdmissionError::ImageOverlap),
+    ));
+}
+
+#[test]
 fn owned_snapshot_is_not_copied_or_publicly_mutable() {
     let bytes = mapped_pe();
     let original_allocation = bytes.as_ptr();

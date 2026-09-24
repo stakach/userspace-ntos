@@ -25,6 +25,8 @@ use crate::{
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ImageAdmissionError {
     Pe(PeError),
+    EmptyCatalog,
+    ImageOrder,
     NotExecutable,
     SnapshotSize,
     AddressRange,
@@ -66,6 +68,83 @@ pub struct BorrowedExceptionImage<'a> {
     base: u64,
     end: u64,
     pe: PeFile<'a>,
+}
+
+/// A caller-owned, already ordered set of sealed mapped images. Admission checks adjacency but
+/// never sorts, copies, or repairs the supplied catalog.
+pub struct BorrowedExceptionCatalog<'images, 'bytes> {
+    images: &'images [BorrowedExceptionImage<'bytes>],
+}
+
+impl<'images, 'bytes> BorrowedExceptionCatalog<'images, 'bytes> {
+    pub fn new(
+        images: &'images [BorrowedExceptionImage<'bytes>],
+    ) -> Result<Self, ImageAdmissionError> {
+        if images.is_empty() {
+            return Err(ImageAdmissionError::EmptyCatalog);
+        }
+        for pair in images.windows(2) {
+            if pair[0].base >= pair[1].base {
+                return Err(ImageAdmissionError::ImageOrder);
+            }
+            if pair[0].end > pair[1].base {
+                return Err(ImageAdmissionError::ImageOverlap);
+            }
+        }
+        Ok(Self { images })
+    }
+
+    pub fn image_count(&self) -> usize {
+        self.images.len()
+    }
+
+    pub fn read_c_scope_table(
+        &self,
+        image_base: u64,
+        handler_data: u64,
+    ) -> Result<ScopeCursor<'_>, ScopeTableError> {
+        self.image_at_base(image_base)
+            .ok_or(ScopeTableError::UnknownImage)?
+            .read_c_scope_table(handler_data)
+    }
+
+    fn image_at_base(&self, base: u64) -> Option<&BorrowedExceptionImage<'bytes>> {
+        self.images
+            .binary_search_by_key(&base, |image| image.base)
+            .ok()
+            .and_then(|index| self.images.get(index))
+    }
+
+    fn image_containing(&self, pc: u64) -> Option<&BorrowedExceptionImage<'bytes>> {
+        let index = self
+            .images
+            .partition_point(|image| image.base <= pc)
+            .checked_sub(1)?;
+        self.images.get(index).filter(|image| pc < image.end)
+    }
+}
+
+impl ExceptionImageReader for BorrowedExceptionCatalog<'_, '_> {
+    fn lookup_exception_function(&self, pc: u64) -> Result<ExceptionFunction, ExceptionImageError> {
+        self.image_containing(pc)
+            .ok_or(ExceptionImageError::UnknownImage)?
+            .lookup_exception_function(pc)
+    }
+
+    fn validate_collision_scope(&self, image_base: u64, handler_data: u64, index: u32) -> bool {
+        self.image_at_base(image_base)
+            .is_some_and(|image| image.validate_collision_scope(image_base, handler_data, index))
+    }
+}
+
+impl ImageReader for BorrowedExceptionCatalog<'_, '_> {
+    fn lookup_function(&self, pc: u64) -> Option<(u64, RuntimeFunction)> {
+        self.image_containing(pc)?.lookup_function(pc)
+    }
+
+    fn read_u8(&self, base: u64, rva: u32) -> Option<u8> {
+        self.image_at_base(base)?.read_u8(base, rva)
+    }
 }
 
 impl<'a> BorrowedExceptionImage<'a> {
