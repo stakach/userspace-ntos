@@ -6,6 +6,11 @@ cd "$ROOT"
 
 RUN_LOG="${RUN_LOG:-$ROOT/.tmp/run-seh-driver-integration-$(date +%Y%m%d-%H%M%S).log}"
 BOOT_TIMEOUT_SECONDS="${BOOT_TIMEOUT_SECONDS:-900}"
+POST_READY_SECONDS="${POST_READY_SECONDS:-2}"
+if [[ ! "$POST_READY_SECONDS" =~ ^[0-9]+$ ]] || (( POST_READY_SECONDS < 1 || POST_READY_SECONDS > 3600 )); then
+  printf 'POST_READY_SECONDS must be 1..3600\n' >&2
+  exit 2
+fi
 DESKTOP=0
 if [[ "${1:-}" == "--desktop" ]]; then
   DESKTOP=1
@@ -30,7 +35,7 @@ else
     --failure-text '[provider-bugcheck] terminal' \
     --ready-file "$RUN_LOG" \
     --ready-text '[seh-native-proof-complete]' \
-    --post-ready-seconds 2 \
+    --post-ready-seconds "$POST_READY_SECONDS" \
     -- ./scripts/run_specs.sh "$@" 2>&1 | tee -a "$RUN_LOG"
   rc=${PIPESTATUS[0]}
   set -e
@@ -59,6 +64,13 @@ require_fixed \
 require_fixed \
   '[driver-launch] loaded reactos\system32\drivers\driver_seh.sys' \
   'native driver image was not loaded'
+require_fixed \
+  '[driver-launch] provider singleton published mup.sys' \
+  'registry-selected Mup did not complete DriverEntry'
+if grep -Fq '[driver-launch] lifecycle unload service=Mup' "$RUN_LOG"; then
+  printf 'native SEH integration failure: boot lifecycle unloaded Mup\nlog: %s\n' "$RUN_LOG" >&2
+  exit 1
+fi
 # Demand faults may print between bytes of the component's DbgPrint. Strip only those kernel
 # fault diagnostics before matching the driver-emitted evidence; keep every proof byte intact.
 if ! perl -0pe 's/\[user #PF:[^\n]*\]\n//g' "$RUN_LOG" | \
