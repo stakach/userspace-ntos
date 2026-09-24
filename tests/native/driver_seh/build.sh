@@ -10,6 +10,7 @@ case "$VARIANT" in
     unhandled) VARIANT_CFLAG=(-DSEH_TERMINAL_UNHANDLED) ;;
     exit) VARIANT_CFLAG=(-DSEH_TERMINAL_EXIT) ;;
     fault-ud2) VARIANT_CFLAG=(-DSEH_FAULT_UD2) ;;
+    fault-protection) VARIANT_CFLAG=(-DSEH_FAULT_PROTECTION) ;;
     *) echo "error: unsupported native SEH fixture variant: $VARIANT" >&2; exit 1 ;;
 esac
 CLANG=${CLANG:-clang}
@@ -37,14 +38,19 @@ fi
     -Wall -Wextra -Werror -O2 "${VARIANT_CFLAG[@]}" -c "$HERE/driver_seh.c" -o "$OUT/driver_seh.obj"
 "$CLANG" --target=x86_64-pc-windows-msvc -c "$HERE/bare_unwind.S" \
     -o "$OUT/bare_unwind.obj"
+EXTRA_EXPORTS=()
+if [[ "$VARIANT" == fault-protection ]]; then
+    EXTRA_EXPORTS=(/export:SehReadOnlySentinel,DATA)
+fi
 "$RUST_LLD" -flavor link /machine:x64 /driver /dll /entry:DriverEntry \
     /subsystem:native,5.2 /osversion:5.2 /nodefaultlib /dynamicbase /nxcompat /timestamp:0 \
-    /export:SehFixtureEvidence,DATA "/out:$OUT/driver_seh.sys" \
+    /export:SehFixtureEvidence,DATA "${EXTRA_EXPORTS[@]}" "/out:$OUT/driver_seh.sys" \
     "$OUT/driver_seh.obj" "$OUT/bare_unwind.obj" "$OUT/ntoskrnl.lib"
 VERIFY_ARGS=()
-if [[ "$VARIANT" == fault-ud2 ]]; then
-    VERIFY_ARGS=(--fault-ud2)
-fi
+case "$VARIANT" in
+    fault-ud2) VERIFY_ARGS=(--fault-ud2) ;;
+    fault-protection) VERIFY_ARGS=(--fault-protection) ;;
+esac
 cargo run --manifest-path "$ROOT/Cargo.toml" -p seh-linkage-verify \
     --bin seh-driver-fixture-verify -- "$OUT/driver_seh.sys" "$OUT/driver_seh.obj" "${VERIFY_ARGS[@]}"
 printf 'Verified native SEH fixture (%s): %s/driver_seh.sys (not staged or executed)\n' "$VARIANT" "$OUT"

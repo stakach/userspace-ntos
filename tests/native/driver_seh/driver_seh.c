@@ -6,11 +6,13 @@ typedef int32_t NTSTATUS;
 #define STATUS_SUCCESS ((NTSTATUS)0)
 #define STATUS_UNSUCCESSFUL ((NTSTATUS)0xc0000001u)
 #define STATUS_ACCESS_DENIED ((NTSTATUS)0xc0000022u)
+#define STATUS_ACCESS_VIOLATION ((NTSTATUS)0xc0000005u)
 #define STATUS_ILLEGAL_INSTRUCTION ((NTSTATUS)0xc000001du)
 #define EXCEPTION_EXECUTE_HANDLER 1
 #define EXCEPTION_CONTINUE_SEARCH 0
 
-#if (defined(SEH_TERMINAL_UNHANDLED) + defined(SEH_TERMINAL_EXIT) + defined(SEH_FAULT_UD2)) > 1
+#if (defined(SEH_TERMINAL_UNHANDLED) + defined(SEH_TERMINAL_EXIT) + \
+     defined(SEH_FAULT_UD2) + defined(SEH_FAULT_PROTECTION)) > 1
 #error "select exactly one native SEH case"
 #endif
 
@@ -87,6 +89,24 @@ unwind_target:
 
 void BareTargetUnwind(void);
 void CollidedTargetUnwind(void);
+
+#if defined(SEH_FAULT_PROTECTION)
+void WriteReadOnlyData(void);
+
+__declspec(noinline) static void CatchProtectionFault(void)
+{
+    __try {
+        SehFixtureEvidence.fault_entered++;
+        WriteReadOnlyData();
+        SehFixtureEvidence.fault_after_instruction++;
+    } __except (__exception_code() == (uint32_t)STATUS_ACCESS_VIOLATION
+                    ? EXCEPTION_EXECUTE_HANDLER
+                    : EXCEPTION_CONTINUE_SEARCH) {
+        SehFixtureEvidence.fault_caught++;
+        SehFixtureEvidence.fault_code = __exception_code();
+    }
+}
+#endif
 
 #if defined(SEH_FAULT_UD2)
 void Ud2Instruction(void);
@@ -179,6 +199,20 @@ NTSTATUS __stdcall DriverEntry(void *driver_object, void *registry_path)
             return STATUS_UNSUCCESSFUL;
         }
         DbgPrint("[seh-fault-proof] kind=ud2 entered=1 after=0 caught=1 code=0xc000001d\n");
+#elif defined(SEH_FAULT_PROTECTION)
+        DbgPrint("[seh-fault-trigger] kind=protection\n");
+        CatchProtectionFault();
+        if (SehFixtureEvidence.fault_entered != 1 ||
+            SehFixtureEvidence.fault_after_instruction != 0 ||
+            SehFixtureEvidence.fault_caught != 1 ||
+            SehFixtureEvidence.fault_code != (uint32_t)STATUS_ACCESS_VIOLATION) {
+            DbgPrint("[seh-fault-failed] kind=protection entered=%u after=%u caught=%u code=0x%08x\n",
+                     SehFixtureEvidence.fault_entered,
+                     SehFixtureEvidence.fault_after_instruction,
+                     SehFixtureEvidence.fault_caught, SehFixtureEvidence.fault_code);
+            return STATUS_UNSUCCESSFUL;
+        }
+        DbgPrint("[seh-fault-proof] kind=protection entered=1 after=0 caught=1 code=0xc0000005\n");
 #else
         DbgPrint("[seh-native-proof-complete]\n");
 #endif

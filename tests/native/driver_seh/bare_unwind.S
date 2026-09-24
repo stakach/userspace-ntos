@@ -37,6 +37,22 @@ Ud2Instruction:
     retq
     .seh_endproc
 
+/* The image loader maps .rdata read-only. This is a present-page write fault. */
+    .globl WriteReadOnlyData
+    .seh_proc WriteReadOnlyData
+WriteReadOnlyData:
+    .seh_endprologue
+    movl $0x98765432, SehReadOnlySentinel(%rip)
+    retq
+    .seh_endproc
+
+    .section .rdata,"dr"
+    .p2align 2
+    .globl SehReadOnlySentinel
+SehReadOnlySentinel:
+    .long 0x13579bdf
+    .text
+
 /* The compiler's outlined ?fin$ helper has no pdata even when it allocates a frame.
    Keep both the C scope and the nested finalizer in explicitly unwindable COFF frames. */
     .globl CollidedTargetUnwind

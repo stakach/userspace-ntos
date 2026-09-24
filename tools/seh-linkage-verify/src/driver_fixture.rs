@@ -92,7 +92,7 @@ fn verify_position_independent_object(bytes: &[u8]) -> Result<usize, String> {
     Ok(relocations)
 }
 
-fn verify(path: &str, object_path: &str, fault_ud2: bool) -> Result<(), String> {
+fn verify(path: &str, object_path: &str, fault_variant: Option<&str>) -> Result<(), String> {
     let object = fs::read(object_path).map_err(|error| format!("read {object_path}: {error}"))?;
     let relocation_count = verify_position_independent_object(&object)?;
     let bytes = fs::read(path).map_err(|error| format!("read {path}: {error}"))?;
@@ -144,20 +144,46 @@ fn verify(path: &str, object_path: &str, fault_ud2: bool) -> Result<(), String> 
     let exports = pe
         .exports()
         .map_err(|error| format!("exports: {error:?}"))?;
-    if exports.len() != 1 || exports[0].name != "SehFixtureEvidence" {
-        return Err(format!("expected only evidence data export: {exports:?}"));
+    let protection = fault_variant == Some("--fault-protection");
+    let expected_export_count = if protection { 2 } else { 1 };
+    if exports.len() != expected_export_count {
+        return Err(format!("unexpected fixture exports: {exports:?}"));
     }
+    let evidence = exports
+        .iter()
+        .find(|export| export.name == "SehFixtureEvidence")
+        .ok_or_else(|| format!("missing evidence data export: {exports:?}"))?;
     if !pe.sections().iter().any(|section| {
         section.is_writable()
             && !section.is_executable()
-            && exports[0].rva >= section.virtual_address
-            && exports[0].rva
+            && evidence.rva >= section.virtual_address
+            && evidence.rva
                 < section
                     .virtual_address
                     .saturating_add(section.virtual_size.max(section.size_of_raw_data))
     }) {
         return Err("evidence export is not in writable, non-executable data".into());
     }
+    let protection_target = if protection {
+        let target = exports
+            .iter()
+            .find(|export| export.name == "SehReadOnlySentinel")
+            .ok_or_else(|| format!("missing read-only sentinel export: {exports:?}"))?;
+        if !pe.sections().iter().any(|section| {
+            !section.is_writable()
+                && !section.is_executable()
+                && target.rva >= section.virtual_address
+                && target.rva
+                    < section
+                        .virtual_address
+                        .saturating_add(section.virtual_size.max(section.size_of_raw_data))
+        }) {
+            return Err("protection target is not in read-only, non-executable PE data".into());
+        }
+        Some(target.rva)
+    } else {
+        None
+    };
 
     let mapped = pe
         .map(COMPONENT_LOAD_BASE)
@@ -217,12 +243,14 @@ fn verify(path: &str, object_path: &str, fault_ud2: bool) -> Result<(), String> 
             "missing compiler-emitted C exception/finally scopes: except={except_scopes} finally={finally_scopes}"
         ));
     }
-    if fault_ud2 {
+    if fault_variant.is_some() {
         if except_scopes < 2 {
             return Err(format!(
                 "fault variant needs an additional compiler-emitted exception scope: {except_scopes}"
             ));
         }
+    }
+    if fault_variant == Some("--fault-ud2") {
         let admitted_ud2 = pe.sections().iter().filter(|section| section.is_executable()).any(
             |section| {
                 let start = section.virtual_address as usize;
@@ -244,6 +272,38 @@ fn verify(path: &str, object_path: &str, fault_ud2: bool) -> Result<(), String> 
             return Err("fault variant needs a UD2 covered by an x64 runtime function".into());
         }
     }
+    if let Some(target_rva) = protection_target {
+        let admitted_store = pe.sections().iter().filter(|section| section.is_executable()).any(
+            |section| {
+                let start = section.virtual_address as usize;
+                let end = start.saturating_add(
+                    section.virtual_size.max(section.size_of_raw_data) as usize,
+                );
+                mapped.bytes.get(start..end).is_some_and(|code| {
+                    code.windows(10).enumerate().any(|(offset, instruction)| {
+                        if instruction[0..2] != [0xc7, 0x05]
+                            || instruction[6..10] != [0x32, 0x54, 0x76, 0x98]
+                        {
+                            return false;
+                        }
+                        let displacement = i32::from_le_bytes(
+                            instruction[2..6].try_into().expect("four-byte displacement"),
+                        );
+                        let instruction_rva = (start + offset) as u64;
+                        let resolved = instruction_rva as i64 + 10 + i64::from(displacement);
+                        resolved == i64::from(target_rva)
+                            && runtime_functions.iter().any(|&(begin, end)| {
+                                u64::from(begin) <= instruction_rva
+                                    && instruction_rva + 10 <= u64::from(end)
+                            })
+                    })
+                })
+            },
+        );
+        if !admitted_store {
+            return Err("fault variant lacks an unwind-covered store into the read-only target".into());
+        }
+    }
     println!(
         "driver_seh.sys admitted at 0x{COMPONENT_LOAD_BASE:x}: except-scopes={except_scopes} finally-scopes={finally_scopes} imports={names:?} coff-relocations={relocation_count}"
     );
@@ -261,11 +321,13 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let variant = args.next();
-    if !matches!(variant.as_deref(), None | Some("--fault-ud2")) || args.next().is_some() {
-        eprintln!("usage: seh-driver-fixture-verify <driver_seh.sys> <driver_seh.obj> [--fault-ud2]");
+    if !matches!(variant.as_deref(), None | Some("--fault-ud2") | Some("--fault-protection"))
+        || args.next().is_some()
+    {
+        eprintln!("usage: seh-driver-fixture-verify <driver_seh.sys> <driver_seh.obj> [--fault-ud2|--fault-protection]");
         return ExitCode::FAILURE;
     }
-    match verify(&path, &object_path, variant.is_some()) {
+    match verify(&path, &object_path, variant.as_deref()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("SEH driver fixture verification failed: {error}");

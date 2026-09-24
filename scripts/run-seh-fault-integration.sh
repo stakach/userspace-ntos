@@ -10,10 +10,20 @@ if ! [[ "$BOOT_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || \
   printf 'BOOT_TIMEOUT_SECONDS must be between 1 and 3600\n' >&2
   exit 1
 fi
-RUN_LOG="${RUN_LOG:-$ROOT/.tmp/run-seh-fault-integration-$(date +%Y%m%d-%H%M%S).log}"
+case "${SEH_FAULT_CASE:-all}" in
+  all)
+    SEH_FAULT_CASE=ud2 bash "$0"
+    SEH_FAULT_CASE=protection bash "$0"
+    exit 0
+    ;;
+  ud2) EXPECTED_CODE=c000001d ;;
+  protection) EXPECTED_CODE=c0000005 ;;
+  *) printf 'unsupported SEH fault case: %s\n' "$SEH_FAULT_CASE" >&2; exit 1 ;;
+esac
+RUN_LOG="${RUN_LOG:-$ROOT/.tmp/run-seh-fault-integration-$(date +%Y%m%d-%H%M%S)-$SEH_FAULT_CASE.log}"
 
-# The regular seh-driver image profile stages this path. Rebuild it for the fault case only.
-bash tests/native/driver_seh/build.sh "$ROOT/.tmp/native-driver-seh" fault-ud2
+# The isolated seh-driver image profile stages this path. Rebuild it for each serial fault case.
+bash tests/native/driver_seh/build.sh "$ROOT/.tmp/native-driver-seh" "fault-$SEH_FAULT_CASE"
 NTOS_IMAGE_PROFILE=seh-driver ./run.sh --build-only
 : > "$RUN_LOG"
 set +e
@@ -65,10 +75,10 @@ if ! perl -0pe 's/\[user #PF:[^\n]*\]\n//g' "$RUN_LOG" | \
   printf 'native SEH fault integration failed: collided unwind prefix did not pass\nlog: %s\n' "$RUN_LOG" >&2
   exit 1
 fi
-require_fixed '[seh-fault-trigger] kind=ud2' 'native driver did not execute the fault case'
+require_fixed "[seh-fault-trigger] kind=$SEH_FAULT_CASE" 'native driver did not execute the fault case'
 if ! perl -0pe 's/\[user #PF:[^\n]*\]\n//g' "$RUN_LOG" | \
-    grep -F '[seh-fault-proof] kind=ud2 entered=1 after=0 caught=1 code=0xc000001d' >/dev/null; then
-  printf 'native SEH fault integration failed: native __except did not catch STATUS_ILLEGAL_INSTRUCTION exactly once\nlog: %s\n' "$RUN_LOG" >&2
+    grep -F "[seh-fault-proof] kind=$SEH_FAULT_CASE entered=1 after=0 caught=1 code=0x$EXPECTED_CODE" >/dev/null; then
+  printf 'native SEH fault integration failed: native __except did not catch the hardware fault exactly once\nlog: %s\n' "$RUN_LOG" >&2
   exit 1
 fi
-printf 'native SEH fault integration passed: %s\n' "$RUN_LOG"
+printf 'native SEH fault %s passed: %s\n' "$SEH_FAULT_CASE" "$RUN_LOG"
