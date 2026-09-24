@@ -26,6 +26,10 @@ struct SehFixtureEvidence {
     uint32_t unwind_landed;
     uint32_t bare_unwind_after_call;
     uint32_t bare_unwind_landed;
+    uint32_t collided_finally;
+    uint32_t collided_inner_after;
+    uint32_t collided_outer_after;
+    uint32_t collided_landed;
 };
 
 volatile struct SehFixtureEvidence SehFixtureEvidence;
@@ -73,6 +77,7 @@ unwind_target:
 }
 
 void BareTargetUnwind(void);
+void CollidedTargetUnwind(void);
 
 NTSTATUS __stdcall DriverEntry(void *driver_object, void *registry_path)
 {
@@ -91,6 +96,7 @@ NTSTATUS __stdcall DriverEntry(void *driver_object, void *registry_path)
 
     ExplicitTargetUnwind();
     BareTargetUnwind();
+    CollidedTargetUnwind();
 
     NTSTATUS status = STATUS_SUCCESS;
     if (SehFixtureEvidence.entered != 1 || SehFixtureEvidence.after_raise != 0 ||
@@ -101,7 +107,11 @@ NTSTATUS __stdcall DriverEntry(void *driver_object, void *registry_path)
         SehFixtureEvidence.unwind_after_call != 0 ||
         SehFixtureEvidence.unwind_landed != 1 ||
         SehFixtureEvidence.bare_unwind_after_call != 0 ||
-        SehFixtureEvidence.bare_unwind_landed != 1) {
+        SehFixtureEvidence.bare_unwind_landed != 1 ||
+        SehFixtureEvidence.collided_finally != 1 ||
+        SehFixtureEvidence.collided_inner_after != 0 ||
+        SehFixtureEvidence.collided_outer_after != 0 ||
+        SehFixtureEvidence.collided_landed != 1) {
         status = STATUS_UNSUCCESSFUL;
     }
     DbgPrint("[seh-native-proof] status=0x%08x entered=%u after-raise=%u finally=%u caught=%u caught-code=0x%08x returned-before-catch=%u\n",
@@ -114,6 +124,9 @@ NTSTATUS __stdcall DriverEntry(void *driver_object, void *registry_path)
                  SehFixtureEvidence.unwind_finally, SehFixtureEvidence.unwind_after_call,
                  SehFixtureEvidence.unwind_landed, SehFixtureEvidence.bare_unwind_after_call,
                  SehFixtureEvidence.bare_unwind_landed);
+        DbgPrint("[seh-collision-proof] finally=%u inner-after=%u outer-after=%u landed=%u\n",
+                 SehFixtureEvidence.collided_finally, SehFixtureEvidence.collided_inner_after,
+                 SehFixtureEvidence.collided_outer_after, SehFixtureEvidence.collided_landed);
         DbgPrint("[seh-native-proof-complete]\n");
     }
     return status;
