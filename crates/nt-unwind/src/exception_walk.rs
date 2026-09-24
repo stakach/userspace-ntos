@@ -210,6 +210,13 @@ pub enum WalkStep {
     Complete(WalkOutcome),
 }
 
+/// Owned first-pass boundary. No stack or image-reader borrow survives admission.
+#[derive(Debug)]
+pub enum FirstRaiseStep {
+    Invoke(HandlerInvocation),
+    Complete(WalkOutcome),
+}
+
 /// One owned pass, with an explicit bound on frames consumed. Neither it nor its continuation is
 /// Clone: a handler cannot advance the same walk or return twice through this API.
 #[derive(Debug)]
@@ -264,7 +271,11 @@ impl SoftwareRaiseSite {
 
     /// Construct the first-pass search. The caller's return slot is consumed exactly as a `ret`
     /// would consume it; the original exception context is never a synthetic handler result.
-    pub fn into_search(mut self, status: u32, frame_limit: usize) -> Result<ExceptionWalk, WalkError> {
+    pub fn into_search(
+        mut self,
+        status: u32,
+        frame_limit: usize,
+    ) -> Result<ExceptionWalk, WalkError> {
         self.captured.rip = self.caller_rip;
         self.captured.set_rsp(self.caller_rsp);
         ExceptionWalk::new(
@@ -280,6 +291,25 @@ impl SoftwareRaiseSite {
             self.stack_high,
             frame_limit,
         )
+    }
+
+    /// Search under the same reader lease until a real handler must execute or the walk ends.
+    /// A Reply that merely starts a handler is not a disposition or exception completion.
+    pub fn search_to_first_handler(
+        self,
+        status: u32,
+        frame_limit: usize,
+        image: &dyn ExceptionImageReader,
+        stack: &dyn StackReader,
+    ) -> Result<FirstRaiseStep, WalkError> {
+        let mut walk = self.into_search(status, frame_limit)?;
+        loop {
+            match walk.step(image, stack)? {
+                WalkStep::Continue(next) => walk = next,
+                WalkStep::Invoke(handler) => return Ok(FirstRaiseStep::Invoke(handler)),
+                WalkStep::Complete(outcome) => return Ok(FirstRaiseStep::Complete(outcome)),
+            }
+        }
     }
 }
 

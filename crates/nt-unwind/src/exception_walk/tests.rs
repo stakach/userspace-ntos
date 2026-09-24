@@ -216,9 +216,86 @@ fn software_raise_rejects_invalid_stack_before_reading_it() {
 fn software_raise_rejects_zero_frame_budget() {
     let mut fixture = Fixture::new(0);
     fixture.stack.insert(LOW + 8, BASE + 0x110);
-    let site = SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture)
-        .unwrap();
-    assert!(matches!(site.into_search(0xc000_0005, 0), Err(WalkError::InvalidBudget)));
+    let site =
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture).unwrap();
+    assert!(matches!(
+        site.into_search(0xc000_0005, 0),
+        Err(WalkError::InvalidBudget)
+    ));
+}
+
+#[test]
+fn software_raise_search_stops_at_the_first_owned_handler() {
+    let mut fixture = Fixture::new(unw_flag::EHANDLER);
+    fixture.stack.insert(LOW + 8, BASE + 0x110);
+    fixture.stack.insert(LOW + 0x20, 0x55);
+    fixture.stack.insert(LOW + 0x28, BASE + 0x210);
+    let site =
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture).unwrap();
+    let FirstRaiseStep::Invoke(invocation) = site
+        .search_to_first_handler(0xc000_0022, 4, &fixture, &fixture)
+        .unwrap()
+    else {
+        panic!("expected the first language handler");
+    };
+    assert_eq!(invocation.control_pc, BASE + 0x110);
+    assert_eq!(invocation.exception.code, 0xc000_0022);
+    assert_eq!(invocation.exception.flags, EXCEPTION_NONCONTINUABLE);
+    assert_eq!(invocation.handler, BASE + 0x800);
+}
+
+#[test]
+fn software_raise_search_fails_closed_on_changed_image_or_unreadable_stack() {
+    let mut fixture = Fixture::new(unw_flag::EHANDLER);
+    fixture.stack.insert(LOW + 8, BASE + 0x110);
+    let site =
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture).unwrap();
+    assert!(matches!(
+        site.search_to_first_handler(0xc000_0022, 4, &fixture, &fixture),
+        Err(WalkError::UnwindData)
+    ));
+
+    fixture.stack.insert(LOW + 0x20, 0x55);
+    fixture.stack.insert(LOW + 0x28, BASE + 0x210);
+    let site =
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture).unwrap();
+    fixture.image_error = Some(ExceptionImageError::UnreadableImage);
+    assert!(matches!(
+        site.search_to_first_handler(0xc000_0022, 4, &fixture, &fixture),
+        Err(WalkError::ImageLookup(ExceptionImageError::UnreadableImage))
+    ));
+}
+
+#[test]
+fn software_raise_search_honors_frame_budget_before_second_frame() {
+    let mut fixture = Fixture::new(0);
+    fixture.stack.insert(LOW + 8, BASE + 0x110);
+    fixture.stack.insert(LOW + 0x20, 0x55);
+    fixture.stack.insert(LOW + 0x28, BASE + 0x210);
+    let site =
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture).unwrap();
+    assert!(matches!(
+        site.search_to_first_handler(0xc000_0022, 1, &fixture, &fixture),
+        Err(WalkError::FrameLimit)
+    ));
+}
+
+#[test]
+fn software_raise_search_returns_owned_unhandled_outcome() {
+    let mut fixture = Fixture::new(0);
+    fixture.stack.insert(LOW + 8, BASE + 0x310);
+    fixture.stack.insert(LOW + 0x10, BASE + 0x310);
+    let high = LOW + 0x18;
+    let site =
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, high, &fixture, &fixture).unwrap();
+    let FirstRaiseStep::Complete(WalkOutcome::Unhandled { exception, context }) = site
+        .search_to_first_handler(0xc000_0022, 4, &fixture, &fixture)
+        .unwrap()
+    else {
+        panic!("expected a terminal unhandled search");
+    };
+    assert_eq!(exception.code, 0xc000_0022);
+    assert_eq!(context.rsp(), LOW + 0x10);
 }
 
 #[test]

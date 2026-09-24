@@ -7,7 +7,7 @@
 use nt_component_suspension::{peer_registry::PeerRoute, LaneDispatchIdentity};
 use nt_io_manager::HostedDomainIdentity;
 use nt_unwind::{
-    exception_walk::SoftwareRaiseSite,
+    exception_walk::{FirstRaiseStep, WalkError},
     raw_context::{RawContext, RawContextCaptureError},
     seh_linkage_image::SehRaiseIngressError,
     StackReader,
@@ -194,17 +194,18 @@ pub(super) fn capture_raw_context(
 pub(super) enum RaiseCaptureError {
     Context(RawContextCaptureError),
     Admission(SehRaiseIngressError),
+    Walk(WalkError),
 }
 
-/// Admit a software raise only while its exact caller stack and sealed image catalog belong to
-/// the same physically retained dispatch. No alias, catalog borrow, or component pointer escapes.
-pub(super) fn capture_raise_site(
+/// Advance a software raise to the first owned handler invocation or terminal result while its
+/// stack and sealed image catalog still belong to the same physically retained dispatch.
+pub(super) fn capture_raise_first_step(
     channel: &crate::spawn_hosts::PumpChannel,
     reply_cap: u64,
     badge: u64,
     context_address: u64,
     status_word: u64,
-) -> Option<Result<SoftwareRaiseSite, RaiseCaptureError>> {
+) -> Option<Result<FirstRaiseStep, RaiseCaptureError>> {
     let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
     let domain = instance_domain_identity(inst)?;
     let linkage = inst.seh_linkage?;
@@ -212,9 +213,11 @@ pub(super) fn capture_raise_site(
         super::hosted_exception_images::with_catalog(instance, domain, |catalog| {
             let raw = RawContext::capture_bounded(reader, context_address, low, high)
                 .map_err(RaiseCaptureError::Context)?;
-            linkage
+            let site = linkage
                 .admit_raise(&raw, status_word, low, high, catalog, reader)
-                .map_err(RaiseCaptureError::Admission)
+                .map_err(RaiseCaptureError::Admission)?;
+            site.search_to_first_handler(status_word as u32, 64, catalog, reader)
+                .map_err(RaiseCaptureError::Walk)
         })
     })?
 }
