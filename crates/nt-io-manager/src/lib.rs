@@ -27,6 +27,7 @@ mod close;
 mod complete;
 mod completion_unwind;
 mod device;
+mod device_file_name;
 mod device_reference;
 mod device_control;
 mod device_property_query;
