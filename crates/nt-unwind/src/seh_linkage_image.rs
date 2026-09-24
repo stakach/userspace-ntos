@@ -97,9 +97,24 @@ impl SehLinkageImage {
         frame_limit: usize,
     ) -> Result<SehRaiseFirstPass, SehRaiseIngressError> {
         let site = self.admit_raise(&raw, status_word, stack_low, stack_high, image, stack)?;
-        let step = site
-            .search_to_first_handler(status_word as u32, frame_limit, image, stack)
-            .map_err(SehRaiseIngressError::Walk)?;
+        let mut walk = site
+            .into_search(status_word as u32, frame_limit)
+            .map_err(SehRaiseIngressError::Walk)?
+            .with_foreign_boundary(
+                self.image_base,
+                (self.foreign_call2_va - self.image_base) as u32,
+            );
+        let step = loop {
+            match walk.step(image, stack).map_err(SehRaiseIngressError::Walk)? {
+                crate::exception_walk::WalkStep::Continue(next) => walk = next,
+                crate::exception_walk::WalkStep::Invoke(handler) => {
+                    break FirstRaiseStep::Invoke(handler)
+                }
+                crate::exception_walk::WalkStep::Complete(outcome) => {
+                    break FirstRaiseStep::Complete(outcome)
+                }
+            }
+        };
         Ok(SehRaiseFirstPass {
             captured: raw,
             step,

@@ -57,6 +57,7 @@ CollidedTargetUnwind:
     callq *__imp_RtlUnwindEx(%rip)
     incl SehFixtureEvidence+52(%rip)
 .Lcollision_try_end:
+    nop
 .Lcollision_target:
     incl SehFixtureEvidence+56(%rip)
     addq $0x500, %rsp

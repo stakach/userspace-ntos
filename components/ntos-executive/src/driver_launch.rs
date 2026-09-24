@@ -505,6 +505,7 @@ pub const SH_RESOURCE_INTERRUPT_ISR_CLAIMED: u64 = 0x460; // out: last ISR BOOLE
 pub const SH_RESOURCE_INTERRUPT_DELIVERIES: u64 = 0x468; // out: ISR delivery count
 pub const SH_DPC_QUEUE_DROPS: u64 = 0x480; // out: rejected root-owned KDPC insertions
 pub const SH_DPC_DELIVERIES: u64 = 0x488; // out: deferred routines called
+pub const SH_SEH_FOREIGN_CALL2_VA: u64 = 0x490; // in: admitted PE boundary for two-argument callbacks
 pub const SH_SUPPORT_ENTRY_COUNT: u64 = 0x498; // in: dependency support records to initialize
 pub const SH_SUPPORT_ENTRY_CAPACITY: u64 = 0x4A0; // in: dependency support record capacity
 pub const SH_SUPPORT_ENTRY_RVA: u64 = 0x4B0; // in: first support DriverEntry RVA, legacy mirror
@@ -36742,6 +36743,10 @@ unsafe fn load_driver_reserved(
         rights,
     )
     .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?;
+    write_volatile(
+        (win.shared_va + SH_SEH_FOREIGN_CALL2_VA) as *mut u64,
+        seh_linkage.foreign_call2_va,
+    );
     let support_images = load_hosted_dependency_images(
         &planned_images,
         instance,

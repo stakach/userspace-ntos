@@ -113,6 +113,10 @@ impl SehHandlerPacket {
         let exception_record = address(offset_of!(Self, exception))?;
         let original_record = address(offset_of!(Self, original_context))?;
         let unwound_record = address(offset_of!(Self, unwound_context))?;
+        let dispatcher_context_record = match invocation.contexts {
+            HandlerContexts::Unwind { .. } => original_record,
+            HandlerContexts::Search { .. } => unwound_record,
+        };
         let function_entry = address(offset_of!(Self, function))?;
         Ok(Self {
             exception: record,
@@ -129,7 +133,7 @@ impl SehHandlerPacket {
                 function_entry,
                 establisher_frame: invocation.establisher_frame,
                 target_ip: invocation.target_ip,
-                context_record: unwound_record,
+                context_record: dispatcher_context_record,
                 language_handler: invocation.handler,
                 handler_data: invocation.handler_data,
                 history_table: 0,
@@ -398,7 +402,7 @@ mod tests {
         assert_eq!(packet.exception.flags, EXCEPTION_UNWINDING | crate::EXCEPTION_TARGET_UNWIND);
         assert_eq!(packet.original_context.rip(), BASE + 0x110);
         assert_eq!(packet.unwound_context.rip(), BASE + 0x210);
-        assert_eq!(packet.dispatcher.context_record, 0x8000 + offset_of!(SehHandlerPacket, unwound_context) as u64);
+        assert_eq!(packet.dispatcher.context_record, 0x8000 + offset_of!(SehHandlerPacket, original_context) as u64);
         assert_eq!(SehHandlerPacket::prepare_search(&capture(), &invocation, 0x8000), Err(HandlerPacketError::NotSearch));
     }
 

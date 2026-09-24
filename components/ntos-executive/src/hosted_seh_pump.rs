@@ -31,6 +31,7 @@ struct Active {
     captured: RawContext,
     phase: Option<Phase>,
     packet_va: u64,
+    restored_rsp: Option<u64>,
 }
 
 impl Active {
@@ -57,6 +58,7 @@ impl Active {
                     context,
                 )?
                 .ok()?;
+                self.restored_rsp = Some(context.rsp());
                 Some((
                     SehCommand::Restore {
                         token: self.token,
@@ -103,6 +105,21 @@ impl SehPump {
 
     pub(super) fn retained(&self) -> bool {
         !self.active.is_empty()
+    }
+
+    fn retire_abandoned(&mut self, restored_rsp: Option<u64>) -> Option<()> {
+        let Some(rsp) = restored_rsp else { return Some(()) };
+        let packet_len = core::mem::size_of::<SehHandlerPacket>() as u64;
+        for ancestor in &self.active {
+            let end = ancestor.packet_va.checked_add(packet_len)?;
+            if ancestor.packet_va == 0 || (ancestor.packet_va <= rsp && rsp <= end) {
+                return None;
+            }
+        }
+        self.active.retain(|ancestor| {
+            ancestor.packet_va.checked_add(packet_len).is_some_and(|end| rsp < end)
+        });
+        Some(())
     }
 
     pub(super) fn call(
@@ -168,8 +185,10 @@ impl SehPump {
                 captured: first.captured,
                 phase: None,
                 packet_va,
+                restored_rsp: None,
             };
             let (command, keep) = active.accept_step(channel, reply, badge, first.step)?;
+            self.retire_abandoned(active.restored_rsp)?;
             if keep {
                 self.active.try_reserve(1).ok()?;
                 self.active.push(active);
@@ -194,8 +213,10 @@ impl SehPump {
                 captured: first.captured,
                 phase: None,
                 packet_va: 0,
+                restored_rsp: None,
             };
             let (command, keep) = active.accept_step(channel, reply, badge, first.step)?;
+            self.retire_abandoned(active.restored_rsp)?;
             if keep {
                 self.active.try_reserve(1).ok()?;
                 self.active.push(active);
@@ -333,6 +354,7 @@ impl SehPump {
             }
             SehCall::Raise { .. } | SehCall::BeginUnwind { .. } => unreachable!(),
         };
+        self.retire_abandoned(active.restored_rsp)?;
         if command.1 {
             self.active.push(active);
         }

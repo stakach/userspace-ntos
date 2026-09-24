@@ -307,6 +307,8 @@ SehCollidedUnwindHandler:
     movq %r10, 16(%r9)
     movq 24(%rax), %r10
     movq %r10, 24(%r9)
+    movq 32(%rax), %r10
+    movq %r10, 32(%r9)
     movq 40(%rax), %r10
     movq %r10, 40(%r9)
     movq 48(%rax), %r10

@@ -412,7 +412,7 @@ pub(crate) fn capture_unwind_first_step(
 ) -> Option<Result<SehRaiseFirstPass, UnwindCaptureError>> {
     let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
     let domain = instance_domain_identity(inst)?;
-    inst.seh_linkage?;
+    let linkage = inst.seh_linkage?;
     with_reader(channel, reply_cap, badge, |reader, low, high| {
         super::hosted_exception_images::with_catalog(instance, domain, |catalog| {
             let packet_end = packet_va
@@ -515,7 +515,11 @@ pub(crate) fn capture_unwind_first_step(
                 high,
                 64,
             )
-            .map_err(UnwindCaptureError::Walk)?;
+            .map_err(UnwindCaptureError::Walk)?
+            .with_foreign_boundary(
+                linkage.image_base,
+                (linkage.foreign_call2_va - linkage.image_base) as u32,
+            );
             let step = loop {
                 match walk
                     .step(catalog, reader)
@@ -568,6 +572,7 @@ pub(crate) fn start_target_unwind(
 ) -> Option<Result<FirstRaiseStep, WalkError>> {
     let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
     let domain = instance_domain_identity(inst)?;
+    let linkage = inst.seh_linkage?;
     with_reader(channel, reply_cap, badge, |reader, low, high| {
         super::hosted_exception_images::with_catalog(instance, domain, |catalog| {
             catalog
@@ -584,7 +589,11 @@ pub(crate) fn start_target_unwind(
                 low,
                 high,
                 64,
-            )?;
+            )?
+            .with_foreign_boundary(
+                linkage.image_base,
+                (linkage.foreign_call2_va - linkage.image_base) as u32,
+            );
             loop {
                 match walk.step(catalog, reader)? {
                     WalkStep::Continue(next) => walk = next,

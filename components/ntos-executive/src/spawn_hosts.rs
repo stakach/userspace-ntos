@@ -3890,6 +3890,15 @@ unsafe fn component_run_support_entries(
         component_write_support_aggregate(shared_va, spec, 0, 0);
         return 0;
     }
+    let foreign_call2 = core::ptr::read_volatile(
+        (shared_va + crate::driver_launch::SH_SEH_FOREIGN_CALL2_VA) as *const u64,
+    );
+    if foreign_call2 == 0 {
+        component_write_support_aggregate(shared_va, spec, STATUS_INVALID_PARAMETER_I32, 0);
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    let call: unsafe extern "win64" fn(u64, u64, u64) -> i32 =
+        core::mem::transmute(foreign_call2 as *const ());
     if spec.support_record_capacity != 0 && support_count > spec.support_record_capacity {
         component_write_support_aggregate(
             shared_va,
@@ -3928,9 +3937,7 @@ unsafe fn component_run_support_entries(
 
         let (support_drv, support_reg_path) = component_driver_entry_context(spec);
         let support_entry = code_va + entry_rva;
-        let support_de: extern "win64" fn(u64, u64) -> i32 =
-            core::mem::transmute(support_entry as *const ());
-        aggregate_status = support_de(support_drv, support_reg_path);
+        aggregate_status = call(support_entry, support_drv, support_reg_path);
         core::ptr::write_volatile(status_va as *mut i32, aggregate_status);
         verdict |= crate::driver_launch::V_RETURNED;
         aggregate_verdict |= crate::driver_launch::V_RETURNED;
@@ -3990,9 +3997,17 @@ pub(crate) unsafe fn component_main(
             crate::driver_launch::V_ENTERED,
         );
         let entry = code_va + entry_rva as u64;
-        let de: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(entry as *const ());
-        primary_ran = true;
-        status = de(drv, reg_path);
+        let foreign_call2 = core::ptr::read_volatile(
+            (shared_va + crate::driver_launch::SH_SEH_FOREIGN_CALL2_VA) as *const u64,
+        );
+        if foreign_call2 == 0 {
+            status = STATUS_INVALID_PARAMETER_I32;
+        } else {
+            let de: unsafe extern "win64" fn(u64, u64, u64) -> i32 =
+                core::mem::transmute(foreign_call2 as *const ());
+            primary_ran = true;
+            status = de(entry, drv, reg_path);
+        }
     }
 
     let mj_base = drv + spec.mj;
