@@ -32,6 +32,8 @@ mod hosted_thread_resources;
 
 #[path = "hosted_primary_retirement.rs"]
 mod hosted_primary_retirement;
+#[path = "hosted_exception_images.rs"]
+mod hosted_exception_images;
 
 #[path = "component_scheduler.rs"]
 mod component_scheduler;
@@ -36243,6 +36245,7 @@ unsafe fn load_hosted_dependency_images(
     img_frames: u64,
     rights: &mut [u64],
     mut executable_thunks: Option<&mut HostedExecutableThunkWriter>,
+    exception_images: &mut Vec<nt_unwind::exception_images::AdmittedExceptionImage>,
 ) -> Option<LoadedSupportImages> {
     clear_support_image_records(shared_va);
 
@@ -36303,6 +36306,9 @@ unsafe fn load_hosted_dependency_images(
         if dep_image_len as u64 > dep_frames * 0x1000 {
             return None;
         }
+        exception_images.push(hosted_exception_images::capture(
+            instance, dep_exec_va, dep_run_va, dep_image_len,
+        )?);
         register_loaded_dependency_image(provider, dep_exec_va, dep_run_va, dep_image_len)?;
         record_hosted_provider_load(
             provider_name,
@@ -36546,6 +36552,15 @@ unsafe fn load_driver_reserved(
             HOSTED_EXECUTABLE_THUNK_TABLE_LEN,
         ))
     };
+    let mut exception_images = Vec::new();
+    let exception_image_count = planned_images
+        .dependencies
+        .len()
+        .checked_add(1)
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    exception_images
+        .try_reserve_exact(exception_image_count)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let support_images = load_hosted_dependency_images(
         &planned_images,
         instance,
@@ -36555,6 +36570,7 @@ unsafe fn load_driver_reserved(
         img_frames,
         rights,
         executable_thunk_writer.as_mut(),
+        &mut exception_images,
     )
     .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?;
     if planned_images.primary_offset & 0xfff != 0 {
@@ -36583,6 +36599,12 @@ unsafe fn load_driver_reserved(
         &mut resolver,
     )
     .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?;
+    exception_images.push(
+        hosted_exception_images::capture(instance, primary_exec_va, primary_run_va, image_len)
+            .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?,
+    );
+    let exception_catalog = hosted_exception_images::catalog(instance, exception_images)
+        .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?;
     let _ = register_system_module(path, primary_exec_va, image_len);
     print_str(b"[driver-launch] DriverEntry rva=0x");
     print_hex(entry_rva);
@@ -36774,6 +36796,17 @@ unsafe fn load_driver_reserved(
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
     driver_thread_projection::bootstrap(route, caller)
         .map_err(|status| nt_status::NtStatus(status as i32))?;
+    hosted_exception_images::publish(
+        instance,
+        instance_domain_identity(domain).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?,
+        exception_catalog,
+    )
+    .map_err(|error| match error {
+        hosted_exception_images::PublishError::InsufficientResources => {
+            nt_status::NtStatus::INSUFFICIENT_RESOURCES
+        }
+        hosted_exception_images::PublishError::Occupied => nt_status::NtStatus::DEVICE_BUSY,
+    })?;
     let parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
     crate::spawn_hosts::shared_ingress::owner::runtime::start_bootstrap(route, cnode, sched_context)
@@ -52481,6 +52514,7 @@ fn finish_instance_physical_release(i: usize, inst: DriverInstance) -> Result<()
             print_str(b"\n");
             return Err(status);
         }
+        hosted_exception_images::retire(i, domain);
     }
     let t = unsafe { driver_instances_mut() };
     if i < t.len() {

@@ -85,6 +85,7 @@ nt-acpi = { path = "../../crates/nt-acpi" }
 nt-ahci = { path = "../../crates/nt-ahci" }
 # PE loader — load + map + relocate a real Windows .sys binary in the isolated host.
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+nt-unwind = { path = "../../crates/nt-unwind" }
 # Process Manager — real EPROCESS/ETHREAD + per-process handle tables + lifecycle. The live
 # executive is CONVERGING its ad-hoc process-hosting (spawn_sec_image + badge/pi arrays + next_handle
 # fakes) onto this host-tested subsystem (policy = nt-process; mechanism = seL4 caps stay executive).
