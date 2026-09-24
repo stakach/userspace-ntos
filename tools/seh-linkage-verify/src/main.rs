@@ -8,12 +8,24 @@ use nt_unwind::{
     exception_walk::{ExceptionFunction, ExceptionImageReader},
     unw_flag, UnwindInfoHeader,
 };
+use sha2::{Digest, Sha256};
 
-const EXPORTS: [&str; 4] = [
+const EXPORTS: [&str; 6] = [
     "SehCallFilter",
     "SehCallFinally",
     "SehExecuteHandlerForException",
     "SehExecuteHandlerForUnwind",
+    "SehRaiseStatus",
+    "SehRaiseDispatch",
+];
+const RAISE_PROLOGUE: [u8; 8] = [0x9c, 0x48, 0x81, 0xec, 0xf0, 0x04, 0x00, 0x00];
+const RAISE_UNWIND_CODES: [u8; 6] = [8, 1, 0x9e, 0, 1, 2];
+const RAISE_FUNCTION_LEN: u32 = 0x11a;
+// Reviewed Win64 capture body, including all GPR stores, FXSAVE, selectors and the fail-closed
+// dispatcher call. A changed digest requires disassembly review before native admission.
+const RAISE_CODE_SHA256: [u8; 32] = [
+    0x9e, 0x07, 0x7e, 0x53, 0xe5, 0xe1, 0x86, 0xbd, 0x5f, 0x64, 0x98, 0x4d, 0x79, 0x31, 0xdf, 0x16,
+    0x68, 0x9d, 0x85, 0xbc, 0x40, 0xbe, 0xc9, 0x8a, 0x8f, 0xe5, 0xb8, 0x3f, 0xb3, 0x1b, 0x21, 0xbd,
 ];
 const CALL_FRAME: [u8; 4] = [0x48, 0x83, 0xec, 0x28];
 const UNWIND_ALLOC_40: [u8; 2] = [4, 0x42];
@@ -150,6 +162,113 @@ fn valid_unwind_header(header: UnwindInfoHeader, flags: u8) -> bool {
         && header.frame_offset == 0
 }
 
+fn raise_layout_is_exact(bytes: &[u8], begin: u32, end: u32, unwind: u32) -> bool {
+    begin.checked_add(RAISE_FUNCTION_LEN) == Some(end)
+        && bytes.get(begin as usize..begin as usize + RAISE_PROLOGUE.len())
+            == Some(RAISE_PROLOGUE.as_slice())
+        && bytes.get(unwind as usize + 4..unwind as usize + 10)
+            == Some(RAISE_UNWIND_CODES.as_slice())
+        && bytes.get(end as usize - 2..end as usize) == Some(&[0x0f, 0x0b])
+}
+
+fn raise_encoding_is_exact(bytes: &[u8], begin: u32, end: u32, unwind: u32) -> bool {
+    let Some(code) = bytes.get(begin as usize..end as usize) else {
+        return false;
+    };
+    raise_layout_is_exact(bytes, begin, end, unwind)
+        && Sha256::digest(code).as_slice() == RAISE_CODE_SHA256
+}
+
+fn raise_dispatch_slot_is_zero(bytes: &[u8], rva: u32) -> bool {
+    rva & 7 == 0 && bytes.get(rva as usize..rva as usize + 8) == Some(&[0; 8])
+}
+
+fn verify_raise_entry(
+    pe: &PeFile<'_>,
+    mapped: &nt_pe_loader::MappedImage,
+    image: &BorrowedExceptionImage<'_>,
+    export: &ExportedSymbol,
+) -> Result<(), String> {
+    let pc = mapped
+        .load_base
+        .checked_add(u64::from(export.rva))
+        .ok_or("raise entry VA overflow")?;
+    let function = match image.lookup_exception_function(pc) {
+        Ok(ExceptionFunction::Function {
+            image_base,
+            function,
+        }) if image_base == mapped.load_base && function.begin == export.rva => function,
+        other => {
+            return Err(format!(
+                "raise entry lacks exact runtime function: {other:?}"
+            ))
+        }
+    };
+    let header: [u8; 4] = mapped
+        .bytes
+        .get(function.unwind_info as usize..function.unwind_info as usize + 4)
+        .ok_or("raise entry unwind header outside image")?
+        .try_into()
+        .map_err(|_| "raise entry unwind header malformed")?;
+    let header = UnwindInfoHeader::parse(&header);
+    let function_len = function
+        .end
+        .checked_sub(function.begin)
+        .ok_or("raise entry reversed")?;
+    if header.version != 1
+        || header.flags != 0
+        || header.is_chained()
+        || header.size_of_prolog != RAISE_PROLOGUE.len() as u8
+        || header.frame_register != 0
+        || header.count_of_codes != 3
+        || !raise_encoding_is_exact(
+            &mapped.bytes,
+            function.begin,
+            function.end,
+            function.unwind_info,
+        )
+        || !pe.sections().iter().any(|section| {
+            section.name_str() == ".text"
+                && section_contains(section, export.rva, function_len as usize)
+                && section.is_readable()
+                && section.is_executable()
+                && !section.is_writable()
+        })
+        || !pe.sections().iter().any(|section| {
+            section_contains(section, function.unwind_info, 8)
+                && section.is_readable()
+                && !section.is_writable()
+                && !section.is_executable()
+        })
+    {
+        return Err("raise entry code or unwind metadata invalid".into());
+    }
+    println!(
+        "{} RVA=0x{:x} unwind=0x{:x} flags={}",
+        export.name, export.rva, function.unwind_info, header.flags
+    );
+    Ok(())
+}
+
+fn verify_raise_dispatch_slot(
+    pe: &PeFile<'_>,
+    mapped: &nt_pe_loader::MappedImage,
+    export: &ExportedSymbol,
+) -> Result<(), String> {
+    if !raise_dispatch_slot_is_zero(&mapped.bytes, export.rva)
+        || !pe.sections().iter().any(|section| {
+            section.name_str() == ".rdata"
+                && section_contains(section, export.rva, 8)
+                && section.is_readable()
+                && !section.is_writable()
+                && !section.is_executable()
+        })
+    {
+        return Err("raise dispatch slot is not zeroed RO_NX data".into());
+    }
+    Ok(())
+}
+
 fn verify(path: &str) -> Result<(), String> {
     let bytes = fs::read(path).map_err(|error| format!("read {path}: {error}"))?;
     let pe = PeFile::parse(&bytes).map_err(|error| format!("PE parse: {error:?}"))?;
@@ -178,6 +297,14 @@ fn verify(path: &str) -> Result<(), String> {
     let mut nested_handler = None;
     let mut collided_handler = None;
     for export in exports {
+        if export.name == "SehRaiseDispatch" {
+            verify_raise_dispatch_slot(&pe, &mapped, &export)?;
+            continue;
+        }
+        if export.name == "SehRaiseStatus" {
+            verify_raise_entry(&pe, &mapped, &image, &export)?;
+            continue;
+        }
         let expected_flags = expected_flags(&export.name);
         let pc = mapped
             .load_base
@@ -409,6 +536,26 @@ mod tests {
             );
             collided[offset] ^= 1;
         }
+    }
+
+    #[test]
+    fn raise_entry_and_dispatch_slot_reject_mutations() {
+        let mut bytes = vec![0u8; 0x2200];
+        bytes[0x1000..0x1008].copy_from_slice(&RAISE_PROLOGUE);
+        bytes[0x1118..0x111a].copy_from_slice(&[0x0f, 0x0b]);
+        bytes[0x2100..0x2106].copy_from_slice(&RAISE_UNWIND_CODES);
+        assert!(raise_layout_is_exact(&bytes, 0x1000, 0x111a, 0x20fc));
+        assert!(!raise_encoding_is_exact(&bytes, 0x1000, 0x111a, 0x20fc));
+        assert!(raise_dispatch_slot_is_zero(&bytes, 0x2000));
+        assert!(!raise_layout_is_exact(&bytes, 0x1000, 0x111b, 0x20fc));
+        assert!(!raise_dispatch_slot_is_zero(&bytes, 0x2001));
+        for offset in (0x1000..0x1008).chain(0x1118..0x111a).chain(0x2100..0x2106) {
+            bytes[offset] ^= 1;
+            assert!(!raise_layout_is_exact(&bytes, 0x1000, 0x111a, 0x20fc));
+            bytes[offset] ^= 1;
+        }
+        bytes[0x2007] = 1;
+        assert!(!raise_dispatch_slot_is_zero(&bytes, 0x2000));
     }
 }
 

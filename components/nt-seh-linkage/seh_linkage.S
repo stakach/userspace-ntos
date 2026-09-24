@@ -11,9 +11,76 @@
  *                                       void *context_record, void *dispatcher_context);
  * int32_t SehExecuteHandlerForUnwind(void *exception_record, void *establisher_frame,
  *                                    void *context_record, void *dispatcher_context);
+ * void SehRaiseStatus(uint32_t status);  // not bound until native dispatch and restore exist
  */
 
     .text
+    .globl SehRaiseStatus
+    .seh_proc SehRaiseStatus
+SehRaiseStatus:
+    pushfq
+    .seh_stackalloc 8
+    subq $0x4f0, %rsp
+    .seh_stackalloc 0x4f0
+    .seh_endprologue
+
+    /* RSP is aligned; [RSP, RSP+0x20) is outgoing Win64 shadow space and
+       the complete 16-byte-aligned NT CONTEXT starts at RSP+0x20. */
+    movq %rax, 0x98(%rsp)
+    movq %rcx, 0xa0(%rsp)
+    movq %rdx, 0xa8(%rsp)
+    movq %rbx, 0xb0(%rsp)
+    movq %rbp, 0xc0(%rsp)
+    movq %rsi, 0xc8(%rsp)
+    movq %rdi, 0xd0(%rsp)
+    movq %r8, 0xd8(%rsp)
+    movq %r9, 0xe0(%rsp)
+    movq %r10, 0xe8(%rsp)
+    movq %r11, 0xf0(%rsp)
+    movq %r12, 0xf8(%rsp)
+    movq %r13, 0x100(%rsp)
+    movq %r14, 0x108(%rsp)
+    movq %r15, 0x110(%rsp)
+
+    leaq 0x4f8(%rsp), %rax
+    movq %rax, 0xb8(%rsp)
+    leaq SehRaiseStatus(%rip), %rax
+    movq %rax, 0x118(%rsp)
+
+    /* Only the saved GPRs and live FXSAVE region are retained from the entry.
+       Clear every other CONTEXT byte before the dispatcher can inspect it. */
+    cld
+    xorl %eax, %eax
+    leaq 0x20(%rsp), %rdi
+    movl $15, %ecx
+    rep stosq
+    leaq 0x320(%rsp), %rdi
+    movl $58, %ecx
+    rep stosq
+    fxsave 0x120(%rsp)
+
+    movl $0x0010000f, 0x50(%rsp)
+    movl 0x138(%rsp), %eax
+    movl %eax, 0x54(%rsp)
+    movw %cs, 0x58(%rsp)
+    movw %ds, 0x5a(%rsp)
+    movw %es, 0x5c(%rsp)
+    movw %fs, 0x5e(%rsp)
+    movw %gs, 0x60(%rsp)
+    movw %ss, 0x62(%rsp)
+    movq 0x4f0(%rsp), %rax
+    movl %eax, 0x64(%rsp)
+
+    movq SehRaiseDispatch(%rip), %rax
+    testq %rax, %rax
+    jz .Lraise_unbound
+    leaq 0x20(%rsp), %rcx
+    movl 0xa0(%rsp), %edx
+    callq *%rax
+.Lraise_unbound:
+    ud2
+    .seh_endproc
+
     .globl SehCallFilter
     .seh_proc SehCallFilter
 SehCallFilter:
@@ -108,3 +175,9 @@ SehCallFinally:
     addq $40, %rsp
     retq
     .seh_endproc
+
+    .section .rdata,"dr"
+    .p2align 3
+    .globl SehRaiseDispatch
+SehRaiseDispatch:
+    .quad 0

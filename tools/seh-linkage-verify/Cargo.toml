@@ -20,3 +20,4 @@ path = "src/driver_fixture.rs"
 [dependencies]
 nt-pe-loader.workspace = true
 nt-unwind.workspace = true
+sha2 = "0.10"

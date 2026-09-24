@@ -18,6 +18,7 @@ mkdir -p "$OUT"
     /dynamicbase /nxcompat /timestamp:0 \
     /export:SehCallFilter /export:SehCallFinally \
     /export:SehExecuteHandlerForException /export:SehExecuteHandlerForUnwind \
+    /export:SehRaiseStatus /export:SehRaiseDispatch,DATA \
     "/out:$OUT/nt-seh-linkage.dll" "$OUT/seh_linkage.obj"
 cargo run --manifest-path "$ROOT/Cargo.toml" -p seh-linkage-verify -- \
     "$OUT/nt-seh-linkage.dll"

@@ -999,6 +999,7 @@ version = "0.1.0"
 dependencies = [
  "nt-pe-loader",
  "nt-unwind",
+ "sha2",
 ]
 
 [[package]]
