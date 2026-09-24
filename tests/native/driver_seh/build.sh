@@ -9,6 +9,7 @@ case "$VARIANT" in
     success) VARIANT_CFLAG=() ;;
     unhandled) VARIANT_CFLAG=(-DSEH_TERMINAL_UNHANDLED) ;;
     exit) VARIANT_CFLAG=(-DSEH_TERMINAL_EXIT) ;;
+    fault-ud2) VARIANT_CFLAG=(-DSEH_FAULT_UD2) ;;
     *) echo "error: unsupported native SEH fixture variant: $VARIANT" >&2; exit 1 ;;
 esac
 CLANG=${CLANG:-clang}

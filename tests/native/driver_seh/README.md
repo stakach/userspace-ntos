@@ -51,3 +51,14 @@ This gate stops QEMU only after the provider bugcheck is logged. It requires the
 exception code, reporting-thread suspension, and terminal state. A timeout, returned terminal
 call, failed prefix, or successful DriverEntry completion fails. Neither terminal fixture is
 staged in the production image.
+
+The CPU-fault case rebuilds the isolated `seh-driver` image with a `ud2` instruction inside a
+compiler-emitted `__try/__except`. It requires the real fault to reach the handler as
+`STATUS_ILLEGAL_INSTRUCTION` exactly once; the instruction after `ud2` must not run. Run it
+separately from the regular image gate:
+
+```sh
+bash scripts/run-seh-fault-integration.sh
+```
+
+This variant is never staged in the production image.

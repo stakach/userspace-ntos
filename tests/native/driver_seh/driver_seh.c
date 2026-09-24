@@ -6,11 +6,12 @@ typedef int32_t NTSTATUS;
 #define STATUS_SUCCESS ((NTSTATUS)0)
 #define STATUS_UNSUCCESSFUL ((NTSTATUS)0xc0000001u)
 #define STATUS_ACCESS_DENIED ((NTSTATUS)0xc0000022u)
+#define STATUS_ILLEGAL_INSTRUCTION ((NTSTATUS)0xc000001du)
 #define EXCEPTION_EXECUTE_HANDLER 1
 #define EXCEPTION_CONTINUE_SEARCH 0
 
-#if defined(SEH_TERMINAL_UNHANDLED) && defined(SEH_TERMINAL_EXIT)
-#error "select exactly one terminal SEH case"
+#if (defined(SEH_TERMINAL_UNHANDLED) + defined(SEH_TERMINAL_EXIT) + defined(SEH_FAULT_UD2)) > 1
+#error "select exactly one native SEH case"
 #endif
 
 __declspec(dllimport) void __stdcall ExRaiseStatus(NTSTATUS status);
@@ -34,6 +35,10 @@ struct SehFixtureEvidence {
     uint32_t collided_inner_after;
     uint32_t collided_outer_after;
     uint32_t collided_landed;
+    uint32_t fault_entered;
+    uint32_t fault_after_instruction;
+    uint32_t fault_caught;
+    uint32_t fault_code;
 };
 
 volatile struct SehFixtureEvidence SehFixtureEvidence;
@@ -82,6 +87,22 @@ unwind_target:
 
 void BareTargetUnwind(void);
 void CollidedTargetUnwind(void);
+
+#if defined(SEH_FAULT_UD2)
+__declspec(noinline) static void CatchIllegalInstruction(void)
+{
+    __try {
+        SehFixtureEvidence.fault_entered++;
+        __asm__ __volatile__("ud2");
+        SehFixtureEvidence.fault_after_instruction++;
+    } __except (__exception_code() == (uint32_t)STATUS_ILLEGAL_INSTRUCTION
+                    ? EXCEPTION_EXECUTE_HANDLER
+                    : EXCEPTION_CONTINUE_SEARCH) {
+        SehFixtureEvidence.fault_caught++;
+        SehFixtureEvidence.fault_code = __exception_code();
+    }
+}
+#endif
 
 NTSTATUS __stdcall DriverEntry(void *driver_object, void *registry_path)
 {
@@ -142,6 +163,20 @@ NTSTATUS __stdcall DriverEntry(void *driver_object, void *registry_path)
         RtlUnwindEx(0, 0, (void *)&UnwindRecord, 0, exit_context, 0);
         DbgPrint("[seh-terminal-unexpected-return]\n");
         return STATUS_UNSUCCESSFUL;
+#elif defined(SEH_FAULT_UD2)
+        DbgPrint("[seh-fault-trigger] kind=ud2\n");
+        CatchIllegalInstruction();
+        if (SehFixtureEvidence.fault_entered != 1 ||
+            SehFixtureEvidence.fault_after_instruction != 0 ||
+            SehFixtureEvidence.fault_caught != 1 ||
+            SehFixtureEvidence.fault_code != (uint32_t)STATUS_ILLEGAL_INSTRUCTION) {
+            DbgPrint("[seh-fault-failed] kind=ud2 entered=%u after=%u caught=%u code=0x%08x\n",
+                     SehFixtureEvidence.fault_entered,
+                     SehFixtureEvidence.fault_after_instruction,
+                     SehFixtureEvidence.fault_caught, SehFixtureEvidence.fault_code);
+            return STATUS_UNSUCCESSFUL;
+        }
+        DbgPrint("[seh-fault-proof] kind=ud2 entered=1 after=0 caught=1 code=0xc000001d\n");
 #else
         DbgPrint("[seh-native-proof-complete]\n");
 #endif
