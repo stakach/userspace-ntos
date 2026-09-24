@@ -55,6 +55,7 @@ mod hosted_file_lifetime_tests;
 mod hosted_device_pointer;
 pub mod inline_file_retirement;
 mod irp;
+pub mod io_create_file;
 mod lock_control;
 mod set_information_completion;
 pub mod share_access;
