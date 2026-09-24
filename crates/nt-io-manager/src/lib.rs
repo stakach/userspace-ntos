@@ -63,6 +63,7 @@ pub mod provider_create_delivery;
 pub mod consumer_file_projection;
 pub mod hosted_forward_target;
 pub mod redir_query_path;
+pub mod retained_query_path_forward;
 pub mod io_create_file_wire;
 mod lock_control;
 mod set_information_completion;

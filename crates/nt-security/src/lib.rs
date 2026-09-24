@@ -22,6 +22,7 @@ mod port;
 pub mod se_exports;
 mod sid;
 pub mod subject_context;
+pub mod source_create_security;
 mod token;
 mod token_filter;
 mod token_info;
