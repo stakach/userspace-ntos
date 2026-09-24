@@ -35,6 +35,7 @@ struct Wait {
 #[derive(Clone, Copy)]
 enum ServiceCompletion {
     Status(i32),
+    FileCreate(nt_io_manager::io_create_file_reply::IoCreateFileReply),
     Registry {
         status: i32,
         handle: u64,
@@ -46,6 +47,7 @@ impl ServiceCompletion {
     fn words(self) -> (u64, [u64; 4]) {
         match self {
             Self::Status(status) => (1, [status as u32 as u64, 0, 0, 0]),
+            Self::FileCreate(reply) => (4, reply.words().expect("terminal File create reply")),
             Self::Registry {
                 status,
                 handle,
@@ -180,6 +182,25 @@ pub(crate) unsafe fn wake_registry_service(
             handle,
             disposition,
         },
+    )
+}
+
+pub(crate) unsafe fn wake_file_create_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    completion: nt_io_manager::io_create_file_reply::IoCreateFileReply,
+) -> Result<(), Error> {
+    if completion.words().is_err() {
+        return Err(Error::Protocol);
+    }
+    wake_with_completion(
+        route,
+        dispatch,
+        reply,
+        token,
+        ServiceCompletion::FileCreate(completion),
     )
 }
 

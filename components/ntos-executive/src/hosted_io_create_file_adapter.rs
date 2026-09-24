@@ -4,12 +4,11 @@ use super::*;
 use nt_io_manager::io_create_file_capture::{
     capture_ordinary, DriverMemoryReader, RawIoCreateFileArguments,
 };
+use nt_io_manager::io_create_file_reply::IoCreateFileReply;
 use nt_io_manager::io_create_file_wire::{encode_into, encoded_len, IoCreateFileWireError};
 use nt_types::AccessMode;
 
-const STATUS_PENDING: u32 = 0x0000_0103;
 const STATUS_PROTOCOL_ERROR: u32 = 0xc000_0010;
-const COMPLETION_VALID: u64 = 1 << 32;
 
 struct DriverMemory;
 
@@ -135,36 +134,29 @@ pub(super) extern "win64" fn s_io_create_file(
         )
     };
     unsafe { pool_free(frame) };
-    if label != 0 || status_word & !(COMPLETION_VALID | u32::MAX as u64) != 0 {
+    if label != 0 {
         return STATUS_PROTOCOL_ERROR as i32;
     }
-    let status = status_word as u32;
-    if status == STATUS_PENDING || iosb_status > u32::MAX as u64 {
-        return STATUS_PROTOCOL_ERROR as i32;
-    }
-    if status_word & COMPLETION_VALID != 0 {
-        if (status as i32) >= 0 {
-            if (iosb_status as u32 as i32) < 0 || handle == 0 {
-                return STATUS_PROTOCOL_ERROR as i32;
+    match IoCreateFileReply::decode([status_word, iosb_status, information, handle]) {
+        Ok(IoCreateFileReply::Rejected { status }) => status as i32,
+        Ok(IoCreateFileReply::Completed {
+            status,
+            iosb_status,
+            information,
+            handle,
+        }) => {
+            unsafe {
+                write_unaligned(captured.outputs.io_status_block as *mut u32, iosb_status);
+                write_unaligned(
+                    (captured.outputs.io_status_block + 8) as *mut u64,
+                    information,
+                );
+                if handle != 0 {
+                    write_unaligned(captured.outputs.file_handle as *mut u64, handle);
+                }
             }
-        } else if handle != 0 {
-            return STATUS_PROTOCOL_ERROR as i32;
+            status as i32
         }
-        unsafe {
-            write_unaligned(
-                captured.outputs.io_status_block as *mut u32,
-                iosb_status as u32,
-            );
-            write_unaligned(
-                (captured.outputs.io_status_block + 8) as *mut u64,
-                information,
-            );
-            if handle != 0 {
-                write_unaligned(captured.outputs.file_handle as *mut u64, handle);
-            }
-        }
-    } else if (status as i32) >= 0 || handle != 0 || iosb_status != 0 || information != 0 {
-        return STATUS_PROTOCOL_ERROR as i32;
+        Err(_) => STATUS_PROTOCOL_ERROR as i32,
     }
-    status as i32
 }
