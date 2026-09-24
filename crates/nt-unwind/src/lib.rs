@@ -662,7 +662,7 @@ fn virtual_unwind_inner(
         && epilogue::unwind_return(
             image_base,
             control_rva,
-            covering_func.end,
+            covering_func,
             hdr.frame_register,
             ctx,
             img,
