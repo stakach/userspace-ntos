@@ -1,6 +1,10 @@
 use super::*;
-use crate::REG_RBX;
-use alloc::{collections::BTreeMap, vec::Vec};
+use crate::{
+    raw_context::{RawContext, CONTEXT_AMD64_FULL_SEGMENTS},
+    seh_handler_packet::{HandlerPacketError, SehHandlerPacket},
+    REG_RBX,
+};
+use alloc::{collections::BTreeMap, vec, vec::Vec};
 use core::cell::Cell;
 
 const BASE: u64 = 0x10_0000;
@@ -296,6 +300,63 @@ fn software_raise_search_returns_owned_unhandled_outcome() {
     };
     assert_eq!(exception.code, 0xc000_0022);
     assert_eq!(context.rsp(), LOW + 0x10);
+}
+
+#[test]
+fn native_handler_packet_preserves_raw_state_and_exact_component_pointers() {
+    let fixture = Fixture::new(unw_flag::EHANDLER);
+    let invocation = invoke(
+        fixture
+            .walk(WalkMode::Search)
+            .step(&fixture, &fixture)
+            .unwrap(),
+    );
+    let mut captured = RawContext::zeroed();
+    captured.set_context_flags(CONTEXT_AMD64_FULL_SEGMENTS);
+    captured.as_bytes_mut()[0x4a0] = 0x5a;
+    let packet = SehHandlerPacket::prepare_search(&captured, &invocation, 0x8000).unwrap();
+    assert_eq!(packet.exception.code, invocation.exception.code);
+    assert_eq!(packet.exception_pointers.exception_record, 0x8000);
+    assert_eq!(packet.exception_pointers.context_record, 0x80b0);
+    assert_eq!(packet.dispatcher.context_record, 0x8580);
+    assert_eq!(packet.dispatcher.function_entry, 0x8aa0);
+    assert_eq!(packet.dispatcher.language_handler, invocation.handler);
+    assert_eq!(packet.original_context.rip(), BASE + 0x110);
+    assert_eq!(packet.unwound_context.rip(), BASE + 0x210);
+    assert_eq!(packet.original_context.as_bytes()[0x4a0], 0x5a);
+    assert_eq!(packet.unwound_context.as_bytes()[0x4a0], 0x5a);
+}
+
+#[test]
+fn native_handler_packet_rejects_wrong_mode_bad_address_and_excess_information() {
+    let fixture = Fixture::new(unw_flag::EHANDLER);
+    let mut invocation = invoke(
+        fixture
+            .walk(WalkMode::Search)
+            .step(&fixture, &fixture)
+            .unwrap(),
+    );
+    let captured = RawContext::zeroed();
+    assert!(matches!(
+        SehHandlerPacket::prepare_search(&captured, &invocation, 0x8008),
+        Err(HandlerPacketError::Address)
+    ));
+    assert!(matches!(
+        SehHandlerPacket::prepare_search(&captured, &invocation, u64::MAX - 15),
+        Err(HandlerPacketError::Address)
+    ));
+    invocation.exception.information = vec![0; 16];
+    assert!(matches!(
+        SehHandlerPacket::prepare_search(&captured, &invocation, 0x8000),
+        Err(HandlerPacketError::InformationCount)
+    ));
+
+    let fixture = Fixture::new(unw_flag::UHANDLER);
+    let invocation = invoke(fixture.walk(unwind(None)).step(&fixture, &fixture).unwrap());
+    assert!(matches!(
+        SehHandlerPacket::prepare_search(&captured, &invocation, 0x8000),
+        Err(HandlerPacketError::NotSearch)
+    ));
 }
 
 #[test]
