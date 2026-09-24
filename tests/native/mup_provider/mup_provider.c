@@ -23,6 +23,7 @@ typedef void *HANDLE;
 #define FILE_DEVICE_NETWORK_FILE_SYSTEM 0x14
 #define FILE_DEVICE_MULTI_UNC_PROVIDER 0x10
 #define FILE_TRAVERSE 0x20
+#define SYNCHRONIZE 0x00100000
 #define FILE_SHARE_READ 0x01
 #define FILE_SHARE_WRITE 0x02
 #define FILE_OPEN 0x01
@@ -159,6 +160,8 @@ struct MupProviderEvidence {
     uint32_t mup_opened;
     uint32_t registration_sent;
     uint32_t registration_status;
+    uint32_t probe_attempted;
+    uint32_t probe_status;
     uint32_t create_count;
     uint32_t cleanup_count;
     uint32_t close_count;
@@ -180,6 +183,11 @@ static WCHAR ProviderName[] = {
 };
 static WCHAR MupName[] = {
     '\\', 'D', 'e', 'v', 'i', 'c', 'e', '\\', 'M', 'u', 'p', 0
+};
+static WCHAR ProbeName[] = {
+    '\\', 'D', 'e', 'v', 'i', 'c', 'e', '\\', 'M', 'u', 'p',
+    '\\', 'n', 't', 'o', 's', '-', 'p', 'r', 'o', 'b', 'e',
+    '\\', 's', 'h', 'a', 'r', 'e', 0
 };
 /* Mup's FileObject name begins with one backslash; include the server only. */
 static const WCHAR AcceptedPrefix[] = {
@@ -316,7 +324,7 @@ NTSTATUS __stdcall DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *registry_p
     OBJECT_ATTRIBUTES attrs = {sizeof(attrs), NULL, &mup_name,
                                 OBJ_CASE_INSENSITIVE, NULL, NULL};
     IO_STATUS_BLOCK iosb = {0};
-    status = ZwCreateFile(&MupRegistrationHandle, FILE_TRAVERSE, &attrs, &iosb,
+    status = ZwCreateFile(&MupRegistrationHandle, FILE_TRAVERSE | SYNCHRONIZE, &attrs, &iosb,
                           NULL, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
                           FILE_OPEN, FILE_DIRECTORY_FILE, NULL, 0);
     if (!NT_SUCCESS(status)) goto fail;
@@ -344,7 +352,30 @@ NTSTATUS __stdcall DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *registry_p
              (uint32_t)status, MupProviderEvidence.device_created,
              MupProviderEvidence.mup_opened,
              MupProviderEvidence.registration_sent);
-    if (NT_SUCCESS(status)) return STATUS_SUCCESS;
+    if (NT_SUCCESS(status)) {
+        UNICODE_STRING probe_name = {
+            (uint16_t)(sizeof(ProbeName) - sizeof(WCHAR)),
+            (uint16_t)sizeof(ProbeName), ProbeName
+        };
+        OBJECT_ATTRIBUTES probe_attrs = {sizeof(probe_attrs), NULL, &probe_name,
+                                          OBJ_CASE_INSENSITIVE, NULL, NULL};
+        HANDLE probe_handle = NULL;
+        IO_STATUS_BLOCK probe_iosb = {0};
+        MupProviderEvidence.probe_attempted++;
+        NTSTATUS probe_status = ZwCreateFile(&probe_handle, FILE_TRAVERSE | SYNCHRONIZE,
+                                              &probe_attrs, &probe_iosb, NULL, 0,
+                                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                              FILE_OPEN, FILE_DIRECTORY_FILE, NULL, 0);
+        if (NT_SUCCESS(probe_status)) {
+            probe_status = probe_iosb.Status;
+            if (probe_handle != NULL) ZwClose(probe_handle);
+        }
+        MupProviderEvidence.probe_status = (uint32_t)probe_status;
+        DbgPrint("[mup-provider-probe] status=0x%08x queries=%u accepted=%u\n",
+                 (uint32_t)probe_status, MupProviderEvidence.query_count,
+                 MupProviderEvidence.query_accepted);
+        return STATUS_SUCCESS;
+    }
 
 fail:
     ProviderUnload(driver);
