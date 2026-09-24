@@ -652,16 +652,23 @@ fn protection_from_section_characteristics() {
         chars: 0xC000_0040, // INITIALIZED_DATA | READ | WRITE
         data: vec![0u8; 8],
     };
+    let rdata = Sec {
+        name: *b".rdata\0\0",
+        va: 0x3000,
+        chars: 0x4000_0040, // INITIALIZED_DATA | READ
+        data: vec![0u8; 8],
+    };
     let pe_bytes = build_pe(
         BASE,
         0x1000,
-        0x3000,
-        &[text_section(0x1000, vec![0xC3]), data],
+        0x4000,
+        &[text_section(0x1000, vec![0xC3]), data, rdata],
         &[],
     );
     let pe = PeFile::parse(&pe_bytes).unwrap();
     assert_eq!(pe.protection_at(0x1000), Protection::ReadExecute); // .text
     assert_eq!(pe.protection_at(0x2000), Protection::ReadWrite); // .data
+    assert_eq!(pe.protection_at(0x3000), Protection::ReadOnly); // .rdata
     assert_eq!(pe.protection_at(0), Protection::ReadOnly); // headers
     assert_eq!(pe.page_has_loader_writable_state(0x2000).unwrap(), false);
 }

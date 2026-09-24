@@ -36059,11 +36059,10 @@ unsafe fn load_pe_into(
         }
         let n = raw_size.min(cap - va);
         copy_bytes(dst_va + va, src_va + raw_ptr, n);
-        // W^X: executable section → RX (2), else RW_NX.
-        let r = if chars & 0x2000_0000 != 0 {
-            2u64
-        } else {
-            RW_NX
+        let r = match nt_pe_loader::Protection::from_section_characteristics(chars) {
+            nt_pe_loader::Protection::ReadExecute => 2,
+            nt_pe_loader::Protection::ReadWrite => RW_NX,
+            nt_pe_loader::Protection::ReadOnly => RO_NX,
         };
         let span = va + vsize.max(raw_size);
         let mut p = va & !0xFFF;
