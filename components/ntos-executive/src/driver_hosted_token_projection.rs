@@ -167,6 +167,16 @@ pub(super) unsafe fn project(
         ));
         return Err(STATUS_DEVICE_BUSY_LOCAL);
     }
+    if (&mut *core::ptr::addr_of_mut!(ROWS))
+        .try_reserve(1)
+        .is_err()
+    {
+        assert!(free_hosted_instance_pool_allocation_exact(
+            provider_inst,
+            address
+        ));
+        return Err(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
+    }
     if matches!(
         source.phase(),
         SourceCreateSecurityPhase::Terminal | SourceCreateSecurityPhase::Released
