@@ -10,7 +10,7 @@ use nt_unwind::{
 };
 use sha2::{Digest, Sha256};
 
-const EXPORTS: [&str; 7] = [
+const EXPORTS: [&str; 9] = [
     "SehCallFilter",
     "SehCallFinally",
     "SehExecuteHandlerForException",
@@ -18,6 +18,8 @@ const EXPORTS: [&str; 7] = [
     "SehRaiseStatus",
     "SehResumeContext",
     "SehRaiseDispatch",
+    "SehUnwindEx",
+    "SehUnwindDispatch",
 ];
 const RAISE_PROLOGUE: [u8; 8] = [0x9c, 0x48, 0x81, 0xec, 0xf0, 0x04, 0x00, 0x00];
 const RAISE_UNWIND_CODES: [u8; 6] = [8, 1, 0x9e, 0, 1, 2];
@@ -38,6 +40,11 @@ const RAISE_CODE_SHA256: [u8; 32] = [
     0x89, 0xfb, 0x08, 0x39, 0x59, 0x8f, 0x2e, 0x04, 0xd4, 0xd2, 0x28, 0x21, 0xcc, 0x28, 0xb7, 0x2e,
     0x20, 0x93, 0xc5, 0xba, 0xdf, 0xf7, 0x6f, 0x8e, 0x2f, 0xc0, 0x95, 0x88, 0x52, 0x36, 0x3c, 0x28,
 ];
+const UNWIND_PROLOGUE: [u8; 8] = [0x9c, 0x48, 0x81, 0xec, 0x30, 0x05, 0x00, 0x00];
+const UNWIND_UNWIND_CODES: [u8; 6] = [8, 1, 0xa6, 0, 1, 2];
+// Derived from the reviewed mapped .text body after the validation-owner build.
+const UNWIND_FUNCTION_LEN: u32 = 0;
+const UNWIND_CODE_SHA256: [u8; 32] = [0; 32];
 const CALL_FRAME: [u8; 4] = [0x48, 0x83, 0xec, 0x28];
 const UNWIND_ALLOC_40: [u8; 2] = [4, 0x42];
 const EXECUTE_BODY: [u8; 15] = [
@@ -190,6 +197,23 @@ fn raise_encoding_is_exact(bytes: &[u8], begin: u32, end: u32, unwind: u32) -> b
         && Sha256::digest(code).as_slice() == RAISE_CODE_SHA256
 }
 
+fn unwind_layout_is_exact(bytes: &[u8], begin: u32, end: u32, unwind: u32) -> bool {
+    begin.checked_add(UNWIND_FUNCTION_LEN) == Some(end)
+        && bytes.get(begin as usize..begin as usize + UNWIND_PROLOGUE.len())
+            == Some(UNWIND_PROLOGUE.as_slice())
+        && bytes.get(unwind as usize + 4..unwind as usize + 10)
+            == Some(UNWIND_UNWIND_CODES.as_slice())
+        && bytes.get(end as usize - 2..end as usize) == Some(&[0x0f, 0x0b])
+}
+
+fn unwind_encoding_is_exact(bytes: &[u8], begin: u32, end: u32, unwind: u32) -> bool {
+    let Some(code) = bytes.get(begin as usize..end as usize) else {
+        return false;
+    };
+    unwind_layout_is_exact(bytes, begin, end, unwind)
+        && Sha256::digest(code).as_slice() == UNWIND_CODE_SHA256
+}
+
 fn raise_dispatch_slot_is_zero(bytes: &[u8], rva: u32) -> bool {
     rva & 7 == 0 && bytes.get(rva as usize..rva as usize + 8) == Some(&[0; 8])
 }
@@ -271,6 +295,73 @@ fn verify_raise_entry(
         })
     {
         return Err("raise entry code or unwind metadata invalid".into());
+    }
+    println!(
+        "{} RVA=0x{:x} unwind=0x{:x} flags={}",
+        export.name, export.rva, function.unwind_info, header.flags
+    );
+    Ok(())
+}
+
+fn verify_unwind_entry(
+    pe: &PeFile<'_>,
+    mapped: &nt_pe_loader::MappedImage,
+    image: &BorrowedExceptionImage<'_>,
+    export: &ExportedSymbol,
+) -> Result<(), String> {
+    let pc = mapped
+        .load_base
+        .checked_add(u64::from(export.rva))
+        .ok_or("unwind entry VA overflow")?;
+    let function = match image.lookup_exception_function(pc) {
+        Ok(ExceptionFunction::Function {
+            image_base,
+            function,
+        }) if image_base == mapped.load_base && function.begin == export.rva => function,
+        other => {
+            return Err(format!(
+                "unwind entry lacks exact runtime function: {other:?}"
+            ))
+        }
+    };
+    let header: [u8; 4] = mapped
+        .bytes
+        .get(function.unwind_info as usize..function.unwind_info as usize + 4)
+        .ok_or("unwind entry header outside image")?
+        .try_into()
+        .map_err(|_| "unwind entry header malformed")?;
+    let header = UnwindInfoHeader::parse(&header);
+    let function_len = function
+        .end
+        .checked_sub(function.begin)
+        .ok_or("unwind entry reversed")?;
+    if header.version != 1
+        || header.flags != 0
+        || header.is_chained()
+        || header.size_of_prolog != UNWIND_PROLOGUE.len() as u8
+        || header.frame_register != 0
+        || header.count_of_codes != 3
+        || !unwind_encoding_is_exact(
+            &mapped.bytes,
+            function.begin,
+            function.end,
+            function.unwind_info,
+        )
+        || !pe.sections().iter().any(|section| {
+            section.name_str() == ".text"
+                && section_contains(section, export.rva, function_len as usize)
+                && section.is_readable()
+                && section.is_executable()
+                && !section.is_writable()
+        })
+        || !pe.sections().iter().any(|section| {
+            section_contains(section, function.unwind_info, 10)
+                && section.is_readable()
+                && !section.is_writable()
+                && !section.is_executable()
+        })
+    {
+        return Err("unwind entry code or unwind metadata invalid".into());
     }
     println!(
         "{} RVA=0x{:x} unwind=0x{:x} flags={}",
@@ -393,12 +484,16 @@ fn verify(path: &str) -> Result<(), String> {
     let mut nested_handler = None;
     let mut collided_handler = None;
     for export in exports {
-        if export.name == "SehRaiseDispatch" {
+        if export.name == "SehRaiseDispatch" || export.name == "SehUnwindDispatch" {
             verify_raise_dispatch_slot(&pe, &mapped, &export)?;
             continue;
         }
         if export.name == "SehRaiseStatus" {
             verify_raise_entry(&pe, &mapped, &image, &export)?;
+            continue;
+        }
+        if export.name == "SehUnwindEx" {
+            verify_unwind_entry(&pe, &mapped, &image, &export)?;
             continue;
         }
         if export.name == "SehResumeContext" {

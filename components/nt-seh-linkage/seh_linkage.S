@@ -11,7 +11,9 @@
  *                                       void *context_record, void *dispatcher_context);
  * int32_t SehExecuteHandlerForUnwind(void *exception_record, void *establisher_frame,
  *                                    void *context_record, void *dispatcher_context);
- * void SehRaiseStatus(uint32_t status);  // not bound until native dispatch and restore exist
+ * void SehRaiseStatus(uint32_t status);
+ * void SehUnwindEx(void *target_frame, void *target_ip, void *exception_record,
+ *                  void *return_value, void *context_record, void *history_table);
  * void SehResumeContext(void *validated_raw_context);  // does not return
  */
 
@@ -81,6 +83,97 @@ SehRaiseStatus:
     movl 0xa0(%rsp), %edx
     callq *%rax
 .Lraise_unbound:
+    ud2
+    .seh_endproc
+
+    .globl SehUnwindEx
+    .seh_proc SehUnwindEx
+SehUnwindEx:
+    pushfq
+    .seh_stackalloc 8
+    subq $0x530, %rsp
+    .seh_stackalloc 0x530
+    .seh_endprologue
+
+    movq %rax, 0xd8(%rsp)
+    /* Outgoing home space is [rsp,rsp+0x20). The fixed 64-byte request at
+       rsp+0x20 contains six original Win64 arguments, the captured context
+       pointer, and the entry RSP. RawContext occupies [rsp+0x60,rsp+0x530). */
+    movq %rcx, 0x20(%rsp)
+    movq %rdx, 0x28(%rsp)
+    movq %r8, 0x30(%rsp)
+    movq %r9, 0x38(%rsp)
+    movq 0x560(%rsp), %rax
+    movq %rax, 0x40(%rsp)
+    movq 0x568(%rsp), %rax
+    movq %rax, 0x48(%rsp)
+    leaq 0x60(%rsp), %rax
+    movq %rax, 0x50(%rsp)
+    leaq 0x538(%rsp), %rax
+    movq %rax, 0x58(%rsp)
+
+    movq %rcx, 0xe0(%rsp)
+    movq %rdx, 0xe8(%rsp)
+    movq %rbx, 0xf0(%rsp)
+    movq %rbp, 0x100(%rsp)
+    movq %rsi, 0x108(%rsp)
+    movq %rdi, 0x110(%rsp)
+    movq %r8, 0x118(%rsp)
+    movq %r9, 0x120(%rsp)
+    movq %r10, 0x128(%rsp)
+    movq %r11, 0x130(%rsp)
+    movq %r12, 0x138(%rsp)
+    movq %r13, 0x140(%rsp)
+    movq %r14, 0x148(%rsp)
+    movq %r15, 0x150(%rsp)
+    leaq 0x540(%rsp), %rax
+    movq %rax, 0xf8(%rsp)
+    movq 0x538(%rsp), %rax
+    movq %rax, 0x158(%rsp)
+
+    /* Zero unmodeled CONTEXT bytes, but retain the captured GPRs above. */
+    cld
+    xorl %eax, %eax
+    leaq 0x60(%rsp), %rdi
+    movl $15, %ecx
+    rep stosq
+    leaq 0x360(%rsp), %rdi
+    movl $58, %ecx
+    rep stosq
+    leaq 0x160(%rsp), %rdi
+    movl $64, %ecx
+    rep stosq
+    fxsave 0x160(%rsp)
+
+    movl $0x0010000f, 0x90(%rsp)
+    movl 0x178(%rsp), %eax
+    movl %eax, 0x94(%rsp)
+    movw %cs, 0x98(%rsp)
+    movw %ds, 0x9a(%rsp)
+    movw %es, 0x9c(%rsp)
+    movw %fs, 0x9e(%rsp)
+    movw %gs, 0xa0(%rsp)
+    movw %ss, 0xa2(%rsp)
+    movq 0x530(%rsp), %rax
+    movl %eax, 0xa4(%rsp)
+
+    /* RtlUnwindEx exposes the captured state through its caller-owned CONTEXT.
+       A null or misaligned destination cannot be used for a native unwind. */
+    movq 0x40(%rsp), %rdi
+    testq %rdi, %rdi
+    jz .Lunwind_invalid
+    testq $15, %rdi
+    jnz .Lunwind_invalid
+    leaq 0x60(%rsp), %rsi
+    movl $154, %ecx
+    rep movsq
+
+    movq SehUnwindDispatch(%rip), %rax
+    testq %rax, %rax
+    jz .Lunwind_invalid
+    leaq 0x20(%rsp), %rcx
+    callq *%rax
+.Lunwind_invalid:
     ud2
     .seh_endproc
 
@@ -228,4 +321,8 @@ SehCallFinally:
     .p2align 3
     .globl SehRaiseDispatch
 SehRaiseDispatch:
+    .quad 0
+    .p2align 3
+    .globl SehUnwindDispatch
+SehUnwindDispatch:
     .quad 0
