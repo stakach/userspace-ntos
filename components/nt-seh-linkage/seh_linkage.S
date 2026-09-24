@@ -47,8 +47,7 @@ SehRaiseStatus:
     leaq SehRaiseStatus(%rip), %rax
     movq %rax, 0x118(%rsp)
 
-    /* Only the saved GPRs and live FXSAVE region are retained from the entry.
-       Clear every other CONTEXT byte before the dispatcher can inspect it. */
+    /* Clear unmodeled and FXSAVE-reserved bytes before the dispatcher can inspect them. */
     cld
     xorl %eax, %eax
     leaq 0x20(%rsp), %rdi
@@ -56,6 +55,9 @@ SehRaiseStatus:
     rep stosq
     leaq 0x320(%rsp), %rdi
     movl $58, %ecx
+    rep stosq
+    leaq 0x120(%rsp), %rdi
+    movl $64, %ecx
     rep stosq
     fxsave 0x120(%rsp)
 
