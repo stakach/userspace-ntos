@@ -779,6 +779,83 @@ fn unfound_target_is_not_successful_unwind() {
 }
 
 #[test]
+fn exact_admitted_foreign_function_ends_each_pass_without_reading_its_stack() {
+    let fixture = Fixture::new(unw_flag::EHANDLER | unw_flag::UHANDLER);
+    for mode in [WalkMode::Search, unwind(None), unwind(Some(HIGH))] {
+        fixture.stack_reads.set(0);
+        let step = fixture
+            .walk(mode)
+            .with_foreign_boundary(BASE, 0x100)
+            .step(&fixture, &fixture)
+            .unwrap();
+        match (mode, step) {
+            (WalkMode::Search, WalkStep::Complete(WalkOutcome::Unhandled { context: observed, .. })) => {
+                assert_eq!(observed, context());
+            }
+            (
+                WalkMode::Unwind { target_frame: None, .. },
+                WalkStep::Complete(WalkOutcome::SecondChance {
+                    reason: SecondChanceReason::ExitUnwind,
+                    ..
+                }),
+            ) => {}
+            (
+                WalkMode::Unwind { target_frame: Some(_), .. },
+                WalkStep::Complete(WalkOutcome::SecondChance {
+                    reason: SecondChanceReason::TargetNotFound,
+                    ..
+                }),
+            ) => {}
+            (_, other) => panic!("foreign boundary produced {other:?}"),
+        }
+        assert_eq!(fixture.stack_reads.get(), 0);
+    }
+}
+
+#[test]
+fn foreign_boundary_requires_exact_admitted_image_and_function_identity() {
+    for boundary in [(BASE + 0x1000, 0x100), (BASE, 0x200)] {
+        let fixture = Fixture::new(0);
+        let step = fixture
+            .walk(WalkMode::Search)
+            .with_foreign_boundary(boundary.0, boundary.1)
+            .step(&fixture, &fixture)
+            .unwrap();
+        assert!(matches!(step, WalkStep::Continue(_)));
+        assert!(fixture.stack_reads.get() > 0);
+    }
+
+    let mut fixture = Fixture::new(0);
+    fixture.image_error = Some(ExceptionImageError::UnknownImage);
+    assert_eq!(
+        fixture
+            .walk(WalkMode::Search)
+            .with_foreign_boundary(BASE, 0x100)
+            .step(&fixture, &fixture)
+            .unwrap_err(),
+        WalkError::ImageLookup(ExceptionImageError::UnknownImage)
+    );
+    assert_eq!(fixture.stack_reads.get(), 0);
+}
+
+#[test]
+fn foreign_boundary_survives_a_real_handler_continuation() {
+    let fixture = Fixture::new(unw_flag::EHANDLER);
+    let first = fixture
+        .walk(WalkMode::Search)
+        .with_foreign_boundary(BASE, 0x200)
+        .step(&fixture, &fixture)
+        .unwrap();
+    let walk = continued(invoke(first).returned(1).unwrap());
+    let reads_before = fixture.stack_reads.get();
+    assert!(matches!(
+        walk.step(&fixture, &fixture).unwrap(),
+        WalkStep::Complete(WalkOutcome::Unhandled { .. })
+    ));
+    assert_eq!(fixture.stack_reads.get(), reads_before);
+}
+
+#[test]
 fn passing_target_fails_with_bad_stack() {
     let fixture = Fixture::new(0);
     let walk = fixture.walk(unwind(Some(LOW + 0x10)));

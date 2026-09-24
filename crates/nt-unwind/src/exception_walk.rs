@@ -324,6 +324,7 @@ impl SoftwareRaiseSite {
 #[derive(Debug)]
 struct WalkState {
     mode: WalkMode,
+    foreign_boundary: Option<(u64, u32)>,
     original: Context,
     current: Context,
     control_pc: u64,
@@ -391,6 +392,7 @@ impl ExceptionWalk {
             exception,
             state: WalkState {
                 mode,
+                foreign_boundary: None,
                 original: context,
                 current: context,
                 control_pc,
@@ -404,6 +406,13 @@ impl ExceptionWalk {
             },
             pending_collision: None,
         })
+    }
+
+    /// Stop at one positively admitted PE runtime-function row that calls into a foreign
+    /// executable. The foreign frame is never interpreted as a PE leaf or virtually unwound.
+    pub fn with_foreign_boundary(mut self, image_base: u64, function_begin: u32) -> Self {
+        self.state.foreign_boundary = Some((image_base, function_begin));
+        self
     }
 
     /// Unwind at most one frame, or suspend before calling its language handler.
@@ -434,6 +443,9 @@ impl ExceptionWalk {
                 image_base,
                 function,
             } => {
+                if self.state.foreign_boundary == Some((image_base, function.begin)) {
+                    return Ok(self.end());
+                }
                 let handler_type = if self.state.mode == WalkMode::Search {
                     unw_flag::EHANDLER
                 } else {
@@ -555,6 +567,9 @@ impl ExceptionWalk {
             ExceptionFunction::Leaf => return Err(WalkError::InvalidCollisionDispatcher),
         };
         if image_base != dispatcher.image_base || function != dispatcher.function {
+            return Err(WalkError::InvalidCollisionDispatcher);
+        }
+        if self.state.foreign_boundary == Some((image_base, function.begin)) {
             return Err(WalkError::InvalidCollisionDispatcher);
         }
         let bounded = BoundedStack::new(stack, self.state.low, self.state.high)
