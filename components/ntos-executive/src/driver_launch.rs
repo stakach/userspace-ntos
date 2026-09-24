@@ -33145,6 +33145,10 @@ pub unsafe extern "C" fn fsd_component_entry(heap_frames: u64) -> ! {
     if !unsafe { allocator::initialize_mapped_heap(heap_frames) } {
         park();
     }
+    if !hosted_exception_images::validate_component_mapping() {
+        print_str(b"[driver-exception-image] component validation failed\n");
+        park();
+    }
     let entry_rva = read_volatile((FSD_SHARED_VADDR + SH_ENTRY_RVA) as *const u64) as u32;
     print_str(b"[fsd-host] START DriverEntry rva=0x");
     print_hex(entry_rva);

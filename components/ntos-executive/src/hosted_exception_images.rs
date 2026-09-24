@@ -8,7 +8,7 @@ use nt_io_manager::HostedDomainIdentity;
 use nt_unwind::exception_images::{
     AdmittedExceptionImage, ExceptionImageCatalog, ImageAdmissionError,
 };
-use nt_unwind::exception_snapshot::{self, SnapshotImage};
+use nt_unwind::exception_snapshot::{self, SealedExceptionView, SnapshotImage};
 
 pub(super) const COMPONENT_SNAPSHOT_VA: u64 = 0x0000_0100_0F40_0000;
 const COMPONENT_SNAPSHOT_LIMIT: u64 = crate::WORK_CLUSTER_BASE;
@@ -18,6 +18,28 @@ const _: () = assert!(COMPONENT_SNAPSHOT_LIMIT - COMPONENT_SNAPSHOT_VA == EXEC_S
 const _: () = assert!(EXEC_SCRATCH_VA > super::FSD_EXEC_LIMIT);
 const _: () = assert!(EXEC_SCRATCH_LIMIT <= 0x0000_0101_6000_0000);
 static SCRATCH_IN_USE: AtomicBool = AtomicBool::new(false);
+
+/// Validate the actual component mapping before any driver code runs. The view retains no image
+/// table or heap allocation; exception dispatch can reconstruct it on the current thread later.
+pub(super) unsafe fn validate_component_mapping() -> bool {
+    let length = core::ptr::read_unaligned((COMPONENT_SNAPSHOT_VA + 16) as *const u64);
+    let Ok(length) = usize::try_from(length) else {
+        return false;
+    };
+    if length < 24 || length > (COMPONENT_SNAPSHOT_LIMIT - COMPONENT_SNAPSHOT_VA) as usize {
+        return false;
+    }
+    let bytes = core::slice::from_raw_parts(COMPONENT_SNAPSHOT_VA as *const u8, length);
+    let Ok(view) = SealedExceptionView::parse(bytes) else {
+        return false;
+    };
+    super::print_str(b"[driver-exception-image] component-verified images=");
+    super::print_u64(view.image_count() as u64);
+    super::print_str(b" bytes=");
+    super::print_u64(length as u64);
+    super::print_str(b"\n");
+    true
+}
 
 /// The exact scratch cap and whether page_map has completed. This local ledger is populated
 /// before each native map effect; an uncertain unmap cannot release the scratch lane.
