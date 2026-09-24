@@ -15,6 +15,8 @@
  * void SehUnwindEx(void *target_frame, void *target_ip, void *exception_record,
  *                  void *return_value, void *context_record, void *history_table);
  * void SehResumeContext(void *validated_raw_context);  // does not return
+ * uint64_t SehForeignCall2(uint64_t (*target)(uint64_t, uint64_t),
+ *                          uint64_t arg1, uint64_t arg2);
  */
 
     .text
@@ -230,6 +232,23 @@ SehCallFilter:
     .seh_handler SehNestedExceptionHandler, @except
     .seh_endprologue
     movq %r9, 32(%rsp)
+    movq %rcx, %rax
+    movq %rdx, %rcx
+    movq %r8, %rdx
+    callq *%rax
+    nop
+    addq $40, %rsp
+    retq
+    .seh_endproc
+
+    /* The admitted terminal frame between executive ELF and a hosted PE callback. An
+       exception walk stops at this exact function identity; it never unwinds into ELF. */
+    .globl SehForeignCall2
+    .seh_proc SehForeignCall2
+SehForeignCall2:
+    subq $40, %rsp
+    .seh_stackalloc 40
+    .seh_endprologue
     movq %rcx, %rax
     movq %rdx, %rcx
     movq %r8, %rdx

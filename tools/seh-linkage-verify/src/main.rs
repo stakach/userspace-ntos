@@ -10,7 +10,7 @@ use nt_unwind::{
 };
 use sha2::{Digest, Sha256};
 
-const EXPORTS: [&str; 9] = [
+const EXPORTS: [&str; 10] = [
     "SehCallFilter",
     "SehCallFinally",
     "SehExecuteHandlerForException",
@@ -20,6 +20,7 @@ const EXPORTS: [&str; 9] = [
     "SehRaiseDispatch",
     "SehUnwindEx",
     "SehUnwindDispatch",
+    "SehForeignCall2",
 ];
 const RAISE_PROLOGUE: [u8; 8] = [0x9c, 0x48, 0x81, 0xec, 0xf0, 0x04, 0x00, 0x00];
 const RAISE_UNWIND_CODES: [u8; 6] = [8, 1, 0x9e, 0, 1, 2];
@@ -71,6 +72,14 @@ const FINALLY_BODY: [u8; 21] = [
     0xb9, 1, 0, 0, 0, // mov ecx,1
     0xff, 0xd0, // call rax
     0x90, // keep callback return site out of the epilogue
+    0x48, 0x83, 0xc4, 0x28, 0xc3, // add rsp,40; ret
+];
+const FOREIGN_CALL2_BODY: [u8; 17] = [
+    0x48, 0x89, 0xc8, // mov rax,rcx (target)
+    0x48, 0x89, 0xd1, // mov rcx,rdx (arg1)
+    0x4c, 0x89, 0xc2, // mov rdx,r8 (arg2)
+    0xff, 0xd0, // call rax
+    0x90, // the return PC must precede the epilogue
     0x48, 0x83, 0xc4, 0x28, 0xc3, // add rsp,40; ret
 ];
 const NESTED_HANDLER: [u8; 32] = [
@@ -459,6 +468,65 @@ fn verify_resume_entry(
     Ok(())
 }
 
+fn verify_foreign_call2(
+    pe: &PeFile<'_>,
+    mapped: &nt_pe_loader::MappedImage,
+    image: &BorrowedExceptionImage<'_>,
+    export: &ExportedSymbol,
+) -> Result<(), String> {
+    let pc = mapped
+        .load_base
+        .checked_add(u64::from(export.rva))
+        .ok_or("foreign callback VA overflow")?;
+    let function = match image.lookup_exception_function(pc) {
+        Ok(ExceptionFunction::Function {
+            image_base,
+            function,
+        }) if image_base == mapped.load_base && function.begin == export.rva => function,
+        other => {
+            return Err(format!(
+                "foreign callback lacks exact runtime function: {other:?}"
+            ))
+        }
+    };
+    let header: [u8; 4] = mapped
+        .bytes
+        .get(function.unwind_info as usize..function.unwind_info as usize + 4)
+        .ok_or("foreign callback unwind header outside image")?
+        .try_into()
+        .map_err(|_| "foreign callback unwind header malformed")?;
+    let header = UnwindInfoHeader::parse(&header);
+    let function_len = function
+        .end
+        .checked_sub(function.begin)
+        .ok_or("foreign callback reversed runtime function")? as usize;
+    if !valid_unwind_header(header, 0)
+        || !frame_encoding_is_exact(&mapped.bytes, export.rva, function.unwind_info)
+        || function_len != CALL_FRAME.len() + FOREIGN_CALL2_BODY.len()
+        || !body_is_exact(&mapped.bytes, export.rva, &FOREIGN_CALL2_BODY)
+        || !pe.sections().iter().any(|section| {
+            section.name_str() == ".text"
+                && section_contains(section, export.rva, function_len)
+                && section.is_readable()
+                && section.is_executable()
+                && !section.is_writable()
+        })
+        || !pe.sections().iter().any(|section| {
+            section_contains(section, function.unwind_info, 6)
+                && section.is_readable()
+                && !section.is_writable()
+                && !section.is_executable()
+        })
+    {
+        return Err("foreign callback code or unwind metadata invalid".into());
+    }
+    println!(
+        "{} RVA=0x{:x} unwind=0x{:x} flags={}",
+        export.name, export.rva, function.unwind_info, header.flags
+    );
+    Ok(())
+}
+
 fn verify(path: &str) -> Result<(), String> {
     let bytes = fs::read(path).map_err(|error| format!("read {path}: {error}"))?;
     let pe = PeFile::parse(&bytes).map_err(|error| format!("PE parse: {error:?}"))?;
@@ -501,6 +569,10 @@ fn verify(path: &str) -> Result<(), String> {
         }
         if export.name == "SehResumeContext" {
             verify_resume_entry(&pe, &mapped, &image, &export)?;
+            continue;
+        }
+        if export.name == "SehForeignCall2" {
+            verify_foreign_call2(&pe, &mapped, &image, &export)?;
             continue;
         }
         let expected_flags = expected_flags(&export.name);
@@ -676,7 +748,12 @@ mod tests {
 
     #[test]
     fn wrapper_bodies_reject_home_slot_call_and_return_site_mutations() {
-        for body in [&FILTER_BODY[..], &FINALLY_BODY[..], &EXECUTE_BODY[..]] {
+        for body in [
+            &FILTER_BODY[..],
+            &FINALLY_BODY[..],
+            &EXECUTE_BODY[..],
+            &FOREIGN_CALL2_BODY[..],
+        ] {
             let mut bytes = [0u8; 64];
             bytes[8..12].copy_from_slice(&CALL_FRAME);
             bytes[12..12 + body.len()].copy_from_slice(body);
@@ -688,6 +765,17 @@ mod tests {
             }
             assert!(!body_is_exact(&bytes, 63, body));
         }
+    }
+
+    #[test]
+    fn foreign_callback_is_an_unhandled_call_frame() {
+        let header = UnwindInfoHeader::parse(&[1, 4, 1, 0]);
+        assert!(valid_unwind_header(header, 0));
+        assert!(!valid_unwind_header(header, unw_flag::EHANDLER));
+        let mut body = FOREIGN_CALL2_BODY;
+        body[11] ^= 1;
+        assert_ne!(body, FOREIGN_CALL2_BODY);
+        assert_eq!(FOREIGN_CALL2_BODY[11], 0x90);
     }
 
     #[test]
@@ -765,8 +853,7 @@ mod tests {
         bytes[begin as usize..begin as usize + UNWIND_PROLOGUE.len()]
             .copy_from_slice(&UNWIND_PROLOGUE);
         bytes[end as usize - 2..end as usize].copy_from_slice(&[0x0f, 0x0b]);
-        bytes[unwind as usize + 4..unwind as usize + 10]
-            .copy_from_slice(&UNWIND_UNWIND_CODES);
+        bytes[unwind as usize + 4..unwind as usize + 10].copy_from_slice(&UNWIND_UNWIND_CODES);
         assert!(unwind_layout_is_exact(&bytes, begin, end, unwind));
         assert!(!unwind_encoding_is_exact(&bytes, begin, end, unwind));
         assert!(!unwind_layout_is_exact(&bytes, begin, end + 1, unwind));

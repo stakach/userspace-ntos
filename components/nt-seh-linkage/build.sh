@@ -16,7 +16,7 @@ mkdir -p "$OUT"
     -o "$OUT/seh_linkage.obj"
 "$RUST_LLD" -flavor link /machine:x64 /dll /noentry /nodefaultlib \
     /dynamicbase /nxcompat /timestamp:0 \
-    /export:SehCallFilter /export:SehCallFinally \
+    /export:SehCallFilter /export:SehCallFinally /export:SehForeignCall2 \
     /export:SehExecuteHandlerForException /export:SehExecuteHandlerForUnwind \
     /export:SehRaiseStatus /export:SehUnwindEx /export:SehResumeContext \
     /export:SehRaiseDispatch,DATA /export:SehUnwindDispatch,DATA \
