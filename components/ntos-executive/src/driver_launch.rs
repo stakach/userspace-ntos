@@ -8173,15 +8173,6 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
         }
         let current_location_after_forward = previous_location - 1;
         let next = irp_next_stack_location(irp);
-        write_unaligned(
-            (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
-            current_location_after_forward,
-        );
-        write_unaligned((irp + 0xb8) as *mut u64, next);
-        write_unaligned(
-            (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
-            device,
-        );
         let forwarded_minor =
             read_unaligned((next + WDM_X64_IO_STACK_MINOR_OFFSET) as *const u8) as u64;
         let major = read_unaligned(next as *const u8) as u64;
@@ -8204,6 +8195,15 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
             if handler == 0 {
                 return 0xC000_0010u32 as i32;
             }
+            write_unaligned(
+                (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+                current_location_after_forward,
+            );
+            write_unaligned((irp + 0xb8) as *mut u64, next);
+            write_unaligned(
+                (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
+                device,
+            );
             trace_wdm_forward_call(
                 device,
                 irp,
@@ -8218,18 +8218,27 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
             return dispatch(device, irp);
         }
 
-        let (status, root_pdo_handled) = if major == IRP_MJ_PNP {
-            let (_, result, handled, _, _) = call_on4(
-                (FSD_SERVICE_ROOT_PDO_PNP_LABEL << 12) | 2,
-                device,
-                forwarded_minor,
-                0,
-                0,
-            );
-            (result as u32 as i32, handled != 0)
-        } else {
-            (nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw(), true)
-        };
+        if major != IRP_MJ_PNP {
+            return nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw();
+        }
+        write_unaligned(
+            (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+            current_location_after_forward,
+        );
+        write_unaligned((irp + 0xb8) as *mut u64, next);
+        write_unaligned(
+            (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
+            device,
+        );
+
+        let (_, result, handled, _, _) = call_on4(
+            (FSD_SERVICE_ROOT_PDO_PNP_LABEL << 12) | 2,
+            device,
+            forwarded_minor,
+            0,
+            0,
+        );
+        let (status, root_pdo_handled) = (result as u32 as i32, handled != 0);
         if root_pdo_handled {
             write_unaligned(
                 (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32,
