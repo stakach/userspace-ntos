@@ -7,6 +7,16 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+default-run = "seh-linkage-verify"
+
+[[bin]]
+name = "seh-linkage-verify"
+path = "src/main.rs"
+
+[[bin]]
+name = "seh-driver-fixture-verify"
+path = "src/driver_fixture.rs"
+
 [dependencies]
 nt-pe-loader.workspace = true
 nt-unwind.workspace = true

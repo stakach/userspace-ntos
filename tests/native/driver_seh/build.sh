@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd "$HERE/../../.." && pwd)
+OUT=${1:-"$ROOT/.tmp/native-driver-seh"}
+CLANG=${CLANG:-clang}
+if [[ -z ${RUST_LLD:-} ]]; then
+    SYSROOT=$(rustc +nightly --print sysroot)
+    HOST=$(rustc +nightly -vV | sed -n 's/^host: //p')
+    RUST_LLD="$SYSROOT/lib/rustlib/$HOST/bin/rust-lld"
+fi
+mkdir -p "$OUT"
+
+if command -v "${LLVM_DLLTOOL:-llvm-dlltool}" >/dev/null 2>&1; then
+    "${LLVM_DLLTOOL:-llvm-dlltool}" -m i386:x86-64 -d "$HERE/imports.def" \
+        -l "$OUT/ntoskrnl.lib"
+else
+    # This trap DLL exists only to create an import library. It is never installed into the OS.
+    "$CLANG" --target=x86_64-pc-windows-msvc -c "$HERE/import_anchor.S" \
+        -o "$OUT/import_anchor.obj"
+    "$RUST_LLD" -flavor link /machine:x64 /dll /noentry /nodefaultlib \
+        /timestamp:0 "/def:$HERE/imports.def" "/implib:$OUT/ntoskrnl.lib" \
+        "/out:$OUT/import-only-ntoskrnl.exe" "$OUT/import_anchor.obj"
+fi
+
+"$CLANG" --target=x86_64-pc-windows-msvc -fms-extensions -ffreestanding \
+    -fno-builtin -fno-stack-protector -mno-stack-arg-probe -fno-ident \
+    -Wall -Wextra -Werror -O2 -c "$HERE/driver_seh.c" -o "$OUT/driver_seh.obj"
+"$RUST_LLD" -flavor link /machine:x64 /driver /dll /entry:DriverEntry \
+    /subsystem:native,5.2 /osversion:5.2 /nodefaultlib /dynamicbase /nxcompat /timestamp:0 \
+    /export:SehFixtureEvidence,DATA "/out:$OUT/driver_seh.sys" \
+    "$OUT/driver_seh.obj" "$OUT/ntoskrnl.lib"
+cargo run --manifest-path "$ROOT/Cargo.toml" -p seh-linkage-verify \
+    --bin seh-driver-fixture-verify -- "$OUT/driver_seh.sys" "$OUT/driver_seh.obj"
+printf 'Verified native SEH fixture: %s/driver_seh.sys (not staged or executed)\n' "$OUT"
