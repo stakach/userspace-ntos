@@ -88,6 +88,8 @@ SehCollidedUnwindHandler:
     movq %r10, 56(%r9)
     movq 64(%rax), %r10
     movq %r10, 64(%r9)
+    movl 72(%rax), %r10d
+    movl %r10d, 72(%r9)
     movl $3, %eax
     retq
 
