@@ -26,12 +26,14 @@ mod initial_system;
 pub mod native_handle;
 mod registry_key_handle;
 mod object_directory_handle;
+mod routed_file_handle;
 pub mod process_object_retirement;
 pub mod thread_suspend;
 
 pub use initial_system::InitialSystemIdentity;
 pub use registry_key_handle::RegistryKeyHandlePublication;
 pub use object_directory_handle::ObjectDirectoryHandlePublication;
+pub use routed_file_handle::RoutedFileHandlePublication;
 
 use dbgk::{DbgKmMessage, DebugEvent, DebugObjectId, DebugObjectStore};
 
@@ -1109,6 +1111,8 @@ pub struct ProcessManager {
     registry_publication_identity: u64,
     /// Move-stable owner identity for staged object-directory handle publication.
     directory_publication_identity: u64,
+    /// Move-stable owner identity for staged routed File handle publication.
+    routed_file_publication_identity: u64,
     processes: IdTable<NtProcess>,
     threads: IdTable<NtThread>,
     /// Withdrawn Ps objects remain owned until their exact cleanup ticket is finished.
