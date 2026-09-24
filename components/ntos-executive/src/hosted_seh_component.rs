@@ -135,6 +135,17 @@ pub(super) extern "win64" fn unwind_dispatch(request_va: u64) -> ! {
     command_loop(command, packet_va)
 }
 
+/// Entered once by a fault Reply after the executive has retained the original CPU snapshot.
+/// The token is not authority on its own: the owning pump also matches the physical route and
+/// dispatch before it reads this packet or advances the saved exception walk.
+#[inline(never)]
+pub(super) extern "win64" fn fault_dispatch(token: u64) -> ! {
+    let mut packet = MaybeUninit::<SehHandlerPacket>::uninit();
+    let packet_va = packet.as_mut_ptr() as u64;
+    let command = exchange(SehCall::FaultBegin { token, packet_va });
+    command_loop(command, packet_va)
+}
+
 /// Enter target unwind while the search-handler wrapper frame remains suspended. A status Reply
 /// here would return into an `__except` branch that has not executed.
 #[inline(never)]

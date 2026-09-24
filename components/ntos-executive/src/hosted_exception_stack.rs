@@ -13,6 +13,7 @@ use nt_unwind::{
         WalkMode, WalkStep,
     },
     raw_context::{RawContext, RawContextCaptureError, RawContextRestoreError},
+    hardware_fault,
     raw_exception::RawExceptionRecord,
     seh_handler_packet::{HandlerPacketError, SehHandlerPacket},
     seh_linkage_image::{SehRaiseFirstPass, SehRaiseIngressError},
@@ -49,6 +50,25 @@ struct WorkerIdentity {
     component_slot: usize,
     exec_alias_slot: u64,
     construction: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FaultSourceIdentity {
+    instance: usize,
+    domain: HostedDomainIdentity,
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    tcb: u64,
+    thread_handle: u64,
+    worker: Option<WorkerIdentity>,
+}
+
+pub(crate) struct CapturedCpuFault {
+    pub source: FaultSourceIdentity,
+    pub first: SehRaiseFirstPass,
+    pub entry_va: u64,
+    pub entry_rsp: u64,
+    pub registers: [u64; 20],
 }
 
 impl HostedStackReader {
@@ -156,6 +176,100 @@ impl HostedStackReader {
             self.component_base.checked_add(self.length)?,
         ))
     }
+
+    fn fault_source(&self) -> FaultSourceIdentity {
+        FaultSourceIdentity {
+            instance: self.instance,
+            domain: self.domain,
+            route: self.route,
+            dispatch: self.dispatch,
+            tcb: self.tcb,
+            thread_handle: self.thread_handle,
+            worker: self.worker,
+        }
+    }
+}
+
+pub(crate) fn fault_source_identity(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+) -> Option<FaultSourceIdentity> {
+    let reader = HostedStackReader::new(channel, reply_cap, badge)?;
+    reader.still_live().then(|| reader.fault_source())
+}
+
+/// Read the actual fault-blocked TCB under the same physical dispatch lease used by the stack
+/// walker. Every frame is classified before changing the target's registers or consuming Reply.
+pub(crate) fn capture_cpu_fault(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    label: u64,
+    words: [u64; 5],
+) -> Option<CapturedCpuFault> {
+    let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
+    let domain = instance_domain_identity(inst)?;
+    let linkage = inst.seh_linkage?;
+    with_reader(channel, reply_cap, badge, |stack, low, high| {
+        let reader = HostedStackReader::new(channel, reply_cap, badge)?;
+        let snapshot = unsafe { crate::thread_context::LegacyThreadContext::read(reader.tcb).ok()? };
+        if !reader.still_live() || snapshot.registers[0] != words[0] {
+            return None;
+        }
+        let raw = RawContext::from_legacy_snapshot(
+            &snapshot.registers,
+            &snapshot.floating_point,
+            &snapshot.debug,
+        ).ok()?;
+        let exception = match label {
+            6 if words[2] <= 1 => {
+                hardware_fault::page_fault(words[0], words[1], words[3], words[2] != 0)?
+            }
+            3 if snapshot.registers[1] == words[1]
+                && snapshot.registers[2] == words[2] => {
+                hardware_fault::user_exception(words[0], words[3], words[4])?
+            }
+            _ => return None,
+        };
+        let original_rsp = raw.rsp();
+        let entry_rsp = original_rsp.checked_sub(0x100)? & !15 | 8;
+        if original_rsp > high || entry_rsp.checked_sub(0x4000)? < low {
+            return None;
+        }
+        let step = super::hosted_exception_images::with_catalog(instance, domain, |catalog| {
+            let mut walk = ExceptionWalk::new(
+                WalkMode::Search,
+                exception,
+                raw.to_context(),
+                low,
+                high,
+                64,
+            ).ok()?
+            .with_foreign_boundary(
+                linkage.image_base,
+                (linkage.foreign_call2_va - linkage.image_base) as u32,
+            )
+            .with_second_foreign_boundary(
+                linkage.image_base,
+                (linkage.foreign_call16_va - linkage.image_base) as u32,
+            );
+            loop {
+                match walk.step(catalog, stack).ok()? {
+                    WalkStep::Continue(next) => walk = next,
+                    WalkStep::Invoke(handler) => break Some(FirstRaiseStep::Invoke(handler)),
+                    WalkStep::Complete(outcome) => break Some(FirstRaiseStep::Complete(outcome)),
+                }
+            }
+        })??;
+        Some(CapturedCpuFault {
+            source: reader.fault_source(),
+            first: SehRaiseFirstPass { captured: raw, step },
+            entry_va: linkage.fault_entry_va,
+            entry_rsp,
+            registers: snapshot.registers,
+        })
+    })?
 }
 
 impl StackReader for HostedStackReader {
@@ -519,6 +633,10 @@ pub(crate) fn capture_unwind_first_step(
             .with_foreign_boundary(
                 linkage.image_base,
                 (linkage.foreign_call2_va - linkage.image_base) as u32,
+            )
+            .with_second_foreign_boundary(
+                linkage.image_base,
+                (linkage.foreign_call16_va - linkage.image_base) as u32,
             );
             let step = loop {
                 match walk
@@ -593,6 +711,10 @@ pub(crate) fn start_target_unwind(
             .with_foreign_boundary(
                 linkage.image_base,
                 (linkage.foreign_call2_va - linkage.image_base) as u32,
+            )
+            .with_second_foreign_boundary(
+                linkage.image_base,
+                (linkage.foreign_call16_va - linkage.image_base) as u32,
             );
             loop {
                 match walk.step(catalog, reader)? {

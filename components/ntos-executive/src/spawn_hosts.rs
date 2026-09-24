@@ -1715,6 +1715,15 @@ unsafe fn pump_reply_recv_retained_seh(
     pump_recv_retained_seh(ch)
 }
 
+unsafe fn pump_reply_recv_retained_cpu_fault(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
+    // Selected registers were installed without restart. Only this Reply consumes the original
+    // pending fault; an uncertain result never permits another receive or retransmission.
+    if !shared_pump::reply(ch, reply_cap, 0, [0; 4]) {
+        return PumpMessage::transport_wall();
+    }
+    pump_recv_retained_seh(ch)
+}
+
 /// Acknowledge the component's outstanding Call before entering the receive-only path.
 /// An uncertain reply never permits another receive or retransmission of this request.
 #[inline(never)]
@@ -2918,6 +2927,7 @@ unsafe fn component_pump_loop(
                 | nt_unwind::seh_transport::HANDLER_RESULT_LABEL
                 | nt_unwind::seh_transport::UNWIND_REQUEST_LABEL
                 | nt_unwind::seh_transport::BEGIN_UNWIND_LABEL
+                | nt_unwind::seh_transport::FAULT_BEGIN_LABEL
         )
             && ch.caps.kind == ReqKind::Irp
         {
@@ -2995,6 +3005,24 @@ unsafe fn component_pump_loop(
             continue;
         } else if label == 6 {
             outcome.accounting.record_fault();
+            let native_fault = ch.caps.kind == ReqKind::Irp
+                && (msg.m3 & 1 != 0
+                    || msg.m1 < 0x10000
+                    || msg.m1 >= 0x0000_8000_0000_0000
+                    || (ch.image_frames != 0
+                        && msg.m1 >= ch.code_va
+                        && msg.m1 < ch.code_va + ch.image_frames * 0x1000));
+            if native_fault {
+                if !seh.begin_cpu_fault(
+                    ch, *reply_cap, msg.badge, label,
+                    [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+                ) {
+                    outcome.wall(msg);
+                    break;
+                }
+                msg = pump_reply_recv_retained_cpu_fault(ch, *reply_cap);
+                continue;
+            }
             if !pump_service_vm_fault(
                 ch,
                 label,
@@ -3015,6 +3043,25 @@ unsafe fn component_pump_loop(
         } else if label == 3 && ch.caps.io_port_faults {
             if let Some(next_ip) = pump_service_io_port_fault(ch, msg.m0, msg.m3) {
                 pump_reply_recv_into!(ch, *reply_cap, msg, 1, next_ip);
+                continue;
+            }
+            if ch.caps.kind == ReqKind::Irp
+                && seh.begin_cpu_fault(
+                    ch, *reply_cap, msg.badge, label,
+                    [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+                )
+            {
+                msg = pump_reply_recv_retained_cpu_fault(ch, *reply_cap);
+                continue;
+            }
+            outcome.wall(msg);
+            break;
+        } else if label == 3 && ch.caps.kind == ReqKind::Irp {
+            if seh.begin_cpu_fault(
+                ch, *reply_cap, msg.badge, label,
+                [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+            ) {
+                msg = pump_reply_recv_retained_cpu_fault(ch, *reply_cap);
                 continue;
             }
             outcome.wall(msg);

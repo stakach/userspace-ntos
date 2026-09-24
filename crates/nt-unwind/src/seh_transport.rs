@@ -12,6 +12,7 @@ pub const RESTORE_COMMAND_LABEL: u64 = 0x794;
 pub const SECOND_CHANCE_COMMAND_LABEL: u64 = 0x795;
 pub const UNWIND_REQUEST_LABEL: u64 = 0x796;
 pub const BEGIN_UNWIND_LABEL: u64 = 0x797;
+pub const FAULT_BEGIN_LABEL: u64 = 0x798;
 
 pub const fn message_info(label: u64, length: u64) -> u64 {
     (label << 12) | length
@@ -42,6 +43,10 @@ pub enum SehCall {
         request_va: u64,
         packet_va: u64,
     },
+    FaultBegin {
+        token: u64,
+        packet_va: u64,
+    },
 }
 
 impl SehCall {
@@ -68,6 +73,10 @@ impl SehCall {
             }),
             x if x == message_info(BEGIN_UNWIND_LABEL, 2) => Some(Self::BeginUnwind {
                 request_va: aligned_nonzero(words[0])?,
+                packet_va: aligned_nonzero(words[1])?,
+            }),
+            x if x == message_info(FAULT_BEGIN_LABEL, 2) => Some(Self::FaultBegin {
+                token: nonzero(words[0])?,
                 packet_va: aligned_nonzero(words[1])?,
             }),
             _ => None,
@@ -97,6 +106,10 @@ impl SehCall {
             Self::BeginUnwind { request_va, packet_va } => (
                 message_info(BEGIN_UNWIND_LABEL, 2),
                 [request_va, packet_va, 0, 0],
+            ),
+            Self::FaultBegin { token, packet_va } => (
+                message_info(FAULT_BEGIN_LABEL, 2),
+                [token, packet_va, 0, 0],
             ),
         }
     }
@@ -209,6 +222,10 @@ mod tests {
                 request_va: 0x4000,
                 packet_va: 0x5000,
             },
+            SehCall::FaultBegin {
+                token: 11,
+                packet_va: 0x5000,
+            },
         ] {
             let (info, words) = call.encode();
             assert_eq!(SehCall::parse(info, words), Some(call));
@@ -249,6 +266,12 @@ mod tests {
             SehCall::parse(message_info(BEGIN_UNWIND_LABEL, 1), [0x4000, 0x5000, 0, 0]),
             None
         );
+        for (token, packet_va) in [(0, 0x5000), (11, 0), (11, 0x5008)] {
+            assert_eq!(
+                SehCall::parse(message_info(FAULT_BEGIN_LABEL, 2), [token, packet_va, 0, 0]),
+                None
+            );
+        }
     }
 
     #[test]

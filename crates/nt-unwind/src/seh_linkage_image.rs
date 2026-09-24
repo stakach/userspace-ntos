@@ -109,6 +109,10 @@ impl SehLinkageImage {
             .with_foreign_boundary(
                 self.image_base,
                 (self.foreign_call2_va - self.image_base) as u32,
+            )
+            .with_second_foreign_boundary(
+                self.image_base,
+                (self.foreign_call16_va - self.image_base) as u32,
             );
         let step = loop {
             match walk.step(image, stack).map_err(SehRaiseIngressError::Walk)? {

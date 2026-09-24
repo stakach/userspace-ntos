@@ -839,6 +839,29 @@ fn foreign_boundary_requires_exact_admitted_image_and_function_identity() {
 }
 
 #[test]
+fn second_foreign_boundary_is_exact_and_never_weakens_first() {
+    let fixture = Fixture::new(0);
+    let second = fixture
+        .walk(WalkMode::Search)
+        .with_foreign_boundary(BASE, 0x200)
+        .with_second_foreign_boundary(BASE, 0x100)
+        .step(&fixture, &fixture)
+        .unwrap();
+    assert!(matches!(second, WalkStep::Complete(WalkOutcome::Unhandled { .. })));
+    assert_eq!(fixture.stack_reads.get(), 0);
+
+    let fixture = Fixture::new(0);
+    let wrong_image = fixture
+        .walk(WalkMode::Search)
+        .with_foreign_boundary(BASE, 0x200)
+        .with_second_foreign_boundary(BASE + 0x1000, 0x100)
+        .step(&fixture, &fixture)
+        .unwrap();
+    assert!(matches!(wrong_image, WalkStep::Continue(_)));
+    assert!(fixture.stack_reads.get() > 0);
+}
+
+#[test]
 fn foreign_boundary_survives_a_real_handler_continuation() {
     let fixture = Fixture::new(unw_flag::EHANDLER);
     let first = fixture

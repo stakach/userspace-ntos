@@ -325,6 +325,7 @@ impl SoftwareRaiseSite {
 struct WalkState {
     mode: WalkMode,
     foreign_boundary: Option<(u64, u32)>,
+    second_foreign_boundary: Option<(u64, u32)>,
     original: Context,
     current: Context,
     control_pc: u64,
@@ -393,6 +394,7 @@ impl ExceptionWalk {
             state: WalkState {
                 mode,
                 foreign_boundary: None,
+                second_foreign_boundary: None,
                 original: context,
                 current: context,
                 control_pc,
@@ -412,6 +414,13 @@ impl ExceptionWalk {
     /// executable. The foreign frame is never interpreted as a PE leaf or virtually unwound.
     pub fn with_foreign_boundary(mut self, image_base: u64, function_begin: u32) -> Self {
         self.state.foreign_boundary = Some((image_base, function_begin));
+        self
+    }
+
+    /// A second exact admitted PE frame can cross to the same foreign executor through a
+    /// different callback arity. No image-wide or unknown-frame terminal rule is installed.
+    pub fn with_second_foreign_boundary(mut self, image_base: u64, function_begin: u32) -> Self {
+        self.state.second_foreign_boundary = Some((image_base, function_begin));
         self
     }
 
@@ -443,7 +452,9 @@ impl ExceptionWalk {
                 image_base,
                 function,
             } => {
-                if self.state.foreign_boundary == Some((image_base, function.begin)) {
+                if self.state.foreign_boundary == Some((image_base, function.begin))
+                    || self.state.second_foreign_boundary == Some((image_base, function.begin))
+                {
                     return Ok(self.end());
                 }
                 let handler_type = if self.state.mode == WalkMode::Search {
@@ -569,7 +580,9 @@ impl ExceptionWalk {
         if image_base != dispatcher.image_base || function != dispatcher.function {
             return Err(WalkError::InvalidCollisionDispatcher);
         }
-        if self.state.foreign_boundary == Some((image_base, function.begin)) {
+        if self.state.foreign_boundary == Some((image_base, function.begin))
+            || self.state.second_foreign_boundary == Some((image_base, function.begin))
+        {
             return Err(WalkError::InvalidCollisionDispatcher);
         }
         let bounded = BoundedStack::new(stack, self.state.low, self.state.high)

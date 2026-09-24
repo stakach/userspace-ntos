@@ -9872,9 +9872,10 @@ extern "win64" fn s_dma_allocate_adapter_channel(
         if map_register == 0 {
             return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
         }
-        let routine: extern "win64" fn(u64, u64, u64, u64) -> u32 =
-            core::mem::transmute(execution_routine as *const ());
-        let action = routine(device_object, 0, map_register, context);
+        let action = call_hosted_pe(
+            execution_routine,
+            &[device_object, 0, map_register, context],
+        ) as u32;
         if action == 2 {
             // DeallocateObject: the caller did not retain the map-register token.
             pool_free(map_register);
@@ -11495,9 +11496,10 @@ unsafe fn hosted_irq_lane_invoke(
 ) -> nt_hosted_runtime::HostedIrqArenaResult {
     match command.kind {
         nt_hosted_runtime::HostedIrqDispatchKind::InterruptService => {
-            let routine: extern "win64" fn(u64, u64) -> u8 =
-                core::mem::transmute(command.routine as *const ());
-            let claimed = routine(command.object, command.context) != 0;
+            let claimed = call_hosted_pe(
+                command.routine,
+                &[command.object, command.context],
+            ) as u8 != 0;
             nt_hosted_runtime::HostedIrqArenaResult {
                 status: STATUS_SUCCESS,
                 faulted: false,
@@ -11506,14 +11508,10 @@ unsafe fn hosted_irq_lane_invoke(
             }
         }
         nt_hosted_runtime::HostedIrqDispatchKind::DeferredProcedure => {
-            let routine: extern "win64" fn(u64, u64, u64, u64) =
-                core::mem::transmute(command.routine as *const ());
-            routine(
-                command.object,
-                command.context,
-                command.arguments[0],
-                command.arguments[1],
-            );
+            call_hosted_pe(command.routine, &[
+                command.object, command.context,
+                command.arguments[0], command.arguments[1],
+            ]);
             nt_hosted_runtime::HostedIrqArenaResult {
                 status: STATUS_SUCCESS,
                 faulted: false,
@@ -11522,21 +11520,7 @@ unsafe fn hosted_irq_lane_invoke(
             }
         }
         nt_hosted_runtime::HostedIrqDispatchKind::ProviderCallback => {
-            let routine: extern "win64" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = core::mem::transmute(command.routine as *const ());
-            let result = routine(
+            let result = call_hosted_pe(command.routine, &[
                 command.arguments[0],
                 command.arguments[1],
                 command.arguments[2],
@@ -11549,7 +11533,7 @@ unsafe fn hosted_irq_lane_invoke(
                 command.arguments[9],
                 command.arguments[10],
                 command.arguments[11],
-            );
+            ]);
             nt_hosted_runtime::HostedIrqArenaResult {
                 status: STATUS_SUCCESS,
                 faulted: false,
@@ -13014,8 +12998,7 @@ extern "win64" fn s_ke_synchronize_execution(interrupt: u64, routine: u64, conte
                 hosted_lower_irql(old_irql);
                 hosted_irq_lane_protocol_fault(interrupt_id);
             }
-            let f: extern "win64" fn(u64) -> u8 = core::mem::transmute(routine as *const ());
-            let result = f(context);
+            let result = call_hosted_pe(routine, &[context]) as u8;
             let mut release_arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
             release_arguments[0] = acquired.values[0];
             let released = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
@@ -13043,8 +13026,7 @@ extern "win64" fn s_ke_synchronize_execution(interrupt: u64, routine: u64, conte
         // IRQL exclusion plus barriers; use the exact ActualLock identity retained at connect time.
         let _actual_lock_identity = actual_lock;
         compiler_fence(Ordering::SeqCst);
-        let f: extern "win64" fn(u64) -> u8 = core::mem::transmute(routine as *const ());
-        let result = f(context);
+        let result = call_hosted_pe(routine, &[context]) as u8;
         compiler_fence(Ordering::SeqCst);
         hosted_lower_irql(old_irql);
         result
@@ -36460,6 +36442,14 @@ unsafe fn load_hosted_auxiliary_image(
     write_volatile(
         unwind_slot_exec_va as *mut u64,
         hosted_seh_component::unwind_dispatch as *const () as usize as u64,
+    );
+    let fault_slot_exec_va = exec_va.checked_add(u64::from(linkage.fault_dispatch_slot_rva))?;
+    if read_volatile(fault_slot_exec_va as *const u64) != 0 {
+        return None;
+    }
+    write_volatile(
+        fault_slot_exec_va as *mut u64,
+        hosted_seh_component::fault_dispatch as *const () as usize as u64,
     );
     let image =
         hosted_exception_images::capture(instance, exec_va, component_va, plan.auxiliary_image_len)?;

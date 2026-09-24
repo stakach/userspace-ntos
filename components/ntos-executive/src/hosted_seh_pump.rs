@@ -34,6 +34,13 @@ struct Active {
     restored_rsp: Option<u64>,
 }
 
+struct PendingCpuFault {
+    token: u64,
+    source: stack::FaultSourceIdentity,
+    first: nt_unwind::seh_linkage_image::SehRaiseFirstPass,
+    entry_rsp: u64,
+}
+
 impl Active {
     fn accept_step(
         &mut self,
@@ -96,15 +103,57 @@ impl Active {
 
 pub(super) struct SehPump {
     active: Vec<Active>,
+    pending_cpu_fault: Option<PendingCpuFault>,
 }
 
 impl SehPump {
     pub(super) const fn new() -> Self {
-        Self { active: Vec::new() }
+        Self { active: Vec::new(), pending_cpu_fault: None }
     }
 
     pub(super) fn retained(&self) -> bool {
-        !self.active.is_empty()
+        !self.active.is_empty() || self.pending_cpu_fault.is_some()
+    }
+
+    /// Preserve fault ownership before any TCB mutation. The original fault Reply remains bound
+    /// until the caller installs this continuation and acknowledges it exactly once.
+    pub(super) fn begin_cpu_fault(
+        &mut self,
+        channel: &PumpChannel,
+        reply: u64,
+        badge: u64,
+        label: u64,
+        words: [u64; 5],
+    ) -> bool {
+        if self.pending_cpu_fault.is_some() || self.active.len() >= 64 {
+            return false;
+        }
+        let Some(captured) = stack::capture_cpu_fault(channel, reply, badge, label, words) else {
+            return false;
+        };
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        if token == 0 {
+            return false;
+        }
+        let mut registers = captured.registers;
+        registers[0] = captured.entry_va;
+        registers[1] = captured.entry_rsp;
+        registers[5] = token;
+        let redirect = nt_thread_start::amd64_context::LegacyContextRestore {
+            registers,
+            register_mask: (1 << 0) | (1 << 1) | (1 << 5),
+            floating_point: None,
+            debug: None,
+        };
+        self.pending_cpu_fault = Some(PendingCpuFault {
+            token,
+            source: captured.source,
+            first: captured.first,
+            entry_rsp: captured.entry_rsp,
+        });
+        // A rejected syscall is not proof that no register was installed. Keep the pending fault
+        // and let the pump wall/stop this exact physical dispatch; never issue the write again.
+        unsafe { crate::thread_context::write(channel.tcb, &redirect, false).is_ok() }
     }
 
     fn retire_abandoned(&mut self, restored_rsp: Option<u64>) -> Option<()> {
@@ -129,6 +178,43 @@ impl SehPump {
         badge: u64,
         call: SehCall,
     ) -> Option<SehCommand> {
+        if let SehCall::FaultBegin { token, packet_va } = call {
+            let pending = self.pending_cpu_fault.as_ref()?;
+            if token != pending.token
+                || stack::fault_source_identity(channel, reply, badge) != Some(pending.source)
+                || packet_va.checked_add(core::mem::size_of::<SehHandlerPacket>() as u64)?
+                    > pending.entry_rsp
+            {
+                return None;
+            }
+            self.active.try_reserve(1).ok()?;
+            let linkage = hosted_seh_linkage(channel, reply)?;
+            stack::initialize_restore_packet(
+                channel, reply, badge, packet_va, token, linkage.resume_va,
+            ).ok()?;
+            // Move the pending fault into the retained active stack before a handler step may
+            // perform any further native packet write. A failure then walls with its owner kept.
+            let pending = self.pending_cpu_fault.take()?;
+            self.active.push(Active {
+                token,
+                captured: pending.first.captured,
+                phase: None,
+                packet_va,
+                restored_rsp: None,
+            });
+            let (command, keep) = self.active.last_mut()?.accept_step(
+                channel, reply, badge, pending.first.step,
+            )?;
+            let active = self.active.pop()?;
+            if self.retire_abandoned(active.restored_rsp).is_none() {
+                self.active.push(active);
+                return None;
+            }
+            if keep {
+                self.active.push(active);
+            }
+            return Some(command);
+        }
         if let SehCall::BeginUnwind {
             request_va,
             packet_va,
@@ -352,7 +438,7 @@ impl SehPump {
                 active.packet_va = packet_va;
                 active.accept_step(channel, reply, badge, step)?
             }
-            SehCall::Raise { .. } | SehCall::BeginUnwind { .. } => unreachable!(),
+            SehCall::Raise { .. } | SehCall::BeginUnwind { .. } | SehCall::FaultBegin { .. } => unreachable!(),
         };
         self.retire_abandoned(active.restored_rsp)?;
         if command.1 {
