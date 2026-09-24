@@ -40,6 +40,7 @@ pub enum SehCall {
     },
     BeginUnwind {
         request_va: u64,
+        packet_va: u64,
     },
 }
 
@@ -65,8 +66,9 @@ impl SehCall {
                 target_ip: words[2],
                 packet_va: aligned_nonzero(words[3])?,
             }),
-            x if x == message_info(BEGIN_UNWIND_LABEL, 1) => Some(Self::BeginUnwind {
+            x if x == message_info(BEGIN_UNWIND_LABEL, 2) => Some(Self::BeginUnwind {
                 request_va: aligned_nonzero(words[0])?,
+                packet_va: aligned_nonzero(words[1])?,
             }),
             _ => None,
         }
@@ -92,9 +94,9 @@ impl SehCall {
                 message_info(UNWIND_REQUEST_LABEL, 4),
                 [token, target_frame, target_ip, packet_va],
             ),
-            Self::BeginUnwind { request_va } => (
-                message_info(BEGIN_UNWIND_LABEL, 1),
-                [request_va, 0, 0, 0],
+            Self::BeginUnwind { request_va, packet_va } => (
+                message_info(BEGIN_UNWIND_LABEL, 2),
+                [request_va, packet_va, 0, 0],
             ),
         }
     }
@@ -205,6 +207,7 @@ mod tests {
             },
             SehCall::BeginUnwind {
                 request_va: 0x4000,
+                packet_va: 0x5000,
             },
         ] {
             let (info, words) = call.encode();
@@ -236,14 +239,14 @@ mod tests {
             SehCall::parse(message_info(UNWIND_REQUEST_LABEL, 3), [7, 0x3000, 0x1234, 0x2000]),
             None
         );
-        for request_va in [0, 0x4008] {
+        for (request_va, packet_va) in [(0, 0x5000), (0x4008, 0x5000), (0x4000, 0), (0x4000, 0x5008)] {
             assert_eq!(
-                SehCall::parse(message_info(BEGIN_UNWIND_LABEL, 1), [request_va, 0, 0, 0]),
+                SehCall::parse(message_info(BEGIN_UNWIND_LABEL, 2), [request_va, packet_va, 0, 0]),
                 None
             );
         }
         assert_eq!(
-            SehCall::parse(message_info(BEGIN_UNWIND_LABEL, 2), [0x4000, 0, 0, 0]),
+            SehCall::parse(message_info(BEGIN_UNWIND_LABEL, 1), [0x4000, 0x5000, 0, 0]),
             None
         );
     }
