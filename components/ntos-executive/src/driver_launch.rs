@@ -36677,6 +36677,15 @@ unsafe fn load_driver_reserved(
     exception_images
         .try_reserve_exact(exception_image_count)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let auxiliary_exception_image = load_hosted_auxiliary_image(
+        &planned_images,
+        instance,
+        code_va,
+        run_va,
+        img_frames,
+        rights,
+    )
+    .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?;
     let support_images = load_hosted_dependency_images(
         &planned_images,
         instance,
@@ -36719,17 +36728,7 @@ unsafe fn load_driver_reserved(
         hosted_exception_images::capture(instance, primary_exec_va, primary_run_va, image_len)
             .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?,
     );
-    exception_images.push(
-        load_hosted_auxiliary_image(
-            &planned_images,
-            instance,
-            code_va,
-            run_va,
-            img_frames,
-            rights,
-        )
-        .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?,
-    );
+    exception_images.push(auxiliary_exception_image);
     let exception_catalog = hosted_exception_images::catalog(instance, exception_images)
         .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?;
     let _ = register_system_module(path, primary_exec_va, image_len);
