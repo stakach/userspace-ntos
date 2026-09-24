@@ -6,7 +6,10 @@
 
 use nt_component_suspension::{peer_registry::PeerRoute, LaneDispatchIdentity};
 use nt_io_manager::HostedDomainIdentity;
-use nt_unwind::StackReader;
+use nt_unwind::{
+    raw_context::{RawContext, RawContextCaptureError},
+    StackReader,
+};
 
 use super::{
     hosted_driver_caller, hosted_thread_resources, hosted_worker_component_base_for_slot,
@@ -169,5 +172,19 @@ pub(super) fn with_reader<R>(
 ) -> Option<R> {
     let reader = HostedStackReader::new(channel, reply_cap, badge)?;
     let (low, high) = reader.bounds()?;
-    Some(use_reader(&reader, low, high))
+    let result = use_reader(&reader, low, high);
+    reader.still_live().then_some(result)
+}
+
+/// Return an owned native context only while every source word belongs to the same live dispatch.
+#[allow(dead_code)]
+pub(super) fn capture_raw_context(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    address: u64,
+) -> Option<Result<RawContext, RawContextCaptureError>> {
+    with_reader(channel, reply_cap, badge, |reader, low, high| {
+        RawContext::capture_bounded(reader, address, low, high)
+    })
 }

@@ -5,7 +5,7 @@
 //! debug registers, FPU legacy state, vector state, and branch records survive unchanged.
 //! Offsets follow NT5/ReactOS `CONTEXT` (`references/reactos/sdk/include/xdk/amd64/ke.h`).
 
-use crate::{Context, REG_RSP};
+use crate::{Context, StackReader, REG_RSP};
 use core::mem::{align_of, offset_of, size_of};
 
 pub const RAW_CONTEXT_SIZE: usize = 0x4d0;
@@ -21,6 +21,14 @@ const XMM_OFFSET: usize = 0x1a0;
 /// Control, integer, and floating-point state in the NT AMD64 `ContextFlags` field.
 pub const CONTEXT_AMD64_FULL: u32 = 0x0010_000b;
 pub const CONTEXT_AMD64_FULL_SEGMENTS: u32 = CONTEXT_AMD64_FULL | 0x4;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RawContextCaptureError {
+    Unaligned,
+    OutOfBounds,
+    Unreadable,
+    InvalidFlags,
+}
 
 /// Opaque native record. No Rust reference to a typed register field is formed from raw bytes.
 #[repr(C, align(16))]
@@ -64,6 +72,37 @@ const _: () = {
 };
 
 impl RawContext {
+    /// Copy one complete native record from an authenticated stack reader before the caller
+    /// releases its physical dispatch lease. No partial record escapes on a failed word read.
+    pub fn capture_bounded(
+        reader: &dyn StackReader,
+        address: u64,
+        stack_low: u64,
+        stack_high: u64,
+    ) -> Result<Self, RawContextCaptureError> {
+        if address & 15 != 0 {
+            return Err(RawContextCaptureError::Unaligned);
+        }
+        let end = address
+            .checked_add(RAW_CONTEXT_SIZE as u64)
+            .ok_or(RawContextCaptureError::OutOfBounds)?;
+        if stack_low >= stack_high || address < stack_low || end > stack_high {
+            return Err(RawContextCaptureError::OutOfBounds);
+        }
+        let mut context = Self::zeroed();
+        for (index, word) in context.bytes.chunks_exact_mut(8).enumerate() {
+            let location = address + (index * 8) as u64;
+            let value = reader
+                .read_u64(location)
+                .ok_or(RawContextCaptureError::Unreadable)?;
+            word.copy_from_slice(&value.to_le_bytes());
+        }
+        if context.context_flags() & CONTEXT_AMD64_FULL_SEGMENTS != CONTEXT_AMD64_FULL_SEGMENTS {
+            return Err(RawContextCaptureError::InvalidFlags);
+        }
+        Ok(context)
+    }
+
     pub const fn zeroed() -> Self {
         Self {
             bytes: [0; RAW_CONTEXT_SIZE],
@@ -220,6 +259,87 @@ impl RawContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::cell::Cell;
+
+    struct MockStack {
+        base: u64,
+        bytes: [u8; RAW_CONTEXT_SIZE],
+        fail_word: Option<usize>,
+        reads: Cell<usize>,
+    }
+
+    impl StackReader for MockStack {
+        fn read_u64(&self, address: u64) -> Option<u64> {
+            self.reads.set(self.reads.get() + 1);
+            let offset = address.checked_sub(self.base)? as usize;
+            if offset & 7 != 0 || self.fail_word == Some(offset / 8) {
+                return None;
+            }
+            let word: [u8; 8] = self.bytes.get(offset..offset + 8)?.try_into().ok()?;
+            Some(u64::from_le_bytes(word))
+        }
+    }
+
+    fn mock_stack() -> MockStack {
+        let mut raw = RawContext::from_bytes([0xa5; RAW_CONTEXT_SIZE]);
+        raw.set_context_flags(CONTEXT_AMD64_FULL_SEGMENTS);
+        MockStack {
+            base: 0x2000,
+            bytes: *raw.as_bytes(),
+            fail_word: None,
+            reads: Cell::new(0),
+        }
+    }
+
+    #[test]
+    fn bounded_capture_copies_exact_native_record() {
+        let stack = mock_stack();
+        let captured = RawContext::capture_bounded(&stack, 0x2000, 0x2000, 0x24d0).unwrap();
+        assert_eq!(captured.as_bytes(), &stack.bytes);
+        assert_eq!(stack.reads.get(), RAW_CONTEXT_SIZE / 8);
+    }
+
+    #[test]
+    fn bounded_capture_rejects_alignment_extent_and_unreadable_words() {
+        let stack = mock_stack();
+        for (address, low, high, error) in [
+            (0x2001, 0x2000, 0x24d0, RawContextCaptureError::Unaligned),
+            (0x2000, 0x2001, 0x24d0, RawContextCaptureError::OutOfBounds),
+            (0x2000, 0x2000, 0x24cf, RawContextCaptureError::OutOfBounds),
+            (0x2000, 0x24d0, 0x2000, RawContextCaptureError::OutOfBounds),
+            (
+                u64::MAX & !15,
+                0,
+                u64::MAX,
+                RawContextCaptureError::OutOfBounds,
+            ),
+        ] {
+            assert_eq!(
+                RawContext::capture_bounded(&stack, address, low, high),
+                Err(error)
+            );
+        }
+        assert_eq!(stack.reads.get(), 0);
+
+        let mut stack = mock_stack();
+        stack.fail_word = Some(RAW_CONTEXT_SIZE / 8 - 1);
+        assert_eq!(
+            RawContext::capture_bounded(&stack, 0x2000, 0x2000, 0x24d0),
+            Err(RawContextCaptureError::Unreadable)
+        );
+        assert_eq!(stack.reads.get(), RAW_CONTEXT_SIZE / 8);
+    }
+
+    #[test]
+    fn bounded_capture_requires_full_integer_float_and_segment_flags() {
+        let mut stack = mock_stack();
+        stack.bytes[FLAGS_OFFSET..FLAGS_OFFSET + 4]
+            .copy_from_slice(&CONTEXT_AMD64_FULL.to_le_bytes());
+        assert_eq!(
+            RawContext::capture_bounded(&stack, 0x2000, 0x2000, 0x24d0),
+            Err(RawContextCaptureError::InvalidFlags)
+        );
+    }
 
     #[test]
     fn register_offsets_and_out_of_range_indices() {
