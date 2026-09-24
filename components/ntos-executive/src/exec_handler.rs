@@ -12510,7 +12510,7 @@ impl ExecNtHandler {
         }
     }
 
-    fn release_file_handle_reference(&mut self, file_id: u64) {
+    pub(crate) fn release_file_handle_reference(&mut self, file_id: u64) {
         if let Ok(release) = self.file_completion.release_handle(file_id) {
             self.complete_file_reference_release(file_id, release);
         }

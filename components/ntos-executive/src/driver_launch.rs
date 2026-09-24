@@ -68,6 +68,8 @@ mod hosted_file_objects;
 mod hosted_io_create_file_adapter;
 #[path = "hosted_io_create_file_ingress.rs"]
 mod hosted_io_create_file_ingress;
+#[path = "hosted_io_create_file_work.rs"]
+mod hosted_io_create_file_work;
 #[path = "driver_share_access.rs"]
 mod driver_share_access;
 use hosted_file_objects::{
@@ -53542,6 +53544,29 @@ pub(crate) fn service_hosted_driver_registry(
     }
 }
 
+pub(crate) fn service_hosted_driver_io_create_file(
+    ch: &crate::spawn_hosts::PumpChannel,
+    packet: u64,
+    packet_length: u64,
+    active_reply_cap: u64,
+) -> Option<nt_io_manager::io_create_file_reply::IoCreateFileReply> {
+    use nt_io_manager::io_create_file_reply::IoCreateFileReply;
+    let captured = match hosted_io_create_file_ingress::capture(
+        ch, active_reply_cap, packet, packet_length,
+    ) {
+        Ok(captured) => captured,
+        Err(status) => return Some(IoCreateFileReply::Rejected { status }),
+    };
+    match unsafe { hosted_io_create_file_work::submit(ch, captured) } {
+        hosted_io_create_file_work::SubmitResult::Ready(reply) => Some(reply),
+        hosted_io_create_file_work::SubmitResult::Deferred => None,
+    }
+}
+
+pub(crate) unsafe fn redrive_hosted_driver_io_create_file(handler: &mut ExecNtHandler) {
+    hosted_io_create_file_work::redrive(handler);
+}
+
 fn service_hosted_driver_registry_sync(
     ch: &crate::spawn_hosts::PumpChannel,
     op: u64,
@@ -58526,6 +58551,29 @@ pub(crate) fn allocate_hosted_relative_file(
         .allocate_external_relative_file(
             ClientId(IO_MANAGER_COMPONENT_ID),
             related_file,
+            AccessMask::from_bits_retain(desired_access),
+            ShareAccess::from_bits_retain(share_access),
+            CreateOptions::from_bits_retain(create_options),
+            nt_types::UnicodeString::from_units(file_name),
+        )
+        .map(|file_id| file_id.raw())
+        .map_err(|status| status.raw() as u32)
+}
+
+/// A retained provider request owns a canonical parent reference, so relative CREATE remains
+/// valid after the source handle enters CLEANUP while the request is parked.
+pub(crate) fn allocate_owned_hosted_relative_file(
+    parent: &hosted_file_capture::Capture,
+    desired_access: u32,
+    share_access: u32,
+    create_options: u32,
+    file_name: &[u16],
+) -> Result<u64, u32> {
+    require_hosted_device_ready_for_dispatch(parent.device_id())?;
+    io_manager_mut()
+        .allocate_owned_external_relative_file(
+            ClientId(IO_MANAGER_COMPONENT_ID),
+            FileId(parent.file_id()),
             AccessMask::from_bits_retain(desired_access),
             ShareAccess::from_bits_retain(share_access),
             CreateOptions::from_bits_retain(create_options),

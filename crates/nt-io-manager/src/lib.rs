@@ -60,6 +60,7 @@ pub mod io_create_file;
 pub mod io_create_file_capture;
 pub mod io_create_file_reply;
 pub mod provider_create_delivery;
+pub mod consumer_file_projection;
 pub mod io_create_file_wire;
 mod lock_control;
 mod set_information_completion;

@@ -41,6 +41,7 @@ pub enum DeliveryError {
     WrongPhase,
     WrongIdentity,
     InvalidHandle,
+    InvalidFailureStatus,
     Cancelled,
 }
 
@@ -51,6 +52,29 @@ pub enum DispatchNotEnteredProof {
     ProviderNotEntered,
 }
 
+/// A sealed retained-service stop proved that an entered Reply was not acknowledged.
+/// An uncertain Reply return alone is not this proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StopUnacknowledgedProof {
+    SealedStop,
+}
+
+/// Created by the integration only after it has revoked the exact PM reservation or handle,
+/// and queued release of the canonical File. If either effect is uncertain, retain the owner
+/// in its existing phase and do not create this receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "settle the exact CREATE publication owner"]
+pub struct PublicationRollbackReceipt {
+    file: FileId,
+    handle: Option<u64>,
+}
+
+impl PublicationRollbackReceipt {
+    pub const fn after_exact_retirement(file: FileId, handle: Option<u64>) -> Self {
+        Self { file, handle }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderCreateDelivery {
     identity: CreateIdentity,
@@ -58,6 +82,7 @@ pub struct ProviderCreateDelivery {
     irp: Option<IrpId>,
     terminal: Option<CreateTerminal>,
     handle: Option<u64>,
+    publication_failure: Option<u32>,
     cancelled: bool,
     stop_acknowledged: bool,
 }
@@ -70,6 +95,7 @@ impl ProviderCreateDelivery {
             irp: None,
             terminal: None,
             handle: None,
+            publication_failure: None,
             cancelled: false,
             stop_acknowledged: false,
         }
@@ -93,6 +119,16 @@ impl ProviderCreateDelivery {
 
     pub const fn handle(&self) -> Option<u64> {
         self.handle
+    }
+
+    /// The provider terminal remains immutable for backend ACK. Publication failure changes
+    /// only the caller-visible status, after exact rollback has completed.
+    pub fn client_completion(&self) -> Option<(u32, u64)> {
+        let terminal = self.terminal?;
+        Some(match self.publication_failure {
+            Some(status) => (status, 0),
+            None => (terminal.status, terminal.information),
+        })
     }
 
     pub const fn cancelled(&self) -> bool {
@@ -176,6 +212,7 @@ impl ProviderCreateDelivery {
             return Err(DeliveryError::Cancelled);
         }
         if self.phase != Phase::Terminal
+            || self.publication_failure.is_some()
             || !matches!(self.terminal, Some(terminal) if (terminal.status as i32) >= 0)
         {
             return Err(DeliveryError::WrongPhase);
@@ -185,6 +222,32 @@ impl ProviderCreateDelivery {
         }
         self.handle = Some(handle);
         self.phase = Phase::HandleBound;
+        Ok(())
+    }
+
+    /// Roll back a successful provider CREATE whose handle publication failed. The exact
+    /// reservation/handle and canonical File must already be retired by the integration. The
+    /// retained IRP still needs its backend ACK after the failed Reply or sealed stop.
+    pub fn rollback_publication(
+        &mut self,
+        receipt: PublicationRollbackReceipt,
+        failure_status: u32,
+    ) -> Result<(), DeliveryError> {
+        if (failure_status as i32) >= 0 {
+            return Err(DeliveryError::InvalidFailureStatus);
+        }
+        if !matches!(self.phase, Phase::Terminal | Phase::HandleBound | Phase::HandlePublished)
+            || self.publication_failure.is_some()
+            || !matches!(self.terminal, Some(terminal) if (terminal.status as i32) >= 0)
+        {
+            return Err(DeliveryError::WrongPhase);
+        }
+        if receipt.file != self.identity.file || receipt.handle != self.handle {
+            return Err(DeliveryError::WrongIdentity);
+        }
+        self.handle = None;
+        self.publication_failure = Some(failure_status);
+        self.phase = Phase::Terminal;
         Ok(())
     }
 
@@ -207,8 +270,8 @@ impl ProviderCreateDelivery {
         if self.cancelled {
             return Err(DeliveryError::Cancelled);
         }
-        let terminal = self.terminal.ok_or(DeliveryError::WrongPhase)?;
-        let ready = if (terminal.status as i32) < 0 {
+        let (status, _) = self.client_completion().ok_or(DeliveryError::WrongPhase)?;
+        let ready = if (status as i32) < 0 {
             self.phase == Phase::Terminal && self.handle.is_none()
         } else {
             self.phase == Phase::HandlePublished && self.handle.is_some()
@@ -254,6 +317,25 @@ impl ProviderCreateDelivery {
             return Err(DeliveryError::WrongPhase);
         }
         self.stop_acknowledged = true;
+        Ok(())
+    }
+
+    /// A stopped route may settle an uncertain Reply only when its retained Call proves no
+    /// acknowledgement. The handle remains owned until exact rollback retires it.
+    pub fn cancel_unacknowledged_reply_after_stop(
+        &mut self,
+        _proof: StopUnacknowledgedProof,
+    ) -> Result<(), DeliveryError> {
+        if self.phase != Phase::ReplyEntered {
+            return Err(DeliveryError::WrongPhase);
+        }
+        self.cancelled = true;
+        self.stop_acknowledged = true;
+        self.phase = if self.handle.is_some() {
+            Phase::HandlePublished
+        } else {
+            Phase::Terminal
+        };
         Ok(())
     }
 
@@ -450,5 +532,96 @@ mod tests {
         owner.enter_dispatch().unwrap();
         owner.abort_not_entered(DispatchNotEnteredProof::ProviderNotEntered).unwrap();
         assert_eq!(owner.enter_dispatch(), Err(DeliveryError::WrongPhase));
+    }
+
+    #[test]
+    fn publication_failure_replies_failure_but_still_acks_original_pending_irp() {
+        let mut owner = ProviderCreateDelivery::new(identity());
+        owner.enter_dispatch().unwrap();
+        owner.retain_irp(IrpId(11)).unwrap();
+        owner.observe_terminal(terminal(IrpId(11), 0)).unwrap();
+        owner.bind_handle(0x44).unwrap();
+        owner.publish_handle(0x44).unwrap();
+        assert_eq!(owner.rollback_publication(
+            PublicationRollbackReceipt::after_exact_retirement(FileId(8), Some(0x44)),
+            0xc000_009a,
+        ), Err(DeliveryError::WrongIdentity));
+        assert_eq!(owner.rollback_publication(
+            PublicationRollbackReceipt::after_exact_retirement(FileId(7), Some(0x45)),
+            0xc000_009a,
+        ), Err(DeliveryError::WrongIdentity));
+        assert_eq!(owner.rollback_publication(
+            PublicationRollbackReceipt::after_exact_retirement(FileId(7), Some(0x44)),
+            0,
+        ), Err(DeliveryError::InvalidFailureStatus));
+        assert_eq!(owner.phase(), Phase::HandlePublished);
+        owner.rollback_publication(
+            PublicationRollbackReceipt::after_exact_retirement(FileId(7), Some(0x44)),
+            0xc000_009a,
+        ).unwrap();
+        assert_eq!(owner.terminal(), Some(terminal(IrpId(11), 0)));
+        assert_eq!(owner.client_completion(), Some((0xc000_009a, 0)));
+        assert_eq!(owner.handle(), None);
+        assert_eq!(owner.bind_handle(0x44), Err(DeliveryError::WrongPhase));
+        owner.enter_reply().unwrap();
+        owner.acknowledge_reply().unwrap();
+        owner.enter_backend_ack().unwrap();
+        owner.acknowledge_backend().unwrap();
+        owner.finish().unwrap();
+    }
+
+    #[test]
+    fn failed_bind_rollback_can_be_cancelled_but_needs_stop_and_backend_ack() {
+        let mut owner = ProviderCreateDelivery::new(identity());
+        owner.enter_dispatch().unwrap();
+        owner.retain_irp(IrpId(11)).unwrap();
+        owner.observe_terminal(terminal(IrpId(11), 0)).unwrap();
+        owner.rollback_publication(
+            PublicationRollbackReceipt::after_exact_retirement(FileId(7), None),
+            0xc000_0008,
+        ).unwrap();
+        owner.cancel().unwrap();
+        assert_eq!(owner.enter_reply(), Err(DeliveryError::Cancelled));
+        assert_eq!(owner.enter_backend_ack(), Err(DeliveryError::WrongPhase));
+        owner.acknowledge_stop().unwrap();
+        owner.enter_backend_ack().unwrap();
+        owner.acknowledge_backend().unwrap();
+        owner.finish().unwrap();
+    }
+
+    #[test]
+    fn sealed_stop_after_uncertain_reply_requires_handle_rollback() {
+        let mut owner = ProviderCreateDelivery::new(identity());
+        owner.enter_dispatch().unwrap();
+        owner.retain_irp(IrpId(11)).unwrap();
+        owner.observe_terminal(terminal(IrpId(11), 0)).unwrap();
+        owner.bind_handle(0x44).unwrap();
+        owner.publish_handle(0x44).unwrap();
+        owner.enter_reply().unwrap();
+        assert_eq!(owner.cancel(), Err(DeliveryError::WrongPhase));
+        owner.cancel_unacknowledged_reply_after_stop(StopUnacknowledgedProof::SealedStop)
+            .unwrap();
+        assert_eq!(owner.phase(), Phase::HandlePublished);
+        assert_eq!(owner.enter_backend_ack(), Err(DeliveryError::WrongPhase));
+        assert_eq!(owner.rollback_cancelled_handle(0x45), Err(DeliveryError::WrongIdentity));
+        owner.rollback_cancelled_handle(0x44).unwrap();
+        owner.enter_backend_ack().unwrap();
+        owner.acknowledge_backend().unwrap();
+        owner.finish().unwrap();
+    }
+
+    #[test]
+    fn sealed_stop_after_failed_reply_keeps_backend_ack() {
+        let mut owner = ProviderCreateDelivery::new(identity());
+        owner.enter_dispatch().unwrap();
+        owner.retain_irp(IrpId(11)).unwrap();
+        owner.observe_terminal(terminal(IrpId(11), 0xc000_0034)).unwrap();
+        owner.enter_reply().unwrap();
+        owner.cancel_unacknowledged_reply_after_stop(StopUnacknowledgedProof::SealedStop)
+            .unwrap();
+        assert_eq!(owner.phase(), Phase::Terminal);
+        owner.enter_backend_ack().unwrap();
+        owner.acknowledge_backend().unwrap();
+        owner.finish().unwrap();
     }
 }

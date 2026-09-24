@@ -19,6 +19,7 @@ pub(super) struct CapturedCreate {
     pub request: nt_io_manager::io_create_file::OwnedIoCreateFileRequest,
     pub device_id: u64,
     pub related_file_id: Option<u64>,
+    pub related_file: Option<crate::driver_launch::hosted_file_capture::Capture>,
     pub relative_name: Vec<u16>,
 }
 
@@ -59,11 +60,11 @@ pub(super) fn capture(
     let packet = unsafe { core::slice::from_raw_parts(exec_packet as *const u8, length) };
     let request = decode(packet).map_err(wire_status)?;
     let case_insensitive = request.object_attributes & 0x40 != 0;
-    let (device_id, related_file_id, relative_name) = if request.root_directory == 0 {
+    let (device_id, related_file_id, related_file, relative_name) = if request.root_directory == 0 {
         let (device_id, prefix) = io_manager_mut()
             .device_prefix_for_file_name(&request.name, case_insensitive)
             .ok_or(STATUS_OBJECT_NAME_NOT_FOUND as u32)?;
-        (device_id.raw(), None, copy_name(&request.name[prefix..])?)
+        (device_id.raw(), None, None, copy_name(&request.name[prefix..])?)
     } else {
         let (file_id, device_id) = unsafe {
             crate::service_sec_image::with_provider_process_manager(|pm| {
@@ -73,13 +74,15 @@ pub(super) fn capture(
         if request.name.first() == Some(&(b'\\' as u16)) {
             return Err(STATUS_OBJECT_NAME_INVALID as u32);
         }
-        (device_id, Some(file_id), copy_name(&request.name)?)
+        let related_file = crate::driver_launch::hosted_file_capture::capture(file_id, device_id, 0)?;
+        (device_id, Some(file_id), Some(related_file), copy_name(&request.name)?)
     };
     Ok(CapturedCreate {
         caller,
         request,
         device_id,
         related_file_id,
+        related_file,
         relative_name,
     })
 }

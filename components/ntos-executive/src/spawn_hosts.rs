@@ -2871,6 +2871,30 @@ unsafe fn component_pump_loop(
                 }
             }
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_IO_CREATE_FILE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let reply = if msg.m2 == 0 && msg.m3 == 0 {
+                crate::driver_launch::service_hosted_driver_io_create_file(
+                    ch, msg.m0, msg.m1, *reply_cap,
+                )
+            } else {
+                Some(nt_io_manager::io_create_file_reply::IoCreateFileReply::Rejected {
+                    status: STATUS_INVALID_PARAMETER_I32 as u32,
+                })
+            };
+            if let Some(reply) = reply {
+                let [status, iosb_status, information, handle] = reply.words()
+                    .expect("provider CREATE service reply");
+                pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
+                    status, iosb_status, information, handle);
+            } else if shared_pump::autonomous(ch) {
+                outcome.provider_wait_suspended = true;
+                break;
+            } else {
+                msg = pump_recv(ch, *reply_cap);
+            }
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_REGISTRY_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
