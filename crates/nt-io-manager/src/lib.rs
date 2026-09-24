@@ -7563,6 +7563,8 @@ mod tests {
                 device_object: 0x2000,
                 file_object_context: 0x77,
                 device_type: 0x23,
+                device_stack_size: 1,
+                ..Default::default()
             },
         )
         .unwrap();

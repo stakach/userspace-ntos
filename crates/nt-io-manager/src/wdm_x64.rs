@@ -67,9 +67,21 @@ pub struct WdmOpenDeviceProjectionInit {
     pub file_object_address: u64,
     pub driver_object: u64,
     pub driver_extension: u64,
+    pub driver_name_len: u16,
+    pub driver_name_max_len: u16,
+    pub driver_name_buffer: u64,
     pub device_object: u64,
     pub file_object_context: u64,
     pub device_type: u32,
+    pub device_flags: u32,
+    pub device_characteristics: u32,
+    pub device_stack_size: u8,
+    pub file_create_options: u32,
+    pub file_opened_case_sensitive: bool,
+    pub file_related_file_object: u64,
+    pub file_name_len: u16,
+    pub file_name_max_len: u16,
+    pub file_name_buffer: u64,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -304,6 +316,39 @@ pub fn write_wdm_open_device_projection(
     init: WdmOpenDeviceProjectionInit,
 ) -> Result<(), WdmLayoutError> {
     validate_file_object_address(init.file_object_address)?;
+    if init.driver_name_len > init.driver_name_max_len
+        || init.driver_name_len & 1 != 0
+        || init.driver_name_max_len & 1 != 0
+        || (init.driver_name_max_len != 0
+            && (init.driver_name_buffer == 0
+                || init.driver_name_buffer & 1 != 0
+                || init
+                    .driver_name_buffer
+                    .checked_add(init.driver_name_max_len as u64)
+                    .is_none()))
+        || init.device_stack_size == 0
+        || init.file_name_len > init.file_name_max_len
+        || init.file_name_len & 1 != 0
+        || init.file_name_max_len & 1 != 0
+        || (init.file_name_max_len != 0
+            && (init.file_name_buffer == 0
+                || init.file_name_buffer & 1 != 0
+                || init
+                    .file_name_buffer
+                    .checked_add(init.file_name_max_len as u64)
+                    .is_none()))
+        || init.file_create_options & 0xff00_0000 != 0
+        || crate::FileModeState::from_create_options(crate::CreateOptions::from_bits_retain(
+            init.file_create_options,
+        ))
+        .wdm_mode_flags()
+        .is_err()
+    {
+        return Err(WdmLayoutError::InvalidField);
+    }
+    require(driver_bytes, WDM_X64_DRIVER_OBJECT_SIZE)?;
+    require(device_bytes, WDM_X64_DEVICE_OBJECT_SIZE)?;
+    require(file_bytes, WDM_X64_FILE_OBJECT_SIZE)?;
     write_wdm_driver_object(
         driver_bytes,
         WdmDriverObjectInit {
@@ -313,6 +358,9 @@ pub fn write_wdm_open_device_projection(
             driver_unload: 0,
         },
     )?;
+    put_u16(driver_bytes, 0x38, init.driver_name_len);
+    put_u16(driver_bytes, 0x3a, init.driver_name_max_len);
+    put_u64(driver_bytes, 0x40, init.driver_name_buffer);
     write_wdm_device_object(
         device_bytes,
         WdmDeviceObjectInit {
@@ -320,24 +368,24 @@ pub fn write_wdm_open_device_projection(
             driver_object: init.driver_object,
             next_device: 0,
             device_extension: 0,
-            flags: 0,
-            characteristics: 0,
+            flags: init.device_flags,
+            characteristics: init.device_characteristics,
             device_type: init.device_type,
-            stack_size: 1,
+            stack_size: init.device_stack_size,
         },
     )?;
     write_wdm_file_object(
         file_bytes,
         WdmFileObjectInit {
             file_object_address: init.file_object_address,
-            create_options: 0,
-            opened_case_sensitive: false,
+            create_options: init.file_create_options,
+            opened_case_sensitive: init.file_opened_case_sensitive,
             device_object: init.device_object,
             fs_context: init.file_object_context,
-            related_file_object: 0,
-            file_name_len: 0,
-            file_name_max_len: 0,
-            file_name_buffer: 0,
+            related_file_object: init.file_related_file_object,
+            file_name_len: init.file_name_len,
+            file_name_max_len: init.file_name_max_len,
+            file_name_buffer: init.file_name_buffer,
         },
     )
 }
