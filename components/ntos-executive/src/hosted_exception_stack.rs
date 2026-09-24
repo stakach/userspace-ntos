@@ -7,7 +7,9 @@
 use nt_component_suspension::{peer_registry::PeerRoute, LaneDispatchIdentity};
 use nt_io_manager::HostedDomainIdentity;
 use nt_unwind::{
+    exception_walk::SoftwareRaiseSite,
     raw_context::{RawContext, RawContextCaptureError},
+    seh_linkage_image::SehRaiseIngressError,
     StackReader,
 };
 
@@ -187,4 +189,32 @@ pub(super) fn capture_raw_context(
     with_reader(channel, reply_cap, badge, |reader, low, high| {
         RawContext::capture_bounded(reader, address, low, high)
     })
+}
+
+pub(super) enum RaiseCaptureError {
+    Context(RawContextCaptureError),
+    Admission(SehRaiseIngressError),
+}
+
+/// Admit a software raise only while its exact caller stack and sealed image catalog belong to
+/// the same physically retained dispatch. No alias, catalog borrow, or component pointer escapes.
+pub(super) fn capture_raise_site(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    context_address: u64,
+    status_word: u64,
+) -> Option<Result<SoftwareRaiseSite, RaiseCaptureError>> {
+    let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
+    let domain = instance_domain_identity(inst)?;
+    let linkage = inst.seh_linkage?;
+    with_reader(channel, reply_cap, badge, |reader, low, high| {
+        super::hosted_exception_images::with_catalog(instance, domain, |catalog| {
+            let raw = RawContext::capture_bounded(reader, context_address, low, high)
+                .map_err(RaiseCaptureError::Context)?;
+            linkage
+                .admit_raise(&raw, status_word, low, high, catalog, reader)
+                .map_err(RaiseCaptureError::Admission)
+        })
+    })?
 }

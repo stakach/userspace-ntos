@@ -14,7 +14,9 @@ pub(super) const COMPONENT_SNAPSHOT_VA: u64 = 0x0000_0100_0F40_0000;
 const COMPONENT_SNAPSHOT_LIMIT: u64 = crate::WORK_CLUSTER_BASE;
 const EXEC_SCRATCH_VA: u64 = 0x0000_0101_5100_0000;
 const EXEC_SCRATCH_LIMIT: u64 = 0x0000_0101_5200_0000;
-const _: () = assert!(COMPONENT_SNAPSHOT_LIMIT - COMPONENT_SNAPSHOT_VA == EXEC_SCRATCH_LIMIT - EXEC_SCRATCH_VA);
+const _: () = assert!(
+    COMPONENT_SNAPSHOT_LIMIT - COMPONENT_SNAPSHOT_VA == EXEC_SCRATCH_LIMIT - EXEC_SCRATCH_VA
+);
 const _: () = assert!(EXEC_SCRATCH_VA > super::FSD_EXEC_LIMIT);
 const _: () = assert!(EXEC_SCRATCH_LIMIT <= 0x0000_0101_6000_0000);
 static SCRATCH_IN_USE: AtomicBool = AtomicBool::new(false);
@@ -275,6 +277,22 @@ pub(super) fn publish(
     crate::print_u64(image_count as u64);
     crate::print_str(b"\n");
     Ok(())
+}
+
+/// Borrow only the catalog sealed for this exact live domain. The borrow cannot outlive the
+/// closure, so retirement or instance-slot reuse cannot leave an unowned catalog reference.
+pub(super) fn with_catalog<R>(
+    instance: usize,
+    domain: HostedDomainIdentity,
+    use_catalog: impl for<'a> FnOnce(&'a ExceptionImageCatalog) -> R,
+) -> Option<R> {
+    unsafe {
+        let row = (&*core::ptr::addr_of!(CATALOGS))
+            .as_ref()?
+            .get(instance)?
+            .as_ref()?;
+        (row.domain == domain).then(|| use_catalog(&row.catalog))
+    }
 }
 
 pub(super) fn retire(instance: usize, domain: HostedDomainIdentity) {

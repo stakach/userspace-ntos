@@ -1,6 +1,12 @@
 //! Admission of the per-instance SEH linkage PE before hosted driver imports are resolved.
 
-use crate::exception_walk::{ExceptionFunction, ExceptionImageError, ExceptionImageReader};
+use crate::{
+    exception_walk::{
+        ExceptionFunction, ExceptionImageError, ExceptionImageReader, SoftwareRaiseSite, WalkError,
+    },
+    raw_context::{RawContext, CONTEXT_AMD64_FULL_SEGMENTS},
+    StackReader, REG_RCX,
+};
 use nt_pe_loader::{
     immutable_support_image, DataDirectory, ExportedSymbol, MappedImage, PeFile, Section,
     DIRECTORY_ENTRY_EXPORT,
@@ -37,6 +43,15 @@ pub struct SehLinkageImage {
     pub dispatch_slot_rva: u32,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SehRaiseIngressError {
+    ContextFlags,
+    StatusShape,
+    StatusMismatch,
+    WrongEntry,
+    Site(WalkError),
+}
+
 fn exact_function(
     result: Result<ExceptionFunction, ExceptionImageError>,
     pc: u64,
@@ -52,6 +67,31 @@ fn exact_function(
 }
 
 impl SehLinkageImage {
+    /// Admit the first Call from the native raise entry without treating its component pointer
+    /// as authority. The caller must first copy `raw` under the exact physical stack lease.
+    pub fn admit_raise(
+        &self,
+        raw: &RawContext,
+        status_word: u64,
+        stack_low: u64,
+        stack_high: u64,
+        image: &dyn ExceptionImageReader,
+        stack: &dyn StackReader,
+    ) -> Result<SoftwareRaiseSite, SehRaiseIngressError> {
+        if raw.context_flags() & CONTEXT_AMD64_FULL_SEGMENTS != CONTEXT_AMD64_FULL_SEGMENTS {
+            return Err(SehRaiseIngressError::ContextFlags);
+        }
+        let status = u32::try_from(status_word).map_err(|_| SehRaiseIngressError::StatusShape)?;
+        if raw.gpr(REG_RCX).expect("RCX is an ABI register") as u32 != status {
+            return Err(SehRaiseIngressError::StatusMismatch);
+        }
+        if raw.rip() != self.raise_va {
+            return Err(SehRaiseIngressError::WrongEntry);
+        }
+        SoftwareRaiseSite::admit(raw.to_context(), stack_low, stack_high, image, stack)
+            .map_err(SehRaiseIngressError::Site)
+    }
+
     /// Both entry PCs must start real runtime-function rows in this exact admitted image.
     pub fn validate_catalog(
         &self,
@@ -175,8 +215,9 @@ fn slot_is_zero(source: Option<&[u8]>, mapped: Option<&[u8]>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RuntimeFunction;
+    use crate::{ImageReader, RuntimeFunction};
     use alloc::vec::Vec;
+    use core::cell::Cell;
     const EXECUTE: u32 = 0x2000_0000;
     const READ: u32 = 0x4000_0000;
     const WRITE: u32 = 0x8000_0000;
@@ -305,6 +346,126 @@ mod tests {
             Err(ExceptionImageError::UnknownImage),
             0x5000,
             0x4000
+        ));
+    }
+
+    struct RaiseFixture {
+        caller: u64,
+        reads: Cell<usize>,
+    }
+
+    impl ImageReader for RaiseFixture {
+        fn lookup_function(&self, _pc: u64) -> Option<(u64, RuntimeFunction)> {
+            None
+        }
+
+        fn read_u8(&self, _base: u64, _rva: u32) -> Option<u8> {
+            None
+        }
+    }
+
+    impl ExceptionImageReader for RaiseFixture {
+        fn lookup_exception_function(
+            &self,
+            pc: u64,
+        ) -> Result<ExceptionFunction, ExceptionImageError> {
+            if pc == 0x5200 {
+                Ok(ExceptionFunction::Leaf)
+            } else {
+                Err(ExceptionImageError::UnknownImage)
+            }
+        }
+    }
+
+    impl StackReader for RaiseFixture {
+        fn read_u64(&self, address: u64) -> Option<u64> {
+            self.reads.set(self.reads.get() + 1);
+            (address == 0x1008).then_some(self.caller)
+        }
+    }
+
+    fn raise_context() -> RawContext {
+        let mut raw = RawContext::zeroed();
+        raw.set_context_flags(CONTEXT_AMD64_FULL_SEGMENTS);
+        raw.set_rip(0x5000);
+        raw.set_rsp(0x1008);
+        raw.set_gpr(REG_RCX, 0xc000_0022);
+        raw
+    }
+
+    fn raise_linkage() -> SehLinkageImage {
+        SehLinkageImage {
+            image_base: 0x4000,
+            raise_va: 0x5000,
+            resume_va: 0x512a,
+            dispatch_slot_rva: 0x3000,
+        }
+    }
+
+    #[test]
+    fn native_raise_ingress_admits_owned_entry_and_exact_caller() {
+        let fixture = RaiseFixture {
+            caller: 0x5200,
+            reads: Cell::new(0),
+        };
+        let site = raise_linkage()
+            .admit_raise(
+                &raise_context(),
+                0xc000_0022,
+                0x1000,
+                0x1040,
+                &fixture,
+                &fixture,
+            )
+            .unwrap();
+        assert!(site.into_search(0xc000_0022, 4).is_ok());
+        assert_eq!(fixture.reads.get(), 1);
+    }
+
+    #[test]
+    fn native_raise_ingress_rejects_shape_status_entry_and_caller() {
+        let fixture = RaiseFixture {
+            caller: 0x5200,
+            reads: Cell::new(0),
+        };
+        let linkage = raise_linkage();
+        let mut raw = raise_context();
+        raw.set_context_flags(0);
+        assert!(matches!(
+            linkage.admit_raise(&raw, 0xc000_0022, 0x1000, 0x1040, &fixture, &fixture),
+            Err(SehRaiseIngressError::ContextFlags)
+        ));
+        raw = raise_context();
+        assert!(matches!(
+            linkage.admit_raise(&raw, 0x1_c000_0022, 0x1000, 0x1040, &fixture, &fixture),
+            Err(SehRaiseIngressError::StatusShape)
+        ));
+        assert!(matches!(
+            linkage.admit_raise(&raw, 0xc000_0005, 0x1000, 0x1040, &fixture, &fixture),
+            Err(SehRaiseIngressError::StatusMismatch)
+        ));
+        raw.set_rip(0x5001);
+        assert!(matches!(
+            linkage.admit_raise(&raw, 0xc000_0022, 0x1000, 0x1040, &fixture, &fixture),
+            Err(SehRaiseIngressError::WrongEntry)
+        ));
+        assert_eq!(fixture.reads.get(), 0);
+        let bad_caller = RaiseFixture {
+            caller: 0x5fff,
+            reads: Cell::new(0),
+        };
+        assert!(matches!(
+            linkage.admit_raise(
+                &raise_context(),
+                0xc000_0022,
+                0x1000,
+                0x1040,
+                &bad_caller,
+                &bad_caller
+            ),
+            Err(SehRaiseIngressError::Site(WalkError::ImageLookup(
+                ExceptionImageError::UnknownImage
+            )))
         ));
     }
 }
