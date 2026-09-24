@@ -325,6 +325,13 @@ impl ExceptionImageReader for ExceptionImageCatalog {
             .ok_or(ExceptionImageError::UnknownImage)?
             .lookup(pc)
     }
+
+    fn validate_collision_scope(&self, image_base: u64, handler_data: u64, index: u32) -> bool {
+        index == 0
+            || self
+                .read_c_scope_table(image_base, handler_data)
+                .is_ok_and(|scopes| index <= scopes.len() as u32)
+    }
 }
 
 impl ImageReader for ExceptionImageCatalog {

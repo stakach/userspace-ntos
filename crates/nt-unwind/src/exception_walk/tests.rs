@@ -101,6 +101,10 @@ impl ExceptionImageReader for Fixture {
             None => ExceptionFunction::Leaf,
         })
     }
+
+    fn validate_collision_scope(&self, image_base: u64, handler_data: u64, index: u32) -> bool {
+        image_base == BASE && handler_data == BASE + 0x100c && index <= 2
+    }
 }
 
 fn context() -> Context {
@@ -238,16 +242,99 @@ fn invalid_dispositions_are_not_continue_search() {
     }
 }
 
+fn saved_dispatcher(invocation: &HandlerInvocation) -> CollisionDispatcher {
+    CollisionDispatcher {
+        control_pc: invocation.control_pc,
+        image_base: invocation.image_base,
+        function: invocation.function,
+        establisher_frame: invocation.establisher_frame,
+        handler: invocation.handler,
+        handler_data: invocation.handler_data,
+        scope_index: 1,
+        context: context(),
+    }
+}
+
 #[test]
-fn collided_unwind_blocks_native_and_ntdll_adoption_in_both_passes() {
+fn collision_requires_an_explicit_saved_dispatcher() {
     let fixture = Fixture::new(unw_flag::EHANDLER | unw_flag::UHANDLER);
     for mode in [WalkMode::Search, unwind(Some(LOW + 0x20))] {
         let invocation = invoke(fixture.walk(mode).step(&fixture, &fixture).unwrap());
         assert_eq!(
             invocation.returned(3).unwrap_err(),
-            WalkError::UnsupportedCollidedUnwind
+            WalkError::InvalidCollisionDispatcher
         );
     }
+}
+
+#[test]
+fn collided_unwind_reinvokes_saved_handler_without_advancing_outer_frame() {
+    let fixture = Fixture::new(unw_flag::EHANDLER | unw_flag::UHANDLER);
+    for mode in [WalkMode::Search, unwind(Some(LOW + 0x20))] {
+        let mut first = invoke(fixture.walk(mode).step(&fixture, &fixture).unwrap());
+        first.collision = Some(saved_dispatcher(&first));
+        let walk = continued(first.returned(3).unwrap());
+        let second = invoke(walk.step(&fixture, &fixture).unwrap());
+        assert_eq!(second.control_pc, BASE + 0x110);
+        assert_eq!(second.establisher_frame, LOW);
+        assert_eq!(second.scope_index, 1);
+        assert_eq!(
+            second.exception.flags & EXCEPTION_COLLIDED_UNWIND,
+            EXCEPTION_COLLIDED_UNWIND
+        );
+        assert_eq!(second.handler, BASE + 0x800);
+        let next = second.returned(1).unwrap();
+        if mode == WalkMode::Search {
+            assert!(matches!(
+                next,
+                WalkStep::Complete(WalkOutcome::Unhandled { .. })
+            ));
+        } else {
+            assert!(matches!(next, WalkStep::Continue(_)));
+        }
+    }
+}
+
+#[test]
+fn collision_rejects_untrusted_image_function_handler_frame_and_scope() {
+    let fixture = Fixture::new(unw_flag::EHANDLER | unw_flag::UHANDLER);
+    for mutation in 0..6 {
+        let mut invocation = invoke(
+            fixture
+                .walk(unwind(Some(LOW + 0x20)))
+                .step(&fixture, &fixture)
+                .unwrap(),
+        );
+        let mut saved = saved_dispatcher(&invocation);
+        match mutation {
+            0 => saved.control_pc = BASE + 0x4000,
+            1 => saved.function.begin += 1,
+            2 => saved.handler += 1,
+            3 => saved.establisher_frame = LOW + 8,
+            4 => saved.scope_index = 3,
+            _ => saved.scope_index = 4097,
+        }
+        invocation.collision = Some(saved);
+        let walk = continued(invocation.returned(3).unwrap());
+        let error = walk.step(&fixture, &fixture).unwrap_err();
+        assert!(matches!(
+            error,
+            WalkError::InvalidCollisionDispatcher | WalkError::BadStack | WalkError::ImageLookup(_)
+        ));
+    }
+}
+
+#[test]
+fn repeated_collision_is_bounded_even_with_one_outer_frame() {
+    let fixture = Fixture::new(unw_flag::EHANDLER | unw_flag::UHANDLER);
+    let walk =
+        ExceptionWalk::new(unwind(Some(LOW + 0x20)), record(), context(), LOW, HIGH, 1).unwrap();
+    let mut first = invoke(walk.step(&fixture, &fixture).unwrap());
+    first.collision = Some(saved_dispatcher(&first));
+    let walk = continued(first.returned(3).unwrap());
+    let mut second = invoke(walk.step(&fixture, &fixture).unwrap());
+    second.collision = Some(saved_dispatcher(&second));
+    assert_eq!(second.returned(3).unwrap_err(), WalkError::FrameLimit);
 }
 
 #[test]
