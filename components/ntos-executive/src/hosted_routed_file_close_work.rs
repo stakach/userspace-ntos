@@ -20,6 +20,7 @@ struct Work {
     actor: Option<NativeThreadProcessReference>,
     capture: Option<crate::driver_launch::hosted_file_capture::Capture>,
     handle: u64,
+    table_owner: nt_process::ProcessId,
     file_id: u64,
     device_id: u64,
     needs_cleanup: bool,
@@ -73,9 +74,9 @@ pub(crate) unsafe fn submit(
         }
         let grant = target.information().granted_access.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let actor = pm.reference_native_requestor(caller)?;
-        Ok((file_id, device_id, grant, actor))
+        Ok((file_id, device_id, grant, target.table_owner(), actor))
     });
-    let (file_id, device_id, grant, mut actor) = match admitted {
+    let (file_id, device_id, grant, table_owner, mut actor) = match admitted {
         Ok(admitted) => admitted,
         Err(status) => return ready(status),
     };
@@ -109,7 +110,8 @@ pub(crate) unsafe fn submit(
     };
     let work = Work {
         route, dispatch, reply, token, caller, actor: Some(actor), capture: Some(capture),
-        handle, file_id, device_id, needs_cleanup: false, close_entered: false, status: None,
+        handle, table_owner, file_id, device_id, needs_cleanup: false, close_entered: false,
+        status: None,
         reply_entered: false, fault_ep: channel.fault_ep, tcb: channel.tcb,
         pml4: channel.pml4, reply_cap: channel.reply_cap,
     };
@@ -235,6 +237,9 @@ impl Work {
             match handler.pm.close_native_routed_file_handle(self.caller, self.handle) {
                 Ok((file, device)) => {
                     assert_eq!((file, device), (self.file_id, self.device_id));
+                    crate::driver_launch::hosted_consumer_file_objects::handle_closed(
+                        self.table_owner, self.handle, file,
+                    ).expect("closed RoutedFile has exact consumer projection owner");
                     handler.release_file_handle_reference(file);
                     if let Some(executor) = lifecycle_executor {
                         crate::driver_launch::pump_hosted_file_lifecycle(executor);

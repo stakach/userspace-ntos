@@ -2775,16 +2775,16 @@ unsafe fn component_pump_loop(
         } else if label == crate::driver_launch::FSD_SERVICE_FILE_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
-            let (status, generation) =
+            let (status, value, granted_access, attributes) =
                 if msg.mi != ((crate::driver_launch::FSD_SERVICE_FILE_LABEL << 12) | 4) {
-                    (0xc000_000du32 as i32, 0)
+                    (0xc000_000du32 as i32, 0, 0, 0)
                 } else {
                     crate::driver_launch::service_hosted_file(
                         ch, msg.m0, msg.m1, msg.m2, msg.m3, *reply_cap,
                     )
                 };
             pump_reply_recv4_into!(
-                ch, *reply_cap, msg, 4, status as u32 as u64, generation, 0, 0
+                ch, *reply_cap, msg, 4, status as u32 as u64, value, granted_access, attributes
             );
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_DEVICE_LABEL

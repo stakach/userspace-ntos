@@ -64,6 +64,8 @@ mod hosted_file_lifecycle_owners;
 mod hosted_file_retirements;
 #[path = "hosted_file_objects.rs"]
 mod hosted_file_objects;
+#[path = "hosted_consumer_file_objects.rs"]
+pub(crate) mod hosted_consumer_file_objects;
 #[path = "hosted_io_create_file_adapter.rs"]
 mod hosted_io_create_file_adapter;
 #[path = "hosted_io_create_file_ingress.rs"]
@@ -13812,28 +13814,79 @@ extern "win64" fn s_se_set_security_descriptor_info(
 
 extern "win64" fn s_ob_dereference_security_descriptor(_security_descriptor: u64) {}
 
+unsafe fn consumer_file_object_in_local_pool(object: u64) -> bool {
+    component_pool_allocation_capacity(object)
+        .is_some_and(|capacity| capacity >= WDM_X64_FILE_OBJECT_SIZE as u64)
+        && read_unaligned(object as *const i16) == nt_io_manager::WDM_X64_IO_TYPE_FILE
+        && !hosted_file_objects::fo_is_registered(object)
+}
+
 extern "win64" fn s_obf_reference_object(object: u64) -> u64 {
+    unsafe {
+        if !consumer_file_object_in_local_pool(object) {
+            return object;
+        }
+        let (info, status, reference, _, _) =
+            call_on4_raw((FSD_SERVICE_FILE_LABEL << 12) | 4, 6, object, 0, 0);
+        if info != 4 || status as u32 as i32 != STATUS_SUCCESS || reference != object {
+            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_FILE_LABEL, 6, object, status]);
+        }
+    }
     object
 }
 
-extern "win64" fn s_obf_dereference_object(_object: u64) -> u64 {
+extern "win64" fn s_obf_dereference_object(object: u64) -> u64 {
+    unsafe {
+        if !consumer_file_object_in_local_pool(object) {
+            return 0;
+        }
+        let (info, status, _, _, _) =
+            call_on4_raw((FSD_SERVICE_FILE_LABEL << 12) | 4, 5, object, 0, 0);
+        if info != 4 || status as u32 as i32 != STATUS_SUCCESS {
+            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_FILE_LABEL, 5, object, status]);
+        }
+    }
     0
 }
 
 /// `NTSTATUS ObReferenceObjectByHandle(HANDLE, ACCESS_MASK, POBJECT_TYPE, KPROCESSOR_MODE, PVOID*, ...)`.
 extern "win64" fn s_ob_reference_object_by_handle(
     handle: u64,
-    _desired_access: u32,
-    _object_type: u64,
-    _access_mode: u8,
+    desired_access: u32,
+    object_type: u64,
+    access_mode: u8,
     object_out: u64,
-    _handle_information: u64,
+    handle_information: u64,
 ) -> i32 {
-    if handle == 0 || object_out == 0 {
+    if handle == 0 || object_out == 0 || access_mode > 1 {
         return STATUS_INVALID_HANDLE;
     }
+    if object_type != 0 && object_type != FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_VA {
+        return nt_process::native_handle::STATUS_OBJECT_TYPE_MISMATCH as i32;
+    }
     unsafe {
-        write_unaligned(object_out as *mut u64, handle);
+        let (info, status, object, granted_access, attributes) = call_on4_raw(
+            (FSD_SERVICE_FILE_LABEL << 12) | 4,
+            4,
+            handle,
+            desired_access as u64,
+            access_mode as u64,
+        );
+        if info != 4 {
+            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_FILE_LABEL, 4, info, status]);
+        }
+        let status = status as u32 as i32;
+        if status != STATUS_SUCCESS {
+            return status;
+        }
+        if object == 0 || granted_access > u32::MAX as u64 || attributes > u32::MAX as u64 {
+            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_FILE_LABEL, 4, object, status as u64]);
+        }
+        write_unaligned(object_out as *mut u64, object);
+        if handle_information != 0 {
+            write_unaligned(handle_information as *mut u32, attributes as u32);
+            write_unaligned((handle_information + 4) as *mut u32, granted_access as u32);
+        }
     }
     STATUS_SUCCESS
 }
@@ -14414,27 +14467,6 @@ extern "win64" fn s_zw_delete_value_key(handle: u64, value_name: u64) -> i32 {
         );
         status
     }
-}
-
-extern "win64" fn s_zw_create_file(
-    file_handle_out: u64,
-    _desired_access: u32,
-    _object_attributes: u64,
-    _io_status_block: u64,
-    _allocation_size: u64,
-    _file_attributes: u32,
-    _share_access: u32,
-    _create_disposition: u32,
-    _create_options: u32,
-    _ea_buffer: u64,
-    _ea_length: u32,
-) -> i32 {
-    if file_handle_out != 0 {
-        unsafe {
-            write_unaligned(file_handle_out as *mut u64, 0);
-        }
-    }
-    STATUS_OBJECT_NAME_NOT_FOUND
 }
 
 extern "win64" fn s_zw_query_information_file(
@@ -31780,6 +31812,10 @@ fn register_fsd_trampolines() -> bool {
         s_io_get_related_device_object as *const () as usize as u64,
     );
     reg.bind(
+        "IoCreateFile",
+        hosted_io_create_file_adapter::s_io_create_file as *const () as usize as u64,
+    );
+    reg.bind(
         "IofCallDriver",
         s_iof_call_driver as *const () as usize as u64,
     );
@@ -32140,6 +32176,10 @@ fn register_fsd_trampolines() -> bool {
         s_rtl_upcase_unicode_char as *const () as usize as u64,
     );
     reg.bind("ZwClose", s_zw_close as *const () as usize as u64);
+    reg.bind(
+        "NtClose",
+        hosted_io_create_file_adapter::s_nt_close as *const () as usize as u64,
+    );
     reg.bind("ZwCreateKey", s_zw_create_key as *const () as usize as u64);
     reg.bind("ZwOpenKey", s_zw_open_key as *const () as usize as u64);
     reg.bind(
@@ -32159,8 +32199,16 @@ fn register_fsd_trampolines() -> bool {
         s_zw_delete_value_key as *const () as usize as u64,
     );
     reg.bind(
+        "NtOpenFile",
+        hosted_io_create_file_adapter::s_nt_open_file as *const () as usize as u64,
+    );
+    reg.bind(
+        "ZwOpenFile",
+        hosted_io_create_file_adapter::s_zw_open_file as *const () as usize as u64,
+    );
+    reg.bind(
         "ZwCreateFile",
-        s_zw_create_file as *const () as usize as u64,
+        hosted_io_create_file_adapter::s_zw_create_file as *const () as usize as u64,
     );
     reg.bind(
         "ZwQueryInformationFile",
@@ -52687,8 +52735,34 @@ pub(crate) fn service_hosted_file(
     file_id: u64,
     address: u64,
     active_reply_cap: u64,
-) -> (i32, u64) {
+) -> (i32, u64, u64, u64) {
     let _durable = crate::allocator::enter_durable();
+    if operation == 4 {
+        if file_id > u32::MAX as u64 || address > 1 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        let (status, object, granted, attributes) = unsafe {
+            hosted_consumer_file_objects::reference_handle(
+                ch, active_reply_cap, request_id, file_id as u32, address as u8,
+            )
+        };
+        return (status, object, granted as u64, attributes as u64);
+    }
+    if operation == 5 || operation == 6 {
+        if file_id != 0 || address != 0 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        return if operation == 5 {
+            (unsafe {
+                hosted_consumer_file_objects::dereference_pointer(ch, active_reply_cap, request_id)
+            }, 0, 0, 0)
+        } else {
+            let (status, object) = unsafe {
+                hosted_consumer_file_objects::reference_pointer(ch, active_reply_cap, request_id)
+            };
+            (status, object, 0, 0)
+        };
+    }
     if !matches!(operation, 1..=3)
         || file_id == 0
         || address == 0
@@ -52699,13 +52773,13 @@ pub(crate) fn service_hosted_file(
         || (operation == 3 && request_id != 0)
         || (operation != 3 && request_id == 0)
     {
-        return (STATUS_INVALID_PARAMETER, 0);
+        return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
     let Some((_, instance)) = instance_for_pump_channel(ch, active_reply_cap) else {
-        return (STATUS_ACCESS_DENIED, 0);
+        return (STATUS_ACCESS_DENIED, 0, 0, 0);
     };
     let Some(domain) = instance_domain_identity(instance) else {
-        return (STATUS_ACCESS_DENIED, 0);
+        return (STATUS_ACCESS_DENIED, 0, 0, 0);
     };
     let file = FileId(file_id);
     let result = match operation {
@@ -52715,7 +52789,7 @@ pub(crate) fn service_hosted_file(
                     .is_some_and(|active| active.file_create == Some((file, domain)))
             };
             if !authorized {
-                return (STATUS_ACCESS_DENIED, 0);
+                return (STATUS_ACCESS_DENIED, 0, 0, 0);
             }
             // CREATE authority identifies the File, not arbitrary component memory. Prove the
             // submitted projection occupies a live provider-pool allocation before publishing it.
@@ -52726,14 +52800,14 @@ pub(crate) fn service_hosted_file(
                     WDM_X64_FILE_OBJECT_SIZE as u64,
                 )
             }) else {
-                return (STATUS_INVALID_PARAMETER, 0);
+                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
             };
             if unsafe {
                 read_unaligned(file_object as *const i16) != nt_io_manager::WDM_X64_IO_TYPE_FILE
                     || read_unaligned((file_object + 2) as *const u16)
                         != WDM_X64_FILE_OBJECT_SIZE as u16
             } {
-                return (STATUS_INVALID_PARAMETER, 0);
+                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
             }
             io_manager_mut()
                 .bind_hosted_file_identity(domain, address, file)
@@ -52748,8 +52822,8 @@ pub(crate) fn service_hosted_file(
         _ => unreachable!("validated File service operation"),
     };
     match result {
-        Ok(information) => (STATUS_SUCCESS, information),
-        Err(status) => (status.raw(), 0),
+        Ok(information) => (STATUS_SUCCESS, information, 0, 0),
+        Err(status) => (status.raw(), 0, 0, 0),
     }
 }
 

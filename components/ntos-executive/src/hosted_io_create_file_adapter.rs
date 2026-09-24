@@ -2,7 +2,8 @@
 
 use super::*;
 use nt_io_manager::io_create_file_capture::{
-    capture_ordinary, DriverMemoryReader, RawIoCreateFileArguments,
+    capture_nt_open_file, capture_ordinary, CapturedDriverCreate, DriverMemoryReader,
+    RawIoCreateFileArguments, RawNtOpenFileArguments,
 };
 use nt_io_manager::io_create_file_reply::IoCreateFileReply;
 use nt_io_manager::io_create_file_wire::{encode_into, encoded_len, IoCreateFileWireError};
@@ -59,50 +60,7 @@ fn wire_status(error: IoCreateFileWireError) -> u32 {
     }
 }
 
-/// The complete Win64 kernel ABI, including its six stack arguments after the first four.
-pub(super) extern "win64" fn s_io_create_file(
-    file_handle_out: u64,
-    desired_access: u32,
-    object_attributes: u64,
-    io_status_block_out: u64,
-    allocation_size: u64,
-    file_attributes: u32,
-    share_access: u32,
-    disposition: u32,
-    create_options: u32,
-    ea_buffer: u64,
-    ea_length: u32,
-    create_file_type: u32,
-    extra_create_parameters: u64,
-    io_options: u32,
-) -> i32 {
-    let mode = match previous_mode() {
-        Ok(mode) => mode,
-        Err(status) => return status as i32,
-    };
-    let captured = match capture_ordinary(
-        &DriverMemory,
-        RawIoCreateFileArguments {
-            file_handle_out,
-            desired_access,
-            object_attributes,
-            io_status_block_out,
-            allocation_size,
-            file_attributes,
-            share_access,
-            disposition,
-            create_options,
-            ea_buffer,
-            ea_length,
-            create_file_type,
-            extra_create_parameters,
-            io_options,
-        },
-        mode,
-    ) {
-        Ok(captured) => captured,
-        Err(status) => return status as i32,
-    };
+fn dispatch_captured(captured: CapturedDriverCreate) -> i32 {
     let length = match encoded_len(&captured.request) {
         Ok(length) => length,
         Err(error) => return wire_status(error) as i32,
@@ -158,5 +116,135 @@ pub(super) extern "win64" fn s_io_create_file(
             status as i32
         }
         Err(_) => STATUS_PROTOCOL_ERROR as i32,
+    }
+}
+
+fn capture_and_dispatch_create(args: RawIoCreateFileArguments, mode: AccessMode) -> i32 {
+    match capture_ordinary(&DriverMemory, args, mode) {
+        Ok(captured) => dispatch_captured(captured),
+        Err(status) => status as i32,
+    }
+}
+
+fn capture_and_dispatch_open(args: RawNtOpenFileArguments, mode: AccessMode) -> i32 {
+    match capture_nt_open_file(&DriverMemory, args, mode) {
+        Ok(captured) => dispatch_captured(captured),
+        Err(status) => status as i32,
+    }
+}
+
+/// The complete Win64 kernel ABI, including its six stack arguments after the first four.
+pub(super) extern "win64" fn s_io_create_file(
+    file_handle_out: u64,
+    desired_access: u32,
+    object_attributes: u64,
+    io_status_block_out: u64,
+    allocation_size: u64,
+    file_attributes: u32,
+    share_access: u32,
+    disposition: u32,
+    create_options: u32,
+    ea_buffer: u64,
+    ea_length: u32,
+    create_file_type: u32,
+    extra_create_parameters: u64,
+    io_options: u32,
+) -> i32 {
+    let mode = match previous_mode() {
+        Ok(mode) => mode,
+        Err(status) => return status as i32,
+    };
+    capture_and_dispatch_create(
+        RawIoCreateFileArguments {
+            file_handle_out,
+            desired_access,
+            object_attributes,
+            io_status_block_out,
+            allocation_size,
+            file_attributes,
+            share_access,
+            disposition,
+            create_options,
+            ea_buffer,
+            ea_length,
+            create_file_type,
+            extra_create_parameters,
+            io_options,
+        }, mode,
+    )
+}
+
+/// The six-argument NtOpenFile ABI has no create-only fields.
+pub(super) extern "win64" fn s_nt_open_file(
+    file_handle_out: u64,
+    desired_access: u32,
+    object_attributes: u64,
+    io_status_block_out: u64,
+    share_access: u32,
+    open_options: u32,
+) -> i32 {
+    let mode = match previous_mode() {
+        Ok(mode) => mode,
+        Err(status) => return status as i32,
+    };
+    capture_and_dispatch_open(
+        RawNtOpenFileArguments {
+            file_handle_out,
+            desired_access,
+            object_attributes,
+            io_status_block_out,
+            share_access,
+            open_options,
+        }, mode,
+    )
+}
+
+/// Zw entry points treat their pointer arguments as kernel-mode callers.
+pub(super) extern "win64" fn s_zw_open_file(
+    file_handle_out: u64,
+    desired_access: u32,
+    object_attributes: u64,
+    io_status_block_out: u64,
+    share_access: u32,
+    open_options: u32,
+) -> i32 {
+    capture_and_dispatch_open(
+        RawNtOpenFileArguments {
+            file_handle_out, desired_access, object_attributes, io_status_block_out,
+            share_access, open_options,
+        },
+        AccessMode::KernelMode,
+    )
+}
+
+pub(super) extern "win64" fn s_zw_create_file(
+    file_handle_out: u64,
+    desired_access: u32,
+    object_attributes: u64,
+    io_status_block_out: u64,
+    allocation_size: u64,
+    file_attributes: u32,
+    share_access: u32,
+    disposition: u32,
+    create_options: u32,
+    ea_buffer: u64,
+    ea_length: u32,
+) -> i32 {
+    capture_and_dispatch_create(
+        RawIoCreateFileArguments {
+            file_handle_out, desired_access, object_attributes, io_status_block_out,
+            allocation_size, file_attributes, share_access, disposition, create_options,
+            ea_buffer, ea_length, create_file_type: 0, extra_create_parameters: 0,
+            io_options: 0,
+        },
+        AccessMode::KernelMode,
+    )
+}
+
+pub(super) extern "win64" fn s_nt_close(handle: u64) -> i32 {
+    match previous_mode() {
+        Ok(AccessMode::KernelMode) => super::s_zw_close(handle),
+        Ok(AccessMode::UserMode) => STATUS_NOT_SUPPORTED,
+        Err(status) => status as i32,
     }
 }
