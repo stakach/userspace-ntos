@@ -1,7 +1,7 @@
 //! Exact consumer-side device authority for a forwarded hosted IRP.
 
 use crate::{
-    DeviceId, DeviceReference, HostedDevicePointerRegistration, HostedDomainIdentity, IoManager,
+    DeviceId, HostedDevicePointerRegistration, HostedDomainIdentity, IoManager,
 };
 use nt_status::NtStatus;
 
@@ -9,7 +9,7 @@ use nt_status::NtStatus;
 #[must_use = "release the retained target device after forwarding retires"]
 pub struct HostedForwardTarget {
     registration: HostedDevicePointerRegistration,
-    reference: DeviceReference,
+    held: bool,
 }
 
 impl HostedForwardTarget {
@@ -22,11 +22,10 @@ impl HostedForwardTarget {
         let registration = io
             .hosted_device_pointer_registration(domain, address)
             .ok_or(NtStatus::INVALID_PARAMETER)?;
-        let reference = io.retain_hosted_device_reference(domain, address)?;
-        debug_assert_eq!(registration.device_id(), reference.device_id());
+        io.reference_hosted_device_pointer(registration)?;
         Ok(Self {
             registration,
-            reference,
+            held: true,
         })
     }
 
@@ -40,7 +39,7 @@ impl HostedForwardTarget {
 
     /// Recheck the generation-bearing binding before an irreversible provider dispatch.
     pub fn validate<P>(&self, io: &IoManager<P>) -> Result<DeviceId, NtStatus> {
-        if !self.reference.is_held()
+        if !self.held
             || io.hosted_device_pointer_registration(
                 self.registration.domain(),
                 self.registration.address(),
@@ -53,7 +52,12 @@ impl HostedForwardTarget {
 
     /// A refused release keeps the exact owner available for redrive.
     pub fn release<P>(&mut self, io: &mut IoManager<P>) -> Result<(), NtStatus> {
-        io.release_device_reference(&mut self.reference)
+        if !self.held {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        io.dereference_hosted_device_pointer(self.registration)?;
+        self.held = false;
+        Ok(())
     }
 }
 
@@ -99,9 +103,11 @@ mod tests {
         assert_eq!(target.registration(), registration);
         assert_eq!(target.validate(&io), Ok(device));
         assert_eq!(io.device_reference_count(device), baseline + 1);
+        assert_eq!(io.retire_hosted_device_pointer(registration), Err(NtStatus::DEVICE_BUSY));
         target.release(&mut io).unwrap();
         assert!(target.validate(&io).is_err());
         assert_eq!(io.device_reference_count(device), baseline);
+        io.retire_hosted_device_pointer(registration).unwrap();
     }
 
     #[test]
