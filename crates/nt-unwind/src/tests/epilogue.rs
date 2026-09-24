@@ -75,7 +75,7 @@ fn direct_jump_within_the_same_chained_function_is_not_a_return() {
                 RuntimeFunction {
                     begin: 0x1000,
                     end: 0x1100,
-                    unwind_info: 0x2100,
+                    unwind_info: 0x2000,
                 },
                 RuntimeFunction {
                     begin: 0x1200,
@@ -85,7 +85,7 @@ fn direct_jump_within_the_same_chained_function_is_not_a_return() {
             ]);
             img.write(0x3000, &0x1000u32.to_le_bytes());
             img.write(0x3004, &0x1100u32.to_le_bytes());
-            img.write(0x3008, &0x2100u32.to_le_bytes());
+            img.write(0x3008, &0x2000u32.to_le_bytes());
         }
         let mut ctx = Context::default();
         ctx.set_rsp(0x9020);
@@ -109,13 +109,13 @@ fn direct_jump_within_the_same_chained_function_is_not_a_return() {
 }
 
 #[test]
-fn direct_jump_to_a_different_function_is_a_return_epilogue() {
+fn direct_jump_to_chaininfo_sibling_is_not_a_return() {
     let mut img = img_with_unwind(&[], 1, 0, 0, 0);
     img.set_pdata(vec![
         RuntimeFunction {
             begin: 0x1000,
             end: 0x1100,
-            unwind_info: 0x2100,
+            unwind_info: 0x2000,
         },
         RuntimeFunction {
             begin: 0x1200,
@@ -124,6 +124,87 @@ fn direct_jump_to_a_different_function_is_a_return_epilogue() {
         },
     ]);
     img.write(0x1050, &[0xe9, 0xab, 0x01, 0, 0]);
+    img.write(0x2200, &[0x21, 0, 0, 0]); // version 1, UNW_FLAG_CHAININFO
+    img.write(0x2204, &0x1000u32.to_le_bytes());
+    img.write(0x2208, &0x1100u32.to_le_bytes());
+    img.write(0x220c, &0x2000u32.to_le_bytes());
+    let mut ctx = Context::default();
+    ctx.set_rsp(0x9020);
+    let before = ctx;
+    let function = img.lookup_function(img.base + 0x1050).unwrap().1;
+    assert_eq!(
+        crate::epilogue::unwind_return(
+            img.base,
+            0x1050,
+            function,
+            0,
+            &mut ctx,
+            &img,
+            &NoStackReads,
+            &mut ContextPointers::default(),
+        ),
+        Some(false)
+    );
+    assert_eq!(ctx, before);
+}
+
+#[test]
+fn cyclic_chaininfo_tail_jump_fails_before_reading_the_stack() {
+    let mut img = img_with_unwind(&[], 1, 0, 0, 0);
+    img.set_pdata(vec![
+        RuntimeFunction {
+            begin: 0x1000,
+            end: 0x1100,
+            unwind_info: 0x2000,
+        },
+        RuntimeFunction {
+            begin: 0x1200,
+            end: 0x1300,
+            unwind_info: 0x2200,
+        },
+    ]);
+    img.write(0x1050, &[0xe9, 0xab, 0x01, 0, 0]);
+    img.write(0x2200, &[0x21, 0, 0, 0]);
+    img.write(0x2204, &0x1200u32.to_le_bytes());
+    img.write(0x2208, &0x1300u32.to_le_bytes());
+    img.write(0x220c, &0x2200u32.to_le_bytes());
+    let mut ctx = Context::default();
+    ctx.set_rsp(0x9020);
+    let before = ctx;
+    let function = img.lookup_function(img.base + 0x1050).unwrap().1;
+    assert_eq!(
+        crate::epilogue::unwind_return(
+            img.base,
+            0x1050,
+            function,
+            0,
+            &mut ctx,
+            &img,
+            &NoStackReads,
+            &mut ContextPointers::default(),
+        ),
+        None
+    );
+    assert_eq!(ctx, before);
+}
+
+#[test]
+fn direct_jump_to_a_different_function_is_a_return_epilogue() {
+    let mut img = img_with_unwind(&[], 1, 0, 0, 0);
+    img.set_pdata(vec![
+        RuntimeFunction {
+            begin: 0x1000,
+            end: 0x1100,
+            unwind_info: 0x2000,
+        },
+        RuntimeFunction {
+            begin: 0x1200,
+            end: 0x1300,
+            unwind_info: 0x2200,
+        },
+    ]);
+    img.write(0x1050, &[0xe9, 0xab, 0x01, 0, 0]);
+    img.write(0x2200, &[1, 0, 0, 0]);
     let mut stack = MockStack::new();
     stack.put(0x9000, 0x1400_2222);
     let mut ctx = Context::default();

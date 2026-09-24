@@ -1,6 +1,23 @@
 use crate::{
-    resolve_function, Context, ContextPointers, ImageReader, RuntimeFunction, StackReader,
+    read_runtime_function, read_unwind_header, resolve_function, Context, ContextPointers,
+    ImageReader, RuntimeFunction, StackReader,
 };
+
+fn root_start(image: &dyn ImageReader, base: u64, mut function: RuntimeFunction) -> Option<u64> {
+    let mut links_left = 32;
+    loop {
+        function = resolve_function(function, base, image, &mut links_left)?;
+        let header = read_unwind_header(image, base, function.unwind_info)?;
+        if !header.is_chained() {
+            return base.checked_add(u64::from(function.begin));
+        }
+        links_left = links_left.checked_sub(1)?;
+        let tail = function
+            .unwind_info
+            .checked_add(u32::try_from(header.tail_offset()).ok()?)?;
+        function = read_runtime_function(image, base, tail)?;
+    }
+}
 
 struct Code<'a> {
     image: &'a dyn ImageReader,
@@ -29,9 +46,9 @@ impl Code<'_> {
         let Some((target_base, target_function)) = self.image.lookup_function(target) else {
             return Some(true);
         };
-        let current_root = resolve_function(current, self.base, self.image, &mut 32)?;
-        let target_root = resolve_function(target_function, target_base, self.image, &mut 32)?;
-        Some((self.base, current_root.begin) != (target_base, target_root.begin))
+        let current_root = root_start(self.image, self.base, current)?;
+        let target_root = root_start(self.image, target_base, target_function)?;
+        Some(current_root != target_root)
     }
 
     fn byte(&self, rva: u32) -> Option<u8> {
