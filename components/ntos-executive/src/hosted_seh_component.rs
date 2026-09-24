@@ -5,6 +5,7 @@ use core::{
     ptr,
 };
 use nt_unwind::{
+    raw_exception::RawExceptionRecord,
     seh_handler_packet::SehHandlerPacket,
     seh_transport::{SehCall, SehCommand},
     Disposition, EXCEPTION_UNWIND,
@@ -14,9 +15,9 @@ use super::call_on4_raw;
 
 fn exchange(call: SehCall) -> SehCommand {
     let (info, words) = call.encode();
-    let (reply_info, m0, m1, _, _) =
+    let (reply_info, m0, m1, m2, m3) =
         unsafe { call_on4_raw(info, words[0], words[1], words[2], words[3]) };
-    SehCommand::parse(reply_info, [m0, m1])
+    SehCommand::parse(reply_info, [m0, m1, m2, m3])
         .expect("hosted SEH transport received an unexpected command")
 }
 
@@ -94,9 +95,9 @@ fn command_loop(mut command: SehCommand, packet_va: u64) -> ! {
                 })
             }
             SehCommand::Restore { token, context_va } => restore(packet_va, token, context_va),
-            SehCommand::SecondChance { .. } => {
-                panic!("hosted SEH raise reached unhandled second chance")
-            }
+            SehCommand::SecondChance { code, address, .. } => unsafe {
+                crate::provider_bugcheck::report(0x1e, [u64::from(code), address, 0, 0])
+            },
         };
     }
 }
@@ -108,6 +109,29 @@ pub(super) extern "win64" fn raise_dispatch(context_va: u64, status: u32) -> ! {
     let mut packet = MaybeUninit::<SehHandlerPacket>::uninit();
     let packet_va = packet.as_mut_ptr() as u64;
     let command = exchange(SehCall::Raise { context_va, status });
+    command_loop(command, packet_va)
+}
+
+/// Bound into the instance's admitted `SehUnwindDispatch` slot. A target unwind restores from
+/// this packet even when there is no intervening language handler to prepare one.
+#[inline(never)]
+pub(super) extern "win64" fn unwind_dispatch(request_va: u64) -> ! {
+    let mut packet = MaybeUninit::<SehHandlerPacket>::uninit();
+    let packet_va = packet.as_mut_ptr() as u64;
+    let record_va = unsafe { ptr::read_volatile((request_va + 0x10) as *const u64) };
+    if record_va != 0 {
+        unsafe {
+            ptr::copy_nonoverlapping(
+                record_va as *const u8,
+                ptr::addr_of_mut!((*packet.as_mut_ptr()).exception).cast::<u8>(),
+                core::mem::size_of::<RawExceptionRecord>(),
+            );
+        }
+    }
+    let command = exchange(SehCall::BeginUnwind {
+        request_va,
+        packet_va,
+    });
     command_loop(command, packet_va)
 }
 

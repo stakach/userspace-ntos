@@ -66,6 +66,11 @@ if ! perl -0pe 's/\[user #PF:[^\n]*\]\n//g' "$RUN_LOG" | \
   printf 'native SEH integration failure: native raise/finally/except evidence was not exact\nlog: %s\n' "$RUN_LOG" >&2
   exit 1
 fi
+if ! perl -0pe 's/\[user #PF:[^\n]*\]\n//g' "$RUN_LOG" | \
+    grep -F '[seh-unwind-proof] finally=1 after-call=0 landed=1 bare-after=0 bare-landed=1' >/dev/null; then
+  printf 'native SEH integration failure: target unwind evidence was not exact\nlog: %s\n' "$RUN_LOG" >&2
+  exit 1
+fi
 if (( DESKTOP )); then
   require_fixed 'PASS exec_explorer_shell_chrome_painted' 'desktop paint regressed'
   require_fixed '[microtest sentinel matched -- exiting QEMU]' 'QEMU did not exit through the sentinel'

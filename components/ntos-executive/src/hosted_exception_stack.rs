@@ -4,6 +4,7 @@
 //! main-stack address and worker slots are reused. Keep the reader scoped to the active physical
 //! ingress dispatch, and revalidate that dispatch before touching its executive alias.
 
+use alloc::vec::Vec;
 use nt_component_suspension::{peer_registry::PeerRoute, LaneDispatchIdentity};
 use nt_io_manager::HostedDomainIdentity;
 use nt_unwind::{
@@ -12,6 +13,7 @@ use nt_unwind::{
         WalkMode, WalkStep,
     },
     raw_context::{RawContext, RawContextCaptureError, RawContextRestoreError},
+    raw_exception::RawExceptionRecord,
     seh_handler_packet::{HandlerPacketError, SehHandlerPacket},
     seh_linkage_image::{SehRaiseFirstPass, SehRaiseIngressError},
     Context, ExceptionRecord, StackReader,
@@ -200,11 +202,68 @@ pub(crate) enum RaiseCaptureError {
     Admission(SehRaiseIngressError),
 }
 
+pub(crate) enum UnwindCaptureError {
+    Packet,
+    Sidecar,
+    Caller,
+    Target,
+    Record,
+    Context(RawContextCaptureError),
+    Walk(WalkError),
+}
+
 /// Writes can have an uncertain effect after the first word. The caller must wall the physical
 /// dispatch on `Uncertain`, never retry the packet on another stack or Reply.
 pub(crate) enum PacketWriteError {
     Refused,
     Uncertain,
+}
+
+/// Install the two control words needed when a target unwind reaches its landing point without
+/// invoking a language handler. A later Prepare may replace the whole packet under this lease.
+pub(crate) fn initialize_restore_packet(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    packet_va: u64,
+    token: u64,
+    resume_va: u64,
+) -> Result<(), PacketWriteError> {
+    let reader =
+        HostedStackReader::new(channel, reply_cap, badge).ok_or(PacketWriteError::Refused)?;
+    if packet_va == 0 || packet_va & 15 != 0 || token == 0 || resume_va == 0 {
+        return Err(PacketWriteError::Refused);
+    }
+    let exec = translate_component_range(
+        packet_va,
+        core::mem::size_of::<SehHandlerPacket>() as u64,
+        reader.component_base,
+        reader.length,
+        reader.exec_base,
+    )
+    .ok_or(PacketWriteError::Refused)?;
+    if !reader.still_live() {
+        return Err(PacketWriteError::Refused);
+    }
+    unsafe {
+        core::ptr::write_volatile(
+            (exec + core::mem::offset_of!(SehHandlerPacket, token) as u64) as *mut u64,
+            token,
+        );
+    }
+    if !reader.still_live() {
+        return Err(PacketWriteError::Uncertain);
+    }
+    unsafe {
+        core::ptr::write_volatile(
+            (exec + core::mem::offset_of!(SehHandlerPacket, resume_va) as u64) as *mut u64,
+            resume_va,
+        );
+    }
+    if !reader.still_live() {
+        return Err(PacketWriteError::Uncertain);
+    }
+    Ok(())
 }
 
 /// Publish one owned handler packet through the exact paused thread's executive stack alias.
@@ -215,8 +274,8 @@ pub(crate) fn write_handler_packet(
     address: u64,
     packet: &SehHandlerPacket,
 ) -> Result<(), PacketWriteError> {
-    let reader = HostedStackReader::new(channel, reply_cap, badge)
-        .ok_or(PacketWriteError::Refused)?;
+    let reader =
+        HostedStackReader::new(channel, reply_cap, badge).ok_or(PacketWriteError::Refused)?;
     let length = core::mem::size_of::<SehHandlerPacket>() as u64;
     if address == 0 || address & 15 != 0 || !reader.still_live() {
         return Err(PacketWriteError::Refused);
@@ -285,18 +344,20 @@ fn read_handler_packet(
     high: u64,
 ) -> Option<SehHandlerPacket> {
     let length = core::mem::size_of::<SehHandlerPacket>() as u64;
-    if address == 0
-        || address & 15 != 0
-        || address < low
-        || address.checked_add(length)? > high
-    {
+    if address == 0 || address & 15 != 0 || address < low || address.checked_add(length)? > high {
         return None;
     }
     let mut packet = core::mem::MaybeUninit::<SehHandlerPacket>::uninit();
     let output = packet.as_mut_ptr().cast::<u8>();
     for index in (0..length).step_by(8) {
         let word = reader.read_u64(address + index)?;
-        unsafe { core::ptr::copy_nonoverlapping(word.to_le_bytes().as_ptr(), output.add(index as usize), 8) };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                word.to_le_bytes().as_ptr(),
+                output.add(index as usize),
+                8,
+            )
+        };
     }
     Some(unsafe { packet.assume_init() })
 }
@@ -312,14 +373,7 @@ pub(crate) fn apply_handler_return(
 ) -> Option<Result<(), HandlerPacketError>> {
     with_reader(channel, reply_cap, badge, |reader, low, high| {
         let returned = read_handler_packet(reader, address, low, high)?;
-        Some(expected.apply_return(
-            &returned,
-            invocation,
-            disposition,
-            reader,
-            low,
-            high,
-        ))
+        Some(expected.apply_return(&returned, invocation, disposition, reader, low, high))
     })?
 }
 
@@ -342,6 +396,140 @@ pub(crate) fn capture_raise_first_step(
             linkage
                 .admit_first_pass(raw, status_word, low, high, catalog, reader, 64)
                 .map_err(RaiseCaptureError::Admission)
+        })
+    })?
+}
+
+/// Copy the shim's fixed request and register image under one physical stack lease, then run the
+/// native unwind walker. The trusted component snapshots an optional caller exception record
+/// into the retained packet before this Call, so its source may reside outside the stack.
+pub(crate) fn capture_unwind_first_step(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    request_va: u64,
+    packet_va: u64,
+) -> Option<Result<SehRaiseFirstPass, UnwindCaptureError>> {
+    let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
+    let domain = instance_domain_identity(inst)?;
+    inst.seh_linkage?;
+    with_reader(channel, reply_cap, badge, |reader, low, high| {
+        super::hosted_exception_images::with_catalog(instance, domain, |catalog| {
+            let packet_end = packet_va
+                .checked_add(core::mem::size_of::<SehHandlerPacket>() as u64)
+                .ok_or(UnwindCaptureError::Packet)?;
+            let request_end = request_va
+                .checked_add(0x40)
+                .ok_or(UnwindCaptureError::Sidecar)?;
+            if packet_va & 15 != 0 || packet_va < low || packet_end > high {
+                return Err(UnwindCaptureError::Packet);
+            }
+            if request_va & 15 != 0 || request_va < low || request_end > high {
+                return Err(UnwindCaptureError::Sidecar);
+            }
+            let mut words = [0u64; 8];
+            for (index, word) in words.iter_mut().enumerate() {
+                *word = reader
+                    .read_u64(request_va + (index as u64) * 8)
+                    .ok_or(UnwindCaptureError::Sidecar)?;
+            }
+            let [target_frame, target_ip, record_va, return_value, context_record_va, _history, captured_va, original_rsp] =
+                words;
+            if captured_va != request_end
+                || original_rsp
+                    != request_va
+                        .checked_add(0x518)
+                        .ok_or(UnwindCaptureError::Sidecar)?
+                || context_record_va == 0
+                || context_record_va & 15 != 0
+            {
+                return Err(UnwindCaptureError::Sidecar);
+            }
+            let raw = RawContext::capture_bounded(reader, captured_va, low, high)
+                .map_err(UnwindCaptureError::Context)?;
+            if raw.rsp()
+                != original_rsp
+                    .checked_add(8)
+                    .ok_or(UnwindCaptureError::Caller)?
+                || reader.read_u64(original_rsp) != Some(raw.rip())
+                || catalog.lookup_exception_function(raw.rip()).is_err()
+            {
+                return Err(UnwindCaptureError::Caller);
+            }
+            if target_frame != 0 && catalog.lookup_exception_function(target_ip).is_err() {
+                return Err(UnwindCaptureError::Target);
+            }
+            let exception = if record_va == 0 {
+                ExceptionRecord {
+                    code: 0xc000_0027,
+                    flags: 0,
+                    address: raw.rip(),
+                    information: Vec::new(),
+                }
+            } else {
+                if record_va & 7 != 0 {
+                    return Err(UnwindCaptureError::Record);
+                }
+                let copy_va = packet_va;
+                let header = reader.read_u64(copy_va).ok_or(UnwindCaptureError::Record)?;
+                let chained = reader
+                    .read_u64(copy_va + 8)
+                    .ok_or(UnwindCaptureError::Record)?;
+                let address = reader
+                    .read_u64(copy_va + 0x10)
+                    .ok_or(UnwindCaptureError::Record)?;
+                let count_word = reader
+                    .read_u64(copy_va + 0x18)
+                    .ok_or(UnwindCaptureError::Record)?;
+                let count = count_word as u32;
+                if chained != 0 || count_word >> 32 != 0 || count > 15 {
+                    return Err(UnwindCaptureError::Record);
+                }
+                let mut information = Vec::new();
+                information
+                    .try_reserve(count as usize)
+                    .map_err(|_| UnwindCaptureError::Record)?;
+                for index in 0..count {
+                    information.push(
+                        reader
+                            .read_u64(copy_va + 0x20 + u64::from(index) * 8)
+                            .ok_or(UnwindCaptureError::Record)?,
+                    );
+                }
+                ExceptionRecord {
+                    code: header as u32,
+                    flags: (header >> 32) as u32,
+                    address,
+                    information,
+                }
+            };
+            let mut walk = ExceptionWalk::new(
+                WalkMode::Unwind {
+                    target_frame: (target_frame != 0).then_some(target_frame),
+                    target_ip,
+                    return_value,
+                },
+                exception,
+                raw.to_context(),
+                low,
+                high,
+                64,
+            )
+            .map_err(UnwindCaptureError::Walk)?;
+            let step = loop {
+                match walk
+                    .step(catalog, reader)
+                    .map_err(UnwindCaptureError::Walk)?
+                {
+                    WalkStep::Continue(next) => walk = next,
+                    WalkStep::Invoke(handler) => break FirstRaiseStep::Invoke(handler),
+                    WalkStep::Complete(outcome) => break FirstRaiseStep::Complete(outcome),
+                }
+            };
+            Ok(SehRaiseFirstPass {
+                captured: raw,
+                step,
+            })
         })
     })?
 }
@@ -422,9 +610,8 @@ pub(crate) fn publish_restore_context(
     let domain = instance_domain_identity(inst)?;
     let reader = HostedStackReader::new(channel, reply_cap, badge)?;
     let (low, high) = reader.bounds()?;
-    let destination = packet_va.checked_add(
-        core::mem::offset_of!(SehHandlerPacket, original_context) as u64,
-    )?;
+    let destination =
+        packet_va.checked_add(core::mem::offset_of!(SehHandlerPacket, original_context) as u64)?;
     let length = core::mem::size_of::<RawContext>() as u64;
     let exec = translate_component_range(
         destination,

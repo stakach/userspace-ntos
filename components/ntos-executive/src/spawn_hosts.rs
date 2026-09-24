@@ -1707,10 +1707,9 @@ unsafe fn pump_reply_recv_retained_seh(
     ch: &PumpChannel,
     reply_cap: u64,
     reply_msginfo: u64,
-    reply_r0: u64,
-    reply_r1: u64,
+    words: [u64; 4],
 ) -> PumpMessage {
-    if !shared_pump::reply_seh(ch, reply_cap, reply_msginfo, [reply_r0, reply_r1, 0, 0]) {
+    if !shared_pump::reply_seh(ch, reply_cap, reply_msginfo, words) {
         return PumpMessage::transport_wall();
     }
     pump_recv_retained_seh(ch)
@@ -2918,6 +2917,7 @@ unsafe fn component_pump_loop(
                 | nt_unwind::seh_transport::PREPARE_LABEL
                 | nt_unwind::seh_transport::HANDLER_RESULT_LABEL
                 | nt_unwind::seh_transport::UNWIND_REQUEST_LABEL
+                | nt_unwind::seh_transport::BEGIN_UNWIND_LABEL
         )
             && ch.caps.kind == ReqKind::Irp
         {
@@ -2932,7 +2932,7 @@ unsafe fn component_pump_loop(
                 break;
             };
             let (info, words) = command.encode();
-            msg = pump_reply_recv_retained_seh(ch, *reply_cap, info, words[0], words[1]);
+            msg = pump_reply_recv_retained_seh(ch, *reply_cap, info, words);
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_IO_CREATE_FILE_LABEL
             && ch.caps.kind == ReqKind::Irp

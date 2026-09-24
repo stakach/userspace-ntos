@@ -137,7 +137,7 @@ fn verify(path: &str, object_path: &str) -> Result<(), String> {
         })
         .collect::<Result<_, _>>()?;
     names.sort_unstable();
-    if names != ["DbgPrint", "ExRaiseStatus", "__C_specific_handler"] {
+    if names != ["DbgPrint", "ExRaiseStatus", "RtlUnwindEx", "__C_specific_handler"] {
         return Err(format!("unexpected ntoskrnl imports: {names:?}"));
     }
 

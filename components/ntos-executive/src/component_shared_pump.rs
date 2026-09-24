@@ -154,7 +154,7 @@ pub(super) unsafe fn reply(ch: &PumpChannel, reply: u64, info: u64, words: [u64;
 }
 
 pub(super) unsafe fn reply_seh(ch: &PumpChannel, reply: u64, info: u64, words: [u64; 4]) -> bool {
-    if nt_unwind::seh_transport::SehCommand::parse(info, [words[0], words[1]]).is_none() {
+    if nt_unwind::seh_transport::SehCommand::parse(info, words).is_none() {
         crate::print_str(b"[fsd-seh] malformed command reply\n");
         PUMP_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed);
         return false;

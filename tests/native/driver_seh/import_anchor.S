@@ -3,6 +3,9 @@
     .globl ExRaiseStatus
 ExRaiseStatus:
     ud2
+    .globl RtlUnwindEx
+RtlUnwindEx:
+    ud2
     .globl DbgPrint
 DbgPrint:
     ud2

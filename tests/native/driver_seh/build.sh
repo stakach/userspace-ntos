@@ -27,10 +27,12 @@ fi
 "$CLANG" --target=x86_64-pc-windows-msvc -fms-extensions -ffreestanding \
     -fno-builtin -fno-stack-protector -mno-stack-arg-probe -fno-ident \
     -Wall -Wextra -Werror -O2 -c "$HERE/driver_seh.c" -o "$OUT/driver_seh.obj"
+"$CLANG" --target=x86_64-pc-windows-msvc -c "$HERE/bare_unwind.S" \
+    -o "$OUT/bare_unwind.obj"
 "$RUST_LLD" -flavor link /machine:x64 /driver /dll /entry:DriverEntry \
     /subsystem:native,5.2 /osversion:5.2 /nodefaultlib /dynamicbase /nxcompat /timestamp:0 \
     /export:SehFixtureEvidence,DATA "/out:$OUT/driver_seh.sys" \
-    "$OUT/driver_seh.obj" "$OUT/ntoskrnl.lib"
+    "$OUT/driver_seh.obj" "$OUT/bare_unwind.obj" "$OUT/ntoskrnl.lib"
 cargo run --manifest-path "$ROOT/Cargo.toml" -p seh-linkage-verify \
     --bin seh-driver-fixture-verify -- "$OUT/driver_seh.sys" "$OUT/driver_seh.obj"
 printf 'Verified native SEH fixture: %s/driver_seh.sys (not staged or executed)\n' "$OUT"

@@ -32907,6 +32907,7 @@ pub fn fsd_export_addr(dll: &str, name: &str) -> Option<u64> {
 struct HostedProviderImportResolver<'a> {
     thunks: Option<&'a mut HostedExecutableThunkWriter>,
     seh_raise_va: Option<u64>,
+    seh_unwind_va: Option<u64>,
 }
 
 impl DriverImportResolver for HostedProviderImportResolver<'_> {
@@ -32917,6 +32918,9 @@ impl DriverImportResolver for HostedProviderImportResolver<'_> {
         let _ = request.iat_slot_rva;
         if hosted_kernel_provider_dll(request.dll) && request.name == "ExRaiseStatus" {
             return Some(DriverImportResolution::DirectVa(self.seh_raise_va?));
+        }
+        if hosted_kernel_provider_dll(request.dll) && request.name == "RtlUnwindEx" {
+            return Some(DriverImportResolution::DirectVa(self.seh_unwind_va?));
         }
         if hosted_dependency_provider_dll(request.dll) {
             unsafe {
@@ -36375,6 +36379,7 @@ unsafe fn load_hosted_dependency_images(
         let mut resolver = HostedProviderImportResolver {
             thunks: executable_thunks.as_deref_mut(),
             seh_raise_va: None,
+            seh_unwind_va: None,
         };
         let (dep_entry_rva, dep_image_len) = load_pe_into(
             planned.src_va,
@@ -36485,6 +36490,14 @@ unsafe fn load_hosted_auxiliary_image(
     write_volatile(
         slot_exec_va as *mut u64,
         hosted_seh_component::raise_dispatch as *const () as usize as u64,
+    );
+    let unwind_slot_exec_va = exec_va.checked_add(u64::from(linkage.unwind_dispatch_slot_rva))?;
+    if read_volatile(unwind_slot_exec_va as *const u64) != 0 {
+        return None;
+    }
+    write_volatile(
+        unwind_slot_exec_va as *mut u64,
+        hosted_seh_component::unwind_dispatch as *const () as usize as u64,
     );
     let image =
         hosted_exception_images::capture(instance, exec_va, component_va, plan.auxiliary_image_len)?;
@@ -36758,6 +36771,7 @@ unsafe fn load_driver_reserved(
     let mut resolver = HostedProviderImportResolver {
         thunks: executable_thunk_writer.as_mut(),
         seh_raise_va: Some(seh_linkage.raise_va),
+        seh_unwind_va: Some(seh_linkage.unwind_entry_va),
     };
     let (entry_rva, image_len) = load_pe_into(
         src_va,
