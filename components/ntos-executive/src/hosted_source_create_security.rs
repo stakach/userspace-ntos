@@ -156,11 +156,26 @@ unsafe fn capture_create_access(
     if access_address == 0 || access_address & 7 != 0 {
         return Err(STATUS_INVALID_HANDLE_LOCAL);
     }
-    let access_exec = hosted_instance_pool_allocation_exec_if_live(
-        source,
-        access_address,
-        nt_kernel_abi::security_create_x64::ACCESS_STATE_SIZE as u64,
-    ).ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
+    let embedded_access = context.has_embedded_access_state(nt_kernel_abi::GuestAddr(context_address));
+    let embedded_qos = context.has_embedded_qos(nt_kernel_abi::GuestAddr(context_address));
+    let embedded_graph = if embedded_access || embedded_qos {
+        Some(hosted_instance_pool_allocation_exec_if_live(
+            source,
+            context_address,
+            nt_kernel_abi::security_create_x64::CREATE_SECURITY_GRAPH_SIZE as u64,
+        ).ok_or(STATUS_INVALID_HANDLE_LOCAL)?)
+    } else {
+        None
+    };
+    let access_exec = if embedded_access {
+        embedded_graph.unwrap() + nt_kernel_abi::security_create_x64::ACCESS_STATE_OFFSET as u64
+    } else {
+        hosted_instance_pool_allocation_exec_if_live(
+            source,
+            access_address,
+            nt_kernel_abi::security_create_x64::ACCESS_STATE_SIZE as u64,
+        ).ok_or(STATUS_INVALID_HANDLE_LOCAL)?
+    };
     let access = capture_pointer_free_access_state(read_unaligned(access_exec as *const AccessState))
         .map_err(|_| STATUS_INVALID_PARAMETER_LOCAL)?;
     let qos = if context.security_qos.is_null() {
@@ -169,11 +184,16 @@ unsafe fn capture_create_access(
         if context.security_qos.0 & 3 != 0 {
             return Err(STATUS_INVALID_PARAMETER_LOCAL);
         }
-        let qos_exec = hosted_instance_pool_allocation_exec_if_live(
-            source,
-            context.security_qos.0,
-            core::mem::size_of::<SecurityQualityOfService>() as u64,
-        ).ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
+        let qos_exec = if embedded_qos {
+            embedded_graph.unwrap()
+                + nt_kernel_abi::security_create_x64::SECURITY_QOS_OFFSET as u64
+        } else {
+            hosted_instance_pool_allocation_exec_if_live(
+                source,
+                context.security_qos.0,
+                core::mem::size_of::<SecurityQualityOfService>() as u64,
+            ).ok_or(STATUS_INVALID_HANDLE_LOCAL)?
+        };
         Some(capture_create_qos(read_unaligned(qos_exec as *const SecurityQualityOfService))
             .map_err(|_| STATUS_INVALID_PARAMETER_LOCAL)?)
     };

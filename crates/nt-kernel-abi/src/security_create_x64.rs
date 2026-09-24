@@ -27,6 +27,17 @@ pub struct IoSecurityContext {
     pub full_create_options: u32,
 }
 
+impl IoSecurityContext {
+    pub fn has_embedded_access_state(self, base: GuestAddr) -> bool {
+        base.0.checked_add(ACCESS_STATE_OFFSET as u64) == Some(self.access_state.0)
+    }
+
+    pub fn has_embedded_qos(self, base: GuestAddr) -> bool {
+        !self.security_qos.is_null()
+            && base.0.checked_add(SECURITY_QOS_OFFSET as u64) == Some(self.security_qos.0)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct SecuritySubjectContext {

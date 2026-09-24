@@ -154,6 +154,10 @@ fn nt5_x64_graph_has_exact_linked_addresses_and_offsets() {
         bytemuck::pod_read_unaligned(&output[..CREATE_SECURITY_GRAPH_SIZE]);
     assert_eq!(graph.io.security_qos, GuestAddr(base.0 + 0xb8));
     assert_eq!(graph.io.access_state, GuestAddr(base.0 + 0x18));
+    assert!(graph.io.has_embedded_access_state(base));
+    assert!(graph.io.has_embedded_qos(base));
+    assert!(!graph.io.has_embedded_access_state(GuestAddr(base.0 + 8)));
+    assert!(!graph.io.has_embedded_qos(GuestAddr(base.0 + 8)));
     assert_eq!(graph.io.desired_access, 0x0012_0089);
     assert_eq!(graph.io.full_create_options, 0x0400_0020);
     assert_eq!(
