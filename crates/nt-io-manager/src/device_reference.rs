@@ -279,6 +279,14 @@ impl<P> IoManager<P> {
             .iter()
             .any(|entry| entry.driver == driver && entry.count != 0)
     }
+
+    pub(crate) fn driver_has_unload_blocking_device_references(&self, driver: DriverId) -> bool {
+        self.device_references.counts.iter().any(|entry| {
+            entry.driver == driver
+                && entry.count
+                    != self.driver_owned_device_pointer_anchors(driver, entry.device)
+        })
+    }
 }
 
 #[cfg(test)]

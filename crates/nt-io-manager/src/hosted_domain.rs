@@ -397,6 +397,25 @@ impl<P> IoManager<P> {
         self.driver(id).map(|_| id)
     }
 
+    pub(crate) fn unique_hosted_driver_domain(
+        &self,
+        driver: DriverId,
+    ) -> Option<HostedDomainIdentity> {
+        let mut owner = None;
+        for (domain_id, domain) in self.hosted_domains.iter() {
+            if domain.drivers.iter().any(|binding| binding.id == driver) {
+                if owner.is_some() || domain.cookie == 0 {
+                    return None;
+                }
+                owner = Some(HostedDomainIdentity {
+                    domain_id,
+                    cookie: domain.cookie,
+                });
+            }
+        }
+        owner
+    }
+
     /// Resolve a hosted DeviceObject projection only when the generation-bearing domain id and
     /// the independently carried cookie both identify the current live address space.
     pub fn hosted_device_by_identity(

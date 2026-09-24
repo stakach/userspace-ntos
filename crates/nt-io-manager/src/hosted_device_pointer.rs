@@ -75,6 +75,27 @@ impl HostedDevicePointerStore {
 }
 
 impl<P> IoManager<P> {
+    /// DriverUnload may delete the driver's own projected devices. Their registration anchors
+    /// cannot bar entry to that callback, but all caller and foreign-domain references still do.
+    pub(crate) fn driver_owned_device_pointer_anchors(
+        &self,
+        driver: crate::DriverId,
+        device: DeviceId,
+    ) -> u64 {
+        let Some(owner) = self.unique_hosted_driver_domain(driver) else {
+            return 0;
+        };
+        self.hosted_device_pointers
+            .rows
+            .iter()
+            .filter(|row| {
+                row.registration.device == device
+                    && row.anchor.is_held()
+                    && row.registration.domain == owner
+            })
+            .count() as u64
+    }
+
     /// Bind and anchor a projection as one publication transaction. On failure a binding created
     /// here is removed; an existing exact binding is left unchanged for its original owner.
     pub fn bind_hosted_device_pointer(

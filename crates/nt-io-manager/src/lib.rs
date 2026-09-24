@@ -402,7 +402,7 @@ impl<P> IoManager<P> {
         if self.driver_has_live_irp(driver) {
             return Err(NtStatus::DEVICE_BUSY);
         }
-        if self.driver_has_device_references(driver) {
+        if self.driver_has_unload_blocking_device_references(driver) {
             return Err(NtStatus::DELETE_PENDING);
         }
         if self.devices_of(driver).iter().any(|device_id| {
