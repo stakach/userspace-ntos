@@ -254,6 +254,19 @@ fn borrowed_scope_cursor_rejects_invalid_rows_without_allocating() {
 }
 
 #[test]
+fn borrowed_scope_cursor_supports_checked_indexed_replay() {
+    let bytes = scope_table_pe();
+    let image = BorrowedExceptionImage::from_mapped_image(BASE, &bytes).unwrap();
+    let mut scopes = image.read_c_scope_table(BASE + 0x3030).unwrap();
+    let first = scopes.get(0).unwrap();
+    let second = scopes.get(1).unwrap();
+    assert_eq!(scopes.next(), Some(first));
+    assert_eq!(scopes.next(), Some(second));
+    assert_eq!(scopes.get(2), None);
+    assert_eq!(scopes.get(u32::MAX), None);
+}
+
+#[test]
 fn borrowed_catalog_routes_two_images_and_rejects_gap_or_wrong_base() {
     const SECOND: u64 = BASE + 0x8000;
     let first_bytes = mapped_pe();

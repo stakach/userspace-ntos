@@ -337,6 +337,13 @@ impl ScopeCursor<'_> {
     pub fn is_empty(&self) -> bool {
         self.raw.is_empty()
     }
+
+    pub fn get(&self, index: u32) -> Option<ScopeRecord> {
+        let start = usize::try_from(index).ok()?.checked_mul(16)?;
+        self.raw
+            .get(start..start.checked_add(16)?)
+            .map(scope_record)
+    }
 }
 
 impl Iterator for ScopeCursor<'_> {

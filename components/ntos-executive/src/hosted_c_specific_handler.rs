@@ -1,30 +1,16 @@
 //! Component-side C language handler for hosted PE drivers.
 //!
-//! The executive owns the exception packet, but filters and termination handlers must execute in
-//! the driver's address space and on its paused thread. Keep the scope walk here and share only
-//! the policy decisions with `nt-unwind`.
+//! The executive owns the packet; filters and termination handlers execute in the driver's VSpace
+//! on the interrupted thread. Image and scope admission comes from that instance's sealed snapshot.
 
+use core::mem::offset_of;
 use nt_unwind::{
-    next_c_scope, CScopeAction, Disposition, ScopeRecord, EXCEPTION_NONCONTINUABLE,
+    exception_snapshot::SealedExceptionView, exception_walk::ExceptionImageReader, next_c_scope,
+    seh_handler_packet::SehHandlerPacket, CScopeAction, Disposition, EXCEPTION_NONCONTINUABLE,
     EXCEPTION_UNWIND,
 };
 
-use super::{FSD_CODE_VA, FSD_POOL_VADDR};
-
-#[repr(C)]
-struct DispatcherContext {
-    control_pc: u64,
-    image_base: u64,
-    function_entry: u64,
-    establisher_frame: u64,
-    target_ip: u64,
-    context_record: u64,
-    language_handler: u64,
-    handler_data: u64,
-    history_table: u64,
-    scope_index: u32,
-    fill: u32,
-}
+use super::hosted_exception_images;
 
 #[repr(C)]
 struct ExceptionPointers {
@@ -32,153 +18,99 @@ struct ExceptionPointers {
     context: u64,
 }
 
-struct Image {
-    base: u64,
-    size: u64,
-    sections: u64,
-    section_count: u16,
-}
-
-impl Image {
-    unsafe fn admit(base: u64) -> Option<Self> {
-        if base < FSD_CODE_VA || base & 0xfff != 0 || base >= FSD_POOL_VADDR {
-            return None;
-        }
-        if unsafe { read_u16(base) } != 0x5a4d {
-            return None;
-        }
-        let pe = u64::from(unsafe { read_u32(base + 0x3c) });
-        if !(0x40..=0x800).contains(&pe) || unsafe { read_u32(base + pe) } != 0x0000_4550 {
-            return None;
-        }
-        let section_count = unsafe { read_u16(base + pe + 6) };
-        let optional_size = u64::from(unsafe { read_u16(base + pe + 20) });
-        if section_count == 0 || section_count > 96 || optional_size < 0x70 {
-            return None;
-        }
-        let optional = pe + 24;
-        if unsafe { read_u16(base + optional) } != 0x20b {
-            return None;
-        }
-        let size = u64::from(unsafe { read_u32(base + optional + 0x38) });
-        let sections = optional.checked_add(optional_size)?;
-        let headers_end = sections.checked_add(u64::from(section_count) * 40)?;
-        if size == 0 || headers_end > size || base.checked_add(size)? > FSD_POOL_VADDR {
-            return None;
-        }
-        Some(Self {
-            base,
-            size,
-            sections: base + sections,
-            section_count,
-        })
-    }
-
-    fn contains(&self, address: u64, length: u64) -> bool {
-        address >= self.base
-            && address
-                .checked_add(length)
-                .is_some_and(|end| end <= self.base + self.size)
-    }
-
-    unsafe fn code_address(&self, rva: u32) -> Option<u64> {
-        let address = self.base.checked_add(u64::from(rva))?;
-        if !self.contains(address, 1) {
-            return None;
-        }
-        for i in 0..self.section_count {
-            let section = self.sections + u64::from(i) * 40;
-            let virtual_size = u64::from(unsafe { read_u32(section + 8) });
-            let virtual_address = u64::from(unsafe { read_u32(section + 12) });
-            let characteristics = unsafe { read_u32(section + 36) };
-            if characteristics & 0x2000_0000 == 0 {
-                continue;
-            }
-            let end = virtual_address.checked_add(virtual_size)?;
-            if u64::from(rva) >= virtual_address && u64::from(rva) < end {
-                return Some(address);
-            }
-        }
-        None
-    }
-}
-
-unsafe fn read_u16(address: u64) -> u16 {
-    unsafe { core::ptr::read_unaligned(address as *const u16) }
-}
-
-unsafe fn read_u32(address: u64) -> u32 {
-    unsafe { core::ptr::read_unaligned(address as *const u32) }
-}
-
-unsafe fn read_u64(address: u64) -> u64 {
-    unsafe { core::ptr::read_unaligned(address as *const u64) }
-}
-
-unsafe fn scope(table: u64, index: u32) -> ScopeRecord {
-    let entry = table + 4 + u64::from(index) * 16;
-    ScopeRecord {
-        begin: unsafe { read_u32(entry) },
-        end: unsafe { read_u32(entry + 4) },
-        handler: unsafe { read_u32(entry + 8) },
-        target: unsafe { read_u32(entry + 12) },
-    }
-}
-
-/// Native x64 exception-routine ABI. Input packet/dispatcher pointers come from the executive's
-/// owned handler command, not from an untrusted driver call.
+/// Native x64 exception-routine ABI. The dispatcher pointer is the one embedded in a packet
+/// written under the executive's authenticated stack lease.
 pub(super) unsafe fn dispatch(
     exception_record: u64,
     establisher_frame: u64,
     context_record: u64,
     dispatcher_context: u64,
 ) -> i32 {
-    if exception_record == 0 || context_record == 0 || dispatcher_context == 0 {
-        panic!("hosted C handler received a null exception packet");
+    let packet_va = dispatcher_context
+        .checked_sub(offset_of!(SehHandlerPacket, dispatcher) as u64)
+        .filter(|address| *address != 0 && *address & 15 == 0)
+        .expect("hosted C handler dispatcher is not in an aligned packet");
+    if exception_record != packet_va + offset_of!(SehHandlerPacket, exception) as u64
+        || context_record == 0
+    {
+        panic!("hosted C handler received mismatched exception records");
     }
-    let dispatcher = dispatcher_context as *mut DispatcherContext;
+    let packet = packet_va as *mut SehHandlerPacket;
+    let dispatcher = unsafe { core::ptr::addr_of_mut!((*packet).dispatcher) };
     let image_base =
         unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*dispatcher).image_base)) };
-    let image = unsafe { Image::admit(image_base) }
-        .expect("hosted C handler image is not a mapped PE image");
-    let table =
-        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*dispatcher).handler_data)) };
-    if !image.contains(table, 4) {
-        panic!("hosted C handler scope table is outside its PE image");
-    }
-    let count = unsafe { read_u32(table) };
-    let table_len = u64::from(count)
-        .checked_mul(16)
-        .and_then(|n| n.checked_add(4))
-        .expect("hosted C handler scope table overflows");
-    if count > 4096 || !image.contains(table, table_len) {
-        panic!("hosted C handler scope table exceeds its PE image");
-    }
     let control_pc =
         unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*dispatcher).control_pc)) };
-    if !image.contains(control_pc, 1) {
-        panic!("hosted C handler control PC is outside its PE image");
-    }
     let target_ip =
         unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*dispatcher).target_ip)) };
-    let target_rva = if target_ip == 0 {
-        u64::MAX
-    } else {
-        target_ip.checked_sub(image.base).unwrap_or(u64::MAX)
-    };
-    let flags = unsafe { read_u32(exception_record + 4) };
+    let handler_data =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*dispatcher).handler_data)) };
+    let flags =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*packet).exception.flags)) };
+    let filter_wrapper =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*packet).filter_wrapper)) };
+    let finally_wrapper =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*packet).finally_wrapper)) };
 
+    unsafe {
+        hosted_exception_images::with_component_view(|view| {
+            dispatch_with_view(
+                view,
+                packet_va,
+                establisher_frame,
+                context_record,
+                dispatcher,
+                image_base,
+                control_pc,
+                target_ip,
+                handler_data,
+                flags,
+                filter_wrapper,
+                finally_wrapper,
+            )
+        })
+    }
+    .expect("hosted C handler lacks its sealed exception snapshot")
+}
+
+fn executable(view: &SealedExceptionView<'_>, address: u64) -> bool {
+    address != 0 && view.lookup_exception_function(address).is_ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_with_view(
+    view: &SealedExceptionView<'_>,
+    packet_va: u64,
+    establisher_frame: u64,
+    context_record: u64,
+    dispatcher: *mut nt_unwind::raw_exception::RawDispatcherContext,
+    image_base: u64,
+    control_pc: u64,
+    target_ip: u64,
+    handler_data: u64,
+    flags: u32,
+    filter_wrapper: u64,
+    finally_wrapper: u64,
+) -> i32 {
+    if !executable(view, control_pc)
+        || !executable(view, filter_wrapper)
+        || !executable(view, finally_wrapper)
+    {
+        panic!("hosted C handler PC or support wrapper is not in sealed executable code");
+    }
+    let scopes = view
+        .read_c_scope_table(image_base, handler_data)
+        .expect("hosted C handler scope table was not sealed");
+    let pc_rva = control_pc
+        .checked_sub(image_base)
+        .expect("hosted C handler PC precedes its image");
+    let target_rva = target_ip.checked_sub(image_base).unwrap_or(u64::MAX);
     loop {
         let mut index =
             unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*dispatcher).scope_index)) };
-        let action = next_c_scope(
-            control_pc - image.base,
-            target_rva,
-            flags,
-            count,
-            &mut index,
-            |i| unsafe { scope(table, i) },
-        );
+        let action = next_c_scope(pc_rva, target_rva, flags, scopes.len(), &mut index, |i| {
+            scopes.get(i).expect("sealed C scope index")
+        });
         unsafe {
             core::ptr::write_unaligned(core::ptr::addr_of_mut!((*dispatcher).scope_index), index)
         };
@@ -189,79 +121,71 @@ pub(super) unsafe fn dispatch(
                 target_rva,
                 ..
             } => {
-                let filter = unsafe { image.code_address(handler_rva) }
-                    .expect("hosted C handler filter is not executable image code");
-                let target = unsafe { image.code_address(target_rva) }
-                    .expect("hosted C handler target is not executable image code");
+                let filter = image_base
+                    .checked_add(u64::from(handler_rva))
+                    .filter(|address| executable(view, *address))
+                    .expect("hosted C filter is not sealed executable code");
+                let target = image_base
+                    .checked_add(u64::from(target_rva))
+                    .filter(|address| executable(view, *address))
+                    .expect("hosted C target is not sealed executable code");
                 let pointers = ExceptionPointers {
-                    record: exception_record,
+                    record: packet_va + offset_of!(SehHandlerPacket, exception) as u64,
                     context: context_record,
                 };
-                let filter: unsafe extern "win64" fn(*const ExceptionPointers, u64) -> i32 =
-                    unsafe { core::mem::transmute(filter as usize) };
-                let verdict = unsafe { filter(&pointers, establisher_frame) };
+                let wrapper: unsafe extern "win64" fn(
+                    u64,
+                    *const ExceptionPointers,
+                    u64,
+                    u64,
+                ) -> i32 = unsafe { core::mem::transmute(filter_wrapper as usize) };
+                let verdict =
+                    unsafe { wrapper(filter, &pointers, establisher_frame, dispatcher as u64) };
                 if verdict < 0 {
                     if flags & EXCEPTION_NONCONTINUABLE != 0 {
-                        panic!("hosted C handler resumed a noncontinuable exception");
+                        panic!("hosted C filter resumed a noncontinuable exception");
                     }
                     return Disposition::ContinueExecution.as_raw();
                 }
                 if verdict > 0 {
-                    execute_handler_unwind(
-                        establisher_frame,
-                        target,
-                        exception_record,
-                        context_record,
-                        dispatcher,
-                    );
+                    execute_handler_unwind(packet_va, establisher_frame, target);
                 }
             }
             CScopeAction::ExecuteHandler { target_rva, .. } => {
-                let target = unsafe { image.code_address(target_rva) }
-                    .expect("hosted C handler target is not executable image code");
-                execute_handler_unwind(
-                    establisher_frame,
-                    target,
-                    exception_record,
-                    context_record,
-                    dispatcher,
-                );
+                let target = image_base
+                    .checked_add(u64::from(target_rva))
+                    .filter(|address| executable(view, *address))
+                    .expect("hosted C target is not sealed executable code");
+                execute_handler_unwind(packet_va, establisher_frame, target);
             }
             CScopeAction::Finally {
                 handler_rva,
                 end_rva,
             } => {
                 if flags & EXCEPTION_UNWIND == 0 {
-                    panic!("hosted C handler selected termination outside unwind");
+                    panic!("hosted C termination selected outside unwind");
                 }
-                let finalizer = unsafe { image.code_address(handler_rva) }
-                    .expect("hosted C handler finalizer is not executable image code");
-                let end_pc = image.base + u64::from(end_rva);
-                if !image.contains(end_pc.saturating_sub(1), 1) {
-                    panic!("hosted C handler scope end is outside its PE image");
-                }
+                let finalizer = image_base
+                    .checked_add(u64::from(handler_rva))
+                    .filter(|address| executable(view, *address))
+                    .expect("hosted C finalizer is not sealed executable code");
+                let end_pc = image_base
+                    .checked_add(u64::from(end_rva))
+                    .expect("hosted C scope end overflows");
                 unsafe {
                     core::ptr::write_unaligned(
                         core::ptr::addr_of_mut!((*dispatcher).control_pc),
                         end_pc,
                     )
                 };
-                let finalizer: unsafe extern "win64" fn(u8, u64) =
-                    unsafe { core::mem::transmute(finalizer as usize) };
-                unsafe { finalizer(1, establisher_frame) };
+                let wrapper: unsafe extern "win64" fn(u64, u64, u64) =
+                    unsafe { core::mem::transmute(finally_wrapper as usize) };
+                unsafe { wrapper(finalizer, establisher_frame, dispatcher as u64) };
             }
         }
     }
 }
 
-fn execute_handler_unwind(
-    _establisher_frame: u64,
-    _target_ip: u64,
-    _exception_record: u64,
-    _context_record: u64,
-    _dispatcher: *mut DispatcherContext,
-) -> ! {
-    // The search result is real, but returning from this branch would skip the required target
-    // unwind and claim a catch that never ran. This is replaced by the owned restore continuation.
-    panic!("hosted C handler target unwind is not connected")
+fn execute_handler_unwind(packet_va: u64, establisher_frame: u64, target_ip: u64) -> ! {
+    super::hosted_seh_component::unwind_request(packet_va, establisher_frame, target_ip)
 }

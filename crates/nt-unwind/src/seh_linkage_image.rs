@@ -39,6 +39,10 @@ pub enum SehLinkageImageError {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SehLinkageImage {
     pub image_base: u64,
+    pub filter_va: u64,
+    pub finally_va: u64,
+    pub search_va: u64,
+    pub unwind_va: u64,
     pub raise_va: u64,
     pub resume_va: u64,
     pub dispatch_slot_rva: u32,
@@ -126,7 +130,14 @@ impl SehLinkageImage {
         &self,
         catalog: &dyn ExceptionImageReader,
     ) -> Result<(), SehLinkageImageError> {
-        for pc in [self.raise_va, self.resume_va] {
+        for pc in [
+            self.filter_va,
+            self.finally_va,
+            self.search_va,
+            self.unwind_va,
+            self.raise_va,
+            self.resume_va,
+        ] {
             if !exact_function(catalog.lookup_exception_function(pc), pc, self.image_base) {
                 return Err(SehLinkageImageError::ExceptionMetadata);
             }
@@ -162,7 +173,7 @@ fn checked_export_rvas(
     exports: &[ExportedSymbol],
     sections: &[Section],
     export_directory: DataDirectory,
-) -> Result<(u32, u32, u32), SehLinkageImageError> {
+) -> Result<(u32, u32, u32, u32, u32, u32, u32), SehLinkageImageError> {
     if exports.len() != NAMES.len() {
         return Err(SehLinkageImageError::Exports);
     }
@@ -196,7 +207,15 @@ fn checked_export_rvas(
     {
         return Err(SehLinkageImageError::SectionRights);
     }
-    Ok((raise, resume, slot))
+    Ok((
+        found[0].ok_or(SehLinkageImageError::Exports)?,
+        found[1].ok_or(SehLinkageImageError::Exports)?,
+        found[2].ok_or(SehLinkageImageError::Exports)?,
+        found[3].ok_or(SehLinkageImageError::Exports)?,
+        raise,
+        resume,
+        slot,
+    ))
 }
 
 /// Admit the exact relocated instance. The dispatch slot must still be zero: the component
@@ -210,7 +229,7 @@ pub fn admit(
         return Err(SehLinkageImageError::InvalidImage);
     }
     let exports = pe.exports().map_err(|_| SehLinkageImageError::Exports)?;
-    let (raise, resume, slot) = checked_export_rvas(
+    let (filter, finally, search, unwind, raise, resume, slot) = checked_export_rvas(
         &exports,
         pe.sections(),
         pe.headers().data_directory(DIRECTORY_ENTRY_EXPORT),
@@ -231,6 +250,22 @@ pub fn admit(
         .ok_or(SehLinkageImageError::AddressOverflow)?;
     Ok(SehLinkageImage {
         image_base: mapped.load_base,
+        filter_va: mapped
+            .load_base
+            .checked_add(u64::from(filter))
+            .ok_or(SehLinkageImageError::AddressOverflow)?,
+        finally_va: mapped
+            .load_base
+            .checked_add(u64::from(finally))
+            .ok_or(SehLinkageImageError::AddressOverflow)?,
+        search_va: mapped
+            .load_base
+            .checked_add(u64::from(search))
+            .ok_or(SehLinkageImageError::AddressOverflow)?,
+        unwind_va: mapped
+            .load_base
+            .checked_add(u64::from(unwind))
+            .ok_or(SehLinkageImageError::AddressOverflow)?,
         raise_va,
         resume_va,
         dispatch_slot_rva: slot,
@@ -291,7 +326,7 @@ mod tests {
         let (exports, sections, directory) = fixture();
         assert_eq!(
             checked_export_rvas(&exports, &sections, directory),
-            Ok((0x1000, 0x112a, 0x3000))
+            Ok((0x1200, 0x1300, 0x1400, 0x1500, 0x1000, 0x112a, 0x3000))
         );
         let mut missing = exports.clone();
         missing.pop();
@@ -425,6 +460,10 @@ mod tests {
     fn raise_linkage() -> SehLinkageImage {
         SehLinkageImage {
             image_base: 0x4000,
+            filter_va: 0x5200,
+            finally_va: 0x5300,
+            search_va: 0x5400,
+            unwind_va: 0x5500,
             raise_va: 0x5000,
             resume_va: 0x512a,
             dispatch_slot_rva: 0x3000,

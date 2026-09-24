@@ -43,6 +43,21 @@ pub(super) unsafe fn validate_component_mapping() -> bool {
     true
 }
 
+/// Re-admit the component's immutable per-instance snapshot for a single native handler call.
+/// No borrowed image bytes may escape while the component could be retired.
+pub(super) unsafe fn with_component_view<R>(
+    use_view: impl for<'a> FnOnce(&SealedExceptionView<'a>) -> R,
+) -> Option<R> {
+    let length = unsafe { core::ptr::read_unaligned((COMPONENT_SNAPSHOT_VA + 16) as *const u64) };
+    let length = usize::try_from(length).ok()?;
+    if length < 24 || length > (COMPONENT_SNAPSHOT_LIMIT - COMPONENT_SNAPSHOT_VA) as usize {
+        return None;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(COMPONENT_SNAPSHOT_VA as *const u8, length) };
+    let view = SealedExceptionView::parse(bytes).ok()?;
+    Some(use_view(&view))
+}
+
 /// The exact scratch cap and whether page_map has completed. This local ledger is populated
 /// before each native map effect; an uncertain unmap cannot release the scratch lane.
 struct ScratchAlias {
