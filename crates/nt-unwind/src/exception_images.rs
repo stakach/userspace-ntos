@@ -19,7 +19,7 @@ use nt_pe_loader::{image_directory_entry, PeError, PeFile};
 use crate::{
     exception_walk::{ExceptionFunction, ExceptionImageError, ExceptionImageReader},
     op_slots, read_runtime_function, read_unwind_header, uwop, ImageReader, RuntimeFunction,
-    DIRECTORY_ENTRY_EXCEPTION,
+    ScopeRecord, DIRECTORY_ENTRY_EXCEPTION,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -37,11 +37,24 @@ pub enum ImageAdmissionError {
     ImageOverlap,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScopeTableError {
+    UnknownImage,
+    InvalidAddress,
+    InvalidExtent,
+    InvalidCount,
+    InsufficientResources,
+    InvalidScope,
+    InvalidHandler,
+    InvalidTarget,
+}
+
 #[derive(Debug)]
 pub struct AdmittedExceptionImage {
     base: u64,
     end: u64,
     bytes: Box<[u8]>,
+    sections: Vec<Range<u32>>,
     executable: Vec<Range<u32>>,
     functions: Vec<RuntimeFunction>,
 }
@@ -143,6 +156,7 @@ impl AdmittedExceptionImage {
             base,
             end,
             bytes,
+            sections,
             executable,
             functions,
         })
@@ -158,6 +172,81 @@ impl AdmittedExceptionImage {
 
     pub fn function_count(&self) -> usize {
         self.functions.len()
+    }
+
+    /// Copy a C language-handler table out of admitted mapped-image metadata. The caller must
+    /// supply the exact image base from its unwind invocation; an address in another image cannot
+    /// be silently reinterpreted using this image's RVAs.
+    pub fn read_c_scope_table(
+        &self,
+        handler_data: u64,
+    ) -> Result<Vec<ScopeRecord>, ScopeTableError> {
+        let rva = u32::try_from(
+            handler_data
+                .checked_sub(self.base)
+                .ok_or(ScopeTableError::InvalidAddress)?,
+        )
+        .map_err(|_| ScopeTableError::InvalidAddress)?;
+        if rva & 3 != 0 {
+            return Err(ScopeTableError::InvalidAddress);
+        }
+        let section = self
+            .sections
+            .iter()
+            .find(|section| section.contains(&rva))
+            .ok_or(ScopeTableError::InvalidAddress)?;
+        let header_end = rva.checked_add(4).ok_or(ScopeTableError::InvalidExtent)?;
+        if header_end > section.end {
+            return Err(ScopeTableError::InvalidExtent);
+        }
+        let count = u32::from_le_bytes(
+            self.bytes[rva as usize..header_end as usize]
+                .try_into()
+                .map_err(|_| ScopeTableError::InvalidExtent)?,
+        );
+        if count > 4096 {
+            return Err(ScopeTableError::InvalidCount);
+        }
+        let end = count
+            .checked_mul(16)
+            .and_then(|bytes| header_end.checked_add(bytes))
+            .ok_or(ScopeTableError::InvalidExtent)?;
+        if end > section.end {
+            return Err(ScopeTableError::InvalidExtent);
+        }
+        let mut scopes = Vec::new();
+        scopes
+            .try_reserve_exact(count as usize)
+            .map_err(|_| ScopeTableError::InsufficientResources)?;
+        for raw in self.bytes[header_end as usize..end as usize].chunks_exact(16) {
+            let field =
+                |offset: usize| u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap());
+            let scope = ScopeRecord {
+                begin: field(0),
+                end: field(4),
+                handler: field(8),
+                target: field(12),
+            };
+            if !covers_range(&self.executable, scope.begin..scope.end) {
+                return Err(ScopeTableError::InvalidScope);
+            }
+            if scope.handler != 1 && !self.is_executable_rva(scope.handler) {
+                return Err(ScopeTableError::InvalidHandler);
+            }
+            if scope.target == 0 {
+                if scope.handler == 1 {
+                    return Err(ScopeTableError::InvalidHandler);
+                }
+            } else if !self.is_executable_rva(scope.target) {
+                return Err(ScopeTableError::InvalidTarget);
+            }
+            scopes.push(scope);
+        }
+        Ok(scopes)
+    }
+
+    fn is_executable_rva(&self, rva: u32) -> bool {
+        self.executable.iter().any(|section| section.contains(&rva))
     }
 
     fn lookup(&self, pc: u64) -> Result<ExceptionFunction, ExceptionImageError> {
@@ -205,6 +294,20 @@ impl ExceptionImageCatalog {
 
     pub fn image_count(&self) -> usize {
         self.images.len()
+    }
+
+    pub fn read_c_scope_table(
+        &self,
+        image_base: u64,
+        handler_data: u64,
+    ) -> Result<Vec<ScopeRecord>, ScopeTableError> {
+        let image = self
+            .images
+            .binary_search_by_key(&image_base, |image| image.base)
+            .ok()
+            .and_then(|index| self.images.get(index))
+            .ok_or(ScopeTableError::UnknownImage)?;
+        image.read_c_scope_table(handler_data)
     }
 
     fn image_containing(&self, pc: u64) -> Option<&AdmittedExceptionImage> {

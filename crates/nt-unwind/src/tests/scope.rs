@@ -24,11 +24,20 @@ fn next(scopes: &[ScopeRecord], pc: u64, target: u64, flags: u32, index: &mut u3
 
 #[test]
 fn cursor_is_published_before_finally_and_resumes_without_repetition() {
-    let scopes = [finally(0x300), finally(0x400)];
+    let scopes = [
+        finally(0x300),
+        ScopeRecord {
+            end: 0x280,
+            ..finally(0x400)
+        },
+    ];
     let mut index = 0;
     assert_eq!(
         next(&scopes, 0x150, 0, EXCEPTION_UNWINDING, &mut index),
-        CScopeAction::Finally { handler_rva: 0x300 }
+        CScopeAction::Finally {
+            handler_rva: 0x300,
+            end_rva: 0x200
+        }
     );
     assert_eq!(index, 1);
     let mut resumed_index = index; // DispatcherContext carried across a collided unwind
@@ -40,7 +49,10 @@ fn cursor_is_published_before_finally_and_resumes_without_repetition() {
             EXCEPTION_COLLIDED_UNWIND,
             &mut resumed_index
         ),
-        CScopeAction::Finally { handler_rva: 0x400 }
+        CScopeAction::Finally {
+            handler_rva: 0x400,
+            end_rva: 0x280
+        }
     );
     assert_eq!(resumed_index, 2);
     assert_eq!(
@@ -75,24 +87,27 @@ fn search_cursor_skips_finally_and_resumes_at_the_next_filter() {
 #[test]
 fn target_within_scope_suppresses_unwind_without_running_a_finally() {
     let scopes = [finally(0x300), finally(0x400)];
-    for target in [0xff, 0x100, 0x150, 0x1ff, 0x200] {
-        let mut index = 0;
-        let action = next(
-            &scopes,
-            0x150,
-            target,
-            EXCEPTION_UNWINDING | EXCEPTION_TARGET_UNWIND,
-            &mut index,
-        );
-        assert_eq!(
-            action,
-            if (0x100..0x200).contains(&target) {
-                CScopeAction::ContinueSearch
-            } else {
-                CScopeAction::Finally { handler_rva: 0x300 }
-            }
-        );
-        assert_eq!(index, 1);
+    for flags in [
+        EXCEPTION_UNWINDING,
+        EXCEPTION_TARGET_UNWIND,
+        EXCEPTION_EXIT_UNWIND,
+    ] {
+        for target in [0xff, 0x100, 0x150, 0x1ff, 0x200, 0x201] {
+            let mut index = 0;
+            let action = next(&scopes, 0x150, target, flags, &mut index);
+            assert_eq!(
+                action,
+                if (0x100..=0x200).contains(&target) {
+                    CScopeAction::ContinueSearch
+                } else {
+                    CScopeAction::Finally {
+                        handler_rva: 0x300,
+                        end_rva: 0x200,
+                    }
+                }
+            );
+            assert_eq!(index, 1);
+        }
     }
 }
 
@@ -102,7 +117,10 @@ fn except_target_stops_before_outer_finalizers() {
     let mut index = 0;
     assert_eq!(
         next(&scopes, 0x150, 0x500, EXCEPTION_UNWINDING, &mut index),
-        CScopeAction::Finally { handler_rva: 0x300 }
+        CScopeAction::Finally {
+            handler_rva: 0x300,
+            end_rva: 0x200
+        }
     );
     assert_eq!(
         next(&scopes, 0x150, 0x500, EXCEPTION_UNWINDING, &mut index),
@@ -124,7 +142,10 @@ fn every_unwind_phase_selects_finalizers_instead_of_filters() {
         let mut index = 0;
         assert_eq!(
             next(&scopes, 0x150, 0, flags, &mut index),
-            CScopeAction::Finally { handler_rva: 0x600 }
+            CScopeAction::Finally {
+                handler_rva: 0x600,
+                end_rva: 0x200
+            }
         );
         assert_eq!(index, 2);
     }
@@ -147,7 +168,10 @@ fn scope_addresses_do_not_alias_after_four_gibibytes() {
             EXCEPTION_UNWINDING | EXCEPTION_TARGET_UNWIND,
             &mut index
         ),
-        CScopeAction::Finally { handler_rva: 0x300 }
+        CScopeAction::Finally {
+            handler_rva: 0x300,
+            end_rva: 0x200
+        }
     );
 }
 
@@ -169,7 +193,10 @@ fn cursor_count_boundaries_do_not_read_or_overflow() {
             assert_eq!(i, u32::MAX - 1);
             finally(0x300)
         }),
-        CScopeAction::Finally { handler_rva: 0x300 }
+        CScopeAction::Finally {
+            handler_rva: 0x300,
+            end_rva: 0x200
+        }
     );
     assert_eq!(index, u32::MAX);
 }

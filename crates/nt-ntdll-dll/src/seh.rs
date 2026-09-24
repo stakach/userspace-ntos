@@ -971,9 +971,8 @@ pub unsafe fn c_specific_handler(
         // Publish the cursor before any filter/finally can initiate a collided unwind. Reload it
         // after callbacks rather than overwriting a cursor the dispatcher may have advanced.
         // SAFETY: the supplied dispatcher record remains live throughout this invocation.
-        let mut index = unsafe {
-            core::ptr::read_unaligned(core::ptr::addr_of!((*disp_ptr).scope_index))
-        };
+        let mut index =
+            unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*disp_ptr).scope_index)) };
         let selected = ex::next_c_scope(pc_rva, target_rva, flags, count, &mut index, read_scope);
         // SAFETY: the cursor is a writable ULONG in the caller's dispatcher record.
         unsafe {
@@ -981,7 +980,20 @@ pub unsafe fn c_specific_handler(
         };
         let action = match selected {
             ex::CScopeAction::ContinueSearch => return ex::Disposition::ContinueSearch.as_raw(),
-            ex::CScopeAction::Finally { handler_rva } => {
+            ex::CScopeAction::Finally {
+                handler_rva,
+                end_rva,
+            } => {
+                let Some(end_pc) = image_base.checked_add(u64::from(end_rva)) else {
+                    return ex::Disposition::ContinueSearch.as_raw();
+                };
+                // A collided unwind resumes from the end of the scope whose finalizer ran.
+                unsafe {
+                    core::ptr::write_unaligned(
+                        core::ptr::addr_of_mut!((*disp_ptr).control_pc),
+                        end_pc,
+                    );
+                }
                 let fin = image_base + u64::from(handler_rva);
                 // SAFETY: the selected loaded-image routine uses the native __finally ABI.
                 unsafe {
@@ -990,13 +1002,18 @@ pub unsafe fn c_specific_handler(
                 }
                 continue;
             }
-            ex::CScopeAction::ExecuteHandler { target_rva, scope_index } => {
-                ex::CHandlerAction::ExecuteHandler {
-                    target_rva,
-                    scope_index: scope_index as usize,
-                }
-            }
-            ex::CScopeAction::Filter { handler_rva, target_rva, scope_index } => {
+            ex::CScopeAction::ExecuteHandler {
+                target_rva,
+                scope_index,
+            } => ex::CHandlerAction::ExecuteHandler {
+                target_rva,
+                scope_index: scope_index as usize,
+            },
+            ex::CScopeAction::Filter {
+                handler_rva,
+                target_rva,
+                scope_index,
+            } => {
                 #[repr(C)]
                 struct ExceptionPointers {
                     record: *mut c_void,
@@ -1009,7 +1026,8 @@ pub unsafe fn c_specific_handler(
                 let filt = image_base + u64::from(handler_rva);
                 // SAFETY: the selected loaded-image filter uses the native EXCEPTION_POINTERS ABI.
                 let verdict = unsafe {
-                    let f: unsafe extern "C" fn(*const c_void, u64) -> i32 = core::mem::transmute(filt);
+                    let f: unsafe extern "C" fn(*const c_void, u64) -> i32 =
+                        core::mem::transmute(filt);
                     f(&ptrs as *const _ as *const c_void, establisher_frame)
                 };
                 ex::CHandlerAction::from_filter_result(verdict, target_rva, scope_index as usize)

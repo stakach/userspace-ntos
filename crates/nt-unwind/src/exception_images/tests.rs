@@ -78,6 +78,98 @@ fn catalog(bytes: Box<[u8]>) -> Result<ExceptionImageCatalog, ImageAdmissionErro
     )?])
 }
 
+fn scope_table_pe() -> Box<[u8]> {
+    let mut bytes = mapped_pe();
+    put32(&mut bytes, 0x3030, 2);
+    for (index, (begin, end, handler, target)) in
+        [(0x1000, 0x1080, 1, 0x1080), (0x1080, 0x1100, 0x1110, 0)]
+            .into_iter()
+            .enumerate()
+    {
+        let offset = 0x3034 + index * 16;
+        put32(&mut bytes, offset, begin);
+        put32(&mut bytes, offset + 4, end);
+        put32(&mut bytes, offset + 8, handler);
+        put32(&mut bytes, offset + 12, target);
+    }
+    bytes
+}
+
+#[test]
+fn c_scope_table_is_owned_and_uses_exact_admitted_image_base() {
+    let table = catalog(scope_table_pe()).unwrap();
+    assert_eq!(
+        table.read_c_scope_table(BASE, BASE + 0x3030),
+        Ok(vec![
+            ScopeRecord {
+                begin: 0x1000,
+                end: 0x1080,
+                handler: 1,
+                target: 0x1080
+            },
+            ScopeRecord {
+                begin: 0x1080,
+                end: 0x1100,
+                handler: 0x1110,
+                target: 0
+            },
+        ])
+    );
+    assert_eq!(
+        table.read_c_scope_table(BASE + 1, BASE + 0x3030),
+        Err(ScopeTableError::UnknownImage)
+    );
+    assert_eq!(
+        table.read_c_scope_table(BASE, BASE + 0x3031),
+        Err(ScopeTableError::InvalidAddress)
+    );
+    assert_eq!(
+        table.read_c_scope_table(BASE, BASE + 0x4030),
+        Err(ScopeTableError::InvalidAddress)
+    );
+}
+
+#[test]
+fn c_scope_table_rejects_truncated_and_excessive_counts() {
+    for (rva, count, expected) in [
+        (0x3030, 4097, ScopeTableError::InvalidCount),
+        (0x31fc, 1, ScopeTableError::InvalidExtent),
+        (0x3030, u32::MAX, ScopeTableError::InvalidCount),
+    ] {
+        let mut bytes = scope_table_pe();
+        put32(&mut bytes, rva, count);
+        let table = catalog(bytes).unwrap();
+        assert_eq!(
+            table.read_c_scope_table(BASE, BASE + rva as u64),
+            Err(expected)
+        );
+    }
+}
+
+#[test]
+fn empty_c_scope_table_has_no_handlers() {
+    let mut bytes = scope_table_pe();
+    put32(&mut bytes, 0x3030, 0);
+    let table = catalog(bytes).unwrap();
+    assert_eq!(table.read_c_scope_table(BASE, BASE + 0x3030), Ok(vec![]));
+}
+
+#[test]
+fn c_scope_table_requires_executable_ranges_filters_and_targets() {
+    for (field_offset, value, expected) in [
+        (0, 0x2000, ScopeTableError::InvalidScope),
+        (4, 0x1000, ScopeTableError::InvalidScope),
+        (8, 0x2000, ScopeTableError::InvalidHandler),
+        (12, 0x3000, ScopeTableError::InvalidTarget),
+        (16 + 8, 1, ScopeTableError::InvalidHandler),
+    ] {
+        let mut bytes = scope_table_pe();
+        put32(&mut bytes, 0x3034 + field_offset, value);
+        let table = catalog(bytes).unwrap();
+        assert_eq!(table.read_c_scope_table(BASE, BASE + 0x3030), Err(expected));
+    }
+}
+
 #[test]
 fn mapped_headers_and_directories_use_rvas_not_raw_file_offsets() {
     let catalog = catalog(mapped_pe()).unwrap();

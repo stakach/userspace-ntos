@@ -26,8 +26,8 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 
 mod epilogue;
-pub mod exception_walk;
 pub mod exception_images;
+pub mod exception_walk;
 
 // =================================================================================================
 // EXCEPTION_RECORD / dispositions
@@ -1082,6 +1082,8 @@ pub enum CScopeAction {
     },
     Finally {
         handler_rva: u32,
+        /// Publish this scope end as DispatcherContext.ControlPc before invoking the finalizer.
+        end_rva: u32,
     },
     ExecuteHandler {
         target_rva: u32,
@@ -1092,6 +1094,8 @@ pub enum CScopeAction {
 /// Select one C scope operation without allocating or invoking foreign code. `scope_index` is
 /// advanced before a selected operation is returned, so a collided unwind can resume from it.
 /// Image-relative PCs remain 64-bit so an address outside the image cannot alias a 32-bit scope.
+/// During unwind, a target at the inclusive scope end remains within that scope, matching the NT5
+/// `__C_specific_handler` leave-from-scope rule.
 /// The adapter must validate the table extent before supplying its record reader.
 pub fn next_c_scope(
     pc_rva: u64,
@@ -1109,15 +1113,13 @@ pub fn next_c_scope(
             continue;
         }
         if flags & EXCEPTION_UNWIND != 0 {
-            if flags & EXCEPTION_TARGET_UNWIND != 0
-                && target_rva >= u64::from(scope.begin)
-                && target_rva < u64::from(scope.end)
-            {
+            if target_rva >= u64::from(scope.begin) && target_rva <= u64::from(scope.end) {
                 return CScopeAction::ContinueSearch;
             }
             if scope.target == 0 {
                 return CScopeAction::Finally {
                     handler_rva: scope.handler,
+                    end_rva: scope.end,
                 };
             }
             if target_rva == u64::from(scope.target) {
@@ -1198,7 +1200,7 @@ pub fn c_specific_handler_unwind(pc_rva: u32, scopes: &[ScopeRecord]) -> Vec<u32
     let mut finallies = Vec::new();
     let count = u32::try_from(scopes.len()).expect("NT scope count fits ULONG");
     let mut index = 0;
-    while let CScopeAction::Finally { handler_rva } = next_c_scope(
+    while let CScopeAction::Finally { handler_rva, .. } = next_c_scope(
         u64::from(pc_rva),
         0,
         EXCEPTION_UNWINDING,
