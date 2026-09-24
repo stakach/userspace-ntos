@@ -4,6 +4,7 @@
 //! snapshots obtained from authenticated ingress, never from a driver pointer or badge alone.
 
 use super::*;
+use nt_kernel_abi::{security_create_x64::ProviderTokenProjection, GuestAddr};
 use nt_security::{
     hosted_token_projection::{
         HostedTokenProjection, HostedTokenProjectionDomain, HostedTokenProjectionError,
@@ -38,6 +39,23 @@ pub(super) struct ProjectedToken {
 pub(super) struct ProjectedTokenMetadata {
     pub session_id: u32,
     pub authentication_id: Luid,
+}
+
+#[must_use = "bind or release the reserved provider token allocation"]
+pub(super) struct ReservedTokenProjection {
+    provider_inst: DriverInstance,
+    provider_domain: HostedTokenProjectionDomain,
+    address: u64,
+    exec_va: u64,
+}
+
+#[must_use = "free the retired provider token allocation"]
+pub(super) struct RetiringTokenProjection {
+    source_ticket: SourceCreateSecurityTicket,
+    source_key: SourceCreateSecurityKey,
+    source_inst: DriverInstance,
+    provider_inst: DriverInstance,
+    address: u64,
 }
 
 struct Row {
@@ -107,38 +125,12 @@ fn projection_status(error: HostedTokenProjectionError) -> i32 {
     }
 }
 
-/// Allocate an opaque token object in the target's own pool and bind its canonical identity.
-/// `source` must remain retained until this projection is retired after provider completion.
-pub(super) unsafe fn project(
-    source_inst: DriverInstance,
+/// Reserve provider-local storage before borrowing TokenStore. The reservation is not a token;
+/// it cannot be queried until `bind` validates and retains its canonical identity.
+pub(super) unsafe fn reserve(
     provider_inst: DriverInstance,
-    source: &SourceCreateSecurityOwner,
-    ticket: SourceCreateSecurityTicket,
-    key: SourceCreateSecurityKey,
-    role: SubjectTokenRole,
-    tokens: &mut TokenStore,
-) -> Result<ProjectedToken, i32> {
-    if !source_matches(source_inst, key)
-        || source.ticket() != ticket
-        || source.key() != key
-        || matches!(
-            source.phase(),
-            SourceCreateSecurityPhase::Terminal | SourceCreateSecurityPhase::Released
-        )
-    {
-        return Err(STATUS_INVALID_HANDLE_LOCAL);
-    }
+) -> Result<ReservedTokenProjection, i32> {
     let provider_domain = domain(provider_inst)?;
-    let (primary, client) = source
-        .token_ids(tokens, ticket, key)
-        .map_err(|status| status as i32)?;
-    let token: TokenId = match role {
-        SubjectTokenRole::Primary => primary,
-        SubjectTokenRole::Client => client.ok_or(STATUS_INVALID_HANDLE_LOCAL)?.token,
-    };
-    (&mut *core::ptr::addr_of_mut!(ROWS))
-        .try_reserve(1)
-        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES_LOCAL)?;
     let address = hosted_instance_pool_alloc(provider_inst, TOKEN_PROJECTION_BYTES)
         .ok_or(STATUS_INSUFFICIENT_RESOURCES_LOCAL)?;
     let Some(exec_va) =
@@ -150,8 +142,67 @@ pub(super) unsafe fn project(
         ));
         return Err(STATUS_INVALID_HANDLE_LOCAL);
     };
-    // Pool allocation may yield. Recheck after it completes, without holding a ledger borrow
-    // across the yield, so a re-entrant projection cannot publish the same source role twice.
+    Ok(ReservedTokenProjection {
+        provider_inst,
+        provider_domain,
+        address,
+        exec_va,
+    })
+}
+
+pub(super) unsafe fn release_reserved(
+    reserved: ReservedTokenProjection,
+) -> Result<(), ReservedTokenProjection> {
+    if free_hosted_instance_pool_allocation_exact(reserved.provider_inst, reserved.address) {
+        Ok(())
+    } else {
+        Err(reserved)
+    }
+}
+
+/// Bind one reserved provider-local address to an exact retained canonical token. This phase
+/// performs no provider IPC or pool operation and may run under a short TokenStore borrow.
+pub(super) unsafe fn bind(
+    reserved: ReservedTokenProjection,
+    source_inst: DriverInstance,
+    source: &SourceCreateSecurityOwner,
+    ticket: SourceCreateSecurityTicket,
+    key: SourceCreateSecurityKey,
+    role: SubjectTokenRole,
+    tokens: &mut TokenStore,
+) -> Result<ProjectedToken, (i32, ReservedTokenProjection)> {
+    if !source_matches(source_inst, key)
+        || source.ticket() != ticket
+        || source.key() != key
+        || matches!(
+            source.phase(),
+            SourceCreateSecurityPhase::Terminal | SourceCreateSecurityPhase::Released
+        )
+    {
+        return Err((STATUS_INVALID_HANDLE_LOCAL, reserved));
+    }
+    let provider_inst = reserved.provider_inst;
+    let provider_domain = reserved.provider_domain;
+    if domain(provider_inst).ok() != Some(provider_domain) {
+        return Err((STATUS_INVALID_HANDLE_LOCAL, reserved));
+    }
+    let (primary, client) = match source.token_ids(tokens, ticket, key) {
+        Ok(ids) => ids,
+        Err(status) => return Err((status as i32, reserved)),
+    };
+    let token: TokenId = match role {
+        SubjectTokenRole::Primary => primary,
+        SubjectTokenRole::Client => match client {
+            Some(client) => client.token,
+            None => return Err((STATUS_INVALID_HANDLE_LOCAL, reserved)),
+        },
+    };
+    if (&mut *core::ptr::addr_of_mut!(ROWS))
+        .try_reserve(1)
+        .is_err()
+    {
+        return Err((STATUS_INSUFFICIENT_RESOURCES_LOCAL, reserved));
+    }
     let duplicate = (&*core::ptr::addr_of!(ROWS)).iter().any(|row| {
         row.source_ticket == ticket
             && row.source_key == key
@@ -161,21 +212,7 @@ pub(super) unsafe fn project(
             && row.role == role
     });
     if duplicate {
-        assert!(free_hosted_instance_pool_allocation_exact(
-            provider_inst,
-            address
-        ));
-        return Err(STATUS_DEVICE_BUSY_LOCAL);
-    }
-    if (&mut *core::ptr::addr_of_mut!(ROWS))
-        .try_reserve(1)
-        .is_err()
-    {
-        assert!(free_hosted_instance_pool_allocation_exact(
-            provider_inst,
-            address
-        ));
-        return Err(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
+        return Err((STATUS_DEVICE_BUSY_LOCAL, reserved));
     }
     if matches!(
         source.phase(),
@@ -187,26 +224,20 @@ pub(super) unsafe fn project(
         },
     ) != Ok(true)
     {
-        assert!(free_hosted_instance_pool_allocation_exact(
-            provider_inst,
-            address
-        ));
-        return Err(STATUS_INVALID_HANDLE_LOCAL);
+        return Err((STATUS_INVALID_HANDLE_LOCAL, reserved));
     }
     let registry = &mut *core::ptr::addr_of_mut!(REGISTRY);
-    let projection = match registry.bind(tokens, provider_domain, address, token) {
+    let projection = match registry.bind(tokens, provider_domain, reserved.address, token) {
         Ok(projection) => projection,
-        Err(error) => {
-            assert!(free_hosted_instance_pool_allocation_exact(
-                provider_inst,
-                address
-            ));
-            return Err(projection_status(error));
-        }
+        Err(error) => return Err((projection_status(error), reserved)),
     };
-    core::ptr::write_bytes(exec_va as *mut u8, 0, TOKEN_PROJECTION_BYTES as usize);
-    core::ptr::write_unaligned(exec_va as *mut u64, TOKEN_PROJECTION_MAGIC);
-    core::ptr::write_unaligned((exec_va + 8) as *mut u64, projection.generation());
+    core::ptr::write_bytes(
+        reserved.exec_va as *mut u8,
+        0,
+        TOKEN_PROJECTION_BYTES as usize,
+    );
+    core::ptr::write_unaligned(reserved.exec_va as *mut u64, TOKEN_PROJECTION_MAGIC);
+    core::ptr::write_unaligned((reserved.exec_va + 8) as *mut u64, projection.generation());
     (&mut *core::ptr::addr_of_mut!(ROWS)).push(Row {
         source_ticket: ticket,
         source_key: key,
@@ -219,10 +250,10 @@ pub(super) unsafe fn project(
         role,
         projection: Some(projection),
         retiring: false,
-        address,
+        address: reserved.address,
     });
     Ok(ProjectedToken {
-        address,
+        address: reserved.address,
         receipt: projection,
     })
 }
@@ -265,9 +296,53 @@ pub(super) unsafe fn query(
     metadata
 }
 
-/// Quiesce a projection only once the exact source CREATE has a genuine terminal result.
-/// A failed physical pool free leaves a retired, non-queryable row for explicit retry.
-pub(super) unsafe fn retire(
+pub(super) unsafe fn verify_bound(
+    provider_inst: DriverInstance,
+    projected: ProjectedToken,
+    tokens: &TokenStore,
+) -> Result<ProviderTokenProjection, i32> {
+    let row = (&*core::ptr::addr_of!(ROWS))
+        .iter()
+        .find(|row| {
+            row.address == projected.address
+                && row.projection == Some(projected.receipt)
+                && !row.retiring
+                && provider_matches(row, provider_inst)
+        })
+        .ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
+    let registry = &mut *core::ptr::addr_of_mut!(REGISTRY);
+    if registry.registration(row.provider_domain, projected.address) != Some(projected.receipt) {
+        return Err(STATUS_INVALID_HANDLE_LOCAL);
+    }
+    registry
+        .reference(tokens, projected.receipt)
+        .map_err(projection_status)?;
+    let result = registry
+        .resolve(tokens, projected.receipt)
+        .map_err(projection_status)
+        .and_then(|_| {
+            let luid = projected.receipt.token_luid();
+            let generation = (luid.low as u64) | ((luid.high as u32 as u64) << 32);
+            if generation == 0 {
+                return Err(STATUS_INVALID_HANDLE_LOCAL);
+            }
+            Ok(ProviderTokenProjection {
+                address: GuestAddr(projected.address),
+                token_id: u64::from(projected.receipt.token().raw()),
+                token_generation: generation,
+                domain_id: row.provider_domain.id(),
+                domain_cookie: row.provider_domain.cookie(),
+            })
+        });
+    registry
+        .dereference(projected.receipt)
+        .expect("verified token projection held exact reference");
+    result
+}
+
+/// Quiesce a projection only after genuine terminal completion. This phase retains the row but
+/// removes token authority without a provider IPC or pool operation.
+pub(super) unsafe fn retire_binding(
     source_inst: DriverInstance,
     provider_inst: DriverInstance,
     source: &SourceCreateSecurityOwner,
@@ -275,7 +350,7 @@ pub(super) unsafe fn retire(
     key: SourceCreateSecurityKey,
     address: u64,
     tokens: &mut TokenStore,
-) -> Result<(), i32> {
+) -> Result<RetiringTokenProjection, i32> {
     if !source_matches(source_inst, key)
         || source.ticket() != ticket
         || source.key() != key
@@ -295,14 +370,43 @@ pub(super) unsafe fn retire(
         (&mut *core::ptr::addr_of_mut!(ROWS))[index].projection = None;
     }
     (&mut *core::ptr::addr_of_mut!(ROWS))[index].retiring = true;
-    if !free_hosted_instance_pool_allocation_exact(provider_inst, address) {
-        let index = retirement_row(source_inst, provider_inst, ticket, key, address)
-            .expect("retiring token projection retained across pool operation");
-        (&mut *core::ptr::addr_of_mut!(ROWS))[index].retiring = false;
-        return Err(STATUS_DEVICE_BUSY_LOCAL);
+    Ok(RetiringTokenProjection {
+        source_ticket: ticket,
+        source_key: key,
+        source_inst,
+        provider_inst,
+        address,
+    })
+}
+
+/// Free the now non-queryable storage outside the TokenStore borrow. A failed free keeps the
+/// row and receipt for an explicit retry; it does not resurrect the token projection.
+pub(super) unsafe fn free_retired(
+    retiring: RetiringTokenProjection,
+) -> Result<(), (i32, RetiringTokenProjection)> {
+    let Some(index) = retirement_row(
+        retiring.source_inst,
+        retiring.provider_inst,
+        retiring.source_ticket,
+        retiring.source_key,
+        retiring.address,
+    ) else {
+        return Err((STATUS_INVALID_HANDLE_LOCAL, retiring));
+    };
+    if !(&*core::ptr::addr_of!(ROWS))[index].retiring {
+        return Err((STATUS_INVALID_HANDLE_LOCAL, retiring));
     }
-    let index = retirement_row(source_inst, provider_inst, ticket, key, address)
-        .expect("retiring token projection retained across pool operation");
+    if !free_hosted_instance_pool_allocation_exact(retiring.provider_inst, retiring.address) {
+        return Err((STATUS_DEVICE_BUSY_LOCAL, retiring));
+    }
+    let index = retirement_row(
+        retiring.source_inst,
+        retiring.provider_inst,
+        retiring.source_ticket,
+        retiring.source_key,
+        retiring.address,
+    )
+    .expect("retiring projection row retained across pool free");
     (&mut *core::ptr::addr_of_mut!(ROWS)).swap_remove(index);
     Ok(())
 }

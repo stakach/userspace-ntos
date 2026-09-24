@@ -80,6 +80,10 @@ mod hosted_file_lifecycle_owners;
 mod hosted_file_retirements;
 #[path = "hosted_source_irp_ledger.rs"]
 mod hosted_source_irp_ledger;
+#[path = "hosted_source_create_security.rs"]
+mod hosted_source_create_security;
+#[path = "hosted_query_path_capture.rs"]
+mod hosted_query_path_capture;
 #[path = "driver_hosted_token_projection.rs"]
 mod driver_hosted_token_projection;
 #[path = "hosted_file_objects.rs"]

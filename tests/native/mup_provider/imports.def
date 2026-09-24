@@ -1,0 +1,10 @@
+LIBRARY ntoskrnl.exe
+EXPORTS
+    IoCreateDevice
+    IoDeleteDevice
+    IofCompleteRequest
+    ZwCreateFile
+    ZwFsControlFile
+    ZwWaitForSingleObject
+    ZwClose
+    DbgPrint
