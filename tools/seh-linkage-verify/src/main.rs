@@ -10,7 +10,7 @@ use nt_unwind::{
 };
 use sha2::{Digest, Sha256};
 
-const EXPORTS: [&str; 11] = [
+const EXPORTS: [&str; 13] = [
     "SehCallFilter",
     "SehCallFinally",
     "SehExecuteHandlerForException",
@@ -22,6 +22,8 @@ const EXPORTS: [&str; 11] = [
     "SehUnwindDispatch",
     "SehForeignCall2",
     "SehForeignCall16",
+    "SehFaultEntry",
+    "SehFaultDispatch",
 ];
 const RAISE_PROLOGUE: [u8; 8] = [0x9c, 0x48, 0x81, 0xec, 0xf0, 0x04, 0x00, 0x00];
 const RAISE_UNWIND_CODES: [u8; 6] = [8, 1, 0x9e, 0, 1, 2];
@@ -90,6 +92,12 @@ const FOREIGN_CALL16_FUNCTION_LEN: u32 = 156;
 const FOREIGN_CALL16_CODE_SHA256: [u8; 32] = [
     0x6e, 0x87, 0x20, 0x6b, 0x31, 0x6d, 0x89, 0x46, 0x78, 0xc9, 0x86, 0xee, 0x88, 0x6e, 0x3c, 0x41,
     0xed, 0x6d, 0xc2, 0xc5, 0xcc, 0xa7, 0xb0, 0x58, 0x89, 0x7b, 0xcd, 0x15, 0x77, 0xb1, 0x0d, 0x8c,
+];
+// The token-preserving Win64 fault entry, including both terminal UD2 paths.
+const FAULT_ENTRY_FUNCTION_LEN: u32 = 20;
+const FAULT_ENTRY_CODE_SHA256: [u8; 32] = [
+    0x1a, 0xc6, 0x58, 0x42, 0xc7, 0xc4, 0x67, 0xf7, 0x72, 0xad, 0xc8, 0x15, 0x9a, 0x35, 0x30, 0xd0,
+    0x4a, 0x54, 0xcb, 0x6b, 0xf3, 0xb2, 0x93, 0xe3, 0xd9, 0x05, 0xba, 0xca, 0x76, 0x6c, 0x64, 0x4d,
 ];
 const NESTED_HANDLER: [u8; 32] = [
     0xb8, 1, 0, 0, 0, // ExceptionContinueSearch
@@ -392,7 +400,7 @@ fn verify_unwind_entry(
     Ok(())
 }
 
-fn verify_raise_dispatch_slot(
+fn verify_dispatch_slot(
     pe: &PeFile<'_>,
     mapped: &nt_pe_loader::MappedImage,
     export: &ExportedSymbol,
@@ -406,8 +414,68 @@ fn verify_raise_dispatch_slot(
                 && !section.is_executable()
         })
     {
-        return Err("raise dispatch slot is not zeroed RO_NX data".into());
+        return Err(format!("{} is not zeroed RO_NX data", export.name));
     }
+    Ok(())
+}
+
+fn verify_fault_entry(
+    pe: &PeFile<'_>,
+    mapped: &nt_pe_loader::MappedImage,
+    image: &BorrowedExceptionImage<'_>,
+    export: &ExportedSymbol,
+) -> Result<(), String> {
+    let pc = mapped
+        .load_base
+        .checked_add(u64::from(export.rva))
+        .ok_or("fault entry VA overflow")?;
+    let function = match image.lookup_exception_function(pc) {
+        Ok(ExceptionFunction::Function {
+            image_base,
+            function,
+        }) if image_base == mapped.load_base && function.begin == export.rva => function,
+        other => return Err(format!("fault entry lacks exact runtime function: {other:?}")),
+    };
+    let header: [u8; 4] = mapped
+        .bytes
+        .get(function.unwind_info as usize..function.unwind_info as usize + 4)
+        .ok_or("fault entry unwind header outside image")?
+        .try_into()
+        .map_err(|_| "fault entry unwind header malformed")?;
+    let header = UnwindInfoHeader::parse(&header);
+    let code = mapped
+        .bytes
+        .get(function.begin as usize..function.end as usize)
+        .ok_or("fault entry body outside image")?;
+    let digest = Sha256::digest(code);
+    if !valid_unwind_header(header, 0)
+        || !frame_encoding_is_exact(&mapped.bytes, export.rva, function.unwind_info)
+        || function.end - function.begin != FAULT_ENTRY_FUNCTION_LEN
+        || code.get(code.len().saturating_sub(2)..) != Some(&[0x0f, 0x0b][..])
+        || digest.as_slice() != FAULT_ENTRY_CODE_SHA256
+        || !pe.sections().iter().any(|section| {
+            section.name_str() == ".text"
+                && section_contains(section, export.rva, code.len())
+                && section.is_readable()
+                && section.is_executable()
+                && !section.is_writable()
+        })
+        || !pe.sections().iter().any(|section| {
+            section_contains(section, function.unwind_info, 6)
+                && section.is_readable()
+                && !section.is_writable()
+                && !section.is_executable()
+        })
+    {
+        return Err(format!(
+            "fault entry code or unwind metadata invalid: len={} sha256={digest:x}",
+            code.len()
+        ));
+    }
+    println!(
+        "{} RVA=0x{:x} unwind=0x{:x} flags={}",
+        export.name, export.rva, function.unwind_info, header.flags
+    );
     Ok(())
 }
 
@@ -637,8 +705,11 @@ fn verify(path: &str) -> Result<(), String> {
     let mut nested_handler = None;
     let mut collided_handler = None;
     for export in exports {
-        if export.name == "SehRaiseDispatch" || export.name == "SehUnwindDispatch" {
-            verify_raise_dispatch_slot(&pe, &mapped, &export)?;
+        if export.name == "SehRaiseDispatch"
+            || export.name == "SehUnwindDispatch"
+            || export.name == "SehFaultDispatch"
+        {
+            verify_dispatch_slot(&pe, &mapped, &export)?;
             continue;
         }
         if export.name == "SehRaiseStatus" {
@@ -651,6 +722,10 @@ fn verify(path: &str) -> Result<(), String> {
         }
         if export.name == "SehResumeContext" {
             verify_resume_entry(&pe, &mapped, &image, &export)?;
+            continue;
+        }
+        if export.name == "SehFaultEntry" {
+            verify_fault_entry(&pe, &mapped, &image, &export)?;
             continue;
         }
         if export.name == "SehForeignCall2" {

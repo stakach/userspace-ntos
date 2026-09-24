@@ -18,6 +18,7 @@
  * uint64_t SehForeignCall2(uint64_t (*target)(uint64_t, uint64_t),
  *                          uint64_t arg1, uint64_t arg2);
  * uint64_t SehForeignCall16(uint64_t target, const uint64_t *args, uint64_t count);
+ * void SehFaultEntry(uint64_t token);  // does not return
  */
 
     .text
@@ -225,6 +226,20 @@ SehResumeContext:
     ud2
     .seh_endproc
 
+    .globl SehFaultEntry
+    .seh_proc SehFaultEntry
+SehFaultEntry:
+    subq $40, %rsp
+    .seh_stackalloc 40
+    .seh_endprologue
+    movq SehFaultDispatch(%rip), %rax
+    testq %rax, %rax
+    jz .Lfault_unbound
+    callq *%rax
+.Lfault_unbound:
+    ud2
+    .seh_endproc
+
     .globl SehCallFilter
     .seh_proc SehCallFilter
 SehCallFilter:
@@ -411,4 +426,8 @@ SehRaiseDispatch:
     .p2align 3
     .globl SehUnwindDispatch
 SehUnwindDispatch:
+    .quad 0
+    .p2align 3
+    .globl SehFaultDispatch
+SehFaultDispatch:
     .quad 0

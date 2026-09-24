@@ -20,7 +20,8 @@ mkdir -p "$OUT"
     /export:SehForeignCall16 \
     /export:SehExecuteHandlerForException /export:SehExecuteHandlerForUnwind \
     /export:SehRaiseStatus /export:SehUnwindEx /export:SehResumeContext \
-    /export:SehRaiseDispatch,DATA /export:SehUnwindDispatch,DATA \
+    /export:SehFaultEntry /export:SehRaiseDispatch,DATA \
+    /export:SehUnwindDispatch,DATA /export:SehFaultDispatch,DATA \
     "/out:$OUT/nt-seh-linkage.dll" "$OUT/seh_linkage.obj"
 cargo run --manifest-path "$ROOT/Cargo.toml" -p seh-linkage-verify -- \
     "$OUT/nt-seh-linkage.dll"
