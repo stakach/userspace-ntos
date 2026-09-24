@@ -23,6 +23,7 @@ pub mod se_exports;
 mod sid;
 pub mod subject_context;
 pub mod source_create_security;
+pub mod hosted_token_projection;
 mod token;
 mod token_filter;
 mod token_info;
@@ -85,6 +86,10 @@ pub use port::{
 pub use sid::{write_native_sid_sddl_utf16, Luid, Sid, STATUS_INVALID_SID};
 pub use subject_context::{
     CapturedClientToken, CapturedSubjectContext, CapturedSubjectTokens, SubjectClientIdentity,
+};
+pub use hosted_token_projection::{
+    HostedTokenProjection, HostedTokenProjectionDomain, HostedTokenProjectionError,
+    HostedTokenProjectionRegistry,
 };
 pub use token::{
     plan_client_impersonation, token_can_impersonate, AccessToken, AnonymousLogonTokenIds,
