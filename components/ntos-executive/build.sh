@@ -6,6 +6,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+mkdir -p ../../rust-micro/.tmp
+SEH_LINKAGE_STAGE=../../rust-micro/.tmp/nt-seh-linkage.dll
+rm -f "$SEH_LINKAGE_STAGE" ../../rust-micro/.tmp/rootserver.elf
+
 # Extra args are forwarded to cargo — e.g. `./build.sh --features debug-trace` to enable
 # the grind-era verbose trace diagnostics. The DEFAULT build (no args) is feature-off = ships.
 cargo +nightly build \
@@ -17,7 +21,10 @@ cargo +nightly build \
   --release \
   "$@"
 
-mkdir -p ../../rust-micro/.tmp
+bash ../nt-seh-linkage/build.sh
+cp ../../.tmp/nt-seh-linkage/nt-seh-linkage.dll "$SEH_LINKAGE_STAGE"
+echo "SEH linkage staged: rust-micro/.tmp/nt-seh-linkage.dll"
+
 cp target/triplet/release/ntos-executive ../../rust-micro/.tmp/rootserver.elf
 echo "ntos-executive staged: rust-micro/.tmp/rootserver.elf"
 

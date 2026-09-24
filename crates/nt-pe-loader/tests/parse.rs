@@ -2,7 +2,8 @@
 //! import listing, and malformed-image rejection (no panics).
 
 use nt_pe_loader::{
-    image_directory_entry, image_nt_header_offset, ImageProtection, ImportRef,
+    image_directory_entry, image_nt_header_offset, immutable_support_image,
+    immutable_support_image::ImmutableSupportImageError, ImageProtection, ImportRef,
     LoaderWritablePageState, PeError, PeFile, Protection,
 };
 
@@ -103,6 +104,92 @@ fn text_section(va: u32, data: Vec<u8>) -> Sec {
 }
 
 const BASE: u64 = 0x1_4000_0000;
+
+fn immutable_support_fixture() -> Vec<u8> {
+    let mut bytes = build_pe(
+        BASE,
+        0,
+        0x3000,
+        &[
+            text_section(0x1000, vec![0x90, 0xc3]),
+            Sec {
+                name: *b".rdata\0\0",
+                va: 0x2000,
+                chars: 0x4000_0040,
+                data: vec![0x11; 32],
+            },
+        ],
+        &[],
+    );
+    put_u16(&mut bytes, NT_OFF + 4 + 18, 0x2002);
+    bytes
+}
+
+fn immutable_result(bytes: &[u8]) -> Result<(), ImmutableSupportImageError> {
+    immutable_support_image::validate(&PeFile::parse(bytes).unwrap())
+}
+
+#[test]
+fn immutable_support_image_requires_exact_import_free_dll_policy() {
+    let valid = immutable_support_fixture();
+    assert_eq!(immutable_result(&valid), Ok(()));
+
+    let mut bytes = valid.clone();
+    put_u16(&mut bytes, NT_OFF + 4 + 18, 0x0002);
+    assert_eq!(immutable_result(&bytes), Err(ImmutableSupportImageError::NotDll));
+
+    let mut bytes = valid.clone();
+    put_u32(&mut bytes, OPT_OFF + 16, 0x1000);
+    assert_eq!(immutable_result(&bytes), Err(ImmutableSupportImageError::EntryPoint));
+
+    for directory in [1, 12] {
+        let mut bytes = valid.clone();
+        put_u32(&mut bytes, OPT_OFF + 112 + directory * 8, 0x2000);
+        assert_eq!(
+            immutable_result(&bytes),
+            Err(ImmutableSupportImageError::ImportDirectory)
+        );
+    }
+    for (directory, error) in [
+        (9, ImmutableSupportImageError::Tls),
+        (13, ImmutableSupportImageError::DelayImports),
+    ] {
+        let mut bytes = valid.clone();
+        put_u32(&mut bytes, OPT_OFF + 112 + directory * 8, 0x2000);
+        assert_eq!(immutable_result(&bytes), Err(error));
+    }
+}
+
+#[test]
+fn immutable_support_image_rejects_writable_shared_and_overlapping_pages() {
+    let valid = immutable_support_fixture();
+    for characteristics in [0xc000_0040, 0x5000_0040, 0x0000_0040] {
+        let mut bytes = valid.clone();
+        put_u32(&mut bytes, SECTION_TABLE + 40 + 36, characteristics);
+        assert_eq!(
+            immutable_result(&bytes),
+            Err(ImmutableSupportImageError::InvalidSection)
+        );
+    }
+    let mut bytes = valid.clone();
+    put_u32(&mut bytes, SECTION_TABLE + 40 + 12, 0x1000);
+    assert_eq!(
+        immutable_result(&bytes),
+        Err(ImmutableSupportImageError::SectionOverlap)
+    );
+    let mut bytes = valid.clone();
+    put_u32(&mut bytes, SECTION_TABLE + 40 + 12, 0x1800);
+    assert_eq!(
+        immutable_result(&bytes),
+        Err(ImmutableSupportImageError::InvalidSection)
+    );
+    let mut bytes = valid.clone();
+    put_u32(&mut bytes, SECTION_TABLE + 36, 0x4000_0040);
+    assert_eq!(
+        immutable_result(&bytes),
+        Err(ImmutableSupportImageError::NoExecutableSection)
+    );
+}
 
 #[test]
 fn stack_sizes_report_exact_pe32_plus_fields_without_sizing_policy() {

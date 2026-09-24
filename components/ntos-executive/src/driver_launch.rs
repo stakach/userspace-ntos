@@ -16447,6 +16447,10 @@ struct PlannedHostedImages {
     dependencies: Vec<PlannedDependencyImage>,
     primary_offset: u64,
     private_dependency_offset: u64,
+    auxiliary_src_va: u64,
+    auxiliary_src_size: u32,
+    auxiliary_offset: u64,
+    auxiliary_image_len: u32,
     executable_thunk_offset: u64,
     executable_thunk_frames: u64,
     total_frames: u64,
@@ -35612,6 +35616,14 @@ fn frames_for_image_len(len: u64) -> Option<u64> {
     Some(align_up_4k(len)? / 0x1000)
 }
 
+const HOSTED_AUXILIARY_PE_PATH: &[u8] = b"reactos\\system32\\nt-seh-linkage.dll";
+
+fn hosted_auxiliary_pe(source: &[u8]) -> Option<nt_pe_loader::PeFile<'_>> {
+    let pe = nt_pe_loader::PeFile::parse(source).ok()?;
+    nt_pe_loader::immutable_support_image::validate(&pe).ok()?;
+    Some(pe)
+}
+
 fn hosted_image_frame_capacity(win: ExecVaWindow) -> u64 {
     let mut limit = FSD_CODE_VA + FSD_IMAGE_MAX_FRAMES * 0x1000;
     for next in [
@@ -35671,7 +35683,9 @@ unsafe fn plan_hosted_images(
 
     let primary_image_len = raw_pe_size_of_image(primary_src_va, primary_src_size)? as u64;
     let mut private_lens = Vec::<u64>::new();
-    private_lens.try_reserve_exact(dependencies.len()).ok()?;
+    private_lens
+        .try_reserve_exact(dependencies.len().checked_add(1)?)
+        .ok()?;
     let mut idx = 0usize;
     while idx < dependencies.len() {
         private_lens
@@ -35680,6 +35694,31 @@ unsafe fn plan_hosted_images(
             );
         idx += 1;
     }
+    let (auxiliary_src_va, auxiliary_src_size) =
+        match load_file_to_pool(fs, HOSTED_AUXILIARY_PE_PATH) {
+            Some(source) => source,
+            None => {
+                print_str(b"[driver-launch] OS support PE missing: ");
+                print_str(HOSTED_AUXILIARY_PE_PATH);
+                print_str(b"\n");
+                return None;
+            }
+        };
+    let auxiliary_source =
+        core::slice::from_raw_parts(auxiliary_src_va as *const u8, auxiliary_src_size as usize);
+    let auxiliary_image_len = match hosted_auxiliary_pe(auxiliary_source) {
+        Some(pe) => pe.size_of_image(),
+        None => {
+            print_str(b"[driver-launch] OS support PE rejected: ");
+            print_str(HOSTED_AUXILIARY_PE_PATH);
+            print_str(b"\n");
+            return None;
+        }
+    };
+    if auxiliary_image_len == 0 {
+        return None;
+    }
+    private_lens.push(auxiliary_image_len as u64);
     let layout = match plan_hosted_driver_image(
         primary_image_len,
         &private_lens,
@@ -35704,7 +35743,11 @@ unsafe fn plan_hosted_images(
             expected_private_offset.checked_add(align_up_4k(private_lens[idx])?)?;
         idx += 1;
     }
-    if expected_private_offset != layout.total_image_len {
+    let auxiliary_offset = expected_private_offset;
+    if auxiliary_offset & 0xfff != 0
+        || auxiliary_offset.checked_add(align_up_4k(auxiliary_image_len as u64)?)?
+            != layout.total_image_len
+    {
         return None;
     }
 
@@ -35735,6 +35778,10 @@ unsafe fn plan_hosted_images(
         dependencies,
         primary_offset: layout.primary_offset,
         private_dependency_offset: layout.private_dependency_offset,
+        auxiliary_src_va,
+        auxiliary_src_size,
+        auxiliary_offset,
+        auxiliary_image_len,
         executable_thunk_offset,
         executable_thunk_frames,
         total_frames,
@@ -36349,6 +36396,58 @@ unsafe fn load_hosted_dependency_images(
     Some(support_images)
 }
 
+/// Map a read-only OS support PE into this domain's own image frames. Its relocations are
+/// computed for the component VA; only the trusted executive alias writes the mapped bytes.
+unsafe fn load_hosted_auxiliary_image(
+    plan: &PlannedHostedImages,
+    instance: usize,
+    code_va: u64,
+    run_va: u64,
+    image_frames: u64,
+    rights: &mut [u64],
+) -> Option<nt_unwind::exception_images::AdmittedExceptionImage> {
+    let source = core::slice::from_raw_parts(
+        plan.auxiliary_src_va as *const u8,
+        plan.auxiliary_src_size as usize,
+    );
+    let pe = hosted_auxiliary_pe(source)?;
+    if pe.size_of_image() != plan.auxiliary_image_len || plan.auxiliary_offset & 0xfff != 0 {
+        return None;
+    }
+    let frame_offset = plan.auxiliary_offset / 0x1000;
+    let frame_count = frames_for_image_len(plan.auxiliary_image_len as u64)?;
+    if frame_offset.checked_add(frame_count)? > image_frames {
+        return None;
+    }
+    let exec_va = code_va.checked_add(plan.auxiliary_offset)?;
+    let component_va = run_va.checked_add(plan.auxiliary_offset)?;
+    let mapped = pe.map(component_va).ok()?;
+    if mapped.bytes.len() != plan.auxiliary_image_len as usize {
+        return None;
+    }
+    let frame_rights = rights.get_mut(frame_offset as usize..(frame_offset + frame_count) as usize)?;
+    frame_rights.fill(RO_NX);
+    for section in pe.sections() {
+        let span = u64::from(section.virtual_size.max(section.size_of_raw_data));
+        if span == 0 {
+            continue;
+        }
+        let start = u64::from(section.virtual_address);
+        if start & 0xfff != 0 || start.checked_add(span)? > plan.auxiliary_image_len as u64 {
+            return None;
+        }
+        if section.is_executable() {
+            let first = (start / 0x1000) as usize;
+            let end = (align_up_4k(start.checked_add(span)?)? / 0x1000) as usize;
+            for right in frame_rights.get_mut(first..end)? {
+                *right = 2; // RX; no component write capability for linkage code.
+            }
+        }
+    }
+    copy_bytes(exec_va, mapped.bytes.as_ptr() as u64, mapped.bytes.len() as u64);
+    hosted_exception_images::capture(instance, exec_va, component_va, plan.auxiliary_image_len)
+}
+
 /// GENERAL dynamic driver launch: load the `.sys` at `path` by-path from the FS, IAT-patch it, spawn
 /// it as an ISOLATED component (per its `class`), run its real DriverEntry, and return the live
 /// [`DriverComponent`]. The FSD/Filter/Device classes are all routed through this ONE Family-A IRP
@@ -36573,7 +36672,7 @@ unsafe fn load_driver_reserved(
     let exception_image_count = planned_images
         .dependencies
         .len()
-        .checked_add(1)
+        .checked_add(2)
         .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     exception_images
         .try_reserve_exact(exception_image_count)
@@ -36619,6 +36718,17 @@ unsafe fn load_driver_reserved(
     exception_images.push(
         hosted_exception_images::capture(instance, primary_exec_va, primary_run_va, image_len)
             .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?,
+    );
+    exception_images.push(
+        load_hosted_auxiliary_image(
+            &planned_images,
+            instance,
+            code_va,
+            run_va,
+            img_frames,
+            rights,
+        )
+        .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?,
     );
     let exception_catalog = hosted_exception_images::catalog(instance, exception_images)
         .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?;

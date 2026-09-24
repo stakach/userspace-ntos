@@ -134,7 +134,9 @@ self-contained launcher that:
    redistributable — the executive loads them via `SEC_IMAGE` and runs their
    real user-mode binaries through this project's Rust `ntdll.dll` implementation.
 4. **Builds** the Rust `ntdll.dll`, `ntos-executive` (the NT executive that
-   hosts the ReactOS processes), and the kernel, then packs the FAT32/UEFI disk image.
+   hosts the ReactOS processes), the verified `nt-seh-linkage.dll` support image,
+   and the kernel, then packs the FAT32/UEFI disk image. The support image is
+   mapped into hosted driver domains; native SEH dispatch is not wired yet.
 5. **Boots QEMU.**
 
 ### Historical boot output

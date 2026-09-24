@@ -14,14 +14,15 @@ extern crate alloc;
 mod exports;
 mod headers;
 mod image;
+pub mod immutable_support_image;
 mod imports;
 mod relocs;
 mod rva;
 
 pub use exports::ExportedSymbol;
 pub use headers::{
-    DataDirectory, Headers, Section, DIRECTORY_ENTRY_EXPORT, DIRECTORY_ENTRY_RESOURCE,
-    DIRECTORY_ENTRY_TLS,
+    DataDirectory, Headers, Section, DIRECTORY_ENTRY_DELAY_IMPORT, DIRECTORY_ENTRY_EXPORT,
+    DIRECTORY_ENTRY_RESOURCE, DIRECTORY_ENTRY_TLS,
 };
 pub use image::MappedImage;
 pub use imports::{ImportRef, ImportedDll};
