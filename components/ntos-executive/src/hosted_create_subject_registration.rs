@@ -73,6 +73,13 @@ pub(super) unsafe fn service(
     if !hosted_source_create_security::live_context(source, security_context) {
         return (STATUS_INVALID_HANDLE_LOCAL, 0, 0);
     }
+    let create_access = match hosted_source_create_security::capture_create_access(
+        source,
+        security_context,
+    ) {
+        Ok(captured) => captured,
+        Err(status) => return (status as i32, 0, 0),
+    };
     let captured = crate::with_provider_security_managers(|pm, tokens| {
         if !pm.validate_thread_lifetime(thread) {
             return Err(STATUS_INVALID_HANDLE_LOCAL as u32);
@@ -90,6 +97,7 @@ pub(super) unsafe fn service(
             primary,
             client,
             u64::from(thread.process_id()),
+            create_access,
             tokens,
         )
     });

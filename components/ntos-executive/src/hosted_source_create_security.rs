@@ -139,7 +139,7 @@ pub(super) unsafe fn live_context(inst: DriverInstance, address: u64) -> bool {
     }
 }
 
-unsafe fn capture_create_access(
+pub(super) unsafe fn capture_create_access(
     source: DriverInstance,
     context_address: u64,
 ) -> Result<CapturedCreateAccess, u32> {
@@ -217,12 +217,12 @@ pub(super) unsafe fn capture(
     primary: TokenId,
     client: Option<SubjectClientIdentity>,
     process_audit_id: u64,
+    create_access: CapturedCreateAccess,
     tokens: &mut TokenStore,
 ) -> Result<SourceSecurityIdentity, u32> {
     if !live_source(source) {
         return Err(STATUS_INVALID_HANDLE_LOCAL);
     }
-    let create_access = capture_create_access(source, security_context_address)?;
     let serial = NEXT_TICKET
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             next.checked_add(1)
