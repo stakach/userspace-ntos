@@ -16,6 +16,7 @@ const EFLAGS_OFFSET: usize = 0x44;
 const GPR_OFFSET: usize = 0x78;
 const RIP_OFFSET: usize = 0xf8;
 const FXSAVE_MXCSR_OFFSET: usize = 0x118;
+const FXSAVE_MXCSR_MASK_OFFSET: usize = 0x11c;
 const XMM_OFFSET: usize = 0x1a0;
 
 /// Control, integer, and floating-point state in the NT AMD64 `ContextFlags` field.
@@ -28,6 +29,16 @@ pub enum RawContextCaptureError {
     OutOfBounds,
     Unreadable,
     InvalidFlags,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RawContextRestoreError {
+    InvalidFlags,
+    Stack,
+    InstructionAddress,
+    Segments,
+    Eflags,
+    Mxcsr,
 }
 
 /// Opaque native record. No Rust reference to a typed register field is formed from raw bytes.
@@ -225,6 +236,58 @@ impl RawContext {
         self.set_rip(context.rip);
     }
 
+    /// Validate a handler-modified record against its owned capture before native restore.
+    /// The caller must additionally authenticate the lane and writable stack mapping under its
+    /// physical dispatch lease; `admitted_pc` must consult that same instance's executable map.
+    pub fn validate_restore(
+        &self,
+        captured: &Self,
+        stack_low: u64,
+        stack_high: u64,
+        admitted_pc: impl FnOnce(u64) -> bool,
+    ) -> Result<(), RawContextRestoreError> {
+        if self.context_flags() & CONTEXT_AMD64_FULL_SEGMENTS != CONTEXT_AMD64_FULL_SEGMENTS
+            || self.context_flags() != captured.context_flags()
+        {
+            return Err(RawContextRestoreError::InvalidFlags);
+        }
+        let rsp = self.rsp();
+        if rsp & 7 != 0
+            || stack_low >= stack_high
+            || rsp
+                .checked_sub(32)
+                .is_none_or(|scratch| scratch < stack_low)
+            || rsp > stack_high
+        {
+            return Err(RawContextRestoreError::Stack);
+        }
+        let rip = self.rip();
+        let sign_extension = if rip & (1 << 47) != 0 { 0xffff } else { 0 };
+        if rip >> 48 != sign_extension || !admitted_pc(rip) {
+            return Err(RawContextRestoreError::InstructionAddress);
+        }
+        if (0..6).any(|index| self.segment(index) != captured.segment(index)) {
+            return Err(RawContextRestoreError::Segments);
+        }
+        // POPFQ may update arithmetic status flags. Keep direction, interrupt, trap, IOPL,
+        // and all reserved bits exactly as they were in the authenticated capture.
+        const ARITHMETIC_FLAGS: u32 = 0x8d5;
+        if captured.eflags() & 2 == 0
+            || (self.eflags() ^ captured.eflags()) & !ARITHMETIC_FLAGS != 0
+        {
+            return Err(RawContextRestoreError::Eflags);
+        }
+        let mask = match captured.read_u32(FXSAVE_MXCSR_MASK_OFFSET) {
+            0 => 0xffbf,
+            value => value,
+        };
+        let mxcsr = self.mxcsr();
+        if mxcsr != self.read_u32(FXSAVE_MXCSR_OFFSET) || mxcsr & !mask != 0 {
+            return Err(RawContextRestoreError::Mxcsr);
+        }
+        Ok(())
+    }
+
     fn read_u32(&self, offset: usize) -> u32 {
         let mut value = [0; 4];
         value.copy_from_slice(&self.bytes[offset..offset + 4]);
@@ -407,5 +470,98 @@ mod tests {
                 assert_eq!(*byte, 0xa5, "unmodelled byte at {offset:#x}");
             }
         }
+    }
+
+    fn restore_fixture() -> RawContext {
+        let mut raw = RawContext::zeroed();
+        raw.set_context_flags(CONTEXT_AMD64_FULL_SEGMENTS);
+        raw.set_rsp(0x3000);
+        raw.set_rip(0x4000);
+        raw.set_eflags(0x202);
+        raw.set_mxcsr(0x1f80);
+        raw.write_u32(FXSAVE_MXCSR_MASK_OFFSET, 0xffbf);
+        for index in 0..6 {
+            raw.set_segment(index, 0x20 + index as u16);
+        }
+        raw
+    }
+
+    fn validate_fixture(
+        raw: &RawContext,
+        captured: &RawContext,
+    ) -> Result<(), RawContextRestoreError> {
+        raw.validate_restore(captured, 0x2fe0, 0x4000, |rip| rip == 0x4000)
+    }
+
+    #[test]
+    fn restore_accepts_status_flags_and_register_updates() {
+        let captured = restore_fixture();
+        let mut restored = captured.clone();
+        restored.set_eflags(0x202 | 0x8d5);
+        restored.set_gpr(0, 0x1234);
+        restored.set_xmm(15, [0x5678, 0x9abc]);
+        assert_eq!(validate_fixture(&restored, &captured), Ok(()));
+    }
+
+    #[test]
+    fn restore_rejects_unowned_stack_and_unadmitted_pc() {
+        let captured = restore_fixture();
+        let mut restored = captured.clone();
+        restored.set_rsp(0x2ff8);
+        assert_eq!(
+            validate_fixture(&restored, &captured),
+            Err(RawContextRestoreError::Stack)
+        );
+        restored.set_rsp(0x3001);
+        assert_eq!(
+            validate_fixture(&restored, &captured),
+            Err(RawContextRestoreError::Stack)
+        );
+        restored.set_rsp(0x3000);
+        restored.set_rip(0x5000);
+        assert_eq!(
+            validate_fixture(&restored, &captured),
+            Err(RawContextRestoreError::InstructionAddress)
+        );
+        restored.set_rip(0x0001_0000_0000_0000);
+        assert_eq!(
+            validate_fixture(&restored, &captured),
+            Err(RawContextRestoreError::InstructionAddress)
+        );
+    }
+
+    #[test]
+    fn restore_rejects_changed_control_state() {
+        let captured = restore_fixture();
+        let mut restored = captured.clone();
+        restored.set_context_flags(CONTEXT_AMD64_FULL);
+        assert_eq!(
+            validate_fixture(&restored, &captured),
+            Err(RawContextRestoreError::InvalidFlags)
+        );
+        restored = captured.clone();
+        restored.set_segment(0, 0);
+        assert_eq!(
+            validate_fixture(&restored, &captured),
+            Err(RawContextRestoreError::Segments)
+        );
+        restored = captured.clone();
+        restored.set_eflags(0x602);
+        assert_eq!(
+            validate_fixture(&restored, &captured),
+            Err(RawContextRestoreError::Eflags)
+        );
+        restored = captured.clone();
+        restored.set_mxcsr(0x11f80);
+        assert_eq!(
+            validate_fixture(&restored, &captured),
+            Err(RawContextRestoreError::Mxcsr)
+        );
+        restored = captured.clone();
+        restored.write_u32(FXSAVE_MXCSR_OFFSET, 0);
+        assert_eq!(
+            validate_fixture(&restored, &captured),
+            Err(RawContextRestoreError::Mxcsr)
+        );
     }
 }
