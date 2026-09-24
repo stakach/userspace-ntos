@@ -10,6 +10,7 @@ use nt_io_manager::provider_create_delivery::{
 };
 use nt_process::native_handle::NativeThreadProcessReference;
 use nt_process::RoutedFileHandlePublication;
+use nt_security::{CapturedSubjectContext, SubjectClientIdentity};
 
 const STATUS_CANCELLED_LOCAL: u32 = 0xc000_0120;
 const STATUS_INSUFFICIENT_RESOURCES_LOCAL: u32 = 0xc000_009a;
@@ -27,6 +28,7 @@ struct Work {
     reply: u64,
     token: u64,
     actor: NativeThreadProcessReference,
+    subject: Option<CapturedSubjectContext>,
     publication: Option<RoutedFileHandlePublication>,
     delivery: Option<ProviderCreateDelivery>,
     file_id: Option<u64>,
@@ -88,14 +90,38 @@ pub(super) unsafe fn submit(
         Ok(actor) => actor,
         Err(status) => return rejected(status),
     };
+    let mut subject = match crate::with_provider_security_managers(|pm, tokens| {
+        pm.validate_native_handle_caller(captured.caller)?;
+        let original = captured.caller.original_thread();
+        let primary = pm.process_primary_token(original.process_id())
+            .ok_or(STATUS_INVALID_HANDLE as u32)?;
+        let client = pm.thread_impersonation(original.thread_id())
+            .map(|context| SubjectClientIdentity {
+                token: context.token,
+                level: context.level,
+            });
+        CapturedSubjectContext::capture(
+            tokens, primary, client, u64::from(original.process_id()),
+        )
+    }) {
+        Ok(subject) => subject,
+        Err(status) => {
+            let mut actor = actor;
+            crate::service_sec_image::with_provider_process_manager(|pm| actor.release(pm))
+                .expect("unadmitted provider CREATE actor");
+            return rejected(status);
+        }
+    };
     let slot = (&*core::ptr::addr_of!(WORK)).iter().enumerate().find_map(|(index, row)| {
         (row.is_none() && !(&*core::ptr::addr_of!(EXECUTING)).contains(&index))
             .then_some(index)
     });
     if slot.is_none() && (&mut *core::ptr::addr_of_mut!(WORK)).try_reserve(1).is_err() {
         let mut actor = actor;
-        crate::service_sec_image::with_provider_process_manager(|pm| actor.release(pm))
-            .expect("unadmitted provider CREATE actor");
+        crate::with_provider_security_managers(|pm, tokens| {
+            subject.release(tokens)?;
+            actor.release(pm)
+        }).expect("unadmitted provider CREATE owners");
         return rejected(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
     }
     let token = match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
@@ -104,13 +130,15 @@ pub(super) unsafe fn submit(
         Ok(token) => token,
         Err(_) => {
             let mut actor = actor;
-            crate::service_sec_image::with_provider_process_manager(|pm| actor.release(pm))
-                .expect("unadmitted provider CREATE actor");
+            crate::with_provider_security_managers(|pm, tokens| {
+                subject.release(tokens)?;
+                actor.release(pm)
+            }).expect("unadmitted provider CREATE owners");
             return rejected(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
         }
     };
     let work = Work {
-        captured, route, dispatch, reply, token, actor, publication: None,
+        captured, route, dispatch, reply, token, actor, subject: Some(subject), publication: None,
         delivery: None, file_id: None, completion_reserved: false,
         lifecycle_reserved: false, terminal: None, reply_completion: None,
         reply_entered: false, backend_ack_entered: false, completion_committed: false,
@@ -129,8 +157,10 @@ pub(super) unsafe fn submit(
     if runtime::park_retained_service(route, token).is_err() {
         let mut work = (&mut *core::ptr::addr_of_mut!(WORK))[index]
             .take().expect("unparked provider CREATE work");
-        crate::service_sec_image::with_provider_process_manager(|pm| work.actor.release(pm))
-            .expect("unparked provider CREATE actor");
+        crate::with_provider_security_managers(|pm, tokens| {
+            work.subject.as_mut().expect("unparked CREATE subject").release(tokens)?;
+            work.actor.release(pm)
+        }).expect("unparked provider CREATE owners");
         return rejected(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
     }
     SubmitResult::Deferred
@@ -341,6 +371,10 @@ impl Work {
     }
 
     unsafe fn release_actor(&mut self, handler: &mut ExecNtHandler) -> Result<(), u32> {
+        if let Some(subject) = self.subject.as_mut() {
+            subject.release(&mut handler.token_store)?;
+            self.subject = None;
+        }
         self.actor.release(&mut handler.pm)
     }
 
