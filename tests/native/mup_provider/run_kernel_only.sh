@@ -38,9 +38,10 @@ if [ "$rc" != 0 ] && [ "$rc" != 3 ]; then
   echo "Mup provider boot did not complete (runner status $rc): $RUN_LOG" >&2
   exit 1
 fi
+# An accepted MUP query requires completed provider registration; the long
+# registration DbgPrint can be interleaved with timer output on serial.
 if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || grep -Fq '[win32k-import] reject image' "$RUN_LOG" \
-   || ! grep -Eq '\[mup-provider-register\] status=0x00000000' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-query\] count=[1-9][0-9]* accepted=[1-9][0-9]* .*security=1' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-create\] probe-file created=[1-9][0-9]*' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-write\] count=[1-9][0-9]* bytes=10' "$RUN_LOG" \

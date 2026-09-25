@@ -122,20 +122,26 @@ pub(crate) unsafe fn submit(
         Ok(value) => value,
         Err(status) => return Some(status as i32),
     };
-    let offset_value = parameters.offset as i64;
-    let valid_offset = io_manager_mut().file(FileId(file_id)).is_some_and(|file| {
-        if file.device_id.raw() != device_id { return false; }
-        let synchronous = file.mode_state().io_mode()
-            .is_ok_and(|mode| mode.is_synchronous());
-        (offset_value >= nt_io_manager::FILE_USE_FILE_POINTER_POSITION)
-            && (offset_value != nt_io_manager::FILE_USE_FILE_POINTER_POSITION || synchronous)
-            && (granted & (FILE_WRITE_DATA | GENERIC_WRITE | GENERIC_ALL) != 0
-                || offset_value == nt_io_manager::FILE_WRITE_TO_END_OF_FILE)
-    });
-    if !valid_offset {
+    // Current-position and append writes require a serialized File position/EOF owner.
+    // This transport currently admits only explicit-offset asynchronous WRITE.
+    let write_admission = io_manager_mut().file(FileId(file_id)).map_or(
+        Err(STATUS_INVALID_HANDLE as u32),
+        |file| {
+            if file.device_id.raw() != device_id { return Err(STATUS_INVALID_HANDLE as u32); }
+            let synchronous = file.mode_state().io_mode()
+                .is_ok_and(|mode| mode.is_synchronous());
+            if synchronous || (parameters.offset as i64) < 0
+                || granted & (FILE_WRITE_DATA | GENERIC_WRITE | GENERIC_ALL) == 0
+            {
+                return Err(STATUS_NOT_SUPPORTED_LOCAL as u32);
+            }
+            Ok(())
+        },
+    );
+    if let Err(status) = write_admission {
         crate::service_sec_image::with_provider_process_manager(|pm| actor.release(pm))
             .expect("unentered hosted WRITE actor");
-        return Some(STATUS_INVALID_PARAMETER);
+        return Some(status as i32);
     }
     let file = match super::hosted_file_capture::capture(file_id, device_id, granted) {
         Ok(file) => file,
@@ -340,10 +346,11 @@ pub(super) extern "win64" fn s_zw_write_file(
     }
     if length != 0 && buffer == 0 { return STATUS_INVALID_PARAMETER; }
     let offset = if byte_offset == 0 {
-        nt_io_manager::FILE_USE_FILE_POINTER_POSITION as u64
+        return STATUS_NOT_SUPPORTED_LOCAL;
     } else {
         unsafe { read_unaligned(byte_offset as *const u64) }
     };
+    if (offset as i64) < 0 { return STATUS_NOT_SUPPORTED_LOCAL; }
     let key = if key == 0 { 0 } else { unsafe { read_unaligned(key as *const u32) } };
     let total = match HEADER_BYTES.checked_add(length as usize) {
         Some(total) if (total as u64) < FSD_POOL_FRAMES * 0x1000 => total,
@@ -367,7 +374,12 @@ pub(super) extern "win64" fn s_zw_write_file(
         (FSD_SERVICE_ZW_WRITE_FILE_LABEL << 12) | 4,
         packet, total as u64, file_handle, 0,
     ) };
-    let result = if label == 0 {
+    if label != 0 {
+        // An IPC error does not prove the retained remote request never read this packet.
+        // Stop this provider rather than freeing/reusing its shared allocation.
+        unsafe { crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_ZW_WRITE_FILE_LABEL, packet, label, status]); }
+    }
+    let result = {
         let completed = unsafe { read_unaligned((packet + COMPLETED_OFF) as *const u32) };
         if completed == 1 {
             let terminal = unsafe { read_unaligned((packet + STATUS_OFF) as *const u32) };
@@ -378,7 +390,7 @@ pub(super) extern "win64" fn s_zw_write_file(
             }
             terminal as i32
         } else { status as u32 as i32 }
-    } else { STATUS_INVALID_PARAMETER };
+    };
     unsafe { pool_free(packet) };
     result
 }
