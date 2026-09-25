@@ -497,6 +497,45 @@ mod tests {
     }
 
     #[test]
+    fn pending_cancel_keeps_target_until_exact_late_terminal_is_retired() {
+        let (mut io, prepared) = fixture(DeviceFlags::BUFFERED_IO);
+        let identity = prepared.identity();
+        let device = identity.target.device_id();
+        let held = io.device_reference_count(device);
+        let invocation = prepared.begin(&io, identity).unwrap();
+        let mut retained = match invocation
+            .returned(ReadForwardOutcome::Pending)
+            .finish(&io, identity)
+        {
+            ReadForwardResult::Retained(retained) => retained,
+            _ => panic!("pending provider must retain the target"),
+        };
+        assert!(!retained.is_indeterminate());
+        retained.request_cancel();
+        let mut wrong = identity;
+        wrong.source.generation = core::num::NonZeroU64::new(4).unwrap();
+        retained = match retained.complete(&io, wrong, completion(0xc0000120, 0, &[])) {
+            ReadForwardResult::Rejected {
+                error: ReadForwardError::WrongIdentity,
+                retained,
+            } => retained,
+            _ => panic!("wrong terminal cannot retire pending cancellation"),
+        };
+        assert!(retained.cancel_requested());
+        assert_eq!(io.device_reference_count(device), held);
+        let terminal = match retained.complete(&io, identity, completion(0xc0000120, 0, &[])) {
+            ReadForwardResult::Terminal(terminal) => terminal,
+            _ => panic!("exact late cancellation must become terminal"),
+        };
+        assert_eq!(io.device_reference_count(device), held);
+        let completion = terminal.retire(&mut io).unwrap();
+        assert_eq!(completion.status(), 0xc0000120);
+        assert_eq!(completion.information(), 0);
+        assert!(completion.bytes().is_empty());
+        assert_eq!(io.device_reference_count(device), held - 1);
+    }
+
+    #[test]
     fn pending_is_not_terminal_and_output_must_match_information_and_request() {
         for (completion, expected) in [
             (completion(0x103, 0, &[]), ReadForwardError::PendingTerminal),
