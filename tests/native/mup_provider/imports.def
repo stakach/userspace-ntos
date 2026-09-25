@@ -4,6 +4,7 @@ EXPORTS
     IoDeleteDevice
     IofCompleteRequest
     ZwCreateFile
+    ZwWriteFile
     ZwFsControlFile
     ZwWaitForSingleObject
     ZwClose

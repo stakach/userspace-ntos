@@ -90,6 +90,8 @@ mod hosted_query_path_capture;
 mod hosted_write_capture;
 #[path = "hosted_query_path_work.rs"]
 mod hosted_query_path_work;
+#[path = "hosted_write_work.rs"]
+mod hosted_write_work;
 #[path = "driver_hosted_token_projection.rs"]
 mod driver_hosted_token_projection;
 #[path = "hosted_token_query.rs"]
@@ -112,6 +114,8 @@ mod hosted_io_create_file_ingress;
 mod hosted_io_create_file_work;
 #[path = "hosted_kernel_file_control.rs"]
 mod hosted_kernel_file_control;
+#[path = "hosted_kernel_file_write.rs"]
+mod hosted_kernel_file_write;
 #[path = "driver_share_access.rs"]
 mod driver_share_access;
 use hosted_file_objects::{
@@ -845,6 +849,8 @@ pub(crate) unsafe fn service_hosted_create_subject_registration(
 }
 pub const FSD_SERVICE_ZW_FS_CONTROL_FILE_LABEL: u64 = 0x79D;
 pub const FSD_SERVICE_ZW_WAIT_FILE_LABEL: u64 = 0x79E;
+pub const FSD_SERVICE_WRITE_FORWARD_LABEL: u64 = 0x79F;
+pub const FSD_SERVICE_ZW_WRITE_FILE_LABEL: u64 = 0x7A0;
 const _: () = {
     let labels = [
         FSD_SERVICE_SOURCE_IRP_LABEL,
@@ -853,6 +859,8 @@ const _: () = {
         FSD_SERVICE_CREATE_SUBJECT_LABEL,
         FSD_SERVICE_ZW_FS_CONTROL_FILE_LABEL,
         FSD_SERVICE_ZW_WAIT_FILE_LABEL,
+        FSD_SERVICE_WRITE_FORWARD_LABEL,
+        FSD_SERVICE_ZW_WRITE_FILE_LABEL,
     ];
     let mut i = 0;
     while i < labels.len() {
@@ -8306,9 +8314,14 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     as *const u64,
             );
             if handler == 0 {
-                if major == IRP_MJ_DEVICE_CONTROL {
+                if major == IRP_MJ_DEVICE_CONTROL || major == major::IRP_MJ_WRITE as u64 {
+                    let forward_label = if major == IRP_MJ_DEVICE_CONTROL {
+                        FSD_SERVICE_QUERY_PATH_FORWARD_LABEL
+                    } else {
+                        FSD_SERVICE_WRITE_FORWARD_LABEL
+                    };
                     let (reply_label, status, accepted, _, _) = call_on4(
-                        (FSD_SERVICE_QUERY_PATH_FORWARD_LABEL << 12) | 4,
+                        (forward_label << 12) | 4,
                         1,
                         device,
                         irp,
@@ -8317,7 +8330,7 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     if reply_label != 0 || accepted > 1 {
                         crate::provider_bugcheck::report(
                             0xc4,
-                            [FSD_SERVICE_QUERY_PATH_FORWARD_LABEL, 1, irp, reply_label],
+                            [forward_label, 1, irp, reply_label],
                         );
                     }
                     if accepted == 0 {
@@ -8334,7 +8347,7 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     );
                     s_io_complete_request(irp, 0);
                     let (ack_label, ack_status, _, _, _) = call_on4(
-                        (FSD_SERVICE_QUERY_PATH_FORWARD_LABEL << 12) | 4,
+                        (forward_label << 12) | 4,
                         2,
                         irp,
                         0,
@@ -8343,7 +8356,7 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     if ack_label != 0 || ack_status as u32 as i32 != STATUS_SUCCESS {
                         crate::provider_bugcheck::report(
                             0xc4,
-                            [FSD_SERVICE_QUERY_PATH_FORWARD_LABEL, 2, irp, ack_status],
+                            [forward_label, 2, irp, ack_status],
                         );
                     }
                     s_io_free_irp(irp);
@@ -32388,6 +32401,10 @@ fn register_fsd_trampolines() -> bool {
         hosted_kernel_file_control::s_zw_fs_control_file as *const () as usize as u64,
     );
     reg.bind(
+        "ZwWriteFile",
+        hosted_kernel_file_write::s_zw_write_file as *const () as usize as u64,
+    );
+    reg.bind(
         "ZwWaitForSingleObject",
         hosted_kernel_file_control::s_zw_wait_for_single_object as *const () as usize as u64,
     );
@@ -54161,6 +54178,20 @@ pub(crate) unsafe fn redrive_hosted_driver_zw_fs_control_file(handler: *mut Exec
     hosted_kernel_file_control::redrive_waits(&mut *handler);
 }
 
+pub(crate) unsafe fn service_hosted_driver_zw_write_file(
+    ch: &crate::spawn_hosts::PumpChannel,
+    packet: u64,
+    packet_length: u64,
+    handle: u64,
+    active_reply_cap: u64,
+) -> Option<i32> {
+    hosted_kernel_file_write::submit(ch, packet, packet_length, handle, active_reply_cap)
+}
+
+pub(crate) unsafe fn redrive_hosted_driver_zw_write_file(handler: *mut ExecNtHandler) {
+    hosted_kernel_file_write::redrive(handler);
+}
+
 pub(crate) unsafe fn service_hosted_query_path_forward(
     ch: &crate::spawn_hosts::PumpChannel,
     reply_cap: u64,
@@ -54181,6 +54212,35 @@ pub(crate) unsafe fn service_hosted_query_path_forward(
 pub(crate) unsafe fn redrive_hosted_query_path_forward(handler: *mut ExecNtHandler) {
     hosted_query_path_work::redrive(handler);
     hosted_create_subject_registration::redrive_terminal();
+}
+
+pub(crate) unsafe fn service_hosted_write_forward(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    operation: u64,
+    address: u64,
+    irp: u64,
+) -> Option<(i32, bool)> {
+    match operation {
+        1 => hosted_write_work::submit(ch, irp, address, badge, reply_cap)
+            .map(|status| (status, false)),
+        2 if irp == 0 => hosted_write_work::acknowledge(ch, reply_cap, badge, address)
+            .map(|status| (status, false)),
+        _ => Some((STATUS_INVALID_PARAMETER, false)),
+    }
+}
+
+pub(crate) unsafe fn redrive_hosted_write_forward(handler: *mut ExecNtHandler) {
+    hosted_write_work::redrive(handler);
+}
+
+pub(crate) unsafe fn nested_hosted_write_ready() -> bool {
+    hosted_write_work::nested_work_ready()
+}
+
+pub(crate) unsafe fn redrive_nested_hosted_write(handler: *mut ExecNtHandler) -> bool {
+    hosted_write_work::redrive_nested_ready(handler)
 }
 
 pub(crate) unsafe fn nested_hosted_query_path_ready() -> bool {

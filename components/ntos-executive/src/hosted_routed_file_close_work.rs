@@ -240,12 +240,14 @@ impl Work {
                     crate::driver_launch::hosted_consumer_file_objects::handle_closed(
                         self.table_owner, self.handle, file,
                     ).expect("closed RoutedFile has exact consumer projection owner");
+                    // The File still has its handle reference. Drop this temporary pointer
+                    // before last-handle release starts and pumps CLEANUP/CLOSE inline.
+                    self.capture.take();
                     handler.release_file_handle_reference(file);
                     if lifecycle_reserved {
                         crate::driver_launch::pump_hosted_file_lifecycle();
                     }
                     if !self.needs_cleanup {
-                        self.capture.take();
                         self.status = Some(0);
                     }
                 }
@@ -267,12 +269,12 @@ impl Work {
                     self.bugcheck(code, parameters)
                 }
             }
-            return false;
         }
         if self.status.is_none() {
             let cleanup_complete = crate::driver_launch::hosted_file_cleanup_terminal(self.file_id);
             if !cleanup_complete { return false; }
-            self.capture.take();
+            // CLEANUP can resolve inline. Drive newly eligible CLOSE before replying.
+            crate::driver_launch::pump_hosted_file_lifecycle();
             self.status = Some(0);
         }
         if self.cancelled() { return self.finish_cancelled(handler); }

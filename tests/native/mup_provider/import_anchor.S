@@ -12,6 +12,9 @@ IofCompleteRequest:
 .globl ZwCreateFile
 ZwCreateFile:
     ud2
+.globl ZwWriteFile
+ZwWriteFile:
+    ud2
 .globl ZwFsControlFile
 ZwFsControlFile:
     ud2

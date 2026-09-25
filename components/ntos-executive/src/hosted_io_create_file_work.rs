@@ -704,7 +704,17 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
 }
 
 pub(super) unsafe fn redrive(handler: *mut ExecNtHandler) {
-    let _ = redrive_one(handler, false);
+    // The outer service loop must reconcile entered Replies as well as ready
+    // provider completions. Nested dispatch cannot retry an uncertain Reply.
+    let count = (&*core::ptr::addr_of!(WORK)).len();
+    for _ in 0..count.saturating_mul(2) {
+        if !redrive_one(handler, false) { break; }
+    }
+    // Inline provider completions need no new ingress event to advance their retained Reply.
+    // A bounded drain also covers a full chain of STATUS_REPARSE name traversals.
+    for _ in 0..(MAX_REPARSE_TRAVERSAL as usize * 8) {
+        if !nested_work_ready() || !redrive_one(handler, true) { break; }
+    }
 }
 
 pub(super) unsafe fn nested_work_ready() -> bool {

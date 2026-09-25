@@ -16,13 +16,16 @@ typedef void *HANDLE;
 
 #define IRP_MJ_CREATE 0x00
 #define IRP_MJ_CLOSE 0x02
+#define IRP_MJ_WRITE 0x04
 #define IRP_MJ_DEVICE_CONTROL 0x0e
 #define IRP_MJ_CLEANUP 0x12
 #define IRP_MJ_MAXIMUM_FUNCTION 0x1b
 #define DO_DEVICE_INITIALIZING 0x80
+#define DO_BUFFERED_IO 0x04
 #define FILE_DEVICE_NETWORK_FILE_SYSTEM 0x14
 #define FILE_DEVICE_MULTI_UNC_PROVIDER 0x10
 #define FILE_TRAVERSE 0x20
+#define FILE_WRITE_DATA 0x02
 #define SYNCHRONIZE 0x00100000
 #define FILE_SHARE_READ 0x01
 #define FILE_SHARE_WRITE 0x02
@@ -68,11 +71,13 @@ typedef struct {
 } FILE_OBJECT;
 
 typedef struct _IRP {
-    uint8_t Reserved0[0x30];
+    uint8_t Reserved0[0x18];
+    void *AssociatedSystemBuffer;
+    uint8_t Reserved1[0x10];
     IO_STATUS_BLOCK IoStatus;
-    uint8_t Reserved1[0x30];
+    uint8_t Reserved2[0x30];
     void *UserBuffer;
-    uint8_t Reserved2[0x40];
+    uint8_t Reserved3[0x40];
     struct _IO_STACK_LOCATION *CurrentStackLocation;
 } IRP;
 
@@ -92,6 +97,11 @@ typedef struct _IO_STACK_LOCATION {
             uint32_t Reserved2;
             void *Type3InputBuffer;
         } DeviceIoControl;
+        struct {
+            uint32_t Length;
+            uint32_t Key;
+            int64_t ByteOffset;
+        } Write;
         uint8_t Bytes[32];
     } Parameters;
     DEVICE_OBJECT *DeviceObject;
@@ -132,6 +142,7 @@ _Static_assert(sizeof(UNICODE_STRING) == 16, "UNICODE_STRING x64 ABI");
 _Static_assert(sizeof(OBJECT_ATTRIBUTES) == 48, "OBJECT_ATTRIBUTES x64 ABI");
 _Static_assert(sizeof(IRP) == 0xc0, "IRP prefix x64 ABI");
 _Static_assert(offsetof(IRP, IoStatus) == 0x30, "IRP IoStatus x64 ABI");
+_Static_assert(offsetof(IRP, AssociatedSystemBuffer) == 0x18, "IRP system buffer x64 ABI");
 _Static_assert(offsetof(IRP, UserBuffer) == 0x70, "IRP UserBuffer x64 ABI");
 _Static_assert(offsetof(IRP, CurrentStackLocation) == 0xb8, "IRP stack x64 ABI");
 _Static_assert(offsetof(IO_STACK_LOCATION, Parameters) == 8, "IO stack params x64 ABI");
@@ -153,6 +164,8 @@ __declspec(dllimport) NTSTATUS __stdcall ZwCreateFile(HANDLE *, uint32_t,
     uint32_t, uint32_t, void *, uint32_t);
 __declspec(dllimport) NTSTATUS __stdcall ZwFsControlFile(HANDLE, HANDLE, void *, void *,
     IO_STATUS_BLOCK *, uint32_t, void *, uint32_t, void *, uint32_t);
+__declspec(dllimport) NTSTATUS __stdcall ZwWriteFile(HANDLE, HANDLE, void *, void *,
+    IO_STATUS_BLOCK *, void *, uint32_t, int64_t *, uint32_t *);
 __declspec(dllimport) NTSTATUS __stdcall ZwWaitForSingleObject(HANDLE, uint8_t, int64_t *);
 __declspec(dllimport) NTSTATUS __stdcall ZwClose(HANDLE);
 __declspec(dllimport) NTSTATUS __stdcall PsCreateSystemThread(HANDLE *, uint32_t,
@@ -175,6 +188,8 @@ struct MupProviderEvidence {
     uint32_t probe_file_created;
     uint32_t probe_file_cleaned;
     uint32_t probe_file_closed;
+    uint32_t probe_write_count;
+    uint32_t probe_write_bytes;
     uint32_t query_count;
     uint32_t query_accepted;
     uint32_t query_rejected;
@@ -208,6 +223,7 @@ static const WCHAR ProbeRelativeName[] = {
     '\\', 'n', 't', 'o', 's', '-', 'p', 'r', 'o', 'b', 'e',
     '\\', 's', 'h', 'a', 'r', 'e'
 };
+static const uint8_t ProbeWriteBytes[] = {'n', 't', 'o', 's', '-', 'w', 'r', 'i', 't', 'e'};
 
 static int IsProbeFileName(const UNICODE_STRING *name)
 {
@@ -243,6 +259,8 @@ static NTSTATUS __stdcall ProviderCreate(DEVICE_OBJECT *device, IRP *irp)
     }
     file->FsContext = file;
     MupProviderEvidence.probe_file_created++;
+    DbgPrint("[mup-provider-create] probe-file created=%u\n",
+             MupProviderEvidence.probe_file_created);
     return Complete(irp, STATUS_SUCCESS, 1);
 }
 
@@ -253,7 +271,11 @@ static NTSTATUS __stdcall ProviderCleanup(DEVICE_OBJECT *device, IRP *irp)
     IO_STACK_LOCATION *stack = irp->CurrentStackLocation;
     if (stack != NULL && stack->FileObject != NULL) {
         FILE_OBJECT *file = (FILE_OBJECT *)stack->FileObject;
-        if (file->FsContext == file) MupProviderEvidence.probe_file_cleaned++;
+        if (file->FsContext == file) {
+            MupProviderEvidence.probe_file_cleaned++;
+            DbgPrint("[mup-provider-cleanup] probe-file cleaned=%u\n",
+                     MupProviderEvidence.probe_file_cleaned);
+        }
     }
     return Complete(irp, STATUS_SUCCESS, 0);
 }
@@ -273,6 +295,28 @@ static NTSTATUS __stdcall ProviderClose(DEVICE_OBJECT *device, IRP *irp)
         }
     }
     return Complete(irp, STATUS_SUCCESS, 0);
+}
+
+static NTSTATUS __stdcall ProviderWrite(DEVICE_OBJECT *device, IRP *irp)
+{
+    (void)device;
+    IO_STACK_LOCATION *stack = irp->CurrentStackLocation;
+    if (stack == NULL || stack->FileObject == NULL ||
+        ((FILE_OBJECT *)stack->FileObject)->FsContext != stack->FileObject ||
+        stack->Parameters.Write.Length != sizeof(ProbeWriteBytes) ||
+        irp->AssociatedSystemBuffer == NULL) {
+        return Complete(irp, STATUS_INVALID_PARAMETER, 0);
+    }
+    const uint8_t *bytes = (const uint8_t *)irp->AssociatedSystemBuffer;
+    for (uint32_t i = 0; i < sizeof(ProbeWriteBytes); i++) {
+        if (bytes[i] != ProbeWriteBytes[i]) return Complete(irp, STATUS_INVALID_PARAMETER, 0);
+    }
+    MupProviderEvidence.probe_write_count++;
+    MupProviderEvidence.probe_write_bytes += sizeof(ProbeWriteBytes);
+    DbgPrint("[mup-provider-write] count=%u bytes=%u\n",
+             MupProviderEvidence.probe_write_count,
+             MupProviderEvidence.probe_write_bytes);
+    return Complete(irp, STATUS_SUCCESS, sizeof(ProbeWriteBytes));
 }
 
 static NTSTATUS __stdcall ProviderDeviceControl(DEVICE_OBJECT *device, IRP *irp)
@@ -401,12 +445,26 @@ static void __stdcall RegistrationWorker(void *context)
         HANDLE probe_handle = NULL;
         IO_STATUS_BLOCK probe_iosb = {0};
         MupProviderEvidence.probe_attempted++;
-        NTSTATUS probe_status = ZwCreateFile(&probe_handle, FILE_TRAVERSE | SYNCHRONIZE,
+        NTSTATUS probe_status = ZwCreateFile(&probe_handle,
+                                              FILE_TRAVERSE | FILE_WRITE_DATA | SYNCHRONIZE,
                                               &probe_attrs, &probe_iosb, NULL, 0,
                                               FILE_SHARE_READ | FILE_SHARE_WRITE,
                                               FILE_OPEN, FILE_DIRECTORY_FILE, NULL, 0);
         if (NT_SUCCESS(probe_status)) {
             probe_status = probe_iosb.Status;
+            if (NT_SUCCESS(probe_status) && probe_handle != NULL) {
+                IO_STATUS_BLOCK write_iosb = {0};
+                int64_t write_offset = 0;
+                NTSTATUS write_status = ZwWriteFile(probe_handle, NULL, NULL, NULL,
+                    &write_iosb, (void *)ProbeWriteBytes, sizeof(ProbeWriteBytes),
+                    &write_offset, NULL);
+                if (NT_SUCCESS(write_status)) write_status = write_iosb.Status;
+                if (NT_SUCCESS(write_status) && write_iosb.Information != sizeof(ProbeWriteBytes))
+                    write_status = STATUS_UNSUCCESSFUL;
+                DbgPrint("[mup-provider-write-result] status=0x%08x info=%u\n",
+                         (uint32_t)write_status, (uint32_t)write_iosb.Information);
+                if (!NT_SUCCESS(write_status)) probe_status = write_status;
+            }
             if (probe_handle != NULL) ZwClose(probe_handle);
         }
         MupProviderEvidence.probe_status = (uint32_t)probe_status;
@@ -443,9 +501,10 @@ NTSTATUS __stdcall DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *registry_p
     driver->MajorFunction[IRP_MJ_CREATE] = ProviderCreate;
     driver->MajorFunction[IRP_MJ_CLEANUP] = ProviderCleanup;
     driver->MajorFunction[IRP_MJ_CLOSE] = ProviderClose;
+    driver->MajorFunction[IRP_MJ_WRITE] = ProviderWrite;
     driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = ProviderDeviceControl;
     driver->DriverUnload = ProviderUnload;
-    ProviderDevice->Flags &= ~DO_DEVICE_INITIALIZING;
+    ProviderDevice->Flags = (ProviderDevice->Flags | DO_BUFFERED_IO) & ~DO_DEVICE_INITIALIZING;
     status = PsCreateSystemThread(&RegistrationWorkerHandle, 0, NULL, NULL, NULL,
                                   RegistrationWorker, NULL);
     if (!NT_SUCCESS(status)) {

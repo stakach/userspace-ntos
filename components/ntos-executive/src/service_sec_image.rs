@@ -3304,6 +3304,7 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
         unsafe {
             let _ = pending_file_io_redrive_all(nt_handler);
             let _ = file_cleanup_redrive_all(nt_handler);
+            let _ = driver_launch::pump_hosted_file_lifecycle();
             let _ = file_irp_drain_redrive_all(nt_handler);
         }
     }
@@ -4655,7 +4656,8 @@ pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
     if handler.is_null() { return false; }
     let create = crate::driver_launch::redrive_nested_hosted_driver_create(handler);
     let query = crate::driver_launch::redrive_nested_hosted_query_path(handler);
-    create || query
+    let write = crate::driver_launch::redrive_nested_hosted_write(handler);
+    create || query || write
 }
 
 pub(crate) unsafe fn watchdog_defer_if_hosted_work_can_run(site: &[u8]) -> bool {
@@ -8089,6 +8091,7 @@ pub(crate) unsafe fn service_sec_image(
             &mut nt_handler,
         );
     }
+    #[cfg(not(feature = "mup-provider-kernel-only"))]
     {
         let resume_error = tcb_resume_r(main_tcb);
         if resume_error != 0 {
@@ -8103,6 +8106,8 @@ pub(crate) unsafe fn service_sec_image(
             panic!("primary hosted process resume failed");
         }
     }
+    #[cfg(feature = "mup-provider-kernel-only")]
+    print_str(b"[mup-provider-gate] SMSS remains suspended during native driver proof\n");
     // Every blocking ingress rechecks retained work, including early fault/refusal branches.
     // This barrier only programs wake demand; provider execution stays at the outer loop top.
     macro_rules! component_recv {
@@ -8466,7 +8471,9 @@ pub(crate) unsafe fn service_sec_image(
             crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
             crate::driver_launch::redrive_hosted_driver_io_create_file(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_path_forward(nt_handler as *mut _);
+            crate::driver_launch::redrive_hosted_write_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_driver_zw_fs_control_file(nt_handler as *mut _);
+            crate::driver_launch::redrive_hosted_driver_zw_write_file(nt_handler as *mut _);
             crate::hosted_routed_file_close_work::redrive(&mut nt_handler);
             crate::driver_launch::hosted_consumer_file_objects::redrive();
             crate::current_apc::redrive(&mut nt_handler);
