@@ -213,7 +213,9 @@ impl ProviderCreateDelivery {
         }
         if self.phase != Phase::Terminal
             || self.publication_failure.is_some()
-            || !matches!(self.terminal, Some(terminal) if (terminal.status as i32) >= 0)
+            || !matches!(self.terminal, Some(terminal)
+                if (terminal.status as i32) >= 0
+                    && terminal.status != nt_status::NtStatus::REPARSE.raw() as u32)
         {
             return Err(DeliveryError::WrongPhase);
         }
@@ -364,6 +366,40 @@ impl ProviderCreateDelivery {
             return Err(DeliveryError::WrongPhase);
         }
         self.phase = Phase::BackendAckEntered;
+        Ok(())
+    }
+
+    /// An IO_REPARSE CREATE has no caller-visible reply. The I/O manager owns the next name
+    /// traversal, but must acknowledge this exact provider IRP before retiring its File.
+    pub fn enter_reparse_backend_ack(&mut self) -> Result<(), DeliveryError> {
+        if self.phase != Phase::Terminal
+            || self.cancelled
+            || self.irp.is_none()
+            || self.handle.is_some()
+            || !self.terminal.is_some_and(|terminal| {
+                terminal.status == nt_status::NtStatus::REPARSE.raw() as u32
+                    && terminal.information == 0
+            })
+        {
+            return Err(DeliveryError::WrongPhase);
+        }
+        self.phase = Phase::BackendAckEntered;
+        Ok(())
+    }
+
+    pub fn finish_inline_reparse(&mut self) -> Result<(), DeliveryError> {
+        if self.phase != Phase::Terminal
+            || self.cancelled
+            || self.irp.is_some()
+            || self.handle.is_some()
+            || !self.terminal.is_some_and(|terminal| {
+                terminal.status == nt_status::NtStatus::REPARSE.raw() as u32
+                    && terminal.information == 0
+            })
+        {
+            return Err(DeliveryError::WrongPhase);
+        }
+        self.phase = Phase::Finished;
         Ok(())
     }
 
@@ -568,6 +604,29 @@ mod tests {
         owner.enter_backend_ack().unwrap();
         owner.acknowledge_backend().unwrap();
         owner.finish().unwrap();
+    }
+
+    #[test]
+    fn reparse_ack_is_internal_and_cannot_publish_or_reply() {
+        let mut owner = ProviderCreateDelivery::new(identity());
+        owner.enter_dispatch().unwrap();
+        owner.retain_irp(IrpId(11)).unwrap();
+        owner.observe_terminal(CreateTerminal {
+            irp: Some(IrpId(11)), identity: identity(),
+            status: nt_status::NtStatus::REPARSE.raw() as u32, information: 0,
+        }).unwrap();
+        assert_eq!(owner.bind_handle(44), Err(DeliveryError::WrongPhase));
+        assert_eq!(owner.enter_reply(), Err(DeliveryError::WrongPhase));
+        owner.enter_reparse_backend_ack().unwrap();
+        assert_eq!(owner.enter_reparse_backend_ack(), Err(DeliveryError::WrongPhase));
+        owner.acknowledge_backend().unwrap();
+        owner.finish().unwrap();
+
+        let mut inline = ProviderCreateDelivery::new(identity());
+        inline.enter_dispatch().unwrap();
+        inline.observe_inline_terminal(nt_status::NtStatus::REPARSE.raw() as u32, 0).unwrap();
+        inline.finish_inline_reparse().unwrap();
+        assert_eq!(inline.phase(), Phase::Finished);
     }
 
     #[test]
