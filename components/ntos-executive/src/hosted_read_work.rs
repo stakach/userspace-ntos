@@ -453,6 +453,7 @@ impl Work {
 
     unsafe fn advance_stopped_source(&mut self) -> bool {
         if !self.cancel_requested {
+            if let Some(retained) = self.retained.as_mut() { retained.request_cancel(); }
             if let Some(irp) = self.canonical_irp { let _ = cancel_irp_if_pending(irp.raw()); }
             self.cancel_requested = true;
         }
