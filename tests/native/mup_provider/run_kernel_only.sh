@@ -29,7 +29,7 @@ python3 scripts/run_with_timeout.py \
   --failure-text '[provider-bugcheck] terminal' \
   --completion-file "$RUN_LOG" \
   --completion-text '[mup-provider-close] probe-file' \
-  --completion-grace-seconds 3 \
+  --completion-grace-seconds 15 \
   -- ./scripts/run_specs.sh 2>&1 | tee -a "$RUN_LOG"
 rc=${PIPESTATUS[0]}
 set -e
@@ -46,10 +46,12 @@ if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-create\] probe-file created=[1-9][0-9]*' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-write\] count=[1-9][0-9]* bytes=10' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-write-result\] status=0x00000000 info=10' "$RUN_LOG" \
+   || ! grep -Eq '\[mup-provider-read\] count=[1-9][0-9]* bytes=10' "$RUN_LOG" \
+   || ! grep -Eq '\[read-forward-result\] call=0x(00000000|00000103) status=0x00000000 iosb=0x00000000 info=10 bytes-match=1' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-cleanup\] probe-file cleaned=[1-9][0-9]*' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-close\] probe-file closed=[1-9][0-9]*' "$RUN_LOG"; then
-  echo "Mup/provider registration, query, and File lifecycle proof incomplete: $RUN_LOG" >&2
+  echo "Mup/provider registration, query, READ/WRITE, and File lifecycle proof incomplete: $RUN_LOG" >&2
   exit 1
 fi
 
-echo "Mup/provider registration, query, File WRITE and CREATE/CLEANUP/CLOSE verified: $RUN_LOG"
+echo "Mup/provider registration, query, File WRITE, cross-domain READ and CREATE/CLEANUP/CLOSE verified: $RUN_LOG"

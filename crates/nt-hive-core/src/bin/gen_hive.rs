@@ -1210,6 +1210,22 @@ fn build_hive_with_configuration(
             RegistryValueType::Sz,
             utf16le_sz("File System"),
         );
+        let read_source = hive.create_key(r"ControlSet001\Services\NtosReadForwardTest");
+        hive.set_value(
+            read_source,
+            "ImagePath",
+            RegistryValueType::ExpandSz,
+            utf16le_sz(r"system32\drivers\read_forward.sys"),
+        );
+        hive.set_dword(read_source, "Type", SERVICE_FILE_SYSTEM_DRIVER);
+        hive.set_dword(read_source, "Start", SERVICE_SYSTEM_START);
+        hive.set_dword(read_source, "ErrorControl", 0x1);
+        hive.set_value(
+            read_source,
+            "Group",
+            RegistryValueType::Sz,
+            utf16le_sz("File System"),
+        );
     }
 
     let initial_network_devnodes = match profile {
@@ -1415,10 +1431,13 @@ mod tests {
     }
 
     #[test]
-    fn mup_provider_profile_declares_only_its_native_driver_service() {
+    fn mup_provider_profile_declares_native_provider_and_read_source() {
         let production = build_hive();
         assert!(production
             .open_key(r"ControlSet001\Services\NtosMupProviderTest")
+            .is_none());
+        assert!(production
+            .open_key(r"ControlSet001\Services\NtosReadForwardTest")
             .is_none());
         let hive = build_hive_with_configuration(
             generated_e1000_adapters(1),
@@ -1435,6 +1454,18 @@ mod tests {
             Some((
                 RegistryValueType::ExpandSz,
                 utf16le_sz(r"system32\drivers\mup_provider.sys").as_slice()
+            ))
+        );
+        let source = hive
+            .open_key(r"ControlSet001\Services\NtosReadForwardTest")
+            .expect("native READ source service");
+        assert_eq!(hive.query_dword(source, "Type"), Some(SERVICE_FILE_SYSTEM_DRIVER));
+        assert_eq!(hive.query_dword(source, "Start"), Some(SERVICE_SYSTEM_START));
+        assert_eq!(
+            hive.query_value(source, "ImagePath"),
+            Some((
+                RegistryValueType::ExpandSz,
+                utf16le_sz(r"system32\drivers\read_forward.sys").as_slice()
             ))
         );
     }

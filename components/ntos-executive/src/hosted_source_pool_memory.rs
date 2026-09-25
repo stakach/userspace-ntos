@@ -51,16 +51,10 @@ impl SourcePoolMemory {
         self.read(address, bytes)
             .then(|| unsafe { value.assume_init() })
     }
-}
 
-impl ClientMemory for SourcePoolMemory {
-    fn read(&self, address: u64, dst: &mut [u8]) -> bool {
-        let Some(offset) = address.checked_sub(FSD_POOL_VADDR) else {
-            return false;
-        };
-        let Ok(length) = u64::try_from(dst.len()) else {
-            return false;
-        };
+    fn allocation_exec(&self, address: u64, length: usize) -> Option<u64> {
+        let offset = address.checked_sub(FSD_POOL_VADDR)?;
+        let length = u64::try_from(length).ok()?;
         let allocation = nt_io_manager::hosted_pool_range::walk_hosted_pool_allocation(
             self.used,
             POOL_DATA_OFF,
@@ -70,19 +64,34 @@ impl ClientMemory for SourcePoolMemory {
                 let at = self.source.exec_pool_va.checked_add(header)?;
                 Some(unsafe { read_volatile(at as *const u64) })
             },
-        );
-        let Some(allocation) = allocation else {
-            return false;
-        };
-        let Some(base) = FSD_POOL_VADDR.checked_add(allocation.base) else {
-            return false;
-        };
+        )?;
+        let base = FSD_POOL_VADDR.checked_add(allocation.base)?;
         if unsafe { hosted_instance_pool_allocation_is_free_unlocked(self.source, base) }
             != Some(false)
         {
-            return false;
+            return None;
         }
-        let Some(exec) = self.source.exec_pool_va.checked_add(offset) else {
+        self.source.exec_pool_va.checked_add(offset)
+    }
+
+    pub(super) fn contains(&self, address: u64, length: usize) -> bool {
+        self.allocation_exec(address, length).is_some()
+    }
+
+    pub(super) fn write(&self, address: u64, src: &[u8]) -> bool {
+        let Some(exec) = self.allocation_exec(address, src.len()) else {
+            return false;
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), exec as *mut u8, src.len());
+        }
+        true
+    }
+}
+
+impl ClientMemory for SourcePoolMemory {
+    fn read(&self, address: u64, dst: &mut [u8]) -> bool {
+        let Some(exec) = self.allocation_exec(address, dst.len()) else {
             return false;
         };
         unsafe {

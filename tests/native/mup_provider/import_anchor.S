@@ -6,8 +6,38 @@ IoCreateDevice:
 .globl IoDeleteDevice
 IoDeleteDevice:
     ud2
+.globl IoAllocateIrp
+IoAllocateIrp:
+    ud2
+.globl IoFreeIrp
+IoFreeIrp:
+    ud2
+.globl IoGetNextIrpStackLocation
+IoGetNextIrpStackLocation:
+    ud2
+.globl IoGetRelatedDeviceObject
+IoGetRelatedDeviceObject:
+    ud2
+.globl IofCallDriver
+IofCallDriver:
+    ud2
 .globl IofCompleteRequest
 IofCompleteRequest:
+    ud2
+.globl ExAllocatePoolWithTag
+ExAllocatePoolWithTag:
+    ud2
+.globl ExFreePoolWithTag
+ExFreePoolWithTag:
+    ud2
+.globl ObReferenceObjectByHandle
+ObReferenceObjectByHandle:
+    ud2
+.globl ObfDereferenceObject
+ObfDereferenceObject:
+    ud2
+.globl KeDelayExecutionThread
+KeDelayExecutionThread:
     ud2
 .globl ZwCreateFile
 ZwCreateFile:

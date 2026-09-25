@@ -2,7 +2,17 @@ LIBRARY ntoskrnl.exe
 EXPORTS
     IoCreateDevice
     IoDeleteDevice
+    IoAllocateIrp
+    IoFreeIrp
+    IoGetNextIrpStackLocation
+    IoGetRelatedDeviceObject
+    IofCallDriver
     IofCompleteRequest
+    ExAllocatePoolWithTag
+    ExFreePoolWithTag
+    ObReferenceObjectByHandle
+    ObfDereferenceObject
+    KeDelayExecutionThread
     ZwCreateFile
     ZwWriteFile
     ZwFsControlFile
