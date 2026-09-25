@@ -78,6 +78,98 @@ fn catalog(bytes: Box<[u8]>) -> Result<ExceptionImageCatalog, ImageAdmissionErro
     )?])
 }
 
+fn scope_table_pe() -> Box<[u8]> {
+    let mut bytes = mapped_pe();
+    put32(&mut bytes, 0x3030, 2);
+    for (index, (begin, end, handler, target)) in
+        [(0x1000, 0x1080, 1, 0x1080), (0x1080, 0x1100, 0x1110, 0)]
+            .into_iter()
+            .enumerate()
+    {
+        let offset = 0x3034 + index * 16;
+        put32(&mut bytes, offset, begin);
+        put32(&mut bytes, offset + 4, end);
+        put32(&mut bytes, offset + 8, handler);
+        put32(&mut bytes, offset + 12, target);
+    }
+    bytes
+}
+
+#[test]
+fn c_scope_table_is_owned_and_uses_exact_admitted_image_base() {
+    let table = catalog(scope_table_pe()).unwrap();
+    assert_eq!(
+        table.read_c_scope_table(BASE, BASE + 0x3030),
+        Ok(vec![
+            ScopeRecord {
+                begin: 0x1000,
+                end: 0x1080,
+                handler: 1,
+                target: 0x1080
+            },
+            ScopeRecord {
+                begin: 0x1080,
+                end: 0x1100,
+                handler: 0x1110,
+                target: 0
+            },
+        ])
+    );
+    assert_eq!(
+        table.read_c_scope_table(BASE + 1, BASE + 0x3030),
+        Err(ScopeTableError::UnknownImage)
+    );
+    assert_eq!(
+        table.read_c_scope_table(BASE, BASE + 0x3031),
+        Err(ScopeTableError::InvalidAddress)
+    );
+    assert_eq!(
+        table.read_c_scope_table(BASE, BASE + 0x4030),
+        Err(ScopeTableError::InvalidAddress)
+    );
+}
+
+#[test]
+fn c_scope_table_rejects_truncated_and_excessive_counts() {
+    for (rva, count, expected) in [
+        (0x3030, 4097, ScopeTableError::InvalidCount),
+        (0x31fc, 1, ScopeTableError::InvalidExtent),
+        (0x3030, u32::MAX, ScopeTableError::InvalidCount),
+    ] {
+        let mut bytes = scope_table_pe();
+        put32(&mut bytes, rva, count);
+        let table = catalog(bytes).unwrap();
+        assert_eq!(
+            table.read_c_scope_table(BASE, BASE + rva as u64),
+            Err(expected)
+        );
+    }
+}
+
+#[test]
+fn empty_c_scope_table_has_no_handlers() {
+    let mut bytes = scope_table_pe();
+    put32(&mut bytes, 0x3030, 0);
+    let table = catalog(bytes).unwrap();
+    assert_eq!(table.read_c_scope_table(BASE, BASE + 0x3030), Ok(vec![]));
+}
+
+#[test]
+fn c_scope_table_requires_executable_ranges_filters_and_targets() {
+    for (field_offset, value, expected) in [
+        (0, 0x2000, ScopeTableError::InvalidScope),
+        (4, 0x1000, ScopeTableError::InvalidScope),
+        (8, 0x2000, ScopeTableError::InvalidHandler),
+        (12, 0x3000, ScopeTableError::InvalidTarget),
+        (16 + 8, 1, ScopeTableError::InvalidHandler),
+    ] {
+        let mut bytes = scope_table_pe();
+        put32(&mut bytes, 0x3034 + field_offset, value);
+        let table = catalog(bytes).unwrap();
+        assert_eq!(table.read_c_scope_table(BASE, BASE + 0x3030), Err(expected));
+    }
+}
+
 #[test]
 fn mapped_headers_and_directories_use_rvas_not_raw_file_offsets() {
     let catalog = catalog(mapped_pe()).unwrap();
@@ -94,6 +186,157 @@ fn mapped_headers_and_directories_use_rvas_not_raw_file_offsets() {
         })
     );
     assert_eq!(catalog.read_u8(BASE, 0x3000), Some(1));
+}
+
+#[test]
+fn borrowed_mapped_image_matches_owned_lookup_and_scope_records() {
+    let bytes = scope_table_pe();
+    let borrowed = BorrowedExceptionImage::from_mapped_image(BASE, &bytes).unwrap();
+    let owned = catalog(bytes.clone()).unwrap();
+    assert_eq!(borrowed.base(), BASE);
+    assert_eq!(borrowed.size(), bytes.len());
+    for rva in [
+        0x1000, 0x1010, 0x107f, 0x1080, 0x10ff, 0x1100, 0x11ff, 0x2000,
+    ] {
+        assert_eq!(
+            borrowed.lookup_exception_function(BASE + rva),
+            owned.lookup_exception_function(BASE + rva),
+        );
+    }
+    assert_eq!(borrowed.read_u8(BASE, 0x3000), owned.read_u8(BASE, 0x3000));
+    assert_eq!(borrowed.read_u8(BASE + 1, 0x3000), None);
+    assert_eq!(
+        borrowed
+            .read_c_scope_table(BASE + 0x3030)
+            .unwrap()
+            .collect::<Vec<_>>(),
+        owned.read_c_scope_table(BASE, BASE + 0x3030).unwrap(),
+    );
+    assert!(borrowed.validate_collision_scope(BASE, BASE + 0x3030, 2));
+    assert!(!borrowed.validate_collision_scope(BASE, BASE + 0x3030, 3));
+    assert!(!borrowed.validate_collision_scope(BASE + 1, BASE + 0x3030, 0));
+}
+
+#[test]
+fn borrowed_admission_rejects_the_same_malformed_images() {
+    for mutate in [
+        (0x2000, 0x1100), // Function begins after its end.
+        (0x200c, 0x1070), // Function table overlaps the previous row.
+        (0x3010, 0x0006), // Unsupported unwind opcode.
+    ] {
+        let mut bytes = mapped_pe();
+        if mutate.0 == 0x3010 {
+            bytes[0x3010] = 1;
+            bytes[0x3011] = 0;
+            bytes[0x3012] = 1;
+            bytes[0x3013] = 0;
+            bytes[0x3014] = 0;
+            bytes[0x3015] = mutate.1 as u8;
+        } else {
+            put32(&mut bytes, mutate.0, mutate.1);
+        }
+        assert_eq!(
+            BorrowedExceptionImage::from_mapped_image(BASE, &bytes).err(),
+            AdmittedExceptionImage::from_mapped_image(BASE, bytes).err(),
+        );
+    }
+}
+
+#[test]
+fn borrowed_scope_cursor_rejects_invalid_rows_without_allocating() {
+    let mut bytes = scope_table_pe();
+    put32(&mut bytes, 0x3034 + 12, 0x3000);
+    let borrowed = BorrowedExceptionImage::from_mapped_image(BASE, &bytes).unwrap();
+    assert!(matches!(
+        borrowed.read_c_scope_table(BASE + 0x3030),
+        Err(ScopeTableError::InvalidTarget)
+    ));
+}
+
+#[test]
+fn borrowed_scope_cursor_supports_checked_indexed_replay() {
+    let bytes = scope_table_pe();
+    let image = BorrowedExceptionImage::from_mapped_image(BASE, &bytes).unwrap();
+    let mut scopes = image.read_c_scope_table(BASE + 0x3030).unwrap();
+    let first = scopes.get(0).unwrap();
+    let second = scopes.get(1).unwrap();
+    assert_eq!(scopes.next(), Some(first));
+    assert_eq!(scopes.next(), Some(second));
+    assert_eq!(scopes.get(2), None);
+    assert_eq!(scopes.get(u32::MAX), None);
+}
+
+#[test]
+fn borrowed_catalog_routes_two_images_and_rejects_gap_or_wrong_base() {
+    const SECOND: u64 = BASE + 0x8000;
+    let first_bytes = mapped_pe();
+    let second_bytes = scope_table_pe();
+    let images = [
+        BorrowedExceptionImage::from_mapped_image(BASE, &first_bytes).unwrap(),
+        BorrowedExceptionImage::from_mapped_image(SECOND, &second_bytes).unwrap(),
+    ];
+    let catalog = BorrowedExceptionCatalog::new(&images).unwrap();
+    assert_eq!(catalog.image_count(), 2);
+    assert_eq!(
+        catalog.lookup_exception_function(BASE + 0x1010),
+        images[0].lookup_exception_function(BASE + 0x1010),
+    );
+    assert_eq!(
+        catalog.lookup_exception_function(SECOND + 0x1080),
+        images[1].lookup_exception_function(SECOND + 0x1080),
+    );
+    assert_eq!(
+        catalog.lookup_exception_function(BASE + 0x5000),
+        Err(ExceptionImageError::UnknownImage),
+    );
+    assert_eq!(catalog.read_u8(SECOND, 0x3000), Some(1));
+    assert_eq!(catalog.read_u8(SECOND + 1, 0x3000), None);
+    assert_eq!(
+        catalog
+            .read_c_scope_table(SECOND, SECOND + 0x3030)
+            .unwrap()
+            .len(),
+        2,
+    );
+    assert!(matches!(
+        catalog.read_c_scope_table(SECOND + 1, SECOND + 0x3030),
+        Err(ScopeTableError::UnknownImage),
+    ));
+    assert!(!catalog.validate_collision_scope(SECOND + 1, SECOND + 0x3030, 0));
+}
+
+#[test]
+fn borrowed_catalog_rejects_empty_unsorted_duplicate_and_overlap() {
+    assert!(matches!(
+        BorrowedExceptionCatalog::new(&[]),
+        Err(ImageAdmissionError::EmptyCatalog),
+    ));
+    let first_bytes = mapped_pe();
+    let second_bytes = mapped_pe();
+    let unsorted = [
+        BorrowedExceptionImage::from_mapped_image(BASE + 0x8000, &first_bytes).unwrap(),
+        BorrowedExceptionImage::from_mapped_image(BASE, &second_bytes).unwrap(),
+    ];
+    assert!(matches!(
+        BorrowedExceptionCatalog::new(&unsorted),
+        Err(ImageAdmissionError::ImageOrder),
+    ));
+    let duplicate = [
+        BorrowedExceptionImage::from_mapped_image(BASE, &first_bytes).unwrap(),
+        BorrowedExceptionImage::from_mapped_image(BASE, &second_bytes).unwrap(),
+    ];
+    assert!(matches!(
+        BorrowedExceptionCatalog::new(&duplicate),
+        Err(ImageAdmissionError::ImageOrder),
+    ));
+    let overlap = [
+        BorrowedExceptionImage::from_mapped_image(BASE, &first_bytes).unwrap(),
+        BorrowedExceptionImage::from_mapped_image(BASE + 0x3000, &second_bytes).unwrap(),
+    ];
+    assert!(matches!(
+        BorrowedExceptionCatalog::new(&overlap),
+        Err(ImageAdmissionError::ImageOverlap),
+    ));
 }
 
 #[test]

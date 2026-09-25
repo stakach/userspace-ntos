@@ -1,6 +1,10 @@
 use super::*;
-use crate::REG_RBX;
-use alloc::{collections::BTreeMap, vec::Vec};
+use crate::{
+    raw_context::{RawContext, CONTEXT_AMD64_FULL_SEGMENTS},
+    seh_handler_packet::{HandlerPacketError, SehHandlerPacket},
+    REG_RBX,
+};
+use alloc::{collections::BTreeMap, vec, vec::Vec};
 use core::cell::Cell;
 
 const BASE: u64 = 0x10_0000;
@@ -101,6 +105,10 @@ impl ExceptionImageReader for Fixture {
             None => ExceptionFunction::Leaf,
         })
     }
+
+    fn validate_collision_scope(&self, image_base: u64, handler_data: u64, index: u32) -> bool {
+        image_base == BASE && handler_data == BASE + 0x100c && index <= 2
+    }
 }
 
 fn context() -> Context {
@@ -140,6 +148,215 @@ fn unwind(target: Option<u64>) -> WalkMode {
         target_ip: BASE + 0x700,
         return_value: 42,
     }
+}
+
+fn raise_context(entry_rsp: u64) -> Context {
+    let mut captured = Context::default();
+    captured.rip = BASE + 0x444;
+    captured.set_rsp(entry_rsp);
+    captured.gpr[REG_RBX] = 0x34;
+    captured
+}
+
+#[test]
+fn software_raise_admits_exact_caller_and_builds_noncontinuable_search() {
+    let mut fixture = Fixture::new(0);
+    fixture.stack.insert(LOW + 8, BASE + 0x110);
+    let walk = SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture)
+        .unwrap()
+        .into_search(0xc000_0005, 3)
+        .unwrap();
+    assert_eq!(fixture.stack_reads.get(), 1);
+    assert_eq!(walk.exception.code, 0xc000_0005);
+    assert_eq!(walk.exception.flags, EXCEPTION_NONCONTINUABLE);
+    assert_eq!(walk.exception.address, BASE + 0x110);
+    assert!(walk.exception.information.is_empty());
+    assert_eq!(walk.state.mode, WalkMode::Search);
+    assert_eq!(walk.state.original.rip, BASE + 0x110);
+    assert_eq!(walk.state.original.rsp(), LOW + 0x10);
+    assert_eq!(walk.state.original.gpr[REG_RBX], 0x34);
+    assert_eq!(walk.state.frames_left, 3);
+}
+
+#[test]
+fn software_raise_rejects_unreadable_or_unadmitted_caller() {
+    let mut fixture = Fixture::new(0);
+    assert!(matches!(
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture),
+        Err(WalkError::StackRead)
+    ));
+    fixture.stack.insert(LOW + 8, BASE - 1);
+    assert!(matches!(
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture),
+        Err(WalkError::ImageLookup(ExceptionImageError::UnknownImage))
+    ));
+    fixture.stack.insert(LOW + 8, BASE + 0x110);
+    fixture.image_error = Some(ExceptionImageError::UnreadableImage);
+    assert!(matches!(
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture),
+        Err(WalkError::ImageLookup(ExceptionImageError::UnreadableImage))
+    ));
+}
+
+#[test]
+fn software_raise_rejects_invalid_stack_before_reading_it() {
+    let fixture = Fixture::new(0);
+    for (entry_rsp, low, high, expected) in [
+        (LOW + 8, HIGH, LOW, WalkError::InvalidStackBounds),
+        (LOW, LOW, HIGH, WalkError::BadStack),
+        (LOW + 8, LOW + 0x10, HIGH, WalkError::BadStack),
+        (LOW + 0x38, LOW, HIGH - 1, WalkError::BadStack),
+        (u64::MAX, LOW, HIGH, WalkError::BadStack),
+    ] {
+        assert!(matches!(
+            SoftwareRaiseSite::admit(raise_context(entry_rsp), low, high, &fixture, &fixture),
+            Err(error) if error == expected
+        ));
+    }
+    assert_eq!(fixture.stack_reads.get(), 0);
+}
+
+#[test]
+fn software_raise_rejects_zero_frame_budget() {
+    let mut fixture = Fixture::new(0);
+    fixture.stack.insert(LOW + 8, BASE + 0x110);
+    let site =
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture).unwrap();
+    assert!(matches!(
+        site.into_search(0xc000_0005, 0),
+        Err(WalkError::InvalidBudget)
+    ));
+}
+
+#[test]
+fn software_raise_search_stops_at_the_first_owned_handler() {
+    let mut fixture = Fixture::new(unw_flag::EHANDLER);
+    fixture.stack.insert(LOW + 8, BASE + 0x110);
+    fixture.stack.insert(LOW + 0x20, 0x55);
+    fixture.stack.insert(LOW + 0x28, BASE + 0x210);
+    let site =
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture).unwrap();
+    let FirstRaiseStep::Invoke(invocation) = site
+        .search_to_first_handler(0xc000_0022, 4, &fixture, &fixture)
+        .unwrap()
+    else {
+        panic!("expected the first language handler");
+    };
+    assert_eq!(invocation.control_pc, BASE + 0x110);
+    assert_eq!(invocation.exception.code, 0xc000_0022);
+    assert_eq!(invocation.exception.flags, EXCEPTION_NONCONTINUABLE);
+    assert_eq!(invocation.handler, BASE + 0x800);
+}
+
+#[test]
+fn software_raise_search_fails_closed_on_changed_image_or_unreadable_stack() {
+    let mut fixture = Fixture::new(unw_flag::EHANDLER);
+    fixture.stack.insert(LOW + 8, BASE + 0x110);
+    let site =
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture).unwrap();
+    assert!(matches!(
+        site.search_to_first_handler(0xc000_0022, 4, &fixture, &fixture),
+        Err(WalkError::UnwindData)
+    ));
+
+    fixture.stack.insert(LOW + 0x20, 0x55);
+    fixture.stack.insert(LOW + 0x28, BASE + 0x210);
+    let site =
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture).unwrap();
+    fixture.image_error = Some(ExceptionImageError::UnreadableImage);
+    assert!(matches!(
+        site.search_to_first_handler(0xc000_0022, 4, &fixture, &fixture),
+        Err(WalkError::ImageLookup(ExceptionImageError::UnreadableImage))
+    ));
+}
+
+#[test]
+fn software_raise_search_honors_frame_budget_before_second_frame() {
+    let mut fixture = Fixture::new(0);
+    fixture.stack.insert(LOW + 8, BASE + 0x110);
+    fixture.stack.insert(LOW + 0x20, 0x55);
+    fixture.stack.insert(LOW + 0x28, BASE + 0x210);
+    let site =
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, HIGH, &fixture, &fixture).unwrap();
+    assert!(matches!(
+        site.search_to_first_handler(0xc000_0022, 1, &fixture, &fixture),
+        Err(WalkError::FrameLimit)
+    ));
+}
+
+#[test]
+fn software_raise_search_returns_owned_unhandled_outcome() {
+    let mut fixture = Fixture::new(0);
+    fixture.stack.insert(LOW + 8, BASE + 0x310);
+    fixture.stack.insert(LOW + 0x10, BASE + 0x310);
+    let high = LOW + 0x18;
+    let site =
+        SoftwareRaiseSite::admit(raise_context(LOW + 8), LOW, high, &fixture, &fixture).unwrap();
+    let FirstRaiseStep::Complete(WalkOutcome::Unhandled { exception, context }) = site
+        .search_to_first_handler(0xc000_0022, 4, &fixture, &fixture)
+        .unwrap()
+    else {
+        panic!("expected a terminal unhandled search");
+    };
+    assert_eq!(exception.code, 0xc000_0022);
+    assert_eq!(context.rsp(), LOW + 0x10);
+}
+
+#[test]
+fn native_handler_packet_preserves_raw_state_and_exact_component_pointers() {
+    let fixture = Fixture::new(unw_flag::EHANDLER);
+    let invocation = invoke(
+        fixture
+            .walk(WalkMode::Search)
+            .step(&fixture, &fixture)
+            .unwrap(),
+    );
+    let mut captured = RawContext::zeroed();
+    captured.set_context_flags(CONTEXT_AMD64_FULL_SEGMENTS);
+    captured.as_bytes_mut()[0x4a0] = 0x5a;
+    let packet = SehHandlerPacket::prepare_search(&captured, &invocation, 0x8000).unwrap();
+    assert_eq!(packet.exception.code, invocation.exception.code);
+    assert_eq!(packet.exception_pointers.exception_record, 0x8000);
+    assert_eq!(packet.exception_pointers.context_record, 0x80b0);
+    assert_eq!(packet.dispatcher.context_record, 0x8580);
+    assert_eq!(packet.dispatcher.function_entry, 0x8aa0);
+    assert_eq!(packet.dispatcher.language_handler, invocation.handler);
+    assert_eq!(packet.original_context.rip(), BASE + 0x110);
+    assert_eq!(packet.unwound_context.rip(), BASE + 0x210);
+    assert_eq!(packet.original_context.as_bytes()[0x4a0], 0x5a);
+    assert_eq!(packet.unwound_context.as_bytes()[0x4a0], 0x5a);
+}
+
+#[test]
+fn native_handler_packet_rejects_wrong_mode_bad_address_and_excess_information() {
+    let fixture = Fixture::new(unw_flag::EHANDLER);
+    let mut invocation = invoke(
+        fixture
+            .walk(WalkMode::Search)
+            .step(&fixture, &fixture)
+            .unwrap(),
+    );
+    let captured = RawContext::zeroed();
+    assert!(matches!(
+        SehHandlerPacket::prepare_search(&captured, &invocation, 0x8008),
+        Err(HandlerPacketError::Address)
+    ));
+    assert!(matches!(
+        SehHandlerPacket::prepare_search(&captured, &invocation, u64::MAX - 15),
+        Err(HandlerPacketError::Address)
+    ));
+    invocation.exception.information = vec![0; 16];
+    assert!(matches!(
+        SehHandlerPacket::prepare_search(&captured, &invocation, 0x8000),
+        Err(HandlerPacketError::InformationCount)
+    ));
+
+    let fixture = Fixture::new(unw_flag::UHANDLER);
+    let invocation = invoke(fixture.walk(unwind(None)).step(&fixture, &fixture).unwrap());
+    assert!(matches!(
+        SehHandlerPacket::prepare_search(&captured, &invocation, 0x8000),
+        Err(HandlerPacketError::NotSearch)
+    ));
 }
 
 #[test]
@@ -238,16 +455,99 @@ fn invalid_dispositions_are_not_continue_search() {
     }
 }
 
+fn saved_dispatcher(invocation: &HandlerInvocation) -> CollisionDispatcher {
+    CollisionDispatcher {
+        control_pc: invocation.control_pc,
+        image_base: invocation.image_base,
+        function: invocation.function,
+        establisher_frame: invocation.establisher_frame,
+        handler: invocation.handler,
+        handler_data: invocation.handler_data,
+        scope_index: 1,
+        context: context(),
+    }
+}
+
 #[test]
-fn collided_unwind_blocks_native_and_ntdll_adoption_in_both_passes() {
+fn collision_requires_an_explicit_saved_dispatcher() {
     let fixture = Fixture::new(unw_flag::EHANDLER | unw_flag::UHANDLER);
     for mode in [WalkMode::Search, unwind(Some(LOW + 0x20))] {
         let invocation = invoke(fixture.walk(mode).step(&fixture, &fixture).unwrap());
         assert_eq!(
             invocation.returned(3).unwrap_err(),
-            WalkError::UnsupportedCollidedUnwind
+            WalkError::InvalidCollisionDispatcher
         );
     }
+}
+
+#[test]
+fn collided_unwind_reinvokes_saved_handler_without_advancing_outer_frame() {
+    let fixture = Fixture::new(unw_flag::EHANDLER | unw_flag::UHANDLER);
+    for mode in [WalkMode::Search, unwind(Some(LOW + 0x20))] {
+        let mut first = invoke(fixture.walk(mode).step(&fixture, &fixture).unwrap());
+        first.collision = Some(saved_dispatcher(&first));
+        let walk = continued(first.returned(3).unwrap());
+        let second = invoke(walk.step(&fixture, &fixture).unwrap());
+        assert_eq!(second.control_pc, BASE + 0x110);
+        assert_eq!(second.establisher_frame, LOW);
+        assert_eq!(second.scope_index, 1);
+        assert_eq!(
+            second.exception.flags & EXCEPTION_COLLIDED_UNWIND,
+            EXCEPTION_COLLIDED_UNWIND
+        );
+        assert_eq!(second.handler, BASE + 0x800);
+        let next = second.returned(1).unwrap();
+        if mode == WalkMode::Search {
+            assert!(matches!(
+                next,
+                WalkStep::Complete(WalkOutcome::Unhandled { .. })
+            ));
+        } else {
+            assert!(matches!(next, WalkStep::Continue(_)));
+        }
+    }
+}
+
+#[test]
+fn collision_rejects_untrusted_image_function_handler_frame_and_scope() {
+    let fixture = Fixture::new(unw_flag::EHANDLER | unw_flag::UHANDLER);
+    for mutation in 0..6 {
+        let mut invocation = invoke(
+            fixture
+                .walk(unwind(Some(LOW + 0x20)))
+                .step(&fixture, &fixture)
+                .unwrap(),
+        );
+        let mut saved = saved_dispatcher(&invocation);
+        match mutation {
+            0 => saved.control_pc = BASE + 0x4000,
+            1 => saved.function.begin += 1,
+            2 => saved.handler += 1,
+            3 => saved.establisher_frame = LOW + 8,
+            4 => saved.scope_index = 3,
+            _ => saved.scope_index = 4097,
+        }
+        invocation.collision = Some(saved);
+        let walk = continued(invocation.returned(3).unwrap());
+        let error = walk.step(&fixture, &fixture).unwrap_err();
+        assert!(matches!(
+            error,
+            WalkError::InvalidCollisionDispatcher | WalkError::BadStack | WalkError::ImageLookup(_)
+        ));
+    }
+}
+
+#[test]
+fn repeated_collision_is_bounded_even_with_one_outer_frame() {
+    let fixture = Fixture::new(unw_flag::EHANDLER | unw_flag::UHANDLER);
+    let walk =
+        ExceptionWalk::new(unwind(Some(LOW + 0x20)), record(), context(), LOW, HIGH, 1).unwrap();
+    let mut first = invoke(walk.step(&fixture, &fixture).unwrap());
+    first.collision = Some(saved_dispatcher(&first));
+    let walk = continued(first.returned(3).unwrap());
+    let mut second = invoke(walk.step(&fixture, &fixture).unwrap());
+    second.collision = Some(saved_dispatcher(&second));
+    assert_eq!(second.returned(3).unwrap_err(), WalkError::FrameLimit);
 }
 
 #[test]
@@ -479,6 +779,106 @@ fn unfound_target_is_not_successful_unwind() {
 }
 
 #[test]
+fn exact_admitted_foreign_function_ends_each_pass_without_reading_its_stack() {
+    let fixture = Fixture::new(unw_flag::EHANDLER | unw_flag::UHANDLER);
+    for mode in [WalkMode::Search, unwind(None), unwind(Some(HIGH))] {
+        fixture.stack_reads.set(0);
+        let step = fixture
+            .walk(mode)
+            .with_foreign_boundary(BASE, 0x100)
+            .step(&fixture, &fixture)
+            .unwrap();
+        match (mode, step) {
+            (WalkMode::Search, WalkStep::Complete(WalkOutcome::Unhandled { context: observed, .. })) => {
+                assert_eq!(observed, context());
+            }
+            (
+                WalkMode::Unwind { target_frame: None, .. },
+                WalkStep::Complete(WalkOutcome::SecondChance {
+                    reason: SecondChanceReason::ExitUnwind,
+                    ..
+                }),
+            ) => {}
+            (
+                WalkMode::Unwind { target_frame: Some(_), .. },
+                WalkStep::Complete(WalkOutcome::SecondChance {
+                    reason: SecondChanceReason::TargetNotFound,
+                    ..
+                }),
+            ) => {}
+            (_, other) => panic!("foreign boundary produced {other:?}"),
+        }
+        assert_eq!(fixture.stack_reads.get(), 0);
+    }
+}
+
+#[test]
+fn foreign_boundary_requires_exact_admitted_image_and_function_identity() {
+    for boundary in [(BASE + 0x1000, 0x100), (BASE, 0x200)] {
+        let fixture = Fixture::new(0);
+        let step = fixture
+            .walk(WalkMode::Search)
+            .with_foreign_boundary(boundary.0, boundary.1)
+            .step(&fixture, &fixture)
+            .unwrap();
+        assert!(matches!(step, WalkStep::Continue(_)));
+        assert!(fixture.stack_reads.get() > 0);
+    }
+
+    let mut fixture = Fixture::new(0);
+    fixture.image_error = Some(ExceptionImageError::UnknownImage);
+    assert_eq!(
+        fixture
+            .walk(WalkMode::Search)
+            .with_foreign_boundary(BASE, 0x100)
+            .step(&fixture, &fixture)
+            .unwrap_err(),
+        WalkError::ImageLookup(ExceptionImageError::UnknownImage)
+    );
+    assert_eq!(fixture.stack_reads.get(), 0);
+}
+
+#[test]
+fn second_foreign_boundary_is_exact_and_never_weakens_first() {
+    let fixture = Fixture::new(0);
+    let second = fixture
+        .walk(WalkMode::Search)
+        .with_foreign_boundary(BASE, 0x200)
+        .with_second_foreign_boundary(BASE, 0x100)
+        .step(&fixture, &fixture)
+        .unwrap();
+    assert!(matches!(second, WalkStep::Complete(WalkOutcome::Unhandled { .. })));
+    assert_eq!(fixture.stack_reads.get(), 0);
+
+    let fixture = Fixture::new(0);
+    let wrong_image = fixture
+        .walk(WalkMode::Search)
+        .with_foreign_boundary(BASE, 0x200)
+        .with_second_foreign_boundary(BASE + 0x1000, 0x100)
+        .step(&fixture, &fixture)
+        .unwrap();
+    assert!(matches!(wrong_image, WalkStep::Continue(_)));
+    assert!(fixture.stack_reads.get() > 0);
+}
+
+#[test]
+fn foreign_boundary_survives_a_real_handler_continuation() {
+    let fixture = Fixture::new(unw_flag::EHANDLER);
+    let first = fixture
+        .walk(WalkMode::Search)
+        .with_foreign_boundary(BASE, 0x200)
+        .step(&fixture, &fixture)
+        .unwrap();
+    let walk = continued(invoke(first).returned(1).unwrap());
+    let reads_before = fixture.stack_reads.get();
+    assert!(matches!(
+        walk.step(&fixture, &fixture).unwrap(),
+        WalkStep::Complete(WalkOutcome::Unhandled { .. })
+    ));
+    assert_eq!(fixture.stack_reads.get(), reads_before);
+}
+
+#[test]
 fn passing_target_fails_with_bad_stack() {
     let fixture = Fixture::new(0);
     let walk = fixture.walk(unwind(Some(LOW + 0x10)));
@@ -502,6 +902,27 @@ fn leaf_frames_are_bounded_and_do_not_invent_a_target_handler_frame() {
     );
     assert_eq!(walk.state.current.rsp(), LOW + 8);
     assert_eq!(walk.state.current.rip, BASE + 0x500);
+}
+
+#[test]
+fn zero_code_no_handler_pdata_frame_accepts_call_entry_stack_alignment() {
+    let mut fixture = Fixture::new(0);
+    fixture.functions.clear();
+    fixture.functions.push(RuntimeFunction {
+        begin: 0x500,
+        end: 0x510,
+        unwind_info: 0x1000,
+    });
+    fixture.image[0x1000..0x1004].copy_from_slice(&[1, 0, 0, 0]);
+    fixture.stack.insert(LOW + 8, BASE + 0x110);
+    let mut current = Context::default();
+    current.rip = BASE + 0x500;
+    current.set_rsp(LOW + 8);
+    let walk = ExceptionWalk::new(WalkMode::Search, record(), current, LOW, HIGH, 8).unwrap();
+    let walk = continued(walk.step(&fixture, &fixture).unwrap());
+    assert_eq!(walk.state.current.rip, BASE + 0x110);
+    assert_eq!(walk.state.current.rsp(), LOW + 0x10);
+    assert_eq!(fixture.stack_reads.get(), 1);
 }
 
 #[test]

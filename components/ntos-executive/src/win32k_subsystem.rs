@@ -197,6 +197,17 @@ const _: () = assert!(WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000 <= WIN32K_
 const _: () = assert!(WIN32K_POOL_VADDR + WIN32K_POOL_FRAMES * 0x1000 <= WIN32K_STACK_VADDR);
 /// Shared handoff page (executive ↔ host). Within the pool's 2 MiB PT window (0x0700..0x0720).
 pub const WIN32K_SHARED_VADDR: u64 = 0x0000_0100_0718_0000;
+
+unsafe fn call_win32k_pe(target: u64, args: &[u64]) -> u64 {
+    assert!(target != 0 && args.len() <= 16, "invalid win32k PE callback");
+    let boundary = read_volatile(
+        (WIN32K_SHARED_VADDR + crate::driver_launch::SH_SEH_FOREIGN_CALL16_VA) as *const u64,
+    );
+    assert_ne!(boundary, 0, "win32k PE callback lacks its admitted boundary");
+    let call: unsafe extern "win64" fn(u64, *const u64, u64) -> u64 =
+        core::mem::transmute(boundary as *const ());
+    call(target, args.as_ptr(), args.len() as u64)
+}
 /// Dedicated fixed-frame provider-wait ABI. A wait may remain live while nested dispatches overwrite
 /// the general request and callback frames, so its canonical object identities cannot alias either.
 pub const WIN32K_PROVIDER_WAIT_VADDR: u64 = WIN32K_SHARED_VADDR + 0x1000;
@@ -10467,13 +10478,12 @@ unsafe fn ensure_win32k_process_attached(process_index: usize, process_role: u64
         let callout = read_volatile(WIN32_CALLOUTS as *const u64);
         if callout != 0 {
             let process = process_ctx_eprocess(process_index);
-            let co: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(callout as *const ());
             let verdict = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32);
             write_volatile(
                 (WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32,
                 verdict | V_CALLOUT_ENTERED,
             );
-            let status = co(process, 1);
+            let status = call_win32k_pe(callout, &[process, 1]) as i32;
             let verdict = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32);
             write_volatile(
                 (WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32,
@@ -10774,8 +10784,10 @@ unsafe fn ensure_win32k_threadinfo(thread_index: usize, client_teb: u64) -> bool
         let callout = read_volatile((WIN32_CALLOUTS + 8) as *const u64);
         if callout != 0 {
             let ethread = thread_ctx_ethread(thread_index);
-            let co: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(callout as *const ());
-            let status = co(ethread, PS_W32_THREAD_CALLOUT_INITIALIZE);
+            let status = call_win32k_pe(
+                callout,
+                &[ethread, PS_W32_THREAD_CALLOUT_INITIALIZE],
+            ) as i32;
             let slot_value = read_volatile(SLOT_W32THREAD as *const u64);
             if slot_value != 0 {
                 set_thread_ctx_w32thread(thread_index, slot_value);
@@ -13105,16 +13117,17 @@ unsafe fn rtl_query_registry_dispatch(
     if query_routine == 0 {
         return 0;
     }
-    let routine: extern "win64" fn(u64, u32, u64, u32, u64, u64) -> i32 =
-        core::mem::transmute(query_routine as *const ());
-    routine(
-        name_ptr,
-        value_type,
-        data.as_ptr() as u64,
-        data.len() as u32,
-        context,
-        entry_context,
-    )
+    call_win32k_pe(
+        query_routine,
+        &[
+            name_ptr,
+            value_type as u64,
+            data.as_ptr() as u64,
+            data.len() as u32 as u64,
+            context,
+            entry_context,
+        ],
+    ) as i32
 }
 
 /// `NTSTATUS RtlQueryRegistryValues(...)` over the same live registry targets as ZwOpenKey and
@@ -15423,9 +15436,7 @@ unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) 
             if routine == 0 {
                 return STATUS_DEVICE_NOT_READY;
             }
-            let callout: extern "win64" fn(u64, u64) -> i32 =
-                core::mem::transmute(routine as *const ());
-            let status = callout(ethread, 1);
+            let status = call_win32k_pe(routine, &[ethread, 1]) as i32;
             if status < 0 {
                 return status as u32 as u64;
             }
@@ -15457,9 +15468,7 @@ unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) 
             if routine == 0 {
                 return STATUS_DEVICE_NOT_READY;
             }
-            let callout: extern "win64" fn(u64, u64) -> i32 =
-                core::mem::transmute(routine as *const ());
-            let status = callout(eprocess, 0);
+            let status = call_win32k_pe(routine, &[eprocess, 0]) as i32;
             if status < 0 {
                 return status as u32 as u64;
             }
@@ -15684,12 +15693,11 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         DESKTOP_GFX_SEEDED = true;
         load_system_font_for_client(current_client_index());
         print_str(b"[win32k-gfx] creating display PDEV before user32 resources...\n");
-        let change_display: extern "win64" fn(u64, u64, u64, *mut u64, u64) -> i32 =
-            core::mem::transmute(
-                (WIN32K_CODE_VA + PDEVOBJ_L_CHANGE_DISPLAY_SETTINGS_RVA) as *const (),
-            );
         let gpmdev = (WIN32K_CODE_VA + GPMDEV_RVA) as *mut u64;
-        let display_status = change_display(0, 0, 0, gpmdev, 1);
+        let display_status = call_win32k_pe(
+            WIN32K_CODE_VA + PDEVOBJ_L_CHANGE_DISPLAY_SETTINGS_RVA,
+            &[0, 0, 0, gpmdev as u64, 1],
+        ) as i32;
         print_str(b"[win32k-gfx] PDEVOBJ_lChangeDisplaySettings status=0x");
         print_hex(display_status as u32);
         print_str(b" gpmdev=0x");
@@ -15728,8 +15736,7 @@ unsafe fn dispatch_gdi_batch_flush_callout(client_pi: u64, client_teb: u64) -> u
         return STATUS_DEVICE_NOT_READY;
     }
 
-    let flush: extern "win64" fn() -> i32 = core::mem::transmute(routine as *const ());
-    flush() as u32 as u64
+    call_win32k_pe(routine, &[]) as u32 as u64
 }
 
 unsafe fn dispatch_win32_job_callout(job: u64, callout_type: u32, data: u64) -> u64 {
@@ -16006,9 +16013,7 @@ unsafe fn dispatch_message_call_direct(
     if handler == 0 {
         return 0;
     }
-    let call: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
-        core::mem::transmute(handler as *const ());
-    call(hwnd, message, wparam, lparam, result_info, fnid, ansi)
+    call_win32k_pe(handler, &[hwnd, message, wparam, lparam, result_info, fnid, ansi])
 }
 
 /// Snapshot the real top-level windows visible to a handle-restricted job. Explicit handle grants
@@ -16610,236 +16615,23 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         prepare_set_thread_desktop(a0);
     }
 
-    let ret = match nargs {
-        0 => {
-            let f: extern "win64" fn() -> u64 = core::mem::transmute(handler as *const ());
-            f()
-        }
-        1 => {
-            let f: extern "win64" fn(u64) -> u64 = core::mem::transmute(handler as *const ());
-            f(a0)
-        }
-        2 => {
-            let f: extern "win64" fn(u64, u64) -> u64 = core::mem::transmute(handler as *const ());
-            f(a0, a1)
-        }
-        3 => {
-            let f: extern "win64" fn(u64, u64, u64) -> u64 =
-                core::mem::transmute(handler as *const ());
-            f(a0, a1, a2)
-        }
-        4 => {
-            let f: extern "win64" fn(u64, u64, u64, u64) -> u64 =
-                core::mem::transmute(handler as *const ());
-            f(a0, a1, a2, a3)
-        }
-        5 => {
-            let f: extern "win64" fn(u64, u64, u64, u64, u64) -> u64 =
-                core::mem::transmute(handler as *const ());
-            f(a0, a1, a2, a3, s(4))
-        }
-        6 => {
-            let f: extern "win64" fn(u64, u64, u64, u64, u64, u64) -> u64 =
-                core::mem::transmute(handler as *const ());
-            f(a0, a1, a2, a3, s(4), s(5))
-        }
-        7 => {
-            let f: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                core::mem::transmute(handler as *const ());
-            f(a0, a1, a2, a3, s(4), s(5), s(6))
-        }
-        8 => {
-            let f: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                core::mem::transmute(handler as *const ());
-            f(a0, a1, a2, a3, s(4), s(5), s(6), s(7))
-        }
-        9 => {
-            let f: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                core::mem::transmute(handler as *const ());
-            f(a0, a1, a2, a3, s(4), s(5), s(6), s(7), s(8))
-        }
-        10 => {
-            let f: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                core::mem::transmute(handler as *const ());
-            f(a0, a1, a2, a3, s(4), s(5), s(6), s(7), s(8), s(9))
-        }
-        11 => {
-            let f: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                core::mem::transmute(handler as *const ());
-            f(a0, a1, a2, a3, s(4), s(5), s(6), s(7), s(8), s(9), s(10))
-        }
-        12 => {
-            let f: extern "win64" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = core::mem::transmute(handler as *const ());
-            f(
-                a0,
-                a1,
-                a2,
-                a3,
-                s(4),
-                s(5),
-                s(6),
-                s(7),
-                s(8),
-                s(9),
-                s(10),
-                s(11),
-            )
-        }
-        13 => {
-            let f: extern "win64" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = core::mem::transmute(handler as *const ());
-            f(
-                a0,
-                a1,
-                a2,
-                a3,
-                s(4),
-                s(5),
-                s(6),
-                s(7),
-                s(8),
-                s(9),
-                s(10),
-                s(11),
-                s(12),
-            )
-        }
-        14 => {
-            let f: extern "win64" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = core::mem::transmute(handler as *const ());
-            f(
-                a0,
-                a1,
-                a2,
-                a3,
-                s(4),
-                s(5),
-                s(6),
-                s(7),
-                s(8),
-                s(9),
-                s(10),
-                s(11),
-                s(12),
-                s(13),
-            )
-        }
-        15 => {
-            let f: extern "win64" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = core::mem::transmute(handler as *const ());
-            f(
-                a0,
-                a1,
-                a2,
-                a3,
-                s(4),
-                s(5),
-                s(6),
-                s(7),
-                s(8),
-                s(9),
-                s(10),
-                s(11),
-                s(12),
-                s(13),
-                s(14),
-            )
-        }
-        16 => {
-            let f: extern "win64" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = core::mem::transmute(handler as *const ());
-            f(
-                a0,
-                a1,
-                a2,
-                a3,
-                s(4),
-                s(5),
-                s(6),
-                s(7),
-                s(8),
-                s(9),
-                s(10),
-                s(11),
-                s(12),
-                s(13),
-                s(14),
-                s(15),
-            )
-        }
-        _ => return STATUS_INVALID_SYSTEM_SERVICE,
-    };
+    if nargs > 16 {
+        return STATUS_INVALID_SYSTEM_SERVICE;
+    }
+    let boundary = read_volatile(
+        (sh + crate::driver_launch::SH_SEH_FOREIGN_CALL16_VA) as *const u64,
+    );
+    if boundary == 0 {
+        return STATUS_INVALID_SYSTEM_SERVICE;
+    }
+    let mut args = [0u64; 16];
+    args[..4].copy_from_slice(&[a0, a1, a2, a3]);
+    for index in 4..nargs {
+        args[index as usize] = s(index);
+    }
+    let call: unsafe extern "win64" fn(u64, *const u64, u64) -> u64 =
+        core::mem::transmute(boundary as *const ());
+    let ret = call(handler, args.as_ptr(), nargs);
     observe_gdi_handle_return(ssn, ret);
 
     // Publish only the interactive Default desktop after Ob creation has already installed its real

@@ -28,7 +28,7 @@ impl Scope {
             Err(_) => return Err(STATUS_INVALID_HANDLE),
         };
         let _durable = allocator::enter_durable();
-        service_sec_image::with_provider_process_manager(|pm| {
+        let result = service_sec_image::with_provider_process_manager(|pm| {
             (&mut *core::ptr::addr_of_mut!(OWNERS)).capture(
                 pm,
                 route,
@@ -36,7 +36,10 @@ impl Scope {
                 channel.pml4,
                 caller,
             )
-        })?;
+        });
+        if let Err(status) = result {
+            return Err(status);
+        }
         Ok(Self)
     }
 }

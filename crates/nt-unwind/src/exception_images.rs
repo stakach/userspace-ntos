@@ -14,17 +14,19 @@
 
 use alloc::{boxed::Box, vec::Vec};
 use core::ops::Range;
-use nt_pe_loader::{image_directory_entry, PeError, PeFile};
+use nt_pe_loader::{image_directory_entry, PeError, PeFile, Section};
 
 use crate::{
     exception_walk::{ExceptionFunction, ExceptionImageError, ExceptionImageReader},
     op_slots, read_runtime_function, read_unwind_header, uwop, ImageReader, RuntimeFunction,
-    DIRECTORY_ENTRY_EXCEPTION,
+    ScopeRecord, DIRECTORY_ENTRY_EXCEPTION,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ImageAdmissionError {
     Pe(PeError),
+    EmptyCatalog,
+    ImageOrder,
     NotExecutable,
     SnapshotSize,
     AddressRange,
@@ -37,19 +39,332 @@ pub enum ImageAdmissionError {
     ImageOverlap,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScopeTableError {
+    UnknownImage,
+    InvalidAddress,
+    InvalidExtent,
+    InvalidCount,
+    InsufficientResources,
+    InvalidScope,
+    InvalidHandler,
+    InvalidTarget,
+}
+
 #[derive(Debug)]
 pub struct AdmittedExceptionImage {
     base: u64,
     end: u64,
     bytes: Box<[u8]>,
+    sections: Vec<Range<u32>>,
     executable: Vec<Range<u32>>,
     functions: Vec<RuntimeFunction>,
 }
 
+/// A validated view of a sealed, complete mapped PE image. The caller must keep the backing
+/// mapping read-only for the entire lifetime of this view; admission cannot enforce page rights.
+/// Unlike `AdmittedExceptionImage`, construction and lookup perform no heap allocation.
+pub struct BorrowedExceptionImage<'a> {
+    base: u64,
+    end: u64,
+    bytes: &'a [u8],
+    pe: PeFile<'a>,
+}
+
+/// A caller-owned, already ordered set of sealed mapped images. Admission checks adjacency but
+/// never sorts, copies, or repairs the supplied catalog.
+pub struct BorrowedExceptionCatalog<'images, 'bytes> {
+    images: &'images [BorrowedExceptionImage<'bytes>],
+}
+
+impl<'images, 'bytes> BorrowedExceptionCatalog<'images, 'bytes> {
+    pub fn new(
+        images: &'images [BorrowedExceptionImage<'bytes>],
+    ) -> Result<Self, ImageAdmissionError> {
+        if images.is_empty() {
+            return Err(ImageAdmissionError::EmptyCatalog);
+        }
+        for pair in images.windows(2) {
+            if pair[0].base >= pair[1].base {
+                return Err(ImageAdmissionError::ImageOrder);
+            }
+            if pair[0].end > pair[1].base {
+                return Err(ImageAdmissionError::ImageOverlap);
+            }
+        }
+        Ok(Self { images })
+    }
+
+    pub fn image_count(&self) -> usize {
+        self.images.len()
+    }
+
+    pub fn read_c_scope_table(
+        &self,
+        image_base: u64,
+        handler_data: u64,
+    ) -> Result<ScopeCursor<'_>, ScopeTableError> {
+        self.image_at_base(image_base)
+            .ok_or(ScopeTableError::UnknownImage)?
+            .read_c_scope_table(handler_data)
+    }
+
+    fn image_at_base(&self, base: u64) -> Option<&BorrowedExceptionImage<'bytes>> {
+        self.images
+            .binary_search_by_key(&base, |image| image.base)
+            .ok()
+            .and_then(|index| self.images.get(index))
+    }
+
+    fn image_containing(&self, pc: u64) -> Option<&BorrowedExceptionImage<'bytes>> {
+        let index = self
+            .images
+            .partition_point(|image| image.base <= pc)
+            .checked_sub(1)?;
+        self.images.get(index).filter(|image| pc < image.end)
+    }
+}
+
+impl ExceptionImageReader for BorrowedExceptionCatalog<'_, '_> {
+    fn lookup_exception_function(&self, pc: u64) -> Result<ExceptionFunction, ExceptionImageError> {
+        self.image_containing(pc)
+            .ok_or(ExceptionImageError::UnknownImage)?
+            .lookup_exception_function(pc)
+    }
+
+    fn validate_collision_scope(&self, image_base: u64, handler_data: u64, index: u32) -> bool {
+        self.image_at_base(image_base)
+            .is_some_and(|image| image.validate_collision_scope(image_base, handler_data, index))
+    }
+}
+
+impl ImageReader for BorrowedExceptionCatalog<'_, '_> {
+    fn lookup_function(&self, pc: u64) -> Option<(u64, RuntimeFunction)> {
+        self.image_containing(pc)?.lookup_function(pc)
+    }
+
+    fn read_u8(&self, base: u64, rva: u32) -> Option<u8> {
+        self.image_at_base(base)?.read_u8(base, rva)
+    }
+}
+
+impl<'a> BorrowedExceptionImage<'a> {
+    pub fn from_mapped_image(base: u64, bytes: &'a [u8]) -> Result<Self, ImageAdmissionError> {
+        let pe = PeFile::parse(bytes).map_err(ImageAdmissionError::Pe)?;
+        let headers = pe.headers();
+        if !headers.is_executable() {
+            return Err(ImageAdmissionError::NotExecutable);
+        }
+        let size = headers.size_of_image;
+        if size == 0 || bytes.len() != size as usize {
+            return Err(ImageAdmissionError::SnapshotSize);
+        }
+        let end = base
+            .checked_add(u64::from(size))
+            .filter(|_| base != 0)
+            .ok_or(ImageAdmissionError::AddressRange)?;
+        let section_table_end = headers
+            .section_table_offset()
+            .checked_add(
+                pe.sections()
+                    .len()
+                    .checked_mul(40)
+                    .ok_or(ImageAdmissionError::HeaderExtent)?,
+            )
+            .ok_or(ImageAdmissionError::HeaderExtent)?;
+        if section_table_end > headers.size_of_headers as usize || headers.size_of_headers > size {
+            return Err(ImageAdmissionError::HeaderExtent);
+        }
+        for (index, section) in pe.sections().iter().enumerate() {
+            let Some(range) = section_range(section) else {
+                if section.virtual_size.max(section.size_of_raw_data) != 0 {
+                    return Err(ImageAdmissionError::SectionExtent);
+                }
+                continue;
+            };
+            if range.start < headers.size_of_headers || range.end > size {
+                return Err(ImageAdmissionError::SectionExtent);
+            }
+            for prior in &pe.sections()[..index] {
+                if let Some(other) = section_range(prior) {
+                    if range.start < other.end && other.start < range.end {
+                        return Err(ImageAdmissionError::SectionOverlap);
+                    }
+                }
+            }
+        }
+        let entry = headers.data_directory(DIRECTORY_ENTRY_EXCEPTION);
+        if (entry.virtual_address == 0) != (entry.size == 0) || entry.size % 12 != 0 {
+            return Err(ImageAdmissionError::ExceptionDirectory);
+        }
+        if let Some((offset, length)) =
+            image_directory_entry(bytes, true, DIRECTORY_ENTRY_EXCEPTION)
+                .map_err(ImageAdmissionError::Pe)?
+        {
+            if offset & 3 != 0 {
+                return Err(ImageAdmissionError::ExceptionDirectory);
+            }
+            let reader = SnapshotReader { base, bytes };
+            let executable = |range| covers_pe_executable(pe.sections(), range);
+            let mut previous_end = 0;
+            for index in 0..length / 12 {
+                let rva = entry
+                    .virtual_address
+                    .checked_add(index * 12)
+                    .ok_or(ImageAdmissionError::ExceptionDirectory)?;
+                let function = read_runtime_function(&reader, base, rva)
+                    .ok_or(ImageAdmissionError::FunctionTable)?;
+                if !executable(function.begin..function.end)
+                    || (index != 0 && previous_end > function.begin)
+                {
+                    return Err(ImageAdmissionError::FunctionTable);
+                }
+                validate_metadata(&reader, &executable, function)?;
+                previous_end = function.end;
+            }
+        }
+        Ok(Self {
+            base,
+            end,
+            bytes,
+            pe,
+        })
+    }
+
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    pub fn size(&self) -> usize {
+        self.pe.bytes().len()
+    }
+
+    pub fn read_c_scope_table(
+        &self,
+        handler_data: u64,
+    ) -> Result<ScopeCursor<'a>, ScopeTableError> {
+        read_scope_cursor(
+            self.base,
+            self.bytes,
+            handler_data,
+            |rva| section_containing(self.pe.sections(), rva),
+            |range| covers_pe_executable(self.pe.sections(), range),
+        )
+    }
+}
+
+impl ExceptionImageReader for BorrowedExceptionImage<'_> {
+    fn lookup_exception_function(&self, pc: u64) -> Result<ExceptionFunction, ExceptionImageError> {
+        let rva = u32::try_from(
+            pc.checked_sub(self.base)
+                .ok_or(ExceptionImageError::UnknownImage)?,
+        )
+        .map_err(|_| ExceptionImageError::UnknownImage)?;
+        if pc >= self.end || !covers_pe_executable(self.pe.sections(), rva..rva.saturating_add(1)) {
+            return Err(ExceptionImageError::UnknownImage);
+        }
+        let entry = self.pe.headers().data_directory(DIRECTORY_ENTRY_EXCEPTION);
+        let reader = SnapshotReader {
+            base: self.base,
+            bytes: self.pe.bytes(),
+        };
+        let mut low = 0u32;
+        let mut high = entry.size / 12;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let row =
+                read_runtime_function(&reader, self.base, entry.virtual_address + middle * 12)
+                    .ok_or(ExceptionImageError::CorruptFunctionTable)?;
+            if row.begin <= rva {
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        if low != 0 {
+            let function =
+                read_runtime_function(&reader, self.base, entry.virtual_address + (low - 1) * 12)
+                    .ok_or(ExceptionImageError::CorruptFunctionTable)?;
+            if function.covers(rva) {
+                return Ok(ExceptionFunction::Function {
+                    image_base: self.base,
+                    function,
+                });
+            }
+        }
+        Ok(ExceptionFunction::Leaf)
+    }
+
+    fn validate_collision_scope(&self, image_base: u64, handler_data: u64, index: u32) -> bool {
+        image_base == self.base
+            && (index == 0
+                || self
+                    .read_c_scope_table(handler_data)
+                    .is_ok_and(|scopes| index <= scopes.len()))
+    }
+}
+
+impl ImageReader for BorrowedExceptionImage<'_> {
+    fn lookup_function(&self, pc: u64) -> Option<(u64, RuntimeFunction)> {
+        match self.lookup_exception_function(pc).ok()? {
+            ExceptionFunction::Function {
+                image_base,
+                function,
+            } => Some((image_base, function)),
+            ExceptionFunction::Leaf => None,
+        }
+    }
+
+    fn read_u8(&self, base: u64, rva: u32) -> Option<u8> {
+        (base == self.base)
+            .then(|| self.pe.bytes().get(rva as usize).copied())
+            .flatten()
+    }
+}
+
+/// An already validated C scope table. Iteration has no allocation or failure path.
+#[derive(Clone)]
+pub struct ScopeCursor<'a> {
+    raw: &'a [u8],
+    index: usize,
+}
+
+impl ScopeCursor<'_> {
+    pub fn len(&self) -> u32 {
+        (self.raw.len() / 16) as u32
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+
+    pub fn get(&self, index: u32) -> Option<ScopeRecord> {
+        let start = usize::try_from(index).ok()?.checked_mul(16)?;
+        self.raw
+            .get(start..start.checked_add(16)?)
+            .map(scope_record)
+    }
+}
+
+impl Iterator for ScopeCursor<'_> {
+    type Item = ScopeRecord;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let raw = self.raw.get(self.index * 16..self.index * 16 + 16)?;
+        self.index += 1;
+        Some(scope_record(raw))
+    }
+}
+
 impl AdmittedExceptionImage {
+    pub fn mapped_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Consume, rather than copy, a complete mapped-image snapshot. Sections are interpreted by RVA;
     /// `PointerToRawData` is deliberately not a source of bytes in this layout.
     pub fn from_mapped_image(base: u64, bytes: Box<[u8]>) -> Result<Self, ImageAdmissionError> {
+        BorrowedExceptionImage::from_mapped_image(base, &bytes)?;
         let pe = PeFile::parse(&bytes).map_err(ImageAdmissionError::Pe)?;
         let headers = pe.headers();
         if !headers.is_executable() {
@@ -135,7 +450,6 @@ impl AdmittedExceptionImage {
                 {
                     return Err(ImageAdmissionError::FunctionTable);
                 }
-                validate_metadata(&reader, &executable, function)?;
                 functions.push(function);
             }
         }
@@ -143,6 +457,7 @@ impl AdmittedExceptionImage {
             base,
             end,
             bytes,
+            sections,
             executable,
             functions,
         })
@@ -158,6 +473,33 @@ impl AdmittedExceptionImage {
 
     pub fn function_count(&self) -> usize {
         self.functions.len()
+    }
+
+    /// Copy a C language-handler table out of admitted mapped-image metadata. The caller must
+    /// supply the exact image base from its unwind invocation; an address in another image cannot
+    /// be silently reinterpreted using this image's RVAs.
+    pub fn read_c_scope_table(
+        &self,
+        handler_data: u64,
+    ) -> Result<Vec<ScopeRecord>, ScopeTableError> {
+        let cursor = read_scope_cursor(
+            self.base,
+            &self.bytes,
+            handler_data,
+            |rva| {
+                self.sections
+                    .iter()
+                    .find(|section| section.contains(&rva))
+                    .cloned()
+            },
+            |range| covers_range(&self.executable, range),
+        )?;
+        let mut scopes = Vec::new();
+        scopes
+            .try_reserve_exact(cursor.len() as usize)
+            .map_err(|_| ScopeTableError::InsufficientResources)?;
+        scopes.extend(cursor);
+        Ok(scopes)
     }
 
     fn lookup(&self, pc: u64) -> Result<ExceptionFunction, ExceptionImageError> {
@@ -195,6 +537,10 @@ pub struct ExceptionImageCatalog {
 }
 
 impl ExceptionImageCatalog {
+    pub fn images(&self) -> &[AdmittedExceptionImage] {
+        &self.images
+    }
+
     pub fn new(mut images: Vec<AdmittedExceptionImage>) -> Result<Self, ImageAdmissionError> {
         images.sort_unstable_by_key(|image| image.base);
         if images.windows(2).any(|pair| pair[0].end > pair[1].base) {
@@ -205,6 +551,20 @@ impl ExceptionImageCatalog {
 
     pub fn image_count(&self) -> usize {
         self.images.len()
+    }
+
+    pub fn read_c_scope_table(
+        &self,
+        image_base: u64,
+        handler_data: u64,
+    ) -> Result<Vec<ScopeRecord>, ScopeTableError> {
+        let image = self
+            .images
+            .binary_search_by_key(&image_base, |image| image.base)
+            .ok()
+            .and_then(|index| self.images.get(index))
+            .ok_or(ScopeTableError::UnknownImage)?;
+        image.read_c_scope_table(handler_data)
     }
 
     fn image_containing(&self, pc: u64) -> Option<&AdmittedExceptionImage> {
@@ -221,6 +581,13 @@ impl ExceptionImageReader for ExceptionImageCatalog {
         self.image_containing(pc)
             .ok_or(ExceptionImageError::UnknownImage)?
             .lookup(pc)
+    }
+
+    fn validate_collision_scope(&self, image_base: u64, handler_data: u64, index: u32) -> bool {
+        index == 0
+            || self
+                .read_c_scope_table(image_base, handler_data)
+                .is_ok_and(|scopes| index <= scopes.len() as u32)
     }
 }
 
@@ -262,6 +629,117 @@ impl ImageReader for SnapshotReader<'_> {
     }
 }
 
+fn section_range(section: &Section) -> Option<Range<u32>> {
+    let length = section.virtual_size.max(section.size_of_raw_data);
+    (length != 0).then_some(())?;
+    Some(section.virtual_address..section.virtual_address.checked_add(length)?)
+}
+
+fn scope_record(raw: &[u8]) -> ScopeRecord {
+    let field = |offset: usize| u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap());
+    ScopeRecord {
+        begin: field(0),
+        end: field(4),
+        handler: field(8),
+        target: field(12),
+    }
+}
+
+fn read_scope_cursor<'a>(
+    base: u64,
+    bytes: &'a [u8],
+    handler_data: u64,
+    containing_section: impl Fn(u32) -> Option<Range<u32>>,
+    executable: impl Fn(Range<u32>) -> bool,
+) -> Result<ScopeCursor<'a>, ScopeTableError> {
+    let rva = u32::try_from(
+        handler_data
+            .checked_sub(base)
+            .ok_or(ScopeTableError::InvalidAddress)?,
+    )
+    .map_err(|_| ScopeTableError::InvalidAddress)?;
+    if rva & 3 != 0 {
+        return Err(ScopeTableError::InvalidAddress);
+    }
+    let section = containing_section(rva).ok_or(ScopeTableError::InvalidAddress)?;
+    let header_end = rva.checked_add(4).ok_or(ScopeTableError::InvalidExtent)?;
+    if header_end > section.end {
+        return Err(ScopeTableError::InvalidExtent);
+    }
+    let count = u32::from_le_bytes(
+        bytes
+            .get(rva as usize..header_end as usize)
+            .ok_or(ScopeTableError::InvalidExtent)?
+            .try_into()
+            .map_err(|_| ScopeTableError::InvalidExtent)?,
+    );
+    if count > 4096 {
+        return Err(ScopeTableError::InvalidCount);
+    }
+    let end = count
+        .checked_mul(16)
+        .and_then(|length| header_end.checked_add(length))
+        .ok_or(ScopeTableError::InvalidExtent)?;
+    if end > section.end {
+        return Err(ScopeTableError::InvalidExtent);
+    }
+    let raw = bytes
+        .get(header_end as usize..end as usize)
+        .ok_or(ScopeTableError::InvalidExtent)?;
+    for row in raw.chunks_exact(16) {
+        let scope = scope_record(row);
+        if !executable(scope.begin..scope.end) {
+            return Err(ScopeTableError::InvalidScope);
+        }
+        if scope.handler != 1
+            && !scope
+                .handler
+                .checked_add(1)
+                .is_some_and(|end| executable(scope.handler..end))
+        {
+            return Err(ScopeTableError::InvalidHandler);
+        }
+        if scope.target == 0 {
+            if scope.handler == 1 {
+                return Err(ScopeTableError::InvalidHandler);
+            }
+        } else if !scope
+            .target
+            .checked_add(1)
+            .is_some_and(|end| executable(scope.target..end))
+        {
+            return Err(ScopeTableError::InvalidTarget);
+        }
+    }
+    Ok(ScopeCursor { raw, index: 0 })
+}
+
+fn section_containing(sections: &[Section], rva: u32) -> Option<Range<u32>> {
+    sections
+        .iter()
+        .filter_map(section_range)
+        .find(|range| range.contains(&rva))
+}
+
+fn covers_pe_executable(sections: &[Section], range: Range<u32>) -> bool {
+    if range.start >= range.end {
+        return false;
+    }
+    let mut covered = range.start;
+    while covered < range.end {
+        let Some(next) = sections
+            .iter()
+            .filter(|section| section.is_executable())
+            .filter_map(section_range)
+            .find(|section| section.contains(&covered))
+        else {
+            return false;
+        };
+        covered = next.end;
+    }
+    true
+}
+
 fn covers_range(executable: &[Range<u32>], range: Range<u32>) -> bool {
     if range.start >= range.end {
         return false;
@@ -284,7 +762,7 @@ fn covers_range(executable: &[Range<u32>], range: Range<u32>) -> bool {
 
 fn validate_metadata(
     reader: &SnapshotReader<'_>,
-    executable: &[Range<u32>],
+    executable: &impl Fn(Range<u32>) -> bool,
     mut function: RuntimeFunction,
 ) -> Result<(), ImageAdmissionError> {
     let invalid = ImageAdmissionError::UnwindMetadata;
@@ -292,7 +770,7 @@ fn validate_metadata(
     let mut links = 32u8;
     let mut chained_frame = None;
     loop {
-        if !covers_range(executable, function.begin..function.end) {
+        if !executable(function.begin..function.end) {
             return Err(invalid);
         }
         if function.is_chained_ptr() {
@@ -362,7 +840,10 @@ fn validate_metadata(
         } else {
             if header.has_handler() {
                 let handler = reader.read_u32(reader.base, tail).ok_or(invalid)?;
-                if !executable.iter().any(|range| range.contains(&handler)) {
+                if !handler
+                    .checked_add(1)
+                    .is_some_and(|end| executable(handler..end))
+                {
                     return Err(invalid);
                 }
                 let data = tail.checked_add(4).ok_or(invalid)?;

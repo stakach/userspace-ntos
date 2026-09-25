@@ -49,6 +49,9 @@ pub fn parse_exports(
         let name = cstr_at_rva(bytes, sections, name_rva)?;
         // The name's index into AddressOfNameOrdinals gives the function-table index.
         let func_index = u16_at_rva(bytes, sections, address_of_name_ordinals + i * 2)?;
+        if u32::from(func_index) >= number_of_functions {
+            return Err(PeError::ImportTableInvalid);
+        }
         let func_rva = u32_at_rva(
             bytes,
             sections,

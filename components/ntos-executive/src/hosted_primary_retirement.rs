@@ -64,6 +64,10 @@ unsafe fn prepare(
     let runs = [
         (inst.stack_frame_base, inst.stack_frame_count),
         (inst.image_frame_base, inst.image_frames),
+        (
+            inst.exception_snapshot_frame_base,
+            inst.exception_snapshot_frames,
+        ),
         (inst.pool_frame_base, FSD_POOL_FRAMES),
         (inst.data_frame_base, FSD_DATA_FRAMES),
         (inst.shared_frame_base, FSD_SHARED_FRAMES),

@@ -207,7 +207,8 @@ impl LaneAddressLayout {
             && self.capacity != 0
     }
 
-    pub fn ipc_buffer_for_stack_pointer(self, stack_pointer: u64) -> Option<u64> {
+    /// Return the mapped stack interval for the lane containing this stack pointer.
+    pub fn stack_bounds_for_stack_pointer(self, stack_pointer: u64) -> Option<(u64, u64)> {
         if !self.is_valid() || stack_pointer < self.base {
             return None;
         }
@@ -217,9 +218,14 @@ impl LaneAddressLayout {
         if lane >= self.capacity as u64 || lane_offset >= self.stack_bytes {
             return None;
         }
-        self.base
-            .checked_add(lane.checked_mul(self.stride)?)?
-            .checked_add(self.ipc_buffer_offset)
+        let low = self.base.checked_add(lane.checked_mul(self.stride)?)?;
+        let high = low.checked_add(self.stack_bytes)?;
+        Some((low, high))
+    }
+
+    pub fn ipc_buffer_for_stack_pointer(self, stack_pointer: u64) -> Option<u64> {
+        let (low, _) = self.stack_bounds_for_stack_pointer(stack_pointer)?;
+        low.checked_add(self.ipc_buffer_offset)
     }
 }
 
@@ -2277,5 +2283,28 @@ mod tests {
         assert_eq!(layout.ipc_buffer_for_stack_pointer(0x1002_0000), None);
         assert_eq!(layout.ipc_buffer_for_stack_pointer(0x100c_0000), None);
         assert_eq!(layout.ipc_buffer_for_stack_pointer(0x0fff_ffff), None);
+        assert_eq!(
+            layout.stack_bounds_for_stack_pointer(0x1004_1234),
+            Some((0x1004_0000, 0x1006_0000))
+        );
+        assert_eq!(
+            layout.stack_bounds_for_stack_pointer(0x1005_ffff),
+            Some((0x1004_0000, 0x1006_0000))
+        );
+        assert_eq!(layout.stack_bounds_for_stack_pointer(0x1006_0000), None);
+        assert_eq!(layout.stack_bounds_for_stack_pointer(0x100c_0000), None);
+        assert_eq!(layout.stack_bounds_for_stack_pointer(0x0fff_ffff), None);
+    }
+
+    #[test]
+    fn lane_stack_window_rejects_overflowing_final_extent() {
+        let layout = LaneAddressLayout {
+            base: u64::MAX - 0xfff,
+            stride: 0x3000,
+            stack_bytes: 0x2000,
+            ipc_buffer_offset: 0x2000,
+            capacity: 1,
+        };
+        assert_eq!(layout.stack_bounds_for_stack_pointer(layout.base), None);
     }
 }

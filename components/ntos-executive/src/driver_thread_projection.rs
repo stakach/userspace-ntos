@@ -59,7 +59,7 @@ pub(crate) unsafe fn enter(channel: &crate::spawn_hosts::PumpChannel,
     let projection = projection(route, caller)?.ok_or(STATUS_INVALID_HANDLE)?;
     let initialized = crate::service_sec_image::with_provider_process_manager(|pm| {
         let owners = &mut *core::ptr::addr_of_mut!(OWNERS);
-        if owners.contains(route) {
+        if owners.contains_dispatch(route, dispatch) || owners.has_bootstrap(route) {
             owners.bind(pm, route, dispatch, caller, projection)?;
             Ok(false)
         } else {

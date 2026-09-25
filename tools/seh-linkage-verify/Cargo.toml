@@ -1,0 +1,23 @@
+[package]
+name = "seh-linkage-verify"
+description = "Static PE and unwind verifier for the hosted SEH linkage frame image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+default-run = "seh-linkage-verify"
+
+[[bin]]
+name = "seh-linkage-verify"
+path = "src/main.rs"
+
+[[bin]]
+name = "seh-driver-fixture-verify"
+path = "src/driver_fixture.rs"
+
+[dependencies]
+nt-pe-loader.workspace = true
+nt-unwind.workspace = true
+sha2 = "0.10"

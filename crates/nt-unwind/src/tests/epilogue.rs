@@ -1,10 +1,24 @@
 use super::*;
 
+fn covering(end: u32) -> RuntimeFunction {
+    RuntimeFunction {
+        begin: 0x1000,
+        end,
+        unwind_info: 0x2000,
+    }
+}
+
 fn run(code: &[u8], frame: u8, ctx: &mut Context, stack: &dyn StackReader) -> Option<bool> {
     let mut image = img_with_unwind(&[], 1, 0, 0, frame);
     image.write(0x1050, code);
     crate::epilogue::unwind_return(
-        image.base, 0x1050, 0x1100, frame, ctx, &image, stack,
+        image.base,
+        0x1050,
+        covering(0x1100),
+        frame,
+        ctx,
+        &image,
+        stack,
         &mut ContextPointers::default(),
     )
 }
@@ -25,6 +39,245 @@ fn return_variants_can_precede_trailing_code_and_padding() {
         assert_eq!(ctx.rip, 0x1400_2222);
         assert_eq!(ctx.rsp(), 0x9008 + extra);
     }
+}
+
+#[test]
+fn direct_tail_jump_after_stack_restore_pops_the_real_caller() {
+    for (rva, code) in [
+        (0x1050, vec![0xe9, 0xab, 0x01, 0, 0]),
+        (0x10f0, vec![0xeb, 0x20]),
+    ] {
+        let mut img = img_with_unwind(&[4, 0x32], 1, 8, 1, 0);
+        img.write(rva, &code);
+        let pc = img.base + u64::from(rva);
+        let (base, function) = img.lookup_function(pc).unwrap();
+        let mut stack = MockStack::new();
+        stack.put(0x9020, 0x1400_2222);
+        stack.put(0x9040, 0x1400_3333);
+        let mut ctx = Context::default();
+        ctx.set_rsp(0x9020); // ADD RSP, 0x20 already executed before the interrupted jump
+        virtual_unwind(1, base, pc, function, &mut ctx, &img, &stack).unwrap();
+        assert_eq!(ctx.rip, 0x1400_2222);
+        assert_eq!(ctx.rsp(), 0x9028);
+    }
+}
+
+#[test]
+fn direct_jump_within_the_same_chained_function_is_not_a_return() {
+    for chained_fragment in [false, true] {
+        let mut img = img_with_unwind(&[], 1, 0, 0, 0);
+        let displacement = if chained_fragment { 0x1abu32 } else { 0x0b };
+        let mut jump = [0xe9, 0, 0, 0, 0];
+        jump[1..].copy_from_slice(&displacement.to_le_bytes());
+        img.write(0x1050, &jump);
+        if chained_fragment {
+            img.set_pdata(vec![
+                RuntimeFunction {
+                    begin: 0x1000,
+                    end: 0x1100,
+                    unwind_info: 0x2000,
+                },
+                RuntimeFunction {
+                    begin: 0x1200,
+                    end: 0x1300,
+                    unwind_info: 0x3001,
+                },
+            ]);
+            img.write(0x3000, &0x1000u32.to_le_bytes());
+            img.write(0x3004, &0x1100u32.to_le_bytes());
+            img.write(0x3008, &0x2000u32.to_le_bytes());
+        }
+        let mut ctx = Context::default();
+        ctx.set_rsp(0x9020);
+        let before = ctx;
+        let function = img.lookup_function(img.base + 0x1050).unwrap().1;
+        assert_eq!(
+            crate::epilogue::unwind_return(
+                img.base,
+                0x1050,
+                function,
+                0,
+                &mut ctx,
+                &img,
+                &NoStackReads,
+                &mut ContextPointers::default(),
+            ),
+            Some(false)
+        );
+        assert_eq!(ctx, before);
+    }
+}
+
+#[test]
+fn direct_jump_to_chaininfo_sibling_is_not_a_return() {
+    let mut img = img_with_unwind(&[], 1, 0, 0, 0);
+    img.set_pdata(vec![
+        RuntimeFunction {
+            begin: 0x1000,
+            end: 0x1100,
+            unwind_info: 0x2000,
+        },
+        RuntimeFunction {
+            begin: 0x1200,
+            end: 0x1300,
+            unwind_info: 0x2200,
+        },
+    ]);
+    img.write(0x1050, &[0xe9, 0xab, 0x01, 0, 0]);
+    img.write(0x2200, &[0x21, 0, 0, 0]); // version 1, UNW_FLAG_CHAININFO
+    img.write(0x2204, &0x1000u32.to_le_bytes());
+    img.write(0x2208, &0x1100u32.to_le_bytes());
+    img.write(0x220c, &0x2000u32.to_le_bytes());
+    let mut ctx = Context::default();
+    ctx.set_rsp(0x9020);
+    let before = ctx;
+    let function = img.lookup_function(img.base + 0x1050).unwrap().1;
+    assert_eq!(
+        crate::epilogue::unwind_return(
+            img.base,
+            0x1050,
+            function,
+            0,
+            &mut ctx,
+            &img,
+            &NoStackReads,
+            &mut ContextPointers::default(),
+        ),
+        Some(false)
+    );
+    assert_eq!(ctx, before);
+}
+
+#[test]
+fn cyclic_chaininfo_tail_jump_fails_before_reading_the_stack() {
+    let mut img = img_with_unwind(&[], 1, 0, 0, 0);
+    img.set_pdata(vec![
+        RuntimeFunction {
+            begin: 0x1000,
+            end: 0x1100,
+            unwind_info: 0x2000,
+        },
+        RuntimeFunction {
+            begin: 0x1200,
+            end: 0x1300,
+            unwind_info: 0x2200,
+        },
+    ]);
+    img.write(0x1050, &[0xe9, 0xab, 0x01, 0, 0]);
+    img.write(0x2200, &[0x21, 0, 0, 0]);
+    img.write(0x2204, &0x1200u32.to_le_bytes());
+    img.write(0x2208, &0x1300u32.to_le_bytes());
+    img.write(0x220c, &0x2200u32.to_le_bytes());
+    let mut ctx = Context::default();
+    ctx.set_rsp(0x9020);
+    let before = ctx;
+    let function = img.lookup_function(img.base + 0x1050).unwrap().1;
+    assert_eq!(
+        crate::epilogue::unwind_return(
+            img.base,
+            0x1050,
+            function,
+            0,
+            &mut ctx,
+            &img,
+            &NoStackReads,
+            &mut ContextPointers::default(),
+        ),
+        None
+    );
+    assert_eq!(ctx, before);
+}
+
+#[test]
+fn direct_jump_to_a_different_function_is_a_return_epilogue() {
+    let mut img = img_with_unwind(&[], 1, 0, 0, 0);
+    img.set_pdata(vec![
+        RuntimeFunction {
+            begin: 0x1000,
+            end: 0x1100,
+            unwind_info: 0x2000,
+        },
+        RuntimeFunction {
+            begin: 0x1200,
+            end: 0x1300,
+            unwind_info: 0x2200,
+        },
+    ]);
+    img.write(0x1050, &[0xe9, 0xab, 0x01, 0, 0]);
+    img.write(0x2200, &[1, 0, 0, 0]);
+    let mut stack = MockStack::new();
+    stack.put(0x9000, 0x1400_2222);
+    let mut ctx = Context::default();
+    ctx.set_rsp(0x9000);
+    let function = img.lookup_function(img.base + 0x1050).unwrap().1;
+    assert_eq!(
+        crate::epilogue::unwind_return(
+            img.base,
+            0x1050,
+            function,
+            0,
+            &mut ctx,
+            &img,
+            &stack,
+            &mut ContextPointers::default(),
+        ),
+        Some(true)
+    );
+    assert_eq!(ctx.rip, 0x1400_2222);
+    assert_eq!(ctx.rsp(), 0x9008);
+}
+
+#[test]
+fn indirect_tail_jumps_pop_the_real_caller_after_stack_restore() {
+    for code in [
+        vec![0xff, 0x25, 0x10, 0, 0, 0], // JMP [RIP+16]
+        vec![0x48, 0xff, 0xe0],          // JMP RAX
+        vec![0x48, 0xff, 0xe7],          // JMP RDI
+    ] {
+        let mut stack = MockStack::new();
+        stack.put(0x9020, 0x1400_2222);
+        let mut ctx = Context::default();
+        ctx.set_rsp(0x9020);
+        assert_eq!(run(&code, 0, &mut ctx, &stack), Some(true));
+        assert_eq!(ctx.rip, 0x1400_2222);
+        assert_eq!(ctx.rsp(), 0x9028);
+    }
+}
+
+#[test]
+fn unrelated_or_truncated_indirect_jump_encodings_are_not_return_epilogues() {
+    for code in [
+        vec![0xff, 0xd0],       // CALL RAX
+        vec![0xff, 0xe0],       // non-canonical JMP RAX without REX.W
+        vec![0x49, 0xff, 0xe0], // REX.B is not the canonical register tail jump
+    ] {
+        let mut ctx = Context::default();
+        ctx.set_rsp(0x9020);
+        let before = ctx;
+        let result = run(&code, 0, &mut ctx, &NoStackReads);
+        assert!(matches!(result, Some(false) | None));
+        assert_eq!(ctx, before);
+    }
+    let mut image = img_with_unwind(&[], 1, 0, 0, 0);
+    image.write(0x1050, &[0xff, 0x25, 1, 2, 3]);
+    image.bytes.remove(&0x1055);
+    let mut ctx = Context::default();
+    ctx.set_rsp(0x9020);
+    let before = ctx;
+    assert_eq!(
+        crate::epilogue::unwind_return(
+            image.base,
+            0x1050,
+            covering(0x1100),
+            0,
+            &mut ctx,
+            &image,
+            &NoStackReads,
+            &mut ContextPointers::default(),
+        ),
+        None
+    );
+    assert_eq!(ctx, before);
 }
 
 #[test]
@@ -200,6 +453,8 @@ fn truncated_code_never_reads_past_the_covering_function() {
         vec![0xc2, 0x10],
         vec![0x48, 0x83, 0xc4],
         vec![0x48, 0x81, 0xc4, 1, 2, 3],
+        vec![0xe9, 1, 2, 3],
+        vec![0xeb],
     ] {
         let end = 0x1050 + bytes.len() as u32;
         let mut inner = img_with_unwind(&[], 1, 0, 0, 0);
@@ -212,7 +467,7 @@ fn truncated_code_never_reads_past_the_covering_function() {
             crate::epilogue::unwind_return(
                 image.inner.base,
                 0x1050,
-                end,
+                covering(end),
                 0,
                 &mut ctx,
                 &image,
@@ -252,7 +507,7 @@ fn unreadable_instruction_inside_a_valid_function_is_a_failure() {
         crate::epilogue::unwind_return(
             image.base,
             0x1050,
-            0x1100,
+            covering(0x1100),
             0,
             &mut ctx,
             &image,
@@ -275,7 +530,13 @@ fn return_needs_no_instruction_bytes_after_it() {
     ctx.set_rsp(0x9000);
     assert_eq!(
         crate::epilogue::unwind_return(
-            image.base, 0x1050, 0x1100, 0, &mut ctx, &image, &stack,
+            image.base,
+            0x1050,
+            covering(0x1100),
+            0,
+            &mut ctx,
+            &image,
+            &stack,
             &mut ContextPointers::default(),
         ),
         Some(true)

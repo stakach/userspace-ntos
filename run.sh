@@ -5,6 +5,7 @@
 #
 #   ./run.sh              # headless serial gate; requires the complete Explorer shell proof
 #   ./run.sh --desktop    # boot with a QEMU window so you SEE the painted desktop
+#   ./run.sh --build-only # stage the same boot image without starting QEMU
 #   ./run.sh --debug      # forward QEMU int/cpu_reset tracing (triple-fault hunts)
 #
 # What it does (idempotent + re-runnable):
@@ -29,10 +30,12 @@ fi
 
 # ---- flags --------------------------------------------------------------
 GRAPHICS=0
+BUILD_ONLY=0
 PASSTHRU=()
 for arg in "$@"; do
   case "$arg" in
     --desktop|--display|--graphics) GRAPHICS=1 ;;
+    --build-only) BUILD_ONLY=1 ;;
     -h|--help)
       grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed '/^!/d'
       exit 0
@@ -234,6 +237,11 @@ ensure_boot_image_available "$BOOT_IMAGE"
 "$ROOT/scripts/build_ntdll_dll.sh"
 "$ROOT/components/ntos-executive/build.sh"
 ( cd "$RM" && ./scripts/build_kernel.sh extern-rootserver )
+
+if [ "$BUILD_ONLY" = 1 ]; then
+  say "Boot image staged: $BOOT_IMAGE"
+  exit 0
+fi
 
 # ---- [5/5] run ----------------------------------------------------------
 ensure_no_qemu_lane_running

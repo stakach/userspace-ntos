@@ -1235,7 +1235,7 @@ impl<P> IoManager<P> {
                 self.free_irp(irp_id);
                 if crate::is_create_major(major) {
                     if let Some(file_id) = file_id {
-                        if status.is_success() {
+                        if crate::file::create_terminal_opens_file(status) {
                             let file = self.file_mut(file_id).expect("CREATE File disappeared");
                             file.driver_context = file_context;
                             file.transition(FileState::Open);

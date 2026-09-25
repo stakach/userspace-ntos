@@ -9,6 +9,7 @@
 #![no_std]
 
 pub mod mutation_begin;
+pub mod key_value_information;
 
 /// The Configuration Manager's SURT opcode range.
 pub const CM_OPCODE_MIN: u16 = 0x2100;

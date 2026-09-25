@@ -1,7 +1,7 @@
 //! Bounded x64 search and target-unwind passes over real unwind metadata.
 //!
 //! This is NOT yet a native `RtlDispatchException`/`RtlUnwindEx` implementation or a replacement
-//! for ntdll's live dispatcher. Collided unwind is explicitly unsupported. Native use additionally
+//! for ntdll's live dispatcher. Native use additionally
 //! requires authenticated physical-stack/image readers, context capture/restore, and assembler
 //! handler linkage with its own unwind metadata. An unknown Rust frame must not become a leaf
 //! merely because the PE reader does not know it.
@@ -16,8 +16,8 @@
 
 use crate::{
     unw_flag, virtual_unwind, BoundedStack, Context, ExceptionRecord, ImageReader, RuntimeFunction,
-    StackReader, EXCEPTION_EXIT_UNWIND, EXCEPTION_NONCONTINUABLE, EXCEPTION_TARGET_UNWIND,
-    EXCEPTION_UNWINDING, REG_RAX,
+    StackReader, EXCEPTION_COLLIDED_UNWIND, EXCEPTION_EXIT_UNWIND, EXCEPTION_NONCONTINUABLE,
+    EXCEPTION_TARGET_UNWIND, EXCEPTION_UNWINDING, REG_RAX,
 };
 
 /// `EXCEPTION_NESTED_CALL`, propagated while search crosses a nested handler's region.
@@ -48,7 +48,7 @@ pub enum WalkError {
     InvalidDisposition(i32),
     NoncontinuableException,
     InvalidHandlerContexts,
-    UnsupportedCollidedUnwind,
+    InvalidCollisionDispatcher,
     /// Restore-time consolidate callbacks need an additional authenticated native continuation.
     UnsupportedUnwindConsolidate,
 }
@@ -80,6 +80,12 @@ pub trait ExceptionImageReader: ImageReader {
         &self,
         control_pc: u64,
     ) -> Result<ExceptionFunction, ExceptionImageError>;
+
+    /// A nonzero collided C scope index needs proof from the admitted handler-data table.
+    /// Readers without such proof may only resume at index zero.
+    fn validate_collision_scope(&self, _image_base: u64, _handler_data: u64, index: u32) -> bool {
+        index == 0
+    }
 }
 
 /// Search receives two distinct context pointers; unwind receives the same Current context through
@@ -93,6 +99,21 @@ pub enum HandlerContexts {
     Unwind {
         current: Context,
     },
+}
+
+/// The saved outer dispatcher context copied by the x64 handler-linkage routine on a collision.
+/// This must be populated from the handler's actual modified dispatcher context, not inferred
+/// from the invocation that just returned.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CollisionDispatcher {
+    pub control_pc: u64,
+    pub image_base: u64,
+    pub function: RuntimeFunction,
+    pub establisher_frame: u64,
+    pub handler: u64,
+    pub handler_data: u64,
+    pub scope_index: u32,
+    pub context: Context,
 }
 
 /// Values for one language-handler invocation. A future ABI adapter must invoke the handler outside
@@ -123,13 +144,21 @@ pub struct HandlerInvocation {
     pub handler: u64,
     pub handler_data: u64,
     pub target_ip: u64,
-    /// A fresh frame starts at scope zero. Resuming a collided scope is not implemented.
+    /// Fresh frames start at zero; a validated collided dispatcher resumes its saved scope.
     pub scope_index: u32,
     pub contexts: HandlerContexts,
+    /// Required only for `ExceptionCollidedUnwind` (3).
+    pub collision: Option<CollisionDispatcher>,
     continuation: HandlerContinuation,
 }
 
 impl HandlerInvocation {
+    /// The virtually unwound Previous context for the dispatcher argument of an unwind handler.
+    /// This is a copy of register state, not access to the one-shot continuation.
+    pub fn dispatcher_unwound(&self) -> Context {
+        self.continuation.previous
+    }
+
     /// Package actual handler outputs. Native adapters must first copy back mutations, including
     /// the dispatcher establisher used by `ExceptionNestedException`.
     pub fn returned(self, disposition: i32) -> Result<WalkStep, WalkError> {
@@ -138,6 +167,7 @@ impl HandlerInvocation {
             exception: self.exception,
             contexts: self.contexts,
             dispatcher_establisher_frame: self.establisher_frame,
+            collision: self.collision,
         })
     }
 }
@@ -148,6 +178,7 @@ struct HandlerResponse {
     exception: ExceptionRecord,
     contexts: HandlerContexts,
     dispatcher_establisher_frame: u64,
+    collision: Option<CollisionDispatcher>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -185,12 +216,107 @@ pub enum WalkStep {
     Complete(WalkOutcome),
 }
 
+/// Owned first-pass boundary. No stack or image-reader borrow survives admission.
+#[derive(Debug)]
+pub enum FirstRaiseStep {
+    Invoke(HandlerInvocation),
+    Complete(WalkOutcome),
+}
+
 /// One owned pass, with an explicit bound on frames consumed. Neither it nor its continuation is
 /// Clone: a handler cannot advance the same walk or return twice through this API.
 #[derive(Debug)]
 pub struct ExceptionWalk {
     exception: ExceptionRecord,
     state: WalkState,
+    pending_collision: Option<CollisionDispatcher>,
+}
+
+/// An admitted x64 software raise at a naked `ExRaiseStatus` entry. The captured context still
+/// describes that entry; the return slot identifies the caller's control PC. Admission does not
+/// inspect or invoke a language handler.
+#[derive(Debug)]
+pub struct SoftwareRaiseSite {
+    caller_rip: u64,
+    caller_rsp: u64,
+    captured: Context,
+    stack_low: u64,
+    stack_high: u64,
+}
+
+impl SoftwareRaiseSite {
+    /// Validate the Win64 entry stack and require affirmative executable-image admission for the
+    /// return address. NT5 dispatches the return address itself, not that address minus one.
+    pub fn admit(
+        captured: Context,
+        stack_low: u64,
+        stack_high: u64,
+        image: &dyn ExceptionImageReader,
+        stack: &dyn StackReader,
+    ) -> Result<Self, WalkError> {
+        if stack_low >= stack_high {
+            return Err(WalkError::InvalidStackBounds);
+        }
+        let entry_rsp = captured.rsp();
+        let caller_rsp = entry_rsp.checked_add(8).ok_or(WalkError::BadStack)?;
+        if entry_rsp < stack_low || caller_rsp > stack_high || entry_rsp & 15 != 8 {
+            return Err(WalkError::BadStack);
+        }
+        let caller_rip = stack.read_u64(entry_rsp).ok_or(WalkError::StackRead)?;
+        image
+            .lookup_exception_function(caller_rip)
+            .map_err(WalkError::ImageLookup)?;
+        Ok(Self {
+            caller_rip,
+            caller_rsp,
+            captured,
+            stack_low,
+            stack_high,
+        })
+    }
+
+    /// Construct the first-pass search. The caller's return slot is consumed exactly as a `ret`
+    /// would consume it; the original exception context is never a synthetic handler result.
+    pub fn into_search(
+        mut self,
+        status: u32,
+        frame_limit: usize,
+    ) -> Result<ExceptionWalk, WalkError> {
+        self.captured.rip = self.caller_rip;
+        self.captured.set_rsp(self.caller_rsp);
+        ExceptionWalk::new(
+            WalkMode::Search,
+            ExceptionRecord {
+                code: status,
+                flags: EXCEPTION_NONCONTINUABLE,
+                address: self.caller_rip,
+                information: Default::default(),
+            },
+            self.captured,
+            self.stack_low,
+            self.stack_high,
+            frame_limit,
+        )
+    }
+
+    /// Search under the same reader lease until a real handler must execute or the walk ends.
+    /// A Reply that merely starts a handler is not a disposition or exception completion.
+    pub fn search_to_first_handler(
+        self,
+        status: u32,
+        frame_limit: usize,
+        image: &dyn ExceptionImageReader,
+        stack: &dyn StackReader,
+    ) -> Result<FirstRaiseStep, WalkError> {
+        let mut walk = self.into_search(status, frame_limit)?;
+        loop {
+            match walk.step(image, stack)? {
+                WalkStep::Continue(next) => walk = next,
+                WalkStep::Invoke(handler) => return Ok(FirstRaiseStep::Invoke(handler)),
+                WalkStep::Complete(outcome) => return Ok(FirstRaiseStep::Complete(outcome)),
+            }
+        }
+    }
 }
 
 /// Control state has no exception-record owner. Suspending a handler moves the real record into
@@ -198,6 +324,8 @@ pub struct ExceptionWalk {
 #[derive(Debug)]
 struct WalkState {
     mode: WalkMode,
+    foreign_boundary: Option<(u64, u32)>,
+    second_foreign_boundary: Option<(u64, u32)>,
     original: Context,
     current: Context,
     control_pc: u64,
@@ -205,6 +333,7 @@ struct WalkState {
     low: u64,
     high: u64,
     frames_left: usize,
+    handler_restarts_left: usize,
     flags: u32,
     nested_frame: Option<u64>,
 }
@@ -264,6 +393,8 @@ impl ExceptionWalk {
             exception,
             state: WalkState {
                 mode,
+                foreign_boundary: None,
+                second_foreign_boundary: None,
                 original: context,
                 current: context,
                 control_pc,
@@ -271,10 +402,26 @@ impl ExceptionWalk {
                 low: stack_low,
                 high: stack_high,
                 frames_left: frame_limit,
+                handler_restarts_left: frame_limit,
                 flags,
                 nested_frame: None,
             },
+            pending_collision: None,
         })
+    }
+
+    /// Stop at one positively admitted PE runtime-function row that calls into a foreign
+    /// executable. The foreign frame is never interpreted as a PE leaf or virtually unwound.
+    pub fn with_foreign_boundary(mut self, image_base: u64, function_begin: u32) -> Self {
+        self.state.foreign_boundary = Some((image_base, function_begin));
+        self
+    }
+
+    /// A second exact admitted PE frame can cross to the same foreign executor through a
+    /// different callback arity. No image-wide or unknown-frame terminal rule is installed.
+    pub fn with_second_foreign_boundary(mut self, image_base: u64, function_begin: u32) -> Self {
+        self.state.second_foreign_boundary = Some((image_base, function_begin));
+        self
     }
 
     /// Unwind at most one frame, or suspend before calling its language handler.
@@ -283,6 +430,9 @@ impl ExceptionWalk {
         image: &dyn ExceptionImageReader,
         stack: &dyn StackReader,
     ) -> Result<WalkStep, WalkError> {
+        if let Some(dispatcher) = self.pending_collision.take() {
+            return self.resume_collision(dispatcher, image, stack);
+        }
         self.validate_context(self.state.current)?;
         if self.state.current.rsp() == self.state.high {
             return Ok(self.end());
@@ -302,6 +452,11 @@ impl ExceptionWalk {
                 image_base,
                 function,
             } => {
+                if self.state.foreign_boundary == Some((image_base, function.begin))
+                    || self.state.second_foreign_boundary == Some((image_base, function.begin))
+                {
+                    return Ok(self.end());
+                }
                 let handler_type = if self.state.mode == WalkMode::Search {
                     unw_flag::EHANDLER
                 } else {
@@ -317,7 +472,11 @@ impl ExceptionWalk {
                     &bounded,
                 )
                 .ok_or(WalkError::UnwindData)?;
-                self.validate_frame(result.establisher_frame)?;
+                if result.handler_rva == 0 {
+                    self.validate_context_rsp(result.establisher_frame)?;
+                } else {
+                    self.validate_frame(result.establisher_frame)?;
+                }
                 self.validate_context(previous)?;
                 if let WalkMode::Unwind {
                     target_frame: Some(target),
@@ -374,6 +533,7 @@ impl ExceptionWalk {
                         target_ip,
                         scope_index: 0,
                         contexts,
+                        collision: None,
                         continuation: HandlerContinuation {
                             state: self.state,
                             previous,
@@ -394,6 +554,138 @@ impl ExceptionWalk {
         }
     }
 
+    fn resume_collision(
+        mut self,
+        dispatcher: CollisionDispatcher,
+        image: &dyn ExceptionImageReader,
+        stack: &dyn StackReader,
+    ) -> Result<WalkStep, WalkError> {
+        self.validate_context(dispatcher.context)?;
+        self.validate_frame(dispatcher.establisher_frame)?;
+        if dispatcher.scope_index > 4096
+            || !image.validate_collision_scope(
+                dispatcher.image_base,
+                dispatcher.handler_data,
+                dispatcher.scope_index,
+            )
+        {
+            return Err(WalkError::InvalidCollisionDispatcher);
+        }
+        let (image_base, function) = match image
+            .lookup_exception_function(dispatcher.control_pc)
+            .map_err(WalkError::ImageLookup)?
+        {
+            ExceptionFunction::Function {
+                image_base,
+                function,
+            } => (image_base, function),
+            ExceptionFunction::Leaf => return Err(WalkError::InvalidCollisionDispatcher),
+        };
+        if image_base != dispatcher.image_base || function != dispatcher.function {
+            return Err(WalkError::InvalidCollisionDispatcher);
+        }
+        if self.state.foreign_boundary == Some((image_base, function.begin))
+            || self.state.second_foreign_boundary == Some((image_base, function.begin))
+        {
+            return Err(WalkError::InvalidCollisionDispatcher);
+        }
+        let bounded = BoundedStack::new(stack, self.state.low, self.state.high)
+            .map_err(|_| WalkError::InvalidStackBounds)?;
+        let mut previous = dispatcher.context;
+        let result = virtual_unwind(
+            unw_flag::UHANDLER,
+            image_base,
+            dispatcher.control_pc,
+            function,
+            &mut previous,
+            image,
+            &bounded,
+        )
+        .ok_or(WalkError::UnwindData)?;
+        let handler = image_base
+            .checked_add(u64::from(result.handler_rva))
+            .ok_or(WalkError::UnwindData)?;
+        let handler_data = image_base
+            .checked_add(u64::from(result.handler_data_rva))
+            .ok_or(WalkError::UnwindData)?;
+        if result.handler_rva == 0
+            || handler != dispatcher.handler
+            || handler_data != dispatcher.handler_data
+            || result.establisher_frame != dispatcher.establisher_frame
+        {
+            return Err(WalkError::InvalidCollisionDispatcher);
+        }
+        if matches!(self.state.mode, WalkMode::Unwind { .. }) {
+            // NT5's collided unwind restores the saved Current context and virtually unwinds
+            // a separate Previous context without invoking another language handler.
+            previous = dispatcher.context;
+            let no_handler = virtual_unwind(
+                unw_flag::NHANDLER,
+                image_base,
+                dispatcher.control_pc,
+                function,
+                &mut previous,
+                image,
+                &bounded,
+            )
+            .ok_or(WalkError::UnwindData)?;
+            if no_handler.establisher_frame != dispatcher.establisher_frame {
+                return Err(WalkError::InvalidCollisionDispatcher);
+            }
+        }
+        self.validate_context(previous)?;
+        self.state.current = dispatcher.context;
+        self.state.control_pc = dispatcher.control_pc;
+        self.state.control_rsp = dispatcher.context.rsp();
+        self.state.flags |= EXCEPTION_COLLIDED_UNWIND;
+        let (contexts, target_ip, next_previous) = match self.state.mode {
+            WalkMode::Search => (
+                HandlerContexts::Search {
+                    exception: self.state.original,
+                    unwound: dispatcher.context,
+                },
+                0,
+                dispatcher.context,
+            ),
+            WalkMode::Unwind {
+                target_frame,
+                target_ip,
+                return_value,
+            } => {
+                self.state.current.gpr[REG_RAX] = return_value;
+                if target_frame == Some(dispatcher.establisher_frame) {
+                    self.state.flags |= EXCEPTION_TARGET_UNWIND;
+                }
+                (
+                    HandlerContexts::Unwind {
+                        current: self.state.current,
+                    },
+                    target_ip,
+                    previous,
+                )
+            }
+        };
+        self.exception.flags = self.state.flags;
+        Ok(WalkStep::Invoke(HandlerInvocation {
+            exception: self.exception,
+            control_pc: dispatcher.control_pc,
+            image_base,
+            function,
+            establisher_frame: dispatcher.establisher_frame,
+            handler,
+            handler_data,
+            target_ip,
+            scope_index: dispatcher.scope_index,
+            contexts,
+            collision: None,
+            continuation: HandlerContinuation {
+                state: self.state,
+                previous: next_previous,
+                establisher_frame: dispatcher.establisher_frame,
+            },
+        }))
+    }
+
     fn validate_frame(&self, frame: u64) -> Result<(), WalkError> {
         if frame < self.state.low || frame > self.state.high || frame & 15 != 0 {
             Err(WalkError::BadStack)
@@ -402,15 +694,16 @@ impl ExceptionWalk {
         }
     }
 
-    fn validate_context(&self, context: Context) -> Result<(), WalkError> {
-        if context.rsp() < self.state.low
-            || context.rsp() > self.state.high
-            || context.rsp() & 7 != 0
-        {
+    fn validate_context_rsp(&self, rsp: u64) -> Result<(), WalkError> {
+        if rsp < self.state.low || rsp > self.state.high || rsp & 7 != 0 {
             Err(WalkError::BadStack)
         } else {
             Ok(())
         }
+    }
+
+    fn validate_context(&self, context: Context) -> Result<(), WalkError> {
+        self.validate_context_rsp(context.rsp())
     }
 
     fn advance(
@@ -468,11 +761,32 @@ impl ExceptionWalk {
 }
 
 impl HandlerContinuation {
-    /// Complete one real handler call. Unknown dispositions and incomplete collided-unwind support
-    /// are errors, never `ContinueSearch`. A native caller must not translate these into success.
+    /// Complete one real handler call. A collision is revalidated against the admitted image on
+    /// the next step; an absent saved dispatcher context is never treated as ContinueSearch.
     fn resume(self, response: HandlerResponse) -> Result<WalkStep, WalkError> {
         if response.disposition == 3 {
-            return Err(WalkError::UnsupportedCollidedUnwind);
+            let collision = response
+                .collision
+                .ok_or(WalkError::InvalidCollisionDispatcher)?;
+            let mut state = self.state;
+            if state.handler_restarts_left == 0 {
+                return Err(WalkError::FrameLimit);
+            }
+            state.handler_restarts_left -= 1;
+            match (state.mode, response.contexts) {
+                (WalkMode::Search, HandlerContexts::Search { exception, .. }) => {
+                    state.original = exception;
+                }
+                (WalkMode::Unwind { .. }, HandlerContexts::Unwind { .. }) => {}
+                _ => return Err(WalkError::InvalidHandlerContexts),
+            }
+            state.flags &= !(EXCEPTION_COLLIDED_UNWIND | EXCEPTION_TARGET_UNWIND);
+            state.flags |= response.exception.flags & EXCEPTION_NONCONTINUABLE;
+            return Ok(WalkStep::Continue(ExceptionWalk {
+                exception: response.exception,
+                state,
+                pending_collision: Some(collision),
+            }));
         }
         let HandlerContinuation {
             state,
@@ -482,7 +796,10 @@ impl HandlerContinuation {
         let mut walk = ExceptionWalk {
             state,
             exception: response.exception,
+            pending_collision: None,
         };
+        let collided_search = walk.state.flags & EXCEPTION_COLLIDED_UNWIND != 0;
+        walk.state.flags &= !EXCEPTION_COLLIDED_UNWIND;
         match (walk.state.mode, response.contexts) {
             (WalkMode::Search, HandlerContexts::Search { exception, unwound }) => {
                 walk.state.original = exception;
@@ -515,6 +832,13 @@ impl HandlerContinuation {
                             Some(walk.state.nested_frame.map_or(frame, |old| old.max(frame)));
                     }
                     raw => return Err(WalkError::InvalidDisposition(raw)),
+                }
+                if collided_search && previous.rip == walk.state.control_pc {
+                    walk.exception.flags = walk.state.flags;
+                    return Ok(WalkStep::Complete(WalkOutcome::Unhandled {
+                        exception: walk.exception,
+                        context: walk.state.original,
+                    }));
                 }
             }
             (WalkMode::Unwind { .. }, HandlerContexts::Unwind { current }) => {

@@ -833,7 +833,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 assert!(record.transition(IrpState::Completed));
                 if crate::is_create_major(owner.projection.major) {
                     let file = self.file_mut(owner.projection.file_id.unwrap()).unwrap();
-                    if status.is_success() {
+                    if crate::file::create_terminal_opens_file(status) {
                         file.driver_context = file_context;
                         if file.state == FileState::CreateIrpDispatched {
                             assert!(file.transition(FileState::Open));

@@ -264,11 +264,13 @@ fn explicit_policy_prepares_same_request_with_distinct_route_and_completion_capt
     let (mut f, _, upper_driver, upper) = stack_fixture();
     for policy in [
         ExternalFileIrpDispatchPolicy::File,
+        ExternalFileIrpDispatchPolicy::FileDeviceControl,
         ExternalFileIrpDispatchPolicy::DeviceControlAtDevice,
     ] {
         let owner = prepare_policy_owner(&mut f, policy, 3, 9);
         let expected_route = match policy {
-            ExternalFileIrpDispatchPolicy::File => (upper_driver, upper),
+            ExternalFileIrpDispatchPolicy::File
+            | ExternalFileIrpDispatchPolicy::FileDeviceControl => (upper_driver, upper),
             ExternalFileIrpDispatchPolicy::DeviceControlAtDevice => (f.driver, f.device),
         };
         assert_eq!(
@@ -276,7 +278,12 @@ fn explicit_policy_prepares_same_request_with_distinct_route_and_completion_capt
             expected_route
         );
         assert_eq!(owner.projection().file_id, None);
-        publish_policy_completion(&mut f, &owner, NtStatus::SUCCESS, 1);
+        let information = if policy == ExternalFileIrpDispatchPolicy::FileDeviceControl {
+            0
+        } else {
+            1
+        };
+        publish_policy_completion(&mut f, &owner, NtStatus::SUCCESS, information);
         let completion =
             f.io.prepare_external_file_irp_completion_with_capture(owner, policy.output_capture())
                 .unwrap();

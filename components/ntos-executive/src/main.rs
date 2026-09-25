@@ -28,6 +28,7 @@ mod cm_server;
 mod cm_key_ownership;
 mod cm_mutation_transport;
 mod registry_mutation_work;
+mod hosted_routed_file_close_work;
 mod registry_key_targets;
 mod registry_security_audit;
 mod provider_registry_caller;
@@ -2029,7 +2030,7 @@ impl DllArenaPagingState {
 pub const DLL_PIN_COUNT: usize = 4;
 /// Buffer for the generated ntdll.dll, shared host<->exec in its own 2 MiB page table.
 pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_1440_0000;
-pub const NTDLLBUF_FRAMES: u64 = 480; // 1.875 MiB, with growth headroom below one PT window
+pub const NTDLLBUF_FRAMES: u64 = 512; // full 2 MiB page-table window
 /// NLS code-page tables (c_1252.nls/c_437.nls/l_intl.nls), shared host<->exec. They live in the
 /// shared-input 2 MiB region (0xA0_0000-0xC0_0000). spawn_sec_image later shares these frames into smss + points the PEB NLS
 /// fields at them so RtlInitNlsTables/RtlUnicodeToMultiByteN work.
@@ -14192,7 +14193,8 @@ unsafe fn map_boot_proof_alias(frame: u64) -> (u64, u64) {
 /// Map the page tables backing one hosted process's 64 MiB demand-fault scratch window
 /// (`*_SCRATCH_BASE`) in the executive's own VSpace. Each demand fill takes a UNIQUE monotonic
 /// scratch slot within this window (`scratch_base + faults*0x1000`), so it must cover FAULT_CAP
-/// pages; 16 PTs = 8192 pages > FAULT_CAP (6000). Called once per process at spawn.
+/// pages; 32 PTs cover the full window. Initial System's window is mapped before boot drivers;
+/// later process windows are mapped when those processes spawn.
 pub(crate) unsafe fn map_demand_scratch_pts(base: u64) {
     // 32 PTs × 2 MiB = the FULL 64 MiB DEMAND_SCRATCH_WINDOW (16384 scratch slots). Raised from 16
     // (32 MiB / 8192 slots) for (A) EAGER IMAGE-MAP: an eager whole-image fill front-loads every
@@ -19491,13 +19493,6 @@ unsafe fn prepare_boot_system_hive_image() -> Result<BootSystemImageReport, Boot
     })
 }
 
-struct ConfigHiveDriverLaunchSpec {
-    service_name: alloc::string::String,
-    driver_object_path: alloc::string::String,
-    image_path: Vec<u8>,
-    class: driver_launch::DriverClass,
-}
-
 #[allow(dead_code)]
 pub(crate) struct DriverServiceLaunchSpec {
     pub(crate) service_name: alloc::string::String,
@@ -20421,7 +20416,6 @@ impl InlineServiceSelectionReport {
     }
 }
 
-const FILE_SYSTEM_LOAD_ORDER_GROUP: &str = "File System";
 
 #[derive(Clone, Copy)]
 struct HostedPciDmaGrant {
@@ -21134,10 +21128,7 @@ fn current_driver_host_can_boot_launch_live(
     binding: &nt_config_client::DriverServiceBinding,
 ) -> bool {
     match binding.class {
-        nt_config_client::DriverServiceClass::FileSystem => binding
-            .load_order_group
-            .as_deref()
-            .is_some_and(|group| group.eq_ignore_ascii_case(FILE_SYSTEM_LOAD_ORDER_GROUP)),
+        nt_config_client::DriverServiceClass::FileSystem => binding.devnodes.is_empty(),
         nt_config_client::DriverServiceClass::Device => {
             binding.devnodes.is_empty()
                 && binding.load_order_group.as_deref().is_some_and(|group| {
@@ -21315,22 +21306,6 @@ fn mount_live_config_manager_config_hive() -> LiveConfigManagerMountReport {
         }
     }
     report
-}
-
-fn config_hive_boot_system_driver_launch_spec(
-    snapshot: &nt_config_client::DriverLaunchPlanSnapshot,
-) -> Option<ConfigHiveDriverLaunchSpec> {
-    let service = snapshot.bindings.iter().find(|binding| {
-        binding.class == nt_config_client::DriverServiceClass::FileSystem
-            && !current_driver_host_can_boot_launch_live(binding)
-    })?;
-    let image_path = live_config_driver_image_path(service, SERVICE_SYSTEM_START)?;
-    Some(ConfigHiveDriverLaunchSpec {
-        service_name: service.service_name.clone(),
-        driver_object_path: service.driver_object_path.clone(),
-        image_path,
-        class: live_config_driver_class(service.class),
-    })
 }
 
 #[derive(Clone, Copy)]
@@ -29487,7 +29462,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             "installed-state transition must classify PlugPlay as auto-start before SCM selection"
         );
     }
-    let proof_driver_spec = config_hive_boot_system_driver_launch_spec(&boot_driver_snapshot);
     let system_boot_driver_plan = system_hive_boot_driver_launch_plan(&boot_driver_snapshot);
     let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan(&boot_driver_snapshot);
     let config_demand_pnp_plan = config_hive_demand_pnp_driver_launch_plan(&demand_driver_snapshot);
@@ -29643,6 +29617,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         &mut passed,
     );
 
+    // Boot drivers may create System threads during DriverEntry. Their canonical thread bodies
+    // use the same retained scratch alias as later process demand fills, so its page tables must
+    // exist before the first driver executes rather than only when SMSS starts.
+    map_demand_scratch_pts(SMSS_SCRATCH_BASE);
+
     // --- SERVICE 9: the GENERAL DYNAMIC driver-launch path. The SYSTEM hive is imported into
     // Config Manager metadata, ordered by ServiceGroupOrder, then narrowed by mechanism: FSD-class
     // services use the persistent IRP host directly; device-class services are selected from
@@ -29767,7 +29746,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         return false;
                     }
                     for _ in 0..4 {
-                        let _ = driver_launch::pump_hosted_file_lifecycle(caller);
+                        let _ = driver_launch::pump_hosted_file_lifecycle();
                         let _ = driver_launch::pump_hosted_io_completions();
                         if !driver_launch::hosted_file_exists(file_id) {
                             return true;
@@ -30391,108 +30370,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             }
         }
 
-        // --- G3: service-selected driver lifecycle through the same general driver path. The
-        // generated SYSTEM.DAT hive declares a boot/system service; the executive imports the
-        // service subtree into Config Manager metadata, selects the boot/system driver candidate,
-        // then proves load -> DriverEntry -> unload -> object teardown without probing a compiled-in
-        // service identity. This driver creates no DEVICE_OBJECT, so it must not receive a fabricated
-        // CREATE request merely to exercise the transport.
-        if let Some(proof_driver_spec) = proof_driver_spec {
-            print_str(b"[driver-launch] launching service ");
-            print_str(proof_driver_spec.service_name.as_bytes());
-            print_str(b" from config hive path=");
-            print_str(&proof_driver_spec.image_path);
-            print_str(b" object=");
-            print_str(proof_driver_spec.driver_object_path.as_bytes());
-            print_str(b"\n");
-            if let Ok(dc) = load_driver(
-                &fs,
-                &proof_driver_spec.image_path,
-                proof_driver_spec.class,
-                &proof_driver_spec.driver_object_path,
-                initial_system_driver_caller(),
-            ) {
-                let driver_ready = dc.finished && (dc.verdict & V_MJ) != 0;
-                driver_launch::register_driver_ready(dc.driver_id, driver_ready);
-                let driver_object_registered = driver_object_route_registered(
-                    &mut *c,
-                    &dc,
-                    &proof_driver_spec.driver_object_path,
-                );
-                check(
-                    b"exec_driver_lifecycle_object_registered",
-                    driver_object_registered,
-                    &mut passed,
-                );
-
-                // Isolation: the service-selected driver runs in its OWN VSpace — a PML4 distinct
-                // from the named-pipe provider AND the executive's.
-                let npfs_pml4 = driver_launch::npfs_pml4();
-                let proof_pml4 = driver_launch::driver_pml4(dc.driver_id);
-                let distinct_pml4 = proof_pml4 != 0
-                    && proof_pml4 != CAP_INIT_THREAD_VSPACE
-                    && proof_pml4 != npfs_pml4;
-
-                print_str(b"[driver-launch] lifecycle driver-id=");
-                print_u64(dc.driver_id);
-                print_str(b" DriverEntry-ready=");
-                print_u64(driver_ready as u64);
-                print_str(b" distinct_pml4=");
-                print_u64(distinct_pml4 as u64);
-                print_str(b"\n");
-                check(
-                    b"exec_driver_lifecycle_isolated_load",
-                    (dc.verdict & V_ENTERED) != 0
-                        && (dc.verdict & V_MJ) != 0
-                        && distinct_pml4
-                        && driver_ready
-                        && driver_object_registered,
-                    &mut passed,
-                );
-
-                let lifecycle_driver_id = dc.driver_id;
-                let unload_entry_present = dc.driver_unload != 0;
-                let unload_status =
-                    driver_launch::unload_driver_by_name(&proof_driver_spec.driver_object_path);
-                let unload_ok = unload_status.is_ok();
-                let route_removed =
-                    driver_launch::driver_id_by_name(&proof_driver_spec.driver_object_path)
-                        .is_none();
-                let object_removed = c
-                    .query_object(&proof_driver_spec.driver_object_path, true)
-                    .is_err();
-                let instance_removed = driver_launch::driver_pml4(lifecycle_driver_id) == 0;
-                print_str(b"[driver-launch] lifecycle unload service=");
-                print_str(proof_driver_spec.service_name.as_bytes());
-                print_str(b" status=0x");
-                print_hex(match unload_status {
-                    Ok(()) => 0,
-                    Err(status) => status.raw() as u32,
-                });
-                print_str(b" route_removed=");
-                print_u64(route_removed as u64);
-                print_str(b" object_removed=");
-                print_u64(object_removed as u64);
-                print_str(b" instance_removed=");
-                print_u64(instance_removed as u64);
-                print_str(b"\n");
-                check(
-                    b"exec_driver_lifecycle_unload_teardown",
-                    unload_entry_present
-                        && unload_ok
-                        && route_removed
-                        && object_removed
-                        && instance_removed,
-                    &mut passed,
-                );
-            } else {
-                print_str(
-                    b"[driver-launch] service-selected driver launch returned None (not staged / load failed)\n",
-                );
-            }
-        } else {
-            print_str(b"[driver-launch] config hive has no boot/system driver service ImagePath\n");
-        }
     }
 
     // --- Phase 2b (graphics): LOAD the real ReactOS win32k.sys into an ISOLATED win32k-service
@@ -30501,6 +30378,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // WIN32K_CODE_VA (W^X), spawns the component with its fault endpoint armed, and drives a
     // crash-contained fault-recv loop that reports each faulting IP as `win32k RVA = ip - CODE_VA`
     // and demand-maps benign accesses — pinning exactly where init stops.
+    #[cfg(not(feature = "mup-provider-kernel-only"))]
     {
         let win32k_size =
             core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x7c) as *const u32) as usize;
@@ -31384,6 +31262,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             }
         }
     }
+    #[cfg(feature = "mup-provider-kernel-only")]
+    print_str(b"[mup-provider-gate] kernel-only native service loop; win32k admission deferred\n");
 
     // --- B3: start registry-selected PnP drivers against their discovered devnodes and
     // generation-owned resources.
@@ -31855,10 +31735,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // Demand-fault scratch: each filled image/ntdll page keeps a persistent
                     // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
                     // so the region grows one page per fault. BATCH 22: smss now uses its own 64 MiB
-                    // demand-scratch window (SMSS_SCRATCH_BASE) with 16 pre-mapped PTs, matching the
-                    // widened per-process layout — clear of every other executive mapping.
+                    // demand-scratch window (SMSS_SCRATCH_BASE), already mapped before boot
+                    // driver execution and clear of every other executive mapping.
                     const SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE;
-                    map_demand_scratch_pts(SCRATCH_BASE);
                     // The demand-fault router fills ntdll's pages from THIS PE — pass OUR ntdll when
                     // substituting so smss's ntdll pages (incl. OUR LdrpInitialize .text) fault in
                     // from OUR DLL's bytes; otherwise the real ntdll (fallback).

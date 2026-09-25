@@ -37,6 +37,17 @@ pub struct RawIoCreateFileArguments {
     pub io_options: u32,
 }
 
+/// The six arguments of NtOpenFile. Its remaining IoCreateFile arguments are fixed by NT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawNtOpenFileArguments {
+    pub file_handle_out: u64,
+    pub desired_access: u32,
+    pub object_attributes: u64,
+    pub io_status_block_out: u64,
+    pub share_access: u32,
+    pub open_options: u32,
+}
+
 /// The output addresses are deliberately not part of the transferred request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CallerOutputs {
@@ -170,6 +181,34 @@ pub fn capture_ordinary(
     })
 }
 
+/// Capture NtOpenFile through the same checked pointer and name path as ordinary IoCreateFile.
+pub fn capture_nt_open_file(
+    reader: &impl DriverMemoryReader,
+    args: RawNtOpenFileArguments,
+    previous_mode: AccessMode,
+) -> Result<CapturedDriverCreate, u32> {
+    capture_ordinary(
+        reader,
+        RawIoCreateFileArguments {
+            file_handle_out: args.file_handle_out,
+            desired_access: args.desired_access,
+            object_attributes: args.object_attributes,
+            io_status_block_out: args.io_status_block_out,
+            allocation_size: 0,
+            file_attributes: 0,
+            share_access: args.share_access,
+            disposition: nt_fs::FILE_OPEN,
+            create_options: args.open_options,
+            ea_buffer: 0,
+            ea_length: 0,
+            create_file_type: 0,
+            extra_create_parameters: 0,
+            io_options: 0,
+        },
+        previous_mode,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +266,54 @@ mod tests {
             io_options: io_create_file::IO_NO_PARAMETER_CHECKING,
         };
         (memory, args)
+    }
+
+    #[test]
+    fn nt_open_file_captures_ordinary_checked_open_without_create_only_fields() {
+        let (memory, base) = fixture();
+        let args = RawNtOpenFileArguments {
+            file_handle_out: base.file_handle_out,
+            desired_access: base.desired_access,
+            object_attributes: base.object_attributes,
+            io_status_block_out: base.io_status_block_out,
+            share_access: base.share_access,
+            open_options: nt_fs::FILE_NON_DIRECTORY_FILE,
+        };
+        let captured = capture_nt_open_file(&memory, args, AccessMode::UserMode).unwrap();
+        assert_eq!(captured.request.disposition, nt_fs::FILE_OPEN);
+        assert_eq!(captured.request.policy.create_options, args.open_options);
+        assert_eq!(captured.request.policy.io_options, 0);
+        assert_eq!(captured.request.policy.access_mode, AccessMode::UserMode);
+        assert!(captured.request.policy.check_parameters);
+        assert_eq!(captured.request.file_attributes, 0);
+        assert_eq!(captured.request.allocation_size, None);
+        assert!(captured.request.ea.is_empty());
+        assert_eq!(captured.request.root_directory, 0x84);
+        assert_eq!(captured.outputs.file_handle, args.file_handle_out);
+        assert_eq!(captured.outputs.io_status_block, args.io_status_block_out);
+    }
+
+    #[test]
+    fn nt_open_file_checks_user_share_flags_and_pointer_capture() {
+        let (mut memory, base) = fixture();
+        let mut args = RawNtOpenFileArguments {
+            file_handle_out: base.file_handle_out,
+            desired_access: base.desired_access,
+            object_attributes: base.object_attributes,
+            io_status_block_out: base.io_status_block_out,
+            share_access: 8,
+            open_options: 0,
+        };
+        assert_eq!(
+            capture_nt_open_file(&memory, args, AccessMode::UserMode).err(),
+            Some(STATUS_INVALID_PARAMETER)
+        );
+        args.share_access = base.share_access;
+        memory.0[1].1[8..16].copy_from_slice(&0xdead_u64.to_le_bytes());
+        assert_eq!(
+            capture_nt_open_file(&memory, args, AccessMode::UserMode).err(),
+            Some(STATUS_ACCESS_VIOLATION)
+        );
     }
 
     #[test]

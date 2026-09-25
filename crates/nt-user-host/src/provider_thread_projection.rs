@@ -36,16 +36,37 @@ impl<R: Copy + Eq, D: Copy + Eq> ProjectionOwners<R, D> {
         self.entries.iter().any(|entry| entry.route == route)
     }
 
+    pub fn contains_dispatch(&self, route: R, dispatch: D) -> bool {
+        self.entries.iter().any(|entry| entry.route == route && entry.dispatch == Some(dispatch))
+    }
+
+    pub fn has_bootstrap(&self, route: R) -> bool {
+        self.entries.iter().any(|entry| entry.route == route && entry.dispatch.is_none())
+    }
+
     pub fn capture(&mut self, pm: &mut ProcessManager, route: R, dispatch: Option<D>,
         caller: NativeHandleCaller, projection: ThreadProjection) -> Result<(), u32> {
         if projection.executor == 0 || projection.address_space == 0
             || projection.component_kpcr == 0 || projection.executive_kpcr == 0
             || projection.thread_body == 0
-            || self.entries.iter().any(|entry| entry.route == route
-                || entry.projection.executor == projection.executor
-                || entry.projection.executive_kpcr == projection.executive_kpcr
-                || (entry.projection.address_space == projection.address_space
-                    && entry.projection.component_kpcr == projection.component_kpcr))
+            || self.entries.iter().any(|entry| {
+                let same_executor = entry.projection.executor == projection.executor;
+                let same_executive_kpcr =
+                    entry.projection.executive_kpcr == projection.executive_kpcr;
+                let same_component_kpcr =
+                    entry.projection.address_space == projection.address_space
+                        && entry.projection.component_kpcr == projection.component_kpcr;
+                let nested_held = entry.route == route
+                    && entry.dispatch.is_some()
+                    && dispatch.is_some()
+                    && entry.dispatch != dispatch
+                    && entry.phase == Phase::Held
+                    && same_executor
+                    && same_executive_kpcr
+                    && same_component_kpcr;
+                (entry.route == route || same_executor || same_executive_kpcr
+                    || same_component_kpcr) && !nested_held
+            })
             || pm.thread_kernel_object(caller.original_thread().thread_id())
                 != Some(projection.thread_body)
         { return Err(STATUS_INVALID_HANDLE); }
@@ -58,8 +79,13 @@ impl<R: Copy + Eq, D: Copy + Eq> ProjectionOwners<R, D> {
     /// Bootstrap ownership is installed before Resume and binds once to the admitted epoch.
     pub fn bind(&mut self, pm: &ProcessManager, route: R, dispatch: D,
         caller: NativeHandleCaller, projection: ThreadProjection) -> Result<(), u32> {
-        let entry = self.entries.iter_mut().find(|entry| entry.route == route)
+        let index = self.entries.iter().position(|entry| {
+            entry.route == route && entry.dispatch == Some(dispatch)
+        }).or_else(|| self.entries.iter().position(|entry| {
+            entry.route == route && entry.dispatch.is_none()
+        }))
             .ok_or(STATUS_INVALID_HANDLE)?;
+        let entry = &mut self.entries[index];
         if entry.dispatch.is_some_and(|held| held != dispatch) || entry.caller != caller
             || entry.projection != projection || entry.phase != Phase::Running
         { return Err(STATUS_INVALID_HANDLE); }
@@ -70,7 +96,10 @@ impl<R: Copy + Eq, D: Copy + Eq> ProjectionOwners<R, D> {
     }
 
     pub fn hold(&mut self, route: R, dispatch: D) -> Result<bool, u32> {
-        let Some(entry) = self.entries.iter_mut().find(|entry| entry.route == route) else { return Ok(false); };
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.route == route
+            && entry.dispatch == Some(dispatch)) else {
+            return if self.contains(route) { Err(STATUS_INVALID_HANDLE) } else { Ok(false) };
+        };
         if entry.dispatch != Some(dispatch) || entry.phase != Phase::Running { return Err(STATUS_INVALID_HANDLE); }
         entry.phase = Phase::Held;
         Ok(true)
@@ -79,7 +108,10 @@ impl<R: Copy + Eq, D: Copy + Eq> ProjectionOwners<R, D> {
     /// The physical hold is still owned. A failed release must not replay this transition.
     pub fn begin_restore(&mut self, pm: &ProcessManager, route: R, dispatch: D)
         -> Result<Option<ThreadProjection>, u32> {
-        let Some(entry) = self.entries.iter_mut().find(|entry| entry.route == route) else { return Ok(None); };
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.route == route
+            && entry.dispatch == Some(dispatch)) else {
+            return if self.contains(route) { Err(STATUS_INVALID_HANDLE) } else { Ok(None) };
+        };
         if entry.dispatch != Some(dispatch) || entry.phase != Phase::Held { return Err(STATUS_INVALID_HANDLE); }
         entry.reference.validate(pm)?;
         pm.validate_native_handle_caller(entry.caller)?;
@@ -88,14 +120,20 @@ impl<R: Copy + Eq, D: Copy + Eq> ProjectionOwners<R, D> {
     }
 
     pub fn restored(&mut self, route: R, dispatch: D) -> Result<(), u32> {
-        let Some(entry) = self.entries.iter_mut().find(|entry| entry.route == route) else { return Ok(()); };
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.route == route
+            && entry.dispatch == Some(dispatch)) else {
+            return if self.contains(route) { Err(STATUS_INVALID_HANDLE) } else { Ok(()) };
+        };
         if entry.dispatch != Some(dispatch) || entry.phase != Phase::ReleaseEntered { return Err(STATUS_INVALID_HANDLE); }
         entry.phase = Phase::Running;
         Ok(())
     }
 
     pub fn completing(&self, route: R, dispatch: D) -> Result<Option<ThreadProjection>, u32> {
-        let Some(entry) = self.entries.iter().find(|entry| entry.route == route) else { return Ok(None); };
+        let Some(entry) = self.entries.iter().find(|entry| entry.route == route
+            && entry.dispatch == Some(dispatch)) else {
+            return if self.contains(route) { Err(STATUS_INVALID_HANDLE) } else { Ok(None) };
+        };
         if entry.dispatch != Some(dispatch) || entry.phase != Phase::Running { return Err(STATUS_INVALID_HANDLE); }
         Ok(Some(entry.projection))
     }
@@ -104,7 +142,8 @@ impl<R: Copy + Eq, D: Copy + Eq> ProjectionOwners<R, D> {
     /// has been cleared. Release failure keeps the entry and its exact physical exclusion.
     pub fn retire(&mut self, pm: &mut ProcessManager, route: R, dispatch: D) -> Result<(), u32> {
         self.completing(route, dispatch)?;
-        if let Some(index) = self.entries.iter().position(|entry| entry.route == route) {
+        if let Some(index) = self.entries.iter().position(|entry| entry.route == route
+            && entry.dispatch == Some(dispatch)) {
             self.entries[index].reference.release(pm)?;
             self.entries.swap_remove(index);
         }
@@ -114,17 +153,20 @@ impl<R: Copy + Eq, D: Copy + Eq> ProjectionOwners<R, D> {
     /// Terminal adapter only: the exact executor has stopped and its ingress has drained.
     pub fn stopped_projection(&self, route: R, executor: u64, address_space: u64)
         -> Result<Option<ThreadProjection>, u32> {
-        let Some(entry) = self.entries.iter().find(|entry| entry.route == route) else { return Ok(None); };
-        if entry.projection.executor != executor || entry.projection.address_space != address_space {
+        if self.entries.iter().filter(|entry| entry.route == route).any(|entry| {
+            entry.projection.executor != executor
+                || entry.projection.address_space != address_space
+        }) {
             return Err(STATUS_INVALID_HANDLE);
         }
-        Ok(Some(entry.projection))
+        Ok(self.entries.iter().find(|entry| entry.route == route)
+            .map(|entry| entry.projection))
     }
 
     pub fn retire_stopped(&mut self, pm: &mut ProcessManager, route: R, executor: u64,
         address_space: u64) -> Result<(), u32> {
         self.stopped_projection(route, executor, address_space)?;
-        if let Some(index) = self.entries.iter().position(|entry| entry.route == route) {
+        while let Some(index) = self.entries.iter().position(|entry| entry.route == route) {
             self.entries[index].reference.release(pm)?;
             self.entries.swap_remove(index);
         }

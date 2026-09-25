@@ -40,23 +40,37 @@ fn eq_ci(a: u16, b: u16) -> bool {
 /// True iff `cand` case-insensitively matches the leading chars of `full` and the following char in
 /// `full` is either end-of-string or `\`. The lone root `\` is a prefix of every rooted name.
 pub fn is_component_prefix(cand: &[u16], full: &[u16]) -> bool {
-    if cand.is_empty() {
+    is_component_prefix_indexed(cand.len(), full.len(), 0, |i| cand[i], |i| full[i])
+}
+
+/// Compare caller-owned UTF-16 buffers without copying them into a fixed-size scratch array.
+/// ReactOS uses `CaseInsensitiveIndex` to keep the first part case-sensitive.
+pub fn is_component_prefix_indexed(
+    cand_len: usize,
+    full_len: usize,
+    case_insensitive_index: usize,
+    mut candidate_at: impl FnMut(usize) -> u16,
+    mut full_at: impl FnMut(usize) -> u16,
+) -> bool {
+    if cand_len == 0 {
         return true;
     }
-    if cand.len() > full.len() {
+    if cand_len > full_len {
         return false;
     }
-    for i in 0..cand.len() {
-        if !eq_ci(cand[i], full[i]) {
+    for i in 0..cand_len {
+        let a = candidate_at(i);
+        let b = full_at(i);
+        if if i < case_insensitive_index { a != b } else { !eq_ci(a, b) } {
             return false;
         }
     }
     // The lone root separator matches anything beginning with `\`.
-    if cand.len() == 1 && cand[0] == SEP {
+    if cand_len == 1 && candidate_at(0) == SEP {
         return true;
     }
     // Exact match, or the next char is a component boundary.
-    full.len() == cand.len() || full[cand.len()] == SEP
+    full_len == cand_len || full_at(cand_len) == SEP
 }
 
 /// Given a set of inserted candidate names and a full name, return the index of the LONGEST candidate
@@ -107,6 +121,20 @@ mod tests {
     fn case_insensitive() {
         assert!(is_component_prefix(&s("\\NtSvcs"), &s("\\ntsvcs")));
         assert!(is_component_prefix(&s("\\ntsvcs"), &s("\\NTSVCS")));
+    }
+
+    #[test]
+    fn indexed_match_observes_case_boundary_without_truncation() {
+        let name = s("\\Provider");
+        let full = s("\\provider\\share");
+        assert!(is_component_prefix_indexed(name.len(), full.len(), 1,
+            |i| name[i], |i| full[i]));
+        assert!(!is_component_prefix_indexed(name.len(), full.len(), 2,
+            |i| name[i], |i| full[i]));
+        let mut long = alloc::vec![b'\\' as u16];
+        long.extend((0..300).map(|_| b'a' as u16));
+        assert!(is_component_prefix_indexed(long.len(), long.len(), 0,
+            |i| long[i], |i| long[i]));
     }
 
     #[test]

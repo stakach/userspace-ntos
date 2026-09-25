@@ -40,15 +40,20 @@ pub(crate) unsafe fn accept(
     message_info: u64,
     words: [u64; 5],
 ) -> Result<FatalReport, ReportError> {
-    // Ordinary component channels grant an unbadged CT_FAULT cap to exactly this executor.
-    // Timer/IRQ notifications and private badged IRQ lanes are not this report authority.
+    // The expected badge belongs to the registered physical ingress route, not to the
+    // provider's scalar report or the received message alone.
+    let route = spawn_hosts::shared_ingress::owner::runtime::channel_route(channel)
+        .map_err(|_| ReportError::InvalidChannel)?
+        .ok_or(ReportError::InvalidChannel)?;
+    spawn_hosts::shared_ingress::owner::runtime::dispatch(route)
+        .map_err(|_| ReportError::InvalidChannel)?;
     let report = FatalReport::decode(
         ProviderChannel {
             endpoint: channel.fault_ep,
             tcb: channel.tcb,
             vspace: channel.pml4,
             reply_object,
-            expected_badge: 0,
+            expected_badge: route.badge(),
         },
         badge,
         message_info,

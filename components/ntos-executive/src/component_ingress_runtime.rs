@@ -22,6 +22,7 @@ pub(crate) use services::{
     retained_service_cancelled, retained_service_resume_next_deadline,
     resume_acknowledged_retained_services, resume_service,
     retire_stopped_acknowledged_retained_service,
+    wake_file_create_service, wake_query_path_rejected_service, wake_query_path_service,
     wake_registry_service, wake_service,
 };
 
@@ -844,12 +845,21 @@ pub(crate) unsafe fn adopt(route: PeerRoute, incoming: u64) -> Result<(), Error>
 }
 
 pub(crate) unsafe fn reply(route: PeerRoute, reply: u64, words: &[u64]) -> Result<(), Error> {
+    reply_with_info(route, reply, words.len() as u64, words)
+}
+
+pub(crate) unsafe fn reply_with_info(
+    route: PeerRoute,
+    reply: u64,
+    info: u64,
+    words: &[u64],
+) -> Result<(), Error> {
     let result = (|| {
         let dispatch = dispatch(route)?;
         if current_reply(route)? != reply {
             return Err(Error::Reply);
         }
-        match owner().reply(lanes(), route, dispatch, words, |route| {
+        match owner().reply(lanes(), route, dispatch, info, words, |route| {
             resolve(route, false)
         }) {
             Ok(IngressReplyObservation::Acknowledged) => Ok(()),

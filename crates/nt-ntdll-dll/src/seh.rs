@@ -475,6 +475,27 @@ struct DispatcherContext {
 /// -> EXCEPTION_DISPOSITION`.
 type ExceptionRoutine = unsafe extern "C" fn(*mut c_void, u64, *mut u8, *mut c_void) -> i32;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum LiveSearchReturn {
+    Handled,
+    Continue,
+    Unhandled,
+}
+
+fn classify_live_search_return(raw: i32) -> LiveSearchReturn {
+    match ex::Disposition::try_from_raw(raw) {
+        Some(ex::Disposition::ContinueExecution) => LiveSearchReturn::Handled,
+        Some(ex::Disposition::ContinueSearch) => LiveSearchReturn::Continue,
+        // NestedException needs nested-region state; CollidedUnwind needs an outer dispatcher
+        // snapshot. This live loop has neither, so it cannot advance as ContinueSearch.
+        _ => LiveSearchReturn::Unhandled,
+    }
+}
+
+fn live_unwind_handler_completed(raw: i32) -> bool {
+    ex::Disposition::try_from_raw(raw) == Some(ex::Disposition::ContinueSearch)
+}
+
 unsafe fn finish_vectored_dispatch(record: *mut c_void, context: *mut u8, handled: bool) -> bool {
     // SAFETY: record/context remain valid for the duration of the dispatch entry.
     unsafe {
@@ -599,15 +620,17 @@ pub unsafe fn rtl_dispatch_exception(record: *mut c_void, context: *mut u8) -> b
                     &mut disp as *mut _ as *mut c_void,
                 )
             };
-            match ex::Disposition::from_raw(disp_ret) {
-                ex::Disposition::ContinueExecution => {
+            match classify_live_search_return(disp_ret) {
+                LiveSearchReturn::Handled => {
                     // The handler fixed the fault: resume the original context.
                     return unsafe { finish_vectored_dispatch(record, context, true) };
                 }
-                ex::Disposition::ContinueSearch => { /* keep walking up */ }
-                // Nested/collided unwind: treat as continue-search for the software path (the full
-                // collision handling is the RtlUnwindEx pass's job, driven by the handler).
-                ex::Disposition::NestedException | ex::Disposition::CollidedUnwind => {}
+                LiveSearchReturn::Continue => { /* ContinueSearch. */ }
+                // This live walker cannot restore the outer dispatcher context. A collision or
+                // invalid disposition is unhandled, never a successful continuation.
+                LiveSearchReturn::Unhandled => {
+                    return unsafe { finish_vectored_dispatch(record, context, false) };
+                }
             }
         }
         // NOTE: if the frame had NO handler, `rtl_virtual_unwind` already advanced `work` to the
@@ -875,13 +898,18 @@ unsafe fn rtl_unwind_ex_from_context(
             // SAFETY: valid EXCEPTION_ROUTINE.
             let routine: ExceptionRoutine = unsafe { core::mem::transmute(handler) };
             // SAFETY: calling the termination handler; it runs the __finally blocks.
-            unsafe {
+            let disposition = unsafe {
                 routine(
                     record,
                     establisher,
                     work_ptr,
                     &mut disp as *mut _ as *mut c_void,
-                );
+                )
+            };
+            if !live_unwind_handler_completed(disposition) {
+                // This live loop has no collided-unwind dispatcher restoration. A failed handler
+                // cannot fall through to the target `NtContinue` as if unwind had completed.
+                unsafe { nt_raise_exception(record, context_record, 0) };
             }
         }
     }
@@ -971,9 +999,8 @@ pub unsafe fn c_specific_handler(
         // Publish the cursor before any filter/finally can initiate a collided unwind. Reload it
         // after callbacks rather than overwriting a cursor the dispatcher may have advanced.
         // SAFETY: the supplied dispatcher record remains live throughout this invocation.
-        let mut index = unsafe {
-            core::ptr::read_unaligned(core::ptr::addr_of!((*disp_ptr).scope_index))
-        };
+        let mut index =
+            unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*disp_ptr).scope_index)) };
         let selected = ex::next_c_scope(pc_rva, target_rva, flags, count, &mut index, read_scope);
         // SAFETY: the cursor is a writable ULONG in the caller's dispatcher record.
         unsafe {
@@ -981,7 +1008,20 @@ pub unsafe fn c_specific_handler(
         };
         let action = match selected {
             ex::CScopeAction::ContinueSearch => return ex::Disposition::ContinueSearch.as_raw(),
-            ex::CScopeAction::Finally { handler_rva } => {
+            ex::CScopeAction::Finally {
+                handler_rva,
+                end_rva,
+            } => {
+                let Some(end_pc) = image_base.checked_add(u64::from(end_rva)) else {
+                    return ex::Disposition::ContinueSearch.as_raw();
+                };
+                // A collided unwind resumes from the end of the scope whose finalizer ran.
+                unsafe {
+                    core::ptr::write_unaligned(
+                        core::ptr::addr_of_mut!((*disp_ptr).control_pc),
+                        end_pc,
+                    );
+                }
                 let fin = image_base + u64::from(handler_rva);
                 // SAFETY: the selected loaded-image routine uses the native __finally ABI.
                 unsafe {
@@ -990,13 +1030,18 @@ pub unsafe fn c_specific_handler(
                 }
                 continue;
             }
-            ex::CScopeAction::ExecuteHandler { target_rva, scope_index } => {
-                ex::CHandlerAction::ExecuteHandler {
-                    target_rva,
-                    scope_index: scope_index as usize,
-                }
-            }
-            ex::CScopeAction::Filter { handler_rva, target_rva, scope_index } => {
+            ex::CScopeAction::ExecuteHandler {
+                target_rva,
+                scope_index,
+            } => ex::CHandlerAction::ExecuteHandler {
+                target_rva,
+                scope_index: scope_index as usize,
+            },
+            ex::CScopeAction::Filter {
+                handler_rva,
+                target_rva,
+                scope_index,
+            } => {
                 #[repr(C)]
                 struct ExceptionPointers {
                     record: *mut c_void,
@@ -1009,7 +1054,8 @@ pub unsafe fn c_specific_handler(
                 let filt = image_base + u64::from(handler_rva);
                 // SAFETY: the selected loaded-image filter uses the native EXCEPTION_POINTERS ABI.
                 let verdict = unsafe {
-                    let f: unsafe extern "C" fn(*const c_void, u64) -> i32 = core::mem::transmute(filt);
+                    let f: unsafe extern "C" fn(*const c_void, u64) -> i32 =
+                        core::mem::transmute(filt);
                     f(&ptrs as *const _ as *const c_void, establisher_frame)
                 };
                 ex::CHandlerAction::from_filter_result(verdict, target_rva, scope_index as usize)

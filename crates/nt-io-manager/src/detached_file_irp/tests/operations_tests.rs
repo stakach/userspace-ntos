@@ -1,6 +1,29 @@
 use super::*;
 
 #[test]
+fn reparse_create_does_not_open_the_source_file() {
+    let mut f = fixture();
+    let file = create_file(&mut f, false);
+    let prepared = f.io.prepare_external_file_irp_owned(
+        create(&f, file), ExternalFileIrpBuffers::new(vec![], vec![]),
+    ).unwrap();
+    let invocation = f.io.begin_prepared_external_file_irp(prepared).unwrap();
+    let ExternalFileIrpResult::Returned(terminal) = f.io.finish_external_file_irp(
+        invocation.returned(ExternalFileIrpOutcome::Returned {
+            status: NtStatus::REPARSE,
+            information: 0,
+            file_context: None,
+        }),
+    ).unwrap() else { panic!("expected reparse terminal") };
+    assert_eq!(f.io.file(file).unwrap().state, FileState::Closed);
+    let (receipt, _) = f.io.retire_external_file_irp_terminal(terminal).unwrap();
+    assert_eq!(receipt.completion().status, NtStatus::REPARSE);
+    f.io.release_external_file(f.client, file).unwrap();
+    f.io.pump();
+    assert!(f.io.file(file).is_none());
+}
+
+#[test]
 fn owner_out_cancel_is_durable_selection_without_backend_entry() {
     let mut f = fixture();
     let prepared =

@@ -1,4 +1,23 @@
-use crate::{Context, ContextPointers, ImageReader, StackReader};
+use crate::{
+    read_runtime_function, read_unwind_header, resolve_function, Context, ContextPointers,
+    ImageReader, RuntimeFunction, StackReader,
+};
+
+fn root_start(image: &dyn ImageReader, base: u64, mut function: RuntimeFunction) -> Option<u64> {
+    let mut links_left = 32;
+    loop {
+        function = resolve_function(function, base, image, &mut links_left)?;
+        let header = read_unwind_header(image, base, function.unwind_info)?;
+        if !header.is_chained() {
+            return base.checked_add(u64::from(function.begin));
+        }
+        links_left = links_left.checked_sub(1)?;
+        let tail = function
+            .unwind_info
+            .checked_add(u32::try_from(header.tail_offset()).ok()?)?;
+        function = read_runtime_function(image, base, tail)?;
+    }
+}
 
 struct Code<'a> {
     image: &'a dyn ImageReader,
@@ -7,6 +26,31 @@ struct Code<'a> {
 }
 
 impl Code<'_> {
+    fn exits_function(
+        &self,
+        next_rva: u32,
+        displacement: i64,
+        current: RuntimeFunction,
+    ) -> Option<bool> {
+        let target = self
+            .base
+            .checked_add(u64::from(next_rva))?
+            .checked_add_signed(displacement)?;
+        if target
+            .checked_sub(self.base)
+            .and_then(|rva| u32::try_from(rva).ok())
+            .is_some_and(|rva| current.covers(rva))
+        {
+            return Some(false);
+        }
+        let Some((target_base, target_function)) = self.image.lookup_function(target) else {
+            return Some(true);
+        };
+        let current_root = root_start(self.image, self.base, current)?;
+        let target_root = root_start(self.image, target_base, target_function)?;
+        Some(current_root != target_root)
+    }
+
     fn byte(&self, rva: u32) -> Option<u8> {
         if rva >= self.end {
             return None;
@@ -56,9 +100,14 @@ struct Plan {
 }
 
 /// Decode without reading the stack. None is an unreadable/truncated instruction, while Some(None)
-/// is ordinary body code and permits metadata interpretation. Tail jumps need separate function
-/// identity checks and are not classified as return epilogues here.
-fn decode(code: &Code<'_>, start: u32, frame_register: u8) -> Option<Option<Plan>> {
+/// is ordinary body code and permits metadata interpretation. A direct jump is a return epilogue
+/// only when its target leaves the covering function and every chained fragment of its root.
+fn decode(
+    code: &Code<'_>,
+    start: u32,
+    function: RuntimeFunction,
+    frame_register: u8,
+) -> Option<Option<Plan>> {
     let mut cursor = start;
     let mut adjustment = Adjustment::None;
     let rex = code.byte(cursor)?;
@@ -109,7 +158,9 @@ fn decode(code: &Code<'_>, start: u32, frame_register: u8) -> Option<Option<Plan
     }
     let pops_end = cursor;
     let mut opcode = code.byte(cursor)?;
+    let mut terminal_rex = 0;
     if opcode & 0xf0 == 0x40 {
+        terminal_rex = opcode;
         cursor = cursor.checked_add(1)?;
         opcode = code.byte(cursor)?;
     }
@@ -117,6 +168,29 @@ fn decode(code: &Code<'_>, start: u32, frame_register: u8) -> Option<Option<Plan
         0xc3 => 0,
         0xc2 => code.word(cursor.checked_add(1)?)?,
         0xf3 if code.byte(cursor.checked_add(1)?)? == 0xc3 => 0,
+        0xe9 => {
+            let displacement = code.dword(cursor.checked_add(1)?)? as i32 as i64;
+            if !code.exits_function(cursor.checked_add(5)?, displacement, function)? {
+                return Some(None);
+            }
+            0
+        }
+        0xeb => {
+            let displacement = code.byte(cursor.checked_add(1)?)? as i8 as i64;
+            if !code.exits_function(cursor.checked_add(2)?, displacement, function)? {
+                return Some(None);
+            }
+            0
+        }
+        0xff => {
+            let modrm = code.byte(cursor.checked_add(1)?)?;
+            if modrm == 0x25 && matches!(terminal_rex, 0 | 0x48) {
+                code.dword(cursor.checked_add(2)?)?; // Complete RIP-relative operand.
+            } else if terminal_rex != 0x48 || modrm & 0xf8 != 0xe0 {
+                return Some(None);
+            }
+            0
+        }
         _ => return Some(None),
     };
     Some(Some(Plan {
@@ -135,7 +209,7 @@ fn decode(code: &Code<'_>, start: u32, frame_register: u8) -> Option<Option<Plan
 pub(crate) fn unwind_return(
     image_base: u64,
     control_rva: u32,
-    function_end: u32,
+    function: RuntimeFunction,
     frame_register: u8,
     context: &mut Context,
     image: &dyn ImageReader,
@@ -145,9 +219,9 @@ pub(crate) fn unwind_return(
     let code = Code {
         image,
         base: image_base,
-        end: function_end,
+        end: function.end,
     };
-    let Some(plan) = decode(&code, control_rva, frame_register)? else {
+    let Some(plan) = decode(&code, control_rva, function, frame_register)? else {
         return Some(false);
     };
     let mut next = *context;

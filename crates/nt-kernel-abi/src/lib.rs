@@ -16,6 +16,7 @@ mod driver;
 mod irp;
 pub mod ps_reactos_x64;
 pub mod security_client_x64;
+pub mod security_create_x64;
 mod string;
 
 pub use device::{device_flags, device_type, DeviceObject};
@@ -143,6 +144,22 @@ mod tests {
         let base = &sl as *const _ as usize;
         let code = &sl.parameters[2] as *const _ as usize; // parameters[2] == +16
         assert_eq!(code - base, 24);
+    }
+
+    #[test]
+    fn ioctl_parameters_decode_pointer_aligned_driver_bytes() {
+        let mut bytes = [0u8; core::mem::size_of::<IoStackLocation>()];
+        bytes[0] = major::IRP_MJ_DEVICE_CONTROL;
+        bytes[8..12].copy_from_slice(&4u32.to_le_bytes());
+        bytes[16..20].copy_from_slice(&58u32.to_le_bytes());
+        bytes[24..28].copy_from_slice(&0x0014_018fu32.to_le_bytes());
+        bytes[32..40].copy_from_slice(&0x1000_2000u64.to_le_bytes());
+        let stack = bytemuck::pod_read_unaligned::<IoStackLocation>(&bytes);
+        let control = stack.device_io_control();
+        assert_eq!(control.output_buffer_length, 4);
+        assert_eq!(control.input_buffer_length, 58);
+        assert_eq!(control.io_control_code, 0x0014_018f);
+        assert_eq!(control.type3_input_buffer, GuestAddr(0x1000_2000));
     }
 
     #[test]

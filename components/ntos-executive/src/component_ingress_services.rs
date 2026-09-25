@@ -14,6 +14,22 @@ enum WaitPhase {
     Cancelled,
     Finished,
 }
+
+impl WaitPhase {
+    fn blocks_new_dispatch(self, same_dispatch: bool) -> bool {
+        match self {
+            Self::Finished => false,
+            // The Call and Reply have finished, but its semantic owner still needs the exact
+            // tombstone. A later dispatch on the same physical route must not wait for that.
+            Self::CompletedAcknowledged => same_dispatch,
+            _ => true,
+        }
+    }
+
+    fn has_cancellable_call(self) -> bool {
+        !matches!(self, Self::Finished | Self::CompletedAcknowledged)
+    }
+}
 #[derive(Clone, Copy, PartialEq)]
 enum WaitKind {
     Ordinary,
@@ -35,6 +51,8 @@ struct Wait {
 #[derive(Clone, Copy)]
 enum ServiceCompletion {
     Status(i32),
+    QueryPath { status: i32, accepted: bool },
+    FileCreate(nt_io_manager::io_create_file_reply::IoCreateFileReply),
     Registry {
         status: i32,
         handle: u64,
@@ -46,6 +64,10 @@ impl ServiceCompletion {
     fn words(self) -> (u64, [u64; 4]) {
         match self {
             Self::Status(status) => (1, [status as u32 as u64, 0, 0, 0]),
+            Self::QueryPath { status, accepted } => {
+                (2, [status as u32 as u64, u64::from(accepted), 0, 0])
+            }
+            Self::FileCreate(reply) => (4, reply.words().expect("terminal File create reply")),
             Self::Registry {
                 status,
                 handle,
@@ -95,7 +117,9 @@ unsafe fn park(route: PeerRoute, token: u64, kind: WaitKind) -> Result<(), Error
     if token == 0
         || waits
             .iter()
-            .any(|row| row.route == route && row.phase != WaitPhase::Finished)
+            .any(|row| {
+                row.route == route && row.phase.blocks_new_dispatch(row.dispatch == dispatch)
+            })
     {
         return Err(Error::Admission);
     }
@@ -180,6 +204,51 @@ pub(crate) unsafe fn wake_registry_service(
             handle,
             disposition,
         },
+    )
+}
+
+pub(crate) unsafe fn wake_query_path_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    status: i32,
+) -> Result<(), Error> {
+    wake_with_completion(
+        route, dispatch, reply, token,
+        ServiceCompletion::QueryPath { status, accepted: true },
+    )
+}
+
+pub(crate) unsafe fn wake_query_path_rejected_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    status: i32,
+) -> Result<(), Error> {
+    wake_with_completion(
+        route, dispatch, reply, token,
+        ServiceCompletion::QueryPath { status, accepted: false },
+    )
+}
+
+pub(crate) unsafe fn wake_file_create_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    completion: nt_io_manager::io_create_file_reply::IoCreateFileReply,
+) -> Result<(), Error> {
+    if completion.words().is_err() {
+        return Err(Error::Protocol);
+    }
+    wake_with_completion(
+        route,
+        dispatch,
+        reply,
+        token,
+        ServiceCompletion::FileCreate(completion),
     )
 }
 
@@ -433,7 +502,7 @@ pub(crate) unsafe fn cancel_parked_service(route: PeerRoute) -> Result<(), Error
     }
     let Some((dispatch, reply, token, phase, kind)) = (&*core::ptr::addr_of!(WAITS))
         .iter()
-        .find(|row| row.route == route && row.phase != WaitPhase::Finished)
+        .find(|row| row.route == route && row.phase.has_cancellable_call())
         .map(|wait| {
             (
                 wait.dispatch,
@@ -447,10 +516,6 @@ pub(crate) unsafe fn cancel_parked_service(route: PeerRoute) -> Result<(), Error
         return Ok(());
     };
     if matches!(phase, WaitPhase::Cancelled | WaitPhase::StoppedAcknowledged) {
-        return Ok(());
-    }
-    if phase == WaitPhase::CompletedAcknowledged {
-        // The Reply and retained Call completed already; no external token remains to cancel.
         return Ok(());
     }
     let owner = owner();
@@ -592,4 +657,18 @@ pub(crate) unsafe fn retire_stopped_acknowledged_retained_service(
         _ => return Err(Error::Retirement),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WaitPhase;
+
+    #[test]
+    fn completed_semantic_tombstone_does_not_block_next_dispatch() {
+        assert!(WaitPhase::CompletedAcknowledged.blocks_new_dispatch(true));
+        assert!(!WaitPhase::CompletedAcknowledged.blocks_new_dispatch(false));
+        assert!(!WaitPhase::CompletedAcknowledged.has_cancellable_call());
+        assert!(WaitPhase::Parked.blocks_new_dispatch(false));
+        assert!(WaitPhase::Parked.has_cancellable_call());
+    }
 }

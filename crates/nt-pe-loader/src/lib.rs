@@ -14,14 +14,15 @@ extern crate alloc;
 mod exports;
 mod headers;
 mod image;
+pub mod immutable_support_image;
 mod imports;
 mod relocs;
 mod rva;
 
 pub use exports::ExportedSymbol;
 pub use headers::{
-    DataDirectory, Headers, Section, DIRECTORY_ENTRY_EXPORT, DIRECTORY_ENTRY_RESOURCE,
-    DIRECTORY_ENTRY_TLS,
+    DataDirectory, Headers, Section, DIRECTORY_ENTRY_DELAY_IMPORT, DIRECTORY_ENTRY_EXPORT,
+    DIRECTORY_ENTRY_RESOURCE, DIRECTORY_ENTRY_TLS,
 };
 pub use image::MappedImage;
 pub use imports::{ImportRef, ImportedDll};
@@ -48,6 +49,17 @@ pub enum Protection {
 }
 
 impl Protection {
+    /// Classify a hosted PE section before translating to the target VSpace's page rights.
+    pub fn from_section_characteristics(characteristics: u32) -> Self {
+        if characteristics & headers::IMAGE_SCN_MEM_EXECUTE != 0 {
+            Self::ReadExecute
+        } else if characteristics & headers::IMAGE_SCN_MEM_WRITE != 0 {
+            Self::ReadWrite
+        } else {
+            Self::ReadOnly
+        }
+    }
+
     /// True if a page with this protection must be writable.
     pub fn writable(self) -> bool {
         matches!(self, Protection::ReadWrite)
@@ -559,13 +571,7 @@ impl<'a> PeFile<'a> {
             let start = s.virtual_address;
             let size = s.virtual_size.max(s.size_of_raw_data);
             if rva >= start && rva - start < size {
-                if s.is_executable() {
-                    return Protection::ReadExecute;
-                }
-                if s.is_writable() {
-                    return Protection::ReadWrite;
-                }
-                return Protection::ReadOnly;
+                return Protection::from_section_characteristics(s.characteristics);
             }
         }
         Protection::ReadOnly // headers / gaps

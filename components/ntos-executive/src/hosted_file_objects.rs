@@ -8,16 +8,43 @@ struct Row {
     in_flight: bool,
 }
 
-static mut FILE_OBJECTS: Vec<Option<Row>> = Vec::new();
-static mut NEXT_RETIREMENT: usize = 0;
+struct FileObjectStore {
+    rows: Vec<Option<Row>>,
+    next_retirement: usize,
+}
+
+const _: () = assert!(core::mem::size_of::<FileObjectStore>() <= 0x40);
 const RETIREMENT_BUDGET: usize = 16;
+const FILE_NAME_BUFFER_OFFSET: u64 = 0x60;
+
+pub(super) unsafe fn free_file_storage(file_object: u64) {
+    let name = read_unaligned((file_object + FILE_NAME_BUFFER_OFFSET) as *const u64);
+    if name != 0 && component_pool_allocation_capacity(name).is_some() {
+        pool_free(name);
+    }
+    pool_free(file_object);
+}
+
+unsafe fn store() -> &'static mut FileObjectStore {
+    &mut *((FSD_DATA_VADDR + FSD_DATA_FILE_OBJECT_STORE_OFF) as *mut FileObjectStore)
+}
+
+pub(super) unsafe fn initialize() {
+    core::ptr::write(
+        (FSD_DATA_VADDR + FSD_DATA_FILE_OBJECT_STORE_OFF) as *mut FileObjectStore,
+        FileObjectStore {
+            rows: Vec::new(),
+            next_retirement: 0,
+        },
+    );
+}
 
 unsafe fn rows() -> &'static Vec<Option<Row>> {
-    &*core::ptr::addr_of!(FILE_OBJECTS)
+    &store().rows
 }
 
 unsafe fn rows_mut() -> &'static mut Vec<Option<Row>> {
-    &mut *core::ptr::addr_of_mut!(FILE_OBJECTS)
+    &mut store().rows
 }
 
 unsafe fn index_for_file(file: u64) -> Option<usize> {
@@ -173,7 +200,7 @@ unsafe fn retire_one(index: usize) -> bool {
         return false;
     }
     rows_mut()[index] = None;
-    pool_free(snapshot.address());
+    free_file_storage(snapshot.address());
     publish_retirements();
     true
 }
@@ -185,7 +212,7 @@ pub(super) unsafe fn drain() -> u64 {
         return 0;
     }
     let mut retired = 0;
-    let start = *core::ptr::addr_of!(NEXT_RETIREMENT) % count;
+    let start = store().next_retirement % count;
     let mut scanned = 0;
     let mut attempted = 0;
     while scanned < count && attempted < RETIREMENT_BUDGET {
@@ -199,7 +226,7 @@ pub(super) unsafe fn drain() -> u64 {
             retired += u64::from(retire_one(index));
         }
     }
-    *core::ptr::addr_of_mut!(NEXT_RETIREMENT) = (start + scanned) % count;
+    store().next_retirement = (start + scanned) % count;
     publish_retirements();
     retired
 }

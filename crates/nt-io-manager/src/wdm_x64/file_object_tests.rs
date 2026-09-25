@@ -140,6 +140,8 @@ fn invalid_final_file_addresses_do_not_mutate_any_projection() {
                     device_object: 0x3000,
                     file_object_context: 0,
                     device_type: 7,
+                    device_stack_size: 1,
+                    ..Default::default()
                 }
             ),
             Err(WdmLayoutError::InvalidField)
@@ -148,6 +150,121 @@ fn invalid_final_file_addresses_do_not_mutate_any_projection() {
         assert_eq!(device, [0xa5; WDM_X64_DEVICE_OBJECT_SIZE]);
         assert_eq!(bytes, [0xa5; WDM_X64_FILE_OBJECT_SIZE]);
     }
+}
+
+#[test]
+fn open_device_projection_uses_canonical_device_and_file_metadata() {
+    let mut driver = [0xa5; WDM_X64_DRIVER_OBJECT_SIZE];
+    let mut device = [0xa5; WDM_X64_DEVICE_OBJECT_SIZE];
+    let mut file = [0xa5; WDM_X64_FILE_OBJECT_SIZE];
+    write_wdm_open_device_projection(
+        &mut driver,
+        &mut device,
+        &mut file,
+        WdmOpenDeviceProjectionInit {
+            file_object_address: 0x4000,
+            driver_object: 0x1000,
+            driver_extension: 0x1150,
+            driver_name_len: 8,
+            driver_name_max_len: 10,
+            driver_name_buffer: 0x7000,
+            device_object: 0x2000,
+            file_object_context: 0x77,
+            device_type: 0x23,
+            device_flags: 0x14,
+            device_characteristics: 0x28,
+            device_stack_size: 3,
+            file_create_options: 0x20,
+            file_opened_case_sensitive: true,
+            file_related_file_object: 0x5000,
+            file_name_len: 6,
+            file_name_max_len: 8,
+            file_name_buffer: 0x6000,
+        },
+    )
+    .unwrap();
+    assert_eq!(&driver[0x38..0x3a], &8u16.to_le_bytes());
+    assert_eq!(&driver[0x3a..0x3c], &10u16.to_le_bytes());
+    assert_eq!(&driver[0x40..0x48], &0x7000u64.to_le_bytes());
+    assert_eq!(&device[0x30..0x34], &0x14u32.to_le_bytes());
+    assert_eq!(&device[0x34..0x38], &0x28u32.to_le_bytes());
+    assert_eq!(device[0x4c], 3);
+    assert_eq!(&file[0x40..0x48], &0x5000u64.to_le_bytes());
+    assert_eq!(&file[0x50..0x54], &0x0002_0002u32.to_le_bytes());
+    assert_eq!(&file[0x58..0x5a], &6u16.to_le_bytes());
+    assert_eq!(&file[0x5a..0x5c], &8u16.to_le_bytes());
+    assert_eq!(&file[0x60..0x68], &0x6000u64.to_le_bytes());
+}
+
+#[test]
+fn invalid_open_device_projection_metadata_leaves_all_outputs_untouched() {
+    let mut driver = [0xa5; WDM_X64_DRIVER_OBJECT_SIZE];
+    let mut device = [0xa5; WDM_X64_DEVICE_OBJECT_SIZE];
+    let mut file = [0xa5; WDM_X64_FILE_OBJECT_SIZE];
+    let mut init = WdmOpenDeviceProjectionInit {
+        file_object_address: 0x4000,
+        driver_object: 0x1000,
+        device_object: 0x2000,
+        device_stack_size: 0,
+        ..Default::default()
+    };
+    for invalid in [
+        init,
+        WdmOpenDeviceProjectionInit {
+            device_stack_size: 1,
+            file_create_options: 0x30,
+            ..init
+        },
+        WdmOpenDeviceProjectionInit {
+            device_stack_size: 1,
+            file_name_len: 2,
+            file_name_max_len: 2,
+            ..init
+        },
+        WdmOpenDeviceProjectionInit {
+            device_stack_size: 1,
+            driver_name_len: 2,
+            driver_name_max_len: 2,
+            ..init
+        },
+        WdmOpenDeviceProjectionInit {
+            device_stack_size: 1,
+            driver_name_len: 3,
+            driver_name_max_len: 4,
+            driver_name_buffer: 0x7000,
+            ..init
+        },
+        WdmOpenDeviceProjectionInit {
+            device_stack_size: 1,
+            driver_name_len: 2,
+            driver_name_max_len: 4,
+            driver_name_buffer: u64::MAX - 1,
+            ..init
+        },
+        WdmOpenDeviceProjectionInit {
+            device_stack_size: 1,
+            file_name_len: 2,
+            file_name_max_len: 2,
+            file_name_buffer: 0x6001,
+            ..init
+        },
+    ] {
+        assert_eq!(
+            write_wdm_open_device_projection(&mut driver, &mut device, &mut file, invalid),
+            Err(WdmLayoutError::InvalidField)
+        );
+        assert_eq!(driver, [0xa5; WDM_X64_DRIVER_OBJECT_SIZE]);
+        assert_eq!(device, [0xa5; WDM_X64_DEVICE_OBJECT_SIZE]);
+        assert_eq!(file, [0xa5; WDM_X64_FILE_OBJECT_SIZE]);
+    }
+    init.device_stack_size = 1;
+    init.file_name_len = 2;
+    init.file_name_max_len = 2;
+    init.file_name_buffer = 0x6000;
+    assert_eq!(
+        write_wdm_open_device_projection(&mut driver, &mut device, &mut file, init),
+        Ok(())
+    );
 }
 
 #[test]

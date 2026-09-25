@@ -54,10 +54,20 @@ mod hosted_file;
 #[cfg(test)]
 mod hosted_file_lifetime_tests;
 mod hosted_device_pointer;
+pub mod hosted_pool_range;
 pub mod inline_file_retirement;
 mod irp;
 pub mod io_create_file;
 pub mod io_create_file_capture;
+pub mod io_create_file_reply;
+pub mod provider_create_delivery;
+pub mod consumer_file_projection;
+pub mod hosted_forward_target;
+pub mod redir_query_path;
+pub mod retained_query_path_forward;
+pub mod retained_write_forward;
+pub mod source_irp_ledger;
+pub mod query_path_wire;
 pub mod io_create_file_wire;
 mod lock_control;
 mod set_information_completion;
@@ -78,6 +88,7 @@ mod store;
 mod synchronous_io;
 mod volume_information;
 mod wdm_x64;
+mod wdm_security_x64;
 
 pub use banked_transfer::{BankedTransferCursor, BankedTransferError};
 pub use bounded_file_read::{BoundedFileReadCompletion, BoundedFileReadPlan};
@@ -232,6 +243,13 @@ pub use wdm_x64::{
     WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
     WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_DEVICE,
     WDM_X64_IO_TYPE_DRIVER, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
+};
+pub use wdm_security_x64::{
+    write_wdm_access_state, write_wdm_create_security_graph,
+    write_wdm_io_security_context, write_wdm_security_subject_context,
+    WdmAccessStateInit, WdmIoSecurityContextInit, WdmSecuritySubjectContext,
+    WDM_X64_ACCESS_STATE_SIZE, WDM_X64_IO_SECURITY_CONTEXT_SIZE,
+    WDM_X64_SECURITY_SUBJECT_CONTEXT_SIZE,
 };
 
 #[cfg(feature = "object-manager")]
@@ -388,7 +406,7 @@ impl<P> IoManager<P> {
         if self.driver_has_live_irp(driver) {
             return Err(NtStatus::DEVICE_BUSY);
         }
-        if self.driver_has_device_references(driver) {
+        if self.driver_has_unload_blocking_device_references(driver) {
             return Err(NtStatus::DELETE_PENDING);
         }
         if self.devices_of(driver).iter().any(|device_id| {
@@ -7558,6 +7576,8 @@ mod tests {
                 device_object: 0x2000,
                 file_object_context: 0x77,
                 device_type: 0x23,
+                device_stack_size: 1,
+                ..Default::default()
             },
         )
         .unwrap();

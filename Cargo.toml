@@ -102,6 +102,7 @@ members = [
     "crates/nt-unwind",
     "tools/driver-import-report",
     "tools/ntdll-dll-verify",
+    "tools/seh-linkage-verify",
 ]
 exclude = [
     "rust-micro",

@@ -19,6 +19,9 @@ path = "src/main.rs"
 # markers, spec PASS/FAIL lines, and the gate summary are NEVER gated by this.
 default = []
 debug-trace = []
+# Native Mup/provider integration boots the normal executive service loop without
+# requiring the unrelated win32k import catalog. Production admission is unchanged.
+mup-provider-kernel-only = []
 
 [dependencies]
 # Kernel ABI + SURT transport.
@@ -85,6 +88,7 @@ nt-acpi = { path = "../../crates/nt-acpi" }
 nt-ahci = { path = "../../crates/nt-ahci" }
 # PE loader — load + map + relocate a real Windows .sys binary in the isolated host.
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+nt-unwind = { path = "../../crates/nt-unwind" }
 # Process Manager — real EPROCESS/ETHREAD + per-process handle tables + lifecycle. The live
 # executive is CONVERGING its ad-hoc process-hosting (spawn_sec_image + badge/pi arrays + next_handle
 # fakes) onto this host-tested subsystem (policy = nt-process; mechanism = seL4 caps stay executive).

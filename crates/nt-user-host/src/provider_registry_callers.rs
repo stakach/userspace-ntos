@@ -36,8 +36,16 @@ impl<R: Copy + Eq, D: Copy + Eq> RegistryCallerOwners<R, D> {
         self.entries.is_empty()
     }
 
-    /// The root supplies the caller explicitly. A parked/uncertain job excludes replacement even
-    /// if a new dispatch ID appears for the same route; it never implicitly releases references.
+    pub fn route_dispatch_count(&self, route: R, dispatch: Option<D>) -> (usize, usize) {
+        (
+            self.entries.iter().filter(|entry| entry.route == route).count(),
+            self.entries.iter().filter(|entry| entry.route == route
+                && entry.dispatch == dispatch).count(),
+        )
+    }
+
+    /// The root supplies the caller explicitly. Nested jobs on one physical route retain
+    /// independent requestor references until their own dispatch epochs complete.
     pub fn capture(
         &mut self,
         pm: &mut ProcessManager,
@@ -46,7 +54,10 @@ impl<R: Copy + Eq, D: Copy + Eq> RegistryCallerOwners<R, D> {
         address_space: u64,
         caller: NativeHandleCaller,
     ) -> Result<(), u32> {
-        if address_space == 0 || self.entries.iter().any(|entry| entry.route == route) {
+        if address_space == 0 || self.entries.iter().any(|entry| {
+            entry.route == route
+                && (entry.dispatch.is_none() || dispatch.is_none() || entry.dispatch == dispatch)
+        }) {
             return Err(STATUS_INVALID_HANDLE);
         }
         self.entries
@@ -70,15 +81,16 @@ impl<R: Copy + Eq, D: Copy + Eq> RegistryCallerOwners<R, D> {
         dispatch: D,
         address_space: u64,
     ) -> Result<NativeHandleCaller, u32> {
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| {
-                entry.route == route
-                    && entry.address_space == address_space
-                    && entry.dispatch.is_none_or(|held| held == dispatch)
-            })
+        let index = self.entries.iter().position(|entry| {
+            entry.route == route
+                && entry.address_space == address_space
+                && entry.dispatch == Some(dispatch)
+        }).or_else(|| self.entries.iter().position(|entry| {
+            entry.route == route && entry.address_space == address_space
+                && entry.dispatch.is_none()
+        }))
             .ok_or(STATUS_INVALID_HANDLE)?;
+        let entry = &mut self.entries[index];
         entry.reference.validate(pm)?;
         pm.validate_native_handle_caller(entry.caller)?;
         entry.dispatch = Some(dispatch);
@@ -89,7 +101,7 @@ impl<R: Copy + Eq, D: Copy + Eq> RegistryCallerOwners<R, D> {
     /// does not prevent cleanup, and a failed release retains the original row and references.
     pub fn retire(&mut self, pm: &mut ProcessManager, route: R, dispatch: D) -> Result<bool, u32> {
         let Some(index) = self.entries.iter().position(|entry| {
-            entry.route == route && entry.dispatch.is_none_or(|held| held == dispatch)
+            entry.route == route && entry.dispatch == Some(dispatch)
         }) else {
             return Ok(false);
         };

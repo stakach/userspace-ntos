@@ -112,8 +112,7 @@ unsafe fn create(device: u64, irp: u64, stack: u64, hw_extension: u64) -> i32 {
     if initialize == 0 {
         protocol_violation(device, irp, STATUS_INVALID_DEVICE_REQUEST as u32 as u64, 0);
     }
-    let init: extern "win64" fn(u64) -> u8 = core::mem::transmute(initialize as *const ());
-    let ok = init(hw_extension);
+    let ok = call_hosted_pe(initialize, &[hw_extension]) as u8;
     let calls = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_CALLS) as *const u64);
     write_volatile(
         (FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_CALLS) as *mut u64,
@@ -209,8 +208,7 @@ pub(super) unsafe extern "win64" fn dispatch(device: u64, irp: u64) -> i32 {
     if packet.write(&mut bytes).is_err() {
         return complete(irp, STATUS_INVALID_PARAMETER, 0);
     }
-    let start: extern "win64" fn(u64, u64) -> u8 = core::mem::transmute(start_io as *const ());
-    let _accepted = start(hw_extension, bytes.as_mut_ptr() as u64);
+    let _accepted = call_hosted_pe(start_io, &[hw_extension, bytes.as_mut_ptr() as u64]) as u8;
     let calls = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_START_IO_CALLS) as *const u64);
     write_volatile(
         (FSD_SHARED_VADDR + SH_VIDEO_HW_START_IO_CALLS) as *mut u64,

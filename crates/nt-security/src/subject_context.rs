@@ -173,6 +173,16 @@ impl CapturedSubjectContext {
         })
     }
 
+    /// Canonical identities corresponding to the still-retained subject references. Native
+    /// projection adapters use these IDs only after validating the exact source owner.
+    pub fn token_ids(
+        &self,
+        tokens: &TokenStore,
+    ) -> Result<(TokenId, Option<SubjectClientIdentity>), u32> {
+        self.validate(tokens)?;
+        Ok((self.primary, self.client))
+    }
+
     pub fn release(&mut self, tokens: &mut TokenStore) -> Result<(), u32> {
         self.validate(tokens)?;
         if let Some(client) = self.client {

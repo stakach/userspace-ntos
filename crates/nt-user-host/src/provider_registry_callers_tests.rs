@@ -73,16 +73,28 @@ fn uncertain_job_excludes_replacement_until_exact_completion() {
     owners
         .capture(&mut parts.pm, 1u64, Some(7u64), 0x5000, caller)
         .unwrap();
-    assert!(owners
-        .capture(&mut parts.pm, 1, Some(8), 0x5000, caller)
-        .is_err());
+    assert!(owners.capture(&mut parts.pm, 1, Some(7), 0x5000, caller).is_err());
     assert_eq!(owners.len(), 1);
     assert_eq!(references(&parts.pm, caller), (1, 1));
+    owners.capture(&mut parts.pm, 1, Some(8), 0x5000, caller).unwrap();
+    assert_eq!(owners.len(), 2);
     assert!(owners.retire(&mut parts.pm, 1, 7).unwrap());
-    owners
-        .capture(&mut parts.pm, 1, Some(8), 0x5000, caller)
-        .unwrap();
+    assert_eq!(references(&parts.pm, caller), (1, 1));
     assert!(owners.retire(&mut parts.pm, 1, 8).unwrap());
+}
+
+#[test]
+fn nested_dispatch_on_same_route_retains_both_exact_callers() {
+    let (mut parts, caller) = fixture();
+    let mut owners = RegistryCallerOwners::new();
+    owners.capture(&mut parts.pm, 1u64, Some(7u64), 0x5000, caller).unwrap();
+    owners.capture(&mut parts.pm, 1, Some(8), 0x5000, caller).unwrap();
+    assert_eq!(references(&parts.pm, caller), (2, 2));
+    assert_eq!(owners.resolve(&parts.pm, 1, 8, 0x5000), Ok(caller));
+    assert_eq!(owners.retire(&mut parts.pm, 1, 8), Ok(true));
+    assert_eq!(owners.resolve(&parts.pm, 1, 7, 0x5000), Ok(caller));
+    assert_eq!(references(&parts.pm, caller), (1, 1));
+    assert_eq!(owners.retire(&mut parts.pm, 1, 7), Ok(true));
 }
 
 #[test]

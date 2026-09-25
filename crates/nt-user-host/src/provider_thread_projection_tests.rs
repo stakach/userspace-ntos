@@ -47,6 +47,28 @@ fn uncertain_release_retains_identity_and_excludes_replay() {
 }
 
 #[test]
+fn held_parent_allows_exact_nested_projection_on_same_executor() {
+    let (mut parts, caller, projection) = fixture();
+    let second_tid = parts.pm.create_thread(caller.original_thread().process_id(),
+        0x7000, 0, false).unwrap();
+    assert!(parts.pm.publish_thread_kernel_object(second_tid, 0x8000));
+    let second_caller = parts.pm.capture_native_handle_caller(
+        parts.pm.thread_lifetime(second_tid).unwrap(),
+        nt_types::AccessMode::KernelMode,
+    ).unwrap();
+    let second_projection = ThreadProjection { thread_body: 0x8000, ..projection };
+    let mut owners = ProjectionOwners::new();
+    owners.capture(&mut parts.pm, 1u64, Some(10u64), caller, projection).unwrap();
+    assert_eq!(owners.hold(1, 10), Ok(true));
+    owners.capture(&mut parts.pm, 1, Some(11), second_caller, second_projection).unwrap();
+    assert_eq!(owners.completing(1, 11), Ok(Some(second_projection)));
+    owners.retire(&mut parts.pm, 1, 11).unwrap();
+    assert_eq!(owners.begin_restore(&parts.pm, 1, 10), Ok(Some(projection)));
+    owners.restored(1, 10).unwrap();
+    owners.retire(&mut parts.pm, 1, 10).unwrap();
+}
+
+#[test]
 fn different_executors_cannot_share_a_kpcr_in_one_address_space() {
     let (mut parts, caller, projection) = fixture();
     let mut owners = ProjectionOwners::new();

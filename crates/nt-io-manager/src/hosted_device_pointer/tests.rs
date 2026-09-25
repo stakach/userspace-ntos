@@ -38,6 +38,46 @@ fn add_device(io: &mut IoManager<MockObjectPort>, driver: DriverId) -> DeviceId 
 }
 
 #[test]
+fn own_projection_anchor_does_not_prevent_driver_unload_callback() {
+    let (mut io, driver, device, domain) = setup();
+    io.bind_hosted_driver_identity(domain, 0x2000, driver).unwrap();
+    let registration = io.bind_hosted_device_pointer(domain, 0x1000, device).unwrap();
+
+    assert_eq!(io.device_reference_count(device), 1);
+    assert_eq!(io.can_begin_driver_unload(driver), Ok(()));
+    io.request_driver_unload_records(driver).unwrap();
+    assert_eq!(io.can_finish_driver_unload(driver), Err(NtStatus::INVALID_DEVICE_REQUEST));
+    io.complete_driver_unload_callback(driver).unwrap();
+    assert_eq!(io.can_finish_driver_unload(driver), Err(NtStatus::DELETE_PENDING));
+
+    io.retire_hosted_device_pointer(registration).unwrap();
+    io.delete_device(device).unwrap();
+    assert_eq!(io.can_finish_driver_unload(driver), Ok(()));
+}
+
+#[test]
+fn external_references_still_prevent_unload_with_own_projection() {
+    let (mut io, driver, device, domain) = setup();
+    io.bind_hosted_driver_identity(domain, 0x2000, driver).unwrap();
+    let registration = io.bind_hosted_device_pointer(domain, 0x1000, device).unwrap();
+
+    let mut external = io.retain_device_reference(device).unwrap();
+    assert_eq!(io.can_begin_driver_unload(driver), Err(NtStatus::DELETE_PENDING));
+    io.release_device_reference(&mut external).unwrap();
+
+    io.reference_hosted_device_pointer(registration).unwrap();
+    assert_eq!(io.can_begin_driver_unload(driver), Err(NtStatus::DELETE_PENDING));
+    io.dereference_hosted_device_pointer(registration).unwrap();
+
+    let foreign = io.register_hosted_domain();
+    let foreign_registration = io.bind_hosted_device_pointer(foreign, 0x3000, device).unwrap();
+    assert_eq!(io.can_begin_driver_unload(driver), Err(NtStatus::DELETE_PENDING));
+    io.retire_hosted_device_pointer(foreign_registration).unwrap();
+    assert_eq!(io.can_begin_driver_unload(driver), Ok(()));
+    io.retire_hosted_device_pointer(registration).unwrap();
+}
+
+#[test]
 fn admission_anchor_and_repeated_callers_have_separate_counts() {
     let (mut io, _, device, domain) = setup();
     let registration = io.register_hosted_device_pointer(domain, 0x1000).unwrap();

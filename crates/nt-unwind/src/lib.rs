@@ -26,8 +26,15 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 
 mod epilogue;
-pub mod exception_walk;
 pub mod exception_images;
+pub mod exception_snapshot;
+pub mod exception_walk;
+pub mod hardware_fault;
+pub mod raw_context;
+pub mod raw_exception;
+pub mod seh_linkage_image;
+pub mod seh_handler_packet;
+pub mod seh_transport;
 
 // =================================================================================================
 // EXCEPTION_RECORD / dispositions
@@ -47,6 +54,18 @@ pub enum Disposition {
 }
 
 impl Disposition {
+    /// Decode a language-handler return without treating an unknown value as ContinueSearch.
+    /// Live dispatchers must reject an invalid disposition before advancing the frame.
+    pub const fn try_from_raw(v: i32) -> Option<Disposition> {
+        match v {
+            0 => Some(Disposition::ContinueExecution),
+            1 => Some(Disposition::ContinueSearch),
+            2 => Some(Disposition::NestedException),
+            3 => Some(Disposition::CollidedUnwind),
+            _ => None,
+        }
+    }
+
     /// The raw `EXCEPTION_DISPOSITION` integer a language handler returns.
     pub fn from_raw(v: i32) -> Disposition {
         match v {
@@ -646,7 +665,7 @@ fn virtual_unwind_inner(
         && epilogue::unwind_return(
             image_base,
             control_rva,
-            covering_func.end,
+            covering_func,
             hdr.frame_register,
             ctx,
             img,
@@ -1082,6 +1101,8 @@ pub enum CScopeAction {
     },
     Finally {
         handler_rva: u32,
+        /// Publish this scope end as DispatcherContext.ControlPc before invoking the finalizer.
+        end_rva: u32,
     },
     ExecuteHandler {
         target_rva: u32,
@@ -1092,6 +1113,8 @@ pub enum CScopeAction {
 /// Select one C scope operation without allocating or invoking foreign code. `scope_index` is
 /// advanced before a selected operation is returned, so a collided unwind can resume from it.
 /// Image-relative PCs remain 64-bit so an address outside the image cannot alias a 32-bit scope.
+/// During unwind, a target at the inclusive scope end remains within that scope, matching the NT5
+/// `__C_specific_handler` leave-from-scope rule.
 /// The adapter must validate the table extent before supplying its record reader.
 pub fn next_c_scope(
     pc_rva: u64,
@@ -1109,15 +1132,13 @@ pub fn next_c_scope(
             continue;
         }
         if flags & EXCEPTION_UNWIND != 0 {
-            if flags & EXCEPTION_TARGET_UNWIND != 0
-                && target_rva >= u64::from(scope.begin)
-                && target_rva < u64::from(scope.end)
-            {
+            if target_rva >= u64::from(scope.begin) && target_rva <= u64::from(scope.end) {
                 return CScopeAction::ContinueSearch;
             }
             if scope.target == 0 {
                 return CScopeAction::Finally {
                     handler_rva: scope.handler,
+                    end_rva: scope.end,
                 };
             }
             if target_rva == u64::from(scope.target) {
@@ -1198,7 +1219,7 @@ pub fn c_specific_handler_unwind(pc_rva: u32, scopes: &[ScopeRecord]) -> Vec<u32
     let mut finallies = Vec::new();
     let count = u32::try_from(scopes.len()).expect("NT scope count fits ULONG");
     let mut index = 0;
-    while let CScopeAction::Finally { handler_rva } = next_c_scope(
+    while let CScopeAction::Finally { handler_rva, .. } = next_c_scope(
         u64::from(pc_rva),
         0,
         EXCEPTION_UNWINDING,
@@ -2201,6 +2222,12 @@ mod tests {
         assert_eq!(Disposition::from_raw(2), Disposition::NestedException);
         assert_eq!(Disposition::from_raw(3), Disposition::CollidedUnwind);
         assert_eq!(Disposition::from_raw(99), Disposition::ContinueSearch);
+        assert_eq!(Disposition::try_from_raw(0), Some(Disposition::ContinueExecution));
+        assert_eq!(Disposition::try_from_raw(1), Some(Disposition::ContinueSearch));
+        assert_eq!(Disposition::try_from_raw(2), Some(Disposition::NestedException));
+        assert_eq!(Disposition::try_from_raw(3), Some(Disposition::CollidedUnwind));
+        assert_eq!(Disposition::try_from_raw(4), None);
+        assert_eq!(Disposition::try_from_raw(-1), None);
     }
 
     #[test]

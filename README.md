@@ -115,6 +115,7 @@ git clone --recursive https://github.com/stakach/userspace-ntos.git
 cd userspace-ntos
 ./run.sh                # headless serial gate (default)
 ./run.sh --desktop      # boot with a QEMU window so you SEE the painted desktop
+./run.sh --build-only   # stage the boot image without launching QEMU
 ```
 
 `./run.sh` (at the repo root — distinct from `scripts/run.sh` above) is a
@@ -134,7 +135,15 @@ self-contained launcher that:
    redistributable — the executive loads them via `SEC_IMAGE` and runs their
    real user-mode binaries through this project's Rust `ntdll.dll` implementation.
 4. **Builds** the Rust `ntdll.dll`, `ntos-executive` (the NT executive that
-   hosts the ReactOS processes), and the kernel, then packs the FAT32/UEFI disk image.
+   hosts the ReactOS processes), the verified `nt-seh-linkage.dll` support image,
+   and the kernel, then packs the FAT32/UEFI disk image. The support image is
+   mapped into hosted driver domains. The native SEH bridge runs driver C filters,
+   termination handlers, explicit target and collided unwinds, and provider CPU-fault
+   handlers on the interrupted component thread. Verify these paths with
+   `bash scripts/run-seh-driver-integration.sh`,
+   `bash scripts/run-seh-terminal-integration.sh`, and
+   `bash scripts/run-seh-fault-integration.sh`; pass `--desktop` to also require
+   the full Explorer gate.
 5. **Boots QEMU.**
 
 ### Historical boot output

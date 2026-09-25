@@ -59,6 +59,16 @@ pub const INITIAL_TEB_STACK_LIMIT_OFFSET: u64 = 0x18;
 pub const INITIAL_TEB_ALLOCATED_STACK_BASE_OFFSET: u64 = 0x20;
 
 pub const CALL_TRAMPOLINE_LEN: usize = 42;
+
+/// A CALL trampoline reserves 32 bytes of home space before CALL pushes its return address.
+/// Its initial RSP must therefore be 16-byte aligned, unlike a direct function entry.
+pub const fn call_trampoline_initial_rsp(stack_end: u64) -> Option<u64> {
+    if stack_end < 40 || stack_end & 15 != 0 {
+        None
+    } else {
+        Some(stack_end)
+    }
+}
 pub const AMD64_HW_BREAKPOINT_SLOTS: usize = 4;
 pub const AMD64_DR7_RESERVED_ONE: u64 = 0x0000_0400;
 pub const DEBUG_BREAKPOINT_DATA: u64 = 0;
@@ -616,6 +626,15 @@ mod tests {
             &code[34..],
             &[0xff, 0xd0, 0x48, 0x83, 0xc4, 0x20, 0xeb, 0xfe]
         );
+    }
+
+    #[test]
+    fn call_trampoline_enters_win64_routine_with_aligned_stack() {
+        let initial = call_trampoline_initial_rsp(0x12_000).unwrap();
+        let callee_rsp = initial - 32 - 8;
+        assert_eq!(callee_rsp & 15, 8);
+        assert_eq!((callee_rsp - 3 * 8 - 0x140 + 0x90) & 15, 0);
+        assert_eq!(call_trampoline_initial_rsp(initial - 8), None);
     }
 
     #[test]
