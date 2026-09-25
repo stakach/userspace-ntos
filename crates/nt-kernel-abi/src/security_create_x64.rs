@@ -236,20 +236,32 @@ pub enum CreateSecurityEncodingError {
 pub fn capture_pointer_free_access_state(
     source: AccessState,
 ) -> Result<AccessStateFields, CreateSecurityEncodingError> {
+    let (fields, descriptor) = capture_access_state_with_descriptor(source)?;
+    if descriptor.is_some() {
+        return Err(CreateSecurityEncodingError::InvalidAccessState);
+    }
+    Ok(fields)
+}
+
+/// Capture scalar ACCESS_STATE data and identify a descriptor for separate, owned projection.
+/// The returned fields never contain a source-domain pointer. The descriptor address is only an
+/// input to source-domain validation and must not be written into a provider graph directly.
+pub fn capture_access_state_with_descriptor(
+    source: AccessState,
+) -> Result<(AccessStateFields, Option<GuestAddr>), CreateSecurityEncodingError> {
     if source.security_evaluated > 1
         || source.generate_audit > 1
         || source.generate_on_close > 1
         || source.privileges_allocated != 0
         || source.audit_privileges > 1
         || source.privileges.privilege_count > 3
-        || !source.security_descriptor.is_null()
         || !source.aux_data.is_null()
         || source.object_name != UnicodeString::default()
         || source.object_type_name != UnicodeString::default()
     {
         return Err(CreateSecurityEncodingError::InvalidAccessState);
     }
-    Ok(AccessStateFields {
+    let fields = AccessStateFields {
         operation_id: source.operation_id,
         security_evaluated: source.security_evaluated != 0,
         generate_audit: source.generate_audit != 0,
@@ -264,7 +276,9 @@ pub fn capture_pointer_free_access_state(
         audit_privileges: source.audit_privileges != 0,
         object_name: UnicodeString::default(),
         object_type_name: UnicodeString::default(),
-    })
+    };
+    let descriptor = (!source.security_descriptor.is_null()).then_some(source.security_descriptor);
+    Ok((fields, descriptor))
 }
 
 pub fn capture_create_qos(

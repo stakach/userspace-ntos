@@ -11,7 +11,7 @@ use super::*;
 use nt_io_manager::redir_query_path::{RetainedSecurityContextTicket, SourceSecurityContext};
 use nt_kernel_abi::security_client_x64::SecurityQualityOfService;
 use nt_kernel_abi::security_create_x64::{
-    capture_create_qos, capture_pointer_free_access_state, AccessState, AccessStateFields,
+    capture_access_state_with_descriptor, capture_create_qos, AccessState, AccessStateFields,
     CreateQosFields, IoSecurityContext, SourceSecurityProof,
 };
 use nt_security::{
@@ -19,19 +19,41 @@ use nt_security::{
         SourceCreateSecurityKey, SourceCreateSecurityOwner, SourceCreateSecurityPhase,
         SourceCreateSecurityTicket,
     },
-    SubjectClientIdentity, TokenId, TokenStore,
+    ClientMemory, SubjectClientIdentity, TokenId, TokenStore,
 };
 
 const STATUS_INVALID_HANDLE_LOCAL: u32 = 0xc000_0008;
 const STATUS_INVALID_PARAMETER_LOCAL: u32 = 0xc000_000d;
 const STATUS_INSUFFICIENT_RESOURCES_LOCAL: u32 = 0xc000_009a;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct CapturedCreateAccess {
     pub desired_access: u32,
     pub full_create_options: u32,
     pub qos: Option<CreateQosFields>,
     pub access: AccessStateFields,
+    pub descriptor: Option<Vec<u8>>,
+}
+
+impl CapturedCreateAccess {
+    fn try_copy(&self) -> Result<Self, u32> {
+        let descriptor = if let Some(bytes) = self.descriptor.as_ref() {
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(bytes.len())
+                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES_LOCAL)?;
+            copy.extend_from_slice(bytes);
+            Some(copy)
+        } else {
+            None
+        };
+        Ok(Self {
+            desired_access: self.desired_access,
+            full_create_options: self.full_create_options,
+            qos: self.qos,
+            access: self.access,
+            descriptor,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +62,7 @@ pub(super) struct SourceSecurityIdentity {
     pub key: SourceCreateSecurityKey,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct SourceSecuritySubject {
     pub primary: TokenId,
     pub client: Option<SubjectClientIdentity>,
@@ -107,76 +129,89 @@ fn row_storage_index(inst: DriverInstance, identity: SourceSecurityIdentity) -> 
     }
 }
 
+struct SourcePoolMemory {
+    source: DriverInstance,
+    used: u64,
+    _lock: ExecutivePoolLockGuard,
+}
+
+impl SourcePoolMemory {
+    unsafe fn new(source: DriverInstance) -> Option<Self> {
+        if !live_source(source) {
+            return None;
+        }
+        let lock = hosted_instance_pool_lock(source.exec_pool_va)?;
+        let used = read_volatile(source.exec_pool_va as *const u64);
+        if used < POOL_DATA_OFF || used > FSD_POOL_FRAMES.checked_mul(0x1000)? {
+            return None;
+        }
+        Some(Self { source, used, _lock: lock })
+    }
+
+    fn read_value<T: Copy>(&self, address: u64) -> Option<T> {
+        let mut value = core::mem::MaybeUninit::<T>::uninit();
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, core::mem::size_of::<T>())
+        };
+        self.read(address, bytes).then(|| unsafe { value.assume_init() })
+    }
+}
+
+impl ClientMemory for SourcePoolMemory {
+    fn read(&self, address: u64, dst: &mut [u8]) -> bool {
+        let Some(offset) = address.checked_sub(FSD_POOL_VADDR) else { return false; };
+        let Ok(length) = u64::try_from(dst.len()) else { return false; };
+        let allocation = nt_io_manager::hosted_pool_range::walk_hosted_pool_allocation(
+            self.used,
+            POOL_DATA_OFF,
+            offset,
+            length,
+            |header| {
+                let at = self.source.exec_pool_va.checked_add(header)?;
+                Some(unsafe { read_volatile(at as *const u64) })
+            },
+        );
+        let Some(allocation) = allocation else { return false; };
+        let Some(base) = FSD_POOL_VADDR.checked_add(allocation.base) else { return false; };
+        if unsafe { hosted_instance_pool_allocation_is_free_unlocked(self.source, base) }
+            != Some(false)
+        {
+            return false;
+        }
+        let Some(exec) = self.source.exec_pool_va.checked_add(offset) else { return false; };
+        unsafe { core::ptr::copy_nonoverlapping(exec as *const u8, dst.as_mut_ptr(), dst.len()); }
+        true
+    }
+}
+
 pub(super) unsafe fn live_context(inst: DriverInstance, address: u64) -> bool {
     if address == 0 || address & 7 != 0 {
         return false;
     }
-    let Some(exec) = hosted_instance_pool_allocation_exec_if_live(
-        inst,
-        address,
-        nt_kernel_abi::security_create_x64::IO_SECURITY_CONTEXT_SIZE as u64,
-    ) else {
-        return false;
-    };
-    let access = read_unaligned((exec + 8) as *const u64);
-    if Some(access)
-        == address.checked_add(nt_kernel_abi::security_create_x64::ACCESS_STATE_OFFSET as u64)
-    {
-        hosted_instance_pool_allocation_exec_if_live(
-            inst,
-            address,
-            nt_kernel_abi::security_create_x64::CREATE_SECURITY_GRAPH_SIZE as u64,
-        )
-        .is_some()
-    } else {
-        access != 0
-            && hosted_instance_pool_allocation_exec_if_live(
-                inst,
-                access,
-                nt_kernel_abi::security_create_x64::ACCESS_STATE_SIZE as u64,
-            )
-            .is_some()
-    }
+    let Some(memory) = SourcePoolMemory::new(inst) else { return false; };
+    let Some(context) = memory.read_value::<IoSecurityContext>(address) else { return false; };
+    context.access_state.0 != 0
+        && context.access_state.0 & 7 == 0
+        && memory.read_value::<AccessState>(context.access_state.0).is_some()
 }
 
 pub(super) unsafe fn capture_create_access(
     source: DriverInstance,
     context_address: u64,
 ) -> Result<CapturedCreateAccess, u32> {
-    if !live_context(source, context_address) {
+    if context_address == 0 || context_address & 7 != 0 {
         return Err(STATUS_INVALID_HANDLE_LOCAL);
     }
-    let context_exec = hosted_instance_pool_allocation_exec_if_live(
-        source,
-        context_address,
-        nt_kernel_abi::security_create_x64::IO_SECURITY_CONTEXT_SIZE as u64,
-    ).ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
-    let context = read_unaligned(context_exec as *const IoSecurityContext);
+    let memory = SourcePoolMemory::new(source).ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
+    let context = memory.read_value::<IoSecurityContext>(context_address)
+        .ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
     let access_address = context.access_state.0;
     if access_address == 0 || access_address & 7 != 0 {
         return Err(STATUS_INVALID_HANDLE_LOCAL);
     }
-    let embedded_access = context.has_embedded_access_state(nt_kernel_abi::GuestAddr(context_address));
-    let embedded_qos = context.has_embedded_qos(nt_kernel_abi::GuestAddr(context_address));
-    let embedded_graph = if embedded_access || embedded_qos {
-        Some(hosted_instance_pool_allocation_exec_if_live(
-            source,
-            context_address,
-            nt_kernel_abi::security_create_x64::CREATE_SECURITY_GRAPH_SIZE as u64,
-        ).ok_or(STATUS_INVALID_HANDLE_LOCAL)?)
-    } else {
-        None
-    };
-    let access_exec = if embedded_access {
-        embedded_graph.unwrap() + nt_kernel_abi::security_create_x64::ACCESS_STATE_OFFSET as u64
-    } else {
-        hosted_instance_pool_allocation_exec_if_live(
-            source,
-            access_address,
-            nt_kernel_abi::security_create_x64::ACCESS_STATE_SIZE as u64,
-        ).ok_or(STATUS_INVALID_HANDLE_LOCAL)?
-    };
-    let access = capture_pointer_free_access_state(read_unaligned(access_exec as *const AccessState))
+    let source_access = memory.read_value::<AccessState>(access_address)
+        .ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
+    let (access, descriptor_address) = capture_access_state_with_descriptor(source_access)
         .map_err(|_| STATUS_INVALID_PARAMETER_LOCAL)?;
     let qos = if context.security_qos.is_null() {
         None
@@ -184,24 +219,20 @@ pub(super) unsafe fn capture_create_access(
         if context.security_qos.0 & 3 != 0 {
             return Err(STATUS_INVALID_PARAMETER_LOCAL);
         }
-        let qos_exec = if embedded_qos {
-            embedded_graph.unwrap()
-                + nt_kernel_abi::security_create_x64::SECURITY_QOS_OFFSET as u64
-        } else {
-            hosted_instance_pool_allocation_exec_if_live(
-                source,
-                context.security_qos.0,
-                core::mem::size_of::<SecurityQualityOfService>() as u64,
-            ).ok_or(STATUS_INVALID_HANDLE_LOCAL)?
-        };
-        Some(capture_create_qos(read_unaligned(qos_exec as *const SecurityQualityOfService))
+        let source_qos = memory.read_value::<SecurityQualityOfService>(context.security_qos.0)
+            .ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
+        Some(capture_create_qos(source_qos)
             .map_err(|_| STATUS_INVALID_PARAMETER_LOCAL)?)
     };
+    let descriptor = descriptor_address
+        .map(|address| nt_security::capture_security_descriptor_bytes(&memory, address.0))
+        .transpose()?;
     Ok(CapturedCreateAccess {
         desired_access: context.desired_access,
         full_create_options: context.full_create_options,
         qos,
         access,
+        descriptor,
     })
 }
 
@@ -379,7 +410,7 @@ pub(super) fn subject(
         client,
         process_audit_id: subject.process_audit_id,
         proof,
-        create_access: row.create_access,
+        create_access: row.create_access.try_copy()?,
     })
 }
 

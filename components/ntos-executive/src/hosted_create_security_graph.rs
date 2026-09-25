@@ -21,6 +21,7 @@ pub(super) struct RetainedProviderCreateSecurityGraph {
     provider: DriverInstance,
     identity: hosted_source_create_security::SourceSecurityIdentity,
     graph_address: u64,
+    descriptor_address: u64,
     primary_address: u64,
     client_address: u64,
     primary_retiring: Option<driver_hosted_token_projection::RetiringTokenProjection>,
@@ -35,13 +36,22 @@ impl RetainedProviderCreateSecurityGraph {
     /// Call only after exact provider terminal or proven pre-entry. The token projections remain
     /// owned by the outer CREATE until its own terminal completion.
     pub(super) unsafe fn retire(
-        self,
+        mut self,
     ) -> Result<(), (i32, RetainedProviderCreateSecurityGraph)> {
         if self.primary_retiring.is_some() || self.client_retiring.is_some() {
             return Err((nt_status::NtStatus::DEVICE_BUSY.raw(), self));
         }
-        if !free_hosted_instance_pool_allocation_exact(self.provider, self.graph_address) {
-            return Err((STATUS_INVALID_HANDLE_LOCAL, self));
+        if self.descriptor_address != 0 {
+            if !free_hosted_instance_pool_allocation_exact(self.provider, self.descriptor_address) {
+                return Err((STATUS_INVALID_HANDLE_LOCAL, self));
+            }
+            self.descriptor_address = 0;
+        }
+        if self.graph_address != 0 {
+            if !free_hosted_instance_pool_allocation_exact(self.provider, self.graph_address) {
+                return Err((STATUS_INVALID_HANDLE_LOCAL, self));
+            }
+            self.graph_address = 0;
         }
         Ok(())
     }
@@ -145,6 +155,7 @@ pub(super) unsafe fn materialize(
         provider,
         identity,
         graph_address,
+        descriptor_address: 0,
         primary_address: 0,
         client_address: 0,
         primary_retiring: None,
@@ -239,6 +250,36 @@ pub(super) unsafe fn materialize(
             return Err(status as i32);
         }
     };
+    if let Some(descriptor) = subject.create_access.descriptor.as_ref() {
+        let bytes = match u64::try_from(descriptor.len()) {
+            Ok(bytes) if bytes != 0 => bytes,
+            _ => {
+                if let Err((rollback_status, owner)) = graph.abort_unentered() {
+                    quarantine_preentry(owner);
+                    return Err(rollback_status);
+                }
+                return Err(STATUS_INVALID_HANDLE_LOCAL);
+            }
+        };
+        let Some(address) = hosted_instance_pool_alloc(provider, bytes) else {
+            if let Err((rollback_status, owner)) = graph.abort_unentered() {
+                quarantine_preentry(owner);
+                return Err(rollback_status);
+            }
+            return Err(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
+        };
+        graph.descriptor_address = address;
+        let Some(exec) = hosted_pool_allocation_exec_va(provider.exec_pool_va, address, bytes) else {
+            if let Err((rollback_status, owner)) = graph.abort_unentered() {
+                quarantine_preentry(owner);
+                return Err(rollback_status);
+            }
+            return Err(STATUS_INVALID_HANDLE_LOCAL);
+        };
+        core::ptr::copy_nonoverlapping(descriptor.as_ptr(), exec as *mut u8, descriptor.len());
+    }
+    let mut access = subject.create_access.access;
+    access.security_descriptor = GuestAddr(graph.descriptor_address);
     let fields = CreateSecurityFields {
         source: subject.proof,
         provider_domain_id: provider.hosted_domain_id,
@@ -251,7 +292,7 @@ pub(super) unsafe fn materialize(
         desired_access: subject.create_access.desired_access,
         full_create_options: subject.create_access.full_create_options,
         qos: subject.create_access.qos,
-        access: subject.create_access.access,
+        access,
     };
     let output = core::slice::from_raw_parts_mut(
         graph_exec as *mut u8, CREATE_SECURITY_GRAPH_SIZE,

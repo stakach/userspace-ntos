@@ -48,6 +48,47 @@ fn pointer_free_access_capture_refuses_unowned_nested_memory() {
 }
 
 #[test]
+fn descriptor_capture_separates_source_address_from_access_fields() {
+    let mut source = initial_create_access_state(0x0012_0089);
+    source.security_descriptor = GuestAddr(0x1000_4000);
+    source.security_evaluated = 1;
+    source.previously_granted_access = 0x20000;
+    let (fields, descriptor) = capture_access_state_with_descriptor(source).unwrap();
+    assert_eq!(descriptor, Some(GuestAddr(0x1000_4000)));
+    assert_eq!(fields.security_descriptor, GuestAddr::NULL);
+    assert_eq!(fields.aux_data, GuestAddr::NULL);
+    assert_eq!(fields.original_desired_access, 0x0012_0089);
+    assert_eq!(fields.previously_granted_access, 0x20000);
+    assert!(fields.security_evaluated);
+    assert_eq!(
+        capture_pointer_free_access_state(source),
+        Err(CreateSecurityEncodingError::InvalidAccessState)
+    );
+
+    source.security_descriptor = GuestAddr::NULL;
+    let (fields, descriptor) = capture_access_state_with_descriptor(source).unwrap();
+    assert_eq!(descriptor, None);
+    assert_eq!(fields, capture_pointer_free_access_state(source).unwrap());
+}
+
+#[test]
+fn descriptor_capture_still_refuses_other_unowned_access_state_graphs() {
+    let mut source = initial_create_access_state(1);
+    source.security_descriptor = GuestAddr(0x1000);
+    source.aux_data = GuestAddr(0x2000);
+    assert_eq!(capture_access_state_with_descriptor(source), Err(CreateSecurityEncodingError::InvalidAccessState));
+    source.aux_data = GuestAddr::NULL;
+    source.privileges_allocated = 1;
+    assert_eq!(capture_access_state_with_descriptor(source), Err(CreateSecurityEncodingError::InvalidAccessState));
+    source.privileges_allocated = 0;
+    source.object_name = UnicodeString::new(GuestAddr(0x3000), 2);
+    assert_eq!(capture_access_state_with_descriptor(source), Err(CreateSecurityEncodingError::InvalidAccessState));
+    source.object_name = UnicodeString::default();
+    source.security_evaluated = 2;
+    assert_eq!(capture_access_state_with_descriptor(source), Err(CreateSecurityEncodingError::InvalidAccessState));
+}
+
+#[test]
 fn qos_capture_checks_nt5_shape() {
     let mut source = SecurityQualityOfService::default();
     source.length = core::mem::size_of::<SecurityQualityOfService>() as u32;

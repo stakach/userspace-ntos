@@ -54,6 +54,7 @@ mod hosted_file;
 #[cfg(test)]
 mod hosted_file_lifetime_tests;
 mod hosted_device_pointer;
+pub mod hosted_pool_range;
 pub mod inline_file_retirement;
 mod irp;
 pub mod io_create_file;
