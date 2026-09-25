@@ -24,12 +24,6 @@ const IRP_CURRENT_LOCATION_OFFSET: u64 = 0x43;
 const IRP_CURRENT_STACK_OFFSET: u64 = 0xb8;
 const IRP_ORIGINAL_FILE_OFFSET: u64 = 0xc0;
 const IRP_USER_BUFFER_OFFSET: u64 = 0x70;
-const STACK_OUTPUT_LENGTH_OFFSET: u64 = 0x08;
-const STACK_INPUT_LENGTH_OFFSET: u64 = 0x0c;
-const STACK_IOCTL_CODE_OFFSET: u64 = 0x10;
-const STACK_TYPE3_INPUT_OFFSET: u64 = 0x18;
-const STACK_DEVICE_OFFSET: u64 = 0x28;
-const STACK_FILE_OFFSET: u64 = 0x30;
 const MAX_INPUT_BYTES: u64 = QUERY_PATH_REQUEST_X64_SIZE as u64 + 65_532;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,9 +268,11 @@ pub(super) unsafe fn capture(
             .ok_or(CaptureError::InvalidSourceIrp)?;
     let result = (|| {
         let (irp, stack) = source_stack(inst, allocation)?;
-        let input_len = read_unaligned((stack + STACK_INPUT_LENGTH_OFFSET) as *const u32) as u64;
-        let output_len = read_unaligned((stack + STACK_OUTPUT_LENGTH_OFFSET) as *const u32);
-        let input_buffer = read_unaligned((stack + STACK_TYPE3_INPUT_OFFSET) as *const u64);
+        let stack = read_unaligned(stack as *const nt_kernel_abi::IoStackLocation);
+        let control = stack.device_io_control();
+        let input_len = control.input_buffer_length as u64;
+        let output_len = control.output_buffer_length;
+        let input_buffer = control.type3_input_buffer.0;
         let output_buffer = read_unaligned((irp + IRP_USER_BUFFER_OFFSET) as *const u64);
         if !(QUERY_PATH_REQUEST_X64_SIZE as u64..=MAX_INPUT_BYTES).contains(&input_len)
             || input_buffer == 0
@@ -286,15 +282,14 @@ pub(super) unsafe fn capture(
         {
             return Err(CaptureError::InvalidSourceBuffer);
         }
-        let input_exec =
-            hosted_instance_pool_allocation_exec_if_live(inst, input_buffer, input_len)
-                .ok_or(CaptureError::InvalidSourceBuffer)?;
+        let input_exec = hosted_instance_pool_allocation_exec_if_live(inst, input_buffer, input_len)
+            .ok_or(CaptureError::InvalidSourceBuffer)?;
         let stack_descriptor = QueryPathStack {
-            major: read_unaligned(stack as *const u8),
-            minor: read_unaligned((stack + 1) as *const u8),
+            major: stack.major_function,
+            minor: stack.minor_function,
             requestor_kernel_mode: read_unaligned((irp + IRP_REQUESTOR_MODE_OFFSET) as *const u8)
                 == 0,
-            io_control_code: read_unaligned((stack + STACK_IOCTL_CODE_OFFSET) as *const u32),
+            io_control_code: control.io_control_code,
             input_buffer_length: input_len as u32,
             output_buffer_length: output_len,
         };
@@ -304,11 +299,11 @@ pub(super) unsafe fn capture(
             .ok_or(CaptureError::MissingSecurityContext)?;
         let request = capture_query_path(stack_descriptor, bytes, Some(security))
             .map_err(CaptureError::QueryPath)?;
-        let stack_device = read_unaligned((stack + STACK_DEVICE_OFFSET) as *const u64);
+        let stack_device = stack.device_object.0;
         if stack_device == 0 || stack_device != target_device_address {
             return Err(CaptureError::InvalidTarget);
         }
-        let stack_file = read_unaligned((stack + STACK_FILE_OFFSET) as *const u64);
+        let stack_file = stack.file_object.0;
         if stack_file == 0
             || read_unaligned((irp + IRP_ORIGINAL_FILE_OFFSET) as *const u64) != stack_file
         {
