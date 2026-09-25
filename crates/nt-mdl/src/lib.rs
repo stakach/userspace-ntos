@@ -22,6 +22,8 @@
 
 extern crate alloc;
 
+pub mod page_lock;
+
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 

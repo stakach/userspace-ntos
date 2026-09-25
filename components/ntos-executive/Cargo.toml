@@ -19,6 +19,9 @@ path = "src/main.rs"
 # markers, spec PASS/FAIL lines, and the gate summary are NEVER gated by this.
 default = []
 debug-trace = []
+# Native Mup/provider integration boots the normal executive service loop without
+# requiring the unrelated win32k import catalog. Production admission is unchanged.
+mup-provider-kernel-only = []
 
 [dependencies]
 # Kernel ABI + SURT transport.

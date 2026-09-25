@@ -86,6 +86,8 @@ mod hosted_source_create_security;
 mod hosted_source_pool_memory;
 #[path = "hosted_query_path_capture.rs"]
 mod hosted_query_path_capture;
+#[path = "hosted_write_capture.rs"]
+mod hosted_write_capture;
 #[path = "hosted_query_path_work.rs"]
 mod hosted_query_path_work;
 #[path = "driver_hosted_token_projection.rs"]
@@ -98,6 +100,8 @@ mod hosted_create_subject_registration;
 mod hosted_create_security_graph;
 #[path = "hosted_file_objects.rs"]
 mod hosted_file_objects;
+#[path = "hosted_reparse_name.rs"]
+mod hosted_reparse_name;
 #[path = "hosted_consumer_file_objects.rs"]
 pub(crate) mod hosted_consumer_file_objects;
 #[path = "hosted_io_create_file_adapter.rs"]
@@ -812,10 +816,11 @@ pub const FSD_SERVICE_DMA_ADAPTER_LABEL: u64 = 0x78B;
 pub const FSD_SERVICE_MDL_LABEL: u64 = 0x78C;
 pub const FSD_SERVICE_FILE_LABEL: u64 = 0x78D;
 pub const FSD_SERVICE_IO_CREATE_FILE_LABEL: u64 = 0x78E;
-pub const FSD_SERVICE_SOURCE_IRP_LABEL: u64 = 0x78F;
-pub const FSD_SERVICE_QUERY_PATH_FORWARD_LABEL: u64 = 0x791;
-pub const FSD_SERVICE_TOKEN_QUERY_LABEL: u64 = 0x792;
-pub const FSD_SERVICE_CREATE_SUBJECT_LABEL: u64 = 0x794;
+// 0x78f..=0x798 belongs to nt-unwind's SEH transport on this same endpoint.
+pub const FSD_SERVICE_SOURCE_IRP_LABEL: u64 = 0x799;
+pub const FSD_SERVICE_QUERY_PATH_FORWARD_LABEL: u64 = 0x79A;
+pub const FSD_SERVICE_TOKEN_QUERY_LABEL: u64 = 0x79B;
+pub const FSD_SERVICE_CREATE_SUBJECT_LABEL: u64 = 0x79C;
 
 pub(crate) fn service_hosted_token_query(
     channel: &crate::spawn_hosts::PumpChannel,
@@ -838,8 +843,29 @@ pub(crate) unsafe fn service_hosted_create_subject_registration(
         channel, reply_cap, caller_badge, source_irp, security_context,
     )
 }
-pub const FSD_SERVICE_ZW_FS_CONTROL_FILE_LABEL: u64 = 0x790;
-pub const FSD_SERVICE_ZW_WAIT_FILE_LABEL: u64 = 0x793;
+pub const FSD_SERVICE_ZW_FS_CONTROL_FILE_LABEL: u64 = 0x79D;
+pub const FSD_SERVICE_ZW_WAIT_FILE_LABEL: u64 = 0x79E;
+const _: () = {
+    let labels = [
+        FSD_SERVICE_SOURCE_IRP_LABEL,
+        FSD_SERVICE_QUERY_PATH_FORWARD_LABEL,
+        FSD_SERVICE_TOKEN_QUERY_LABEL,
+        FSD_SERVICE_CREATE_SUBJECT_LABEL,
+        FSD_SERVICE_ZW_FS_CONTROL_FILE_LABEL,
+        FSD_SERVICE_ZW_WAIT_FILE_LABEL,
+    ];
+    let mut i = 0;
+    while i < labels.len() {
+        assert!(labels[i] > nt_unwind::seh_transport::FAULT_BEGIN_LABEL);
+        assert!(labels[i] <= 0xfff);
+        let mut j = i + 1;
+        while j < labels.len() {
+            assert!(labels[i] != labels[j]);
+            j += 1;
+        }
+        i += 1;
+    }
+};
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
@@ -1518,9 +1544,12 @@ const FSD_DATA_IRP_DISPATCH_REQUEST_OFF: u64 = align_up_u64(
         + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64,
     0x1000,
 );
+const FSD_DATA_FILE_OBJECT_STORE_OFF: u64 = align_up_u64(
+    FSD_DATA_IRP_DISPATCH_REQUEST_OFF + core::mem::size_of::<IrpDispatchRequest>() as u64,
+    8,
+);
 const _: () = assert!(
-    FSD_DATA_IRP_DISPATCH_REQUEST_OFF + core::mem::size_of::<IrpDispatchRequest>() as u64
-        <= FSD_DATA_PHYSICAL_MAP_OFF
+    FSD_DATA_FILE_OBJECT_STORE_OFF + 0x40 <= FSD_DATA_PHYSICAL_MAP_OFF
 );
 
 const fn align_up_u64(value: u64, align: u64) -> u64 {
@@ -1833,7 +1862,11 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
     ];
     for (index, pointer) in candidates.iter().copied().enumerate() {
         if pointer != 0 && !candidates[..index].contains(&pointer) {
-            pool_free(pointer);
+            if entry.owns_fo && pointer == entry.file_object {
+                hosted_file_objects::free_file_storage(pointer);
+            } else {
+                pool_free(pointer);
+            }
         }
     }
 }
@@ -8103,7 +8136,8 @@ extern "win64" fn s_io_get_related_device_object(file_object: u64) -> u64 {
     if file_object == 0 {
         return 0;
     }
-    unsafe { read_unaligned((file_object + 0x08) as *const u64) }
+    let device = unsafe { read_unaligned((file_object + 0x08) as *const u64) };
+    device
 }
 
 unsafe fn csq_acquire(csq: u64) -> u8 {
@@ -8730,9 +8764,6 @@ extern "win64" fn s_io_allocate_mdl(
                 return 0;
             }
             let mut slot = irp + 0x08;
-            if read_unaligned(slot as *const u64) != 0 && secondary_buffer == 0 {
-                return 0;
-            }
             let mut count = 0usize;
             while secondary_buffer != 0 {
                 let current = read_unaligned(slot as *const u64);
@@ -10976,129 +11007,78 @@ extern "win64" fn s_io_write_error_log_entry(entry: u64) {
     }
 }
 
-// --- REAL VCB internals: the Unicode prefix table (name -> FCB), generic table, ERESOURCE ---------
-//
-// An FSD's DriverEntry runs its OWN `NpInitializeVcb`/`NpCreateRootDcb`, and every create/open runs
-// its OWN `NpFsdCreate*` → `NpCreateFcb`/`NpCreateCcb`. Those exercise the prefix table + resource for
-// REAL (the create path bug-checks on a NULL `RtlFindUnicodePrefix`, and create-then-connect must find
-// the FCB by name). So these trampolines carry real host-side logic, backed by a fixed-capacity static
-// table (no `alloc` in the isolated component). The prefix-MATCH contract is the host-tested
-// [`nt_kernel_exec::np_prefix`] logic (component-prefix, case-insensitive, longest wins).
-//
-// `RtlInsertUnicodePrefix(Table, &Fcb->FullName, &Fcb->PrefixTableEntry)` records the entry pointer
-// the FSD passed (so `RtlFindUnicodePrefix` can return the SAME pointer → `CONTAINING_RECORD` recovers
-// the FCB). `RtlFindUnicodePrefix(Table, FullName, _)` returns the recorded entry of the longest name
-// that is a component-prefix of `FullName`.
+// Keep prefix links in the caller's UNICODE_PREFIX_TABLE and entries. A host-global list would
+// mix identical virtual pool addresses from different isolated drivers (notably NPFS and Mup).
+const PREFIX_NEXT_OFF: u64 = 8;
+const PREFIX_CASE_MATCH_OFF: u64 = 16;
+const PREFIX_LINKS_OFF: u64 = 24;
+const PREFIX_STRING_OFF: u64 = 48;
 
-/// A recorded prefix-table entry: (the caller's `PUNICODE_PREFIX_TABLE_ENTRY`, the name VA, len-bytes).
-/// The name is a `UNICODE_STRING.Buffer` (UTF-16); we read it live from the FSD's own pool at Find time.
-#[derive(Clone, Copy)]
-struct PrefixSlot {
-    entry: u64, // the PUNICODE_PREFIX_TABLE_ENTRY the FSD passed to Insert (returned by Find)
-    name_va: u64, // UNICODE_STRING.Buffer VA
-    name_len: u16, // UNICODE_STRING.Length (bytes)
-    used: bool,
+unsafe fn prefix_name(prefix: u64) -> (u64, usize) {
+    let length = read_unaligned(prefix as *const u16) as usize;
+    let buffer = read_unaligned((prefix + 8) as *const u64);
+    (buffer, length / 2)
 }
 
-impl PrefixSlot {
-    const fn empty() -> Self {
-        Self {
-            entry: 0,
-            name_va: 0,
-            name_len: 0,
-            used: false,
-        }
-    }
+unsafe fn prefix_matches(prefix: u64, full: u64, case_insensitive_index: usize) -> bool {
+    let (candidate, candidate_len) = prefix_name(prefix);
+    let (name, name_len) = prefix_name(full);
+    if candidate == 0 || name == 0 { return false; }
+    nt_kernel_exec::np_prefix::is_component_prefix_indexed(
+        candidate_len, name_len, case_insensitive_index,
+        |index| read_unaligned((candidate + index as u64 * 2) as *const u16),
+        |index| read_unaligned((name + index as u64 * 2) as *const u16),
+    )
 }
 
-/// The single VCB prefix table (npfs is a singleton driver). Populated by
-/// `s_rtl_insert_unicode_prefix`, queried by `s_rtl_find_unicode_prefix`, and reset by
-/// `s_rtl_init_unicode_prefix`.
-static mut PREFIX_TABLE: Option<Vec<PrefixSlot>> = None;
-
-unsafe fn prefix_table_mut() -> &'static mut Vec<PrefixSlot> {
-    let slot = &mut *core::ptr::addr_of_mut!(PREFIX_TABLE);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    slot.as_mut().unwrap()
-}
-
-unsafe fn prefix_table() -> Option<&'static Vec<PrefixSlot>> {
-    (&*core::ptr::addr_of!(PREFIX_TABLE)).as_ref()
-}
-
-/// Copy a UNICODE_STRING.Buffer (UTF-16) into a fixed scratch for comparison. Returns the length in
-/// u16 units (capped at the scratch size). Pipe names are short (`\ntsvcs` = 7).
-unsafe fn read_ustr16(buf_va: u64, len_bytes: u16, out: &mut [u16]) -> usize {
-    let n = ((len_bytes as usize) / 2).min(out.len());
-    for i in 0..n {
-        out[i] = read_unaligned((buf_va + (i as u64) * 2) as *const u16);
-    }
-    n
-}
-
-/// `void RtlInitializeUnicodePrefix(PUNICODE_PREFIX_TABLE)` — zero the control struct AND clear the
-/// host-side table (the FSD calls this once at NpInitializeVcb before inserting the root DCB).
+/// `void RtlInitializeUnicodePrefix(PUNICODE_PREFIX_TABLE)`.
 extern "win64" fn s_rtl_init_unicode_prefix(tbl: u64) {
     unsafe {
         if tbl != 0 {
-            // UNICODE_PREFIX_TABLE (0x14 bytes): zero it (NodeTypeCode/NameLength/NextPrefixTree/…).
-            write_unaligned(tbl as *mut u64, 0);
-            write_unaligned((tbl + 8) as *mut u64, 0);
-            write_unaligned((tbl + 16) as *mut u32, 0);
-        }
-        if let Some(table) = (*core::ptr::addr_of_mut!(PREFIX_TABLE)).as_mut() {
-            table.clear();
+            write_unaligned(tbl as *mut u16, 0x0800);
+            write_unaligned((tbl + 2) as *mut u16, 0);
+            write_unaligned((tbl + PREFIX_NEXT_OFF) as *mut u64, tbl);
+            write_unaligned((tbl + PREFIX_CASE_MATCH_OFF) as *mut u64, 0);
         }
     }
 }
 
-/// `BOOLEAN RtlInsertUnicodePrefix(PUNICODE_PREFIX_TABLE, PUNICODE_STRING Prefix,
-/// PUNICODE_PREFIX_TABLE_ENTRY PrefixTableEntry)`. Record (entry, name) so Find returns this entry for
-/// names of which `Prefix` is a component-prefix. Returns TRUE unless a duplicate exact name exists.
-extern "win64" fn s_rtl_insert_unicode_prefix(_tbl: u64, prefix: u64, entry: u64) -> u64 {
-    if prefix == 0 || entry == 0 {
+/// `BOOLEAN RtlInsertUnicodePrefix(...)`. Entries remain owned by the driver's own VSpace.
+extern "win64" fn s_rtl_insert_unicode_prefix(tbl: u64, prefix: u64, entry: u64) -> u64 {
+    if tbl == 0 || prefix == 0 || entry == 0 {
         return 0;
     }
     unsafe {
-        let name_len = read_unaligned(prefix as *const u16); // UNICODE_STRING.Length
-        let name_va = read_unaligned((prefix + 8) as *const u64); // UNICODE_STRING.Buffer
-        let table = prefix_table_mut();
-        // dedup: an identical (case-insensitive) name already present → FALSE (the FSD bug-checks on
-        // this, meaning it never re-creates the same pipe; our create arm rejects duplicates first).
-        let mut new: [u16; 128] = [0; 128];
-        let nn = read_ustr16(name_va, name_len, &mut new);
-        for s in table.iter() {
-            if !s.used {
-                continue;
+        let (name, name_len) = prefix_name(prefix);
+        if name == 0 || name_len == 0 { return 0; }
+        let head = read_unaligned((tbl + PREFIX_NEXT_OFF) as *const u64);
+        let mut current = head;
+        for _ in 0..65_536 {
+            if current == tbl { break; }
+            if current == 0 { return 0; }
+            let existing = read_unaligned((current + PREFIX_STRING_OFF) as *const u64);
+            if existing != 0 && prefix_matches(existing, prefix, usize::MAX)
+                && prefix_name(existing).1 == name_len {
+                return 0;
             }
-            let mut ex: [u16; 128] = [0; 128];
-            let en = read_ustr16(s.name_va, s.name_len, &mut ex);
-            if en == nn
-                && nt_kernel_exec::np_prefix::is_component_prefix(&ex[..en], &new[..nn])
-                && nn == en
-            {
-                return 0; // duplicate
+            current = read_unaligned((current + PREFIX_NEXT_OFF) as *const u64);
+        }
+        if current != tbl { return 0; }
+        let mut components = 1u16;
+        for index in 0..name_len.saturating_sub(1) {
+            if read_unaligned((name + index as u64 * 2) as *const u16) == b'\\' as u16 {
+                components = components.saturating_add(1);
             }
         }
-        for s in table.iter_mut() {
-            if !s.used {
-                *s = PrefixSlot {
-                    entry,
-                    name_va,
-                    name_len,
-                    used: true,
-                };
-                return 1;
-            }
-        }
-        table.push(PrefixSlot {
-            entry,
-            name_va,
-            name_len,
-            used: true,
-        });
+        write_unaligned(entry as *mut u16, 0x0801);
+        write_unaligned((entry + 2) as *mut u16, components);
+        write_unaligned((entry + PREFIX_NEXT_OFF) as *mut u64, head);
+        write_unaligned((entry + PREFIX_CASE_MATCH_OFF) as *mut u64, entry);
+        write_unaligned((entry + PREFIX_LINKS_OFF) as *mut u64, entry + PREFIX_LINKS_OFF);
+        write_unaligned((entry + PREFIX_LINKS_OFF + 8) as *mut u64, 0);
+        write_unaligned((entry + PREFIX_LINKS_OFF + 16) as *mut u64, 0);
+        write_unaligned((entry + PREFIX_STRING_OFF) as *mut u64, prefix);
+        write_unaligned((tbl + PREFIX_NEXT_OFF) as *mut u64, entry);
         1
     }
 }
@@ -11106,35 +11086,26 @@ extern "win64" fn s_rtl_insert_unicode_prefix(_tbl: u64, prefix: u64, entry: u64
 /// `PUNICODE_PREFIX_TABLE_ENTRY RtlFindUnicodePrefix(PUNICODE_PREFIX_TABLE, PUNICODE_STRING FullName,
 /// ULONG CaseInsensitiveIndex)`. Return the recorded entry of the longest inserted name that is a
 /// component-prefix of `FullName` (NULL if none — the FSD bug-checks, but the root `\` always matches).
-extern "win64" fn s_rtl_find_unicode_prefix(_tbl: u64, full: u64, _ci: u64) -> u64 {
-    if full == 0 {
+extern "win64" fn s_rtl_find_unicode_prefix(tbl: u64, full: u64, ci: u64) -> u64 {
+    if tbl == 0 || full == 0 {
         return 0;
     }
     unsafe {
-        let full_len = read_unaligned(full as *const u16);
-        let full_va = read_unaligned((full + 8) as *const u64);
-        let mut fbuf: [u16; 256] = [0; 256];
-        let fn_ = read_ustr16(full_va, full_len, &mut fbuf);
-        let Some(table) = prefix_table() else {
-            return 0;
-        };
         let mut best_entry = 0u64;
-        let mut best_len = 0usize; // matched name length in u16 units
-                                   // Compare against each used slot; keep the longest component-prefix.
-        let mut cbuf: [u16; 128] = [0; 128];
-        for s in table.iter() {
-            if !s.used {
-                continue;
+        let mut best_len = 0usize;
+        let mut current = read_unaligned((tbl + PREFIX_NEXT_OFF) as *const u64);
+        for _ in 0..65_536 {
+            if current == tbl || current == 0 { break; }
+            let prefix = read_unaligned((current + PREFIX_STRING_OFF) as *const u64);
+            if prefix != 0 {
+                let length = prefix_name(prefix).1;
+                if length > best_len && prefix_matches(prefix, full, ci as usize) {
+                    best_len = length;
+                    best_entry = current;
+                }
             }
-            let cn = read_ustr16(s.name_va, s.name_len, &mut cbuf);
-            if nt_kernel_exec::np_prefix::is_component_prefix(&cbuf[..cn], &fbuf[..fn_])
-                && cn >= best_len
-            {
-                best_len = cn;
-                best_entry = s.entry;
-            }
+            current = read_unaligned((current + PREFIX_NEXT_OFF) as *const u64);
         }
-        let _ = full_len;
         best_entry
     }
 }
@@ -11165,17 +11136,23 @@ extern "win64" fn s_rtl_delete_element_generic_table(_tbl: u64, _buffer: u64) ->
 }
 
 /// `VOID RtlRemoveUnicodePrefix(PUNICODE_PREFIX_TABLE, PUNICODE_PREFIX_TABLE_ENTRY)`.
-extern "win64" fn s_rtl_remove_unicode_prefix(_tbl: u64, entry: u64) {
-    if entry == 0 {
+extern "win64" fn s_rtl_remove_unicode_prefix(tbl: u64, entry: u64) {
+    if tbl == 0 || entry == 0 {
         return;
     }
     unsafe {
-        let table = prefix_table_mut();
-        for slot in table.iter_mut() {
-            if slot.used && slot.entry == entry {
-                *slot = PrefixSlot::empty();
+        let mut previous = tbl;
+        for _ in 0..65_536 {
+            let current = read_unaligned((previous + PREFIX_NEXT_OFF) as *const u64);
+            if current == tbl || current == 0 { return; }
+            if current == entry {
+                let next = read_unaligned((entry + PREFIX_NEXT_OFF) as *const u64);
+                write_unaligned((previous + PREFIX_NEXT_OFF) as *mut u64, next);
+                write_unaligned((entry + PREFIX_NEXT_OFF) as *mut u64, 0);
+                write_unaligned((entry + PREFIX_STRING_OFF) as *mut u64, 0);
                 return;
             }
+            previous = current;
         }
     }
 }
@@ -14462,7 +14439,10 @@ extern "win64" fn s_zw_query_value_key(
                 Some(value_name) => value_name,
                 None => return STATUS_INVALID_PARAMETER,
             };
-        if key_value_information_class != KEY_VALUE_PARTIAL_INFORMATION_CLASS {
+        if key_value_information_class != KEY_VALUE_PARTIAL_INFORMATION_CLASS
+            && key_value_information_class
+                != nt_config_abi::key_value_information::FULL_INFORMATION_CLASS
+        {
             if result_length != 0 {
                 write_unaligned(result_length as *mut u32, 0);
             }
@@ -14478,13 +14458,36 @@ extern "win64" fn s_zw_query_value_key(
         let (status, value_type, data_len) =
             hosted_registry_broker_call(HOSTED_REGISTRY_OP_QUERY_HANDLE_VALUE, handle, 0, 0);
         match status {
-            STATUS_SUCCESS => write_key_value_partial_raw(
-                value_type as u32,
-                registry_arg_data_slice(data_len as u32),
-                key_value_information,
-                length,
-                result_length,
-            ),
+            STATUS_SUCCESS if key_value_information_class == KEY_VALUE_PARTIAL_INFORMATION_CLASS =>
+                write_key_value_partial_raw(
+                    value_type as u32,
+                    registry_arg_data_slice(data_len as u32),
+                    key_value_information,
+                    length,
+                    result_length,
+                ),
+            STATUS_SUCCESS => {
+                let data = registry_arg_data_slice(data_len as u32);
+                let name_bytes = &value_name.bytes[..value_name.len];
+                let Some(layout) = nt_config_abi::key_value_information::FullValueLayout::for_ascii_name(
+                    name_bytes, data,
+                ) else {
+                    return STATUS_INVALID_BUFFER_SIZE as i32;
+                };
+                if result_length != 0 {
+                    write_unaligned(result_length as *mut u32, layout.required_length as u32);
+                }
+                if key_value_information == 0 || (length as usize) < layout.required_length {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+                let out = core::slice::from_raw_parts_mut(
+                    key_value_information as *mut u8, layout.required_length,
+                );
+                if !layout.encode_ascii(name_bytes, value_type as u32, data, out) {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                STATUS_SUCCESS
+            }
             status => {
                 if result_length != 0 {
                     write_unaligned(result_length as *mut u32, 0);
@@ -33336,6 +33339,7 @@ pub unsafe extern "C" fn fsd_component_entry(heap_frames: u64) -> ! {
     if !unsafe { allocator::initialize_mapped_heap(heap_frames) } {
         park();
     }
+    hosted_file_objects::initialize();
     if !hosted_exception_images::validate_component_mapping() {
         print_str(b"[driver-exception-image] component validation failed\n");
         park();
@@ -34210,19 +34214,10 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     if owns_fo && !fo_reserve_new_slot() {
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
-    let fo_allocation_len = if owns_fo {
-        match (WDM_X64_FILE_OBJECT_SIZE as u64).checked_add(create_file_name_len.saturating_add(2))
-        {
-            Some(length) => length,
-            None => return (0xC000_009Au32 as i32, 0),
-        }
-    } else {
-        WDM_X64_FILE_OBJECT_SIZE as u64
-    };
     let fo = if !uses_file_object {
         0
     } else if owns_fo {
-        pool_alloc(fo_allocation_len)
+        pool_alloc_zeroed(WDM_X64_FILE_OBJECT_SIZE as u64)
     } else {
         existing
     };
@@ -34230,6 +34225,15 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
     if owns_fo {
+        let Some(name_len) = create_file_name_len.checked_add(2) else {
+            pool_free(fo);
+            return (0xC000_009Au32 as i32, 0);
+        };
+        let name = pool_alloc(name_len);
+        if name == 0 {
+            pool_free(fo);
+            return (0xC000_009Au32 as i32, 0);
+        }
         let fo_bytes = core::slice::from_raw_parts_mut(fo as *mut u8, WDM_X64_FILE_OBJECT_SIZE);
         if write_wdm_file_object(
             fo_bytes,
@@ -34242,11 +34246,12 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 related_file_object,
                 file_name_len: create_file_name_len as u16,
                 file_name_max_len: (create_file_name_len + 2) as u16,
-                file_name_buffer: fo + WDM_X64_FILE_OBJECT_SIZE as u64,
+                file_name_buffer: name,
             },
         )
         .is_err()
         {
+            pool_free(name);
             pool_free(fo);
             return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
         }
@@ -34285,7 +34290,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let data = pool_alloc_zeroed(data_len);
     if data == 0 {
         if owns_fo {
-            pool_free(fo);
+            hosted_file_objects::free_file_storage(fo);
         }
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
@@ -34295,7 +34300,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         if aux_data == 0 {
             pool_free_request_buffers(data, 0, 0);
             if owns_fo {
-                pool_free(fo);
+                hosted_file_objects::free_file_storage(fo);
             }
             return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
         }
@@ -34313,7 +34318,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     {
         pool_free_request_buffers(data, aux_data, 0);
         if owns_fo {
-            pool_free(fo);
+            hosted_file_objects::free_file_storage(fo);
         }
         return (0xC000_0001u32 as i32, 0); // STATUS_UNSUCCESSFUL
     }
@@ -34326,7 +34331,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         if aux_data == 0 {
             pool_free_request_buffers(data, 0, 0);
             if owns_fo {
-                pool_free(fo);
+                hosted_file_objects::free_file_storage(fo);
             }
             return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
         }
@@ -34337,7 +34342,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         );
     }
     if owns_fo {
-        let file_name = fo + WDM_X64_FILE_OBJECT_SIZE as u64;
+        let file_name = read_unaligned((fo + 0x60) as *const u64);
         let mut index = 0u64;
         while index < create_file_name_len {
             write_volatile(
@@ -34358,7 +34363,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     {
         pool_free_request_buffers(data, aux_data, 0);
         if owns_fo {
-            pool_free(fo);
+            hosted_file_objects::free_file_storage(fo);
         }
         return (0xC000_0001u32 as i32, 0); // STATUS_UNSUCCESSFUL
     }
@@ -34372,7 +34377,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         if mdl == 0 {
             pool_free_request_buffers(data, aux_data, 0);
             if owns_fo {
-                pool_free(fo);
+                hosted_file_objects::free_file_storage(fo);
             }
             return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
         }
@@ -34466,7 +34471,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     if irp == 0 {
         pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
-            pool_free(fo);
+            hosted_file_objects::free_file_storage(fo);
         }
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
@@ -34495,7 +34500,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    pool_free(fo);
+                    hosted_file_objects::free_file_storage(fo);
                 }
                 return (0xC000_009Au32 as i32, 0);
             }
@@ -34506,7 +34511,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    pool_free(fo);
+                    hosted_file_objects::free_file_storage(fo);
                 }
                 return (0xC000_009Au32 as i32, 0);
             }
@@ -34540,7 +34545,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        pool_free(fo);
+                        hosted_file_objects::free_file_storage(fo);
                     }
                     return (0xC000_009Au32 as i32, 0);
                 }
@@ -34567,7 +34572,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        pool_free(fo);
+                        hosted_file_objects::free_file_storage(fo);
                     }
                     return (0xC000_009Au32 as i32, 0);
                 }
@@ -34637,7 +34642,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        pool_free(fo);
+                        hosted_file_objects::free_file_storage(fo);
                     }
                     return (STATUS_INVALID_PARAMETER, 0);
                 }
@@ -34680,7 +34685,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 pool_free(irp);
                 pool_free_request_buffers(data, 0, mdl);
                 if owns_fo {
-                    pool_free(fo);
+                    hosted_file_objects::free_file_storage(fo);
                 }
                 return (0xC000_009Au32 as i32, 0);
             }
@@ -34708,7 +34713,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    pool_free(fo);
+                    hosted_file_objects::free_file_storage(fo);
                 }
                 return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
             }
@@ -34719,7 +34724,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        pool_free(fo);
+                        hosted_file_objects::free_file_storage(fo);
                     }
                     return (0xC000_000Du32 as i32, 0);
                 };
@@ -34731,7 +34736,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        pool_free(fo);
+                        hosted_file_objects::free_file_storage(fo);
                     }
                     return (0xC000_000Du32 as i32, 0);
                 };
@@ -34740,7 +34745,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        pool_free(fo);
+                        hosted_file_objects::free_file_storage(fo);
                     }
                     return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
                 }
@@ -34777,7 +34782,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    pool_free(fo);
+                    hosted_file_objects::free_file_storage(fo);
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -34794,7 +34799,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    pool_free(fo);
+                    hosted_file_objects::free_file_storage(fo);
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -34813,7 +34818,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    pool_free(fo);
+                    hosted_file_objects::free_file_storage(fo);
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -34830,7 +34835,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    pool_free(fo);
+                    hosted_file_objects::free_file_storage(fo);
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -34853,7 +34858,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    pool_free(fo);
+                    hosted_file_objects::free_file_storage(fo);
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -34889,7 +34894,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         pool_free(irp);
         pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
-            pool_free(fo);
+            hosted_file_objects::free_file_storage(fo);
         }
         return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
@@ -34938,7 +34943,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         );
         pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
-            pool_free(fo);
+            hosted_file_objects::free_file_storage(fo);
         }
         return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
@@ -47679,7 +47684,9 @@ unsafe fn build_hosted_irq_lane(
         {
             return None;
         }
-        let stack_top = component_base + FSD_WORKER_STACK_FRAMES * 0x1000 - 8;
+        let stack_top = nt_thread_start::call_trampoline_initial_rsp(
+            component_base + FSD_WORKER_STACK_FRAMES * 0x1000,
+        )?;
         if tcb_write_registers_r(lane.tcb, tramp_va, stack_top, 0) != 0 {
             return None;
         }
@@ -54127,8 +54134,16 @@ pub(crate) fn service_hosted_driver_io_create_file(
     }
 }
 
-pub(crate) unsafe fn redrive_hosted_driver_io_create_file(handler: &mut ExecNtHandler) {
+pub(crate) unsafe fn redrive_hosted_driver_io_create_file(handler: *mut ExecNtHandler) {
     hosted_io_create_file_work::redrive(handler);
+}
+
+pub(crate) unsafe fn nested_hosted_driver_create_ready() -> bool {
+    hosted_io_create_file_work::nested_work_ready()
+}
+
+pub(crate) unsafe fn redrive_nested_hosted_driver_create(handler: *mut ExecNtHandler) -> bool {
+    hosted_io_create_file_work::redrive_nested_ready(handler)
 }
 
 pub(crate) unsafe fn service_hosted_driver_zw_fs_control_file(
@@ -54141,9 +54156,9 @@ pub(crate) unsafe fn service_hosted_driver_zw_fs_control_file(
     hosted_kernel_file_control::submit(ch, packet, packet_length, handle, active_reply_cap)
 }
 
-pub(crate) unsafe fn redrive_hosted_driver_zw_fs_control_file(handler: &mut ExecNtHandler) {
+pub(crate) unsafe fn redrive_hosted_driver_zw_fs_control_file(handler: *mut ExecNtHandler) {
     hosted_kernel_file_control::redrive(handler);
-    hosted_kernel_file_control::redrive_waits(handler);
+    hosted_kernel_file_control::redrive_waits(&mut *handler);
 }
 
 pub(crate) unsafe fn service_hosted_query_path_forward(
@@ -54163,9 +54178,17 @@ pub(crate) unsafe fn service_hosted_query_path_forward(
     }
 }
 
-pub(crate) unsafe fn redrive_hosted_query_path_forward(handler: &mut ExecNtHandler) {
+pub(crate) unsafe fn redrive_hosted_query_path_forward(handler: *mut ExecNtHandler) {
     hosted_query_path_work::redrive(handler);
     hosted_create_subject_registration::redrive_terminal();
+}
+
+pub(crate) unsafe fn nested_hosted_query_path_ready() -> bool {
+    hosted_query_path_work::nested_work_ready()
+}
+
+pub(crate) unsafe fn redrive_nested_hosted_query_path(handler: *mut ExecNtHandler) -> bool {
+    hosted_query_path_work::redrive_nested_ready(handler)
 }
 
 pub(crate) unsafe fn service_hosted_driver_zw_wait_file(
@@ -54587,7 +54610,9 @@ unsafe fn spawn_hosted_driver_worker_thread(
     } else {
         u64::MAX
     };
-    let stack_top = stack_base + FSD_WORKER_STACK_FRAMES * 0x1000 - 8;
+    let stack_top = nt_thread_start::call_trampoline_initial_rsp(
+        stack_base + FSD_WORKER_STACK_FRAMES * 0x1000,
+    )?;
     let set_regs = if tcb_retype == 0 && set_space == 0 && set_ipc == 0 {
         tcb_write_registers_r(tcb, tramp_va, stack_top, 0)
     } else {
@@ -60001,10 +60026,10 @@ pub(crate) fn cancel_hosted_file_lifecycle_reservation(file_id: u64) -> bool {
     hosted_file_lifecycle_owners::cancel(FileId(file_id))
 }
 
-pub(crate) fn pump_hosted_file_lifecycle(
-    executor: nt_process::native_handle::NativeHandleCaller,
-) -> usize {
-    hosted_file_lifecycle_owners::pump(executor)
+pub(crate) fn pump_hosted_file_lifecycle() -> usize {
+    // The row retains the original requestor. Driver execution uses the published System
+    // thread, which has real Ps bodies even when the file owner has no native projection.
+    hosted_file_lifecycle_owners::pump(unsafe { crate::initial_system_driver_caller() })
 }
 
 /// Abandon a canonical File whose process-handle publication never committed.

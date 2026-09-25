@@ -25,6 +25,7 @@ const STATUS_DEVICE_BUSY_LOCAL: i32 = nt_status::NtStatus::DEVICE_BUSY.raw();
 
 struct Work {
     source: hosted_query_path_capture::CapturedSourceForward,
+    source_device_id: u64,
     source_instance: DriverInstance,
     security: hosted_source_create_security::SourceSecurityIdentity,
     provider_instance: DriverInstance,
@@ -231,6 +232,7 @@ pub(super) unsafe fn submit(
         }
     };
     let work = Work {
+        source_device_id: source.device_id().raw(),
         source,
         source_instance,
         security,
@@ -275,6 +277,19 @@ pub(super) unsafe fn submit(
 }
 
 impl Work {
+    unsafe fn ready_for_nested_step(&self) -> bool {
+        if let Some(ack) = &self.ack { return !ack.reply_entered; }
+        if self.reply_entered { return false; }
+        if self.abort_pending || self.initial_status.is_none() || self.terminal.is_some() {
+            return true;
+        }
+        if self.retained.is_some() {
+            return self.canonical_irp
+                .is_some_and(|irp| completed_irp_exact(irp.raw()).is_some());
+        }
+        self.graph.is_none()
+    }
+
     unsafe fn actor_release(&mut self) -> Result<(), u32> {
         crate::service_sec_image::with_provider_process_manager(|pm| self.actor.release(pm))
     }
@@ -315,9 +330,9 @@ impl Work {
         })
     }
 
-    unsafe fn dispatch(&mut self, handler: &mut ExecNtHandler) {
+    unsafe fn dispatch(&mut self, handler: *mut ExecNtHandler) {
         assert!(self.graph.is_none() && self.retained.is_none());
-        if let Err(status) = self.actor.validate(&handler.pm) {
+        if let Err(status) = self.actor.validate(&(*handler).pm) {
             self.initial_status = Some(status as i32);
             return;
         }
@@ -498,7 +513,7 @@ impl Work {
             print_str(b"[mup-query-path] source-ticket=");
             print_hex64(self.source.source_ticket().id.get());
             print_str(b" target-device=");
-            print_hex64(self.source.device_id().raw());
+            print_hex64(self.source_device_id);
             print_str(b" status=");
             print_hex(completion.status);
             print_str(b" accepted-bytes=");
@@ -674,7 +689,7 @@ impl Work {
             .expect("Mup deferred IRP free admission");
     }
 
-    unsafe fn advance(&mut self, handler: &mut ExecNtHandler) -> bool {
+    unsafe fn advance(&mut self, handler: *mut ExecNtHandler) -> bool {
         if self.ack.is_some() {
             return self.advance_ack();
         }
@@ -773,11 +788,11 @@ impl Work {
     }
 }
 
-pub(super) unsafe fn redrive(handler: &mut ExecNtHandler) {
+unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> bool {
     let _durable = crate::allocator::enter_durable();
     let count = (&*core::ptr::addr_of!(WORK)).len();
     if count == 0 {
-        return;
+        return false;
     }
     let start = CURSOR.load(Ordering::Relaxed) as usize % count;
     let Some((index, mut work)) = (0..count).find_map(|step| {
@@ -788,18 +803,22 @@ pub(super) unsafe fn redrive(handler: &mut ExecNtHandler) {
         {
             return None;
         }
+        if nested_ready_only && !(&*core::ptr::addr_of!(WORK))[index]
+            .as_ref().is_some_and(|work| work.ready_for_nested_step()) {
+            return None;
+        }
         (&mut *core::ptr::addr_of_mut!(WORK))[index]
             .take()
             .map(|work| (index, work))
     }) else {
-        return;
+        return false;
     };
     if (&mut *core::ptr::addr_of_mut!(EXECUTING))
         .try_reserve(1)
         .is_err()
     {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
-        return;
+        return false;
     }
     (&mut *core::ptr::addr_of_mut!(EXECUTING)).push((
         index,
@@ -817,6 +836,22 @@ pub(super) unsafe fn redrive(handler: &mut ExecNtHandler) {
             .map(|row| row.0),
         Some(index)
     );
+    true
+}
+
+pub(super) unsafe fn redrive(handler: *mut ExecNtHandler) {
+    let _ = redrive_one(handler, false);
+}
+
+pub(super) unsafe fn nested_work_ready() -> bool {
+    (&*core::ptr::addr_of!(WORK)).iter().enumerate().any(|(index, row)| {
+        !(&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, _, _)| *active == index)
+            && row.as_ref().is_some_and(|work| work.ready_for_nested_step())
+    })
+}
+
+pub(super) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
+    redrive_one(handler, true)
 }
 
 /// The ACK is a new authenticated source Call, not evidence inferred from the original Reply.

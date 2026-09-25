@@ -20276,8 +20276,8 @@ impl ExecNtHandler {
             Ok(object) => {
                 unsafe { driver_launch::driver_registry_value_transfers::cancel_closed_handle(pid, handle); }
                 self.release_handle_object(object);
-                if let Some(executor) = lifecycle_executor {
-                    driver_launch::pump_hosted_file_lifecycle(executor);
+                if lifecycle_executor.is_some() {
+                    driver_launch::pump_hosted_file_lifecycle();
                 }
                 PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
                 Ok(true)
@@ -20383,8 +20383,8 @@ impl ExecNtHandler {
             );
         }
         self.release_handle_object(closed.into_object());
-        if let Some(executor) = lifecycle_executor {
-            driver_launch::pump_hosted_file_lifecycle(executor);
+        if lifecycle_executor.is_some() {
+            driver_launch::pump_hosted_file_lifecycle();
         }
         PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
         Ok(true)

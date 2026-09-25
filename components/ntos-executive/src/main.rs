@@ -2030,7 +2030,7 @@ impl DllArenaPagingState {
 pub const DLL_PIN_COUNT: usize = 4;
 /// Buffer for the generated ntdll.dll, shared host<->exec in its own 2 MiB page table.
 pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_1440_0000;
-pub const NTDLLBUF_FRAMES: u64 = 480; // 1.875 MiB, with growth headroom below one PT window
+pub const NTDLLBUF_FRAMES: u64 = 512; // full 2 MiB page-table window
 /// NLS code-page tables (c_1252.nls/c_437.nls/l_intl.nls), shared host<->exec. They live in the
 /// shared-input 2 MiB region (0xA0_0000-0xC0_0000). spawn_sec_image later shares these frames into smss + points the PEB NLS
 /// fields at them so RtlInitNlsTables/RtlUnicodeToMultiByteN work.
@@ -29746,7 +29746,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         return false;
                     }
                     for _ in 0..4 {
-                        let _ = driver_launch::pump_hosted_file_lifecycle(caller);
+                        let _ = driver_launch::pump_hosted_file_lifecycle();
                         let _ = driver_launch::pump_hosted_io_completions();
                         if !driver_launch::hosted_file_exists(file_id) {
                             return true;
@@ -30378,6 +30378,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // WIN32K_CODE_VA (W^X), spawns the component with its fault endpoint armed, and drives a
     // crash-contained fault-recv loop that reports each faulting IP as `win32k RVA = ip - CODE_VA`
     // and demand-maps benign accesses — pinning exactly where init stops.
+    #[cfg(not(feature = "mup-provider-kernel-only"))]
     {
         let win32k_size =
             core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x7c) as *const u32) as usize;
@@ -31261,6 +31262,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             }
         }
     }
+    #[cfg(feature = "mup-provider-kernel-only")]
+    print_str(b"[mup-provider-gate] kernel-only native service loop; win32k admission deferred\n");
 
     // --- B3: start registry-selected PnP drivers against their discovered devnodes and
     // generation-owned resources.

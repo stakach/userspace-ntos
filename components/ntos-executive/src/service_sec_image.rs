@@ -4648,6 +4648,16 @@ pub(crate) unsafe fn drain_nested_pump_timer_delivery() -> bool {
     true
 }
 
+/// Run locally ready retained File work while the exact parent invocation is parked.
+/// These work runners hold no handler borrow across nested provider dispatch.
+pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if handler.is_null() { return false; }
+    let create = crate::driver_launch::redrive_nested_hosted_driver_create(handler);
+    let query = crate::driver_launch::redrive_nested_hosted_query_path(handler);
+    create || query
+}
+
 pub(crate) unsafe fn watchdog_defer_if_hosted_work_can_run(site: &[u8]) -> bool {
     if crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) != 1 {
         return false;
@@ -8069,6 +8079,7 @@ pub(crate) unsafe fn service_sec_image(
     if !initialize_fsd_export_registry() {
         panic!("hosted driver export registry allocation failed");
     }
+    #[cfg(not(feature = "mup-provider-kernel-only"))]
     if !win32k_subsystem::initialize_export_registry() {
         panic!("win32k export registry allocation failed");
     }
@@ -8338,7 +8349,8 @@ pub(crate) unsafe fn service_sec_image(
                 crash_parked,
                 wait_parked,
             );
-            if (live_top_badges(&nt_handler) & !(crash_parked | wait_parked)) == 0
+            if !cfg!(feature = "mup-provider-kernel-only")
+                && (live_top_badges(&nt_handler) & !(crash_parked | wait_parked)) == 0
                 && !pre_user_shell_frontier_pending(
                     &nt_handler,
                     crash_parked,
@@ -8452,9 +8464,9 @@ pub(crate) unsafe fn service_sec_image(
         {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
-            crate::driver_launch::redrive_hosted_driver_io_create_file(&mut nt_handler);
-            crate::driver_launch::redrive_hosted_query_path_forward(&mut nt_handler);
-            crate::driver_launch::redrive_hosted_driver_zw_fs_control_file(&mut nt_handler);
+            crate::driver_launch::redrive_hosted_driver_io_create_file(nt_handler as *mut _);
+            crate::driver_launch::redrive_hosted_query_path_forward(nt_handler as *mut _);
+            crate::driver_launch::redrive_hosted_driver_zw_fs_control_file(nt_handler as *mut _);
             crate::hosted_routed_file_close_work::redrive(&mut nt_handler);
             crate::driver_launch::hosted_consumer_file_objects::redrive();
             crate::current_apc::redrive(&mut nt_handler);
@@ -10397,7 +10409,8 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
-                    if (live_top_badges(&nt_handler) & !(crash_parked | wait_parked)) == 0
+                    if !cfg!(feature = "mup-provider-kernel-only")
+                        && (live_top_badges(&nt_handler) & !(crash_parked | wait_parked)) == 0
                         && !pre_user_shell_frontier_pending(
                             &nt_handler,
                             crash_parked,
@@ -12049,11 +12062,7 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.dbgk_block_request {
                     park_dbgk_reporter = true;
                 }
-                if let Ok(executor) =
-                    nt_handler.native_handle_caller(nt_syscall::ProcessorMode::KernelMode)
-                {
-                    let _ = driver_launch::pump_hosted_file_lifecycle(executor);
-                }
+                let _ = driver_launch::pump_hosted_file_lifecycle();
                 let hosted_io_progress = pump_hosted_io_and_redrive_driver_starts(
                     driver_launch::drain_hosted_driver_dpcs(),
                     &mut nt_handler,
@@ -12063,11 +12072,7 @@ pub(crate) unsafe fn service_sec_image(
                 {
                     let _ = pending_file_io_redrive_all(&mut nt_handler);
                     let _ = file_cleanup_redrive_all(&mut nt_handler);
-                    if let Ok(executor) =
-                        nt_handler.native_handle_caller(nt_syscall::ProcessorMode::KernelMode)
-                    {
-                        let _ = driver_launch::pump_hosted_file_lifecycle(executor);
-                    }
+                    let _ = driver_launch::pump_hosted_file_lifecycle();
                 }
                 if nt_handler.pipe_endpoint_progress || hosted_io_progress != 0 {
                     let _ = pending_file_io_redrive_all(&mut nt_handler);
@@ -24463,9 +24468,7 @@ pub(crate) unsafe fn start_file_cleanup(nt_handler: &mut ExecNtHandler, file_id:
     }
     driver_launch::release_hosted_file(file_id)
         .expect("canonical File cleanup was rejected before driver acceptance");
-    if let Ok(executor) = nt_handler.native_handle_caller(nt_syscall::ProcessorMode::KernelMode) {
-        driver_launch::pump_hosted_file_lifecycle(executor);
-    }
+    driver_launch::pump_hosted_file_lifecycle();
     // CLEANUP can complete retained reads/listens. Their ordinary completion
     // owners must publish and ACK before the manager is allowed to send CLOSE.
     nt_handler.pipe_endpoint_progress = true;

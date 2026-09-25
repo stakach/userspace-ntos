@@ -268,6 +268,8 @@ static NTSTATUS __stdcall ProviderClose(DEVICE_OBJECT *device, IRP *irp)
         if (file->FsContext == file) {
             file->FsContext = NULL;
             MupProviderEvidence.probe_file_closed++;
+            DbgPrint("[mup-provider-close] probe-file closed=%u\n",
+                     MupProviderEvidence.probe_file_closed);
         }
     }
     return Complete(irp, STATUS_SUCCESS, 0);

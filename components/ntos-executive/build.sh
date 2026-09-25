@@ -9,6 +9,14 @@ cd "$(dirname "$0")"
 mkdir -p ../../rust-micro/.tmp
 SEH_LINKAGE_STAGE=../../rust-micro/.tmp/nt-seh-linkage.dll
 rm -f "$SEH_LINKAGE_STAGE" ../../rust-micro/.tmp/rootserver.elf
+IMAGE_PROFILE="${NTOS_IMAGE_PROFILE:-production}"
+if [ "${NTOS_MUP_PROVIDER_KERNEL_ONLY:-0}" = 1 ]; then
+  if [ "$IMAGE_PROFILE" != mup-provider ]; then
+    echo "NTOS_MUP_PROVIDER_KERNEL_ONLY requires NTOS_IMAGE_PROFILE=mup-provider" >&2
+    exit 2
+  fi
+  set -- "$@" --features mup-provider-kernel-only
+fi
 
 # Extra args are forwarded to cargo — e.g. `./build.sh --features debug-trace` to enable
 # the grind-era verbose trace diagnostics. The DEFAULT build (no args) is feature-off = ships.
@@ -32,7 +40,6 @@ echo "ntos-executive staged: rust-micro/.tmp/rootserver.elf"
 # the Config Manager can read it off the FS. Host tool (std); the nt-hive-core lib stays
 # no_std, and it lives in the main workspace (not this component's), so run it from there.
 HIVE_OUT="$(cd ../../rust-micro/.tmp && pwd)/hive.dat"
-IMAGE_PROFILE="${NTOS_IMAGE_PROFILE:-production}"
 ( cd ../../crates/nt-hive-core && NTOS_IMAGE_PROFILE="$IMAGE_PROFILE" cargo run -q --release --bin gen_hive -- "$HIVE_OUT" )
 printf '%s\n' "$IMAGE_PROFILE" > ../../rust-micro/.tmp/image-profile
 echo "registry hive staged: rust-micro/.tmp/hive.dat"

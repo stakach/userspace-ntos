@@ -7,6 +7,19 @@ use nt_component_suspension::peer_registry::PeerRoute;
 pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: bool) -> PumpMessage {
     loop {
         crate::registry_mutation_work::redrive_provider();
+        if crate::driver_launch::nested_hosted_driver_create_ready()
+            || crate::driver_launch::nested_hosted_query_path_ready() {
+            let _message = crate::ipc_message::SavedMessageBuffer::capture();
+            let parent = match runtime::nested::park_current() {
+                Ok(parent) => parent,
+                Err(_) => return PumpMessage::transport_wall(),
+            };
+            let progressed = crate::service_sec_image::redrive_nested_hosted_file_work();
+            if runtime::nested::restore(parent).is_err() {
+                return PumpMessage::transport_wall();
+            }
+            if progressed { continue; }
+        }
         match runtime::resume_acknowledged_retained_services() {
             Ok(true) => continue,
             Ok(false) => {}

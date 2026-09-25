@@ -15,10 +15,18 @@ use nt_security::{CapturedSubjectContext, SubjectClientIdentity};
 const STATUS_CANCELLED_LOCAL: u32 = 0xc000_0120;
 const STATUS_INSUFFICIENT_RESOURCES_LOCAL: u32 = 0xc000_009a;
 const STATUS_NOT_SUPPORTED_LOCAL: u32 = 0xc000_00bb;
+const STATUS_REPARSE_LOCAL: u32 = nt_status::NtStatus::REPARSE.raw() as u32;
+const MAX_REPARSE_TRAVERSAL: u8 = 32;
 
 pub(super) enum SubmitResult {
     Ready(IoCreateFileReply),
     Deferred,
+}
+
+struct ReparseTarget {
+    device_id: u64,
+    absolute_name: Vec<u16>,
+    relative_name: Vec<u16>,
 }
 
 struct Work {
@@ -44,6 +52,8 @@ struct Work {
     stop_acknowledged: bool,
     preentry_failure: Option<u32>,
     publication_failure: Option<u32>,
+    reparse_hops: u8,
+    reparse_target: Option<ReparseTarget>,
 }
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
@@ -145,6 +155,7 @@ pub(super) unsafe fn submit(
         published_handle: None, cancel_requested: false,
         stop_acknowledged: false,
         preentry_failure: None, publication_failure: None,
+        reparse_hops: 0, reparse_target: None,
     };
     let index = if let Some(index) = slot {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
@@ -175,7 +186,20 @@ impl Work {
         }
     }
 
-    unsafe fn prepare(&mut self, handler: &mut ExecNtHandler) -> Result<(), u32> {
+    unsafe fn ready_for_nested_step(&self) -> bool {
+        if self.cancelled() { return true; }
+        if self.reply_entered { return false; }
+        if self.reply_completion.is_some() || self.delivery.is_none() { return true; }
+        match self.delivery.as_ref().unwrap().phase() {
+            Phase::Prepared | Phase::Terminal | Phase::Aborted => true,
+            Phase::Finished if self.reparse_target.is_some() => true,
+            Phase::AwaitTerminal => self.delivery.as_ref().unwrap().irp()
+                .is_some_and(|irp| completed_irp_exact(irp.raw()).is_some()),
+            _ => false,
+        }
+    }
+
+    unsafe fn prepare(&mut self, handler: *mut ExecNtHandler) -> Result<(), u32> {
         if self.cancelled() { return Err(STATUS_CANCELLED_LOCAL); }
         let request = &self.captured.request;
         let mode = nt_io_completion::FileIoMode::from_create_flags(
@@ -184,11 +208,13 @@ impl Work {
             request.desired_access
                 & (nt_fs::SYNCHRONIZE | 0xf000_0000 | 0x0200_0000) != 0,
         )?;
-        let publication = handler.pm.reserve_native_routed_file_handle(
-            self.captured.caller,
-            request.object_attributes & (nt_process::native_handle::OBJ_KERNEL_HANDLE | 2),
-        )?;
-        self.publication = Some(publication);
+        if self.publication.is_none() {
+            let publication = (*handler).pm.reserve_native_routed_file_handle(
+                self.captured.caller,
+                request.object_attributes & (nt_process::native_handle::OBJ_KERNEL_HANDLE | 2),
+            )?;
+            self.publication = Some(publication);
+        }
         let file_id = match self.captured.related_file.as_ref() {
             Some(parent) => allocate_owned_hosted_relative_file(
                 parent, request.desired_access, request.share_access,
@@ -200,15 +226,15 @@ impl Work {
             )?,
         };
         self.file_id = Some(file_id);
-        let lifecycle_actor = handler.pm.reference_native_requestor(self.captured.caller)?;
+        let lifecycle_actor = (*handler).pm.reference_native_requestor(self.captured.caller)?;
         match reserve_hosted_file_lifecycle(file_id, self.captured.caller, lifecycle_actor) {
             Ok(()) => self.lifecycle_reserved = true,
             Err((status, mut actor)) => {
-                actor.release(&mut handler.pm)?;
+                actor.release(&mut (*handler).pm)?;
                 return Err(status.raw() as u32);
             }
         }
-        handler.file_completion.reserve_file_handle_publication(
+        (*handler).file_completion.reserve_file_handle_publication(
             file_id, self.captured.device_id, mode,
         )?;
         self.completion_reserved = true;
@@ -220,10 +246,10 @@ impl Work {
         Ok(())
     }
 
-    unsafe fn dispatch_create(&mut self, handler: &mut ExecNtHandler) -> Result<(), u32> {
+    unsafe fn dispatch_create(&mut self, handler: *mut ExecNtHandler) -> Result<(), u32> {
         if self.cancelled() { return Err(STATUS_CANCELLED_LOCAL); }
-        self.actor.validate(&handler.pm)?;
-        handler.pm.validate_native_handle_caller(self.captured.caller)?;
+        self.actor.validate(&(*handler).pm)?;
+        (*handler).pm.validate_native_handle_caller(self.captured.caller)?;
         let request = &self.captured.request;
         let name = &self.captured.relative_name;
         let length = name.len().checked_mul(2)
@@ -286,18 +312,18 @@ impl Work {
         Ok(true)
     }
 
-    unsafe fn rollback_unpublished(&mut self, handler: &mut ExecNtHandler) -> Result<(), u32> {
+    unsafe fn rollback_unpublished(&mut self, handler: *mut ExecNtHandler) -> Result<(), u32> {
         if let Some(publication) = self.publication.as_mut() {
-            publication.abort(&mut handler.pm)?;
+            publication.abort(&mut (*handler).pm)?;
             self.publication = None;
         }
         if let Some(file_id) = self.file_id {
             let committed = self.completion_committed;
             if self.completion_reserved {
-                handler.file_completion.cancel_reserved_file_handle(file_id)?;
+                (*handler).file_completion.cancel_reserved_file_handle(file_id)?;
                 self.completion_reserved = false;
             } else if self.completion_committed {
-                handler.release_file_handle_reference(file_id);
+                (*handler).release_file_handle_reference(file_id);
                 self.completion_committed = false;
             }
             if !committed {
@@ -308,22 +334,100 @@ impl Work {
         Ok(())
     }
 
-    unsafe fn rollback_published(&mut self, handler: &mut ExecNtHandler) -> Result<(), u32> {
+    unsafe fn fail_reparse(&mut self, handler: *mut ExecNtHandler, status: u32) -> Result<(), u32> {
+        let file = self.file_id.expect("reparsed source File");
+        self.rollback_unpublished(handler)?;
+        self.delivery.as_mut().expect("reparsed CREATE delivery")
+            .rollback_publication(
+                PublicationRollbackReceipt::after_exact_retirement(FileId(file), None),
+                status,
+            ).expect("reparse failure revokes unpublished File");
+        self.reply_completion = Some(IoCreateFileReply::Completed {
+            status, iosb_status: status, information: 0, handle: 0,
+        });
+        Ok(())
+    }
+
+    unsafe fn advance_reparse(&mut self, handler: *mut ExecNtHandler) -> Result<(), u32> {
+        let (status, information) = self.terminal.expect("reparse terminal");
+        debug_assert_eq!(status, STATUS_REPARSE_LOCAL);
+        if self.reparse_target.is_none() {
+            if information != 0 || self.reparse_hops >= MAX_REPARSE_TRAVERSAL {
+                return self.fail_reparse(handler, STATUS_NOT_SUPPORTED_LOCAL);
+            }
+            let file = self.file_id.expect("reparsed source File");
+            let target = crate::driver_launch::hosted_reparse_name::capture(
+                file, self.captured.device_id,
+            ).and_then(|absolute_name| {
+                let (device_id, prefix) = io_manager_mut()
+                    .device_prefix_for_file_name(&absolute_name, true)
+                    .ok_or(STATUS_OBJECT_NAME_NOT_FOUND as u32)?;
+                require_hosted_device_ready_for_dispatch(device_id.raw())?;
+                let mut relative_name = Vec::new();
+                relative_name.try_reserve_exact(absolute_name.len() - prefix)
+                    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES_LOCAL)?;
+                relative_name.extend_from_slice(&absolute_name[prefix..]);
+                Ok(ReparseTarget { device_id: device_id.raw(), absolute_name, relative_name })
+            });
+            match target {
+                Ok(target) => self.reparse_target = Some(target),
+                Err(status) => return self.fail_reparse(handler, status),
+            }
+        }
+        let delivery = self.delivery.as_mut().expect("reparsed CREATE delivery");
+        if delivery.phase() != Phase::Finished {
+            if let Some(irp) = delivery.irp() {
+                if !self.backend_ack_entered {
+                    delivery.enter_reparse_backend_ack()
+                        .expect("IO_REPARSE enters internal backend ACK");
+                    self.backend_ack_entered = true;
+                }
+                acknowledge_completed_irp(irp.raw())?;
+                delivery.acknowledge_backend().expect("reparse backend ACK receipt");
+                delivery.finish().expect("reparsed hop retired without client Reply");
+            } else {
+                delivery.finish_inline_reparse()
+                    .expect("inline reparse retired without client Reply");
+            }
+        }
+        let file = self.file_id.expect("reparsed source File");
+        if self.completion_reserved {
+            (*handler).file_completion.cancel_reserved_file_handle(file)?;
+            self.completion_reserved = false;
+        }
+        abandon_unpublished_hosted_file(file)?;
+        self.file_id = None;
+        self.lifecycle_reserved = false;
+        let target = self.reparse_target.take().expect("retained reparse target");
+        self.captured.device_id = target.device_id;
+        self.captured.request.name = target.absolute_name;
+        self.captured.request.root_directory = 0;
+        self.captured.related_file = None;
+        self.captured.related_file_id = None;
+        self.captured.relative_name = target.relative_name;
+        self.reparse_hops += 1;
+        self.delivery = None;
+        self.terminal = None;
+        self.backend_ack_entered = false;
+        Ok(())
+    }
+
+    unsafe fn rollback_published(&mut self, handler: *mut ExecNtHandler) -> Result<(), u32> {
         let Some(handle) = self.published_handle else { return Ok(()); };
-        let (expected_file, expected_device) = handler.pm.lookup_native_routed_file_handle(
+        let (expected_file, expected_device) = (*handler).pm.lookup_native_routed_file_handle(
             self.captured.caller, handle, 0,
         )?;
         if Some(expected_file) != self.file_id || expected_device != self.captured.device_id {
             return Err(STATUS_INVALID_HANDLE as u32);
         }
-        let (file, device) = handler.pm.close_native_routed_file_handle(self.captured.caller, handle)
+        let (file, device) = (*handler).pm.close_native_routed_file_handle(self.captured.caller, handle)
             .map_err(|error| match error {
                 nt_process::native_handle::NativePsCloseError::Status(status) => status,
                 _ => STATUS_INVALID_HANDLE as u32,
             })?;
         assert_eq!((file, device), (expected_file, expected_device));
         self.published_handle = None;
-        handler.release_file_handle_reference(file);
+        (*handler).release_file_handle_reference(file);
         self.completion_committed = false;
         self.publication = None;
         self.delivery.as_mut().expect("published provider CREATE delivery")
@@ -343,9 +447,10 @@ impl Work {
         let _ = cancel_irp_if_pending(irp.raw());
     }
 
-    unsafe fn finish_cancelled(&mut self, handler: &mut ExecNtHandler) -> Result<bool, u32> {
+    unsafe fn finish_cancelled(&mut self, handler: *mut ExecNtHandler) -> Result<bool, u32> {
         if let Some(delivery) = self.delivery.as_mut() {
-            if !delivery.cancelled() && delivery.phase() != Phase::Aborted {
+            if !delivery.cancelled()
+                && !matches!(delivery.phase(), Phase::Aborted | Phase::Finished) {
                 delivery.cancel().expect("cancelled provider CREATE before Reply");
             }
         }
@@ -360,7 +465,7 @@ impl Work {
             ).map_err(|_| STATUS_INVALID_HANDLE as u32)?;
             self.stop_acknowledged = true;
             if let Some(delivery) = self.delivery.as_mut() {
-                if delivery.phase() != Phase::Aborted {
+                if !matches!(delivery.phase(), Phase::Aborted | Phase::Finished) {
                     delivery.acknowledge_stop().expect("sealed provider CREATE stop");
                 }
             }
@@ -370,16 +475,17 @@ impl Work {
         Ok(true)
     }
 
-    unsafe fn release_actor(&mut self, handler: &mut ExecNtHandler) -> Result<(), u32> {
+    unsafe fn release_actor(&mut self, handler: *mut ExecNtHandler) -> Result<(), u32> {
         if let Some(subject) = self.subject.as_mut() {
-            subject.release(&mut handler.token_store)?;
+            subject.release(&mut (*handler).token_store)?;
             self.subject = None;
         }
-        self.actor.release(&mut handler.pm)
+        self.actor.release(&mut (*handler).pm)
     }
 
     unsafe fn ack_backend(&mut self) -> Result<(), u32> {
         let Some(delivery) = self.delivery.as_mut() else { return Ok(()); };
+        if delivery.phase() == Phase::Finished { return Ok(()); }
         let Some(irp) = delivery.irp() else {
             if matches!(delivery.phase(), Phase::ReplyAcknowledged | Phase::Terminal)
                 && delivery.terminal().is_some()
@@ -398,15 +504,15 @@ impl Work {
         Ok(())
     }
 
-    unsafe fn publish_success(&mut self, handler: &mut ExecNtHandler) -> Result<u64, u32> {
+    unsafe fn publish_success(&mut self, handler: *mut ExecNtHandler) -> Result<u64, u32> {
         let file = self.file_id.expect("provider CREATE File");
         let publication = self.publication.as_mut().expect("provider CREATE reservation");
-        publication.bind(&mut handler.pm, file, self.captured.device_id,
+        publication.bind(&mut (*handler).pm, file, self.captured.device_id,
             self.captured.request.desired_access)?;
-        handler.file_completion.commit_reserved_file_handle(file)?;
+        (*handler).file_completion.commit_reserved_file_handle(file)?;
         self.completion_reserved = false;
         self.completion_committed = true;
-        let handle = publication.publish(&mut handler.pm)?;
+        let handle = publication.publish(&mut (*handler).pm)?;
         self.published_handle = Some(handle);
         assert!(cancel_hosted_file_lifecycle_reservation(file));
         self.lifecycle_reserved = false;
@@ -416,7 +522,7 @@ impl Work {
         Ok(handle)
     }
 
-    unsafe fn advance(&mut self, handler: &mut ExecNtHandler) -> Result<bool, u32> {
+    unsafe fn advance(&mut self, handler: *mut ExecNtHandler) -> Result<bool, u32> {
         if self.reply_entered {
             if !runtime::reconcile_retained_service_reply(
                 self.route, self.dispatch, self.reply, self.token,
@@ -492,13 +598,20 @@ impl Work {
             }
             if self.cancelled() { return self.finish_cancelled(handler); }
             let phase = self.delivery.as_ref().unwrap().phase();
+            if matches!(phase, Phase::Finished | Phase::BackendAckEntered)
+                && self.reparse_target.is_some() {
+                self.advance_reparse(handler)?;
+                return Ok(false);
+            }
             if phase == Phase::Aborted {
                 let status = self.terminal.expect("pre-entry CREATE status").0;
                 self.rollback_unpublished(handler)?;
                 self.reply_completion = Some(IoCreateFileReply::Rejected { status });
             } else if phase == Phase::Terminal {
                 let (status, information) = self.terminal.expect("CREATE terminal");
-                if (status as i32) < 0 {
+                if status == STATUS_REPARSE_LOCAL {
+                    self.advance_reparse(handler)?;
+                } else if (status as i32) < 0 {
                     self.rollback_unpublished(handler)?;
                     self.reply_completion = Some(IoCreateFileReply::Completed {
                         status, iosb_status: status, information, handle: 0,
@@ -554,7 +667,7 @@ impl Work {
 }
 
 /// Drive one retained transaction per sweep; nested hosted dispatch may re-enter this function.
-pub(super) unsafe fn redrive(handler: &mut ExecNtHandler) {
+unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> bool {
     let _durable = crate::allocator::enter_durable();
     let count = (&*core::ptr::addr_of!(WORK)).len();
     if count != 0 {
@@ -562,6 +675,10 @@ pub(super) unsafe fn redrive(handler: &mut ExecNtHandler) {
         if let Some((index, mut work)) = (0..count).find_map(|step| {
             let index = (start + step) % count;
             if (&*core::ptr::addr_of!(EXECUTING)).contains(&index) { return None; }
+            if nested_ready_only && !(&*core::ptr::addr_of!(WORK))[index]
+                .as_ref().is_some_and(|work| work.ready_for_nested_step()) {
+                return None;
+            }
             (&mut *core::ptr::addr_of_mut!(WORK))[index]
                 .take().map(|work| (index, work))
         }) {
@@ -569,14 +686,34 @@ pub(super) unsafe fn redrive(handler: &mut ExecNtHandler) {
                 let executing = &mut *core::ptr::addr_of_mut!(EXECUTING);
                 if executing.try_reserve(1).is_err() {
                     (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
-                    return;
+                    return false;
                 }
                 executing.push(index);
             }
             CURSOR.store(index as u64 + 1, Ordering::Relaxed);
-            let done = work.advance(handler).unwrap_or(false);
+            let done = match work.advance(handler) {
+                Ok(done) => done,
+                Err(_) => false,
+            };
             if !done { (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work); }
             assert_eq!((&mut *core::ptr::addr_of_mut!(EXECUTING)).pop(), Some(index));
+            return true;
         }
     }
+    false
+}
+
+pub(super) unsafe fn redrive(handler: *mut ExecNtHandler) {
+    let _ = redrive_one(handler, false);
+}
+
+pub(super) unsafe fn nested_work_ready() -> bool {
+    (&*core::ptr::addr_of!(WORK)).iter().enumerate().any(|(index, row)| {
+        !(&*core::ptr::addr_of!(EXECUTING)).contains(&index)
+            && row.as_ref().is_some_and(|work| work.ready_for_nested_step())
+    })
+}
+
+pub(super) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
+    redrive_one(handler, true)
 }

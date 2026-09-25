@@ -205,7 +205,7 @@ impl Work {
                     return false;
                 }
             };
-            let lifecycle_executor = if self.needs_cleanup {
+            let lifecycle_reserved = if self.needs_cleanup {
                 let reserved = (|| {
                     let executor = handler.pm.capture_native_handle_caller(
                         self.caller.original_thread(), nt_types::AccessMode::KernelMode,
@@ -214,7 +214,7 @@ impl Work {
                     match crate::driver_launch::reserve_hosted_file_lifecycle(
                         self.file_id, executor, requestor,
                     ) {
-                        Ok(()) => Ok(executor),
+                        Ok(()) => Ok(()),
                         Err((status, mut requestor)) => {
                             requestor.release(&mut handler.pm)?;
                             Err(status.raw() as u32)
@@ -222,7 +222,7 @@ impl Work {
                     }
                 })();
                 match reserved {
-                    Ok(executor) => Some(executor),
+                    Ok(()) => true,
                     Err(status) => {
                         self.close_entered = true;
                         self.capture.take();
@@ -231,7 +231,7 @@ impl Work {
                     }
                 }
             } else {
-                None
+                false
             };
             self.close_entered = true;
             match handler.pm.close_native_routed_file_handle(self.caller, self.handle) {
@@ -241,8 +241,8 @@ impl Work {
                         self.table_owner, self.handle, file,
                     ).expect("closed RoutedFile has exact consumer projection owner");
                     handler.release_file_handle_reference(file);
-                    if let Some(executor) = lifecycle_executor {
-                        crate::driver_launch::pump_hosted_file_lifecycle(executor);
+                    if lifecycle_reserved {
+                        crate::driver_launch::pump_hosted_file_lifecycle();
                     }
                     if !self.needs_cleanup {
                         self.capture.take();
@@ -250,7 +250,7 @@ impl Work {
                     }
                 }
                 Err(NativeCloseError::Status(status)) => {
-                    if lifecycle_executor.is_some() {
+                    if lifecycle_reserved {
                         assert!(crate::driver_launch::cancel_hosted_file_lifecycle_reservation(
                             self.file_id,
                         ));
@@ -259,7 +259,7 @@ impl Work {
                     self.status = Some(status);
                 }
                 Err(NativeCloseError::BugCheck { code, parameters }) => {
-                    if lifecycle_executor.is_some() {
+                    if lifecycle_reserved {
                         assert!(crate::driver_launch::cancel_hosted_file_lifecycle_reservation(
                             self.file_id,
                         ));

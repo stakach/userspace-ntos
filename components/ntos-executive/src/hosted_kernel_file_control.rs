@@ -203,11 +203,11 @@ impl FileWork {
         unsafe { runtime::retained_service_cancelled(self.route, self.dispatch, self.reply, self.token) }
     }
 
-    unsafe fn release(&mut self, handler: &mut ExecNtHandler) {
-        self.actor.release(&mut handler.pm).expect("hosted FSCTL actor identity");
+    unsafe fn release(&mut self, handler: *mut ExecNtHandler) {
+        self.actor.release(&mut (*handler).pm).expect("hosted FSCTL actor identity");
     }
 
-    unsafe fn finish_cancelled(&mut self, handler: &mut ExecNtHandler) -> bool {
+    unsafe fn finish_cancelled(&mut self, handler: *mut ExecNtHandler) -> bool {
         runtime::acknowledge_retained_service_cancellation(
             self.route, self.dispatch, self.reply, self.token,
         ).expect("sealed hosted FSCTL cancellation");
@@ -218,7 +218,7 @@ impl FileWork {
         true
     }
 
-    unsafe fn advance(&mut self, handler: &mut ExecNtHandler) -> bool {
+    unsafe fn advance(&mut self, handler: *mut ExecNtHandler) -> bool {
         if self.reply_entered {
             let acked = runtime::reconcile_retained_service_reply(
                 self.route, self.dispatch, self.reply, self.token,
@@ -238,11 +238,11 @@ impl FileWork {
         }
         if !self.entered {
             if self.cancelled() { return self.finish_cancelled(handler); }
-            if let Err(status) = self.actor.validate(&handler.pm) {
+            if let Err(status) = self.actor.validate(&(*handler).pm) {
                 self.entered = true;
                 self.terminal = Some((status, 0));
             } else {
-                handler.file_completion.set_signaled(self.file.file_id(), false)
+                (*handler).file_completion.set_signaled(self.file.file_id(), false)
                     .expect("live hosted FSCTL File signal");
                 self.entered = true;
                 match dispatch_hosted_file_irp_result_exact(
@@ -311,7 +311,7 @@ impl FileWork {
         write_unaligned((exec + COPIED_OFF) as *mut u32, self.copied as u32);
         write_unaligned((exec + INFORMATION_OFF) as *mut u64, information);
         write_unaligned((exec + COMPLETED_OFF) as *mut u32, 1);
-        handler.file_completion.set_signaled(self.file.file_id(), true)
+        (*handler).file_completion.set_signaled(self.file.file_id(), true)
             .expect("terminal hosted FSCTL File signal");
         self.reply_entered = true;
         let _ = runtime::wake_service(
@@ -321,7 +321,7 @@ impl FileWork {
     }
 }
 
-pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
+pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
     let _durable = crate::allocator::enter_durable();
     let count = (&*core::ptr::addr_of!(WORK)).len();
     if count == 0 { return; }
