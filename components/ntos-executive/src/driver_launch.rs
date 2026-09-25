@@ -58977,19 +58977,29 @@ unsafe fn dispatch_irp_for_instance_exact(
             {
                 return None;
             }
-            project_provider_device_dispatch_state(
-                binding,
-                dependent_inst.exec_shared_va,
-                provider_inst,
-                provider_inst.exec_shared_va,
-            )
-            .ok()?;
             dispatch_index = route.provider_instance;
             d = provider_inst;
             sh = provider_inst.exec_shared_va;
             driver_object = route.provider_driver_object;
         provider_binding = Some(binding);
         provider_route = Some(route);
+    }
+    let ingress_route = hosted_ingress_sources::primary_route(dispatch_index)?;
+    if !crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(ingress_route)
+        .ok()?
+    {
+        return Some(HostedIrpTransportResult::NotDispatched {
+            status: nt_status::NtStatus::DEVICE_BUSY,
+        });
+    }
+    if let Some(binding) = provider_binding {
+        project_provider_device_dispatch_state(
+            binding,
+            dependent_inst.exec_shared_va,
+            d,
+            sh,
+        )
+        .ok()?;
     }
     let ep = d.fault_ep;
     let pml4 = d.pml4;
@@ -59073,7 +59083,6 @@ unsafe fn dispatch_irp_for_instance_exact(
     // in-image wall), demand-caps at 256, all win32k caps false — degenerate to today's inline loop
     // EXACTLY. `component_pump` bumps `HARNESS_IRP_DISPATCHES` per serviced dispatch (the
     // `exec_fsd_on_shared_harness` proof). Status is read at SH_REQ_STATUS(0x70) by kind=Irp.
-    let ingress_route = hosted_ingress_sources::primary_route(dispatch_index)?;
     let reply_cap = crate::spawn_hosts::shared_ingress::owner::runtime::current_reply(ingress_route).ok()?;
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: ep,

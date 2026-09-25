@@ -67,6 +67,9 @@ No kernel build or proprietary Windows binaries are required. The optional
 Windows 7 export test requires a locally supplied `references/ntdll.dll`:
 `cargo test -p nt-pe-loader --test ntdll_exports -- --ignored`.
 Native builds and end-to-end CI are separate follow-ups, not covered by these specs.
+The local `tests/native/mup_provider/run_kernel_only.sh` gate checks real
+cross-domain driver READs, including immediate and pending completion through
+the source driver's completion event, IOSB, and exact payload bytes.
 
 The kernel is a **pinned git submodule**, not vendored source: `userspace-ntos`
 depends on an exact kernel SHA (its syscall/invocation ABI is tightly coupled),
