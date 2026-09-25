@@ -368,7 +368,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         // preserve that driver's context while leaving its File on the deferred-close path.
         if crate::is_create_major(major) {
             if let Some(file) = file_id.and_then(|file_id| self.file_mut(file_id)) {
-                if completion.status.is_success() {
+                if crate::file::create_terminal_opens_file(completion.status) {
                     file.driver_context = completion.file_context;
                     if file.state == crate::FileState::CreateIrpDispatched {
                         file.transition(crate::FileState::Open);

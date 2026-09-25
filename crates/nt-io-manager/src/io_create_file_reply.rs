@@ -1,6 +1,7 @@
 //! Terminal provider IoCreateFile reply, with an explicit output-publication receipt.
 
 const STATUS_PENDING: u32 = 0x0000_0103;
+const STATUS_REPARSE: u32 = 0x0000_0104;
 const COMPLETION_VALID: u64 = 1 << 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +41,9 @@ impl IoCreateFileReply {
                 if status == STATUS_PENDING || iosb_status == STATUS_PENDING {
                     return Err(ReplyError::Pending);
                 }
+                if status == STATUS_REPARSE || iosb_status == STATUS_REPARSE {
+                    return Err(ReplyError::Malformed);
+                }
                 if ((status as i32) >= 0 && ((iosb_status as i32) < 0 || handle == 0))
                     || ((status as i32) < 0 && handle != 0)
                 {
@@ -65,6 +69,9 @@ impl IoCreateFileReply {
         let status = status_word as u32;
         if status == STATUS_PENDING {
             return Err(ReplyError::Pending);
+        }
+        if status == STATUS_REPARSE {
+            return Err(ReplyError::Malformed);
         }
         let reply = if status_word & COMPLETION_VALID == 0 {
             if iosb_status != 0 || information != 0 || handle != 0 {
@@ -146,6 +153,24 @@ mod tests {
         assert_eq!(
             IoCreateFileReply::decode([COMPLETION_VALID, STATUS_PENDING as u64, 0, 4]),
             Err(ReplyError::Pending)
+        );
+    }
+
+    #[test]
+    fn reparse_is_internal_name_resolution_not_an_open_handle() {
+        assert_eq!(
+            IoCreateFileReply::Completed {
+                status: STATUS_REPARSE,
+                iosb_status: STATUS_REPARSE,
+                information: 0,
+                handle: 44,
+            }.words(),
+            Err(ReplyError::Malformed),
+        );
+        assert_eq!(
+            IoCreateFileReply::decode([COMPLETION_VALID | STATUS_REPARSE as u64,
+                STATUS_REPARSE as u64, 0, 44]),
+            Err(ReplyError::Malformed),
         );
     }
 }

@@ -46,6 +46,23 @@ pub enum FileState {
     Closed,
 }
 
+pub(crate) fn create_terminal_opens_file(status: nt_status::NtStatus) -> bool {
+    status.is_success() && status != nt_status::NtStatus::REPARSE
+}
+
+#[cfg(test)]
+mod create_terminal_tests {
+    use super::create_terminal_opens_file;
+    use nt_status::NtStatus;
+
+    #[test]
+    fn reparse_is_not_an_open_even_though_nt_success_is_true() {
+        assert!(create_terminal_opens_file(NtStatus::SUCCESS));
+        assert!(!create_terminal_opens_file(NtStatus::REPARSE));
+        assert!(!create_terminal_opens_file(NtStatus::ACCESS_DENIED));
+    }
+}
+
 impl FileState {
     /// Whether `self -> next` is an allowed transition (spec §12.2).
     pub fn can_transition_to(self, next: FileState) -> bool {
