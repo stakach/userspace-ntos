@@ -131,12 +131,14 @@ self-contained launcher that:
    and stops — no cryptic mid-build failure.
 2. **Checks out the `rust-micro` submodule** if you forgot `--recursive`.
 3. **Fetches the ReactOS binaries** on first run (a ~30 MiB GPL ReactOS x64
-   livecd, `reactos-livecd-0.4.17-dev-478-g4117217`, from
+   livecd, `reactos-livecd-0.4.17-dev-933-ga9fc819`, from
    [iso.reactos.org](https://iso.reactos.org/livecd/); cached under
    `rust-micro/.tmp/reactos/`, extracted with `bsdtar`). Override the URL with
    `REACTOS_7Z_URL=…`. ReactOS is GPL, so its binaries are freely
    redistributable — the executive loads them via `SEC_IMAGE` and runs their
    real user-mode binaries through this project's Rust `ntdll.dll` implementation.
+   The requested dev-933 archive currently contains an ISO byte-identical to
+   the earlier dev-478 archive; its label does not yet imply a newer payload.
 4. **Builds** the Rust `ntdll.dll`, `ntos-executive` (the NT executive that
    hosts the ReactOS processes), the verified `nt-seh-linkage.dll` support image,
    and the kernel, then packs the FAT32/UEFI disk image. The support image is

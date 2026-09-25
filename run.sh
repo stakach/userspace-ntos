@@ -218,16 +218,9 @@ if [ ! -e "$RM/scripts/build_kernel.sh" ]; then
   git submodule update --init --recursive
 fi
 
-# ---- [3/5] fetch the ReactOS binaries (first run only) ------------------
+# ---- [3/5] verify/fetch the pinned ReactOS binaries ---------------------
 say "[3/5] checking ReactOS binaries..."
-REACTOS_KEY="$RM/.tmp/reactos/ros-csrss.exe"
-if [ ! -f "$REACTOS_KEY" ] || [ ! -f "$RM/.tmp/reactos/ros-win32k.sys" ] \
-   || [ ! -f "$RM/.tmp/reactos/ros-winlogon.exe" ]; then
-  say "      fetching GPL ReactOS x64 livecd (~30 MiB download, first run only, cached)"
-  "$RM/scripts/fetch_reactos.sh"
-else
-  say "      ReactOS binaries already staged (cached)"
-fi
+"$RM/scripts/fetch_reactos.sh"
 "$RM/scripts/verify_reactos_acpi_provider.sh"
 
 # ---- [4/5] build the executive + kernel + disk image --------------------
