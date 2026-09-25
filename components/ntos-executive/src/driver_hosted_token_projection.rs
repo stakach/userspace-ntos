@@ -129,18 +129,24 @@ fn projection_status(error: HostedTokenProjectionError) -> i32 {
 /// it cannot be queried until `bind` validates and retains its canonical identity.
 pub(super) unsafe fn reserve(
     provider_inst: DriverInstance,
-) -> Result<ReservedTokenProjection, i32> {
-    let provider_domain = domain(provider_inst)?;
+) -> Result<ReservedTokenProjection, (i32, Option<ReservedTokenProjection>)> {
+    let provider_domain = domain(provider_inst).map_err(|status| (status, None))?;
     let address = hosted_instance_pool_alloc(provider_inst, TOKEN_PROJECTION_BYTES)
-        .ok_or(STATUS_INSUFFICIENT_RESOURCES_LOCAL)?;
+        .ok_or((STATUS_INSUFFICIENT_RESOURCES_LOCAL, None))?;
     let Some(exec_va) =
         hosted_pool_allocation_exec_va(provider_inst.exec_pool_va, address, TOKEN_PROJECTION_BYTES)
     else {
-        assert!(free_hosted_instance_pool_allocation_exact(
-            provider_inst,
-            address
+        // The allocation is still ours if the mapping lookup fails. Return its exact receipt
+        // so the source-keyed pre-entry rollback can retry a failed pool free.
+        return Err((
+            STATUS_INVALID_HANDLE_LOCAL,
+            Some(ReservedTokenProjection {
+                provider_inst,
+                provider_domain,
+                address,
+                exec_va: 0,
+            }),
         ));
-        return Err(STATUS_INVALID_HANDLE_LOCAL);
     };
     Ok(ReservedTokenProjection {
         provider_inst,

@@ -24,6 +24,8 @@ pub(super) struct RetainedProviderCreateSecurityGraph {
     descriptor_address: u64,
     primary_address: u64,
     client_address: u64,
+    primary_reserved: Option<driver_hosted_token_projection::ReservedTokenProjection>,
+    client_reserved: Option<driver_hosted_token_projection::ReservedTokenProjection>,
     primary_retiring: Option<driver_hosted_token_projection::RetiringTokenProjection>,
     client_retiring: Option<driver_hosted_token_projection::RetiringTokenProjection>,
 }
@@ -38,7 +40,11 @@ impl RetainedProviderCreateSecurityGraph {
     pub(super) unsafe fn retire(
         mut self,
     ) -> Result<(), (i32, RetainedProviderCreateSecurityGraph)> {
-        if self.primary_retiring.is_some() || self.client_retiring.is_some() {
+        if self.primary_reserved.is_some()
+            || self.client_reserved.is_some()
+            || self.primary_retiring.is_some()
+            || self.client_retiring.is_some()
+        {
             return Err((nt_status::NtStatus::DEVICE_BUSY.raw(), self));
         }
         if self.descriptor_address != 0 {
@@ -61,6 +67,18 @@ impl RetainedProviderCreateSecurityGraph {
     pub(super) unsafe fn abort_unentered(
         mut self,
     ) -> Result<(), (i32, RetainedProviderCreateSecurityGraph)> {
+        if let Some(reserved) = self.client_reserved.take() {
+            if let Err(reserved) = driver_hosted_token_projection::release_reserved(reserved) {
+                self.client_reserved = Some(reserved);
+                return Err((nt_status::NtStatus::DEVICE_BUSY.raw(), self));
+            }
+        }
+        if let Some(reserved) = self.primary_reserved.take() {
+            if let Err(reserved) = driver_hosted_token_projection::release_reserved(reserved) {
+                self.primary_reserved = Some(reserved);
+                return Err((nt_status::NtStatus::DEVICE_BUSY.raw(), self));
+            }
+        }
         for address in [self.client_address, self.primary_address] {
             if address == 0 {
                 continue;
@@ -141,15 +159,6 @@ pub(super) unsafe fn materialize(
     }).map_err(|status| status as i32)?;
     let graph_address = hosted_instance_pool_alloc(provider, CREATE_SECURITY_GRAPH_SIZE as u64)
         .ok_or(STATUS_INSUFFICIENT_RESOURCES_LOCAL)?;
-    let graph_exec = match hosted_pool_allocation_exec_va(
-        provider.exec_pool_va, graph_address, CREATE_SECURITY_GRAPH_SIZE as u64,
-    ) {
-        Some(exec) => exec,
-        None => {
-            assert!(free_hosted_instance_pool_allocation_exact(provider, graph_address));
-            return Err(STATUS_INVALID_HANDLE_LOCAL);
-        }
-    };
     let mut graph = RetainedProviderCreateSecurityGraph {
         source,
         provider,
@@ -158,13 +167,31 @@ pub(super) unsafe fn materialize(
         descriptor_address: 0,
         primary_address: 0,
         client_address: 0,
+        primary_reserved: None,
+        client_reserved: None,
         primary_retiring: None,
         client_retiring: None,
     };
+    let graph_exec = match hosted_pool_allocation_exec_va(
+        provider.exec_pool_va, graph_address, CREATE_SECURITY_GRAPH_SIZE as u64,
+    ) {
+        Some(exec) => exec,
+        None => {
+            if let Err((status, owner)) = graph.abort_unentered() {
+                quarantine_preentry(owner);
+                return Err(status);
+            }
+            return Err(STATUS_INVALID_HANDLE_LOCAL);
+        }
+    };
     let reserved_primary = match driver_hosted_token_projection::reserve(provider) {
         Ok(reserved) => reserved,
-        Err(status) => {
-            assert!(free_hosted_instance_pool_allocation_exact(provider, graph_address));
+        Err((status, reserved)) => {
+            graph.primary_reserved = reserved;
+            if let Err((rollback_status, owner)) = graph.abort_unentered() {
+                quarantine_preentry(owner);
+                return Err(rollback_status);
+            }
             return Err(status);
         }
     };
@@ -183,9 +210,12 @@ pub(super) unsafe fn materialize(
     }) {
         Ok(primary) => primary,
         Err(status) => {
-            let reserved = reserved_primary.expect("failed binding retained reservation");
-            assert!(driver_hosted_token_projection::release_reserved(reserved).is_ok());
-            assert!(free_hosted_instance_pool_allocation_exact(provider, graph_address));
+            graph.primary_reserved =
+                Some(reserved_primary.expect("failed binding retained reservation"));
+            if let Err((rollback_status, owner)) = graph.abort_unentered() {
+                quarantine_preentry(owner);
+                return Err(rollback_status);
+            }
             return Err(status as i32);
         }
     };
@@ -193,7 +223,8 @@ pub(super) unsafe fn materialize(
     let client = if subject.client.is_some() {
         let reserved_client = match driver_hosted_token_projection::reserve(provider) {
             Ok(reserved) => reserved,
-            Err(status) => {
+            Err((status, reserved)) => {
+                graph.client_reserved = reserved;
                 if let Err((rollback_status, owner)) = graph.abort_unentered() {
                     quarantine_preentry(owner);
                     return Err(rollback_status);
@@ -219,8 +250,8 @@ pub(super) unsafe fn materialize(
                 Some(client)
             }
             Err(status) => {
-                let reserved = reserved_client.expect("failed binding retained reservation");
-                assert!(driver_hosted_token_projection::release_reserved(reserved).is_ok());
+                graph.client_reserved =
+                    Some(reserved_client.expect("failed binding retained reservation"));
                 if let Err((rollback_status, owner)) = graph.abort_unentered() {
                     quarantine_preentry(owner);
                     return Err(rollback_status);
