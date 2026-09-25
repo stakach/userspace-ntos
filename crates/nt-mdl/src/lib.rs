@@ -23,6 +23,9 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_READ_LEASE_ID: AtomicU64 = AtomicU64::new(1);
 
 // --- driver-visible MDL layout (x64) -----------------------------------------
 
@@ -57,6 +60,12 @@ pub enum MdlError {
     ActiveMappings,
     /// The requested slice is outside the MDL's byte range.
     OutOfRange,
+    /// A retained reader still owns a range of this MDL.
+    ActiveReadLeases,
+    /// A lease identifier cannot be allocated without reusing an old one.
+    LeaseIdsExhausted,
+    /// A read lease could not reserve registry storage.
+    InsufficientResources,
 }
 
 /// A driver-visible MDL's canonical identity outside the public `MDL` fields.
@@ -84,6 +93,36 @@ impl MdlKey {
     }
 }
 
+/// Exact, generation-bearing retention of a locked hosted MDL descriptor range.
+///
+/// This is an owned value, not a pointer into the driver's address space. The
+/// The caller must separately prove that the backing pages are readable and stable. Retain
+/// this value until reads and provider effects finish, then release it through the originating
+/// registry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MdlReadLease {
+    lease_id: u64,
+    key: MdlKey,
+    mdl_id: u64,
+    generation: u32,
+    virtual_address: u64,
+    length: u32,
+}
+
+impl MdlReadLease {
+    pub const fn virtual_address(self) -> u64 {
+        self.virtual_address
+    }
+
+    pub const fn length(self) -> u32 {
+        self.length
+    }
+
+    pub const fn key(self) -> MdlKey {
+        self.key
+    }
+}
+
 struct MdlRecord {
     id: u64,
     key: Option<MdlKey>,
@@ -99,6 +138,7 @@ struct MdlRecord {
 #[derive(Default)]
 pub struct MdlRegistry {
     mdls: Vec<MdlRecord>,
+    read_leases: Vec<MdlReadLease>,
     next_id: u64,
     next_gen: u32,
 }
@@ -121,6 +161,10 @@ impl MdlRegistry {
 
     fn find_key(&self, key: MdlKey) -> Option<&MdlRecord> {
         self.mdls.iter().find(|m| m.key == Some(key))
+    }
+
+    fn has_read_lease(&self, id: u64) -> bool {
+        self.read_leases.iter().any(|lease| lease.mdl_id == id)
     }
 
     fn allocate_record(&mut self, key: Option<MdlKey>, virtual_address: u64, length: u32) -> u64 {
@@ -181,6 +225,9 @@ impl MdlRegistry {
         length: u32,
     ) -> Result<(), MdlError> {
         let id = self.id_for(key).ok_or(MdlError::StaleId)?;
+        if self.has_read_lease(id) {
+            return Err(MdlError::ActiveReadLeases);
+        }
         let record = self.find_mut(id).ok_or(MdlError::StaleId)?;
         if record.active_mappings != 0 {
             return Err(MdlError::ActiveMappings);
@@ -194,6 +241,9 @@ impl MdlRegistry {
 
     pub fn unlock_key(&mut self, key: MdlKey) -> Result<(), MdlError> {
         let id = self.id_for(key).ok_or(MdlError::StaleId)?;
+        if self.has_read_lease(id) {
+            return Err(MdlError::ActiveReadLeases);
+        }
         let record = self.find_mut(id).ok_or(MdlError::StaleId)?;
         if record.active_mappings != 0 {
             return Err(MdlError::ActiveMappings);
@@ -204,6 +254,9 @@ impl MdlRegistry {
 
     pub fn can_free_key(&self, key: MdlKey) -> Result<(), MdlError> {
         let record = self.find_key(key).ok_or(MdlError::StaleId)?;
+        if self.has_read_lease(record.id) {
+            return Err(MdlError::ActiveReadLeases);
+        }
         if record.active_mappings != 0 {
             return Err(MdlError::ActiveMappings);
         }
@@ -228,6 +281,11 @@ impl MdlRegistry {
             })
         }) {
             return Err(MdlError::ActiveMappings);
+        }
+        if self.read_leases.iter().any(|lease| {
+            lease.key.domain_id == domain_id && lease.key.domain_cookie == domain_cookie
+        }) {
+            return Err(MdlError::ActiveReadLeases);
         }
         let before = self.mdls.len();
         self.mdls.retain(|record| {
@@ -271,9 +329,70 @@ impl MdlRegistry {
         if !m.locked {
             return Err(MdlError::StaleId);
         }
-        if length == 0 || offset + length > m.byte_count as u64 {
+        if length == 0
+            || offset
+                .checked_add(length)
+                .is_none_or(|end| end > m.byte_count as u64)
+        {
             return Err(MdlError::OutOfRange);
         }
+        Ok(())
+    }
+
+    /// Retain an exact range of a locked hosted MDL for read-side projection.
+    /// The returned virtual address is only an address value; the host must
+    /// authenticate and copy bytes through its own source-memory boundary.
+    pub fn acquire_read_lease(
+        &mut self,
+        key: MdlKey,
+        offset: u64,
+        length: u64,
+    ) -> Result<MdlReadLease, MdlError> {
+        let record = self.find_key(key).ok_or(MdlError::StaleId)?;
+        self.validate_slice(record.id, offset, length)?;
+        let virtual_address = record
+            .virtual_address
+            .checked_add(offset)
+            .ok_or(MdlError::OutOfRange)?;
+        virtual_address
+            .checked_add(length - 1)
+            .ok_or(MdlError::OutOfRange)?;
+        let length = u32::try_from(length).map_err(|_| MdlError::OutOfRange)?;
+        let mdl_id = record.id;
+        let generation = record.generation;
+        self.read_leases
+            .try_reserve(1)
+            .map_err(|_| MdlError::InsufficientResources)?;
+        let lease_id = NEXT_READ_LEASE_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| MdlError::LeaseIdsExhausted)?;
+        let lease = MdlReadLease {
+            lease_id,
+            key,
+            mdl_id,
+            generation,
+            virtual_address,
+            length,
+        };
+        self.read_leases.push(lease);
+        Ok(lease)
+    }
+
+    /// Release only the exact lease issued by this registry. A failed release
+    /// leaves the original lease in place for retry or explicit recovery.
+    pub fn release_read_lease(&mut self, lease: MdlReadLease) -> Result<(), MdlError> {
+        let position = self
+            .read_leases
+            .iter()
+            .position(|held| *held == lease)
+            .ok_or(MdlError::StaleId)?;
+        let record = self.find(lease.mdl_id).ok_or(MdlError::StaleId)?;
+        if record.key != Some(lease.key) || record.generation != lease.generation {
+            return Err(MdlError::StaleId);
+        }
+        self.read_leases.remove(position);
         Ok(())
     }
 
@@ -294,6 +413,9 @@ impl MdlRegistry {
     /// (spec §8.4).
     pub fn free(&mut self, id: u64) -> Result<(), MdlError> {
         let m = self.find(id).ok_or(MdlError::StaleId)?;
+        if self.has_read_lease(id) {
+            return Err(MdlError::ActiveReadLeases);
+        }
         if m.active_mappings > 0 {
             return Err(MdlError::ActiveMappings);
         }
@@ -394,5 +516,93 @@ mod tests {
         assert_eq!(r.revoke_domain(9, 4), Ok(1));
         assert_eq!(r.id_for(old), None);
         assert!(r.id_for(current).is_some());
+    }
+
+    #[test]
+    fn read_lease_retains_exact_locked_range_until_release() {
+        let mut r = MdlRegistry::new();
+        let key = MdlKey::new(15, 7, 0x300100).unwrap();
+        let id = r.register(key, 0x8123, 128).unwrap();
+        assert_eq!(r.acquire_read_lease(key, 4, 8), Err(MdlError::StaleId));
+        r.build_for_nonpaged_key(key).unwrap();
+        let lease = r.acquire_read_lease(key, 4, 8).unwrap();
+        assert_eq!(lease.virtual_address(), 0x8127);
+        assert_eq!(lease.length(), 8);
+        assert_eq!(lease.key(), key);
+        assert_eq!(
+            r.update_key(key, 0x9000, 16),
+            Err(MdlError::ActiveReadLeases)
+        );
+        assert_eq!(r.unlock_key(key), Err(MdlError::ActiveReadLeases));
+        assert_eq!(r.can_free_key(key), Err(MdlError::ActiveReadLeases));
+        assert_eq!(r.free_key(key), Err(MdlError::ActiveReadLeases));
+        assert_eq!(r.free(id), Err(MdlError::ActiveReadLeases));
+        assert_eq!(r.revoke_domain(15, 7), Err(MdlError::ActiveReadLeases));
+        assert_eq!(r.virtual_address(id), Some(0x8123));
+        r.release_read_lease(lease).unwrap();
+        assert_eq!(r.release_read_lease(lease), Err(MdlError::StaleId));
+        r.update_key(key, 0x9000, 16).unwrap();
+        r.free_key(key).unwrap();
+    }
+
+    #[test]
+    fn failed_release_preserves_exact_lease_and_other_readers() {
+        let mut r = MdlRegistry::new();
+        let key = MdlKey::new(20, 2, 0x400100).unwrap();
+        let other_generation = MdlKey::new(20, 3, 0x400100).unwrap();
+        r.register(key, 0x10000, 32).unwrap();
+        r.register(other_generation, 0x20000, 32).unwrap();
+        r.build_for_nonpaged_key(key).unwrap();
+        r.build_for_nonpaged_key(other_generation).unwrap();
+        let first = r.acquire_read_lease(key, 0, 16).unwrap();
+        let second = r.acquire_read_lease(key, 16, 16).unwrap();
+        let altered = MdlReadLease {
+            key: other_generation,
+            ..first
+        };
+        assert_eq!(r.release_read_lease(altered), Err(MdlError::StaleId));
+        assert_eq!(r.free_key(key), Err(MdlError::ActiveReadLeases));
+        r.release_read_lease(first).unwrap();
+        assert_eq!(r.free_key(key), Err(MdlError::ActiveReadLeases));
+        r.release_read_lease(second).unwrap();
+        r.free_key(key).unwrap();
+        assert_eq!(r.acquire_read_lease(key, 0, 1), Err(MdlError::StaleId));
+        assert!(r.id_for(other_generation).is_some());
+    }
+
+    #[test]
+    fn lease_from_another_registry_cannot_release_same_key_and_range() {
+        let key = MdlKey::new(25, 9, 0x410000).unwrap();
+        let mut first = MdlRegistry::new();
+        let mut second = MdlRegistry::new();
+        first.register(key, 0x12000, 16).unwrap();
+        second.register(key, 0x12000, 16).unwrap();
+        first.build_for_nonpaged_key(key).unwrap();
+        second.build_for_nonpaged_key(key).unwrap();
+        let first_lease = first.acquire_read_lease(key, 0, 8).unwrap();
+        let second_lease = second.acquire_read_lease(key, 0, 8).unwrap();
+        assert_eq!(
+            second.release_read_lease(first_lease),
+            Err(MdlError::StaleId)
+        );
+        assert_eq!(second.free_key(key), Err(MdlError::ActiveReadLeases));
+        first.release_read_lease(first_lease).unwrap();
+        second.release_read_lease(second_lease).unwrap();
+    }
+
+    #[test]
+    fn read_lease_rejects_offset_length_and_address_overflow() {
+        let mut r = MdlRegistry::new();
+        let key = MdlKey::new(30, 1, 0x500100).unwrap();
+        let id = r.register(key, u64::MAX - 3, 16).unwrap();
+        r.build_for_nonpaged_key(key).unwrap();
+        assert_eq!(r.validate_slice(id, u64::MAX, 8), Err(MdlError::OutOfRange));
+        assert_eq!(r.acquire_read_lease(key, 0, 0), Err(MdlError::OutOfRange));
+        assert_eq!(r.acquire_read_lease(key, 16, 1), Err(MdlError::OutOfRange));
+        assert_eq!(r.acquire_read_lease(key, 0, 16), Err(MdlError::OutOfRange));
+        assert_eq!(r.acquire_read_lease(key, 4, 1), Err(MdlError::OutOfRange));
+        let lease = r.acquire_read_lease(key, 3, 1).unwrap();
+        assert_eq!(lease.virtual_address(), u64::MAX);
+        r.release_read_lease(lease).unwrap();
     }
 }

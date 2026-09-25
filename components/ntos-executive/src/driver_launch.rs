@@ -82,6 +82,8 @@ mod hosted_file_retirements;
 mod hosted_source_irp_ledger;
 #[path = "hosted_source_create_security.rs"]
 mod hosted_source_create_security;
+#[path = "hosted_source_pool_memory.rs"]
+mod hosted_source_pool_memory;
 #[path = "hosted_query_path_capture.rs"]
 mod hosted_query_path_capture;
 #[path = "hosted_query_path_work.rs"]
@@ -8713,18 +8715,48 @@ unsafe fn require_hosted_mdl_service(op: u64, mdl: u64, virtual_address: u64, le
 extern "win64" fn s_io_allocate_mdl(
     virtual_address: u64,
     length: u32,
-    _secondary_buffer: u8,
+    secondary_buffer: u8,
     _charge_quota: u8,
-    _irp: u64,
+    irp: u64,
 ) -> u64 {
     unsafe {
         if virtual_address == 0 || length == 0 {
             return 0;
         }
+        let link = if irp == 0 {
+            None
+        } else {
+            if validate_hosted_irp_packet(irp).is_none() {
+                return 0;
+            }
+            let mut slot = irp + 0x08;
+            if read_unaligned(slot as *const u64) != 0 && secondary_buffer == 0 {
+                return 0;
+            }
+            let mut count = 0usize;
+            while secondary_buffer != 0 {
+                let current = read_unaligned(slot as *const u64);
+                if current == 0 {
+                    break;
+                }
+                if count == 256
+                    || component_pool_allocation_capacity(current)
+                        .is_none_or(|capacity| capacity < nt_mdl::MDL_SIZE as u64)
+                    || read_unaligned((current + nt_mdl::MDL_OFF_SIZE) as *const i16)
+                        != nt_mdl::MDL_SIZE as i16
+                {
+                    return 0;
+                }
+                slot = current + nt_mdl::MDL_OFF_NEXT;
+                count += 1;
+            }
+            Some(slot)
+        };
         let mdl = pool_alloc(nt_mdl::MDL_SIZE as u64);
         if mdl == 0 {
             return 0;
         }
+        core::ptr::write_bytes(mdl as *mut u8, 0, nt_mdl::MDL_SIZE);
         write_unaligned((mdl + nt_mdl::MDL_OFF_NEXT) as *mut u64, 0);
         write_unaligned(
             (mdl + nt_mdl::MDL_OFF_SIZE) as *mut i16,
@@ -8748,6 +8780,9 @@ extern "win64" fn s_io_allocate_mdl(
         {
             pool_free(mdl);
             return 0;
+        }
+        if let Some(slot) = link {
+            write_unaligned(slot as *mut u64, mdl);
         }
         mdl
     }
@@ -53550,7 +53585,12 @@ pub(crate) fn service_hosted_driver_dma_adapter(
 fn hosted_mdl_status(error: nt_mdl::MdlError) -> nt_status::NtStatus {
     match error {
         nt_mdl::MdlError::AlreadyExists => nt_status::NtStatus::OBJECT_NAME_COLLISION,
-        nt_mdl::MdlError::ActiveMappings => nt_status::NtStatus::DEVICE_BUSY,
+        nt_mdl::MdlError::ActiveMappings | nt_mdl::MdlError::ActiveReadLeases => {
+            nt_status::NtStatus::DEVICE_BUSY
+        }
+        nt_mdl::MdlError::InsufficientResources | nt_mdl::MdlError::LeaseIdsExhausted => {
+            nt_status::NtStatus::INSUFFICIENT_RESOURCES
+        }
         nt_mdl::MdlError::InvalidKey
         | nt_mdl::MdlError::StaleId
         | nt_mdl::MdlError::OutOfRange => nt_status::NtStatus::INVALID_PARAMETER,
