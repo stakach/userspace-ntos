@@ -30,4 +30,11 @@ fi
     /subsystem:native,5.2 /osversion:5.2 /nodefaultlib /dynamicbase /nxcompat /timestamp:0 \
     /export:MupProviderEvidence,DATA "/out:$OUT/mup_provider.sys" \
     "$OUT/mup_provider.obj" "$OUT/ntoskrnl.lib"
-printf 'Prepared native Mup provider fixture: %s/mup_provider.sys (not staged or executed)\n' "$OUT"
+"$CLANG" --target=x86_64-pc-windows-msvc -fms-extensions -ffreestanding \
+    -fno-builtin -fno-stack-protector -mno-stack-arg-probe -fno-ident \
+    -Wall -Wextra -Werror -O2 -c "$HERE/read_forward.c" -o "$OUT/read_forward.obj"
+"$RUST_LLD" -flavor link /machine:x64 /driver /dll /entry:DriverEntry \
+    /subsystem:native,5.2 /osversion:5.2 /nodefaultlib /dynamicbase /nxcompat /timestamp:0 \
+    "/out:$OUT/read_forward.sys" \
+    "$OUT/read_forward.obj" "$OUT/ntoskrnl.lib"
+printf 'Prepared native Mup provider and READ source fixtures: %s (not staged or executed)\n' "$OUT"

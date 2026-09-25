@@ -80,11 +80,13 @@ impl ReadCompletion {
             .try_reserve_exact(bytes.len())
             .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
         owned.extend_from_slice(bytes);
-        Ok(Self {
-            status,
-            information,
-            bytes: owned,
-        })
+        Ok(Self::from_owned(status, information, owned))
+    }
+
+    /// Adopt provider output without a second allocation after its dispatch has retired.
+    /// The forward owner validates terminal bounds before publication.
+    pub fn from_owned(status: u32, information: u64, bytes: Vec<u8>) -> Self {
+        Self { status, information, bytes }
     }
 
     pub fn status(&self) -> u32 {
@@ -414,6 +416,15 @@ mod tests {
         source[0] = 8;
         assert_eq!(source[0], 8);
         assert_eq!(output.bytes(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn immediate_completion_adopts_provider_output_without_copying() {
+        let output = alloc::vec![4, 5, 6];
+        let address = output.as_ptr();
+        let completion = ReadCompletion::from_owned(0, 3, output);
+        assert_eq!(completion.bytes(), &[4, 5, 6]);
+        assert_eq!(completion.bytes().as_ptr(), address);
     }
 
     #[test]

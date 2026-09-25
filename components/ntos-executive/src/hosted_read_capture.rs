@@ -1,13 +1,13 @@
-//! Source-domain ownership and buffered-byte capture for a hosted WRITE forward.
+//! Source-domain ownership and buffered output for a hosted READ forward.
 
 use super::*;
 use super::hosted_source_pool_memory::SourcePoolMemory;
 use nt_io_manager::{
     hosted_forward_target::HostedForwardTarget,
     retained_query_path_forward::SourceIrpTicket,
-    retained_write_forward::{
-        select_write_buffer_source, CapturedWrite, PreparedWriteForward, TerminalWriteForward,
-        WriteBufferSource, WriteCompletion, WriteForwardIdentity,
+    retained_read_forward::{
+        CapturedRead, PreparedReadForward, ReadCompletion, ReadForwardIdentity,
+        TerminalReadForward,
     },
     source_irp_ledger::SourceIrpAllocation,
     DeviceFlags, HostedDomainIdentity, StackFlags,
@@ -23,24 +23,26 @@ pub(super) enum CaptureError {
     InvalidFile,
     InvalidTarget,
     UnsupportedBuffer,
-    InsufficientResources,
 }
 
 #[must_use = "retain until source-local completion and exact target retirement"]
-pub(super) struct CapturedSourceWrite {
+pub(super) struct CapturedSourceRead {
     instance_index: usize,
     allocation: SourceIrpAllocation,
     source: SourceIrpTicket,
+    source_stack_address: u64,
+    system_buffer: u64,
+    source_file_address: u64,
+    target_device_address: u64,
     source_file: Option<hosted_consumer_file_objects::ForwardFileOwner>,
     target: Option<HostedForwardTarget>,
-    write: Option<CapturedWrite>,
+    read: Option<CapturedRead>,
     pinned: bool,
-    forward_identity: Option<WriteForwardIdentity>,
+    forward_identity: Option<ReadForwardIdentity>,
     target_retired: bool,
 }
 
-impl CapturedSourceWrite {
-    pub(super) fn source_ticket(&self) -> SourceIrpTicket { self.source }
+impl CapturedSourceRead {
     pub(super) fn source_irp_address(&self) -> u64 { self.allocation.component_address }
     pub(super) fn file_id(&self) -> nt_io_manager::FileId {
         self.source_file.as_ref().expect("source File released").file_id()
@@ -48,8 +50,8 @@ impl CapturedSourceWrite {
     pub(super) fn device_id(&self) -> nt_io_manager::DeviceId {
         self.source_file.as_ref().expect("source File released").device_id()
     }
-    pub(super) fn write(&self) -> &CapturedWrite {
-        self.write.as_ref().expect("WRITE bytes prepared")
+    pub(super) fn read(&self) -> &CapturedRead {
+        self.read.as_ref().expect("READ parameters prepared")
     }
 
     pub(super) fn validate_source(&self) -> Result<(), CaptureError> {
@@ -76,6 +78,42 @@ impl CapturedSourceWrite {
         ).ok_or(CaptureError::InvalidSourceIrp)
     }
 
+    /// Write only into the captured, still-live source buffer before local completion unwinds.
+    pub(super) unsafe fn write_output(&self, completion: &ReadCompletion) -> Result<(), CaptureError> {
+        self.validate_source()?;
+        let read = self.read();
+        if completion.information() > u64::from(read.length())
+            || completion.bytes().len() as u64 != completion.information()
+        {
+            return Err(CaptureError::InvalidSourceBuffer);
+        }
+        let inst = instance(self.instance_index).ok_or(CaptureError::InvalidSourceIrp)?;
+        let memory = SourcePoolMemory::new(inst).ok_or(CaptureError::InvalidSourceIrp)?;
+        let irp = memory.read_value::<Irp>(self.allocation.component_address)
+            .ok_or(CaptureError::InvalidSourceIrp)?;
+        let stack = memory.read_value::<IoStackLocation>(self.source_stack_address)
+            .ok_or(CaptureError::InvalidSourceIrp)?;
+        if irp.type_ != WDM_X64_IO_TYPE_IRP as i16
+            || irp.size as u64 != self.allocation.bytes
+            || irp.associated_irp_system_buffer.0 != self.system_buffer
+            || irp._tail_post[..8] != self.source_file_address.to_le_bytes()
+            || stack.major_function != major::IRP_MJ_READ
+            || stack.file_object.0 != self.source_file_address
+            || stack.device_object.0 != self.target_device_address
+            || stack.read_write().length != read.length()
+            || stack.read_write().key != read.key()
+            || stack.read_write().byte_offset != read.byte_offset()
+        {
+            return Err(CaptureError::InvalidSourceIrp);
+        }
+        if !completion.bytes().is_empty()
+            && !memory.write(self.system_buffer, completion.bytes())
+        {
+            return Err(CaptureError::InvalidSourceBuffer);
+        }
+        Ok(())
+    }
+
     pub(super) fn arm_callback_free(&self) -> Result<(), CaptureError> {
         self.validate_source()?;
         hosted_source_irp_ledger::arm_deferred_free(self.source)
@@ -86,18 +124,18 @@ impl CapturedSourceWrite {
         hosted_source_irp_ledger::deferred_free_requested(self.source)
     }
 
-    pub(super) fn prepare(&mut self) -> Result<PreparedWriteForward, CaptureError> {
+    pub(super) fn prepare(&mut self) -> Result<PreparedReadForward, CaptureError> {
         self.validate_source()?;
         let target = self.target.take().ok_or(CaptureError::InvalidTarget)?;
-        let write = self.write.take().ok_or(CaptureError::InvalidSourceIrp)?;
-        let prepared = PreparedWriteForward::new(self.source, target, self.file_id(), write);
+        let read = *self.read();
+        let prepared = PreparedReadForward::new(self.source, target, self.file_id(), read);
         self.forward_identity = Some(prepared.identity());
         Ok(prepared)
     }
 
     pub(super) fn retire_target_after_source_completion(
-        &mut self, terminal: TerminalWriteForward,
-    ) -> Result<WriteCompletion, (CaptureError, TerminalWriteForward)> {
+        &mut self, terminal: TerminalReadForward,
+    ) -> Result<ReadCompletion, (CaptureError, TerminalReadForward)> {
         if self.forward_identity != Some(terminal.identity())
             || self.target_retired || !self.callback_requested_free()
         {
@@ -110,8 +148,8 @@ impl CapturedSourceWrite {
     }
 
     pub(super) fn retire_target_after_source_stop(
-        &mut self, terminal: TerminalWriteForward,
-    ) -> Result<WriteCompletion, (CaptureError, TerminalWriteForward)> {
+        &mut self, terminal: TerminalReadForward,
+    ) -> Result<ReadCompletion, (CaptureError, TerminalReadForward)> {
         if self.forward_identity != Some(terminal.identity())
             || self.target_retired || self.callback_requested_free()
         {
@@ -147,9 +185,7 @@ impl CapturedSourceWrite {
 fn source_stack_address(
     allocation: SourceIrpAllocation, irp: &Irp,
 ) -> Result<u64, CaptureError> {
-    if irp.type_ != WDM_X64_IO_TYPE_IRP as i16
-        || irp.size as u64 != allocation.bytes
-    {
+    if irp.type_ != WDM_X64_IO_TYPE_IRP as i16 || irp.size as u64 != allocation.bytes {
         return Err(CaptureError::InvalidSourceIrp);
     }
     let location = u8::try_from(irp.current_location)
@@ -172,7 +208,7 @@ pub(super) unsafe fn capture(
     reply_cap: u64,
     source_irp_address: u64,
     target_device_address: u64,
-) -> Result<CapturedSourceWrite, CaptureError> {
+) -> Result<CapturedSourceRead, CaptureError> {
     let (instance_index, inst) =
         instance_for_pump_channel(ch, reply_cap).ok_or(CaptureError::InvalidCaller)?;
     let domain: HostedDomainIdentity =
@@ -181,15 +217,16 @@ pub(super) unsafe fn capture(
         hosted_source_irp_ledger::pin(instance_index, domain, source_irp_address)
             .ok_or(CaptureError::InvalidSourceIrp)?;
     let result = (|| {
-        let (initial_irp, initial_stack) = {
+        let (initial_irp, initial_stack, stack_address) = {
             let memory = SourcePoolMemory::new(inst).ok_or(CaptureError::InvalidSourceIrp)?;
             let irp = memory.read_value::<Irp>(source_irp_address)
                 .ok_or(CaptureError::InvalidSourceIrp)?;
-            let stack = memory.read_value::<IoStackLocation>(source_stack_address(allocation, &irp)?)
+            let stack_address = source_stack_address(allocation, &irp)?;
+            let stack = memory.read_value::<IoStackLocation>(stack_address)
                 .ok_or(CaptureError::InvalidSourceIrp)?;
-            (irp, stack)
+            (irp, stack, stack_address)
         };
-        if initial_stack.major_function != major::IRP_MJ_WRITE
+        if initial_stack.major_function != major::IRP_MJ_READ
             || initial_stack.device_object.0 != target_device_address
             || initial_stack.file_object.0 == 0
             || initial_irp._tail_post[..8] != initial_stack.file_object.0.to_le_bytes()
@@ -204,7 +241,7 @@ pub(super) unsafe fn capture(
         ) {
             Ok(target) => target,
             Err(_) => {
-                source_file.release().expect("unentered WRITE File rollback");
+                source_file.release().expect("unentered READ File rollback");
                 return Err(CaptureError::InvalidTarget);
             }
         };
@@ -214,60 +251,44 @@ pub(super) unsafe fn capture(
             }
             let flags: DeviceFlags = io_manager_mut().device(target.device_id())
                 .ok_or(CaptureError::InvalidTarget)?.flags;
-            let params = initial_stack.read_write();
-            let buffer = select_write_buffer_source(
-                flags, params.length, initial_irp.associated_irp_system_buffer.0,
-                initial_irp.mdl_address.0, initial_irp.user_buffer.0,
-            ).map_err(|_| CaptureError::InvalidSourceBuffer)?;
-            // Direct and neither I/O require authenticated process-backed reads. Never
-            // interpret their virtual addresses as executive or provider pointers.
-            let mut bytes = Vec::new();
-            match buffer {
-                WriteBufferSource::Empty => {}
-                WriteBufferSource::SystemBuffer(address) => {
-                    bytes.try_reserve_exact(params.length as usize)
-                        .map_err(|_| CaptureError::InsufficientResources)?;
-                    bytes.resize(params.length as usize, 0);
-                    let memory = SourcePoolMemory::new(inst)
-                        .ok_or(CaptureError::InvalidSourceIrp)?;
-                    let irp = memory.read_value::<Irp>(source_irp_address)
-                        .ok_or(CaptureError::InvalidSourceIrp)?;
-                    let stack = memory.read_value::<IoStackLocation>(
-                        source_stack_address(allocation, &irp)?,
-                    ).ok_or(CaptureError::InvalidSourceIrp)?;
-                    if irp != initial_irp || stack != initial_stack
-                        || !memory.read(address, &mut bytes)
-                    {
-                        return Err(CaptureError::InvalidSourceBuffer);
-                    }
-                }
-                WriteBufferSource::Mdl(_) | WriteBufferSource::UserBuffer(_) => {
-                    return Err(CaptureError::UnsupportedBuffer);
-                }
+            if !flags.contains(DeviceFlags::BUFFERED_IO) {
+                return Err(CaptureError::UnsupportedBuffer);
             }
-            CapturedWrite::capture(
-                &bytes, params.length, params.key, params.byte_offset,
+            let params = initial_stack.read_write();
+            let buffer = initial_irp.associated_irp_system_buffer.0;
+            let memory = SourcePoolMemory::new(inst).ok_or(CaptureError::InvalidSourceIrp)?;
+            if params.length != 0 && (buffer == 0 || !memory.contains(buffer, params.length as usize)) {
+                return Err(CaptureError::InvalidSourceBuffer);
+            }
+            let irp = memory.read_value::<Irp>(source_irp_address)
+                .ok_or(CaptureError::InvalidSourceIrp)?;
+            let stack = memory.read_value::<IoStackLocation>(stack_address)
+                .ok_or(CaptureError::InvalidSourceIrp)?;
+            if irp != initial_irp || stack != initial_stack {
+                return Err(CaptureError::InvalidSourceIrp);
+            }
+            Ok((buffer, CapturedRead::new(
+                params.length, params.key, params.byte_offset,
                 StackFlags::from_bits_retain(initial_stack.flags),
-            ).map_err(|status| if status == nt_status::NtStatus::INSUFFICIENT_RESOURCES {
-                CaptureError::InsufficientResources
-            } else { CaptureError::InvalidSourceBuffer })
+            )))
         })();
-        let write = match captured {
-            Ok(write) => write,
+        let (system_buffer, read) = match captured {
+            Ok(value) => value,
             Err(error) => {
-                target.release(io_manager_mut()).expect("unentered WRITE target rollback");
-                source_file.release().expect("unentered WRITE File rollback");
+                target.release(io_manager_mut()).expect("unentered READ target rollback");
+                source_file.release().expect("unentered READ File rollback");
                 return Err(error);
             }
         };
-        Ok(CapturedSourceWrite {
-            instance_index, allocation, source,
-            source_file: Some(source_file), target: Some(target), write: Some(write),
-            pinned: true, forward_identity: None, target_retired: false,
+        Ok(CapturedSourceRead {
+            instance_index, allocation, source, source_stack_address: stack_address,
+            system_buffer, source_file_address: initial_stack.file_object.0,
+            target_device_address, source_file: Some(source_file), target: Some(target),
+            read: Some(read), pinned: true, forward_identity: None, target_retired: false,
         })
     })();
     if result.is_err() {
-        assert!(hosted_source_irp_ledger::unpin(source), "unentered WRITE source rollback");
+        assert!(hosted_source_irp_ledger::unpin(source), "unentered READ source rollback");
     }
     result
 }

@@ -16,6 +16,7 @@ typedef void *HANDLE;
 
 #define IRP_MJ_CREATE 0x00
 #define IRP_MJ_CLOSE 0x02
+#define IRP_MJ_READ 0x03
 #define IRP_MJ_WRITE 0x04
 #define IRP_MJ_DEVICE_CONTROL 0x0e
 #define IRP_MJ_CLEANUP 0x12
@@ -99,9 +100,20 @@ typedef struct _IO_STACK_LOCATION {
         } DeviceIoControl;
         struct {
             uint32_t Length;
+            uint32_t Reserved0;
             uint32_t Key;
+            uint32_t Reserved1;
             int64_t ByteOffset;
+            uint64_t Reserved2;
         } Write;
+        struct {
+            uint32_t Length;
+            uint32_t Reserved0;
+            uint32_t Key;
+            uint32_t Reserved1;
+            int64_t ByteOffset;
+            uint64_t Reserved2;
+        } Read;
         uint8_t Bytes[32];
     } Parameters;
     DEVICE_OBJECT *DeviceObject;
@@ -190,6 +202,8 @@ struct MupProviderEvidence {
     uint32_t probe_file_closed;
     uint32_t probe_write_count;
     uint32_t probe_write_bytes;
+    uint32_t probe_read_count;
+    uint32_t probe_read_bytes;
     uint32_t query_count;
     uint32_t query_accepted;
     uint32_t query_rejected;
@@ -224,6 +238,7 @@ static const WCHAR ProbeRelativeName[] = {
     '\\', 's', 'h', 'a', 'r', 'e'
 };
 static const uint8_t ProbeWriteBytes[] = {'n', 't', 'o', 's', '-', 'w', 'r', 'i', 't', 'e'};
+static const uint8_t ProbeReadBytes[] = {'n', 't', 'o', 's', '-', 'r', 'e', 'a', 'd', '!'};
 
 static int IsProbeFileName(const UNICODE_STRING *name)
 {
@@ -317,6 +332,26 @@ static NTSTATUS __stdcall ProviderWrite(DEVICE_OBJECT *device, IRP *irp)
              MupProviderEvidence.probe_write_count,
              MupProviderEvidence.probe_write_bytes);
     return Complete(irp, STATUS_SUCCESS, sizeof(ProbeWriteBytes));
+}
+
+static NTSTATUS __stdcall ProviderRead(DEVICE_OBJECT *device, IRP *irp)
+{
+    (void)device;
+    IO_STACK_LOCATION *stack = irp->CurrentStackLocation;
+    if (stack == NULL || stack->FileObject == NULL ||
+        stack->Parameters.Read.Length != sizeof(ProbeReadBytes) ||
+        stack->Parameters.Read.ByteOffset != 0 ||
+        irp->AssociatedSystemBuffer == NULL) {
+        return Complete(irp, STATUS_INVALID_PARAMETER, 0);
+    }
+    uint8_t *bytes = (uint8_t *)irp->AssociatedSystemBuffer;
+    for (uint32_t i = 0; i < sizeof(ProbeReadBytes); i++) bytes[i] = ProbeReadBytes[i];
+    MupProviderEvidence.probe_read_count++;
+    MupProviderEvidence.probe_read_bytes += sizeof(ProbeReadBytes);
+    DbgPrint("[mup-provider-read] count=%u bytes=%u\n",
+             MupProviderEvidence.probe_read_count,
+             MupProviderEvidence.probe_read_bytes);
+    return Complete(irp, STATUS_SUCCESS, sizeof(ProbeReadBytes));
 }
 
 static NTSTATUS __stdcall ProviderDeviceControl(DEVICE_OBJECT *device, IRP *irp)
@@ -501,6 +536,7 @@ NTSTATUS __stdcall DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *registry_p
     driver->MajorFunction[IRP_MJ_CREATE] = ProviderCreate;
     driver->MajorFunction[IRP_MJ_CLEANUP] = ProviderCleanup;
     driver->MajorFunction[IRP_MJ_CLOSE] = ProviderClose;
+    driver->MajorFunction[IRP_MJ_READ] = ProviderRead;
     driver->MajorFunction[IRP_MJ_WRITE] = ProviderWrite;
     driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = ProviderDeviceControl;
     driver->DriverUnload = ProviderUnload;
