@@ -93,6 +93,29 @@ fn admission_keeps_call_stored_and_recycles_only_displaced_reply() {
 }
 
 #[test]
+fn same_lane_is_not_ready_for_a_second_dispatch_while_first_reply_is_owned() {
+    let (mut lanes, mut peers, route, mut owner, _) = setup();
+    let mut pool = IngressReplyPool::new(20, 2).unwrap();
+    pool.insert(ComponentIngress::new(20, 41).unwrap(), &owner, &lanes, free)
+        .ok().unwrap();
+    call(&mut owner, &lanes);
+    pool.retain(&mut owner, &lanes, &mut peers, route.badge(), free, bound)
+        .unwrap();
+    assert!(pool.ready_for_admission(&owner, route, &lanes));
+    let first = pool.admit(&mut owner, route, &mut lanes, &peers, 1, 2, |_, reply| {
+        Ok::<_, u8>(if reply == 30 {
+            ReplyBindingObservation::Free
+        } else {
+            ReplyBindingObservation::BoundToTarget
+        })
+    }).unwrap();
+    assert!(!pool.ready_for_admission(&owner, route, &lanes));
+    assert_eq!(lanes.active_dispatch_identity(first.lane), Ok(Some(first)));
+    assert!(owner.excludes_reply(40));
+    assert!(pool.excludes_reply(30));
+}
+
+#[test]
 fn admission_query_failure_preserves_stored_call_and_all_ownership() {
     for fail_reply in [30, 40] {
         let (mut lanes, mut peers, route, mut owner, mut pool) = setup();

@@ -659,6 +659,17 @@ pub(crate) unsafe fn admit(route: PeerRoute) -> Result<LaneDispatchIdentity, Err
         .map_err(|_| Error::Admission)
 }
 
+/// Scheduling hint only; `admit` still owns the final physical Reply check.
+pub(crate) unsafe fn ready_for_admission(route: PeerRoute) -> Result<bool, Error> {
+    if resolve(route, false).is_none() {
+        return Err(Error::PhysicalIdentity);
+    }
+    let ingress = owner();
+    let receiver = ingress.receiver.as_ref().ok_or(Error::Initialization)?;
+    let replacements = ingress.replacements.as_ref().ok_or(Error::Initialization)?;
+    Ok(replacements.ready_for_admission(receiver, route, lanes()))
+}
+
 /// Resolve a transport snapshot through its retained physical source, not its numeric badge.
 pub(crate) unsafe fn channel_route(
     channel: &crate::spawn_hosts::PumpChannel,

@@ -8,7 +8,7 @@ use core::convert::Infallible;
 use crate::peer_registry::PeerRoute;
 use crate::{peer_registry::PeerRegistry, ReservedReceiveError};
 use crate::{ComponentIngress, ComponentSuspensionLanes, IngressReceiver, ReplyBindingObservation};
-use crate::{LaneDispatchIdentity, RetainedDispatchError, RetainedWorkError};
+use crate::{LaneDispatchIdentity, LanePhase, RetainedDispatchError, RetainedWorkError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplyAdmissionError<E> {
@@ -48,6 +48,32 @@ pub struct IngressReplyPool<M> {
 }
 
 impl<M> IngressReplyPool<M> {
+    /// A read-only scheduling hint. `admit` still validates the exact Call and Reply bindings.
+    pub fn ready_for_admission<C, R, T>(
+        &self,
+        receiver: &IngressReceiver<M>,
+        route: PeerRoute,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+    ) -> bool {
+        if receiver.endpoint() != self.endpoint
+            || route.endpoint() != self.endpoint
+            || receiver.phase().is_some()
+            || self.entries.len() == self.capacity
+            || lanes.phase(route.identity().lane) != Ok(LanePhase::Idle)
+        {
+            return false;
+        }
+        let Ok(binding) = lanes.binding(route.identity().lane) else {
+            return false;
+        };
+        let old = binding.reply_object;
+        if receiver.excludes_reply(old) || self.excludes_reply(old) {
+            return false;
+        }
+        receiver.next_unadmitted(route)
+            .is_some_and(|(incoming, _)| !self.excludes_reply(incoming))
+    }
+
     /// Admit a stored Call and recycle the displaced canonical Reply in one transaction.
     /// All fallible pool checks precede dispatch mutation; the final push uses reserved capacity
     /// and the Free proof collected by canonical admission, not another native query.

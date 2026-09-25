@@ -12,6 +12,7 @@ typedef void *HANDLE;
 #define STATUS_BAD_NETWORK_NAME ((NTSTATUS)0xc00000ccu)
 #define STATUS_INVALID_PARAMETER ((NTSTATUS)0xc000000du)
 #define STATUS_UNSUCCESSFUL ((NTSTATUS)0xc0000001u)
+#define STATUS_DEVICE_BUSY ((NTSTATUS)0xc000009eu)
 #define NT_SUCCESS(status) ((status) >= 0)
 
 #define IRP_MJ_CREATE 0x00
@@ -21,6 +22,7 @@ typedef void *HANDLE;
 #define IRP_MJ_DEVICE_CONTROL 0x0e
 #define IRP_MJ_CLEANUP 0x12
 #define IRP_MJ_MAXIMUM_FUNCTION 0x1b
+#define SL_PENDING_RETURNED 0x01
 #define DO_DEVICE_INITIALIZING 0x80
 #define DO_BUFFERED_IO 0x04
 #define FILE_DEVICE_NETWORK_FILE_SYSTEM 0x14
@@ -183,6 +185,7 @@ __declspec(dllimport) NTSTATUS __stdcall ZwClose(HANDLE);
 __declspec(dllimport) NTSTATUS __stdcall PsCreateSystemThread(HANDLE *, uint32_t,
     OBJECT_ATTRIBUTES *, HANDLE, void *, void (__stdcall *)(void *), void *);
 __declspec(dllimport) void __stdcall PsTerminateSystemThread(NTSTATUS);
+__declspec(dllimport) NTSTATUS __stdcall KeDelayExecutionThread(uint8_t, uint8_t, int64_t *);
 __declspec(dllimport) int __cdecl DbgPrint(const char *, ...);
 
 struct MupProviderEvidence {
@@ -239,6 +242,7 @@ static const WCHAR ProbeRelativeName[] = {
 };
 static const uint8_t ProbeWriteBytes[] = {'n', 't', 'o', 's', '-', 'w', 'r', 'i', 't', 'e'};
 static const uint8_t ProbeReadBytes[] = {'n', 't', 'o', 's', '-', 'r', 'e', 'a', 'd', '!'};
+static IRP *PendingReadIrp;
 
 static int IsProbeFileName(const UNICODE_STRING *name)
 {
@@ -334,20 +338,38 @@ static NTSTATUS __stdcall ProviderWrite(DEVICE_OBJECT *device, IRP *irp)
     return Complete(irp, STATUS_SUCCESS, sizeof(ProbeWriteBytes));
 }
 
+static void FillRead(IRP *irp)
+{
+    uint8_t *bytes = (uint8_t *)irp->AssociatedSystemBuffer;
+    for (uint32_t i = 0; i < sizeof(ProbeReadBytes); i++) bytes[i] = ProbeReadBytes[i];
+    MupProviderEvidence.probe_read_count++;
+    MupProviderEvidence.probe_read_bytes += sizeof(ProbeReadBytes);
+}
+
 static NTSTATUS __stdcall ProviderRead(DEVICE_OBJECT *device, IRP *irp)
 {
     (void)device;
     IO_STACK_LOCATION *stack = irp->CurrentStackLocation;
     if (stack == NULL || stack->FileObject == NULL ||
         stack->Parameters.Read.Length != sizeof(ProbeReadBytes) ||
-        stack->Parameters.Read.ByteOffset != 0 ||
+        (stack->Parameters.Read.ByteOffset != 0 &&
+         stack->Parameters.Read.ByteOffset != 1) ||
         irp->AssociatedSystemBuffer == NULL) {
         return Complete(irp, STATUS_INVALID_PARAMETER, 0);
     }
-    uint8_t *bytes = (uint8_t *)irp->AssociatedSystemBuffer;
-    for (uint32_t i = 0; i < sizeof(ProbeReadBytes); i++) bytes[i] = ProbeReadBytes[i];
-    MupProviderEvidence.probe_read_count++;
-    MupProviderEvidence.probe_read_bytes += sizeof(ProbeReadBytes);
+    if (stack->Parameters.Read.ByteOffset == 1) {
+        IRP *empty = NULL;
+        stack->Control |= SL_PENDING_RETURNED;
+        if (!__atomic_compare_exchange_n(&PendingReadIrp, &empty, irp, 0,
+                                         __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+            stack->Control &= (uint8_t)~SL_PENDING_RETURNED;
+            return Complete(irp, STATUS_DEVICE_BUSY, 0);
+        }
+        DbgPrint("[mup-provider-read-pending-dispatch] status=0x%08x\n",
+                 (uint32_t)STATUS_PENDING);
+        return STATUS_PENDING;
+    }
+    FillRead(irp);
     DbgPrint("[mup-provider-read] count=%u bytes=%u\n",
              MupProviderEvidence.probe_read_count,
              MupProviderEvidence.probe_read_bytes);
@@ -509,6 +531,21 @@ static void __stdcall RegistrationWorker(void *context)
                  MupProviderEvidence.probe_file_created,
                  MupProviderEvidence.probe_file_cleaned,
                  MupProviderEvidence.probe_file_closed);
+        for (uint32_t attempt = 0; attempt < 100; attempt++) {
+            IRP *pending = __atomic_exchange_n(&PendingReadIrp, NULL, __ATOMIC_ACQ_REL);
+            if (pending != NULL) {
+                int64_t delay = -1000000;
+                KeDelayExecutionThread(0, 0, &delay);
+                FillRead(pending);
+                DbgPrint("[mup-provider-read-pending-complete] count=%u bytes=%u\n",
+                         MupProviderEvidence.probe_read_count,
+                         MupProviderEvidence.probe_read_bytes);
+                Complete(pending, STATUS_SUCCESS, sizeof(ProbeReadBytes));
+                break;
+            }
+            int64_t delay = -1000000;
+            KeDelayExecutionThread(0, 0, &delay);
+        }
         PsTerminateSystemThread(STATUS_SUCCESS);
         return;
     }

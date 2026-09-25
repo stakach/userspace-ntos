@@ -135,6 +135,65 @@ static WCHAR ProviderName[] = {
 };
 static const uint8_t ExpectedBytes[] = {'n', 't', 'o', 's', '-', 'r', 'e', 'a', 'd', '!'};
 
+static NTSTATUS ForwardOnce(void *file, DEVICE_OBJECT *device, int64_t offset)
+{
+    uint8_t output[sizeof(ExpectedBytes)];
+    for (uint32_t i = 0; i < sizeof(output); i++) output[i] = 0xcc;
+    void *system_buffer = ExAllocatePoolWithTag(PagedPool, sizeof(output), 0x52646e74);
+    if (system_buffer == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+    for (uint32_t i = 0; i < sizeof(output); i++) ((uint8_t *)system_buffer)[i] = 0xa5;
+    IRP *irp = IoAllocateIrp(device->StackSize, 0);
+    if (irp == NULL) {
+        ExFreePoolWithTag(system_buffer, 0x52646e74);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    IO_STACK_LOCATION *stack = IoGetNextIrpStackLocation(irp);
+    if (stack == NULL) {
+        IoFreeIrp(irp);
+        ExFreePoolWithTag(system_buffer, 0x52646e74);
+        return STATUS_UNSUCCESSFUL;
+    }
+    IO_STATUS_BLOCK read_iosb = {0};
+    uint64_t completion_event[3] = {0};
+    KeInitializeEvent(completion_event, 1, 0);
+    irp->Flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION;
+    irp->AssociatedSystemBuffer = system_buffer;
+    irp->UserBuffer = output;
+    irp->UserIosb = &read_iosb;
+    irp->UserEvent = completion_event;
+    irp->OriginalFileObject = file;
+    stack->MajorFunction = IRP_MJ_READ;
+    stack->Read.Length = sizeof(output);
+    stack->Read.ByteOffset = offset;
+    stack->DeviceObject = device;
+    stack->FileObject = file;
+    DbgPrint("[read-forward-stage] offset=%u dispatching buffered IRP through IofCallDriver\n",
+             (uint32_t)offset);
+    NTSTATUS call_status = IofCallDriver(device, irp);
+    NTSTATUS wait_status = STATUS_UNSUCCESSFUL;
+    if (call_status == STATUS_SUCCESS || call_status == STATUS_PENDING)
+        wait_status = KeWaitForSingleObject(completion_event, 0, 0, 0, NULL);
+    NTSTATUS status = call_status == (offset == 0 ? STATUS_SUCCESS : STATUS_PENDING) &&
+                      wait_status == STATUS_SUCCESS &&
+                      read_iosb.Status == STATUS_SUCCESS &&
+                      read_iosb.Information == sizeof(output) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    if (status == STATUS_SUCCESS) {
+        for (uint32_t i = 0; i < sizeof(output); i++) {
+            if (output[i] != ExpectedBytes[i]) {
+                status = STATUS_UNSUCCESSFUL;
+                break;
+            }
+        }
+    }
+    DbgPrint("[read-forward-result] offset=%u call=0x%08x wait=0x%08x status=0x%08x iosb=0x%08x info=%u bytes-match=%u\n",
+             (uint32_t)offset, (uint32_t)call_status, (uint32_t)wait_status,
+             (uint32_t)status, (uint32_t)read_iosb.Status,
+             (uint32_t)read_iosb.Information, status == STATUS_SUCCESS);
+    if (status == STATUS_SUCCESS)
+        DbgPrint("[read-forward-verified-%u]\n", (uint32_t)offset);
+    return status;
+}
+
 static void __stdcall ReadWorker(void *context)
 {
     (void)context;
@@ -167,61 +226,8 @@ static void __stdcall ReadWorker(void *context)
         goto dereference;
     }
 
-    uint8_t output[sizeof(ExpectedBytes)];
-    for (uint32_t i = 0; i < sizeof(output); i++) output[i] = 0xcc;
-    void *system_buffer = ExAllocatePoolWithTag(PagedPool, sizeof(output), 0x52646e74);
-    if (system_buffer == NULL) {
-        status = STATUS_INSUFFICIENT_RESOURCES;
-        goto dereference;
-    }
-    for (uint32_t i = 0; i < sizeof(output); i++) ((uint8_t *)system_buffer)[i] = 0xa5;
-    IRP *irp = IoAllocateIrp(device->StackSize, 0);
-    if (irp == NULL) {
-        ExFreePoolWithTag(system_buffer, 0x52646e74);
-        status = STATUS_INSUFFICIENT_RESOURCES;
-        goto dereference;
-    }
-    IO_STACK_LOCATION *stack = IoGetNextIrpStackLocation(irp);
-    if (stack == NULL) {
-        IoFreeIrp(irp);
-        ExFreePoolWithTag(system_buffer, 0x52646e74);
-        status = STATUS_UNSUCCESSFUL;
-        goto dereference;
-    }
-    IO_STATUS_BLOCK read_iosb = {0};
-    uint64_t completion_event[3] = {0};
-    KeInitializeEvent(completion_event, 1, 0);
-    irp->Flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION;
-    irp->AssociatedSystemBuffer = system_buffer;
-    irp->UserBuffer = output;
-    irp->UserIosb = &read_iosb;
-    irp->UserEvent = completion_event;
-    irp->OriginalFileObject = file;
-    stack->MajorFunction = IRP_MJ_READ;
-    stack->Read.Length = sizeof(output);
-    stack->Read.ByteOffset = 0;
-    stack->DeviceObject = device;
-    stack->FileObject = file;
-    DbgPrint("[read-forward-stage] dispatching buffered IRP through IofCallDriver\n");
-    NTSTATUS call_status = IofCallDriver(device, irp);
-    NTSTATUS wait_status = KeWaitForSingleObject(completion_event, 0, 0, 0, NULL);
-    status = (call_status == STATUS_SUCCESS || call_status == STATUS_PENDING) &&
-             wait_status == STATUS_SUCCESS &&
-             read_iosb.Status == STATUS_SUCCESS &&
-             read_iosb.Information == sizeof(output) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
-    if (status == STATUS_SUCCESS) {
-        for (uint32_t i = 0; i < sizeof(output); i++) {
-            if (output[i] != ExpectedBytes[i]) {
-                status = STATUS_UNSUCCESSFUL;
-                break;
-            }
-        }
-    }
-    DbgPrint("[read-forward-result] call=0x%08x wait=0x%08x status=0x%08x iosb=0x%08x info=%u bytes-match=%u\n",
-             (uint32_t)call_status, (uint32_t)wait_status, (uint32_t)status,
-             (uint32_t)read_iosb.Status,
-             (uint32_t)read_iosb.Information, status == STATUS_SUCCESS);
-
+    status = ForwardOnce(file, device, 0);
+    if (status == STATUS_SUCCESS) status = ForwardOnce(file, device, 1);
 dereference:
     ObfDereferenceObject(file);
 close:

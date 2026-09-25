@@ -216,7 +216,8 @@ impl Work {
     unsafe fn ready_for_nested_step(&self) -> bool {
         if let Some(ack) = &self.ack { return !ack.reply_entered; }
         if self.reply_entered { return false; }
-        if self.initial_status.is_none() || self.terminal.is_some() { return true; }
+        if self.initial_status.is_none() { return self.provider_dispatch_ready(); }
+        if self.terminal.is_some() { return true; }
         self.retained.is_some() && self.canonical_irp
             .is_some_and(|irp| completed_irp_exact(irp.raw()).is_some())
     }
@@ -233,19 +234,25 @@ impl Work {
         !self.actor.is_held() || self.actor_release().is_ok()
     }
 
-    unsafe fn provider_still_exact(&self) -> bool {
+    unsafe fn provider_index_if_exact(&self) -> Option<usize> {
         let Some((target_index, _, _)) =
             hosted_driver_device_route_by_device_id(self.source.device_id().raw())
-        else { return false; };
+        else { return None; };
         let provider_index = hosted_provider_dispatch_route_for_instance(target_index)
             .map_or(target_index, |route| route.provider_instance);
-        instance(provider_index).is_some_and(|live| {
+        instance(provider_index).filter(|live| {
             live.pml4 == self.provider_instance.pml4
                 && live.exec_pool_va == self.provider_instance.exec_pool_va
                 && live.hosted_domain_id == self.provider_instance.hosted_domain_id
                 && live.hosted_domain_cookie == self.provider_instance.hosted_domain_cookie
                 && live.driver_id == self.provider_instance.driver_id
-        })
+        }).map(|_| provider_index)
+    }
+
+    unsafe fn provider_dispatch_ready(&self) -> bool {
+        let Some(index) = self.provider_index_if_exact() else { return true; };
+        let Some(route) = hosted_ingress_sources::primary_route(index) else { return true; };
+        !matches!(runtime::ready_for_admission(route), Ok(false))
     }
 
     unsafe fn dispatch_provider(&mut self, handler: *mut ExecNtHandler) {
@@ -254,7 +261,7 @@ impl Work {
             self.initial_status = Some(status as i32);
             return;
         }
-        if self.source.validate_source().is_err() || !self.provider_still_exact() {
+        if self.source.validate_source().is_err() || self.provider_index_if_exact().is_none() {
             self.initial_status = Some(STATUS_INVALID_DEVICE_REQUEST_LOCAL);
             return;
         }
@@ -283,6 +290,7 @@ impl Work {
         );
         let result = match result {
             Ok(result) => result,
+            Err(status) if status == nt_status::NtStatus::DEVICE_BUSY => return,
             Err(status) => {
                 self.initial_status = Some(status.raw());
                 return;
@@ -479,7 +487,11 @@ impl Work {
             }
             return self.advance_stopped_source();
         }
-        if self.initial_status.is_none() { self.dispatch_provider(handler); }
+        if self.initial_status.is_none() {
+            if !self.provider_dispatch_ready() { return false; }
+            self.dispatch_provider(handler);
+            if self.initial_status.is_none() { return false; }
+        }
         if self.retained.is_some() { self.poll_provider(); }
         if self.terminal.is_none() && self.canonical_irp.is_some() { return false; }
         if self.terminal.is_some() { self.publish_source(); }
@@ -522,9 +534,10 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
     ));
     CURSOR.store(index as u64 + 1, Ordering::Relaxed);
     let done = work.advance(handler);
+    let deferred_unentered = !done && work.initial_status.is_none();
     if !done { (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work); }
     assert_eq!((&mut *core::ptr::addr_of_mut!(EXECUTING)).pop().map(|row| row.0), Some(index));
-    true
+    !deferred_unentered
 }
 
 pub(super) unsafe fn redrive(handler: *mut ExecNtHandler) {
