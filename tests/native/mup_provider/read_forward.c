@@ -121,6 +121,9 @@ __declspec(dllimport) NTSTATUS __stdcall IofCallDriver(DEVICE_OBJECT *, IRP *);
 __declspec(dllimport) void *__stdcall ExAllocatePoolWithTag(uint32_t, size_t, uint32_t);
 __declspec(dllimport) void __stdcall ExFreePoolWithTag(void *, uint32_t);
 __declspec(dllimport) NTSTATUS __stdcall KeDelayExecutionThread(uint8_t, uint8_t, int64_t *);
+__declspec(dllimport) void __stdcall KeInitializeEvent(void *, uint32_t, uint8_t);
+__declspec(dllimport) NTSTATUS __stdcall KeWaitForSingleObject(void *, uint32_t, uint32_t,
+    uint8_t, int64_t *);
 __declspec(dllimport) NTSTATUS __stdcall PsCreateSystemThread(HANDLE *, uint32_t,
     OBJECT_ATTRIBUTES *, HANDLE, void *, void (__stdcall *)(void *), void *);
 __declspec(dllimport) void __stdcall PsTerminateSystemThread(NTSTATUS);
@@ -186,10 +189,13 @@ static void __stdcall ReadWorker(void *context)
         goto dereference;
     }
     IO_STATUS_BLOCK read_iosb = {0};
+    uint64_t completion_event[3] = {0};
+    KeInitializeEvent(completion_event, 1, 0);
     irp->Flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION;
     irp->AssociatedSystemBuffer = system_buffer;
     irp->UserBuffer = output;
     irp->UserIosb = &read_iosb;
+    irp->UserEvent = completion_event;
     irp->OriginalFileObject = file;
     stack->MajorFunction = IRP_MJ_READ;
     stack->Read.Length = sizeof(output);
@@ -198,7 +204,9 @@ static void __stdcall ReadWorker(void *context)
     stack->FileObject = file;
     DbgPrint("[read-forward-stage] dispatching buffered IRP through IofCallDriver\n");
     NTSTATUS call_status = IofCallDriver(device, irp);
+    NTSTATUS wait_status = KeWaitForSingleObject(completion_event, 0, 0, 0, NULL);
     status = (call_status == STATUS_SUCCESS || call_status == STATUS_PENDING) &&
+             wait_status == STATUS_SUCCESS &&
              read_iosb.Status == STATUS_SUCCESS &&
              read_iosb.Information == sizeof(output) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
     if (status == STATUS_SUCCESS) {
@@ -209,8 +217,9 @@ static void __stdcall ReadWorker(void *context)
             }
         }
     }
-    DbgPrint("[read-forward-result] call=0x%08x status=0x%08x iosb=0x%08x info=%u bytes-match=%u\n",
-             (uint32_t)call_status, (uint32_t)status, (uint32_t)read_iosb.Status,
+    DbgPrint("[read-forward-result] call=0x%08x wait=0x%08x status=0x%08x iosb=0x%08x info=%u bytes-match=%u\n",
+             (uint32_t)call_status, (uint32_t)wait_status, (uint32_t)status,
+             (uint32_t)read_iosb.Status,
              (uint32_t)read_iosb.Information, status == STATUS_SUCCESS);
 
 dereference:

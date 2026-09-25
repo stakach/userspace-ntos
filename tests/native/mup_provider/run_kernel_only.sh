@@ -47,7 +47,7 @@ if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-write\] count=[1-9][0-9]* bytes=10' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-write-result\] status=0x00000000 info=10' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-read\] count=[1-9][0-9]* bytes=10' "$RUN_LOG" \
-   || ! grep -Eq '\[read-forward-result\] call=0x(00000000|00000103) status=0x00000000 iosb=0x00000000 info=10 bytes-match=1' "$RUN_LOG" \
+   || ! grep -Eq '\[read-forward-result\] call=0x(00000000|00000103) wait=0x00000000 status=0x00000000 iosb=0x00000000 info=10 bytes-match=1' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-cleanup\] probe-file cleaned=[1-9][0-9]*' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-close\] probe-file closed=[1-9][0-9]*' "$RUN_LOG"; then
   echo "Mup/provider registration, query, READ/WRITE, and File lifecycle proof incomplete: $RUN_LOG" >&2
