@@ -10795,10 +10795,6 @@ unsafe fn finish_driver_local_irp(irp: u64) {
         write_unaligned(user_iosb as *mut i32, status);
         write_unaligned((user_iosb + 8) as *mut u64, information);
     }
-    if user_event != 0 {
-        let _ = s_ke_set_event(user_event, 0, 0);
-    }
-
     let flags = read_unaligned((irp + 0x10) as *const u32);
     let system_buffer = read_unaligned((irp + 0x18) as *const u64);
     let user_buffer = read_unaligned((irp + 0x70) as *const u64);
@@ -10829,6 +10825,9 @@ unsafe fn finish_driver_local_irp(irp: u64) {
     }
     if mdl != 0 && component_pool_allocation_capacity(mdl).is_some() {
         s_io_free_mdl(mdl);
+    }
+    if user_event != 0 {
+        let _ = s_ke_set_event(user_event, 0, 0);
     }
     s_io_free_irp(irp);
 }

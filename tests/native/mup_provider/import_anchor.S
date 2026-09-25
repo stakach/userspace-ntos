@@ -39,6 +39,12 @@ ObfDereferenceObject:
 .globl KeDelayExecutionThread
 KeDelayExecutionThread:
     ud2
+.globl KeInitializeEvent
+KeInitializeEvent:
+    ud2
+.globl KeWaitForSingleObject
+KeWaitForSingleObject:
+    ud2
 .globl ZwCreateFile
 ZwCreateFile:
     ud2
