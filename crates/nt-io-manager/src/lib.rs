@@ -65,6 +65,7 @@ pub mod consumer_file_projection;
 pub mod hosted_forward_target;
 pub mod redir_query_path;
 pub mod retained_query_path_forward;
+pub mod retained_write_forward;
 pub mod source_irp_ledger;
 pub mod query_path_wire;
 pub mod io_create_file_wire;
