@@ -1,4 +1,7 @@
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_ALLOCATION_CATALOG_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderArenaIdentity {
@@ -32,6 +35,19 @@ pub struct ProviderAllocationSnapshot {
     pub capacity: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderAllocationPin {
+    catalog_id: u64,
+    identity: ProviderAllocationIdentity,
+    id: u64,
+}
+
+impl ProviderAllocationPin {
+    pub const fn identity(self) -> ProviderAllocationIdentity {
+        self.identity
+    }
+}
+
 impl ProviderAllocationSnapshot {
     pub fn offset_of(self, address: u64) -> Option<u64> {
         if address < self.base {
@@ -53,6 +69,14 @@ pub enum ProviderAllocationError {
     NotFound,
     StaleIdentity,
     ContainsLiveAllocations,
+    Pinned,
+    StalePin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProviderAllocationPinRecord {
+    identity: ProviderAllocationIdentity,
+    id: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,13 +128,19 @@ impl ProviderAllocationRecord {
 /// arenas. Containment resolves to the smallest live allocation so embedded-object ownership
 /// follows the innermost heap allocation.
 pub struct ProviderAllocationCatalog {
+    catalog_id: u64,
     records: Vec<ProviderAllocationRecord>,
+    pins: Vec<ProviderAllocationPinRecord>,
+    next_pin_id: u64,
 }
 
 impl ProviderAllocationCatalog {
     pub const fn new() -> Self {
         Self {
+            catalog_id: 0,
             records: Vec::new(),
+            pins: Vec::new(),
+            next_pin_id: 1,
         }
     }
 
@@ -224,6 +254,64 @@ impl ProviderAllocationCatalog {
         record.snapshot(slot)
     }
 
+    pub fn pin_containing(
+        &mut self,
+        address: u64,
+        required: u64,
+    ) -> Result<(ProviderAllocationSnapshot, ProviderAllocationPin), ProviderAllocationError> {
+        let snapshot = self.containing(address, required)?;
+        let id = self.next_pin_id;
+        let next = id
+            .checked_add(1)
+            .ok_or(ProviderAllocationError::IdentityExhausted)?;
+        self.pins
+            .try_reserve(1)
+            .map_err(|_| ProviderAllocationError::NoCapacity)?;
+        if self.catalog_id == 0 {
+            self.catalog_id = loop {
+                let id = NEXT_ALLOCATION_CATALOG_ID.load(Ordering::Relaxed);
+                let next = id
+                    .checked_add(1)
+                    .ok_or(ProviderAllocationError::IdentityExhausted)?;
+                if NEXT_ALLOCATION_CATALOG_ID
+                    .compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break id;
+                }
+            };
+        }
+        self.pins.push(ProviderAllocationPinRecord {
+            identity: snapshot.identity,
+            id,
+        });
+        self.next_pin_id = next;
+        Ok((
+            snapshot,
+            ProviderAllocationPin {
+                catalog_id: self.catalog_id,
+                identity: snapshot.identity,
+                id,
+            },
+        ))
+    }
+
+    pub fn release_pin(
+        &mut self,
+        pin: ProviderAllocationPin,
+    ) -> Result<(), ProviderAllocationError> {
+        if pin.catalog_id != self.catalog_id || self.catalog_id == 0 {
+            return Err(ProviderAllocationError::StalePin);
+        }
+        let index = self
+            .pins
+            .iter()
+            .position(|record| record.id == pin.id && record.identity == pin.identity)
+            .ok_or(ProviderAllocationError::StalePin)?;
+        self.pins.swap_remove(index);
+        Ok(())
+    }
+
     pub fn retire(
         &mut self,
         identity: ProviderAllocationIdentity,
@@ -240,6 +328,9 @@ impl ProviderAllocationCatalog {
     ) -> Result<ProviderAllocationSnapshot, ProviderAllocationError> {
         let slot = self.slot(identity)?;
         let retiring = self.records[slot];
+        if self.pins.iter().any(|pin| pin.identity == identity) {
+            return Err(ProviderAllocationError::Pinned);
+        }
         if self.records.iter().enumerate().any(|(index, record)| {
             index != slot
                 && record.live
@@ -385,5 +476,90 @@ mod tests {
         catalog.retire(old.identity).unwrap();
         assert_ne!(old.identity, moved.identity);
         assert_eq!(catalog.exact(arena(1), 0x6000).unwrap(), moved);
+    }
+
+    #[test]
+    fn pins_hold_exact_allocations_until_each_receipt_is_released() {
+        let mut catalog = ProviderAllocationCatalog::new();
+        let allocation = catalog.register(arena(1), 0x7000, 0x100).unwrap();
+        let (snapshot, first) = catalog.pin_containing(0x7010, 0x10).unwrap();
+        let (_, second) = catalog.pin_containing(0x7020, 0x10).unwrap();
+        assert_eq!(snapshot, allocation);
+        assert_ne!(first, second);
+        assert_eq!(
+            catalog.validate_retirement(allocation.identity),
+            Err(ProviderAllocationError::Pinned)
+        );
+        catalog.release_pin(first).unwrap();
+        assert_eq!(
+            catalog.release_pin(first),
+            Err(ProviderAllocationError::StalePin)
+        );
+        assert_eq!(
+            catalog.retire(allocation.identity),
+            Err(ProviderAllocationError::Pinned)
+        );
+        catalog.release_pin(second).unwrap();
+        catalog.retire(allocation.identity).unwrap();
+        let reused = catalog.register(arena(1), 0x7000, 0x100).unwrap();
+        assert_ne!(reused.identity, allocation.identity);
+        assert_eq!(
+            catalog.release_pin(second),
+            Err(ProviderAllocationError::StalePin)
+        );
+        catalog.retire(reused.identity).unwrap();
+    }
+
+    #[test]
+    fn pin_range_requires_the_innermost_owner_and_keeps_parent_live() {
+        let mut catalog = ProviderAllocationCatalog::new();
+        let outer = catalog.register(arena(1), 0x8000, 0x1000).unwrap();
+        let inner = catalog.register(arena(2), 0x8800, 0x100).unwrap();
+        assert_eq!(
+            catalog.pin_containing(0x88f8, 0x10),
+            Err(ProviderAllocationError::InvalidRange)
+        );
+        let (snapshot, pin) = catalog.pin_containing(0x8810, 0x20).unwrap();
+        assert_eq!(snapshot, inner);
+        assert_eq!(
+            catalog.retire(outer.identity),
+            Err(ProviderAllocationError::ContainsLiveAllocations)
+        );
+        assert_eq!(
+            catalog.retire(inner.identity),
+            Err(ProviderAllocationError::Pinned)
+        );
+        catalog.release_pin(pin).unwrap();
+        catalog.retire(inner.identity).unwrap();
+        catalog.retire(outer.identity).unwrap();
+    }
+
+    #[test]
+    fn colliding_catalogs_cannot_release_each_others_pin() {
+        let mut first = ProviderAllocationCatalog::new();
+        let mut second = ProviderAllocationCatalog::new();
+        let a = first.register(arena(1), 0x9000, 0x100).unwrap();
+        let b = second.register(arena(1), 0x9000, 0x100).unwrap();
+        assert_eq!(a.identity, b.identity);
+        let (_, first_pin) = first.pin_containing(0x9010, 0x10).unwrap();
+        let (_, second_pin) = second.pin_containing(0x9010, 0x10).unwrap();
+        assert_eq!(
+            first.release_pin(second_pin),
+            Err(ProviderAllocationError::StalePin)
+        );
+        assert_eq!(
+            second.release_pin(first_pin),
+            Err(ProviderAllocationError::StalePin)
+        );
+        assert_eq!(
+            first.retire(a.identity),
+            Err(ProviderAllocationError::Pinned)
+        );
+        assert_eq!(
+            second.retire(b.identity),
+            Err(ProviderAllocationError::Pinned)
+        );
+        first.release_pin(first_pin).unwrap();
+        second.release_pin(second_pin).unwrap();
     }
 }

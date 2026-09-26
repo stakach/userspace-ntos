@@ -7115,8 +7115,7 @@ unsafe fn heap_realloc_in(
     let Some(arena) = provider_heap_arena_identity(arena_base) else {
         return 0;
     };
-    let Some(allocation) = provider_allocations_mut()
-        .and_then(|allocations| allocations.exact(arena, p).ok())
+    let Some(allocation) = validate_provider_allocation_retirement(arena, p, old_cap)
     else {
         return 0;
     };
