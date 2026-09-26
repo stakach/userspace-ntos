@@ -90,12 +90,16 @@ mod hosted_query_path_capture;
 mod hosted_write_capture;
 #[path = "hosted_read_capture.rs"]
 mod hosted_read_capture;
+#[path = "hosted_flush_capture.rs"]
+mod hosted_flush_capture;
 #[path = "hosted_query_path_work.rs"]
 mod hosted_query_path_work;
 #[path = "hosted_write_work.rs"]
 mod hosted_write_work;
 #[path = "hosted_read_work.rs"]
 mod hosted_read_work;
+#[path = "hosted_flush_work.rs"]
+mod hosted_flush_work;
 #[path = "driver_hosted_token_projection.rs"]
 mod driver_hosted_token_projection;
 #[path = "hosted_token_query.rs"]
@@ -856,6 +860,7 @@ pub const FSD_SERVICE_ZW_WAIT_FILE_LABEL: u64 = 0x79E;
 pub const FSD_SERVICE_WRITE_FORWARD_LABEL: u64 = 0x79F;
 pub const FSD_SERVICE_ZW_WRITE_FILE_LABEL: u64 = 0x7A0;
 pub const FSD_SERVICE_READ_FORWARD_LABEL: u64 = 0x7A1;
+pub const FSD_SERVICE_FLUSH_FORWARD_LABEL: u64 = 0x7A2;
 const _: () = {
     let labels = [
         FSD_SERVICE_SOURCE_IRP_LABEL,
@@ -867,6 +872,7 @@ const _: () = {
         FSD_SERVICE_WRITE_FORWARD_LABEL,
         FSD_SERVICE_ZW_WRITE_FILE_LABEL,
         FSD_SERVICE_READ_FORWARD_LABEL,
+        FSD_SERVICE_FLUSH_FORWARD_LABEL,
     ];
     let mut i = 0;
     while i < labels.len() {
@@ -8323,11 +8329,14 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                 if major == IRP_MJ_DEVICE_CONTROL
                     || major == major::IRP_MJ_WRITE as u64
                     || major == major::IRP_MJ_READ as u64
+                    || major == major::IRP_MJ_FLUSH_BUFFERS as u64
                 {
                     let forward_label = if major == IRP_MJ_DEVICE_CONTROL {
                         FSD_SERVICE_QUERY_PATH_FORWARD_LABEL
                     } else if major == major::IRP_MJ_READ as u64 {
                         FSD_SERVICE_READ_FORWARD_LABEL
+                    } else if major == major::IRP_MJ_FLUSH_BUFFERS as u64 {
+                        FSD_SERVICE_FLUSH_FORWARD_LABEL
                     } else {
                         FSD_SERVICE_WRITE_FORWARD_LABEL
                     };
@@ -54264,6 +54273,35 @@ pub(crate) unsafe fn service_hosted_read_forward(
 
 pub(crate) unsafe fn redrive_hosted_read_forward(handler: *mut ExecNtHandler) {
     hosted_read_work::redrive(handler);
+}
+
+pub(crate) unsafe fn service_hosted_flush_forward(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    operation: u64,
+    address: u64,
+    irp: u64,
+) -> Option<(i32, bool)> {
+    match operation {
+        1 => hosted_flush_work::submit(ch, irp, address, badge, reply_cap)
+            .map(|status| (status, false)),
+        2 if irp == 0 => hosted_flush_work::acknowledge(ch, reply_cap, badge, address)
+            .map(|status| (status, false)),
+        _ => Some((STATUS_INVALID_PARAMETER, false)),
+    }
+}
+
+pub(crate) unsafe fn redrive_hosted_flush_forward(handler: *mut ExecNtHandler) {
+    hosted_flush_work::redrive(handler);
+}
+
+pub(crate) unsafe fn nested_hosted_flush_ready() -> bool {
+    hosted_flush_work::nested_work_ready()
+}
+
+pub(crate) unsafe fn redrive_nested_hosted_flush(handler: *mut ExecNtHandler) -> bool {
+    hosted_flush_work::redrive_nested_ready(handler)
 }
 
 pub(crate) unsafe fn nested_hosted_read_ready() -> bool {
