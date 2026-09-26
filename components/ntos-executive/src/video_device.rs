@@ -691,11 +691,7 @@ pub(crate) unsafe fn video_get_device_object_pointer(
     0
 }
 
-/// Translate the exact projected video File into the live top-of-stack Device projection.
-///
-/// The canonical I/O Manager owns attachment topology. This bridge only publishes a Device pointer
-/// while the current canonical identity still matches the projection installed in win32k's VSpace;
-/// a newly attached device must publish its own projection before it can be returned.
+/// Resolve the current attachment top through the File's exact consumer projection.
 pub(crate) unsafe fn video_related_device_object(file_object: u64) -> Result<u64, NtStatus> {
     if !projected_video_route_ready() {
         return Err(NtStatus::DEVICE_NOT_READY);
@@ -704,12 +700,7 @@ pub(crate) unsafe fn video_related_device_object(file_object: u64) -> Result<u64
     if file_object == 0 || file_object != state.route.file_projection {
         return Err(NtStatus::INVALID_HANDLE);
     }
-    let (device_id, device_object_id) =
-        crate::driver_launch::related_io_device_identity_for_file(state.route.file_id)?;
-    if device_id != state.route.device_id || device_object_id != state.route.device_object_id {
-        return Err(NtStatus::INVALID_DEVICE_REQUEST);
-    }
-    Ok(state.objects.device)
+    video_projection_owners::related_device_address(state.route.owner_id, file_object)
 }
 
 pub(crate) unsafe fn video_file_projection_contains(object: u64) -> bool {

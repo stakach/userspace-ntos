@@ -189,6 +189,20 @@ pub(super) unsafe fn pointer_reference_count(id: u64) -> Option<usize> {
         .map(ConsumerFileProjection::pointer_reference_count)
 }
 
+pub(super) unsafe fn related_device_address(id: u64, address: u64) -> Result<u64, NtStatus> {
+    let index = index_for(id).ok_or(NtStatus::INVALID_HANDLE)?;
+    let row = rows()[index].as_ref().ok_or(NtStatus::INVALID_HANDLE)?;
+    if row.retiring || row.address != address {
+        return Err(NtStatus::INVALID_HANDLE);
+    }
+    let projection = row.projection.as_ref().ok_or(NtStatus::INVALID_HANDLE)?;
+    if projection.pointer_reference_count() == 0 {
+        return Err(NtStatus::INVALID_HANDLE);
+    }
+    crate::driver_launch::win32k_device_consumer::related_file_device_address(projection)
+        .map_err(NtStatus)
+}
+
 pub(super) unsafe fn reference_by_handle(id: u64, address: u64) -> Result<u64, NtStatus> {
     let index = index_for(id).ok_or(NtStatus::INVALID_HANDLE)?;
     let row = rows_mut()[index].as_mut().unwrap();

@@ -140,6 +140,25 @@ impl ConsumerFileProjection {
         Ok(self.device.address())
     }
 
+    /// Resolve the current attachment-stack top, which may differ from the opening Device.
+    /// The caller must supply a live Device pointer receipt in this File's consumer domain.
+    pub fn related_top_device_address<P>(
+        &self,
+        io: &IoManager<P>,
+        top: HostedDevicePointerRegistration,
+    ) -> Result<u64, NtStatus> {
+        self.validate_live(io)?;
+        if top.domain() != self.identity.domain()
+            || io.hosted_device_pointer_registration(top.domain(), top.address()) != Some(top)
+        {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        if io.related_device_for_file(self.identity.file_id())? != top.device_id() {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        Ok(top.address())
+    }
+
     pub fn pointer_reference_count(&self) -> usize {
         self.references.len()
     }
@@ -392,6 +411,48 @@ mod tests {
         projection.retire(&mut io).unwrap();
         assert_eq!(io.hosted_device_pointer_count(device), Ok(0));
         assert_eq!(io.hosted_file_by_identity(identity.domain(), identity.address()), None);
+    }
+
+    #[test]
+    fn related_device_tracks_attachment_top_and_exact_consumer_receipt() {
+        let (mut io, identity, opening_device) = opened();
+        let base = opening_device.device_id();
+        let driver = io.device(base).unwrap().driver_id;
+        let top = io
+            .create_device(
+                driver,
+                None,
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let mut projection = ConsumerFileProjection::new(&mut io, identity, opening_device).unwrap();
+        assert_eq!(
+            projection.related_top_device_address(&io, opening_device),
+            Ok(opening_device.address()),
+        );
+        io.attach_device_to_stack(top, base).unwrap();
+        let top_pointer = io.bind_hosted_device_pointer(identity.domain(), 0x7000, top).unwrap();
+        assert_eq!(
+            projection.related_top_device_address(&io, opening_device),
+            Err(NtStatus::INVALID_DEVICE_REQUEST),
+        );
+        assert_eq!(projection.related_top_device_address(&io, top_pointer), Ok(0x7000));
+        let other_domain = io.register_hosted_domain();
+        let foreign = io.bind_hosted_device_pointer(other_domain, 0x8000, top).unwrap();
+        assert_eq!(
+            projection.related_top_device_address(&io, foreign),
+            Err(NtStatus::INVALID_HANDLE),
+        );
+        io.unregister_hosted_device_pointer(top_pointer).unwrap();
+        assert_eq!(
+            projection.related_top_device_address(&io, top_pointer),
+            Err(NtStatus::INVALID_HANDLE),
+        );
+        projection.handle_closed(identity).unwrap();
+        projection.retire(&mut io).unwrap();
     }
 
     #[test]

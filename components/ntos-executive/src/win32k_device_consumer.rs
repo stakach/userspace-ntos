@@ -304,6 +304,27 @@ pub(crate) unsafe fn retire_file_owner(
     projection.retire(io_manager_mut()).map_err(|status| status.raw())
 }
 
+pub(crate) unsafe fn related_file_device_address(
+    projection: &nt_io_manager::consumer_file_projection::ConsumerFileProjection,
+) -> Result<u64, i32> {
+    let consumer = live_consumer()?;
+    if projection.identity().domain() != consumer.domain {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    let top = io_manager_mut()
+        .related_device_for_file(projection.identity().file_id())
+        .map_err(|status| status.raw())?;
+    let registration = consumer
+        .projections
+        .iter()
+        .find(|row| row.device == top && row.bound)
+        .and_then(|row| row.registration)
+        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    projection
+        .related_top_device_address(io_manager_mut(), registration)
+        .map_err(|status| status.raw())
+}
+
 /// Exact receipt retirement remains available after consumer admission has closed. Unbind does
 /// not free the native allocation; the owner must retain it until this call succeeds.
 pub(crate) unsafe fn retire_file_projection(
