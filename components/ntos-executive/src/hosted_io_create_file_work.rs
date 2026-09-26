@@ -39,6 +39,7 @@ struct Work {
     subject: Option<CapturedSubjectContext>,
     publication: Option<RoutedFileHandlePublication>,
     delivery: Option<ProviderCreateDelivery>,
+    target: Option<RegisteredFileTarget>,
     file_id: Option<u64>,
     completion_reserved: bool,
     lifecycle_reserved: bool,
@@ -149,7 +150,7 @@ pub(super) unsafe fn submit(
     };
     let work = Work {
         captured, route, dispatch, reply, token, actor, subject: Some(subject), publication: None,
-        delivery: None, file_id: None, completion_reserved: false,
+        delivery: None, target: None, file_id: None, completion_reserved: false,
         lifecycle_reserved: false, terminal: None, reply_completion: None,
         reply_entered: false, backend_ack_entered: false, completion_committed: false,
         published_handle: None, cancel_requested: false,
@@ -202,6 +203,7 @@ impl Work {
     unsafe fn prepare(&mut self, handler: *mut ExecNtHandler) -> Result<(), u32> {
         if self.cancelled() { return Err(STATUS_CANCELLED_LOCAL); }
         let request = &self.captured.request;
+        let target = registered_file_target(self.captured.device_id, request.policy.major)?;
         let mode = nt_io_completion::FileIoMode::from_create_flags(
             request.policy.create_options & nt_fs::FILE_SYNCHRONOUS_IO_ALERT != 0,
             request.policy.create_options & nt_fs::FILE_SYNCHRONOUS_IO_NONALERT != 0,
@@ -226,18 +228,21 @@ impl Work {
             )?,
         };
         self.file_id = Some(file_id);
-        let lifecycle_actor = (*handler).pm.reference_native_requestor(self.captured.caller)?;
-        match reserve_hosted_file_lifecycle(file_id, self.captured.caller, lifecycle_actor) {
-            Ok(()) => self.lifecycle_reserved = true,
-            Err((status, mut actor)) => {
-                actor.release(&mut (*handler).pm)?;
-                return Err(status.raw() as u32);
+        if target == RegisteredFileTarget::DriverPeer {
+            let lifecycle_actor = (*handler).pm.reference_native_requestor(self.captured.caller)?;
+            match reserve_hosted_file_lifecycle(file_id, self.captured.caller, lifecycle_actor) {
+                Ok(()) => self.lifecycle_reserved = true,
+                Err((status, mut actor)) => {
+                    actor.release(&mut (*handler).pm)?;
+                    return Err(status.raw() as u32);
+                }
             }
         }
         (*handler).file_completion.reserve_file_handle_publication(
             file_id, self.captured.device_id, mode,
         )?;
         self.completion_reserved = true;
+        self.target = Some(target);
         self.delivery = Some(ProviderCreateDelivery::new(CreateIdentity {
             file: FileId(file_id),
             requestor_tid: u64::from(self.captured.caller.original_thread().thread_id()),
@@ -251,6 +256,9 @@ impl Work {
         self.actor.validate(&(*handler).pm)?;
         (*handler).pm.validate_native_handle_caller(self.captured.caller)?;
         let request = &self.captured.request;
+        if Some(registered_file_target(self.captured.device_id, request.policy.major)?) != self.target {
+            return Err(STATUS_INVALID_HANDLE as u32);
+        }
         let name = &self.captured.relative_name;
         let length = name.len().checked_mul(2)
             .and_then(|bytes| bytes.checked_add(request.ea.len()))
@@ -363,7 +371,7 @@ impl Work {
                     crate::driver_launch::hosted_io_create_file_ingress::resolve_absolute_name(
                         &absolute_name, true,
                     )?;
-                require_hosted_device_ready_for_dispatch(device_id)?;
+                require_file_device_ready_for_dispatch(device_id)?;
                 Ok(ReparseTarget { device_id, absolute_name, relative_name })
             });
             match target {
@@ -404,6 +412,7 @@ impl Work {
         self.captured.relative_name = target.relative_name;
         self.reparse_hops += 1;
         self.delivery = None;
+        self.target = None;
         self.terminal = None;
         self.backend_ack_entered = false;
         Ok(())
@@ -511,8 +520,10 @@ impl Work {
         self.completion_committed = true;
         let handle = publication.publish(&mut (*handler).pm)?;
         self.published_handle = Some(handle);
-        assert!(cancel_hosted_file_lifecycle_reservation(file));
-        self.lifecycle_reserved = false;
+        if self.lifecycle_reserved {
+            assert!(cancel_hosted_file_lifecycle_reservation(file));
+            self.lifecycle_reserved = false;
+        }
         let delivery = self.delivery.as_mut().expect("provider CREATE delivery");
         delivery.bind_handle(handle).expect("bound provider CREATE handle");
         delivery.publish_handle(handle).expect("published provider CREATE handle");

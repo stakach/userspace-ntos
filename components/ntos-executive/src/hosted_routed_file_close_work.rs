@@ -205,7 +205,24 @@ impl Work {
                     return false;
                 }
             };
-            let lifecycle_reserved = if self.needs_cleanup {
+            let peer_cleanup = if self.needs_cleanup {
+                match crate::driver_launch::registered_file_target(
+                    self.device_id,
+                    nt_io_abi::major::IRP_MJ_CLEANUP,
+                ) {
+                    Ok(crate::driver_launch::RegisteredFileTarget::DriverPeer) => true,
+                    Ok(crate::driver_launch::RegisteredFileTarget::Kernel) => false,
+                    Err(status) => {
+                        self.close_entered = true;
+                        self.capture.take();
+                        self.status = Some(status);
+                        return false;
+                    }
+                }
+            } else {
+                false
+            };
+            let lifecycle_reserved = if peer_cleanup {
                 let reserved = (|| {
                     let executor = handler.pm.capture_native_handle_caller(
                         self.caller.original_thread(), nt_types::AccessMode::KernelMode,
@@ -246,6 +263,8 @@ impl Work {
                     handler.release_file_handle_reference(file);
                     if lifecycle_reserved {
                         crate::driver_launch::pump_hosted_file_lifecycle();
+                    } else if self.needs_cleanup {
+                        crate::driver_launch::pump_registered_file_lifecycle();
                     }
                     if !self.needs_cleanup {
                         self.status = Some(0);
@@ -274,6 +293,7 @@ impl Work {
             let cleanup_complete = crate::driver_launch::hosted_file_cleanup_terminal(self.file_id);
             if !cleanup_complete { return false; }
             // CLEANUP can resolve inline. Drive newly eligible CLOSE before replying.
+            crate::driver_launch::pump_registered_file_lifecycle();
             crate::driver_launch::pump_hosted_file_lifecycle();
             self.status = Some(0);
         }

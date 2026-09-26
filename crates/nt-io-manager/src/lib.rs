@@ -5106,6 +5106,106 @@ mod tests {
     }
 
     #[test]
+    fn queued_kernel_file_release_waits_for_pending_read_ack() {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(KernelFileRouteState::default()));
+        let mut om = io();
+        let client = om.register_client();
+        let driver = om
+            .create_kernel_driver_with_majors(
+                &path("\\Driver\\QueuedMountedVolume"),
+                Box::new(KernelFileRouteBackend { state: state.clone() }),
+                &[
+                    major::IRP_MJ_CREATE,
+                    major::IRP_MJ_READ,
+                    major::IRP_MJ_CLEANUP,
+                    major::IRP_MJ_CLOSE,
+                ],
+            )
+            .unwrap();
+        let device = om
+            .create_device(
+                driver,
+                Some(&path("\\Device\\QueuedMountedVolume")),
+                DeviceType::DISK_FILE_SYSTEM,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let file = om
+            .allocate_external_file(
+                client,
+                device,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::empty(),
+                nt_types::UnicodeString::from_str("reactos\\Fonts\\Arial.ttf"),
+            )
+            .unwrap();
+        assert!(matches!(
+            om.build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(file),
+                0,
+                71,
+                major::IRP_MJ_CREATE,
+                IoParameters::Create(CreateParameters::default()),
+                0,
+                0,
+                &mut [],
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                ..
+            })
+        ));
+        let pending = om
+            .build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(file),
+                0,
+                71,
+                major::IRP_MJ_READ,
+                IoParameters::Read(ReadWriteParameters {
+                    length: 4,
+                    key: 0,
+                    offset: 0,
+                }),
+                0,
+                4,
+                &mut [0; 4],
+            )
+            .unwrap();
+        let ExternalDispatchResult::Pending { irp_id } = pending else {
+            panic!("Kernel READ must retain its IRP")
+        };
+        om.queue_external_file_release(client, file).unwrap();
+        assert_eq!(om.pump(), 1);
+        assert_eq!(om.file(file).unwrap().outstanding_irp_refs, 1);
+        state.borrow_mut().read_ready = true;
+        assert_eq!(om.pump(), 1);
+        assert!(om.file(file).is_some());
+        assert_eq!(
+            state.borrow().seen.iter().map(|irp| irp.major).collect::<std::vec::Vec<_>>(),
+            [major::IRP_MJ_CREATE, major::IRP_MJ_READ, major::IRP_MJ_CLEANUP]
+        );
+        om.acknowledge_completed_irp_strict(irp_id).unwrap();
+        om.pump();
+        assert!(om.file(file).is_none());
+        assert_eq!(
+            state.borrow().seen.iter().map(|irp| irp.major).collect::<std::vec::Vec<_>>(),
+            [
+                major::IRP_MJ_CREATE,
+                major::IRP_MJ_READ,
+                major::IRP_MJ_CLEANUP,
+                major::IRP_MJ_CLOSE,
+            ]
+        );
+    }
+
+    #[test]
     fn set_information_target_rejects_stale_cross_client_and_cross_device_files() {
         let mut om = io();
         let client = ClientId(1);
