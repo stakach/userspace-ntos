@@ -69,6 +69,7 @@ mod executive_ingress;
 mod executive_va;
 mod fs_loader;
 mod mounted_volume;
+mod mounted_volume_backend;
 pub(crate) use fs_loader::*;
 mod hosted_bootstrap;
 pub(crate) use hosted_bootstrap::*;
@@ -29222,8 +29223,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let dma_exec = copy_cap(dma_frame);
             let _ = page_map(dma_exec, AHCI_DMA_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
             let mut generic_loader_ok = false;
+            let mut mounted_volume_provider_ok = false;
+            let mut mounted_volume_file_ok = false;
             if let Some(fs) = fat32_mount(AHCI_VADDR, AHCI_DMA_VADDR, AHCI_IOVA)
                 .and_then(|fs| publish_exec_fs(fs).ok().map(|()| fs)) {
+                if let Ok((_, file_ok)) = mounted_volume::register_mounted_volume(fs) {
+                    mounted_volume_provider_ok = true;
+                    mounted_volume_file_ok = file_ok;
+                }
                 if let Some((va, sz)) = load_file_to_pool(&fs, b"reactos\\system32\\version.dll") {
                     let bytes = core::slice::from_raw_parts(va as *const u8, sz as usize);
                     let mz = sz >= 2 && bytes[0] == b'M' && bytes[1] == b'Z';
@@ -29250,6 +29257,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             check(
                 b"exec_generic_loader_by_path",
                 generic_loader_ok,
+                &mut passed,
+            );
+            check(
+                b"exec_mounted_volume_provider_registered",
+                mounted_volume_provider_ok,
+                &mut passed,
+            );
+            check(
+                b"exec_mounted_volume_canonical_font_read",
+                mounted_volume_file_ok,
                 &mut passed,
             );
 

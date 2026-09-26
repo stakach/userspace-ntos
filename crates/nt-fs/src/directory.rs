@@ -1,5 +1,7 @@
 //! Native directory-query state, wildcard matching, and information-record encoding.
 
+use alloc::vec::Vec;
+
 use crate::{
     STATUS_BUFFER_OVERFLOW, STATUS_INFO_LENGTH_MISMATCH, STATUS_INSUFFICIENT_RESOURCES,
     STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS, STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE,
@@ -530,16 +532,14 @@ impl ReadOnlyFileOpenSlot {
 }
 
 pub struct ReadOnlyFileOpenTable<const SLOTS: usize> {
-    slots: [ReadOnlyFileOpenSlot; SLOTS],
+    slots: Vec<ReadOnlyFileOpenSlot>,
 }
 
 impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
     pub const fn new() -> Self {
         assert!(SLOTS > 0);
         assert!(SLOTS <= OPEN_SLOT_MASK as usize + 1);
-        Self {
-            slots: [ReadOnlyFileOpenSlot::empty(); SLOTS],
-        }
+        Self { slots: Vec::new() }
     }
 
     pub fn create(
@@ -558,12 +558,22 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
         }
         let requested = crate::FileShareAccess::new(desired_access, share_access);
         self.check_share_access(volume_relative_path, metadata, requested)?;
-        let (index, slot) = self
+        let index = match self
             .slots
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| !slot.occupied && slot.generation <= u16::MAX as u32)
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+            .iter()
+            .position(|slot| !slot.occupied && slot.generation <= u16::MAX as u32)
+        {
+            Some(index) => index,
+            None if self.slots.len() < SLOTS => {
+                self.slots
+                    .try_reserve(1)
+                    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                self.slots.push(ReadOnlyFileOpenSlot::empty());
+                self.slots.len() - 1
+            }
+            None => return Err(STATUS_INSUFFICIENT_RESOURCES),
+        };
+        let slot = &mut self.slots[index];
         let mut path = [0; DIRECTORY_OPEN_PATH_CAP];
         path[..volume_relative_path.len()].copy_from_slice(volume_relative_path);
         *slot = ReadOnlyFileOpenSlot {
@@ -1387,7 +1397,9 @@ mod tests {
 
     #[test]
     fn readonly_file_open_references_share_position() {
-        let mut table = ReadOnlyFileOpenTable::<2>::new();
+        const EMPTY: ReadOnlyFileOpenTable<2> = ReadOnlyFileOpenTable::new();
+        let mut table = EMPTY;
+        assert!(table.slots.is_empty());
         let alternate_name = fat_short_name("NTDLL.DLL");
         let shared = table
             .create(
@@ -1413,6 +1425,20 @@ mod tests {
                 crate::FatShortName::EMPTY,
             )
             .unwrap();
+        assert_eq!(table.slots.len(), 2);
+        assert_eq!(
+            table.create(
+                77,
+                1,
+                b"reactos\\other",
+                0,
+                0,
+                0,
+                crate::FileMetadata::default(),
+                crate::FatShortName::EMPTY,
+            ),
+            Err(STATUS_INSUFFICIENT_RESOURCES)
+        );
         table.retain(shared).unwrap();
         assert_eq!(table.is_final_reference(shared), Ok(false));
         assert_eq!(table.is_signaled(shared), Ok(true));
@@ -1566,6 +1592,7 @@ mod tests {
         );
 
         let mut files = ReadOnlyFileOpenTable::<1>::new();
+        files.slots.push(ReadOnlyFileOpenSlot::empty());
         files.slots[0].generation = u16::MAX as u32;
         let file = files
             .create(
