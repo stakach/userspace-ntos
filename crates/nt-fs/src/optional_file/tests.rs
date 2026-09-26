@@ -126,6 +126,35 @@ fn relative_queries_preserve_directory_metadata_but_reads_refuse_directories() {
 }
 
 #[test]
+fn relative_directory_snapshot_distinguishes_absence_file_and_live_children() {
+    let mut fs = fs();
+    assert_eq!(fs.try_directory_entries_relative(b"missing"), Ok(None));
+    assert!(fs.provision_file(PRIMARY, b"data"));
+    assert_eq!(
+        fs.try_directory_entries_relative(b"config\\hive"),
+        Err(STATUS_NOT_A_DIRECTORY)
+    );
+    let entries = fs
+        .try_directory_entries_relative(b"config")
+        .unwrap()
+        .unwrap();
+    let names: Vec<Vec<u16>> = entries.iter().map(|entry| entry.name().to_vec()).collect();
+    assert_eq!(
+        names,
+        [".", "..", "Hive"].map(|name| name.encode_utf16().collect::<Vec<_>>())
+    );
+    assert_eq!(entries[2].end_of_file, 4);
+    assert_eq!(
+        entries[2].file_id,
+        fs.query_metadata(PRIMARY).unwrap().file_id
+    );
+    assert_eq!(
+        fs.try_directory_entries_relative(b"Config"),
+        Err(STATUS_OBJECT_NAME_INVALID)
+    );
+}
+
+#[test]
 fn relative_queries_reject_non_directory_ancestors_instead_of_falling_through() {
     let mut fs = fs();
     assert!(fs.provision_file(PRIMARY, b"data"));
