@@ -23,8 +23,9 @@ use core::mem::size_of;
 use bytemuck::Pod;
 use nt_object_abi::{
     opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateFileHandleRequest,
-    ObCreateIoObjectRequest, ObCreateSymbolicLinkRequest, ObDereferenceObjectRequest,
-    ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo, ObReferenceFileHandleRequest,
+    ObCreateIoObjectRequest, ObCreateSymbolicLinkRequest, ObDeleteSymbolicLinkExactRequest,
+    ObDereferenceObjectRequest, ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo,
+    ObReferenceFileHandleRequest,
     ObReferenceHandleRequest, ObReply, ObDirectoryHandleRequest, ObQueryDirectoryRequest,
 };
 use nt_status::NtStatus;
@@ -325,6 +326,31 @@ impl<B: Backend> ObjectClient<B> {
             .backend
             .call(opcode::OB_OP_DELETE_OBJECT, &buf, &mut []);
         NtStatus(r.status).to_result()
+    }
+
+    /// Unlink a symbolic link only if the name still identifies the link this
+    /// client created. A replacement at the same path is left intact.
+    pub fn delete_symbolic_link_exact(
+        &mut self,
+        path: &str,
+        expected: ObjectId,
+        case_insensitive: bool,
+    ) -> Result<(), NtStatus> {
+        if expected.0 == 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let units = utf16(path);
+        let req = ObDeleteSymbolicLinkExactRequest {
+            abi_size: size_of::<ObDeleteSymbolicLinkExactRequest>() as u16,
+            flags: case_flag(case_insensitive),
+            _reserved: 0,
+            expected_object_id: expected.0,
+            path_offset: size_of::<ObDeleteSymbolicLinkExactRequest>() as u32,
+            path_len_bytes: byte_len(&units),
+        };
+        let buf = pack(&req, &units);
+        let reply = self.backend.call(opcode::OB_OP_DELETE_SYMBOLIC_LINK_EXACT, &buf, &mut []);
+        NtStatus(reply.status).to_result()
     }
 
     /// Resolve a path and return its object/routing metadata.

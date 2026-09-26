@@ -33,6 +33,7 @@ pub mod opcode {
     pub const OB_OP_DEREFERENCE_OBJECT: u16 = 0x2014;
     pub const OB_OP_MAKE_TEMPORARY: u16 = 0x2015;
     pub const OB_OP_DELETE_OBJECT: u16 = 0x2016;
+    pub const OB_OP_DELETE_SYMBOLIC_LINK_EXACT: u16 = 0x2017;
 
     pub const OB_OP_CREATE_DIRECTORY: u16 = 0x2020;
     pub const OB_OP_CREATE_SYMBOLIC_LINK: u16 = 0x2021;
@@ -238,6 +239,19 @@ pub struct ObLookupPathRequest {
     pub path_len_bytes: u32,
 }
 
+/// Delete only the symbolic link currently named by `path` when its identity
+/// matches the object returned by CREATE_SYMBOLIC_LINK.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ObDeleteSymbolicLinkExactRequest {
+    pub abi_size: u16,
+    pub flags: u16,
+    pub _reserved: u32,
+    pub expected_object_id: u64,
+    pub path_offset: u32,
+    pub path_len_bytes: u32,
+}
+
 /// `OB_OP_QUERY_OBJECT` fixed result.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -292,6 +306,7 @@ const _: () = {
     assert!(size_of::<ObReferenceHandleRequest>() == 24);
     assert!(size_of::<ObDereferenceObjectRequest>() == 16);
     assert!(size_of::<ObLookupPathRequest>() == 12);
+    assert!(size_of::<ObDeleteSymbolicLinkExactRequest>() == 24);
     assert!(size_of::<ObQueryObjectInfo>() == 48);
     assert!(size_of::<ObCloseHandleRequest>() == 16);
     assert!(size_of::<ObReply>() == 24);
@@ -301,6 +316,7 @@ const _: () = {
     assert!(align_of::<ObReferenceFileHandleRequest>() == 8);
     assert!(align_of::<ObReferenceHandleRequest>() == 8);
     assert!(align_of::<ObLookupPathRequest>() == 4);
+    assert!(align_of::<ObDeleteSymbolicLinkExactRequest>() == 8);
 };
 
 #[cfg(test)]
