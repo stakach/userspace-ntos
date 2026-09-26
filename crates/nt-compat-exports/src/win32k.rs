@@ -165,7 +165,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ZwQueryKey", Partial, "leased SYSTEM keys use the complete native key-information layouts and sizing policy; non-SYSTEM dynamic keys remain"),
     e("ZwQueryObject", Partial, "handle/directory-object ops routed to nt-object-manager"),
     e("ZwQueryDirectoryFile", StubSuccess, "file ops routed to nt-fs where mounted; else success with empty result (Phase 2 wiring)"),
-    e("ZwQueryInformationFile", StubSuccess, "file ops routed to nt-fs where mounted; else success with empty result (Phase 2 wiring)"),
+    e("ZwQueryInformationFile", Partial, "authenticated win32k kernel-handle queries retain real routed File IRP completion and exact pool ownership"),
     e("ZwUnmapViewOfSection", Partial, "virtual-memory/section ops routed to nt-memory-manager/nt-address-space"),
     e("ZwMapViewOfSection", Partial, "virtual-memory/section ops routed to nt-memory-manager/nt-address-space"),
     e("ZwCreateFile", StubSuccess, "file ops routed to nt-fs where mounted; else success with empty result (Phase 2 wiring)"),

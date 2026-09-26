@@ -4480,6 +4480,30 @@ pub(crate) unsafe fn service_win32k_file_create_request(
     crate::driver_launch::service_win32k_io_create_file(channel, packet, length)
 }
 
+pub(crate) unsafe fn service_win32k_file_query_request(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    packet: u64,
+    length: u64,
+    handle: u64,
+    spare: u64,
+) -> Option<i32> {
+    if spare != 0 {
+        return Some(nt_process::STATUS_INVALID_PARAMETER as i32);
+    }
+    if let Err(status) = authenticate_win32k_service_request(
+        channel, reply_cap, badge, mi, (crate::win32k_subsystem::W32_FILE_QUERY_LABEL << 12) | 4,
+    ) {
+        return Some(status as i32);
+    }
+    if SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) == 0 {
+        return Some(0xC000_00A3u32 as i32);
+    }
+    crate::driver_launch::service_win32k_file_query(channel, packet, length, handle)
+}
+
 /// The canonical shared-ingress completion owns final cleanup of unpublished stages.
 pub(crate) unsafe fn retire_win32k_directory_route(
     route: nt_component_suspension::peer_registry::PeerRoute,

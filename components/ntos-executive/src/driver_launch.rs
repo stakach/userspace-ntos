@@ -54467,6 +54467,15 @@ pub(crate) unsafe fn service_hosted_driver_zw_read_query_file(
     hosted_kernel_file_read_query::submit(ch, packet, packet_length, handle, active_reply_cap)
 }
 
+pub(crate) unsafe fn service_win32k_file_query(
+    ch: &crate::spawn_hosts::PumpChannel,
+    packet: u64,
+    packet_length: u64,
+    handle: u64,
+) -> Option<i32> {
+    hosted_kernel_file_read_query::submit_win32k(ch, packet, packet_length, handle)
+}
+
 pub(crate) unsafe fn redrive_hosted_driver_zw_read_query_file(handler: *mut ExecNtHandler) {
     hosted_kernel_file_read_query::redrive(handler);
 }
