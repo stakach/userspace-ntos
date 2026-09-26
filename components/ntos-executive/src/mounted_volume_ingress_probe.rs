@@ -91,6 +91,78 @@ pub(crate) unsafe fn run(device_id: u64) -> bool {
     opened && released && !crate::driver_launch::hosted_file_exists(file)
 }
 
+pub(crate) unsafe fn run_directory(device_id: u64) -> bool {
+    let caller = crate::initial_system_driver_caller();
+    let name = UnicodeString::from_str("reactos\\Fonts");
+    let access = nt_types::AccessMask::GENERIC_READ;
+    let share = nt_io_manager::ShareAccess::READ;
+    let options = nt_io_manager::CreateOptions::DIRECTORY_FILE;
+    let file = match crate::driver_launch::allocate_hosted_file(
+        device_id,
+        access.bits(),
+        share.bits(),
+        options.bits(),
+        name.as_units(),
+    ) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let tested = (|| -> Result<bool, u32> {
+        let mut input = Vec::new();
+        input
+            .try_reserve_exact(name.as_units().len() * 2)
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32)?;
+        for unit in name.as_units() {
+            input.extend_from_slice(&unit.to_le_bytes());
+        }
+        let (status, information, pending, context) =
+            crate::driver_launch::dispatch_hosted_file_create_irp_result_exact(
+                file,
+                major::IRP_MJ_CREATE,
+                caller,
+                CreateParameters {
+                    desired_access: access,
+                    share_access: share,
+                    create_options: options,
+                    create_disposition: nt_fs::FILE_OPEN,
+                    ..CreateParameters::default()
+                },
+                &input,
+            )?;
+        if status != 0
+            || information != nt_fs::FILE_OPENED as u64
+            || pending.is_some()
+            || context.is_none()
+        {
+            return Ok(false);
+        }
+        let mut standard = [0u8; 24];
+        let (status, information, pending, _) =
+            crate::driver_launch::dispatch_hosted_file_irp_result_exact(
+                file,
+                major::IRP_MJ_QUERY_INFORMATION as u64,
+                nt_fs::FILE_STANDARD_INFORMATION as u64,
+                caller,
+                &[],
+                &mut standard,
+                0,
+            )?;
+        Ok(status == 0
+            && information == standard.len() as u64
+            && pending.is_none()
+            && standard[21] == 1)
+    })()
+    .unwrap_or(false);
+    let released = crate::driver_launch::release_hosted_file(file).is_ok();
+    for _ in 0..4 {
+        crate::driver_launch::pump_registered_file_lifecycle();
+        if !crate::driver_launch::hosted_file_exists(file) {
+            break;
+        }
+    }
+    tested && released && !crate::driver_launch::hosted_file_exists(file)
+}
+
 pub(crate) unsafe fn run_overlay(device_id: u64) -> bool {
     let caller = crate::initial_system_driver_caller();
     let name = UnicodeString::from_str("ntos-mount-probe.tmp");
