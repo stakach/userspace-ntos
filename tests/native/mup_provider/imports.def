@@ -17,6 +17,8 @@ EXPORTS
     KeWaitForSingleObject
     KeSetEvent
     ZwCreateFile
+    ZwQueryInformationFile
+    ZwReadFile
     ZwWriteFile
     ZwFsControlFile
     ZwWaitForSingleObject

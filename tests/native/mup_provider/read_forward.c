@@ -132,6 +132,10 @@ _Static_assert(offsetof(DRIVER_OBJECT, DriverUnload) == 0x68, "driver unload x64
 __declspec(dllimport) NTSTATUS __stdcall ZwCreateFile(HANDLE *, uint32_t,
     OBJECT_ATTRIBUTES *, IO_STATUS_BLOCK *, int64_t *, uint32_t, uint32_t,
     uint32_t, uint32_t, void *, uint32_t);
+__declspec(dllimport) NTSTATUS __stdcall ZwQueryInformationFile(HANDLE, IO_STATUS_BLOCK *,
+    void *, uint32_t, uint32_t);
+__declspec(dllimport) NTSTATUS __stdcall ZwReadFile(HANDLE, HANDLE, void *, void *,
+    IO_STATUS_BLOCK *, void *, uint32_t, int64_t *, uint32_t *);
 __declspec(dllimport) NTSTATUS __stdcall ZwClose(HANDLE);
 __declspec(dllimport) NTSTATUS __stdcall ObReferenceObjectByHandle(HANDLE, uint32_t,
     void *, uint8_t, void **, void *);
@@ -317,6 +321,57 @@ static NTSTATUS QueryOnce(void *file, DEVICE_OBJECT *device, uint32_t ordinal)
     return status;
 }
 
+static NTSTATUS QueryThroughZw(HANDLE handle)
+{
+    FILE_STANDARD_INFORMATION output;
+    uint8_t *output_bytes = (uint8_t *)&output;
+    for (uint32_t i = 0; i < sizeof(output); i++) output_bytes[i] = 0xcc;
+    IO_STATUS_BLOCK iosb = {0};
+    NTSTATUS call_status = ZwQueryInformationFile(handle, &iosb, &output,
+                                                  sizeof(output), FileStandardInformation);
+    NTSTATUS status = call_status == STATUS_SUCCESS && iosb.Status == STATUS_SUCCESS &&
+                      iosb.Information == sizeof(output) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    if (status == STATUS_SUCCESS) {
+        const uint8_t *expected = (const uint8_t *)&ExpectedStandardInfo;
+        for (uint32_t i = 0; i < sizeof(output); i++) {
+            if (output_bytes[i] != expected[i]) {
+                status = STATUS_UNSUCCESSFUL;
+                break;
+            }
+        }
+    }
+    DbgPrint("[zw-query-file-result] call=0x%08x iosb=0x%08x info=%u bytes-match=%u\n",
+             (uint32_t)call_status, (uint32_t)iosb.Status,
+             (uint32_t)iosb.Information, status == STATUS_SUCCESS);
+    if (status == STATUS_SUCCESS) DbgPrint("[zw-query-file-verified]\n");
+    return status;
+}
+
+static NTSTATUS ReadThroughZw(HANDLE handle)
+{
+    uint8_t output[sizeof(ExpectedBytes)];
+    for (uint32_t i = 0; i < sizeof(output); i++) output[i] = 0xcc;
+    IO_STATUS_BLOCK iosb = {0};
+    int64_t offset = 0;
+    NTSTATUS call_status = ZwReadFile(handle, NULL, NULL, NULL, &iosb, output,
+                                      sizeof(output), &offset, NULL);
+    NTSTATUS status = call_status == STATUS_SUCCESS && iosb.Status == STATUS_SUCCESS &&
+                      iosb.Information == sizeof(output) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    if (status == STATUS_SUCCESS) {
+        for (uint32_t i = 0; i < sizeof(output); i++) {
+            if (output[i] != ExpectedBytes[i]) {
+                status = STATUS_UNSUCCESSFUL;
+                break;
+            }
+        }
+    }
+    DbgPrint("[zw-read-file-result] call=0x%08x iosb=0x%08x info=%u bytes-match=%u\n",
+             (uint32_t)call_status, (uint32_t)iosb.Status,
+             (uint32_t)iosb.Information, status == STATUS_SUCCESS);
+    if (status == STATUS_SUCCESS) DbgPrint("[zw-read-file-verified]\n");
+    return status;
+}
+
 static void __stdcall ReadWorker(void *context)
 {
     (void)context;
@@ -355,6 +410,8 @@ static void __stdcall ReadWorker(void *context)
     if (status == STATUS_SUCCESS) status = FlushOnce(file, device, 1);
     if (status == STATUS_SUCCESS) status = QueryOnce(file, device, 0);
     if (status == STATUS_SUCCESS) status = QueryOnce(file, device, 1);
+    if (status == STATUS_SUCCESS) status = QueryThroughZw(handle);
+    if (status == STATUS_SUCCESS) status = ReadThroughZw(handle);
 dereference:
     ObfDereferenceObject(file);
 close:

@@ -3167,6 +3167,31 @@ unsafe fn component_pump_loop(
                 msg = pump_recv(ch, *reply_cap);
             }
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_ZW_READ_QUERY_FILE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_ZW_READ_QUERY_FILE_LABEL << 12) | 4)
+                && msg.m3 == 0
+            {
+                unsafe {
+                    crate::driver_launch::service_hosted_driver_zw_read_query_file(
+                        ch, msg.m0, msg.m1, msg.m2, *reply_cap,
+                    )
+                }
+            } else {
+                Some(STATUS_INVALID_PARAMETER_I32)
+            };
+            if let Some(status) = status {
+                pump_reply_recv4_into!(ch, *reply_cap, msg, 1,
+                    status as u32 as u64, 0, 0, 0);
+            } else if shared_pump::autonomous(ch) {
+                outcome.provider_wait_suspended = true;
+                break;
+            } else {
+                msg = pump_recv(ch, *reply_cap);
+            }
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_ZW_WAIT_FILE_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
