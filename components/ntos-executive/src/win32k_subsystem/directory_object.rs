@@ -179,8 +179,6 @@ unsafe fn open_impl(
     publish_status
 }
 
-/// Unbound until the executive's directory broker is integrated.
-#[allow(dead_code)]
 pub(super) extern "win64" fn create(
     handle_out: *mut u64,
     desired_access: u32,
@@ -189,8 +187,6 @@ pub(super) extern "win64" fn create(
     unsafe { open_impl(handle_out, desired_access, object_attributes, true) }
 }
 
-/// Unbound until the executive's directory broker is integrated.
-#[allow(dead_code)]
 pub(super) extern "win64" fn open(
     handle_out: *mut u64,
     desired_access: u32,
@@ -213,8 +209,6 @@ unsafe fn query_call(op: u64, first: u64, second: u64, third: u64) -> (i32, u64,
     (raw as u32 as i32, out1, out2, out3)
 }
 
-/// Unbound until native name, security, and typed-close contracts are ready for import cutover.
-#[allow(dead_code)]
 pub(super) extern "win64" fn query(
     handle: u64,
     buffer: *mut u8,
