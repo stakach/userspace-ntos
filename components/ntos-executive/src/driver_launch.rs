@@ -38101,6 +38101,26 @@ pub(crate) fn registered_dos_drive_type(target: &[u8]) -> Option<u8> {
     })
 }
 
+/// Resolve an absolute native directory name through the Object Manager, then require a live
+/// kernel-backed file-system Device. The returned name is device-relative FILE_OBJECT.FileName.
+pub(crate) fn resolve_kernel_directory_file_name(
+    name: &[u16],
+    case_insensitive: bool,
+) -> Result<(u64, alloc::vec::Vec<u16>), u32> {
+    let (device_id, relative) =
+        hosted_io_create_file_ingress::resolve_absolute_name(name, case_insensitive)?;
+    let device = io_manager_mut()
+        .device(nt_io_manager::DeviceId(device_id))
+        .ok_or(STATUS_INVALID_HANDLE as u32)?;
+    if device.device_type != DeviceType::DISK_FILE_SYSTEM
+        || registered_file_target(device_id, major::IRP_MJ_CREATE)?
+            != RegisteredFileTarget::Kernel
+    {
+        return Err(STATUS_INVALID_DEVICE_REQUEST as u32);
+    }
+    Ok((device_id, relative))
+}
+
 fn pump_io_manager() -> usize {
     let io = io_manager_mut();
     hosted_file_capture::redrive(io);

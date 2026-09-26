@@ -25730,7 +25730,7 @@ unsafe fn pending_file_io_redrive_pass(
                         wake_server_fid: 0,
                     }
                 } else {
-                    match nt_handler.publish_npfs_create(
+                    match nt_handler.publish_registered_create(
                         pending.major,
                         file_id,
                         completed.file_context.unwrap_or(0),
@@ -25792,9 +25792,11 @@ unsafe fn pending_file_io_redrive_pass(
                         .publish_bound_file_handle(reservation)
                         .expect("pending CREATE bound handle could not be published");
                     assert_eq!(published, create.handle_value);
-                    assert!(driver_launch::cancel_hosted_file_lifecycle_reservation(
-                        pending.route.hosted_file_id().expect("hosted CREATE lost its File route")
-                    ));
+                    if create.lifecycle_reserved {
+                        assert!(driver_launch::cancel_hosted_file_lifecycle_reservation(
+                            pending.route.hosted_file_id().expect("hosted CREATE lost its File route")
+                        ));
+                    }
                 }
                 delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                     .mark_create_handle_published_exact(slot, pending.irp_id)

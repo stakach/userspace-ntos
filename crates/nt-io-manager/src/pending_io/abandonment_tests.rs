@@ -27,6 +27,7 @@ fn create(irp: u64) -> PendingFileIo {
             handle_va: 0x1000,
             desired_access: 3,
             provider_context: 4,
+            lifecycle_reserved: true,
             reservation_pid: 5,
             reserved_handle: 6,
             reservation_generation: 7,

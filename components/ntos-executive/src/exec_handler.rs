@@ -252,6 +252,7 @@ pub(crate) enum HostedCreateDispatch {
         file_id: u64,
         fs_context: u64,
         reservation: Option<nt_process::HandleReservation>,
+        lifecycle_reserved: bool,
     },
     Pending,
 }
@@ -26313,10 +26314,64 @@ impl ExecNtHandler {
         })
     }
 
-    /// Allocate one canonical File, reserve every publication surface, and route CREATE through the
-    /// dynamically registered NPFS device. A pending result transfers its exact File/IRP and caller
-    /// outputs into the common pending File-I/O owner; CREATE syscalls always wait for terminal
-    /// completion regardless of the new File's synchronous flag.
+    unsafe fn create_kernel_directory_file(
+        &mut self,
+        name16: &[u16],
+        object_attributes: u32,
+        desired_access: u32,
+        share_access: u32,
+        disposition: u32,
+        file_attributes: u32,
+        create_options: u32,
+        ea: &[u8],
+        file_handle_va: u64,
+        iosb_va: u64,
+    ) -> u32 {
+        let dispatch = driver_launch::resolve_kernel_directory_file_name(
+            name16,
+            object_attributes & 0x40 != 0,
+        )
+        .and_then(|(device_id, relative)| {
+            self.registered_create_file(
+                device_id,
+                major::IRP_MJ_CREATE,
+                &relative,
+                None,
+                object_attributes,
+                0,
+                desired_access,
+                share_access,
+                disposition,
+                file_attributes,
+                create_options,
+                ea,
+                file_handle_va,
+                iosb_va,
+            )
+        });
+        let publication = match dispatch {
+            Ok(dispatch) => self.finish_registered_create_dispatch(
+                dispatch,
+                major::IRP_MJ_CREATE,
+                desired_access,
+                0,
+            ),
+            Err(status) => Some(HostedCreatePublication {
+                status,
+                information: 0,
+                handle: 0,
+                wake_server_fid: 0,
+            }),
+        };
+        let Some(publication) = publication else {
+            return STATUS_PENDING;
+        };
+        self.write_nt_open_file_handle_out(file_handle_va, publication.handle);
+        self.xas_write_buf(iosb_va, &publication.status.to_le_bytes());
+        self.xas_write_buf(iosb_va + 8, &publication.information.to_le_bytes());
+        publication.status
+    }
+
     pub(crate) unsafe fn npfs_create_file(
         &mut self,
         major: u8,
@@ -26333,11 +26388,56 @@ impl ExecNtHandler {
         file_handle_va: u64,
         iosb_va: u64,
     ) -> Result<HostedCreateDispatch, u32> {
-        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
         if !driver_launch::npfs_ready() {
             return Err(STATUS_DEVICE_NOT_READY);
         }
+        let device_id = driver_launch::device_id_by_name("\\Device\\NamedPipe")
+            .ok_or(STATUS_DEVICE_NOT_READY)?;
+        let result = self.registered_create_file(
+            device_id,
+            major,
+            name16,
+            related_file_id,
+            object_attributes,
+            provider_context,
+            desired_access,
+            share_access,
+            create_disposition,
+            file_attributes,
+            create_options,
+            ea,
+            file_handle_va,
+            iosb_va,
+        );
+        if result.is_ok() {
+            NPFS_ROUTED_IRPS.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Reserve canonical File, process handle, and pending owner before any registered provider
+    /// sees CREATE. Pipe endpoint metadata is requested only when provider_context is nonzero.
+    pub(crate) unsafe fn registered_create_file(
+        &mut self,
+        device_id: u64,
+        major: u8,
+        name16: &[u16],
+        related_file_id: Option<u64>,
+        object_attributes: u32,
+        provider_context: u64,
+        desired_access: u32,
+        share_access: u32,
+        create_disposition: u32,
+        file_attributes: u32,
+        create_options: u32,
+        ea: &[u8],
+        file_handle_va: u64,
+        iosb_va: u64,
+    ) -> Result<HostedCreateDispatch, u32> {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+        let lifecycle_reserved = driver_launch::registered_file_target(device_id, major)?
+            == driver_launch::RegisteredFileTarget::DriverPeer;
         let io_mode = file_io_mode_from_create(desired_access, create_options)?;
         if file_handle_va == 0
             || iosb_va == 0
@@ -26346,8 +26446,6 @@ impl ExecNtHandler {
         {
             return Err(STATUS_ACCESS_VIOLATION);
         }
-        let device_id = driver_launch::device_id_by_name("\\Device\\NamedPipe")
-            .ok_or(STATUS_DEVICE_NOT_READY)?;
         if related_file_id.is_some_and(|file_id| {
             driver_launch::hosted_file_route(file_id)
                 .is_none_or(|(parent_device_id, _)| parent_device_id != device_id)
@@ -26404,10 +26502,12 @@ impl ExecNtHandler {
                 return Err(status);
             }
         };
-        if let Err(status) = self.reserve_unpublished_hosted_file_lifecycle(canonical_file_id) {
-            let _ = self.pm.cancel_reserved_handle(reservation);
-            let _ = driver_launch::abandon_unpublished_hosted_file(canonical_file_id);
-            return Err(status);
+        if lifecycle_reserved {
+            if let Err(status) = self.reserve_unpublished_hosted_file_lifecycle(canonical_file_id) {
+                let _ = self.pm.cancel_reserved_handle(reservation);
+                let _ = driver_launch::abandon_unpublished_hosted_file(canonical_file_id);
+                return Err(status);
+            }
         }
         if let Err(status) = self.file_completion.reserve_file_handle_publication(
             canonical_file_id,
@@ -26445,7 +26545,6 @@ impl ExecNtHandler {
                 return Err(status);
             }
         };
-        NPFS_ROUTED_IRPS.fetch_add(1, Ordering::Relaxed);
         if let Some(irp_id) = pending_irp_id {
             self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
                 route: PendingFileRoute::Hosted(canonical_file_id),
@@ -26457,6 +26556,7 @@ impl ExecNtHandler {
                         handle_va: file_handle_va,
                         desired_access,
                         provider_context,
+                        lifecycle_reserved,
                         reservation_pid: reservation.process_id,
                         reserved_handle: reservation.handle,
                         reservation_generation: reservation.generation,
@@ -26503,6 +26603,7 @@ impl ExecNtHandler {
                 file_id: 0,
                 fs_context: 0,
                 reservation: None,
+                lifecycle_reserved,
             });
         }
         let fs_context = file_context
@@ -26514,10 +26615,11 @@ impl ExecNtHandler {
             file_id: canonical_file_id,
             fs_context,
             reservation: Some(reservation),
+            lifecycle_reserved,
         })
     }
 
-    pub(crate) unsafe fn publish_npfs_create(
+    pub(crate) unsafe fn publish_registered_create(
         &mut self,
         major: u8,
         file_id: u64,
@@ -26528,8 +26630,6 @@ impl ExecNtHandler {
         status: u32,
         information: u64,
     ) -> Result<HostedCreatePublication, u32> {
-        let named_pipe_device = driver_launch::device_id_by_name("\\Device\\NamedPipe")
-            .ok_or(STATUS_DEVICE_NOT_READY)?;
         let (device_id, live_context) = driver_launch::hosted_file_route(file_id)
             .ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
         let fs_context = if fs_context != 0 {
@@ -26540,12 +26640,11 @@ impl ExecNtHandler {
         } else {
             live_context
         };
-        if device_id != named_pipe_device || fs_context == 0 {
+        if fs_context == 0 {
             return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
         }
 
-        // A zero provider context denotes the NPFS root/control File. The RootDcb FILE_OBJECT is a
-        // canonical routed File, but it has no endpoint-name metadata to publish in the executive.
+        // Ordinary provider CREATE and the NPFS root have no endpoint-name metadata.
         if major == major::IRP_MJ_CREATE && provider_context == 0 {
             let handle = self.bind_reserved_file_handle(file_id, reservation, desired_access)?;
             return Ok(HostedCreatePublication {
@@ -26556,6 +26655,11 @@ impl ExecNtHandler {
             });
         }
         if provider_context == 0 {
+            return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let named_pipe_device = driver_launch::device_id_by_name("\\Device\\NamedPipe")
+            .ok_or(STATUS_DEVICE_NOT_READY)?;
+        if device_id != named_pipe_device {
             return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
         }
 
@@ -26613,7 +26717,7 @@ impl ExecNtHandler {
         })
     }
 
-    pub(crate) unsafe fn finish_npfs_create_dispatch(
+    pub(crate) unsafe fn finish_registered_create_dispatch(
         &mut self,
         dispatch: HostedCreateDispatch,
         major: u8,
@@ -26626,6 +26730,7 @@ impl ExecNtHandler {
             file_id,
             fs_context,
             reservation,
+            lifecycle_reserved,
         } = dispatch
         else {
             return None;
@@ -26646,7 +26751,7 @@ impl ExecNtHandler {
                 wake_server_fid: 0,
             });
         };
-        match self.publish_npfs_create(
+        match self.publish_registered_create(
             major,
             file_id,
             fs_context,
@@ -26659,7 +26764,9 @@ impl ExecNtHandler {
             Ok(publication) => match self.publish_bound_file_handle(reservation) {
                 Ok(handle) => {
                     debug_assert_eq!(handle, publication.handle);
-                    assert!(driver_launch::cancel_hosted_file_lifecycle_reservation(file_id));
+                    if lifecycle_reserved {
+                        assert!(driver_launch::cancel_hosted_file_lifecycle_reservation(file_id));
+                    }
                     Some(publication)
                 }
                 Err(status) => {
@@ -31201,7 +31308,7 @@ impl ExecNtHandler {
                     args[3],
                 );
                 let publication = match dispatch {
-                    Ok(dispatch) => self.finish_npfs_create_dispatch(
+                    Ok(dispatch) => self.finish_registered_create_dispatch(
                         dispatch,
                         major::IRP_MJ_CREATE,
                         desired_access,
@@ -31312,7 +31419,7 @@ impl ExecNtHandler {
                     args[3],
                 );
                 let publication = match dispatch {
-                    Ok(dispatch) => self.finish_npfs_create_dispatch(
+                    Ok(dispatch) => self.finish_registered_create_dispatch(
                         dispatch,
                         major::IRP_MJ_CREATE,
                         desired_access,
@@ -31360,6 +31467,20 @@ impl ExecNtHandler {
                 );
                 return publication.status;
             }
+        }
+        if open_options & FILE_DIRECTORY_FILE as u32 != 0 {
+            return self.create_kernel_directory_file(
+                name16,
+                captured.attributes,
+                desired_access,
+                share_access,
+                nt_fs::FILE_OPEN,
+                0,
+                open_options,
+                &[],
+                file_handle_out,
+                args[3],
+            );
         }
         let mut path_folded = [0u8; FILE_OBJECT_NAME_CAP];
         let mut path_relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
@@ -31542,26 +31663,16 @@ impl ExecNtHandler {
         let is_sxs = nb[..nlen].windows(6).any(|w| w == b".local")
             || nb[..nlen].windows(9).any(|w| w == b".manifest")
             || nb[..nlen].windows(7).any(|w| w == b".config");
-        let want_dir = open_options & FILE_DIRECTORY_FILE as u32 != 0;
-        // Directory opens resolve authoritatively against the mounted FAT volume. The empty
-        // volume-relative path denotes the FAT root directory.
         let volume_path = volume_relative_len.map(|length| &path_relative[..length]);
         let volume_entry = volume_path.and_then(|path| {
             exec_fs().and_then(|fs| crate::fs_loader::fat_open_path_metadata(&fs, path))
         });
-        let volume_directory = if want_dir {
-            volume_path.zip(volume_entry.filter(|entry| entry.metadata.is_directory))
-        } else {
-            None
-        };
         let volume_file = volume_entry.filter(|entry| !entry.metadata.is_directory);
         let volume_not_directory = volume_file.is_some();
         let dynamic_role = self.dynamic_child_role();
         let mut hosted_exe_image = {
             let catalog = &*ctx.exe_image_catalog;
-            let probed = (!want_dir)
-                .then(|| Self::exe_probe_image(catalog, &nb[..nlen], is_sxs))
-                .flatten()
+            let probed = Self::exe_probe_image(catalog, &nb[..nlen], is_sxs)
                 .filter(|image| Self::hosted_image_exists(*image));
             match (probed, dynamic_role) {
                 (Some(image), Some(_)) if image.pi >= nt_exe_image::DYNAMIC_PROCESS_FIRST_PI => {
@@ -31579,7 +31690,7 @@ impl ExecNtHandler {
                 (None, _) => None,
             }
         };
-        if hosted_exe_image.is_none() && !want_dir {
+        if hosted_exe_image.is_none() {
             if let Some((image, _)) =
                 admit_dynamic_hosted_exe(ctx, dynamic_role, name16, &nb[..nlen], is_sxs)
             {
@@ -31588,7 +31699,7 @@ impl ExecNtHandler {
         }
         let hosted_exe_leaf = hosted_exe_image.map(|image| image.leaf);
         let userinit_shell_probe =
-            if self.current_process_is_shell_bootstrap() && !want_dir && !is_sxs {
+            if self.current_process_is_shell_bootstrap() && !is_sxs {
                 if nb[..nlen].windows(8).any(|w| w == b"explorer") {
                     Some(b"explorer.exe" as &[u8])
                 } else if nb[..nlen].windows(3).any(|w| w == b"cmd") {
@@ -31616,17 +31727,16 @@ impl ExecNtHandler {
             }
         }
         if self.current_process_is_winlogon()
-            && !want_dir
             && nb[..nlen].windows(8).any(|w| w == b"userinit")
         {
             WINLOGON_USERINIT_IMAGE_OPENS.fetch_add(1, Ordering::Relaxed);
         }
-        let mut dll_i = if self.pi >= 1 && !want_dir {
+        let mut dll_i = if self.pi >= 1 {
             reg.resolve_name(&nb[..nlen])
         } else {
             None
         };
-        if self.pi >= 1 && !want_dir && dll_i.is_none() && !is_sxs {
+        if self.pi >= 1 && dll_i.is_none() && !is_sxs {
             let load = {
                 let _alloc_scope = crate::allocator::enter_scope(b"demand-load-dll");
                 demand_load_dll_result(reg, &mut *ctx.dll_pe_store, &nb[..nlen])
@@ -31683,15 +31793,7 @@ impl ExecNtHandler {
         let loader_file = (hosted_exe_leaf.is_some() || dll_i.is_some())
             .then_some(volume_file)
             .flatten();
-        let loader_open = if let Some((path, directory)) = volume_directory {
-            Some(self.mint_directory_handle(
-                directory,
-                path,
-                desired_access,
-                share_access,
-                open_options,
-            ))
-        } else if let (Some(file), Some(path)) = (loader_file, volume_path) {
+        let loader_open = if let (Some(file), Some(path)) = (loader_file, volume_path) {
             Some(self.mint_disk_file_handle(file, path, desired_access, share_access, open_options))
         } else {
             None
@@ -33000,7 +33102,7 @@ impl ExecNtHandler {
                     iosb,
                 );
                 let publication = match dispatch {
-                    Ok(dispatch) => self.finish_npfs_create_dispatch(
+                    Ok(dispatch) => self.finish_registered_create_dispatch(
                         dispatch,
                         major::IRP_MJ_CREATE_NAMED_PIPE,
                         desired_access,
@@ -39299,7 +39401,7 @@ impl ExecNtHandler {
                             iosb,
                         );
                         let publication = match dispatch {
-                            Ok(dispatch) => self.finish_npfs_create_dispatch(
+                            Ok(dispatch) => self.finish_registered_create_dispatch(
                                 dispatch,
                                 major::IRP_MJ_CREATE,
                                 desired_access,
@@ -39338,6 +39440,23 @@ impl ExecNtHandler {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     self.xas_write_buf(iosb + 8, &information.to_le_bytes());
                     return status;
+                }
+                if create_options & nt_fs::FILE_DIRECTORY_FILE != 0
+                    && !Self::is_named_pipe_root_path(name16)
+                    && !nt_fs::is_named_pipe_path(name16)
+                {
+                    return self.create_kernel_directory_file(
+                        name16,
+                        captured.attributes,
+                        desired_access,
+                        share_access,
+                        create_disposition,
+                        file_attributes,
+                        create_options,
+                        &ea,
+                        file_handle_out,
+                        iosb,
+                    );
                 }
                 let mut status;
                 let mut info = 0u64;
@@ -39401,7 +39520,7 @@ impl ExecNtHandler {
                             iosb,
                         );
                         let publication = match dispatch {
-                            Ok(dispatch) => self.finish_npfs_create_dispatch(
+                            Ok(dispatch) => self.finish_registered_create_dispatch(
                                 dispatch,
                                 major::IRP_MJ_CREATE,
                                 desired_access,
@@ -39453,7 +39572,7 @@ impl ExecNtHandler {
                             iosb,
                         );
                         let publication = match dispatch {
-                            Ok(dispatch) => self.finish_npfs_create_dispatch(
+                            Ok(dispatch) => self.finish_registered_create_dispatch(
                                 dispatch,
                                 major::IRP_MJ_CREATE,
                                 desired_access,
