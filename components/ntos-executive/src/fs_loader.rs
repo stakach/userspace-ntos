@@ -294,23 +294,54 @@ const FAT_EOC_MIN: u32 = 0x0FFF_FFF8;
 
 /// Follow the FAT: next cluster after `cluster` (>= 0x0FFF_FFF8 means end-of-chain).
 pub(crate) unsafe fn fat_next(fs: &Fat32, cluster: u32) -> u32 {
-    let byte = cluster * 4;
-    let sec = fs.fat_start + byte / fs.bps;
+    fat_next_checked(fs, cluster).unwrap_or(0x0FFF_FFFF)
+}
+
+unsafe fn fat_next_checked(fs: &Fat32, cluster: u32) -> Result<u32, u32> {
+    let byte = cluster.checked_mul(4).ok_or(nt_fs::STATUS_DATA_ERROR)?;
+    let sec = fs
+        .fat_start
+        .checked_add(byte / fs.bps)
+        .filter(|sector| *sector < fs.data_start)
+        .ok_or(nt_fs::STATUS_DATA_ERROR)?;
     let off = (byte % fs.bps) as u64;
     let cache = &mut *((fs.dma_vaddr + FAT32_FAT_CACHE_OFFSET) as *mut FatSectorCacheScratch);
     if cache.valid != 1 || cache.sector != sec {
-        let p = match fat_read_sector_checked(fs, sec) {
-            Some(p) => p,
-            None => return 0x0FFF_FFFF,
-        };
+        let p = fat_read_sector_checked(fs, sec).ok_or(nt_fs::STATUS_DATA_ERROR)?;
         core::ptr::copy_nonoverlapping(p, cache.data.as_mut_ptr(), cache.data.len());
         cache.sector = sec;
         cache.valid = 1;
     }
     if off as usize + core::mem::size_of::<u32>() > cache.data.len() {
-        return 0x0FFF_FFFF;
+        return Err(nt_fs::STATUS_DATA_ERROR);
     }
-    (core::ptr::read_unaligned(cache.data.as_ptr().add(off as usize) as *const u32)) & 0x0FFF_FFFF
+    Ok((core::ptr::read_unaligned(cache.data.as_ptr().add(off as usize) as *const u32)) & 0x0FFF_FFFF)
+}
+
+/// Checked directory traversal for provider queries. Unlike the legacy visitor, an unreadable
+/// sector or malformed cluster chain cannot be mistaken for a complete directory listing.
+pub(crate) unsafe fn fat_visit_directory_checked(
+    fs: &Fat32,
+    dir_cluster: u32,
+    mut visit: impl FnMut(nt_fs::DirectoryEntry, u32) -> bool,
+) -> Result<nt_fs::FatDirectoryWalkEnd, u32> {
+    nt_fs::walk_fat_directory(
+        nt_fs::FatDirectoryGeometry {
+            bytes_per_sector: fs.bps,
+            sectors_per_cluster: fs.spc,
+            data_start_sector: fs.data_start,
+            total_sectors: fs.total_sectors,
+        },
+        dir_cluster,
+        |sector| {
+            let data = fat_read_sector_checked(fs, sector).ok_or(nt_fs::STATUS_DATA_ERROR)?;
+            let mut bytes = [0; 512];
+            core::ptr::copy_nonoverlapping(data, bytes.as_mut_ptr(), bytes.len());
+            Ok(bytes)
+        },
+        |cluster| fat_next_checked(fs, cluster),
+        |record| visit(record.entry, record.first_cluster),
+    )
 }
 
 /// Visit native directory entries in stable FAT stream order. LFN fragments are decoded by the
