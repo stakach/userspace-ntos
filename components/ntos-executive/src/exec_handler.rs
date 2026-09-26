@@ -10414,37 +10414,65 @@ impl ExecNtHandler {
                     Err(status) => return (status, 0, 0),
                 };
                 let full_path = &full_path[..full_len];
-                let overlay_hit =
-                    match crate::writable_fs::query_metadata_relative_if_mounted(full_path) {
-                        Ok(info) => info.is_some(),
-                        Err(status) => return (status, 0, 0),
-                    };
-                if overlay_hit {
-                    return publish_overlay(
-                        self,
-                        crate::writable_fs::create(
-                            full_path,
-                            desired_access,
-                            file_attributes,
-                            share_access,
-                            disposition,
-                            options,
-                        ),
-                    );
+                let overlay_lookup =
+                    crate::writable_fs::query_metadata_relative_if_mounted(full_path)
+                        .map(|info| info.is_some());
+                if let Err(status) = overlay_lookup {
+                    return (status, 0, 0);
                 }
                 let fat_entry = exec_fs().and_then(|fs| {
                     crate::fs_loader::fat_open_path_metadata_from(&fs, first_cluster, relative)
                 });
-                if let Some(source) = fat_entry.filter(|entry| !entry.metadata.is_directory) {
-                    return self.open_installed_file(
-                        source,
-                        full_path,
+                if fat_entry.is_some_and(|entry| entry.metadata.is_directory) {
+                    if overlay_lookup == Ok(true) {
+                        return publish_overlay(
+                            self,
+                            crate::writable_fs::create(
+                                full_path,
+                                desired_access,
+                                file_attributes,
+                                share_access,
+                                disposition,
+                                options,
+                            ),
+                        );
+                    }
+                } else {
+                    let decision = nt_fs::layered_file_open_decision(
+                        overlay_lookup,
+                        fat_entry.is_some(),
                         desired_access,
-                        file_attributes,
-                        share_access,
                         disposition,
                         options,
                     );
+                    match decision {
+                        Ok(nt_fs::LayeredFileOpenDecision::UseOverlay) => {
+                            return publish_overlay(
+                                self,
+                                crate::writable_fs::create(
+                                    full_path,
+                                    desired_access,
+                                    file_attributes,
+                                    share_access,
+                                    disposition,
+                                    options,
+                                ),
+                            );
+                        }
+                        Ok(nt_fs::LayeredFileOpenDecision::Installed(_)) => {
+                            return self.open_installed_file(
+                                fat_entry.expect("installed file decision requires FAT metadata"),
+                                full_path,
+                                desired_access,
+                                file_attributes,
+                                share_access,
+                                disposition,
+                                options,
+                            );
+                        }
+                        Ok(nt_fs::LayeredFileOpenDecision::CreateOverlay) => {}
+                        Err(status) => return (status, 0, 0),
+                    }
                 }
                 if disposition == nt_fs::FILE_OPEN
                     || (disposition == nt_fs::FILE_OPEN_IF && fat_entry.is_some())
