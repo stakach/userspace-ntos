@@ -750,6 +750,48 @@ fn mount_resolver() {
 }
 
 #[test]
+fn configured_mount_normalizes_aliases_and_rejects_traversal() {
+    let mut mm = MountManager::empty();
+    mm.mount(r"\SystemRoot\\", r"\Device\VolumeGuid\ReactOS\\")
+        .unwrap();
+    mm.mount(r"\??\C:\", r"\Device\VolumeGuid\").unwrap();
+
+    assert_eq!(
+        mm.resolve(r"\SystemRoot\Fonts\arial.ttf"),
+        Some((
+            r"\Device\VolumeGuid".into(),
+            r"\ReactOS\Fonts\arial.ttf".into(),
+        ))
+    );
+    assert_eq!(
+        mm.resolve(r"\SystemRoot"),
+        Some((r"\Device\VolumeGuid".into(), r"\ReactOS".into()))
+    );
+    assert_eq!(
+        mm.resolve(r"\??\C:\ReactOS\Fonts\arial.ttf"),
+        mm.resolve(r"\SystemRoot\Fonts\arial.ttf")
+    );
+    assert_eq!(mm.resolve(r"\SystemRooted\Fonts\arial.ttf"), None);
+    assert_eq!(mm.resolve(r"\SystemRoot\..\Private\secret"), None);
+    assert_eq!(
+        mm.mount(r"\SystemRoot\..\Private", r"\Device\VolumeGuid"),
+        Err(MountError::InvalidPrefix)
+    );
+    assert_eq!(
+        mm.mount(r"\Other", r"\Device\VolumeGuid\..\Private"),
+        Err(MountError::InvalidTarget)
+    );
+    assert_eq!(
+        mm.mount(r"\Other", r"Device\VolumeGuid"),
+        Err(MountError::InvalidTarget)
+    );
+    assert_eq!(
+        mm.mount(r"\", r"\Device\VolumeGuid"),
+        Err(MountError::InvalidPrefix)
+    );
+}
+
+#[test]
 fn named_pipe_path_classification_is_exact() {
     let utf16 = |path: &str| path.encode_utf16().collect::<alloc::vec::Vec<_>>();
     assert!(is_named_pipe_path(&utf16(r"\??\pipe\ntsvcs")));
@@ -813,7 +855,7 @@ fn local_nt_paths_resolve_to_the_fat_volume() {
 #[test]
 fn mounted_dos_drives_publish_process_device_map() {
     let mut mm = MountManager::new();
-    mm.mount(r"\??\D:", MEMFS_VOLUME);
+    mm.mount(r"\??\D:", MEMFS_VOLUME).unwrap();
     let (drive_map, drive_type) = mm.process_device_map();
     assert_eq!(drive_map & (1 << 2), 1 << 2);
     assert_eq!(drive_map & (1 << 3), 1 << 3);

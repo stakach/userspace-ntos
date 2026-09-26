@@ -16,6 +16,12 @@ struct Mount {
     target: String,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MountError {
+    InvalidPrefix,
+    InvalidTarget,
+}
+
 /// The Mount Manager (spec §13): resolves an NT path to a volume + volume-relative path.
 pub struct MountManager {
     mounts: Vec<Mount>,
@@ -28,23 +34,40 @@ impl Default for MountManager {
 }
 
 impl MountManager {
+    /// An unconfigured mount table for volumes discovered at runtime.
+    pub fn empty() -> Self {
+        Self { mounts: Vec::new() }
+    }
+
     /// A Mount Manager with the required v0.1 mounts (spec §13.2): `\SystemRoot` →
     /// `\Device\MemFsVolume0\Windows`, `\??\C:` → `\Device\MemFsVolume0`.
     pub fn new() -> Self {
-        let mut m = MountManager { mounts: Vec::new() };
-        m.mount(r"\SystemRoot", &alloc::format!("{MEMFS_VOLUME}\\Windows"));
-        m.mount(r"\??\C:", MEMFS_VOLUME);
-        m.mount(r"\DosDevices\C:", MEMFS_VOLUME); // optional alias (spec §6.4)
+        let mut m = Self::empty();
+        m.mount(r"\SystemRoot", &alloc::format!("{MEMFS_VOLUME}\\Windows"))
+            .expect("valid default SystemRoot mount");
+        m.mount(r"\??\C:", MEMFS_VOLUME)
+            .expect("valid default drive mount");
+        m.mount(r"\DosDevices\C:", MEMFS_VOLUME)
+            .expect("valid default drive alias");
         m
     }
 
-    pub fn mount(&mut self, prefix: &str, target: &str) {
+    pub fn mount(&mut self, prefix: &str, target: &str) -> Result<(), MountError> {
+        let prefix = normalize_separators(prefix);
+        let target = normalize_separators(target);
+        if prefix == "\\" || !prefix.starts_with('\\') || has_parent_component(&prefix) {
+            return Err(MountError::InvalidPrefix);
+        }
+        if !target.starts_with('\\')
+            || has_parent_component(&target)
+            || split_volume(&target).is_none()
+        {
+            return Err(MountError::InvalidTarget);
+        }
         self.mounts
-            .retain(|m| !m.prefix.eq_ignore_ascii_case(prefix));
-        self.mounts.push(Mount {
-            prefix: prefix.into(),
-            target: target.into(),
-        });
+            .retain(|m| !m.prefix.eq_ignore_ascii_case(&prefix));
+        self.mounts.push(Mount { prefix, target });
+        Ok(())
     }
 
     /// Return the NT `PROCESS_DEVICEMAP_INFORMATION.Query` view for the mounted DOS drive letters.
@@ -66,6 +89,9 @@ impl MountManager {
     /// (spec §13.3). `volume_relative_path` starts with `\` and uses normalized separators.
     pub fn resolve(&self, path: &str) -> Option<(String, String)> {
         let norm = normalize_separators(path);
+        if !norm.starts_with('\\') || has_parent_component(&norm) {
+            return None;
+        }
         // Longest matching mount prefix wins.
         let mut best: Option<&Mount> = None;
         for m in &self.mounts {
@@ -83,6 +109,10 @@ impl MountManager {
         let full_target = alloc::format!("{}{}", m.target, rest);
         split_volume(&full_target)
     }
+}
+
+fn has_parent_component(path: &str) -> bool {
+    path.split('\\').any(|component| component == "..")
 }
 
 /// Collapse `/` → `\` and any run of separators to a single `\`.
