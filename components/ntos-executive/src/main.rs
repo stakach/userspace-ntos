@@ -29328,12 +29328,26 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // The mounted File backend resolves both layers. Publish it only after the boot SYSTEM
     // authority has restored the writable snapshot; an earlier lookup would consume that mount.
     let mut mounted_volume_file_ok = false;
+    let mut mounted_volume_install_root = None;
     if let Some(fs) = exec_fs() {
-        if let Ok((device_id, file_ok)) = mounted_volume::register_mounted_volume(fs) {
-            mounted_volume_device_id = Some(device_id);
-            mounted_volume_file_ok = file_ok;
+        match mounted_volume::register_mounted_volume(fs) {
+            Ok((device_id, file_ok, installed_root)) => {
+                mounted_volume_device_id = Some(device_id);
+                mounted_volume_file_ok = file_ok;
+                mounted_volume_install_root = Some(installed_root);
+            }
+            Err(status) => {
+                print_str(b"[mounted-volume] registration refused status=0x");
+                print_hex_u64(status.raw() as u32 as u64);
+                print_str(b"\n");
+            }
         }
     }
+    check(
+        b"exec_mounted_volume_installation_root_validated",
+        mounted_volume_install_root.is_some(),
+        &mut passed,
+    );
     check(
         b"exec_mounted_volume_provider_registered",
         mounted_volume_device_id.is_some(),
