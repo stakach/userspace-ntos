@@ -217,6 +217,34 @@ pub(crate) unsafe fn bind_file_projection(
         .map_err(|status| status.raw())
 }
 
+/// Publish the native File body only after both exact consumer bindings are recorded.
+pub(crate) unsafe fn write_file_projection(
+    identity: nt_io_manager::HostedFileIdentity,
+    device: nt_io_manager::DeviceId,
+) -> Result<(), i32> {
+    let consumer = live_consumer()?;
+    if identity.domain() != consumer.domain {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    let registration = consumer
+        .projections
+        .iter()
+        .find(|projection| projection.device == device && projection.bound)
+        .and_then(|projection| projection.registration)
+        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    let bytes = core::slice::from_raw_parts_mut(
+        identity.address() as *mut u8,
+        nt_io_manager::WDM_X64_FILE_OBJECT_SIZE,
+    );
+    nt_io_manager::consumer_file_projection::write_consumer_wdm_file_object(
+        io_manager_mut(),
+        identity,
+        registration,
+        bytes,
+    )
+    .map_err(|status| status.raw())
+}
+
 /// Exact receipt retirement remains available after consumer admission has closed. Unbind does
 /// not free the native allocation; the owner must retain it until this call succeeds.
 pub(crate) unsafe fn retire_file_projection(
