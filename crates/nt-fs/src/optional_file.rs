@@ -51,6 +51,48 @@ impl FileSystem {
             .ok_or(STATUS_DATA_ERROR)
     }
 
+    /// Snapshot one writable-layer directory by canonical lowercase volume-relative path.
+    /// Absence is distinct from an existing file, and no child is reopened by name.
+    pub fn try_directory_entries_relative(
+        &self,
+        relative: &[u8],
+    ) -> Result<Option<Vec<DirectoryEntry>>, u32> {
+        let Some(id) = self.optional_relative_node(relative)? else {
+            return Ok(None);
+        };
+        let directory = self.volume.node(id).ok_or(STATUS_DATA_ERROR)?;
+        if !directory.is_dir {
+            return Err(STATUS_NOT_A_DIRECTORY);
+        }
+        let count = directory
+            .children
+            .len()
+            .checked_add(2)
+            .ok_or(STATUS_DATA_ERROR)?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(count)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        for index in 0..count {
+            let target_id = match index {
+                0 => id,
+                1 => directory.parent,
+                _ => directory.children[index - 2].node_id,
+            };
+            let target = self.volume.node(target_id).ok_or(STATUS_DATA_ERROR)?;
+            if !target.is_dir {
+                target.data.checked_len(&self.volume.blobs)?;
+            }
+            let mut entry = self
+                .volume
+                .directory_entry(id, index)
+                .ok_or(STATUS_DATA_ERROR)?;
+            entry.file_id = target.file_id;
+            entries.push(entry);
+        }
+        Ok(Some(entries))
+    }
+
     /// Read a complete file by canonical lowercase ASCII volume-relative path without allocating
     /// or opening a FILE_OBJECT. Validate all backing and destination capacity before copying;
     /// failures and missing entries leave the entire destination unchanged.
