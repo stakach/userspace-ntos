@@ -28,7 +28,7 @@ python3 scripts/run_with_timeout.py \
   --failure-file "$RUN_LOG" \
   --failure-text '[provider-bugcheck] terminal' \
   --completion-file "$RUN_LOG" \
-  --completion-text '[query-forward-verified-1]' \
+  --completion-text '[zw-read-file-verified]' \
   --completion-grace-seconds 15 \
   -- ./scripts/run_specs.sh 2>&1 | tee -a "$RUN_LOG"
 rc=${PIPESTATUS[0]}
@@ -68,11 +68,14 @@ if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || ! grep -Fq '[mup-provider-query-file-pending-complete] count=2 bytes=24' "$RUN_LOG" \
    || ! grep -Fq '[query-forward-verified-1]' "$RUN_LOG" \
    || [ "$(grep -Fc '[mup-provider-query-file-pending-complete]' "$RUN_LOG")" -ne 1 ] \
+   || ! grep -Fq '[mup-provider-query-file] count=3 class=5 bytes=24' "$RUN_LOG" \
+   || ! grep -Fq '[zw-query-file-verified]' "$RUN_LOG" \
+   || ! grep -Fq '[zw-read-file-verified]' "$RUN_LOG" \
    || { ! grep -Eq '\[mup-provider-probe\] status=0x00000000 queries=[1-9][0-9]* accepted=[1-9][0-9]* .*file-created=[1-9][0-9]* cleaned=[1-9][0-9]* closed=[1-9][0-9]*' "$RUN_LOG" \
         && { ! grep -Eq '\[mup-provider-cleanup\] probe-file cleaned=[1-9][0-9]*' "$RUN_LOG" \
-             || ! grep -Eq '\[mup-provider-close\] probe-file closed=[1-9][0-9]*' "$RUN_LOG"; }; }; then
-  echo "Mup/provider registration, query, immediate/pending READ, FLUSH and QUERY_INFORMATION, WRITE, and File lifecycle proof incomplete: $RUN_LOG" >&2
+             || ! grep -Eq 'probe-file closed=[1-9][0-9]*' "$RUN_LOG"; }; }; then
+  echo "Mup/provider registration, query, immediate/pending IRPs, Zw READ/QUERY, WRITE, and File lifecycle proof incomplete: $RUN_LOG" >&2
   exit 1
 fi
 
-echo "Mup/provider registration, query, File WRITE, immediate/pending cross-domain READ, FLUSH and QUERY_INFORMATION, and CREATE/CLEANUP/CLOSE verified: $RUN_LOG"
+echo "Mup/provider registration, query, File WRITE, immediate/pending cross-domain READ, FLUSH and QUERY_INFORMATION, Zw READ/QUERY, and CREATE/CLEANUP/CLOSE verified: $RUN_LOG"

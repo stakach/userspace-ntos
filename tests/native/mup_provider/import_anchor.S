@@ -51,6 +51,12 @@ KeSetEvent:
 .globl ZwCreateFile
 ZwCreateFile:
     ud2
+.globl ZwQueryInformationFile
+ZwQueryInformationFile:
+    ud2
+.globl ZwReadFile
+ZwReadFile:
+    ud2
 .globl ZwWriteFile
 ZwWriteFile:
     ud2

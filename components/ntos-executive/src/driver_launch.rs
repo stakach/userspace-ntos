@@ -126,6 +126,8 @@ mod hosted_io_create_file_ingress;
 mod hosted_io_create_file_work;
 #[path = "hosted_kernel_file_control.rs"]
 mod hosted_kernel_file_control;
+#[path = "hosted_kernel_file_read_query.rs"]
+mod hosted_kernel_file_read_query;
 #[path = "hosted_kernel_file_write.rs"]
 mod hosted_kernel_file_write;
 #[path = "driver_share_access.rs"]
@@ -866,6 +868,7 @@ pub const FSD_SERVICE_ZW_WRITE_FILE_LABEL: u64 = 0x7A0;
 pub const FSD_SERVICE_READ_FORWARD_LABEL: u64 = 0x7A1;
 pub const FSD_SERVICE_FLUSH_FORWARD_LABEL: u64 = 0x7A2;
 pub const FSD_SERVICE_QUERY_INFORMATION_FORWARD_LABEL: u64 = 0x7A3;
+pub const FSD_SERVICE_ZW_READ_QUERY_FILE_LABEL: u64 = 0x7A4;
 const _: () = {
     let labels = [
         FSD_SERVICE_SOURCE_IRP_LABEL,
@@ -879,6 +882,7 @@ const _: () = {
         FSD_SERVICE_READ_FORWARD_LABEL,
         FSD_SERVICE_FLUSH_FORWARD_LABEL,
         FSD_SERVICE_QUERY_INFORMATION_FORWARD_LABEL,
+        FSD_SERVICE_ZW_READ_QUERY_FILE_LABEL,
     ];
     let mut i = 0;
     while i < labels.len() {
@@ -14673,42 +14677,6 @@ extern "win64" fn s_zw_delete_value_key(handle: u64, value_name: u64) -> i32 {
         );
         status
     }
-}
-
-extern "win64" fn s_zw_query_information_file(
-    _file_handle: u64,
-    io_status_block: u64,
-    _file_information: u64,
-    _length: u32,
-    _file_information_class: u32,
-) -> i32 {
-    if io_status_block != 0 {
-        unsafe {
-            write_unaligned(io_status_block as *mut i32, STATUS_OBJECT_NAME_NOT_FOUND);
-            write_unaligned((io_status_block + 8) as *mut u64, 0);
-        }
-    }
-    STATUS_OBJECT_NAME_NOT_FOUND
-}
-
-extern "win64" fn s_zw_read_file(
-    _file_handle: u64,
-    _event: u64,
-    _apc_routine: u64,
-    _apc_context: u64,
-    io_status_block: u64,
-    _buffer: u64,
-    _length: u32,
-    _byte_offset: u64,
-    _key: u64,
-) -> i32 {
-    if io_status_block != 0 {
-        unsafe {
-            write_unaligned(io_status_block as *mut i32, STATUS_OBJECT_NAME_NOT_FOUND);
-            write_unaligned((io_status_block + 8) as *mut u64, 0);
-        }
-    }
-    STATUS_OBJECT_NAME_NOT_FOUND
 }
 
 extern "win64" fn s_ex_get_current_processor_counts(idle: u64, kernel: u64, user: u64) {
@@ -32438,9 +32406,9 @@ fn register_fsd_trampolines() -> bool {
     );
     reg.bind(
         "ZwQueryInformationFile",
-        s_zw_query_information_file as *const () as usize as u64,
+        hosted_kernel_file_read_query::s_zw_query_information_file as *const () as usize as u64,
     );
-    reg.bind("ZwReadFile", s_zw_read_file as *const () as usize as u64);
+    reg.bind("ZwReadFile", hosted_kernel_file_read_query::s_zw_read_file as *const () as usize as u64);
     reg.bind(
         "ExInterlockedInsertTailList",
         s_ex_interlocked_insert_tail_list as *const () as usize as u64,
@@ -54441,6 +54409,20 @@ pub(crate) unsafe fn service_hosted_driver_zw_write_file(
 
 pub(crate) unsafe fn redrive_hosted_driver_zw_write_file(handler: *mut ExecNtHandler) {
     hosted_kernel_file_write::redrive(handler);
+}
+
+pub(crate) unsafe fn service_hosted_driver_zw_read_query_file(
+    ch: &crate::spawn_hosts::PumpChannel,
+    packet: u64,
+    packet_length: u64,
+    handle: u64,
+    active_reply_cap: u64,
+) -> Option<i32> {
+    hosted_kernel_file_read_query::submit(ch, packet, packet_length, handle, active_reply_cap)
+}
+
+pub(crate) unsafe fn redrive_hosted_driver_zw_read_query_file(handler: *mut ExecNtHandler) {
+    hosted_kernel_file_read_query::redrive(handler);
 }
 
 pub(crate) unsafe fn service_hosted_query_path_forward(

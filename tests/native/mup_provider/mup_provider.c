@@ -473,7 +473,7 @@ static NTSTATUS __stdcall ProviderQueryInformation(DEVICE_OBJECT *device, IRP *i
         KeSetEvent(PendingQueryFileEvent, 0, 0);
         return STATUS_PENDING;
     }
-    if (count != 1) return Complete(irp, STATUS_INVALID_PARAMETER, 0);
+    if (count != 1 && count != 3) return Complete(irp, STATUS_INVALID_PARAMETER, 0);
     FillStandardInformation(irp);
     DbgPrint("[mup-provider-query-file] count=%u class=5 bytes=24\n", count);
     return Complete(irp, STATUS_SUCCESS, sizeof(ProbeStandardInfo));
