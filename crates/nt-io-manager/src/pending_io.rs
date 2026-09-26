@@ -64,6 +64,8 @@ pub struct PendingFileCreate {
     pub handle_va: u64,
     pub desired_access: u32,
     pub provider_context: u64,
+    /// Exact DriverPeer lifetime reservation made before CREATE dispatch; kernel backends have none.
+    pub lifecycle_reserved: bool,
     pub reservation_pid: u32,
     pub reserved_handle: u32,
     pub reservation_generation: u64,
@@ -2018,6 +2020,37 @@ mod tests {
     }
 
     #[test]
+    fn kernel_create_never_acquires_peer_lifecycle_ownership() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(1, 2, 7);
+        request.major = nt_io_abi::major::IRP_MJ_CREATE;
+        request.operation = PendingFileIoOperation::Create(PendingFileCreate {
+            handle_va: 0x7000,
+            lifecycle_reserved: false,
+            reservation_pid: 4,
+            reserved_handle: 0x44,
+            reservation_generation: 7,
+            status: nt_status::NtStatus::PENDING.raw() as u32,
+            ..PendingFileCreate::default()
+        });
+        request.output_va = 0;
+        request.output_len = 0;
+        request.apc_routine = 0;
+        request.signal_file = false;
+        request.event_obj_idx = u64::MAX;
+        let slot = table.park(request).unwrap();
+        table.commit_create_exact(slot, 2, 0, 1, 0x44).unwrap();
+        let pending = table.get(slot).unwrap();
+        assert!(matches!(
+            pending.operation,
+            PendingFileIoOperation::Create(PendingFileCreate {
+                lifecycle_reserved: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn completion_identity_includes_file_thread_and_major() {
         let mut table = PendingFileIoTable::new();
         let request = pending(1, 2, 7);
@@ -2212,6 +2245,7 @@ mod tests {
             handle_va: 0x7000,
             desired_access: 0x12019F,
             provider_context: 0xAABB,
+            lifecycle_reserved: true,
             reservation_pid: 4,
             reserved_handle: 0x44,
             reservation_generation: 7,
@@ -2243,7 +2277,14 @@ mod tests {
         table.mark_reply_published_exact(slot, 2).unwrap();
         assert!(table.completion_surfaces_settled_exact(slot, 2));
         table.mark_backend_acked_exact(slot, 2).unwrap();
-        assert!(table.finish_exact(slot, 2).is_some());
+        let finished = table.finish_exact(slot, 2).unwrap();
+        assert!(matches!(
+            finished.operation,
+            PendingFileIoOperation::Create(PendingFileCreate {
+                lifecycle_reserved: true,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2255,6 +2296,7 @@ mod tests {
             handle_va: 0x7000,
             desired_access: 0,
             provider_context: 0xAABB,
+            lifecycle_reserved: true,
             reservation_pid: 4,
             reserved_handle: 0x44,
             reservation_generation: 8,
