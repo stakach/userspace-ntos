@@ -10,6 +10,32 @@ use crate::{
 /// Matches the executive's captured native File-name limit without folding or truncating UTF-16.
 pub const LAYERED_OPEN_NAME_CAP: usize = 1024;
 
+/// Compose a child CREATE name beneath a retained directory open without accepting an absolute
+/// name or traversal. The effective path is for backing lookup; the child's FileName stays intact.
+pub fn join_layered_relative_name_into(
+    parent: &[u16],
+    child: &[u16],
+    output: &mut [u16],
+) -> Result<usize, u32> {
+    let mut folded = [0u8; LAYERED_OPEN_NAME_CAP];
+    let mut relative = [0u8; LAYERED_OPEN_NAME_CAP];
+    super::path::nt_file_relative_path_into(child, &mut folded, &mut relative)
+        .ok_or(STATUS_OBJECT_NAME_INVALID)?;
+    let separator = usize::from(!parent.is_empty() && parent.last() != Some(&(b'\\' as u16)));
+    let length = parent
+        .len()
+        .checked_add(separator)
+        .and_then(|length| length.checked_add(child.len()))
+        .filter(|length| *length <= output.len() && *length <= LAYERED_OPEN_NAME_CAP)
+        .ok_or(STATUS_OBJECT_NAME_INVALID)?;
+    output[..parent.len()].copy_from_slice(parent);
+    if separator != 0 {
+        output[parent.len()] = b'\\' as u16;
+    }
+    output[parent.len() + separator..length].copy_from_slice(child);
+    Ok(length)
+}
+
 /// The source selected by CREATE. Later operations must not repeat namespace lookup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayeredOpenSource {
@@ -180,6 +206,24 @@ impl<const SLOTS: usize> LayeredOpenTable<SLOTS> {
             source: entry.source.ok_or(STATUS_INVALID_HANDLE)?,
             name: &entry.name[..entry.name_len as usize],
         })
+    }
+
+    /// Find the live open bound to an exact canonical File identity, including its generation.
+    pub fn get_by_file_id(
+        &self,
+        canonical_file_id: u64,
+    ) -> Result<(LayeredOpenContextId, LayeredOpenRecord<'_>), u32> {
+        let (index, slot) = self
+            .slots
+            .iter()
+            .enumerate()
+            .find(|(_, slot)| {
+                slot.entry
+                    .is_some_and(|entry| entry.canonical_file_id == canonical_file_id)
+            })
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let context = LayeredOpenContextId((u64::from(slot.generation) << 32) | (index as u64 + 1));
+        Ok((context, self.get(context, canonical_file_id)?))
     }
 
     pub fn release(
@@ -370,6 +414,57 @@ mod tests {
             Ok(LayeredOpenSource::Overlay { file_id: 99 })
         );
         assert_eq!(table.release(second, 11), Err(STATUS_INVALID_HANDLE));
+    }
+
+    #[test]
+    fn file_identity_lookup_is_generation_exact() {
+        let mut table = LayeredOpenTable::<1>::new();
+        let first = table.insert(10, installed(), &[b'a' as u16]).unwrap();
+        assert_eq!(table.get_by_file_id(10).unwrap().0, first);
+        table.release(first, 10).unwrap();
+        assert_eq!(table.get_by_file_id(10), Err(STATUS_INVALID_HANDLE));
+        let second = table.insert(11, installed(), &[b'b' as u16]).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(table.get_by_file_id(10), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.get_by_file_id(11).unwrap().0, second);
+    }
+
+    #[test]
+    fn relative_child_name_stays_beneath_retained_parent() {
+        let mut output = [0u16; 32];
+        let root =
+            join_layered_relative_name_into(&[b'\\' as u16], &[b'a' as u16], &mut output).unwrap();
+        assert_eq!(&output[..root], &[b'\\' as u16, b'a' as u16]);
+        let nested = join_layered_relative_name_into(
+            &[b'\\' as u16, b'a' as u16],
+            &[b'B' as u16],
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(
+            &output[..nested],
+            &[b'\\' as u16, b'a' as u16, b'\\' as u16, b'B' as u16]
+        );
+        assert_eq!(
+            join_layered_relative_name_into(
+                &[b'a' as u16],
+                &[b'.' as u16, b'.' as u16],
+                &mut output
+            ),
+            Err(STATUS_OBJECT_NAME_INVALID)
+        );
+        assert_eq!(
+            join_layered_relative_name_into(
+                &[b'a' as u16],
+                &[b'\\' as u16, b'b' as u16],
+                &mut output
+            ),
+            Err(STATUS_OBJECT_NAME_INVALID)
+        );
+        assert_eq!(
+            join_layered_relative_name_into(&[b'a' as u16], &[b'b' as u16], &mut output[..1]),
+            Err(STATUS_OBJECT_NAME_INVALID)
+        );
     }
 
     #[test]

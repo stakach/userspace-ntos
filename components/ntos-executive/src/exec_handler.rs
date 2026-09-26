@@ -26314,8 +26314,9 @@ impl ExecNtHandler {
         })
     }
 
-    unsafe fn create_kernel_directory_file(
+    unsafe fn create_registered_kernel_file(
         &mut self,
+        root: FileParseRoot,
         name16: &[u16],
         object_attributes: u32,
         desired_access: u32,
@@ -26327,16 +26328,24 @@ impl ExecNtHandler {
         file_handle_va: u64,
         iosb_va: u64,
     ) -> u32 {
-        let dispatch = driver_launch::resolve_kernel_directory_file_name(
-            name16,
-            object_attributes & 0x40 != 0,
-        )
-        .and_then(|(device_id, relative)| {
+        let target = match root {
+            FileParseRoot::Absolute => driver_launch::resolve_kernel_directory_file_name(
+                name16,
+                object_attributes & 0x40 != 0,
+            )
+            .map(|(device_id, name)| (device_id, None, Some(name))),
+            FileParseRoot::HostedFile { file_id, device_id } => {
+                driver_launch::require_registered_kernel_filesystem_device(device_id)
+                    .map(|()| (device_id, Some(file_id), None))
+            }
+            _ => Err(STATUS_INVALID_HANDLE),
+        };
+        let dispatch = target.and_then(|(device_id, parent, owned_name)| {
             self.registered_create_file(
                 device_id,
                 major::IRP_MJ_CREATE,
-                &relative,
-                None,
+                owned_name.as_deref().unwrap_or(name16),
+                parent,
                 object_attributes,
                 0,
                 desired_access,
@@ -31288,6 +31297,21 @@ impl ExecNtHandler {
                 if name16.first() == Some(&(b'\\' as u16)) {
                     return STATUS_OBJECT_NAME_INVALID;
                 }
+                if driver_launch::require_registered_kernel_filesystem_device(device_id).is_ok() {
+                    return self.create_registered_kernel_file(
+                        parse_root,
+                        name16,
+                        captured.attributes,
+                        desired_access,
+                        share_access,
+                        nt_fs::FILE_OPEN,
+                        0,
+                        open_options,
+                        &[],
+                        file_handle_out,
+                        args[3],
+                    );
+                }
                 if driver_launch::device_id_by_name("\\Device\\NamedPipe") != Some(device_id) {
                     return STATUS_INVALID_DEVICE_REQUEST;
                 }
@@ -31469,7 +31493,8 @@ impl ExecNtHandler {
             }
         }
         if open_options & FILE_DIRECTORY_FILE as u32 != 0 {
-            return self.create_kernel_directory_file(
+            return self.create_registered_kernel_file(
+                parse_root,
                 name16,
                 captured.attributes,
                 desired_access,
@@ -39373,6 +39398,23 @@ impl ExecNtHandler {
                         if name16.first() == Some(&(b'\\' as u16)) {
                             return STATUS_OBJECT_NAME_INVALID;
                         }
+                        if driver_launch::require_registered_kernel_filesystem_device(device_id)
+                            .is_ok()
+                        {
+                            return self.create_registered_kernel_file(
+                                parse_root,
+                                name16,
+                                captured.attributes,
+                                desired_access,
+                                share_access,
+                                create_disposition,
+                                file_attributes,
+                                create_options,
+                                &ea,
+                                file_handle_out,
+                                iosb,
+                            );
+                        }
                         if driver_launch::device_id_by_name("\\Device\\NamedPipe")
                             != Some(device_id)
                         {
@@ -39445,7 +39487,8 @@ impl ExecNtHandler {
                     && !Self::is_named_pipe_root_path(name16)
                     && !nt_fs::is_named_pipe_path(name16)
                 {
-                    return self.create_kernel_directory_file(
+                    return self.create_registered_kernel_file(
+                        parse_root,
                         name16,
                         captured.attributes,
                         desired_access,
