@@ -4861,6 +4861,250 @@ mod tests {
         assert!(om.file(target).is_none());
     }
 
+    #[derive(Default)]
+    struct KernelFileRouteState {
+        seen: std::vec::Vec<IrpProjection>,
+        pending_read: Option<IrpId>,
+        read_ready: bool,
+        read_acknowledged: bool,
+    }
+
+    struct KernelFileRouteBackend {
+        state: std::rc::Rc<std::cell::RefCell<KernelFileRouteState>>,
+    }
+
+    impl DriverDispatchBackend for KernelFileRouteBackend {
+        fn dispatch_irp(
+            &mut self,
+            ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            let mut state = self.state.borrow_mut();
+            state.seen.push(irp.clone());
+            match irp.major {
+                major::IRP_MJ_CREATE => Ok(DispatchOutcome::Completed {
+                    status: NtStatus::SUCCESS,
+                    information: 1,
+                    file_context: Some(0xfeed),
+                }),
+                major::IRP_MJ_QUERY_INFORMATION => {
+                    ctx.system_buffer[..4].copy_from_slice(b"meta");
+                    Ok(DispatchOutcome::Completed {
+                        status: NtStatus::SUCCESS,
+                        information: 4,
+                        file_context: None,
+                    })
+                }
+                major::IRP_MJ_READ => {
+                    state.pending_read = Some(irp.irp_id);
+                    Ok(DispatchOutcome::Pending)
+                }
+                major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE => Ok(DispatchOutcome::Completed {
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                    file_context: None,
+                }),
+                _ => Err(NtStatus::INVALID_DEVICE_REQUEST),
+            }
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            Err(NtStatus::NOT_SUPPORTED)
+        }
+
+        fn poll_completion(&mut self) -> Option<DriverCompletion> {
+            let mut state = self.state.borrow_mut();
+            if !state.read_ready {
+                return None;
+            }
+            state.read_ready = false;
+            Some(DriverCompletion {
+                irp_id: state.pending_read?,
+                status: NtStatus::SUCCESS,
+                information: 4,
+                file_context: None,
+            })
+        }
+
+        fn copy_completion_output(
+            &mut self,
+            irp_id: IrpId,
+            offset: u64,
+            output: &mut [u8],
+        ) -> Result<usize, NtStatus> {
+            let state = self.state.borrow();
+            if state.pending_read != Some(irp_id) || offset > 4 {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let start = offset as usize;
+            let bytes = &b"font"[start..];
+            let copied = bytes.len().min(output.len());
+            output[..copied].copy_from_slice(&bytes[..copied]);
+            Ok(copied)
+        }
+
+        fn acknowledge_completion(&mut self, irp_id: IrpId) -> Result<(), NtStatus> {
+            let mut state = self.state.borrow_mut();
+            if state.pending_read != Some(irp_id) {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            state.pending_read = None;
+            state.read_acknowledged = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn registered_kernel_file_route_retains_create_read_and_close_identity() {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(KernelFileRouteState::default()));
+        let mut om = io();
+        let client = om.register_client();
+        let driver = om
+            .create_kernel_driver_with_majors(
+                &path("\\Driver\\MountedVolume"),
+                Box::new(KernelFileRouteBackend { state: state.clone() }),
+                &[
+                    major::IRP_MJ_CREATE,
+                    major::IRP_MJ_QUERY_INFORMATION,
+                    major::IRP_MJ_READ,
+                    major::IRP_MJ_CLEANUP,
+                    major::IRP_MJ_CLOSE,
+                ],
+            )
+            .unwrap();
+        assert!(om
+            .driver(driver)
+            .unwrap()
+            .dispatch
+            .get(major::IRP_MJ_CREATE)
+            .kernel_id()
+            .is_some());
+        let device = om
+            .create_device(
+                driver,
+                Some(&path("\\Device\\MountedVolume0")),
+                DeviceType::DISK_FILE_SYSTEM,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let name = nt_types::UnicodeString::from_str("reactos\\Fonts\\Arial.ttf");
+        let file = om
+            .allocate_external_file(
+                client,
+                device,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::empty(),
+                name.clone(),
+            )
+            .unwrap();
+        let create = om
+            .build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(file),
+                0,
+                71,
+                major::IRP_MJ_CREATE,
+                IoParameters::Create(CreateParameters::default()),
+                0,
+                0,
+                &mut [],
+            )
+            .unwrap();
+        assert!(matches!(
+            create,
+            ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                file_context: Some(0xfeed),
+                ..
+            }
+        ));
+        assert_eq!(om.file(file).unwrap().state, FileState::Open);
+        assert_eq!(om.external_file_context(client, file), Ok(Some(0xfeed)));
+
+        let mut metadata = [0; 4];
+        assert!(matches!(
+            om.build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(file),
+                0,
+                71,
+                major::IRP_MJ_QUERY_INFORMATION,
+                IoParameters::QueryInformation(InformationParameters {
+                    info_class: 4,
+                    length: 4,
+                }),
+                0,
+                4,
+                &mut metadata,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 4,
+                ..
+            })
+        ));
+        assert_eq!(&metadata, b"meta");
+
+        let pending = om
+            .build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(file),
+                0,
+                71,
+                major::IRP_MJ_READ,
+                IoParameters::Read(ReadWriteParameters {
+                    length: 4,
+                    key: 0,
+                    offset: 0,
+                }),
+                0,
+                4,
+                &mut [0; 4],
+            )
+            .unwrap();
+        let ExternalDispatchResult::Pending { irp_id } = pending else {
+            panic!("registered kernel READ must retain its IRP")
+        };
+        assert_eq!(om.file(file).unwrap().outstanding_irp_refs, 1);
+        om.release_external_file(client, file).unwrap();
+        assert!(om.file(file).unwrap().close_deferred);
+        assert_eq!(om.file(file).unwrap().outstanding_irp_refs, 1);
+        state.borrow_mut().read_ready = true;
+        assert_eq!(om.pump(), 1);
+        let mut output = [0; 4];
+        assert_eq!(om.copy_completed_irp_output(irp_id, 0, &mut output), Ok(4));
+        assert_eq!(&output, b"font");
+        assert_eq!(om.file(file).unwrap().outstanding_irp_refs, 1);
+        om.acknowledge_completed_irp_strict(irp_id).unwrap();
+        assert!(state.borrow().read_acknowledged);
+        assert!(om.file(file).is_none());
+
+        let seen = &state.borrow().seen;
+        assert_eq!(
+            seen.iter().map(|irp| irp.major).collect::<std::vec::Vec<_>>(),
+            [
+                major::IRP_MJ_CREATE,
+                major::IRP_MJ_QUERY_INFORMATION,
+                major::IRP_MJ_READ,
+                major::IRP_MJ_CLEANUP,
+                major::IRP_MJ_CLOSE,
+            ]
+        );
+        assert!(seen
+            .iter()
+            .all(|irp| irp.device_id == device && irp.file_id == Some(file)));
+        assert_eq!(seen[0].file_name, Some(name));
+        assert!(seen[1..]
+            .iter()
+            .all(|irp| irp.file_name.is_none() && irp.user_data == 0xfeed));
+    }
+
     #[test]
     fn set_information_target_rejects_stale_cross_client_and_cross_device_files() {
         let mut om = io();
