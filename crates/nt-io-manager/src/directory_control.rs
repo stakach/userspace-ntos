@@ -1,6 +1,6 @@
-//! Typed `IRP_MJ_DIRECTORY_CONTROL` notification parameters.
+//! Typed `IRP_MJ_DIRECTORY_CONTROL` query and notification parameters.
 
-use nt_types::AccessMask;
+use nt_types::{AccessMask, UnicodeString};
 
 pub const IRP_MN_QUERY_DIRECTORY: u8 = 0x01;
 pub const IRP_MN_NOTIFY_CHANGE_DIRECTORY: u8 = 0x02;
@@ -13,6 +13,21 @@ const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
 pub struct DirectoryNotifyParameters {
     pub length: u32,
     pub completion_filter: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DirectoryQueryParameters {
+    pub length: u32,
+    pub information_class: u32,
+    pub file_index: u32,
+    pub pattern: Option<UnicodeString>,
+}
+
+pub fn valid_directory_query_parameters(parameters: &DirectoryQueryParameters) -> bool {
+    parameters
+        .pattern
+        .as_ref()
+        .is_none_or(|pattern| pattern.as_units().len() <= nt_fs::MAX_DIRECTORY_NAME)
 }
 
 pub const fn valid_directory_notify_parameters(parameters: DirectoryNotifyParameters) -> bool {
@@ -53,5 +68,21 @@ mod tests {
             AccessMask::from_bits_retain(FILE_LIST_DIRECTORY)
         ));
         assert!(!directory_notify_access_granted(AccessMask::GENERIC_WRITE));
+    }
+
+    #[test]
+    fn query_pattern_is_bounded_without_changing_notification_policy() {
+        let query = DirectoryQueryParameters {
+            length: 512,
+            information_class: nt_fs::FILE_BOTH_DIRECTORY_INFORMATION,
+            file_index: 4,
+            pattern: Some(UnicodeString::from_str("*.dll")),
+        };
+        assert!(valid_directory_query_parameters(&query));
+        let oversized = UnicodeString::from_units(&[b'x' as u16; nt_fs::MAX_DIRECTORY_NAME + 1]);
+        assert!(!valid_directory_query_parameters(&DirectoryQueryParameters {
+            pattern: Some(oversized),
+            ..query
+        }));
     }
 }

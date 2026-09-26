@@ -251,6 +251,24 @@ fn captured_request_lifecycle(
 }
 
 #[test]
+fn directory_query_capture_preserves_pattern_index_flags_through_real_irp_lifetime() {
+    captured_request_lifecycle(
+        major::IRP_MJ_DIRECTORY_CONTROL,
+        IRP_MN_QUERY_DIRECTORY,
+        IoParameters::QueryDirectory(DirectoryQueryParameters {
+            length: 128,
+            information_class: nt_fs::FILE_BOTH_DIRECTORY_INFORMATION,
+            file_index: 7,
+            pattern: Some(nt_types::UnicodeString::from_str("*.dll")),
+        }),
+        StackFlags::RESTART_SCAN | StackFlags::RETURN_SINGLE_ENTRY | StackFlags::INDEX_SPECIFIED,
+        AccessMask::GENERIC_READ,
+        &[],
+        128,
+    );
+}
+
+#[test]
 fn directory_notify_capture_preserves_filter_and_watch_tree_through_real_irp_lifetime() {
     captured_request_lifecycle(
         major::IRP_MJ_DIRECTORY_CONTROL,
