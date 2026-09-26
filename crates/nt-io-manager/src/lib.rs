@@ -2255,6 +2255,7 @@ mod tests {
     fn projection(major: u8, parameters: IoParameters) -> IrpProjection {
         IrpProjection {
             create_case_sensitive: false,
+            file_name: None,
             file_create_options: 0,
             irp_id: IrpId::new(1, 1),
             driver_id: DriverId::new(1, 1),
@@ -3637,6 +3638,7 @@ mod tests {
         client_id: ClientId,
         device_id: DeviceId,
         file_id: Option<FileId>,
+        file_name: Option<nt_types::UnicodeString>,
         stack_location: u8,
         stack_count: u8,
         major: u8,
@@ -3668,6 +3670,7 @@ mod tests {
                 client_id: ctx.client_id,
                 device_id: irp.device_id,
                 file_id: irp.file_id,
+                file_name: irp.file_name.clone(),
                 stack_location: irp.stack_location,
                 stack_count: irp.stack_count,
                 major: irp.major,
@@ -4056,6 +4059,7 @@ mod tests {
                 client_id: ClientId(44),
                 device_id: device,
                 file_id: None,
+                file_name: None,
                 stack_location: 0,
                 stack_count: 1,
                 major: major::IRP_MJ_SET_INFORMATION,
@@ -4514,8 +4518,71 @@ mod tests {
             ]
         );
         assert!(seen.iter().all(|entry| entry.file_id == Some(file_id)));
+        assert_eq!(
+            seen[0].file_name,
+            Some(nt_types::UnicodeString::from_str("\\Device\\ExternalFile0\\name"))
+        );
+        assert!(seen[1..].iter().all(|entry| entry.file_name.is_none()));
         assert_eq!(seen[0].user_data, 0);
         assert!(seen[1..].iter().all(|entry| entry.user_data == 0xCCB0));
+    }
+
+    #[test]
+    fn external_create_projection_preserves_exact_utf16_and_empty_name() {
+        for name in [
+            nt_types::UnicodeString::new(),
+            nt_types::UnicodeString::from_units(&[b'F' as u16, 0x00e9, 0xd83d, 0xde00]),
+        ] {
+            let mut om = io();
+            let client = om.register_client();
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(std::vec::Vec::new()));
+            let driver = om
+                .create_driver(
+                    &path("\\Driver\\ExactName"),
+                    Box::new(RecordingBackend {
+                        seen: seen.clone(),
+                        status: NtStatus::SUCCESS,
+                        information: 0,
+                        file_context: None,
+                        output: std::vec::Vec::new(),
+                    }),
+                )
+                .unwrap();
+            let device = om
+                .create_device(
+                    driver,
+                    None,
+                    DeviceType::UNKNOWN,
+                    DeviceCharacteristics::empty(),
+                    DeviceFlags::BUFFERED_IO,
+                    0,
+                )
+                .unwrap();
+            let file = om
+                .allocate_external_file(
+                    client,
+                    device,
+                    AccessMask::GENERIC_READ,
+                    ShareAccess::READ,
+                    CreateOptions::empty(),
+                    name.clone(),
+                )
+                .unwrap();
+            om.build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(file),
+                0,
+                17,
+                major::IRP_MJ_CREATE,
+                IoParameters::Create(CreateParameters::default()),
+                0,
+                0,
+                &mut [],
+            )
+            .unwrap();
+            assert_eq!(seen.borrow()[0].file_name.as_ref(), Some(&name));
+        }
     }
 
     #[test]
@@ -4617,6 +4684,10 @@ mod tests {
             panic!("expected CREATE parameters")
         };
         assert_eq!(parameters.related_file, Some(parent));
+        assert_eq!(
+            seen[0].file_name,
+            Some(nt_types::UnicodeString::from_str("child"))
+        );
     }
 
     #[test]

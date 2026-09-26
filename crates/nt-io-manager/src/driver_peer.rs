@@ -736,6 +736,7 @@ mod initial_information_tests {
     fn projection() -> IrpProjection {
         IrpProjection {
             create_case_sensitive: false,
+            file_name: None,
             file_create_options: 0,
             irp_id: IrpId::new(1, 1),
             driver_id: DriverId::new(1, 2),

@@ -187,6 +187,10 @@ fn owned_relative_create_after_cleanup_transfers_parent_lifetime_until_ack() {
         panic!("expected relative target CREATE")
     };
     assert_eq!(parameters.related_file, Some(f.file));
+    assert_eq!(
+        prepared.projection().file_name,
+        Some(UnicodeString::from_str("subdir\\leaf"))
+    );
     assert_eq!(prepared.buffers().input(), name);
     assert_eq!(f.io.file(child).unwrap().related_file, None);
     assert_eq!(f.io.file(f.file).unwrap().outstanding_irp_refs, 1);

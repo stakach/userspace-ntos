@@ -86,6 +86,9 @@ impl<'a> DispatchContext<'a> {
 pub struct IrpProjection {
     /// Canonical File-body case provenance, independent of the current driver's CREATE flags.
     pub create_case_sensitive: bool,
+    /// Exact FILE_OBJECT name for CREATE after canonical File lookup. A bare projection made from
+    /// an IRP record alone has no name; unrelated IRPs never carry one.
+    pub file_name: Option<nt_types::UnicodeString>,
     /// Initial File options, not the mutable current stack's CREATE options.
     pub file_create_options: u32,
     pub irp_id: IrpId,
@@ -118,6 +121,7 @@ impl IrpProjection {
             u8::try_from(record.stack.len()).map_err(|_| NtStatus::INVALID_PARAMETER)?;
         Ok(Self {
             create_case_sensitive: crate::is_create_major(stack.major) && record.create_case_sensitive(),
+            file_name: None,
             file_create_options: if crate::is_create_major(stack.major) {
                 record.file_create_options()
             } else {
