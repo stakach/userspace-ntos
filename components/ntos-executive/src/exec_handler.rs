@@ -24654,7 +24654,9 @@ impl ExecNtHandler {
             let Ok(path) = core::str::from_utf8(&mirrored_path[..length]) else {
                 return;
             };
-            if unsafe { crate::object_manager_delete_symbolic_link_path(path) }.is_err() {
+            if unsafe { crate::object_manager_delete_symbolic_link_exact(path, entry.payload) }
+                .is_err()
+            {
                 return;
             }
         }
@@ -37358,21 +37360,32 @@ impl ExecNtHandler {
                             let Some(handle) =
                                 self.mint_object_namespace_handle(index, desired_access)
                             else {
-                                let _ =
-                                    crate::object_manager_delete_symbolic_link_path(absolute_link);
-                                self.rollback_new_namespace_object(index);
+                                if crate::object_manager_delete_symbolic_link_exact(
+                                    absolute_link,
+                                    mirror_id,
+                                )
+                                .is_ok()
+                                {
+                                    self.rollback_new_namespace_object(index);
+                                }
                                 return 0xC000_009A;
                             };
                             if !self.xas_write_u64(out, handle) {
-                                // Keep handle-close cleanup local; this failed create is rolled back
-                                // explicitly in both namespace authorities below.
-                                self.obj_ns[index].payload = 0;
-                                if let Some(pid) = self.pm_pid_for_pi(self.pi) {
-                                    let _ = self.close_process_handle(pid, handle);
+                                // Retain the mirror name if canonical deletion cannot be confirmed.
+                                let deleted = crate::object_manager_delete_symbolic_link_exact(
+                                    absolute_link,
+                                    mirror_id,
+                                )
+                                .is_ok();
+                                if deleted {
+                                    self.obj_ns[index].payload = 0;
                                 }
-                                let _ =
-                                    crate::object_manager_delete_symbolic_link_path(absolute_link);
-                                self.rollback_new_namespace_object(index);
+                                let closed = self
+                                    .pm_pid_for_pi(self.pi)
+                                    .is_some_and(|pid| self.close_process_handle(pid, handle));
+                                if deleted && closed {
+                                    self.rollback_new_namespace_object(index);
+                                }
                                 return 0xC000_0005;
                             }
                             0

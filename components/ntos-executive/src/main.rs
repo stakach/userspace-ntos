@@ -15029,6 +15029,16 @@ pub(crate) unsafe fn object_manager_delete_symbolic_link_path(
     object_manager_delete_path(link)
 }
 
+pub(crate) unsafe fn object_manager_delete_symbolic_link_exact(
+    link: &str,
+    object_id: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    client.delete_symbolic_link_exact(link, nt_types::ObjectId(object_id), true)
+}
+
 pub(crate) unsafe fn object_manager_resolve_file_target(
     path: &[u16],
     case_insensitive: bool,
