@@ -59791,23 +59791,6 @@ pub(crate) fn owned_hosted_file_metadata(
         .map_err(|status| status.raw() as u32)
 }
 
-/// Resolve the current top device for an executive-owned File through the canonical attachment
-/// topology. Both the generation-protected device id and Object Manager identity are returned so a
-/// component can validate its local WDM projection before publishing it to imported kernel code.
-pub(crate) fn related_io_device_identity_for_file(
-    file_id: u64,
-) -> Result<(u64, u64), nt_status::NtStatus> {
-    let manager = io_manager_mut();
-    let file_id = FileId(file_id);
-    manager
-        .file(file_id)
-        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID) && file.state.is_open())
-        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
-    manager
-        .related_device_identity_for_file(file_id)
-        .map(|(device, object)| (device.raw(), object.0))
-}
-
 pub(crate) enum HostedFileNameTarget {
     RelatedFile(u64),
     DeviceObject(ObjectId),
