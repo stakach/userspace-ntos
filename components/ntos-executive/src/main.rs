@@ -29225,15 +29225,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let dma_exec = copy_cap(dma_frame);
             let _ = page_map(dma_exec, AHCI_DMA_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
             let mut generic_loader_ok = false;
-            let mut mounted_volume_provider_ok = false;
-            let mut mounted_volume_file_ok = false;
             if let Some(fs) = fat32_mount(AHCI_VADDR, AHCI_DMA_VADDR, AHCI_IOVA)
                 .and_then(|fs| publish_exec_fs(fs).ok().map(|()| fs)) {
-                if let Ok((device_id, file_ok)) = mounted_volume::register_mounted_volume(fs) {
-                    mounted_volume_provider_ok = true;
-                    mounted_volume_file_ok = file_ok;
-                    mounted_volume_device_id = Some(device_id);
-                }
                 if let Some((va, sz)) = load_file_to_pool(&fs, b"reactos\\system32\\version.dll") {
                     let bytes = core::slice::from_raw_parts(va as *const u8, sz as usize);
                     let mz = sz >= 2 && bytes[0] == b'M' && bytes[1] == b'Z';
@@ -29262,17 +29255,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 generic_loader_ok,
                 &mut passed,
             );
-            check(
-                b"exec_mounted_volume_provider_registered",
-                mounted_volume_provider_ok,
-                &mut passed,
-            );
-            check(
-                b"exec_mounted_volume_canonical_font_read",
-                mounted_volume_file_ok,
-                &mut passed,
-            );
-
             // --- P2 finale: the Config Manager parses the registry hive the isolated storage
             // host read off the FS (an nt-hive-core image at STORAGE_HIVE_IMAGE_OFFSET) and
             // reads a known value back — disk -> volume -> FS -> REGISTRY, end to end.
@@ -29332,6 +29314,26 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b" image-bytes=");
     print_u64(boot_system.image_bytes);
     print_str(b"\n");
+
+    // The mounted File backend resolves both layers. Publish it only after the boot SYSTEM
+    // authority has restored the writable snapshot; an earlier lookup would consume that mount.
+    let mut mounted_volume_file_ok = false;
+    if let Some(fs) = exec_fs() {
+        if let Ok((device_id, file_ok)) = mounted_volume::register_mounted_volume(fs) {
+            mounted_volume_device_id = Some(device_id);
+            mounted_volume_file_ok = file_ok;
+        }
+    }
+    check(
+        b"exec_mounted_volume_provider_registered",
+        mounted_volume_device_id.is_some(),
+        &mut passed,
+    );
+    check(
+        b"exec_mounted_volume_canonical_font_read",
+        mounted_volume_file_ok,
+        &mut passed,
+    );
 
     let live_cm_mount = mount_live_config_manager_config_hive();
     print_str(b"[cm-mount] live Config Manager composed SYSTEM hive bytes=");
@@ -29718,6 +29720,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         check(
             b"exec_mounted_volume_external_file_dispatch_font_read",
             mounted_volume_ingress_ok,
+            &mut passed,
+        );
+        let mounted_overlay_ingress_ok = mounted_volume_device_id
+            .is_some_and(|device_id| mounted_volume_ingress_probe::run_overlay(device_id));
+        check(
+            b"exec_mounted_volume_external_overlay_create_write_read_close",
+            mounted_overlay_ingress_ok,
+            &mut passed,
+        );
+        let mounted_copy_up_ok = mounted_volume_device_id
+            .is_some_and(|device_id| mounted_volume_ingress_probe::run_copy_up(device_id));
+        check(
+            b"exec_mounted_volume_installed_file_copy_up_and_delete",
+            mounted_copy_up_ok,
             &mut passed,
         );
         if let Some((dc, driver_object_path)) = named_pipe_provider {

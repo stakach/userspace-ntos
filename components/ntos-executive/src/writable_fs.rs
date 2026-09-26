@@ -1362,6 +1362,24 @@ pub(crate) unsafe fn copy_up_installed_file(
     source: crate::fs_loader::FatOpenMetadata,
     mode: InstalledFileCopyUp,
 ) -> Result<bool, u32> {
+    copy_up_installed_file_with_source(None, relative, source, mode)
+}
+
+pub(crate) unsafe fn copy_up_installed_file_from(
+    fat: &crate::Fat32,
+    relative: &[u8],
+    source: crate::fs_loader::FatOpenMetadata,
+    mode: InstalledFileCopyUp,
+) -> Result<bool, u32> {
+    copy_up_installed_file_with_source(Some(fat), relative, source, mode)
+}
+
+unsafe fn copy_up_installed_file_with_source(
+    fat: Option<&crate::Fat32>,
+    relative: &[u8],
+    source: crate::fs_loader::FatOpenMetadata,
+    mode: InstalledFileCopyUp,
+) -> Result<bool, u32> {
     if source.metadata.is_directory {
         return Err(nt_fs::STATUS_FILE_IS_A_DIRECTORY);
     }
@@ -1370,8 +1388,15 @@ pub(crate) unsafe fn copy_up_installed_file(
         InstalledFileCopyUp::PreserveContents => {
             let size = u32::try_from(metadata.end_of_file)
                 .map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
-            let fat = exec_fs().ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
-            read_staged_file_result(&fat, source.first_cluster, size)?
+            let local;
+            let fat = match fat {
+                Some(fat) => fat,
+                None => {
+                    local = exec_fs().ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+                    &local
+                }
+            };
+            read_staged_file_result(fat, source.first_cluster, size)?
         }
         InstalledFileCopyUp::MetadataOnly => {
             metadata.allocation_size = 0;
@@ -2138,11 +2163,21 @@ pub(crate) unsafe fn acknowledge_directory_notify_completion(
 
 /// `NtClose` on a writable-volume file object (honours a pending delete).
 pub(crate) unsafe fn close(file_id: u64) {
-    if let Ok(fs) = writable_fs() {
-        if fs.zw_close(file_id) == nt_fs::STATUS_SUCCESS {
-            OVERLAY_CLOSES.fetch_add(1, Ordering::Relaxed);
-        }
-        publish_file_cleanup_effects(fs);
+    let _ = close_checked(file_id);
+}
+
+/// Preserve an unconsumed File handle if cleanup admission fails.
+pub(crate) unsafe fn close_checked(file_id: u64) -> Result<(), u32> {
+    let fs = writable_fs()?;
+    let result = fs.zw_close(file_id);
+    if result == nt_fs::STATUS_SUCCESS {
+        OVERLAY_CLOSES.fetch_add(1, Ordering::Relaxed);
+    }
+    publish_file_cleanup_effects(fs);
+    if result == nt_fs::STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(result)
     }
 }
 
