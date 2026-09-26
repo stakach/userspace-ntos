@@ -8,6 +8,20 @@ use crate::{
 
 pub const MAX_DIRECTORY_NAME: usize = 260;
 pub const MAX_SHORT_NAME: usize = 12;
+const OPEN_SLOT_BITS: u32 = 16;
+const OPEN_SLOT_MASK: u32 = (1 << OPEN_SLOT_BITS) - 1;
+
+fn open_id(index: usize, generation: u32) -> u32 {
+    (generation << OPEN_SLOT_BITS) | index as u32
+}
+
+fn open_slot(id: u32) -> usize {
+    (id & OPEN_SLOT_MASK) as usize
+}
+
+fn open_generation(id: u32) -> u32 {
+    id >> OPEN_SLOT_BITS
+}
 
 pub const FILE_DIRECTORY_INFORMATION: u32 = 1;
 pub const FILE_FULL_DIRECTORY_INFORMATION: u32 = 2;
@@ -169,6 +183,7 @@ fn same_fat_file(
 #[derive(Clone, Copy)]
 struct DirectoryOpenSlot {
     occupied: bool,
+    generation: u32,
     handle_references: u16,
     references: u16,
     open: DirectoryOpen,
@@ -178,6 +193,7 @@ impl DirectoryOpenSlot {
     const fn empty() -> Self {
         Self {
             occupied: false,
+            generation: 0,
             handle_references: 0,
             references: 0,
             open: DirectoryOpen {
@@ -207,6 +223,12 @@ impl DirectoryOpenSlot {
             },
         }
     }
+
+    fn vacate(&mut self) {
+        let generation = self.generation + 1;
+        *self = Self::empty();
+        self.generation = generation;
+    }
 }
 
 pub struct DirectoryOpenTable<const SLOTS: usize> {
@@ -216,6 +238,7 @@ pub struct DirectoryOpenTable<const SLOTS: usize> {
 impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
     pub const fn new() -> Self {
         assert!(SLOTS > 0);
+        assert!(SLOTS <= OPEN_SLOT_MASK as usize + 1);
         Self {
             slots: [DirectoryOpenSlot::empty(); SLOTS],
         }
@@ -240,12 +263,13 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
             .slots
             .iter_mut()
             .enumerate()
-            .find(|(_, slot)| !slot.occupied)
+            .find(|(_, slot)| !slot.occupied && slot.generation <= u16::MAX as u32)
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         let mut path = [0; DIRECTORY_OPEN_PATH_CAP];
         path[..volume_relative_path.len()].copy_from_slice(volume_relative_path);
         *slot = DirectoryOpenSlot {
             occupied: true,
+            generation: slot.generation,
             handle_references: 1,
             references: 1,
             open: DirectoryOpen {
@@ -260,7 +284,7 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
                 path,
             },
         };
-        Ok(index as u32)
+        Ok(open_id(index, slot.generation))
     }
 
     pub fn check_share(
@@ -304,16 +328,16 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
 
     pub fn get(&self, id: u32) -> Result<&DirectoryOpen, u32> {
         self.slots
-            .get(id as usize)
-            .filter(|slot| slot.occupied)
+            .get(open_slot(id))
+            .filter(|slot| slot.occupied && slot.generation == open_generation(id))
             .map(|slot| &slot.open)
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
     pub fn get_mut(&mut self, id: u32) -> Result<&mut DirectoryOpen, u32> {
         self.slots
-            .get_mut(id as usize)
-            .filter(|slot| slot.occupied)
+            .get_mut(open_slot(id))
+            .filter(|slot| slot.occupied && slot.generation == open_generation(id))
             .map(|slot| &mut slot.open)
             .ok_or(STATUS_INVALID_HANDLE)
     }
@@ -321,8 +345,12 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
     pub fn retain(&mut self, id: u32) -> Result<(), u32> {
         let slot = self
             .slots
-            .get_mut(id as usize)
-            .filter(|slot| slot.occupied && slot.handle_references != 0)
+            .get_mut(open_slot(id))
+            .filter(|slot| {
+                slot.occupied
+                    && slot.generation == open_generation(id)
+                    && slot.handle_references != 0
+            })
             .ok_or(STATUS_INVALID_HANDLE)?;
         let references = slot
             .references
@@ -340,8 +368,12 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
     pub fn retain_io(&mut self, id: u32) -> Result<(), u32> {
         let slot = self
             .slots
-            .get_mut(id as usize)
-            .filter(|slot| slot.occupied && slot.handle_references != 0)
+            .get_mut(open_slot(id))
+            .filter(|slot| {
+                slot.occupied
+                    && slot.generation == open_generation(id)
+                    && slot.handle_references != 0
+            })
             .ok_or(STATUS_INVALID_HANDLE)?;
         slot.references = slot
             .references
@@ -362,8 +394,12 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
     /// Whether releasing one process handle will issue this directory FILE_OBJECT's cleanup/close.
     pub fn is_final_reference(&self, id: u32) -> Result<bool, u32> {
         self.slots
-            .get(id as usize)
-            .filter(|slot| slot.occupied && slot.handle_references != 0)
+            .get(open_slot(id))
+            .filter(|slot| {
+                slot.occupied
+                    && slot.generation == open_generation(id)
+                    && slot.handle_references != 0
+            })
             .map(|slot| slot.handle_references == 1)
             .ok_or(STATUS_INVALID_HANDLE)
     }
@@ -371,8 +407,8 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
     pub fn release(&mut self, id: u32) -> Result<(), u32> {
         let slot = self
             .slots
-            .get_mut(id as usize)
-            .filter(|slot| slot.occupied)
+            .get_mut(open_slot(id))
+            .filter(|slot| slot.occupied && slot.generation == open_generation(id))
             .ok_or(STATUS_INVALID_HANDLE)?;
         if slot.handle_references == 0 {
             return Err(STATUS_INVALID_HANDLE);
@@ -380,7 +416,7 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
         slot.handle_references -= 1;
         slot.references -= 1;
         if slot.references == 0 {
-            *slot = DirectoryOpenSlot::empty();
+            slot.vacate();
         }
         Ok(())
     }
@@ -388,15 +424,15 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
     pub fn release_io(&mut self, id: u32) -> Result<(), u32> {
         let slot = self
             .slots
-            .get_mut(id as usize)
-            .filter(|slot| slot.occupied)
+            .get_mut(open_slot(id))
+            .filter(|slot| slot.occupied && slot.generation == open_generation(id))
             .ok_or(STATUS_INVALID_HANDLE)?;
         if slot.references == slot.handle_references {
             return Err(STATUS_INVALID_HANDLE);
         }
         slot.references -= 1;
         if slot.references == 0 {
-            *slot = DirectoryOpenSlot::empty();
+            slot.vacate();
         }
         Ok(())
     }
@@ -407,7 +443,9 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
     /// executive service-loop restart.
     pub fn clear(&mut self) {
         for slot in &mut self.slots {
-            *slot = DirectoryOpenSlot::empty();
+            if slot.occupied {
+                slot.vacate();
+            }
         }
     }
 }
@@ -442,6 +480,7 @@ impl ReadOnlyFileOpen {
 #[derive(Clone, Copy)]
 struct ReadOnlyFileOpenSlot {
     occupied: bool,
+    generation: u32,
     handle_references: u16,
     references: u16,
     open: ReadOnlyFileOpen,
@@ -451,6 +490,7 @@ impl ReadOnlyFileOpenSlot {
     const fn empty() -> Self {
         Self {
             occupied: false,
+            generation: 0,
             handle_references: 0,
             references: 0,
             open: ReadOnlyFileOpen {
@@ -481,6 +521,12 @@ impl ReadOnlyFileOpenSlot {
             },
         }
     }
+
+    fn vacate(&mut self) {
+        let generation = self.generation + 1;
+        *self = Self::empty();
+        self.generation = generation;
+    }
 }
 
 pub struct ReadOnlyFileOpenTable<const SLOTS: usize> {
@@ -490,6 +536,7 @@ pub struct ReadOnlyFileOpenTable<const SLOTS: usize> {
 impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
     pub const fn new() -> Self {
         assert!(SLOTS > 0);
+        assert!(SLOTS <= OPEN_SLOT_MASK as usize + 1);
         Self {
             slots: [ReadOnlyFileOpenSlot::empty(); SLOTS],
         }
@@ -515,12 +562,13 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
             .slots
             .iter_mut()
             .enumerate()
-            .find(|(_, slot)| !slot.occupied)
+            .find(|(_, slot)| !slot.occupied && slot.generation <= u16::MAX as u32)
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         let mut path = [0; DIRECTORY_OPEN_PATH_CAP];
         path[..volume_relative_path.len()].copy_from_slice(volume_relative_path);
         *slot = ReadOnlyFileOpenSlot {
             occupied: true,
+            generation: slot.generation,
             handle_references: 1,
             references: 1,
             open: ReadOnlyFileOpen {
@@ -536,7 +584,7 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
                 path,
             },
         };
-        Ok(index as u32)
+        Ok(open_id(index, slot.generation))
     }
 
     pub fn check_share(
@@ -580,16 +628,16 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
 
     pub fn get(&self, id: u32) -> Result<&ReadOnlyFileOpen, u32> {
         self.slots
-            .get(id as usize)
-            .filter(|slot| slot.occupied)
+            .get(open_slot(id))
+            .filter(|slot| slot.occupied && slot.generation == open_generation(id))
             .map(|slot| &slot.open)
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
     pub fn get_mut(&mut self, id: u32) -> Result<&mut ReadOnlyFileOpen, u32> {
         self.slots
-            .get_mut(id as usize)
-            .filter(|slot| slot.occupied)
+            .get_mut(open_slot(id))
+            .filter(|slot| slot.occupied && slot.generation == open_generation(id))
             .map(|slot| &mut slot.open)
             .ok_or(STATUS_INVALID_HANDLE)
     }
@@ -597,8 +645,12 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
     pub fn retain(&mut self, id: u32) -> Result<(), u32> {
         let slot = self
             .slots
-            .get_mut(id as usize)
-            .filter(|slot| slot.occupied && slot.handle_references != 0)
+            .get_mut(open_slot(id))
+            .filter(|slot| {
+                slot.occupied
+                    && slot.generation == open_generation(id)
+                    && slot.handle_references != 0
+            })
             .ok_or(STATUS_INVALID_HANDLE)?;
         let references = slot
             .references
@@ -616,8 +668,12 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
     pub fn retain_io(&mut self, id: u32) -> Result<(), u32> {
         let slot = self
             .slots
-            .get_mut(id as usize)
-            .filter(|slot| slot.occupied && slot.handle_references != 0)
+            .get_mut(open_slot(id))
+            .filter(|slot| {
+                slot.occupied
+                    && slot.generation == open_generation(id)
+                    && slot.handle_references != 0
+            })
             .ok_or(STATUS_INVALID_HANDLE)?;
         slot.references = slot
             .references
@@ -638,8 +694,12 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
     /// Whether releasing one process handle will issue this FILE_OBJECT's cleanup/close.
     pub fn is_final_reference(&self, id: u32) -> Result<bool, u32> {
         self.slots
-            .get(id as usize)
-            .filter(|slot| slot.occupied && slot.handle_references != 0)
+            .get(open_slot(id))
+            .filter(|slot| {
+                slot.occupied
+                    && slot.generation == open_generation(id)
+                    && slot.handle_references != 0
+            })
             .map(|slot| slot.handle_references == 1)
             .ok_or(STATUS_INVALID_HANDLE)
     }
@@ -647,8 +707,8 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
     pub fn release(&mut self, id: u32) -> Result<(), u32> {
         let slot = self
             .slots
-            .get_mut(id as usize)
-            .filter(|slot| slot.occupied)
+            .get_mut(open_slot(id))
+            .filter(|slot| slot.occupied && slot.generation == open_generation(id))
             .ok_or(STATUS_INVALID_HANDLE)?;
         if slot.handle_references == 0 {
             return Err(STATUS_INVALID_HANDLE);
@@ -656,7 +716,7 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
         slot.handle_references -= 1;
         slot.references -= 1;
         if slot.references == 0 {
-            *slot = ReadOnlyFileOpenSlot::empty();
+            slot.vacate();
         }
         Ok(())
     }
@@ -664,22 +724,24 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
     pub fn release_io(&mut self, id: u32) -> Result<(), u32> {
         let slot = self
             .slots
-            .get_mut(id as usize)
-            .filter(|slot| slot.occupied)
+            .get_mut(open_slot(id))
+            .filter(|slot| slot.occupied && slot.generation == open_generation(id))
             .ok_or(STATUS_INVALID_HANDLE)?;
         if slot.references == slot.handle_references {
             return Err(STATUS_INVALID_HANDLE);
         }
         slot.references -= 1;
         if slot.references == 0 {
-            *slot = ReadOnlyFileOpenSlot::empty();
+            slot.vacate();
         }
         Ok(())
     }
 
     pub fn clear(&mut self) {
         for slot in &mut self.slots {
-            *slot = ReadOnlyFileOpenSlot::empty();
+            if slot.occupied {
+                slot.vacate();
+            }
         }
     }
 }
@@ -1223,20 +1285,22 @@ mod tests {
         assert_eq!(table.get(shared).unwrap().create_options, 0x20);
         table.release(shared).unwrap();
         assert_eq!(table.get(shared), Err(STATUS_INVALID_HANDLE));
-        assert_eq!(
-            table
-                .create(
-                    99,
-                    b"reactos",
-                    0,
-                    0,
-                    0,
-                    crate::FileMetadata::default(),
-                    crate::FatShortName::EMPTY,
-                )
-                .unwrap(),
-            shared
-        );
+        let reused = table
+            .create(
+                99,
+                b"reactos",
+                0,
+                0,
+                0,
+                crate::FileMetadata::default(),
+                crate::FatShortName::EMPTY,
+            )
+            .unwrap();
+        assert_ne!(reused, shared);
+        assert_eq!(table.get(shared), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.retain(shared), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.release(shared), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.get(reused).unwrap().first_cluster, 99);
     }
 
     #[test]
@@ -1291,34 +1355,34 @@ mod tests {
         table.clear();
 
         assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
-        assert_eq!(
-            table
-                .create(
-                    99,
-                    b"",
-                    0,
-                    0,
-                    0,
-                    crate::FileMetadata::default(),
-                    crate::FatShortName::EMPTY,
-                )
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            table
-                .create(
-                    100,
-                    b"reactos",
-                    0,
-                    0,
-                    0,
-                    crate::FileMetadata::default(),
-                    crate::FatShortName::EMPTY,
-                )
-                .unwrap(),
-            1
-        );
+        let reused = table
+            .create(
+                99,
+                b"",
+                0,
+                0,
+                0,
+                crate::FileMetadata::default(),
+                crate::FatShortName::EMPTY,
+            )
+            .unwrap();
+        assert_ne!(reused, first);
+        assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.release(first), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.get(reused).unwrap().first_cluster, 99);
+        let second = table
+            .create(
+                100,
+                b"reactos",
+                0,
+                0,
+                0,
+                crate::FileMetadata::default(),
+                crate::FatShortName::EMPTY,
+            )
+            .unwrap();
+        assert_eq!(open_slot(second), 1);
+        assert_ne!(second, 1);
     }
 
     #[test]
@@ -1372,21 +1436,23 @@ mod tests {
         assert_eq!(table.get(shared).unwrap().create_options, 0x20);
         table.release(shared).unwrap();
         assert_eq!(table.get(shared), Err(STATUS_INVALID_HANDLE));
-        assert_eq!(
-            table
-                .create(
-                    99,
-                    128,
-                    b"reactos\\x",
-                    0,
-                    0,
-                    0,
-                    crate::FileMetadata::default(),
-                    crate::FatShortName::EMPTY,
-                )
-                .unwrap(),
-            shared
-        );
+        let reused = table
+            .create(
+                99,
+                128,
+                b"reactos\\x",
+                0,
+                0,
+                0,
+                crate::FileMetadata::default(),
+                crate::FatShortName::EMPTY,
+            )
+            .unwrap();
+        assert_ne!(reused, shared);
+        assert_eq!(table.get(shared), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.retain(shared), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.release(shared), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.get(reused).unwrap().first_cluster, 99);
     }
 
     #[test]
@@ -1444,35 +1510,92 @@ mod tests {
         table.clear();
 
         assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
+        let reused = table
+            .create(
+                99,
+                1,
+                b"",
+                0,
+                0,
+                0,
+                crate::FileMetadata::default(),
+                crate::FatShortName::EMPTY,
+            )
+            .unwrap();
+        assert_ne!(reused, first);
+        assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.release(first), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.get(reused).unwrap().first_cluster, 99);
+        let second = table
+            .create(
+                100,
+                2,
+                b"reactos",
+                0,
+                0,
+                0,
+                crate::FileMetadata::default(),
+                crate::FatShortName::EMPTY,
+            )
+            .unwrap();
+        assert_eq!(open_slot(second), 1);
+        assert_ne!(second, 1);
+    }
+
+    #[test]
+    fn fat_open_generations_retire_instead_of_wrapping() {
+        let metadata = crate::FileMetadata::default();
+        let mut directories = DirectoryOpenTable::<1>::new();
+        directories.slots[0].generation = u16::MAX as u32;
+        let directory = directories
+            .create(
+                41,
+                b"reactos",
+                0,
+                0,
+                0,
+                metadata,
+                crate::FatShortName::EMPTY,
+            )
+            .unwrap();
+        directories.release(directory).unwrap();
+        assert_eq!(directories.get(directory), Err(STATUS_INVALID_HANDLE));
         assert_eq!(
-            table
-                .create(
-                    99,
-                    1,
-                    b"",
-                    0,
-                    0,
-                    0,
-                    crate::FileMetadata::default(),
-                    crate::FatShortName::EMPTY,
-                )
-                .unwrap(),
-            0
+            directories.create(42, b"other", 0, 0, 0, metadata, crate::FatShortName::EMPTY),
+            Err(STATUS_INSUFFICIENT_RESOURCES)
         );
+
+        let mut files = ReadOnlyFileOpenTable::<1>::new();
+        files.slots[0].generation = u16::MAX as u32;
+        let file = files
+            .create(
+                41,
+                64,
+                b"reactos\\a",
+                0,
+                0,
+                0,
+                metadata,
+                crate::FatShortName::EMPTY,
+            )
+            .unwrap();
+        files.retain_io(file).unwrap();
+        files.release(file).unwrap();
+        assert_eq!(files.get(file).unwrap().first_cluster, 41);
+        files.release_io(file).unwrap();
+        assert_eq!(files.get(file), Err(STATUS_INVALID_HANDLE));
         assert_eq!(
-            table
-                .create(
-                    100,
-                    2,
-                    b"reactos",
-                    0,
-                    0,
-                    0,
-                    crate::FileMetadata::default(),
-                    crate::FatShortName::EMPTY,
-                )
-                .unwrap(),
-            1
+            files.create(
+                42,
+                64,
+                b"reactos\\b",
+                0,
+                0,
+                0,
+                metadata,
+                crate::FatShortName::EMPTY
+            ),
+            Err(STATUS_INSUFFICIENT_RESOURCES)
         );
     }
 
@@ -1557,8 +1680,8 @@ mod tests {
             Err(STATUS_SHARING_VIOLATION)
         );
         files.release(file).unwrap();
-        assert_eq!(
-            files.create(
+        let reopened = files
+            .create(
                 51,
                 64,
                 b"reactos\\system32\\ntdll.dll",
@@ -1567,8 +1690,9 @@ mod tests {
                 0,
                 file_metadata,
                 crate::FatShortName::EMPTY,
-            ),
-            Ok(file)
-        );
+            )
+            .unwrap();
+        assert_ne!(reopened, file);
+        assert_eq!(files.get(file), Err(STATUS_INVALID_HANDLE));
     }
 }
