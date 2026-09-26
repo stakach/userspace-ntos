@@ -3764,6 +3764,10 @@ extern "win64" fn s_zw_close(handle: u64) -> i32 {
             unsafe { win32k_registry_broker_call(WIN32K_REGISTRY_OP_CLOSE, handle) };
         return status;
     }
+    let directory_status = unsafe { directory_object::close(handle) };
+    if !matches!(directory_status as u32, 0xC000_0008 | 0xC000_0024) {
+        return directory_status;
+    }
     s_ob_close_handle(handle, 0)
 }
 
@@ -13928,6 +13932,18 @@ fn register_trampolines() -> bool {
     reg.bind("NtDuplicateObject", s_zw_duplicate_object as usize as u64);
     reg.bind("ZwClose", s_zw_close as usize as u64);
     reg.bind("NtClose", s_nt_close as usize as u64);
+    reg.bind(
+        "ZwCreateDirectoryObject",
+        directory_object::create as *const () as usize as u64,
+    );
+    reg.bind(
+        "ZwOpenDirectoryObject",
+        directory_object::open as *const () as usize as u64,
+    );
+    reg.bind(
+        "ZwQueryDirectoryObject",
+        directory_object::query as *const () as usize as u64,
+    );
     reg.bind(
         "LpcRequestPort",
         s_lpc_request_port as *const () as usize as u64,
