@@ -19,6 +19,7 @@ mod file_backing;
 mod flush;
 mod fs;
 mod hive_provider;
+mod installation_root;
 mod layered_directory;
 mod layered_open;
 mod notify;
@@ -51,6 +52,7 @@ pub use fs::{
     SnapshotJournalOpenError, SnapshotJournalPhase, OwnedSnapshotJournal, OwnedSnapshotJournalOpenError,
 };
 pub use hive_provider::NtFileHiveIoProvider;
+pub use installation_root::*;
 pub use layered_directory::merge_layered_directory_entries;
 pub use layered_open::{
     LayeredOpenContextId, LayeredOpenRecord, LayeredOpenSource, LayeredOpenTable,
