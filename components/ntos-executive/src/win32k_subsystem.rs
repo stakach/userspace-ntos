@@ -1184,6 +1184,7 @@ pub const W32_DEVICE_POINTER_LABEL: u64 = 0x781;
 /// Pointer-free staged Object Manager directory requests.
 pub const W32_DIRECTORY_LABEL: u64 = 0x782;
 pub const W32_FILE_CLOSE_LABEL: u64 = 0x790;
+pub const W32_FILE_CREATE_LABEL: u64 = 0x791;
 /// Root-authenticated kernel activation handoff before entering provider code.
 pub const W32_KERNEL_ACTIVATION_LABEL: u64 = 0x78E;
 pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
@@ -1427,6 +1428,23 @@ unsafe fn provider_pool_allocation_capacity(p: u64) -> Option<u64> {
     }
     let _guard = provider_pool_lock()?;
     shared_pool::allocation_capacity(&ProviderPoolMemory, p - WIN32K_POOL_VADDR).ok()
+}
+
+pub(crate) unsafe fn copy_provider_pool_allocation(p: u64, length: usize) -> Result<Vec<u8>, u32> {
+    if !provider_pool_contains(p) || length == 0 || length as u64 >= WIN32K_POOL_FRAMES * 0x1000 {
+        return Err(0xC000_000D);
+    }
+    let _guard = provider_pool_lock().ok_or(0xC000_009Au32)?;
+    let capacity = shared_pool::allocation_capacity(&ProviderPoolMemory, p - WIN32K_POOL_VADDR)
+        .map_err(|_| 0xC000_000Du32)?;
+    if length as u64 > capacity {
+        return Err(0xC000_000D);
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length).map_err(|_| 0xC000_009Au32)?;
+    bytes.resize(length, 0);
+    core::ptr::copy_nonoverlapping(p as *const u8, bytes.as_mut_ptr(), length);
+    Ok(bytes)
 }
 
 unsafe fn provider_pool_validate_owned(objects: &[(u64, u64)]) -> bool {
@@ -3505,6 +3523,7 @@ static mut OBJ_TABLE: ObHandleTable = ObHandleTable::new();
 mod object_security;
 mod directory_object;
 mod file_close;
+mod file_open;
 pub(crate) use object_security::census as object_security_census;
 
 /// Duplicate a handle owned by win32k's USER object table. Native `NtDuplicateObject` calls this
@@ -10870,15 +10889,6 @@ pub(crate) unsafe fn win32k_window_owner_pi(hwnd: u64) -> Option<u32> {
     Some(process_ctx_pi(process_index) as u32)
 }
 
-/// `NTSTATUS ZwOpenFile(...)` — win32k's font init (IntLoadSystemFonts) opens `\SystemRoot\Fonts\`
-/// as a directory to enumerate *.ttf. That directory doesn't exist in this environment, so return
-/// STATUS_OBJECT_NAME_NOT_FOUND: IntLoadSystemFonts then SKIPS the whole enumeration loop (rather
-/// than being fed a garbage handle by an s_zero=SUCCESS stub and crashing on a bogus font read), and
-/// InitFontSupport returns TRUE. A no-op SUCCESS here is actively harmful (it faked a valid handle).
-extern "win64" fn s_zw_open_file_fail() -> i32 {
-    0xC000_0034u32 as i32 // STATUS_OBJECT_NAME_NOT_FOUND
-}
-
 /// `VOID RtlInitEmptyUnicodeString(PUNICODE_STRING, PWSTR Buffer, USHORT MaximumLength)`.
 extern "win64" fn s_rtl_init_empty_unicode_string(dest: *mut u8, buffer: u64, max_len: u64) {
     if dest.is_null() {
@@ -14206,8 +14216,8 @@ fn register_trampolines() -> bool {
         "NtSetSystemInformation",
         s_zw_set_system_information as usize as u64,
     );
-    reg.bind("ZwOpenFile", s_zw_open_file_fail as usize as u64);
-    reg.bind("NtOpenFile", s_zw_open_file_fail as usize as u64);
+    reg.bind("ZwOpenFile", file_open::open as *const () as usize as u64);
+    reg.bind("ZwCreateFile", file_open::create as *const () as usize as u64);
     reg.bind("ZwOpenKey", s_zw_open_key as usize as u64);
     reg.bind("NtOpenKey", s_nt_open_key as usize as u64);
     reg.bind(

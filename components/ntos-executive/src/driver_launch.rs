@@ -54179,6 +54179,22 @@ pub(crate) fn service_hosted_driver_io_create_file(
     }
 }
 
+pub(crate) fn service_win32k_io_create_file(
+    ch: &crate::spawn_hosts::PumpChannel,
+    packet: u64,
+    packet_length: u64,
+) -> Option<nt_io_manager::io_create_file_reply::IoCreateFileReply> {
+    use nt_io_manager::io_create_file_reply::IoCreateFileReply;
+    let captured = match hosted_io_create_file_ingress::capture_win32k(ch, packet, packet_length) {
+        Ok(captured) => captured,
+        Err(status) => return Some(IoCreateFileReply::Rejected { status }),
+    };
+    match unsafe { hosted_io_create_file_work::submit(ch, captured) } {
+        hosted_io_create_file_work::SubmitResult::Ready(reply) => Some(reply),
+        hosted_io_create_file_work::SubmitResult::Deferred => None,
+    }
+}
+
 pub(crate) unsafe fn redrive_hosted_driver_io_create_file(handler: *mut ExecNtHandler) {
     hosted_io_create_file_work::redrive(handler);
 }
