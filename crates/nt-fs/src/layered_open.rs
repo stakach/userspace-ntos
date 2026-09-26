@@ -1,5 +1,7 @@
 //! Retained source identity for a canonical File opened through a layered volume.
 
+use alloc::vec::Vec;
+
 use crate::{
     FatShortName, FileMetadata, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_HANDLE,
     STATUS_OBJECT_NAME_INVALID,
@@ -68,15 +70,13 @@ impl OpenSlot {
 /// Bounded driver-owned open descriptions. Exhausted generations retire a slot rather than alias
 /// a context that may still be retained by a stale IRP.
 pub struct LayeredOpenTable<const SLOTS: usize> {
-    slots: [OpenSlot; SLOTS],
+    slots: Vec<OpenSlot>,
 }
 
 impl<const SLOTS: usize> LayeredOpenTable<SLOTS> {
     pub const fn new() -> Self {
         assert!(SLOTS > 0 && SLOTS < u32::MAX as usize);
-        Self {
-            slots: [OpenSlot::empty(); SLOTS],
-        }
+        Self { slots: Vec::new() }
     }
 
     pub fn insert(
@@ -88,12 +88,22 @@ impl<const SLOTS: usize> LayeredOpenTable<SLOTS> {
         if volume_relative_name.len() > LAYERED_OPEN_NAME_CAP {
             return Err(STATUS_OBJECT_NAME_INVALID);
         }
-        let (index, slot) = self
+        let index = match self
             .slots
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| slot.entry.is_none() && slot.generation != u32::MAX)
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+            .iter()
+            .position(|slot| slot.entry.is_none() && slot.generation != u32::MAX)
+        {
+            Some(index) => index,
+            None if self.slots.len() < SLOTS => {
+                self.slots
+                    .try_reserve(1)
+                    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                self.slots.push(OpenSlot::empty());
+                self.slots.len() - 1
+            }
+            None => return Err(STATUS_INSUFFICIENT_RESOURCES),
+        };
+        let slot = &mut self.slots[index];
         let mut name = [0; LAYERED_OPEN_NAME_CAP];
         name[..volume_relative_name.len()].copy_from_slice(volume_relative_name);
         slot.entry = Some(OpenEntry {
@@ -216,6 +226,19 @@ mod tests {
                 name: &[b'x' as u16]
             })
         );
+    }
+
+    #[test]
+    fn lazy_table_retains_generation_fence_after_reuse() {
+        let mut table = LayeredOpenTable::<1>::new();
+        assert!(table.slots.is_empty());
+        let first = table.insert(7, installed(), &[b'a' as u16]).unwrap();
+        assert_eq!(table.slots.len(), 1);
+        assert_eq!(table.release(first, 7), Ok(installed()));
+        let second = table.insert(7, installed(), &[b'b' as u16]).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(table.get(first, 7), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.get(second, 7).unwrap().name, &[b'b' as u16]);
     }
 
     #[test]

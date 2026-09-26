@@ -43419,6 +43419,132 @@ pub(crate) fn register_kernel_io_driver_with_majors(
         .map(|driver_id| driver_id.raw())
 }
 
+pub(crate) fn register_kernel_volume_device(
+    driver_object_path: &str,
+    device_object_path: &str,
+    backend: Box<dyn DriverDispatchBackend>,
+    majors: &[u8],
+) -> Result<u64, nt_status::NtStatus> {
+    let driver_name =
+        parse_nt_path(driver_object_path).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let device_name =
+        parse_nt_path(device_object_path).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let io = io_manager_mut();
+    let driver = io.create_kernel_driver_with_majors(&driver_name, backend, majors)?;
+    match io.create_device(
+        driver,
+        Some(&device_name),
+        DeviceType::DISK_FILE_SYSTEM,
+        DeviceCharacteristics::empty(),
+        DeviceFlags::BUFFERED_IO,
+        0,
+    ) {
+        Ok(device) => Ok(device.raw()),
+        Err(status) => {
+            io.destroy_driver(driver)
+                .expect("unpublished mounted-volume driver rollback");
+            Err(status)
+        }
+    }
+}
+
+pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
+    use nt_io_manager::{
+        CreateOptions, CreateParameters, ExternalDispatchResult, InformationParameters,
+        IoParameters, ReadWriteParameters, ShareAccess,
+    };
+
+    let Some(device_name) = parse_nt_path(device_path) else {
+        return false;
+    };
+    let io = io_manager_mut();
+    let Some(device) = io.device_id_by_name(&device_name) else {
+        return false;
+    };
+    let client = ClientId(IO_MANAGER_COMPONENT_ID);
+    let name = nt_types::UnicodeString::from_str("reactos\\Fonts\\arial.ttf");
+    let Ok(file) = io.allocate_external_file(
+        client,
+        device,
+        AccessMask::GENERIC_READ,
+        ShareAccess::READ,
+        CreateOptions::empty(),
+        name,
+    ) else {
+        return false;
+    };
+    let result = (|| -> Result<bool, nt_status::NtStatus> {
+        let create = io.build_and_dispatch_external_to_device(
+            client,
+            device,
+            Some(file),
+            0,
+            0,
+            nt_io_abi::major::IRP_MJ_CREATE,
+            IoParameters::Create(CreateParameters {
+                desired_access: AccessMask::GENERIC_READ,
+                share_access: ShareAccess::READ,
+                create_disposition: nt_fs::FILE_OPEN,
+                ..CreateParameters::default()
+            }),
+            0,
+            0,
+            &mut [],
+        )?;
+        if !matches!(create, ExternalDispatchResult::Completed { status: nt_status::NtStatus::SUCCESS, file_context: Some(_), .. }) {
+            return Ok(false);
+        }
+        let mut standard = [0u8; 24];
+        let query = io.build_and_dispatch_external_to_device(
+            client,
+            device,
+            Some(file),
+            0,
+            0,
+            nt_io_abi::major::IRP_MJ_QUERY_INFORMATION,
+            IoParameters::QueryInformation(InformationParameters {
+                info_class: nt_fs::FILE_STANDARD_INFORMATION,
+                length: standard.len() as u32,
+            }),
+            0,
+            standard.len() as u32,
+            &mut standard,
+        )?;
+        if !matches!(query, ExternalDispatchResult::Completed { status: nt_status::NtStatus::SUCCESS, information: 24, .. })
+            || u64::from_le_bytes(standard[8..16].try_into().unwrap()) < 4
+        {
+            return Ok(false);
+        }
+        let mut signature = [0u8; 4];
+        let read = io.build_and_dispatch_external_to_device(
+            client,
+            device,
+            Some(file),
+            0,
+            0,
+            nt_io_abi::major::IRP_MJ_READ,
+            IoParameters::Read(ReadWriteParameters {
+                length: signature.len() as u32,
+                key: 0,
+                offset: 0,
+            }),
+            0,
+            signature.len() as u32,
+            &mut signature,
+        )?;
+        Ok(matches!(read, ExternalDispatchResult::Completed { status: nt_status::NtStatus::SUCCESS, information: 4, .. })
+            && signature == [0, 1, 0, 0])
+    })();
+    let released = io.release_external_file(client, file).is_ok();
+    for _ in 0..3 {
+        if io.file(file).is_none() {
+            break;
+        }
+        io.pump();
+    }
+    result.unwrap_or(false) && released && io.file(file).is_none()
+}
+
 pub(crate) fn driver_id_by_name(path: &str) -> Option<u64> {
     let path = parse_nt_path(path)?;
     io_manager_mut()
