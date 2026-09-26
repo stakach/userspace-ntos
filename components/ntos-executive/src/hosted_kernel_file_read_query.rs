@@ -133,7 +133,7 @@ pub(crate) unsafe fn submit(
             shared: channel.shared_va,
         },
     };
-    submit_captured(channel, packet, packet_length, handle, caller, operation, output, source)
+    submit_captured(channel, packet, packet_length, handle, 0, caller, operation, output, source)
 }
 
 pub(crate) unsafe fn submit_win32k(
@@ -141,6 +141,7 @@ pub(crate) unsafe fn submit_win32k(
     packet: u64,
     packet_length: u64,
     handle: u64,
+    expected_file: u64,
 ) -> Option<i32> {
     let _durable = crate::allocator::enter_durable();
     let caller = match crate::provider_registry_caller::resolve(channel) {
@@ -159,7 +160,7 @@ pub(crate) unsafe fn submit_win32k(
     if !matches!(operation, Operation::Query(_)) {
         return Some(STATUS_INVALID_PARAMETER);
     }
-    submit_captured(channel, packet, packet_length, handle, caller, operation, output,
+    submit_captured(channel, packet, packet_length, handle, expected_file, caller, operation, output,
         PacketSource::Win32k { lease, packet: bytes })
 }
 
@@ -168,6 +169,7 @@ unsafe fn submit_captured(
     packet: u64,
     packet_length: u64,
     handle: u64,
+    expected_file: u64,
     caller: NativeHandleCaller,
     operation: Operation,
     output: Vec<u8>,
@@ -189,6 +191,9 @@ unsafe fn submit_captured(
         match crate::service_sec_image::with_provider_process_manager(|pm| {
             pm.validate_native_handle_caller(caller)?;
             let (file_id, device_id) = pm.lookup_native_routed_file_handle(caller, handle, 0)?;
+            if expected_file != 0 && file_id != expected_file {
+                return Err(STATUS_INVALID_HANDLE as u32);
+            }
             let target = pm.inspect_native_close_target(caller, handle)?;
             if target.object() != (nt_process::HandleObject::RoutedFile { file_id, device_id }) {
                 return Err(STATUS_INVALID_HANDLE as u32);

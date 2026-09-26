@@ -1192,6 +1192,7 @@ pub const W32_FILE_OBJECT_REFERENCE_POINTER: u64 = 2;
 pub const W32_FILE_OBJECT_DEREFERENCE_POINTER: u64 = 3;
 pub const W32_FILE_OBJECT_RELATED_DEVICE: u64 = 4;
 pub const W32_FILE_OBJECT_WAIT_IDENTITY: u64 = 5;
+pub const W32_FILE_OBJECT_DEVICE_NAME: u64 = 6;
 /// Root-authenticated kernel activation handoff before entering provider code.
 pub const W32_KERNEL_ACTIVATION_LABEL: u64 = 0x78E;
 pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
@@ -3606,6 +3607,7 @@ mod directory_object;
 mod file_close;
 mod file_open;
 mod file_query;
+mod file_object_query;
 pub(crate) use object_security::census as object_security_census;
 
 /// Duplicate a handle owned by win32k's USER object table. Native `NtDuplicateObject` calls this
@@ -14376,6 +14378,7 @@ fn register_trampolines() -> bool {
     reg.bind("ZwOpenFile", file_open::open as *const () as usize as u64);
     reg.bind("ZwCreateFile", file_open::create as *const () as usize as u64);
     reg.bind("ZwQueryInformationFile", file_query::query_information as *const () as usize as u64);
+    reg.bind("ZwQueryObject", file_object_query::query_object as *const () as usize as u64);
     reg.bind("ZwOpenKey", s_zw_open_key as usize as u64);
     reg.bind("NtOpenKey", s_nt_open_key as usize as u64);
     reg.bind(

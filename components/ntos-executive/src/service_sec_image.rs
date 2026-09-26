@@ -4490,9 +4490,6 @@ pub(crate) unsafe fn service_win32k_file_query_request(
     handle: u64,
     spare: u64,
 ) -> Option<i32> {
-    if spare != 0 {
-        return Some(nt_process::STATUS_INVALID_PARAMETER as i32);
-    }
     if let Err(status) = authenticate_win32k_service_request(
         channel, reply_cap, badge, mi, (crate::win32k_subsystem::W32_FILE_QUERY_LABEL << 12) | 4,
     ) {
@@ -4501,7 +4498,7 @@ pub(crate) unsafe fn service_win32k_file_query_request(
     if SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) == 0 {
         return Some(0xC000_00A3u32 as i32);
     }
-    crate::driver_launch::service_win32k_file_query(channel, packet, length, handle)
+    crate::driver_launch::service_win32k_file_query(channel, packet, length, handle, spare)
 }
 
 /// Resolve only canonical routed File handles or exact win32k consumer pointer receipts.
@@ -4516,9 +4513,10 @@ pub(crate) unsafe fn service_win32k_file_object_request(
     mode: u64,
 ) -> (i32, u64, u64, u64) {
     use crate::win32k_subsystem::{
-        W32_FILE_OBJECT_DEREFERENCE_POINTER, W32_FILE_OBJECT_LABEL,
-        W32_FILE_OBJECT_REFERENCE_HANDLE, W32_FILE_OBJECT_REFERENCE_POINTER,
-        W32_FILE_OBJECT_RELATED_DEVICE, W32_FILE_OBJECT_WAIT_IDENTITY,
+        W32_FILE_OBJECT_DEREFERENCE_POINTER, W32_FILE_OBJECT_DEVICE_NAME,
+        W32_FILE_OBJECT_LABEL, W32_FILE_OBJECT_REFERENCE_HANDLE,
+        W32_FILE_OBJECT_REFERENCE_POINTER, W32_FILE_OBJECT_RELATED_DEVICE,
+        W32_FILE_OBJECT_WAIT_IDENTITY,
     };
     let caller = match authenticate_win32k_service_request(
         channel, reply_cap, badge, mi, (W32_FILE_OBJECT_LABEL << 12) | 4,
@@ -4563,6 +4561,55 @@ pub(crate) unsafe fn service_win32k_file_object_request(
                 Ok(identity) => (0, identity.file_id().raw(), identity.binding_generation(), 0),
                 Err(status) => (status, 0, 0, 0),
             }
+        }
+        W32_FILE_OBJECT_DEVICE_NAME => {
+            let Ok(length) = usize::try_from(access) else {
+                return (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0);
+            };
+            if length != nt_io_manager::file_object_name::FILE_OBJECT_NAME_SCRATCH_BYTES {
+                return (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0);
+            }
+            let (lease, mut packet) =
+                match crate::win32k_subsystem::capture_provider_pool_packet(object, length) {
+                    Ok(packet) => packet,
+                    Err(status) => return (status as i32, 0, 0, 0),
+                };
+            let target = with_provider_process_manager(|pm| {
+                pm.validate_native_handle_caller(caller)?;
+                let (file_id, device_id) = pm.lookup_native_routed_file_handle(caller, mode, 0)?;
+                let close = pm.inspect_native_close_target(caller, mode)?;
+                if close.object() != (nt_process::HandleObject::RoutedFile { file_id, device_id }) {
+                    return Err(nt_process::STATUS_INVALID_HANDLE);
+                }
+                Ok((file_id, device_id))
+            });
+            let (file_id, device_id) = match target {
+                Ok(target) => target,
+                Err(status) => return (status as i32, 0, 0, 0),
+            };
+            let io = crate::driver_launch::io_manager_mut();
+            let name = match io.file(nt_io_manager::FileId(file_id)) {
+                Some(file) if file.device_id.raw() == device_id => io
+                    .device(file.device_id)
+                    .map(|device| device.name.as_ref().map(|path| path.to_unicode_string())),
+                _ => None,
+            };
+            let Some(name) = name else {
+                return (nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0);
+            };
+            let name = name.as_ref().map_or(&[][..], |name| name.as_units());
+            let required = name.len().saturating_mul(2);
+            if required > length - 4 || required > u16::MAX as usize - 1 {
+                return (0x8000_0005u32 as i32, required as u64, 0, 0);
+            }
+            packet[..4].copy_from_slice(&(required as u32).to_le_bytes());
+            for (index, unit) in name.iter().enumerate() {
+                packet[4 + index * 2..6 + index * 2].copy_from_slice(&unit.to_le_bytes());
+            }
+            if !crate::win32k_subsystem::publish_provider_pool_packet(lease, &packet) {
+                return (nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0);
+            }
+            (0, required as u64, file_id, 0)
         }
         _ => (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0),
     }
