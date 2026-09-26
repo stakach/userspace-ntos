@@ -825,7 +825,7 @@ fn record_layout(class: u32) -> Option<RecordLayout> {
     }
 }
 
-fn fold(value: u16) -> u16 {
+pub(crate) fn fold(value: u16) -> u16 {
     if value <= 0x7f {
         (value as u8).to_ascii_uppercase() as u16
     } else {
