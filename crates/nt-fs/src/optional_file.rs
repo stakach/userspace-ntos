@@ -60,6 +60,19 @@ impl FileSystem {
         let Some(id) = self.optional_relative_node(relative)? else {
             return Ok(None);
         };
+        self.directory_entries_for_node(id).map(Some)
+    }
+
+    /// Snapshot the directory retained by an open File, independent of later path changes.
+    pub fn try_directory_entries_opened(
+        &self,
+        handle: u64,
+    ) -> Result<Vec<DirectoryEntry>, u32> {
+        let id = self.obj(handle).ok_or(STATUS_INVALID_HANDLE)?.node_id;
+        self.directory_entries_for_node(id)
+    }
+
+    fn directory_entries_for_node(&self, id: u64) -> Result<Vec<DirectoryEntry>, u32> {
         let directory = self.volume.node(id).ok_or(STATUS_DATA_ERROR)?;
         if !directory.is_dir {
             return Err(STATUS_NOT_A_DIRECTORY);
@@ -90,7 +103,7 @@ impl FileSystem {
             entry.file_id = target.file_id;
             entries.push(entry);
         }
-        Ok(Some(entries))
+        Ok(entries)
     }
 
     /// Read a complete file by canonical lowercase ASCII volume-relative path without allocating

@@ -147,10 +147,56 @@ pub(crate) unsafe fn run_directory(device_id: u64) -> bool {
                 &mut standard,
                 0,
             )?;
-        Ok(status == 0
-            && information == standard.len() as u64
-            && pending.is_none()
-            && standard[21] == 1)
+        if status != 0
+            || information != standard.len() as u64
+            || pending.is_some()
+            || standard[21] != 1
+        {
+            return Ok(false);
+        }
+        let pattern = UnicodeString::from_str("arial.ttf");
+        let parameters = nt_io_manager::DirectoryQueryParameters {
+            length: 512,
+            information_class: nt_fs::FILE_NAMES_INFORMATION,
+            file_index: 0,
+            pattern: Some(pattern),
+        };
+        let mut entries = [0u8; 512];
+        let query = |flags, entries: &mut [u8; 512]| {
+            crate::driver_launch::dispatch_hosted_file_directory_query_result_exact(
+                file,
+                caller,
+                parameters.clone(),
+                flags,
+                entries,
+            )
+        };
+        let flags = nt_io_manager::StackFlags::RESTART_SCAN
+            | nt_io_manager::StackFlags::RETURN_SINGLE_ENTRY;
+        let (status, information, pending) = query(flags, &mut entries)?;
+        let expected: Vec<u16> = "arial.ttf".encode_utf16().collect();
+        let actual_len = u32::from_le_bytes(entries[8..12].try_into().unwrap()) as usize;
+        if status != 0
+            || pending.is_some()
+            || actual_len != expected.len() * 2
+            || information < (12 + actual_len) as u64
+            || entries[12..12 + actual_len]
+                .chunks_exact(2)
+                .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+                .collect::<Vec<_>>()
+                != expected
+        {
+            return Ok(false);
+        }
+        let (status, information, pending) = query(
+            nt_io_manager::StackFlags::RETURN_SINGLE_ENTRY,
+            &mut entries,
+        )?;
+        if status as u32 != nt_fs::STATUS_NO_MORE_FILES || information != 0 || pending.is_some() {
+            return Ok(false);
+        }
+        let (status, information, pending) = query(flags, &mut entries)?;
+        Ok(status == 0 && information >= (12 + actual_len) as u64 && pending.is_none())
     })()
     .unwrap_or(false);
     let released = crate::driver_launch::release_hosted_file(file).is_ok();

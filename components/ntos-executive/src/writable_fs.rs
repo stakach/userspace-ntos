@@ -1287,6 +1287,18 @@ pub(crate) unsafe fn query_metadata_relative(
     Ok(info)
 }
 
+pub(crate) unsafe fn directory_entries_relative(
+    relative: &[u8],
+) -> Result<Option<alloc::vec::Vec<nt_fs::DirectoryEntry>>, u32> {
+    writable_fs()?.try_directory_entries_relative(relative)
+}
+
+pub(crate) unsafe fn directory_entries_opened(
+    file_id: u64,
+) -> Result<alloc::vec::Vec<nt_fs::DirectoryEntry>, u32> {
+    writable_fs()?.try_directory_entries_opened(file_id)
+}
+
 pub(crate) unsafe fn query_metadata_relative_to_directory(
     root_file_id: u64,
     relative: &[u8],
