@@ -81,6 +81,11 @@ fn build_dispatch_request(
     target: HostedDomainIdentity,
     provider: Option<HostedProviderIdentity>,
 ) -> Result<IrpDispatchRequest, NtStatus> {
+    // A hosted WDM query needs a driver-domain UNICODE_STRING/FileName allocation. The kernel
+    // backend owns the captured pattern directly; do not drop it from a peer wire request.
+    if matches!(&irp.parameters, crate::irp::IoParameters::QueryDirectory(_)) {
+        return Err(NtStatus::NOT_SUPPORTED);
+    }
     let mut cursor = u32::try_from(core::mem::size_of::<IrpDispatchRequest>())
         .map_err(|_| NtStatus::INVALID_PARAMETER)?;
     let (buffer_offset, buffer_len) = segment(&mut cursor, ctx.system_buffer.len())?;
@@ -772,6 +777,25 @@ mod initial_information_tests {
         let mut bytes = [0; 104];
         let context = DispatchContext::new(irp.driver_id, ClientId(1), &mut bytes);
         build_dispatch_request(&irp, &context, target(), None).unwrap()
+    }
+
+    #[test]
+    fn hosted_peer_refuses_directory_query_until_pattern_has_a_wire_representation() {
+        let mut irp = projection();
+        irp.major = major::IRP_MJ_DIRECTORY_CONTROL;
+        irp.minor = crate::IRP_MN_QUERY_DIRECTORY;
+        irp.parameters = IoParameters::QueryDirectory(crate::DirectoryQueryParameters {
+            length: 104,
+            information_class: nt_fs::FILE_BOTH_DIRECTORY_INFORMATION,
+            file_index: 7,
+            pattern: Some(nt_types::UnicodeString::from_str("*.dll")),
+        });
+        let mut output = [0; 104];
+        let context = DispatchContext::new(irp.driver_id, ClientId(1), &mut output);
+        assert_eq!(
+            build_dispatch_request(&irp, &context, target(), None),
+            Err(NtStatus::NOT_SUPPORTED)
+        );
     }
 
     #[test]

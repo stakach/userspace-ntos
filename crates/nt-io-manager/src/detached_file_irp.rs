@@ -368,6 +368,7 @@ fn validate_buffers(
         | IoParameters::QueryVolumeInformation(_)
         | IoParameters::SetVolumeInformation(_)
         | IoParameters::LockControl(_)
+        | IoParameters::QueryDirectory(_)
         | IoParameters::NotifyDirectory(_) => true,
         _ => false,
     };

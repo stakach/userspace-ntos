@@ -126,7 +126,8 @@ pub use device_property_transfer::{
     HostedDevicePropertyTransferTable,
 };
 pub use directory_control::{
-    directory_notify_access_granted, valid_directory_notify_parameters, DirectoryNotifyParameters,
+    directory_notify_access_granted, valid_directory_notify_parameters,
+    valid_directory_query_parameters, DirectoryNotifyParameters, DirectoryQueryParameters,
     IRP_MN_NOTIFY_CHANGE_DIRECTORY, IRP_MN_QUERY_DIRECTORY, SL_WATCH_TREE,
 };
 pub use dispatch::{
@@ -723,6 +724,9 @@ impl<P> IoManager<P> {
                     IoParameters::NotifyDirectory(_) => {
                         location.minor = crate::IRP_MN_NOTIFY_CHANGE_DIRECTORY
                     }
+                    IoParameters::QueryDirectory(_) => {
+                        location.minor = crate::IRP_MN_QUERY_DIRECTORY
+                    }
                     _ => {}
                 }
             }
@@ -762,6 +766,9 @@ impl<P> IoManager<P> {
                 IoParameters::LockControl(parameters) => location.minor = parameters.minor,
                 IoParameters::NotifyDirectory(_) => {
                     location.minor = crate::IRP_MN_NOTIFY_CHANGE_DIRECTORY
+                }
+                IoParameters::QueryDirectory(_) => {
+                    location.minor = crate::IRP_MN_QUERY_DIRECTORY
                 }
                 _ => {}
             }
@@ -7515,6 +7522,86 @@ mod tests {
         assert_eq!(request.flags as u8, SL_WATCH_TREE);
         assert_eq!(request.ioctl_code, 0x53);
         assert_eq!((request.input_len, request.output_len), (0, 96));
+    }
+
+    #[test]
+    fn query_directory_retains_minor_flags_pattern_and_index() {
+        let mut om = io();
+        let client = om.register_client();
+        let driver = a_driver(&mut om);
+        let device = a_device(&mut om, driver);
+        let query = DirectoryQueryParameters {
+            length: 128,
+            information_class: nt_fs::FILE_BOTH_DIRECTORY_INFORMATION,
+            file_index: 7,
+            pattern: Some(nt_types::UnicodeString::from_str("*.dll")),
+        };
+        let record = om
+            .build_irp_record(
+                client,
+                driver,
+                device,
+                Some(FileId(42)),
+                major::IRP_MJ_DIRECTORY_CONTROL,
+                IoParameters::QueryDirectory(query.clone()),
+            )
+            .unwrap();
+        assert_eq!(record.origin_minor, IRP_MN_QUERY_DIRECTORY);
+        let mut projection = IrpProjection::from_record(&record).unwrap();
+        projection.flags = StackFlags::RESTART_SCAN | StackFlags::RETURN_SINGLE_ENTRY;
+        assert_eq!(projection.minor, IRP_MN_QUERY_DIRECTORY);
+        assert_eq!(projection.parameters, IoParameters::QueryDirectory(query.clone()));
+        assert_eq!(projection.parameters.buffered_lengths(128), (0, 128));
+        assert_eq!(
+            crate::external_dispatch::validate_external_parameter_layout(
+                projection.major,
+                &projection.parameters,
+                projection.flags,
+                0,
+                128,
+                128,
+            ),
+            Ok(())
+        );
+        for (flags, input, output, capacity) in [
+            (StackFlags::empty(), 2, 128, 128),
+            (StackFlags::empty(), 0, 127, 128),
+            (StackFlags::empty(), 0, 128, 127),
+        ] {
+            assert_eq!(
+                crate::external_dispatch::validate_external_parameter_layout(
+                    projection.major,
+                    &projection.parameters,
+                    flags,
+                    input,
+                    output,
+                    capacity,
+                ),
+                Err(NtStatus::INVALID_PARAMETER)
+            );
+        }
+        assert_eq!(
+            crate::external_dispatch::validate_external_parameter_layout(
+                projection.major,
+                &projection.parameters,
+                StackFlags::CASE_SENSITIVE,
+                0,
+                128,
+                128,
+            ),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            crate::external_dispatch::validate_external_parameter_layout(
+                major::IRP_MJ_READ,
+                &projection.parameters,
+                StackFlags::empty(),
+                0,
+                128,
+                128,
+            ),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
     }
 
     #[test]

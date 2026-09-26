@@ -178,6 +178,17 @@ pub(crate) fn validate_external_parameter_layout(
                 return Err(NtStatus::INVALID_PARAMETER);
             }
         }
+        IoParameters::QueryDirectory(parameters) => {
+            if major != nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL
+                || input_len != 0
+                || output_len != parameters.length
+                || system_buffer_len != parameters.length as usize
+                || stack_flags.bits() & !0x07 != 0
+                || !crate::valid_directory_query_parameters(parameters)
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+        }
         _ if major == nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL => {
             return Err(NtStatus::INVALID_PARAMETER)
         }
