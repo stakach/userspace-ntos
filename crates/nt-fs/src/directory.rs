@@ -825,6 +825,11 @@ fn record_layout(class: u32) -> Option<RecordLayout> {
     }
 }
 
+/// Minimum caller buffer length for a supported NT directory information class.
+pub fn directory_query_minimum_length(class: u32) -> Option<usize> {
+    record_layout(class).map(|layout| layout.minimum_size)
+}
+
 pub(crate) fn fold(value: u16) -> u16 {
     if value <= 0x7f {
         (value as u8).to_ascii_uppercase() as u16
@@ -1228,6 +1233,7 @@ mod tests {
             (FILE_ID_BOTH_DIRECTORY_INFORMATION, 104, 112),
             (FILE_ID_FULL_DIRECTORY_INFORMATION, 80, 88),
         ] {
+            assert_eq!(directory_query_minimum_length(class), Some(minimum));
             let mut state = DirectoryQueryState::new();
             let mut output = [0u8; 128];
             let result = query_directory(&mut state, &[item], class, true, None, true, &mut output);
@@ -1244,6 +1250,7 @@ mod tests {
                 b'x' as u16
             );
         }
+        assert_eq!(directory_query_minimum_length(u32::MAX), None);
     }
 
     #[test]

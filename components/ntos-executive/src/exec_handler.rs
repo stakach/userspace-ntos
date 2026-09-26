@@ -18,6 +18,9 @@ mod file_capture;
 #[path = "exec_file_query.rs"]
 mod file_query;
 
+#[path = "exec_file_directory_query.rs"]
+mod file_directory_query;
+
 #[path = "exec_file_set_information.rs"]
 mod file_set_information;
 
@@ -37809,6 +37812,30 @@ impl ExecNtHandler {
                         args[7],
                     );
                     return STATUS_ACCESS_VIOLATION;
+                }
+
+                let Some(minimum) = nt_fs::directory_query_minimum_length(information_class) else {
+                    return nt_fs::STATUS_INVALID_INFO_CLASS;
+                };
+                if length < minimum {
+                    return nt_fs::STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let capture = match self.capture_hosted_file_unless_local_with_access(
+                    args[0],
+                    nt_io_manager::directory_notify_access_granted,
+                ) {
+                    Ok(capture) => capture,
+                    Err(status) => return status,
+                };
+                if let Some(capture) = capture {
+                    return self.query_hosted_file_directory(
+                        args,
+                        length,
+                        information_class,
+                        return_single_entry,
+                        restart_scan,
+                        &capture,
+                    );
                 }
 
                 let pid = match self.pm_pid_for_pi(self.pi) {
