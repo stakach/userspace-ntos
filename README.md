@@ -68,9 +68,10 @@ Windows 7 export test requires a locally supplied `references/ntdll.dll`:
 `cargo test -p nt-pe-loader --test ntdll_exports -- --ignored`.
 Native builds and end-to-end CI are separate follow-ups, not covered by these specs.
 The local `tests/native/mup_provider/run_kernel_only.sh` gate checks real
-cross-domain driver READ and FLUSH requests, including immediate and pending
-completion through the source driver's completion event and IOSB. READ also
-checks exact payload bytes; FLUSH checks zero completion information.
+cross-domain driver READ, FLUSH, and buffered QUERY_INFORMATION requests,
+including immediate and pending completion through the source driver's event
+and IOSB. READ and QUERY_INFORMATION check exact output bytes; FLUSH checks
+zero completion information.
 
 The kernel is a **pinned git submodule**, not vendored source: `userspace-ntos`
 depends on an exact kernel SHA (its syscall/invocation ABI is tightly coupled),

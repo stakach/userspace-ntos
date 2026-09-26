@@ -28,7 +28,7 @@ python3 scripts/run_with_timeout.py \
   --failure-file "$RUN_LOG" \
   --failure-text '[provider-bugcheck] terminal' \
   --completion-file "$RUN_LOG" \
-  --completion-text '[flush-forward-verified-1]' \
+  --completion-text '[query-forward-verified-1]' \
   --completion-grace-seconds 15 \
   -- ./scripts/run_specs.sh 2>&1 | tee -a "$RUN_LOG"
 rc=${PIPESTATUS[0]}
@@ -39,16 +39,18 @@ if [ "$rc" != 0 ] && [ "$rc" != 3 ]; then
   exit 1
 fi
 # An accepted MUP query requires completed provider registration; the long
-# registration DbgPrint can be interleaved with timer output on serial.
+# registration DbgPrint can be interleaved with timer output on serial. Source
+# completion records are authoritative when an individual provider trace is split.
 if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || grep -Fq '[win32k-import] reject image' "$RUN_LOG" \
    || grep -Fq '!@src/component_scheduler.rs:' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-query\] count=[1-9][0-9]* accepted=[1-9][0-9]* .*security=1' "$RUN_LOG" \
-   || ! grep -Eq '\[mup-provider-create\] probe-file created=[1-9][0-9]*' "$RUN_LOG" \
-   || ! grep -Eq '\[mup-provider-write\] count=[1-9][0-9]* bytes=10' "$RUN_LOG" \
+   || { ! grep -Eq '\[mup-provider-create\] probe-file created=[1-9][0-9]*' "$RUN_LOG" \
+        && ! grep -Eq '\[mup-provider-probe\] status=0x00000000 .*file-created=[1-9][0-9]* cleaned=[1-9][0-9]* closed=[1-9][0-9]*' "$RUN_LOG"; } \
    || ! grep -Eq '\[mup-provider-write-result\] status=0x00000000 info=10' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-read\] count=[1-9][0-9]* bytes=10' "$RUN_LOG" \
-   || ! grep -Fq '[read-forward-verified-0]' "$RUN_LOG" \
+   || { ! grep -Fq '[read-forward-result] offset=0 call=0x00000000 wait=0x00000000 status=0x00000000 iosb=0x00000000 info=10 bytes-match=1' "$RUN_LOG" \
+        && ! grep -Fq '[read-forward-verified-0]' "$RUN_LOG"; } \
    || ! grep -Fq '[mup-provider-read-pending-dispatch] status=0x00000103' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-read-pending-complete\] count=[1-9][0-9]* bytes=20' "$RUN_LOG" \
    || ! grep -Fq '[read-forward-verified-1]' "$RUN_LOG" \
@@ -59,10 +61,17 @@ if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || ! grep -Fq '[mup-provider-flush-pending-complete] count=2' "$RUN_LOG" \
    || ! grep -Fq '[flush-forward-verified-1]' "$RUN_LOG" \
    || [ "$(grep -Fc '[mup-provider-flush-pending-complete]' "$RUN_LOG")" -ne 1 ] \
-   || ! grep -Eq '\[mup-provider-cleanup\] probe-file cleaned=[1-9][0-9]*' "$RUN_LOG" \
-   || ! grep -Eq '\[mup-provider-close\] probe-file closed=[1-9][0-9]*' "$RUN_LOG"; then
-  echo "Mup/provider registration, query, immediate/pending READ and FLUSH, WRITE, and File lifecycle proof incomplete: $RUN_LOG" >&2
+   || ! grep -Fq '[mup-provider-query-file] count=1 class=5 bytes=24' "$RUN_LOG" \
+   || ! grep -Fq '[query-forward-verified-0]' "$RUN_LOG" \
+   || ! grep -Fq '[mup-provider-query-file-pending-dispatch] status=0x00000103' "$RUN_LOG" \
+   || ! grep -Fq '[mup-provider-query-file-pending-complete] count=2 bytes=24' "$RUN_LOG" \
+   || ! grep -Fq '[query-forward-verified-1]' "$RUN_LOG" \
+   || [ "$(grep -Fc '[mup-provider-query-file-pending-complete]' "$RUN_LOG")" -ne 1 ] \
+   || { ! grep -Eq '\[mup-provider-probe\] status=0x00000000 .*file-created=[1-9][0-9]* cleaned=[1-9][0-9]* closed=[1-9][0-9]*' "$RUN_LOG" \
+        && { ! grep -Eq '\[mup-provider-cleanup\] probe-file cleaned=[1-9][0-9]*' "$RUN_LOG" \
+             || ! grep -Eq '\[mup-provider-close\] probe-file closed=[1-9][0-9]*' "$RUN_LOG"; }; }; then
+  echo "Mup/provider registration, query, immediate/pending READ, FLUSH and QUERY_INFORMATION, WRITE, and File lifecycle proof incomplete: $RUN_LOG" >&2
   exit 1
 fi
 
-echo "Mup/provider registration, query, File WRITE, immediate/pending cross-domain READ and FLUSH, and CREATE/CLEANUP/CLOSE verified: $RUN_LOG"
+echo "Mup/provider registration, query, File WRITE, immediate/pending cross-domain READ, FLUSH and QUERY_INFORMATION, and CREATE/CLEANUP/CLOSE verified: $RUN_LOG"
