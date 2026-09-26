@@ -27,6 +27,7 @@ pub(crate) fn register_mounted_volume(fs: crate::Fat32) -> Result<(u64, bool), N
             nt_io_abi::major::IRP_MJ_READ,
             nt_io_abi::major::IRP_MJ_WRITE,
             nt_io_abi::major::IRP_MJ_QUERY_INFORMATION,
+            nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL,
             nt_io_abi::major::IRP_MJ_CLEANUP,
             nt_io_abi::major::IRP_MJ_CLOSE,
         ],

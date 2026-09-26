@@ -59884,6 +59884,67 @@ pub(crate) unsafe fn dispatch_hosted_file_irp_result_exact(
     )
 }
 
+/// Submit a typed directory query for an exact canonical File to a kernel-mounted provider.
+/// The peer transport does not yet encode this IRP shape.
+pub(crate) unsafe fn dispatch_hosted_file_directory_query_result_exact(
+    file_id: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
+    parameters: nt_io_manager::DirectoryQueryParameters,
+    flags: StackFlags,
+    out: &mut [u8],
+) -> Result<(i32, u64, Option<IrpId>), u32> {
+    if parameters.length as usize != out.len() {
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let canonical_file_id = FileId(file_id);
+    let device_id = io_manager_mut()
+        .file(canonical_file_id)
+        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
+        .map(|file| file.device_id.raw())
+        .ok_or(STATUS_INVALID_HANDLE as u32)?;
+    require_file_device_ready_for_dispatch(device_id)?;
+    if registered_file_target(device_id, major::IRP_MJ_DIRECTORY_CONTROL)?
+        != RegisteredFileTarget::Kernel
+    {
+        return Err(nt_status::NtStatus::NOT_SUPPORTED.raw() as u32);
+    }
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(out.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32)?;
+    buffer.resize(out.len(), 0);
+    let result = io_manager_mut()
+        .build_and_dispatch_external_to_device_with_stack_flags(
+            ClientId(IO_MANAGER_COMPONENT_ID),
+            nt_io_manager::DeviceId(device_id),
+            Some(canonical_file_id),
+            0,
+            u64::from(caller.original_thread().thread_id()),
+            major::IRP_MJ_DIRECTORY_CONTROL,
+            IoParameters::QueryDirectory(parameters),
+            flags,
+            0,
+            out.len() as u32,
+            &mut buffer,
+        )
+        .map_err(|status| status.raw() as u32)?;
+    Ok(match result {
+        nt_io_manager::ExternalDispatchResult::Completed {
+            status,
+            information,
+            ..
+        } => {
+            let copied = nt_io_manager::completion_output_transfer_len(information, out.len() as u64)
+                as usize;
+            out[..copied].copy_from_slice(&buffer[..copied]);
+            (status.raw(), information, None)
+        }
+        nt_io_manager::ExternalDispatchResult::Pending { irp_id } => {
+            (STATUS_PENDING as i32, 0, Some(irp_id))
+        }
+    })
+}
+
 /// Dispatch READ/WRITE with the captured byte offset and lock key preserved in the canonical IRP.
 pub(crate) unsafe fn dispatch_hosted_file_read_write_irp_result_exact(
     file_id: u64,

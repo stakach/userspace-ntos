@@ -155,6 +155,36 @@ fn relative_directory_snapshot_distinguishes_absence_file_and_live_children() {
 }
 
 #[test]
+fn opened_directory_snapshot_keeps_its_node_after_rename_and_path_replacement() {
+    let mut fs = fs();
+    assert!(fs.provision_file(PRIMARY, b"old"));
+    let opened = fs.zw_create_file(
+        r"\??\C:\Config",
+        FILE_LIST_DIRECTORY | DELETE,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(opened.status, STATUS_SUCCESS);
+    let moved: Vec<u8> = "Moved".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    assert_eq!(
+        fs.zw_rename_file(opened.handle, FileRenameRoot::SourceParent, &moved, false),
+        STATUS_SUCCESS
+    );
+    assert!(fs.provision_directory(r"\??\C:\Config"));
+    assert!(fs.provision_file(r"\??\C:\Config\New", b"new"));
+    let entries = fs.try_directory_entries_opened(opened.handle).unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[2].name(), &"Hive".encode_utf16().collect::<Vec<_>>());
+    assert_eq!(fs.zw_close(opened.handle), STATUS_SUCCESS);
+    assert_eq!(
+        fs.try_directory_entries_opened(opened.handle),
+        Err(STATUS_INVALID_HANDLE)
+    );
+}
+
+#[test]
 fn relative_queries_reject_non_directory_ancestors_instead_of_falling_through() {
     let mut fs = fs();
     assert!(fs.provision_file(PRIMARY, b"data"));
