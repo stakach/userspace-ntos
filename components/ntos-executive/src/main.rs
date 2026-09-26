@@ -27642,6 +27642,7 @@ struct Fat32 {
     dma_vaddr: u64,
     dma_paddr: u64,
     scratch_vaddr: u64,
+    partition_guid: [u8; 16],
     volume_start_lba: u64,
     snapshot_start_lba: u64,
     bps: u32,           // bytes per sector

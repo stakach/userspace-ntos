@@ -1527,12 +1527,13 @@ pub(crate) unsafe fn fat32_mount_with_census(
     read_disk_sector_into(ahci_vaddr, dma_vaddr, dma_paddr, esp.first_lba, &mut sector)?;
     let geometry = nt_fs::Fat32Geometry::parse(&sector, partition_sectors).ok()?;
     let snapshot_start_lba = header.disk_sectors()?;
-    Some(Fat32 {
+    let mounted = Fat32 {
         census,
         ahci_vaddr,
         dma_vaddr,
         dma_paddr,
         scratch_vaddr: dma_vaddr + FAT32_SCRATCH_OFFSET,
+        partition_guid: esp.unique_guid,
         volume_start_lba: esp.first_lba,
         snapshot_start_lba,
         bps: geometry.bytes_per_sector,
@@ -1544,7 +1545,11 @@ pub(crate) unsafe fn fat32_mount_with_census(
         fat_start: geometry.fat_start_sector,
         data_start: geometry.data_start_sector,
         root_cl: geometry.root_cluster,
-    })
+    };
+    print_str(b"[fat-mount] partition-guid=");
+    print_str(&nt_fs::format_gpt_guid(mounted.partition_guid));
+    print_str(b"\n");
+    Some(mounted)
 }
 
 pub(crate) unsafe fn fat32_mount(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64) -> Option<Fat32> {

@@ -64,6 +64,24 @@ impl GptPartition {
     }
 }
 
+/// Render a GPT on-disk GUID in canonical Windows text order without allocation.
+pub fn format_gpt_guid(guid: [u8; 16]) -> [u8; 36] {
+    const ORDER: [usize; 16] = [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15];
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = [0u8; 36];
+    let mut out = 0;
+    for (index, byte) in ORDER.into_iter().map(|index| guid[index]).enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            text[out] = b'-';
+            out += 1;
+        }
+        text[out] = HEX[(byte >> 4) as usize];
+        text[out + 1] = HEX[(byte & 0xf) as usize];
+        out += 2;
+    }
+    text
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GptCrc32(u32);
 
@@ -261,7 +279,8 @@ pub fn parse_gpt_partition_entry(
         last_lba: le_u64(bytes, 40)?,
         attributes: le_u64(bytes, 48)?,
     };
-    if partition.first_lba < header.first_usable_lba
+    if partition.unique_guid == [0; 16]
+        || partition.first_lba < header.first_usable_lba
         || partition.last_lba > header.last_usable_lba
         || partition.first_lba > partition.last_lba
     {
@@ -338,11 +357,34 @@ mod tests {
         let partition = parse_gpt_partition_entry(&entry, header).unwrap().unwrap();
         assert!(partition.is_efi_system_partition());
         assert_eq!(partition.sector_count(), Some(1024));
+        assert_eq!(partition.unique_guid, [7; 16]);
+
+        entry[16..32].fill(0);
+        assert_eq!(
+            parse_gpt_partition_entry(&entry, header),
+            Err(GptError::InvalidEntry)
+        );
+        entry[16..32].copy_from_slice(&[7; 16]);
 
         entry[40..48].copy_from_slice(&4090u64.to_le_bytes());
         assert_eq!(
             parse_gpt_partition_entry(&entry, header),
             Err(GptError::InvalidEntry)
+        );
+    }
+
+    #[test]
+    fn formats_gpt_guid_in_windows_text_order() {
+        assert_eq!(
+            format_gpt_guid(EFI_SYSTEM_PARTITION_GUID),
+            *b"c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+        );
+        assert_eq!(
+            format_gpt_guid([
+                0xd5, 0x9e, 0xcf, 0x5c, 0x8d, 0xe1, 0xc4, 0x42,
+                0x3a, 0x12, 0xb4, 0x0b, 0xd6, 0xa3, 0x18, 0x5b,
+            ]),
+            *b"5ccf9ed5-e18d-42c4-3a12-b40bd6a3185b"
         );
     }
 
