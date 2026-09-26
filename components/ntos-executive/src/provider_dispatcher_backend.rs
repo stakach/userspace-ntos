@@ -6,13 +6,16 @@ use nt_user_host::provider_dispatcher_backend::{
     ProviderDispatcherObjects, ProviderEventBacking,
 };
 
-pub(crate) struct NativeEventBacking<'a>(pub &'a mut [ObjEntry]);
+pub(crate) struct NativeEventBacking<'a> {
+    pub objects: &'a mut [ObjEntry],
+    pub file_completion: Option<&'a mut ExecFileCompletion>,
+}
 
 impl ProviderEventBacking for NativeEventBacking<'_> {
     fn is_live_event(&self, native_identity: u64) -> bool {
         usize::try_from(native_identity)
             .ok()
-            .and_then(|index| self.0.get(index))
+            .and_then(|index| self.objects.get(index))
             .is_some_and(|entry| entry.is_live() && entry.kind == OBJ_KIND_EVENT)
     }
 
@@ -21,7 +24,36 @@ impl ProviderEventBacking for NativeEventBacking<'_> {
         events: &mut nt_kernel_exec::EventStore,
         retired: nt_kernel_exec::RetiredEventObject,
     ) {
-        finalize_retired_event(self.0, events, retired);
+        finalize_retired_event(self.objects, events, retired);
+    }
+
+    fn acquire_file_wait(
+        &mut self,
+        owner: nt_provider_wait::ProviderWaitOwner,
+        object: nt_provider_wait::ProviderWaitObject,
+        process: Option<nt_kernel_exec::EventObjectOwner>,
+    ) -> Result<u64, u32> {
+        if process.is_none() {
+            return Err(0xC000_000D);
+        }
+        crate::provider_file_wait::acquire(
+            owner,
+            object,
+            self.file_completion.as_deref_mut().ok_or(0xC000_000Du32)?,
+        )
+    }
+
+    fn file_wait_is_ready(&self, lease: u64) -> bool {
+        self.file_completion.as_deref().is_some_and(|files| {
+            crate::provider_file_wait::is_ready(lease, files)
+        })
+    }
+
+    fn release_file_wait(&mut self, lease: u64) {
+        crate::provider_file_wait::release(
+            lease,
+            self.file_completion.as_deref_mut().expect("File wait has no completion owner"),
+        );
     }
 
     fn lease_acquired(&mut self) {
@@ -68,7 +100,10 @@ impl ExecNtHandler {
             events: &mut self.events,
             event_objects: &mut self.event_objects,
             timers: self.provider_timers.as_mut(),
-            backing: NativeEventBacking(&mut self.obj_ns),
+            backing: NativeEventBacking {
+                objects: &mut self.obj_ns,
+                file_completion: Some(&mut self.file_completion),
+            },
             access,
         }
     }
@@ -108,6 +143,9 @@ impl nt_provider_wait::ProviderDispatcherWaitBackend for ExecNtHandler {
     }
 
     fn dispatcher_is_ready(&self, lease: Self::Lease) -> bool {
+        if let ProviderDispatcherLease::File(token) = lease {
+            return crate::provider_file_wait::is_ready(token, &self.file_completion);
+        }
         dispatcher_lease_is_ready(
             &self.event_objects,
             &self.events,

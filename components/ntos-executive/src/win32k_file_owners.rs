@@ -5,6 +5,7 @@ use core::ptr::{addr_of, addr_of_mut};
 
 use nt_io_manager::{
     consumer_file_projection::ConsumerFileProjection, DeviceId, FileId, HostedFileIdentity,
+    WDM_X64_FILE_OBJECT_EVENT_OFFSET, WDM_X64_FILE_OBJECT_EVENT_SIGNAL_STATE_OFFSET,
     WDM_X64_FILE_OBJECT_SIZE,
 };
 use nt_process::{
@@ -55,6 +56,70 @@ unsafe fn id_for_address(address: u64) -> Option<u64> {
 
 pub(crate) unsafe fn quiescent() -> bool {
     rows().is_empty()
+}
+
+/// The embedded notification Event is not an independently allocated Event object. A provider
+/// wait may name it only through an exact, referenced File projection.
+pub(crate) unsafe fn wait_identity_for_event(event: u64) -> Result<HostedFileIdentity, i32> {
+    let id = rows()
+        .iter()
+        .find(|row| {
+            row.address.checked_add(WDM_X64_FILE_OBJECT_EVENT_OFFSET as u64) == Some(event)
+                && row.address != 0
+        })
+        .map(|row| row.id)
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    wait_identity_for_row(id)
+}
+
+pub(crate) unsafe fn wait_identity_for_canonical(
+    file_id: u64,
+    binding_generation: u64,
+) -> Result<HostedFileIdentity, i32> {
+    let id = rows()
+        .iter()
+        .find(|row| {
+            row.identity.is_some_and(|identity| {
+                identity.file_id().raw() == file_id
+                    && identity.binding_generation() == binding_generation
+            })
+        })
+        .map(|row| row.id)
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    wait_identity_for_row(id)
+}
+
+unsafe fn wait_identity_for_row(id: u64) -> Result<HostedFileIdentity, i32> {
+    let row = row(id).ok_or(STATUS_INVALID_HANDLE)?;
+    if row.phase == Phase::Building {
+        return Err(STATUS_INVALID_HANDLE);
+    }
+    let identity = row.identity.ok_or(STATUS_INVALID_HANDLE)?;
+    let projection = row.projection.as_ref().ok_or(STATUS_INVALID_HANDLE)?;
+    if projection.pointer_reference_count() == 0
+        || io_manager_mut()
+            .hosted_file_identity_at(identity.domain(), identity.file_id(), identity.address())
+            .map_err(|status| status.raw())?
+            != Some(identity)
+    {
+        return Err(STATUS_INVALID_HANDLE);
+    }
+    Ok(identity)
+}
+
+/// Keep the visible WDM Event header coherent with the canonical completion table. Wait
+/// admission and selection never trust this field as authority.
+pub(crate) unsafe fn sync_event_signal(file_id: u64, signaled: bool) {
+    for row in rows().iter() {
+        if row.address != 0
+            && row.identity.is_some_and(|identity| identity.file_id().raw() == file_id)
+            && row.projection.is_some()
+        {
+            let state = (row.address + WDM_X64_FILE_OBJECT_EVENT_SIGNAL_STATE_OFFSET as u64)
+                as *const core::sync::atomic::AtomicI32;
+            (*state).store(i32::from(signaled), core::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 unsafe fn build(id: u64) -> Result<(), i32> {

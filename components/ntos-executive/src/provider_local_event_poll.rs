@@ -19,7 +19,10 @@ impl LocalEventState<'_> {
             events: self.events,
             event_objects: self.event_objects,
             timers: None,
-            backing: NativeEventBacking(self.obj_ns),
+            backing: NativeEventBacking {
+                objects: self.obj_ns,
+                file_completion: None,
+            },
             access: Some(access),
         };
         arbiter

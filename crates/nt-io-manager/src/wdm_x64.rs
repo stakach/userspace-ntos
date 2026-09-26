@@ -14,6 +14,8 @@ pub const WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET: usize = 0x70;
 
 pub const WDM_X64_DEVICE_OBJECT_SIZE: usize = 0x150;
 pub const WDM_X64_FILE_OBJECT_SIZE: usize = 0x100;
+pub const WDM_X64_FILE_OBJECT_EVENT_OFFSET: usize = 0x98;
+pub const WDM_X64_FILE_OBJECT_EVENT_SIGNAL_STATE_OFFSET: usize = 0x9c;
 pub const WDM_X64_IRP_SIZE: usize = 0x120;
 pub const WDM_X64_IO_STACK_LOCATION_SIZE: usize = 0x48;
 
@@ -284,7 +286,7 @@ pub fn write_wdm_file_object(
     if flags & 0x0000_0002 != 0 {
         write_file_event(bytes, 0x80, init.file_object_address, 1);
     }
-    write_file_event(bytes, 0x98, init.file_object_address, 0);
+    write_file_event(bytes, WDM_X64_FILE_OBJECT_EVENT_OFFSET, init.file_object_address, 0);
     Ok(())
 }
 

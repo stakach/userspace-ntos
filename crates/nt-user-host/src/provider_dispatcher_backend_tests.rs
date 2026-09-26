@@ -22,6 +22,9 @@ const PROVIDER: ProviderDomainIdentity = ProviderDomainIdentity {
 #[derive(Default)]
 struct Backing {
     live: bool,
+    file_ready: bool,
+    file_leases: usize,
+    file_releases: usize,
     acquired: usize,
     released: usize,
     retired: usize,
@@ -37,6 +40,33 @@ impl ProviderEventBacking for Backing {
         assert!(events.remove_existing(retired.native_identity));
         self.live = false;
         self.retired += 1;
+    }
+
+    fn acquire_file_wait(
+        &mut self,
+        owner: ProviderWaitOwner,
+        object: ProviderWaitObject,
+        process: Option<EventObjectOwner>,
+    ) -> Result<u64, u32> {
+        if owner != self::owner()
+            || object != ProviderWaitObject::new(ProviderWaitObjectType::File, 401, 2)
+            || process != Some(EventObjectOwner::new(42, 4))
+        {
+            return Err(INVALID_PARAMETER);
+        }
+        self.file_leases += 1;
+        Ok(401)
+    }
+
+    fn file_wait_is_ready(&self, lease: u64) -> bool {
+        assert_eq!(lease, 401);
+        self.file_ready
+    }
+
+    fn release_file_wait(&mut self, lease: u64) {
+        assert_eq!(lease, 401);
+        assert!(self.file_releases < self.file_leases);
+        self.file_releases += 1;
     }
 
     fn lease_acquired(&mut self) {
@@ -335,6 +365,78 @@ fn selector_scope_reuses_lease_and_retires_backing_only_after_last_release() {
         Err(EventObjectError::StaleObject)
     );
     assert_eq!(objects.backing.released, 2);
+}
+
+#[test]
+fn file_wait_requires_backing_admission_and_releases_without_consuming_signal() {
+    let mut state = DispatcherState::new(1, 1);
+    let file = ProviderWaitObject::new(ProviderWaitObjectType::File, 401, 2);
+    let access = ProviderDispatcherAccess::hosted(owner(), 42).unwrap();
+    let mut objects = backend(&mut state, Some(access));
+    assert_eq!(
+        objects.acquire_dispatcher_wait(
+            owner(),
+            ProviderWaitObject::new(ProviderWaitObjectType::File, 401, 3)
+        ),
+        Err(INVALID_PARAMETER)
+    );
+    assert_eq!(objects.backing.acquired, 0);
+    let lease = objects.acquire_dispatcher_wait(owner(), file).unwrap();
+    assert_eq!(lease, ProviderDispatcherLease::File(401));
+    assert!(!objects.dispatcher_is_ready(lease));
+    assert!(!dispatcher_lease_is_ready(
+        objects.event_objects,
+        objects.events,
+        objects.timers.as_deref(),
+        lease,
+    ));
+    objects.backing.file_ready = true;
+    assert!(objects.dispatcher_is_ready(lease));
+    objects.consume_ready_dispatcher(lease);
+    assert!(objects.dispatcher_is_ready(lease));
+    objects.release_dispatcher_wait(lease);
+    assert_eq!(
+        (objects.backing.file_leases, objects.backing.file_releases),
+        (1, 1)
+    );
+    assert_eq!((objects.backing.acquired, objects.backing.released), (1, 1));
+
+    let mut kernel = backend(
+        &mut state,
+        Some(ProviderDispatcherAccess::kernel_events(kernel_owner()).unwrap()),
+    );
+    assert_eq!(
+        kernel.acquire_dispatcher_wait(kernel_owner(), file),
+        Err(INVALID_PARAMETER)
+    );
+    assert_eq!(kernel.backing.acquired, 0);
+}
+
+#[test]
+fn file_wait_all_remains_parked_until_backing_reports_ready() {
+    let mut state = DispatcherState::new(1, 1);
+    let (_, event) = event(&mut state);
+    let file = ProviderWaitObject::new(ProviderWaitObjectType::File, 401, 2);
+    let mut objects = backend(
+        &mut state,
+        Some(ProviderDispatcherAccess::hosted(owner(), 42).unwrap()),
+    );
+    let mut arbiter = ProviderDispatcherWaitArbiter::new();
+    assert_eq!(
+        arbiter.admit(&mut objects, &wait(&[event, file]), owner(), 1, now()),
+        Ok(ProviderDispatcherWaitAdmission::Parked { wait_id: 23 })
+    );
+    assert!(arbiter.pop_ready(&mut objects).is_none());
+    assert!(objects.events.read_state(101));
+    objects.backing.file_ready = true;
+    assert_eq!(arbiter.pop_ready(&mut objects).unwrap().status, 0);
+    assert!(!objects.events.read_state(101));
+    assert!(objects.backing.file_ready);
+    assert_eq!(
+        (objects.backing.file_leases, objects.backing.file_releases),
+        (1, 1)
+    );
+    assert_eq!((objects.backing.acquired, objects.backing.released), (2, 2));
 }
 
 #[test]

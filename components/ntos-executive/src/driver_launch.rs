@@ -37919,7 +37919,7 @@ pub(crate) unsafe fn ensure_paging(page: u64, pml4: u64, domain: HostedDomainIde
 pub(crate) const IO_MANAGER_COMPONENT_ID: u64 = 0x494F_0000;
 
 #[derive(Clone, Copy, Default)]
-struct ExecutiveObjectManagerPort;
+pub(crate) struct ExecutiveObjectManagerPort;
 
 impl ExecutiveObjectManagerPort {
     fn ascii_path(path: &NtPath) -> Result<String, nt_status::NtStatus> {
@@ -38066,11 +38066,11 @@ impl ObjectManagerPort for ExecutiveObjectManagerPort {
     }
 }
 
-type ExecutiveIoManager = IoManager<ExecutiveObjectManagerPort>;
+pub(crate) type ExecutiveIoManager = IoManager<ExecutiveObjectManagerPort>;
 static mut DRIVER_IO_MANAGER: MaybeUninit<ExecutiveIoManager> = MaybeUninit::uninit();
 static mut DRIVER_IO_MANAGER_INIT: bool = false;
 
-fn io_manager_mut() -> &'static mut ExecutiveIoManager {
+pub(crate) fn io_manager_mut() -> &'static mut ExecutiveIoManager {
     unsafe {
         let init = core::ptr::addr_of_mut!(DRIVER_IO_MANAGER_INIT);
         let slot = core::ptr::addr_of_mut!(DRIVER_IO_MANAGER);

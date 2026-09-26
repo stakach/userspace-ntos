@@ -1191,6 +1191,7 @@ pub const W32_FILE_OBJECT_REFERENCE_HANDLE: u64 = 1;
 pub const W32_FILE_OBJECT_REFERENCE_POINTER: u64 = 2;
 pub const W32_FILE_OBJECT_DEREFERENCE_POINTER: u64 = 3;
 pub const W32_FILE_OBJECT_RELATED_DEVICE: u64 = 4;
+pub const W32_FILE_OBJECT_WAIT_IDENTITY: u64 = 5;
 /// Root-authenticated kernel activation handoff before entering provider code.
 pub const W32_KERNEL_ACTIVATION_LABEL: u64 = 0x78E;
 pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
@@ -4749,17 +4750,36 @@ unsafe fn provider_wait_object_for_dispatcher(
         .and_then(|snapshot| snapshot.canonical)
     {
         canonical
+    } else if let Some(canonical) = provider_local_timers()
+        .and_then(|timers| timers.resolve_body(object_body).ok())
+        .and_then(|snapshot| snapshot.canonical)
+    {
+        canonical
     } else {
-        provider_local_timers()?
-            .resolve_body(object_body)
-            .ok()?
-            .canonical?
+        if !provider_pool_contains(object_body) {
+            return None;
+        }
+        let (status, file_id, generation, _) = win32k_file_object_broker_call(
+            W32_FILE_OBJECT_WAIT_IDENTITY,
+            object_body,
+            0,
+            0,
+        );
+        if status != 0 || file_id == 0 || generation == 0 {
+            return None;
+        }
+        nt_provider_wait::ProviderWaitObject::new(
+            nt_provider_wait::ProviderWaitObjectType::File,
+            file_id,
+            generation,
+        )
     };
     matches!(
         canonical.typed(),
         Some(
             nt_provider_wait::ProviderWaitObjectType::Event
                 | nt_provider_wait::ProviderWaitObjectType::Timer
+                | nt_provider_wait::ProviderWaitObjectType::File
         )
     )
     .then_some(canonical)

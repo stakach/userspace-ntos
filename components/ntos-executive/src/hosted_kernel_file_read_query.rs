@@ -475,6 +475,8 @@ impl Work {
             .file_completion
             .set_signaled(self.file.file_id(), true)
             .expect("terminal hosted File read/query signal");
+        let mut objects = (*handler).dispatcher_objects(None);
+        crate::service_sec_image::provider_wait_select_ready(&mut objects);
         self.reply_entered = true;
         let _ = runtime::wake_service(
             self.route,

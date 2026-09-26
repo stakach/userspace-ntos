@@ -15,6 +15,7 @@ const INVALID_PARAMETER: u32 = 0xC000_000D;
 pub enum ProviderDispatcherLease {
     Event(EventLeaseId),
     Timer(ProviderTimerLeaseId),
+    File(u64),
 }
 
 /// Object-access scope, not proof of caller liveness. The execution adapter must authenticate
@@ -54,6 +55,20 @@ impl ProviderDispatcherAccess {
 pub trait ProviderEventBacking {
     fn is_live_event(&self, native_identity: u64) -> bool;
     fn retire_event(&mut self, events: &mut EventStore, retired: RetiredEventObject);
+    fn acquire_file_wait(
+        &mut self,
+        _owner: ProviderWaitOwner,
+        _object: ProviderWaitObject,
+        _process: Option<EventObjectOwner>,
+    ) -> Result<u64, u32> {
+        Err(INVALID_PARAMETER)
+    }
+    fn file_wait_is_ready(&self, _lease: u64) -> bool {
+        false
+    }
+    fn release_file_wait(&mut self, _lease: u64) {
+        panic!("File wait lease has no backing");
+    }
     fn lease_acquired(&mut self) {}
     fn lease_released(&mut self) {}
 }
@@ -130,6 +145,7 @@ pub fn dispatcher_lease_is_ready(
             .expect("provider Timer table disappeared with a live wait lease")
             .is_ready(lease)
             .expect("provider Timer wait lost its canonical lease"),
+        ProviderDispatcherLease::File(_) => false,
     }
 }
 
@@ -190,6 +206,10 @@ impl<B: ProviderEventBacking> ProviderDispatcherWaitBackend for ProviderDispatch
                         .map_err(|_| INVALID_PARAMETER)?,
                 )
             }
+            Some(ProviderWaitObjectType::File) => ProviderDispatcherLease::File(
+                self.backing
+                    .acquire_file_wait(owner, object, access.process)?,
+            ),
             _ => return Err(INVALID_PARAMETER),
         };
         self.backing.lease_acquired();
@@ -197,6 +217,9 @@ impl<B: ProviderEventBacking> ProviderDispatcherWaitBackend for ProviderDispatch
     }
 
     fn dispatcher_is_ready(&self, lease: Self::Lease) -> bool {
+        if let ProviderDispatcherLease::File(lease) = lease {
+            return self.backing.file_wait_is_ready(lease);
+        }
         dispatcher_lease_is_ready(
             self.event_objects,
             self.events,
@@ -218,6 +241,7 @@ impl<B: ProviderEventBacking> ProviderDispatcherWaitBackend for ProviderDispatch
                 .expect("provider Timer table disappeared with a live wait lease")
                 .consume_ready(lease)
                 .expect("provider Timer wait selected an unsignalled object"),
+            ProviderDispatcherLease::File(_) => {}
         }
     }
 
@@ -239,6 +263,7 @@ impl<B: ProviderEventBacking> ProviderDispatcherWaitBackend for ProviderDispatch
                     .release_wait(lease)
                     .expect("provider Timer wait lost its exact lease during release");
             }
+            ProviderDispatcherLease::File(lease) => self.backing.release_file_wait(lease),
         }
         self.backing.lease_released();
     }
