@@ -135,6 +135,8 @@ pub struct MockObjectPort {
     handles: Vec<MockHandle>,
     references: Vec<MockReference>,
     next_reference: u64,
+    #[cfg(test)]
+    fail_next_file_reference: bool,
 }
 
 impl MockObjectPort {
@@ -144,6 +146,16 @@ impl MockObjectPort {
 
     pub fn retained_reference_count(&self) -> usize {
         self.references.len()
+    }
+
+    #[cfg(test)]
+    pub fn fail_next_file_reference(&mut self) {
+        self.fail_next_file_reference = true;
+    }
+
+    #[cfg(test)]
+    pub fn live_handle_count(&self) -> usize {
+        self.handles.iter().filter(|handle| handle.live).count()
     }
 
     pub fn is_object_retained(&self, object: ObjectId) -> bool {
@@ -302,6 +314,10 @@ impl ObjectManagerPort for MockObjectPort {
         handle: HandleValue,
         desired_access: AccessMask,
     ) -> Result<ObjectId, NtStatus> {
+        #[cfg(test)]
+        if core::mem::take(&mut self.fail_next_file_reference) {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
         let h = self
             .handles
             .iter()
