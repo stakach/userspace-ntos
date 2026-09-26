@@ -66,6 +66,8 @@ pub(crate) mod device_property;
 pub(crate) mod win32k_device_properties;
 #[path = "win32k_device_consumer.rs"]
 pub(crate) mod win32k_device_consumer;
+#[path = "win32k_file_owners.rs"]
+pub(crate) mod win32k_file_owners;
 #[path = "win32k_device_pointers.rs"]
 pub(crate) mod win32k_device_pointers;
 #[path = "hosted_add_device_rollback.rs"]

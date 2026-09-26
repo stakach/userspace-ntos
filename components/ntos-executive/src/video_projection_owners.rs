@@ -308,7 +308,7 @@ unsafe fn retire_inner(index: usize) -> bool {
     }
     let address = snapshot(index).address;
     if address != 0 {
-        if !crate::win32k_subsystem::release_video_projection(
+        if !crate::win32k_subsystem::release_consumer_projection(
             address,
             WDM_X64_FILE_OBJECT_SIZE as u64,
         ) {

@@ -257,6 +257,9 @@ impl Work {
                     crate::driver_launch::hosted_consumer_file_objects::handle_closed(
                         self.table_owner, self.handle, file,
                     ).expect("closed RoutedFile has exact consumer projection owner");
+                    crate::driver_launch::win32k_file_owners::handle_closed(
+                        self.table_owner, self.handle, file,
+                    ).expect("closed RoutedFile has exact win32k consumer projection owner");
                     // The File still has its handle reference. Drop this temporary pointer
                     // before last-handle release starts and pumps CLEANUP/CLOSE inline.
                     self.capture.take();
