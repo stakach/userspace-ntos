@@ -47,7 +47,7 @@ impl LayeredOpenContextId {
 #[derive(Clone, Copy)]
 struct OpenEntry {
     canonical_file_id: u64,
-    source: LayeredOpenSource,
+    source: Option<LayeredOpenSource>,
     name_len: u16,
     name: [u16; LAYERED_OPEN_NAME_CAP],
 }
@@ -85,6 +85,17 @@ impl<const SLOTS: usize> LayeredOpenTable<SLOTS> {
         source: LayeredOpenSource,
         volume_relative_name: &[u16],
     ) -> Result<LayeredOpenContextId, u32> {
+        let context = self.reserve(canonical_file_id, volume_relative_name)?;
+        self.finish(context, canonical_file_id, source)?;
+        Ok(context)
+    }
+
+    /// Retain the File identity and name before the selected layer performs native effects.
+    pub fn reserve(
+        &mut self,
+        canonical_file_id: u64,
+        volume_relative_name: &[u16],
+    ) -> Result<LayeredOpenContextId, u32> {
         if volume_relative_name.len() > LAYERED_OPEN_NAME_CAP {
             return Err(STATUS_OBJECT_NAME_INVALID);
         }
@@ -108,13 +119,51 @@ impl<const SLOTS: usize> LayeredOpenTable<SLOTS> {
         name[..volume_relative_name.len()].copy_from_slice(volume_relative_name);
         slot.entry = Some(OpenEntry {
             canonical_file_id,
-            source,
+            source: None,
             name_len: volume_relative_name.len() as u16,
             name,
         });
         Ok(LayeredOpenContextId(
             (u64::from(slot.generation) << 32) | (index as u64 + 1),
         ))
+    }
+
+    pub fn finish(
+        &mut self,
+        context: LayeredOpenContextId,
+        canonical_file_id: u64,
+        source: LayeredOpenSource,
+    ) -> Result<(), u32> {
+        let entry = self
+            .slot_mut(context, canonical_file_id)?
+            .entry
+            .as_mut()
+            .expect("validated occupied slot");
+        if entry.source.is_some() {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        entry.source = Some(source);
+        Ok(())
+    }
+
+    pub fn cancel(
+        &mut self,
+        context: LayeredOpenContextId,
+        canonical_file_id: u64,
+    ) -> Result<(), u32> {
+        let slot = self.slot_mut(context, canonical_file_id)?;
+        if slot
+            .entry
+            .as_ref()
+            .expect("validated occupied slot")
+            .source
+            .is_some()
+        {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        slot.entry = None;
+        slot.generation += 1;
+        Ok(())
     }
 
     pub fn get(
@@ -128,7 +177,7 @@ impl<const SLOTS: usize> LayeredOpenTable<SLOTS> {
             .as_ref()
             .expect("validated occupied slot");
         Ok(LayeredOpenRecord {
-            source: entry.source,
+            source: entry.source.ok_or(STATUS_INVALID_HANDLE)?,
             name: &entry.name[..entry.name_len as usize],
         })
     }
@@ -139,7 +188,13 @@ impl<const SLOTS: usize> LayeredOpenTable<SLOTS> {
         canonical_file_id: u64,
     ) -> Result<LayeredOpenSource, u32> {
         let slot = self.slot_mut(context, canonical_file_id)?;
-        let source = slot.entry.take().expect("validated occupied slot").source;
+        let source = slot
+            .entry
+            .as_ref()
+            .expect("validated occupied slot")
+            .source
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        slot.entry = None;
         slot.generation += 1;
         Ok(source)
     }
@@ -226,6 +281,50 @@ mod tests {
                 name: &[b'x' as u16]
             })
         );
+    }
+
+    #[test]
+    fn reservation_retains_identity_until_source_is_known() {
+        let mut table = LayeredOpenTable::<1>::new();
+        let mut name = alloc::vec![b'a' as u16];
+        let reserved = table.reserve(17, &name).unwrap();
+        name[0] = b'b' as u16;
+        assert_eq!(table.get(reserved, 17), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.release(reserved, 17), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.reserve(18, &name), Err(STATUS_INSUFFICIENT_RESOURCES));
+        assert_eq!(
+            table.finish(reserved, 18, installed()),
+            Err(STATUS_INVALID_HANDLE)
+        );
+        table
+            .finish(reserved, 17, LayeredOpenSource::Overlay { file_id: 29 })
+            .unwrap();
+        assert_eq!(table.get(reserved, 17).unwrap().name, &[b'a' as u16]);
+        assert_eq!(
+            table.finish(reserved, 17, installed()),
+            Err(STATUS_INVALID_HANDLE)
+        );
+        assert_eq!(table.cancel(reserved, 17), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(
+            table.release(reserved, 17),
+            Ok(LayeredOpenSource::Overlay { file_id: 29 })
+        );
+    }
+
+    #[test]
+    fn canceled_reservation_fences_stale_context() {
+        let mut table = LayeredOpenTable::<1>::new();
+        let first = table.reserve(17, &[b'a' as u16]).unwrap();
+        assert_eq!(table.cancel(first, 18), Err(STATUS_INVALID_HANDLE));
+        table.cancel(first, 17).unwrap();
+        let second = table.reserve(17, &[b'b' as u16]).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            table.finish(first, 17, installed()),
+            Err(STATUS_INVALID_HANDLE)
+        );
+        table.finish(second, 17, installed()).unwrap();
+        assert_eq!(table.get(second, 17).unwrap().name, &[b'b' as u16]);
     }
 
     #[test]

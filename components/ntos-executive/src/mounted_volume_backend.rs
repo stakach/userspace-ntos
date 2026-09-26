@@ -13,23 +13,25 @@ use nt_io_manager::{
 };
 use nt_status::NtStatus;
 
-use crate::fs_loader::{fat_open_path_metadata_from, fat_read_file_range};
+use crate::fs_loader::{fat_open_path_metadata_from, fat_read_file_range, FatOpenMetadata};
 
 const OPEN_CAP: usize = 64;
 const PATH_CAP: usize = nt_fs::LAYERED_OPEN_NAME_CAP;
 
 #[derive(Clone, Copy)]
-struct InstalledBinding {
+struct MountedBinding {
     context: nt_fs::LayeredOpenContextId,
     share_open: Option<u32>,
+    overlay_open: bool,
     granted_access: u32,
+    create_options: u32,
 }
 
 pub(crate) struct MountedVolumeBackend {
     fs: crate::Fat32,
     opens: nt_fs::LayeredOpenTable<OPEN_CAP>,
     shares: nt_fs::ReadOnlyFileOpenTable<OPEN_CAP>,
-    bindings: Vec<Option<InstalledBinding>>,
+    bindings: Vec<Option<MountedBinding>>,
 }
 
 impl MountedVolumeBackend {
@@ -86,64 +88,107 @@ impl MountedVolumeBackend {
             .ok_or(NtStatus::OBJECT_NAME_INVALID)?;
         let relative = &relative[..length];
 
-        let installed =
-            match unsafe { fat_open_path_metadata_from(&self.fs, self.fs.root_cl, relative) } {
-                Some(installed) => installed,
-                None if parameters.create_disposition == nt_fs::FILE_OPEN => {
-                    return Err(NtStatus::OBJECT_NAME_NOT_FOUND);
-                }
-                None => return Err(NtStatus::NOT_SUPPORTED),
-            };
-        if installed.metadata.is_directory {
+        let installed = unsafe { fat_open_path_metadata_from(&self.fs, self.fs.root_cl, relative) };
+        let overlay =
+            unsafe { crate::writable_fs::query_metadata_relative(relative) }.map_err(status)?;
+        if overlay.is_some_and(|entry| entry.is_directory)
+            || (overlay.is_none() && installed.is_some_and(|entry| entry.metadata.is_directory))
+        {
             return Err(status(nt_fs::STATUS_FILE_IS_A_DIRECTORY));
         }
-        match nt_fs::installed_file_open_action(access, parameters.create_disposition, options)
-            .map_err(status)?
-        {
-            nt_fs::InstalledFileOpenAction::NameCollision => {
-                return Err(NtStatus::OBJECT_NAME_COLLISION);
+        let decision = nt_fs::layered_file_open_decision(
+            Ok(overlay.is_some()),
+            installed.is_some(),
+            access,
+            parameters.create_disposition,
+            options,
+        )
+        .map_err(status)?;
+        match decision {
+            nt_fs::LayeredFileOpenDecision::Installed(nt_fs::InstalledFileOpenAction::ReadOnly) => {
+                self.create_installed(
+                    file_id.raw(),
+                    units,
+                    relative,
+                    installed.unwrap(),
+                    access,
+                    share,
+                    options,
+                )
             }
-            nt_fs::InstalledFileOpenAction::ReadOnly => {}
-            nt_fs::InstalledFileOpenAction::CopyContents
-            | nt_fs::InstalledFileOpenAction::CopyMetadata => {
-                return Err(NtStatus::NOT_SUPPORTED);
-            }
-        }
-
-        let share_open = self
-            .shares
-            .create(
-                installed.first_cluster,
-                installed.metadata.end_of_file.min(u32::MAX as u64) as u32,
+            nt_fs::LayeredFileOpenDecision::Installed(
+                nt_fs::InstalledFileOpenAction::NameCollision,
+            ) => Err(NtStatus::OBJECT_NAME_COLLISION),
+            nt_fs::LayeredFileOpenDecision::Installed(action) => self.create_overlay(
+                file_id.raw(),
+                units,
                 relative,
-                access,
-                share,
-                options,
-                installed.metadata,
-                installed.alternate_name,
-            )
-            .map_err(status)?;
-        let context = match self.opens.insert(
-            file_id.raw(),
-            nt_fs::LayeredOpenSource::Installed {
-                first_cluster: installed.first_cluster,
-                metadata: installed.metadata,
-                alternate_name: installed.alternate_name,
-            },
-            units,
+                installed,
+                Some(action),
+                true,
+                parameters,
+            ),
+            nt_fs::LayeredFileOpenDecision::UseOverlay
+            | nt_fs::LayeredFileOpenDecision::CreateOverlay => self.create_overlay(
+                file_id.raw(),
+                units,
+                relative,
+                installed,
+                None,
+                matches!(decision, nt_fs::LayeredFileOpenDecision::CreateOverlay),
+                parameters,
+            ),
+        }
+    }
+
+    fn create_installed(
+        &mut self,
+        file_id: u64,
+        units: &[u16],
+        relative: &[u8],
+        installed: FatOpenMetadata,
+        access: u32,
+        share: u32,
+        options: u32,
+    ) -> Result<DispatchOutcome, NtStatus> {
+        let context = self.opens.reserve(file_id, units).map_err(status)?;
+        let share_open = match self.shares.create(
+            installed.first_cluster,
+            installed.metadata.end_of_file.min(u32::MAX as u64) as u32,
+            relative,
+            access,
+            share,
+            options,
+            installed.metadata,
+            installed.alternate_name,
         ) {
-            Ok(context) => context,
+            Ok(share_open) => share_open,
             Err(error) => {
-                let _ = self.shares.release(share_open);
+                self.opens
+                    .cancel(context, file_id)
+                    .expect("owned reservation");
                 return Err(status(error));
             }
         };
+        self.opens
+            .finish(
+                context,
+                file_id,
+                nt_fs::LayeredOpenSource::Installed {
+                    first_cluster: installed.first_cluster,
+                    metadata: installed.metadata,
+                    alternate_name: installed.alternate_name,
+                },
+            )
+            .expect("owned reservation");
         let index = context_index(context).expect("bounded layered table context index");
         debug_assert!(self.bindings[index].is_none());
-        self.bindings[index] = Some(InstalledBinding {
+        self.bindings[index] = Some(MountedBinding {
             context,
             share_open: Some(share_open),
+            overlay_open: false,
             granted_access: access,
+            create_options: options,
         });
         Ok(DispatchOutcome::Completed {
             status: NtStatus::SUCCESS,
@@ -152,10 +197,112 @@ impl MountedVolumeBackend {
         })
     }
 
+    fn create_overlay(
+        &mut self,
+        file_id: u64,
+        units: &[u16],
+        relative: &[u8],
+        installed: Option<FatOpenMetadata>,
+        copy_action: Option<nt_fs::InstalledFileOpenAction>,
+        materialize_parent: bool,
+        parameters: &nt_io_manager::CreateParameters,
+    ) -> Result<DispatchOutcome, NtStatus> {
+        let access = parameters.desired_access.bits();
+        let share = parameters.share_access.bits();
+        let options = parameters.create_options.bits();
+        if let Some(source) = installed {
+            self.shares
+                .check_share(relative, source.metadata, access, share)
+                .map_err(status)?;
+        }
+        let context = self.opens.reserve(file_id, units).map_err(status)?;
+        let result = (|| -> Result<(u64, u64), NtStatus> {
+            if let Some(parent) = relative
+                .iter()
+                .rposition(|byte| *byte == b'\\')
+                .filter(|_| materialize_parent)
+                .map(|end| &relative[..end])
+            {
+                let parent_entry =
+                    unsafe { fat_open_path_metadata_from(&self.fs, self.fs.root_cl, parent) };
+                if parent_entry.is_some_and(|entry| entry.metadata.is_directory) {
+                    unsafe { crate::writable_fs::ensure_installed_directory_relative(parent) }
+                        .map_err(status)?;
+                }
+            }
+            if let (Some(source), Some(action)) = (installed, copy_action) {
+                let mode = match action {
+                    nt_fs::InstalledFileOpenAction::CopyContents => {
+                        crate::writable_fs::InstalledFileCopyUp::PreserveContents
+                    }
+                    nt_fs::InstalledFileOpenAction::CopyMetadata => {
+                        crate::writable_fs::InstalledFileCopyUp::MetadataOnly
+                    }
+                    _ => return Err(NtStatus::INVALID_PARAMETER),
+                };
+                unsafe {
+                    crate::writable_fs::copy_up_installed_file_from(
+                        &self.fs, relative, source, mode,
+                    )
+                }
+                .map_err(status)?;
+            }
+            let (result, opened, information) = unsafe {
+                crate::writable_fs::create(
+                    relative,
+                    access,
+                    parameters.file_attributes,
+                    share,
+                    parameters.create_disposition,
+                    options,
+                )
+            };
+            if result != nt_fs::STATUS_SUCCESS {
+                return Err(status(result));
+            }
+            Ok((
+                opened.expect("successful overlay CREATE owns a File"),
+                information,
+            ))
+        })();
+        let (overlay_file, information) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.opens
+                    .cancel(context, file_id)
+                    .expect("owned reservation");
+                return Err(error);
+            }
+        };
+        self.opens
+            .finish(
+                context,
+                file_id,
+                nt_fs::LayeredOpenSource::Overlay {
+                    file_id: overlay_file,
+                },
+            )
+            .expect("owned reservation");
+        let index = context_index(context).expect("bounded layered table context index");
+        debug_assert!(self.bindings[index].is_none());
+        self.bindings[index] = Some(MountedBinding {
+            context,
+            share_open: None,
+            overlay_open: true,
+            granted_access: access,
+            create_options: options,
+        });
+        Ok(DispatchOutcome::Completed {
+            status: NtStatus::SUCCESS,
+            information,
+            file_context: Some(context.raw()),
+        })
+    }
+
     fn binding(
         &self,
         irp: &IrpProjection,
-    ) -> Result<(nt_fs::LayeredOpenContextId, InstalledBinding), NtStatus> {
+    ) -> Result<(nt_fs::LayeredOpenContextId, MountedBinding), NtStatus> {
         let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
         let context = nt_fs::LayeredOpenContextId::from_raw(irp.user_data);
         self.opens.get(context, file_id.raw()).map_err(status)?;
@@ -171,7 +318,6 @@ impl MountedVolumeBackend {
         irp: &IrpProjection,
     ) -> Result<DispatchOutcome, NtStatus> {
         let (context, binding) = self.binding(irp)?;
-        let share_open = binding.share_open.ok_or(NtStatus::INVALID_HANDLE)?;
         if binding.granted_access & (nt_fs::FILE_READ_DATA | nt_fs::FILE_EXECUTE | 0x8000_0000) == 0
         {
             return Err(NtStatus::ACCESS_DENIED);
@@ -189,9 +335,39 @@ impl MountedVolumeBackend {
                 file_context: None,
             });
         }
-        let offset = u32::try_from(parameters.offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
         let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
         let record = self.opens.get(context, file_id.raw()).map_err(status)?;
+        if let nt_fs::LayeredOpenSource::Overlay {
+            file_id: overlay_file,
+        } = record.source
+        {
+            if !binding.overlay_open {
+                return Err(NtStatus::INVALID_HANDLE);
+            }
+            let info = unsafe { crate::writable_fs::file_object_information(overlay_file) }
+                .map_err(status)?;
+            let synchronous = binding.create_options
+                & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+                != 0;
+            let resolved = nt_io_manager::resolve_regular_file_read_offset(
+                Some(parameters.offset as i64),
+                synchronous,
+                info.current_offset,
+            )?;
+            let (result, transferred) = unsafe {
+                crate::writable_fs::read_completed_into(
+                    overlay_file,
+                    resolved,
+                    synchronous,
+                    &mut ctx.system_buffer[..parameters.length as usize],
+                )
+            };
+            return Ok(DispatchOutcome::Completed {
+                status: status(result),
+                information: transferred as u64,
+                file_context: None,
+            });
+        }
         let nt_fs::LayeredOpenSource::Installed {
             first_cluster,
             metadata,
@@ -200,6 +376,8 @@ impl MountedVolumeBackend {
         else {
             return Err(NtStatus::INVALID_HANDLE);
         };
+        let share_open = binding.share_open.ok_or(NtStatus::INVALID_HANDLE)?;
+        let offset = u32::try_from(parameters.offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
         self.shares.get(share_open).map_err(status)?;
         let eof = metadata.end_of_file.min(u32::MAX as u64) as u32;
         if offset >= eof {
@@ -240,7 +418,6 @@ impl MountedVolumeBackend {
         irp: &IrpProjection,
     ) -> Result<DispatchOutcome, NtStatus> {
         let (context, binding) = self.binding(irp)?;
-        let share_open = binding.share_open.ok_or(NtStatus::INVALID_HANDLE)?;
         let IoParameters::QueryInformation(parameters) = &irp.parameters else {
             return Err(NtStatus::INVALID_PARAMETER);
         };
@@ -248,19 +425,38 @@ impl MountedVolumeBackend {
         let output = &mut ctx.system_buffer[..capacity];
         let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
         let record = self.opens.get(context, file_id.raw()).map_err(status)?;
-        let nt_fs::LayeredOpenSource::Installed {
-            metadata,
-            alternate_name,
-            ..
-        } = record.source
-        else {
-            return Err(NtStatus::INVALID_HANDLE);
+        let (metadata, alternate_name, current_offset, mode) = match record.source {
+            nt_fs::LayeredOpenSource::Installed {
+                metadata,
+                alternate_name,
+                ..
+            } => {
+                let share_open = binding.share_open.ok_or(NtStatus::INVALID_HANDLE)?;
+                let open = self.shares.get(share_open).map_err(status)?;
+                (
+                    metadata,
+                    alternate_name,
+                    open.current_offset,
+                    nt_fs::file_mode_from_create_options(open.create_options),
+                )
+            }
+            nt_fs::LayeredOpenSource::Overlay {
+                file_id: overlay_file,
+            } => {
+                if !binding.overlay_open {
+                    return Err(NtStatus::INVALID_HANDLE);
+                }
+                let info = unsafe { crate::writable_fs::file_object_information(overlay_file) }
+                    .map_err(status)?;
+                let short =
+                    unsafe { crate::writable_fs::short_name(overlay_file) }.map_err(status)?;
+                (info.metadata, short, info.current_offset, info.mode)
+            }
         };
-        let open = self.shares.get(share_open).map_err(status)?;
         let mut query = metadata.query_metadata();
-        query.current_byte_offset = open.current_offset;
+        query.current_byte_offset = current_offset;
         query.access_flags = binding.granted_access;
-        query.mode = open.create_options;
+        query.mode = mode;
         let result = match parameters.info_class {
             nt_fs::FILE_NAME_INFORMATION | nt_fs::FILE_ALL_INFORMATION => {
                 nt_fs::encode_named_query_information(
@@ -306,6 +502,66 @@ impl MountedVolumeBackend {
         })
     }
 
+    fn write(
+        &mut self,
+        ctx: DispatchContext<'_>,
+        irp: &IrpProjection,
+    ) -> Result<DispatchOutcome, NtStatus> {
+        let (context, binding) = self.binding(irp)?;
+        let IoParameters::Write(parameters) = &irp.parameters else {
+            return Err(NtStatus::INVALID_PARAMETER);
+        };
+        if parameters.length as usize > ctx.system_buffer.len() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let write_access =
+            nt_fs::FILE_WRITE_DATA | nt_fs::FILE_APPEND_DATA | 0x4000_0000 | 0x1000_0000;
+        if binding.granted_access & write_access == 0 {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
+        let nt_fs::LayeredOpenSource::Overlay {
+            file_id: overlay_file,
+        } = self
+            .opens
+            .get(context, file_id.raw())
+            .map_err(status)?
+            .source
+        else {
+            return Err(NtStatus::ACCESS_DENIED);
+        };
+        if !binding.overlay_open {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        let info =
+            unsafe { crate::writable_fs::file_object_information(overlay_file) }.map_err(status)?;
+        let synchronous = binding.create_options
+            & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+            != 0;
+        let append_only = binding.granted_access & nt_fs::FILE_APPEND_DATA != 0
+            && binding.granted_access & (nt_fs::FILE_WRITE_DATA | 0x4000_0000 | 0x1000_0000) == 0;
+        let resolved = nt_io_manager::resolve_regular_file_write_offset(
+            Some(parameters.offset as i64),
+            synchronous,
+            info.current_offset,
+            info.metadata.end_of_file,
+            append_only,
+        )?;
+        let (result, written) = unsafe {
+            crate::writable_fs::write_completed(
+                overlay_file,
+                resolved,
+                synchronous,
+                &ctx.system_buffer[..parameters.length as usize],
+            )
+        };
+        Ok(DispatchOutcome::Completed {
+            status: status(result),
+            information: written as u64,
+            file_context: None,
+        })
+    }
+
     fn cleanup_or_close(
         &mut self,
         irp: &IrpProjection,
@@ -320,8 +576,24 @@ impl MountedVolumeBackend {
                 .expect("validated binding")
                 .share_open = None;
         }
+        let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
+        if let nt_fs::LayeredOpenSource::Overlay {
+            file_id: overlay_file,
+        } = self
+            .opens
+            .get(context, file_id.raw())
+            .map_err(status)?
+            .source
+        {
+            if binding.overlay_open {
+                unsafe { crate::writable_fs::close_checked(overlay_file) }.map_err(status)?;
+                self.bindings[index]
+                    .as_mut()
+                    .expect("validated binding")
+                    .overlay_open = false;
+            }
+        }
         if close {
-            let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
             self.opens.release(context, file_id.raw()).map_err(status)?;
             self.bindings[index] = None;
         }
@@ -342,6 +614,7 @@ impl DriverDispatchBackend for MountedVolumeBackend {
         match irp.major {
             major::IRP_MJ_CREATE => self.create(irp),
             major::IRP_MJ_READ => self.read(ctx, irp),
+            major::IRP_MJ_WRITE => self.write(ctx, irp),
             major::IRP_MJ_QUERY_INFORMATION => self.query(ctx, irp),
             major::IRP_MJ_CLEANUP => self.cleanup_or_close(irp, false),
             major::IRP_MJ_CLOSE => self.cleanup_or_close(irp, true),

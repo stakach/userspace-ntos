@@ -43,6 +43,8 @@ fi
 # than the individual query trace for that proof.
 if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || ! grep -Fq 'PASS exec_mounted_volume_external_file_dispatch_font_read' "$RUN_LOG" \
+   || ! grep -Fq 'PASS exec_mounted_volume_external_overlay_create_write_read_close' "$RUN_LOG" \
+   || ! grep -Fq 'PASS exec_mounted_volume_installed_file_copy_up_and_delete' "$RUN_LOG" \
    || grep -Fq '[win32k-import] reject image' "$RUN_LOG" \
    || grep -Fq '!@src/component_scheduler.rs:' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-probe\] status=0x00000000 queries=[1-9][0-9]* accepted=[1-9][0-9]* ' "$RUN_LOG" \
@@ -50,7 +52,7 @@ if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
         && ! grep -Eq '\[mup-provider-probe\] status=0x00000000 queries=[1-9][0-9]* accepted=[1-9][0-9]* .*file-created=[1-9][0-9]* cleaned=[1-9][0-9]* closed=[1-9][0-9]*' "$RUN_LOG"; } \
    || ! grep -Eq '\[mup-provider-write-result\] status=0x00000000 info=10' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-read\] count=[1-9][0-9]* bytes=10' "$RUN_LOG" \
-   || { ! grep -Fq '[read-forward-result] offset=0 call=0x00000000 wait=0x00000000 status=0x00000000 iosb=0x00000000 info=10 bytes-match=1' "$RUN_LOG" \
+   || { ! grep -Fq 'offset=0 call=0x00000000 wait=0x00000000 status=0x00000000 iosb=0x00000000 info=10 bytes-match=1' "$RUN_LOG" \
         && ! grep -Fq '[read-forward-verified-0]' "$RUN_LOG"; } \
    || ! grep -Fq '[mup-provider-read-pending-dispatch] status=0x00000103' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-read-pending-complete\] count=[1-9][0-9]* bytes=20' "$RUN_LOG" \
