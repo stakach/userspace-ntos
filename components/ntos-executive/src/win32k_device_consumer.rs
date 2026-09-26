@@ -10,6 +10,7 @@ struct Projection {
     registration: Option<nt_io_manager::HostedDevicePointerRegistration>,
     bound: bool,
     pdo_identity: Option<nt_pnp_manager::DevnodeIdentity>,
+    owned_allocation: Option<(u64, u64)>,
 }
 
 struct Consumer {
@@ -155,6 +156,7 @@ pub(crate) unsafe fn bind_projection(
             registration: None,
             bound: false,
             pdo_identity,
+            owned_allocation: None,
         });
         consumer.projections.len() - 1
     };
@@ -173,6 +175,85 @@ pub(crate) unsafe fn bind_projection(
         consumer.projections[index].registration = Some(registration);
     }
     Ok(())
+}
+
+/// Project any canonical opening or attachment-top Device into win32k's VSpace. One durable
+/// registration is shared by all File projections for that Device, including after handle close.
+pub(crate) unsafe fn ensure_projection(device: nt_io_manager::DeviceId) -> Result<u64, i32> {
+    let _durable = crate::allocator::enter_durable();
+    let consumer = live_consumer()?;
+    if let Some(row) = consumer.projections.iter().find(|row| row.device == device) {
+        if row.bound && row.registration.is_some() {
+            return Ok(row.address);
+        }
+        if row.owned_allocation.is_none() {
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
+    }
+    let io = io_manager_mut();
+    let record = io.device(device).ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    if record.delete_pending || record.stack_size == 0 || io.driver(record.driver_id).is_none() {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let (device_type, flags, characteristics, stack_size) = (
+        record.device_type.0,
+        record.flags.bits(),
+        record.characteristics.bits(),
+        record.stack_size,
+    );
+    let pdo_identity = hosted_pnp_manager_mut().devnode_identity_for_pdo(device.raw());
+    let driver_size = nt_io_manager::WDM_X64_DRIVER_OBJECT_SIZE as u64;
+    let extension_size = nt_io_manager::WDM_X64_DRIVER_EXTENSION_SIZE as u64;
+    let device_size = nt_io_manager::WDM_X64_DEVICE_OBJECT_SIZE as u64;
+    let size = driver_size + extension_size + device_size;
+    let (base, address) = if let Some(row) = consumer.projections.iter().find(|row| row.device == device) {
+        let (base, recorded_size) = row.owned_allocation.ok_or(STATUS_DEVICE_NOT_READY)?;
+        if recorded_size != size || row.address != base + driver_size + extension_size {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        (base, row.address)
+    } else {
+        consumer.projections.try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        let base = crate::win32k_subsystem::pool_alloc_export(size);
+        if base == 0 {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let address = base + driver_size + extension_size;
+        // Retain the exact pool allocation even if native body initialization fails.
+        consumer.projections.push(Projection {
+            address,
+            device,
+            registration: None,
+            bound: false,
+            pdo_identity,
+            owned_allocation: Some((base, size)),
+        });
+        (base, address)
+    };
+    nt_io_manager::write_wdm_driver_object(
+        core::slice::from_raw_parts_mut(base as *mut u8, driver_size as usize),
+        nt_io_manager::WdmDriverObjectInit {
+            size_field: driver_size as u16,
+            device_object: address,
+            driver_extension: base + driver_size,
+            ..Default::default()
+        },
+    ).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    core::ptr::write_bytes((base + driver_size) as *mut u8, 0, extension_size as usize);
+    nt_io_manager::write_wdm_device_object(
+        core::slice::from_raw_parts_mut(address as *mut u8, device_size as usize),
+        nt_io_manager::WdmDeviceObjectInit {
+            size_field: device_size as u16,
+            driver_object: base,
+            flags,
+            characteristics,
+            device_type,
+            stack_size,
+            ..Default::default()
+        },
+    ).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    bind_projection(address, device)?;
+    Ok(address)
 }
 
 /// Root-only publication after a genuine open. The consumer's physical domain owns the File
@@ -314,6 +395,8 @@ pub(crate) unsafe fn related_file_device_address(
     let top = io_manager_mut()
         .related_device_for_file(projection.identity().file_id())
         .map_err(|status| status.raw())?;
+    let _ = ensure_projection(top)?;
+    let consumer = live_consumer()?;
     let registration = consumer
         .projections
         .iter()
@@ -463,7 +546,9 @@ pub(crate) unsafe fn authenticate(
 /// every physical lane first. Failed retirement denies new admission and retains unfinished owners.
 #[allow(dead_code)]
 pub(crate) unsafe fn retire_quiescent_projections() -> Result<(), i32> {
-    if !crate::video_device::video_file_owners_quiesced() {
+    if !crate::video_device::video_file_owners_quiesced()
+        || !super::win32k_file_owners::quiescent()
+    {
         return Err(STATUS_DEVICE_NOT_READY);
     }
     let consumer = consumer_mut()?;
@@ -488,6 +573,12 @@ pub(crate) unsafe fn retire_quiescent_projections() -> Result<(), i32> {
                 return Err(STATUS_ACCESS_DENIED);
             }
             row.bound = false;
+        }
+        if let Some((address, size)) = row.owned_allocation {
+            if !crate::win32k_subsystem::release_consumer_projection(address, size) {
+                return Err(STATUS_DEVICE_NOT_READY);
+            }
+            row.owned_allocation = None;
         }
         consumer.projections.pop();
     }

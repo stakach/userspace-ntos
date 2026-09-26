@@ -1186,6 +1186,11 @@ pub const W32_DIRECTORY_LABEL: u64 = 0x782;
 pub const W32_FILE_CLOSE_LABEL: u64 = 0x790;
 pub const W32_FILE_CREATE_LABEL: u64 = 0x791;
 pub const W32_FILE_QUERY_LABEL: u64 = 0x792;
+pub const W32_FILE_OBJECT_LABEL: u64 = 0x793;
+pub const W32_FILE_OBJECT_REFERENCE_HANDLE: u64 = 1;
+pub const W32_FILE_OBJECT_REFERENCE_POINTER: u64 = 2;
+pub const W32_FILE_OBJECT_DEREFERENCE_POINTER: u64 = 3;
+pub const W32_FILE_OBJECT_RELATED_DEVICE: u64 = 4;
 /// Root-authenticated kernel activation handoff before entering provider code.
 pub const W32_KERNEL_ACTIVATION_LABEL: u64 = 0x78E;
 pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
@@ -1622,8 +1627,8 @@ pub(crate) unsafe fn property_pool_free(p: u64) {
     }
 }
 
-/// Executive-owned video projection release; failure retains the allocation for retirement retry.
-pub(crate) unsafe fn release_video_projection(address: u64, size: u64) -> bool {
+/// Release an executive-owned consumer projection only after its canonical receipts retire.
+pub(crate) unsafe fn release_consumer_projection(address: u64, size: u64) -> bool {
     size != 0 && provider_pool_release_owned(&[(address, size)])
 }
 
@@ -2928,6 +2933,25 @@ unsafe fn win32k_ps_broker_call(op: u64, object: u64, value: u64) -> (i32, u64, 
     (status as u32 as i32, out1, out2, out3)
 }
 
+unsafe fn win32k_file_object_broker_call(
+    operation: u64,
+    object: u64,
+    access: u64,
+    mode: u64,
+) -> (i32, u64, u64, u64) {
+    let (words, status, out1, out2, out3) = crate::driver_launch::call_on4_raw(
+        (W32_FILE_OBJECT_LABEL << 12) | 4,
+        operation,
+        object,
+        access,
+        mode,
+    );
+    if words != 4 {
+        crate::provider_bugcheck::report(0xc4, [W32_FILE_OBJECT_LABEL, object, words, status]);
+    }
+    (status as u32 as i32, out1, out2, out3)
+}
+
 unsafe fn win32k_atom_broker_call(operation: u64, value: u64) -> (i32, u64) {
     let (_label, status, atom, _, _) =
         crate::driver_launch::call_on4((W32_ATOM_LABEL << 12) | 2, operation, value, 0, 0);
@@ -3729,6 +3753,17 @@ extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
         return unsafe { crate::video_device::reference_video_file_pointer(object) }
         .unwrap_or_else(|status| panic!("video projection retain failed: {status:#010x}"));
     }
+    if provider_pool_contains(object) {
+        let (file_status, file_count, _, _) = unsafe {
+            win32k_file_object_broker_call(W32_FILE_OBJECT_REFERENCE_POINTER, object, 0, 0)
+        };
+        if file_status == 0 {
+            return file_count;
+        }
+        if file_status != STATUS_INVALID_HANDLE_I32 {
+            panic!("File projection retain failed: {file_status:#010x}");
+        }
+    }
     if !provider_event_projection_contains(object) {
         return unsafe { crate::driver_launch::win32k_device_pointers::reference(object) }
             .unwrap_or_else(|status| panic!("Device pointer reference failed: {status:#010x}"));
@@ -3780,6 +3815,17 @@ extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
     if unsafe { crate::video_device::video_file_projection_contains(object) } {
         return unsafe { crate::video_device::release_video_file_projection(object) }
             .unwrap_or_else(|status| panic!("video projection release failed: {status:#010x}"));
+    }
+    if provider_pool_contains(object) {
+        let (file_status, file_count, _, _) = unsafe {
+            win32k_file_object_broker_call(W32_FILE_OBJECT_DEREFERENCE_POINTER, object, 0, 0)
+        };
+        if file_status == 0 {
+            return file_count;
+        }
+        if file_status != STATUS_INVALID_HANDLE_I32 {
+            panic!("File projection release failed: {file_status:#010x}");
+        }
     }
     if !provider_event_projection_contains(object) {
         return unsafe { crate::driver_launch::win32k_device_pointers::dereference(object) }
@@ -6145,16 +6191,16 @@ const STATUS_OBJECT_TYPE_MISMATCH: i32 = 0xC000_0024u32 as i32;
 ///  - `Event` (`ExEventObjectType`) — winsrv's power/media request events, modeled as real `KEVENT`
 ///    objects when `NtUserInitialize` receives their handles (see [`register_event_object`]).
 ///
-/// The unregistered handles resolved here are win32k's narrow process-connect handle, NT's
-/// current-process/current-thread pseudo handles, and broker-owned LPC port handles. Process/thread
-/// identities resolve to the live dispatch context. An LPC reference is validated by the isolated
-/// broker and retains that same opaque handle as the port object body; kernel LPC imports hand it
-/// back to the broker instead of manufacturing a parallel object identity.
+/// Unregistered handles include typed routed Files, win32k's process-connect handle, NT's
+/// current-process/current-thread pseudo handles, and broker-owned LPC port handles. A File
+/// reference is validated by the isolated owner and returns a per-open consumer projection;
+/// process/thread identities resolve to the live dispatch context. LPC retains its broker handle
+/// as the opaque port body rather than manufacturing a parallel object identity.
 extern "win64" fn s_ob_reference_object_by_handle(
     handle: u64,
     access: u64,
     obj_type: u64,
-    _mode: u64,
+    mode: u64,
     object_out: *mut u64,
     handle_info: *mut u8,
 ) -> i32 {
@@ -6259,6 +6305,29 @@ extern "win64" fn s_ob_reference_object_by_handle(
             let process_ty = nt_object_manager::object_type::process_object_type_addr();
             let thread_ty = nt_object_manager::object_type::thread_object_type_addr();
             let port_ty = nt_object_manager::object_type::port_object_type_addr();
+            if obj_type == 0 {
+                let (status, pointer, granted, attributes) = unsafe {
+                    win32k_file_object_broker_call(
+                        W32_FILE_OBJECT_REFERENCE_HANDLE,
+                        handle,
+                        access,
+                        mode,
+                    )
+                };
+                if status == 0 {
+                    unsafe { write_unaligned(object_out, pointer) };
+                    if !handle_info.is_null() {
+                        unsafe {
+                            write_unaligned(handle_info as *mut u32, attributes as u32);
+                            write_unaligned(handle_info.add(4) as *mut u32, granted as u32);
+                        }
+                    }
+                    return 0;
+                }
+                if status != STATUS_INVALID_HANDLE_I32 && status != STATUS_OBJECT_TYPE_MISMATCH {
+                    return status;
+                }
+            }
             if handle == FAKE_PROCESS_HANDLE {
                 // win32k's process-connect handle → the current EPROCESS; enforce a specific
                 // ExpectedType against PsProcessType (NULL is polymorphic).
@@ -13326,9 +13395,22 @@ extern "win64" fn s_io_get_device_object_pointer(
 /// `PDEVICE_OBJECT IoGetRelatedDeviceObject(PFILE_OBJECT)`.
 extern "win64" fn s_io_get_related_device_object(file_object: u64) -> u64 {
     unsafe {
-        crate::video_device::video_related_device_object(file_object).unwrap_or_else(|status| {
-            panic!("IoGetRelatedDeviceObject rejected File projection: {:#010x}", status.raw())
-        })
+        if crate::video_device::video_file_projection_contains(file_object) {
+            return crate::video_device::video_related_device_object(file_object)
+                .unwrap_or_else(|status| {
+                    panic!("IoGetRelatedDeviceObject rejected video File: {:#010x}", status.raw())
+                });
+        }
+        let (status, device, _, _) = win32k_file_object_broker_call(
+            W32_FILE_OBJECT_RELATED_DEVICE,
+            file_object,
+            0,
+            0,
+        );
+        if status != 0 {
+            panic!("IoGetRelatedDeviceObject rejected File projection: {status:#010x}");
+        }
+        device
     }
 }
 

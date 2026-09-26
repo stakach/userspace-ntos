@@ -4504,6 +4504,64 @@ pub(crate) unsafe fn service_win32k_file_query_request(
     crate::driver_launch::service_win32k_file_query(channel, packet, length, handle)
 }
 
+/// Resolve only canonical routed File handles or exact win32k consumer pointer receipts.
+pub(crate) unsafe fn service_win32k_file_object_request(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    op: u64,
+    object: u64,
+    access: u64,
+    mode: u64,
+) -> (i32, u64, u64, u64) {
+    use crate::win32k_subsystem::{
+        W32_FILE_OBJECT_DEREFERENCE_POINTER, W32_FILE_OBJECT_LABEL,
+        W32_FILE_OBJECT_REFERENCE_HANDLE, W32_FILE_OBJECT_REFERENCE_POINTER,
+        W32_FILE_OBJECT_RELATED_DEVICE,
+    };
+    let caller = match authenticate_win32k_service_request(
+        channel, reply_cap, badge, mi, (W32_FILE_OBJECT_LABEL << 12) | 4,
+    ) {
+        Ok((_, _, caller)) => caller,
+        Err(status) => return (status as i32, 0, 0, 0),
+    };
+    if SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) == 0 {
+        return (0xC000_00A3u32 as i32, 0, 0, 0);
+    }
+    match op {
+        W32_FILE_OBJECT_REFERENCE_HANDLE => {
+            let (Ok(access), Ok(mode)) = (u32::try_from(access), u8::try_from(mode)) else {
+                return (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0);
+            };
+            let (status, pointer, granted, attributes) =
+                crate::driver_launch::win32k_file_owners::reference_handle(
+                    caller, object, access, mode,
+                );
+            (status, pointer, granted as u64, attributes as u64)
+        }
+        W32_FILE_OBJECT_REFERENCE_POINTER if access == 0 && mode == 0 => {
+            match crate::driver_launch::win32k_file_owners::reference_pointer(object) {
+                Ok(count) => (0, count, 0, 0),
+                Err(status) => (status, 0, 0, 0),
+            }
+        }
+        W32_FILE_OBJECT_DEREFERENCE_POINTER if access == 0 && mode == 0 => {
+            match crate::driver_launch::win32k_file_owners::dereference_pointer(object) {
+                Ok(count) => (0, count, 0, 0),
+                Err(status) => (status, 0, 0, 0),
+            }
+        }
+        W32_FILE_OBJECT_RELATED_DEVICE if access == 0 && mode == 0 => {
+            match crate::driver_launch::win32k_file_owners::related_device_address(object) {
+                Ok(device) => (0, device, 0, 0),
+                Err(status) => (status, 0, 0, 0),
+            }
+        }
+        _ => (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0),
+    }
+}
+
 /// The canonical shared-ingress completion owns final cleanup of unpublished stages.
 pub(crate) unsafe fn retire_win32k_directory_route(
     route: nt_component_suspension::peer_registry::PeerRoute,
@@ -8569,6 +8627,7 @@ pub(crate) unsafe fn service_sec_image(
             crate::driver_launch::redrive_hosted_driver_zw_read_query_file(nt_handler as *mut _);
             crate::hosted_routed_file_close_work::redrive(&mut nt_handler);
             crate::driver_launch::hosted_consumer_file_objects::redrive();
+            crate::driver_launch::win32k_file_owners::redrive();
             crate::current_apc::redrive(&mut nt_handler);
             crate::current_apc::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
             crate::object_wait_reply::redrive(&mut nt_handler);
