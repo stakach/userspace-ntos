@@ -10,6 +10,17 @@ pub(super) extern "win64" fn query_information(
     length: u32,
     class: u32,
 ) -> i32 {
+    query_information_expected(handle, iosb, output, length, class, 0)
+}
+
+pub(super) fn query_information_expected(
+    handle: u64,
+    iosb: u64,
+    output: u64,
+    length: u32,
+    class: u32,
+    expected_file: u64,
+) -> i32 {
     let Some(contract) = nt_io_manager::query_information_contract(class) else {
         return 0xC000_0003u32 as i32;
     };
@@ -31,7 +42,9 @@ pub(super) extern "win64" fn query_information(
         if wire::encode_request(
             FileReadQueryRequest::Query { class, length },
             core::slice::from_raw_parts_mut(packet as *mut u8, total),
-        ).is_err() {
+        )
+        .is_err()
+        {
             if !provider_pool_free(packet) {
                 crate::provider_bugcheck::report(0xc4, [W32_FILE_QUERY_LABEL, packet, 0, 0]);
             }
@@ -42,7 +55,7 @@ pub(super) extern "win64" fn query_information(
             packet,
             total as u64,
             handle,
-            0,
+            expected_file,
         );
         if words != 1 {
             crate::provider_bugcheck::report(0xc4, [W32_FILE_QUERY_LABEL, packet, words, raw]);
@@ -56,10 +69,15 @@ pub(super) extern "win64" fn query_information(
                 core::slice::from_raw_parts(packet as *const u8, total),
             ) {
                 Ok(completion) => completion,
-                Err(_) => crate::provider_bugcheck::report(0xc4, [W32_FILE_QUERY_LABEL, packet, raw, 0]),
+                Err(_) => {
+                    crate::provider_bugcheck::report(0xc4, [W32_FILE_QUERY_LABEL, packet, raw, 0])
+                }
             };
             if status != raw as u32 {
-                crate::provider_bugcheck::report(0xc4, [W32_FILE_QUERY_LABEL, packet, raw, status as u64]);
+                crate::provider_bugcheck::report(
+                    0xc4,
+                    [W32_FILE_QUERY_LABEL, packet, raw, status as u64],
+                );
             }
             let copied = if nt_io_completion::file_io_status_copies_output(status) {
                 nt_io_manager::completion_output_transfer_len(information, length as u64) as usize

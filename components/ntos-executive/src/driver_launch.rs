@@ -54474,8 +54474,9 @@ pub(crate) unsafe fn service_win32k_file_query(
     packet: u64,
     packet_length: u64,
     handle: u64,
+    expected_file: u64,
 ) -> Option<i32> {
-    hosted_kernel_file_read_query::submit_win32k(ch, packet, packet_length, handle)
+    hosted_kernel_file_read_query::submit_win32k(ch, packet, packet_length, handle, expected_file)
 }
 
 pub(crate) unsafe fn redrive_hosted_driver_zw_read_query_file(handler: *mut ExecNtHandler) {

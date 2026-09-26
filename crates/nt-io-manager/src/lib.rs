@@ -46,6 +46,7 @@ mod file;
 mod file_mode;
 mod file_reference;
 pub mod file_io_capture;
+pub mod file_object_name;
 mod file_information;
 mod hosted_domain;
 mod hosted_transport;
