@@ -1186,7 +1186,7 @@ impl<P> IoManager<P> {
                 status: NtStatus::INVALID_DEVICE_REQUEST,
             });
         };
-        let proj = IrpProjection::from_record(self.irp(irp_id).expect("checked above"))?;
+        let proj = self.file_irp_projection(irp_id)?;
         let backend = self
             .backends
             .get_mut(idx)
@@ -1202,6 +1202,21 @@ impl<P> IoManager<P> {
             ),
             &proj,
         )
+    }
+
+    pub(crate) fn file_irp_projection(&self, irp_id: IrpId) -> Result<IrpProjection, NtStatus> {
+        let irp = self.irp(irp_id).ok_or(NtStatus::INVALID_HANDLE)?;
+        let mut projection = IrpProjection::from_record(irp)?;
+        if crate::is_create_major(projection.major) {
+            if let Some(file_id) = projection.file_id {
+                let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
+                if file.client_id != irp.client_id {
+                    return Err(NtStatus::INVALID_HANDLE);
+                }
+                projection.file_name = Some(file.file_name.clone());
+            }
+        }
+        Ok(projection)
     }
 
     pub(crate) fn complete_external_dispatch(

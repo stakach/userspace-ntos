@@ -501,6 +501,16 @@ impl<P: ObjectManagerPort> IoManager<P> {
         });
         record.set_request_input_fingerprint(&buffers.input);
         let mut projection = IrpProjection::from_record(&record)?;
+        if crate::is_create_major(projection.major) {
+            if let Some(file_id) = projection.file_id {
+                projection.file_name = Some(
+                    self.file(file_id)
+                        .ok_or(NtStatus::INVALID_HANDLE)?
+                        .file_name
+                        .clone(),
+                );
+            }
+        }
         let peer = self
             .driver(projection.driver_id)
             .and_then(|driver| driver.dispatch.get(request.major).driver_peer_id())
@@ -626,7 +636,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 return Err(NtStatus::CANCELLED);
             }
             if record.state != IrpState::Initialized
-                || IrpProjection::from_record(record)? != prepared.0.projection
+                || self.file_irp_projection(prepared.irp_id())? != prepared.0.projection
             {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
