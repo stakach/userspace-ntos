@@ -19,8 +19,9 @@ use core::mem::size_of;
 use bytemuck::Pod;
 use nt_object_abi::{
     opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateFileHandleRequest,
-    ObCreateIoObjectRequest, ObCreateSymbolicLinkRequest, ObDereferenceObjectRequest,
-    ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo, ObReferenceFileHandleRequest,
+    ObCreateIoObjectRequest, ObCreateSymbolicLinkRequest, ObDeleteSymbolicLinkExactRequest,
+    ObDereferenceObjectRequest, ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo,
+    ObReferenceFileHandleRequest,
     ObReferenceHandleRequest, ObReply, ObDirectoryHandleRequest, ObQueryDirectoryRequest,
 };
 use nt_object_manager::{ClientKind, ComponentId, ObjectBody, ObjectManager, ObjectRef};
@@ -104,6 +105,7 @@ impl Server {
             opcode::OB_OP_REFERENCE_HANDLE => self.op_reference_handle(client, in_buf),
             opcode::OB_OP_DEREFERENCE_OBJECT => self.op_dereference_object(client, in_buf),
             opcode::OB_OP_DELETE_OBJECT => self.op_delete_object(in_buf),
+            opcode::OB_OP_DELETE_SYMBOLIC_LINK_EXACT => self.op_delete_symbolic_link_exact(in_buf),
             opcode::OB_OP_LOOKUP_PATH => self.op_lookup(in_buf),
             opcode::OB_OP_RESOLVE_FILE_TARGET => self.op_resolve_file_target(in_buf, out_buf),
             opcode::OB_OP_QUERY_OBJECT => self.op_query_object(in_buf, out_buf),
@@ -200,6 +202,29 @@ impl Server {
             .lookup_path(&parent_path, CaseSensitivity::CaseInsensitive)?;
         self.om
             .remove_named_object(&parent, &leaf, case_of(req.flags))?;
+        Ok(ok())
+    }
+
+    fn op_delete_symbolic_link_exact(&mut self, buf: &[u8]) -> Result<ObReply, NtStatus> {
+        let req: ObDeleteSymbolicLinkExactRequest = read_req(buf)?;
+        check_size::<ObDeleteSymbolicLinkExactRequest>(req.abi_size)?;
+        if req._reserved != 0
+            || req.expected_object_id == 0
+            || req.path_offset != size_of::<ObDeleteSymbolicLinkExactRequest>() as u32
+            || req.flags & !(ObjAttrFlags::CASE_INSENSITIVE.bits() as u16) != 0
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let path = read_path(buf, req.path_offset, req.path_len_bytes)?;
+        let link = self.om.lookup_link(&path, case_of(req.flags))?;
+        self.om.query_symbolic_link(&link)?;
+        if link.id().0 != req.expected_object_id {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        let leaf = path.leaf().ok_or(NtStatus::INVALID_PARAMETER)?.clone();
+        let parent_path = path.parent().ok_or(NtStatus::INVALID_PARAMETER)?;
+        let parent = self.om.lookup_path(&parent_path, CaseSensitivity::CaseInsensitive)?;
+        self.om.remove_named_object(&parent, &leaf, case_of(req.flags))?;
         Ok(ok())
     }
 
