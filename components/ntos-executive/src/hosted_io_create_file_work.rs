@@ -359,15 +359,12 @@ impl Work {
             let target = crate::driver_launch::hosted_reparse_name::capture(
                 file, self.captured.device_id,
             ).and_then(|absolute_name| {
-                let (device_id, prefix) = io_manager_mut()
-                    .device_prefix_for_file_name(&absolute_name, true)
-                    .ok_or(STATUS_OBJECT_NAME_NOT_FOUND as u32)?;
-                require_hosted_device_ready_for_dispatch(device_id.raw())?;
-                let mut relative_name = Vec::new();
-                relative_name.try_reserve_exact(absolute_name.len() - prefix)
-                    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES_LOCAL)?;
-                relative_name.extend_from_slice(&absolute_name[prefix..]);
-                Ok(ReparseTarget { device_id: device_id.raw(), absolute_name, relative_name })
+                let (device_id, relative_name) =
+                    crate::driver_launch::hosted_io_create_file_ingress::resolve_absolute_name(
+                        &absolute_name, true,
+                    )?;
+                require_hosted_device_ready_for_dispatch(device_id)?;
+                Ok(ReparseTarget { device_id, absolute_name, relative_name })
             });
             match target {
                 Ok(target) => self.reparse_target = Some(target),
