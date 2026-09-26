@@ -59,6 +59,31 @@ pub(super) fn capture(
     .ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let packet = unsafe { core::slice::from_raw_parts(exec_packet as *const u8, length) };
     let request = decode(packet).map_err(wire_status)?;
+    resolve_request(caller, request)
+}
+
+pub(super) fn capture_win32k(
+    channel: &crate::spawn_hosts::PumpChannel,
+    component_packet: u64,
+    packet_length: u64,
+) -> Result<CapturedCreate, u32> {
+    let _durable = crate::allocator::enter_durable();
+    let caller = unsafe { crate::provider_registry_caller::resolve(channel)? };
+    let length = usize::try_from(packet_length).map_err(|_| STATUS_INVALID_BUFFER_SIZE as u32)?;
+    if length < nt_io_manager::io_create_file_wire::IO_CREATE_FILE_WIRE_HEADER_BYTES {
+        return Err(STATUS_INVALID_BUFFER_SIZE as u32);
+    }
+    let packet = unsafe {
+        crate::win32k_subsystem::copy_provider_pool_allocation(component_packet, length)?
+    };
+    let request = decode(&packet).map_err(wire_status)?;
+    resolve_request(caller, request)
+}
+
+fn resolve_request(
+    caller: nt_process::native_handle::NativeHandleCaller,
+    request: nt_io_manager::io_create_file::OwnedIoCreateFileRequest,
+) -> Result<CapturedCreate, u32> {
     let case_insensitive = request.object_attributes & 0x40 != 0;
     let (device_id, related_file_id, related_file, relative_name) = if request.root_directory == 0 {
         let (device_id, prefix) = io_manager_mut()
