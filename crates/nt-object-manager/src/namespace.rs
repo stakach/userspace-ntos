@@ -33,7 +33,6 @@ const ROOT_DIRECTORIES: &[&str] = &[
     "KnownDlls",
     "BaseNamedObjects",
     "Sessions",
-    "DosDevices",
     "Windows",
     "ObjectTypes",
     "Driver",
@@ -139,6 +138,12 @@ impl ObjectManager {
                 _ => {}
             }
         }
+        self.create_symbolic_link(
+            &root,
+            &UnicodeString::from_str("DosDevices"),
+            NtPath::parse_str("\\??")?,
+            true,
+        )?;
         if let Some(filesystem) = filesystem {
             self.create_directory(&filesystem, &UnicodeString::from_str("Filters"), true)?;
         }

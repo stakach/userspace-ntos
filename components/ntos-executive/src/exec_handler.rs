@@ -3090,7 +3090,6 @@ pub(super) fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
         b"knowndlls",
         b"basenamedobjects",
         b"sessions",
-        b"dosdevices",
         b"windows",
         b"objecttypes",
         b"driver",
@@ -3099,6 +3098,8 @@ pub(super) fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
     ] {
         ObjEntry::push_dir(&mut v, d, 0, true).expect("initial object directory");
     }
+    ObjEntry::push_symlink(&mut v, b"dosdevices", 0, b"\\??", true)
+        .expect("initial DosDevices alias");
     let bno = v
         .iter()
         .position(|entry| entry.parent == 0 && entry.name() == b"basenamedobjects")

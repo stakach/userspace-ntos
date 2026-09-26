@@ -20,7 +20,7 @@ fn leaf(alias: &Alias) -> &[u8] {
     alias.path.rsplit('\\').next().unwrap_or("").as_bytes()
 }
 
-unsafe fn rollback(aliases: &[Alias; 3], ids: &[u64; 3], count: usize) {
+unsafe fn rollback(aliases: &[Alias; 2], ids: &[u64; 2], count: usize) {
     for (created, id) in aliases[..count].iter().zip(&ids[..count]).rev() {
         unsafe { object_manager_delete_symbolic_link_exact(&created.path, *id) }
             .expect("boot alias rollback requires exact ObjectId deletion");
@@ -43,11 +43,6 @@ pub(crate) unsafe fn publish(
             parent: b"??",
         },
         Alias {
-            path: format!("\\DosDevices\\{drive}"),
-            target: String::from(device_path),
-            parent: b"dosdevices",
-        },
-        Alias {
             path: String::from("\\SystemRoot"),
             target: format!("{device_path}{system_root_suffix}"),
             parent: b"",
@@ -58,7 +53,15 @@ pub(crate) unsafe fn publish(
             entries
                 .try_reserve(aliases.len())
                 .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-            let mut parents = [0usize; 3];
+            let mut parents = [0usize; 2];
+            if !entries.iter().any(|entry| {
+                entry.kind == OBJ_KIND_SYMBOLIC_LINK
+                    && entry.parent == 0
+                    && entry.name() == b"dosdevices"
+                    && entry.target() == b"\\??"
+            }) {
+                return Err(nt_status::NtStatus::OBJECT_PATH_NOT_FOUND);
+            }
             for (index, alias) in aliases.iter().enumerate() {
                 if alias.target.len() > OBJ_NAME_CAP || leaf(alias).len() > OBJ_NAME_CAP {
                     return Err(nt_status::NtStatus::OBJECT_NAME_INVALID);
@@ -83,7 +86,7 @@ pub(crate) unsafe fn publish(
     }
     .map_err(|status| nt_status::NtStatus(status as i32))??;
 
-    let mut ids = [0u64; 3];
+    let mut ids = [0u64; 2];
     for (index, alias) in aliases.iter().enumerate() {
         match unsafe {
             object_manager_create_symbolic_link_path_with_permanence(
@@ -123,6 +126,15 @@ pub(crate) unsafe fn publish(
             unsafe { rollback(&aliases, &ids, aliases.len()) };
             return Err(nt_status::NtStatus::OBJECT_PATH_NOT_FOUND);
         }
+    }
+    let dos_path = format!("\\DosDevices\\{drive}{system_root_suffix}\\System32");
+    let dos_wide: alloc::vec::Vec<u16> = dos_path.encode_utf16().collect();
+    let dos_resolved = unsafe { object_manager_resolve_file_target_owned(&dos_wide, true) };
+    if !dos_resolved.is_ok_and(|(id, suffix)| {
+        id.0 == expected_device && suffix == expected_suffix
+    }) {
+        unsafe { rollback(&aliases, &ids, aliases.len()) };
+        return Err(nt_status::NtStatus::OBJECT_PATH_NOT_FOUND);
     }
 
     unsafe {
