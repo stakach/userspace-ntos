@@ -10,6 +10,32 @@ use alloc::vec::Vec;
 pub const MEMFS_VOLUME: &str = r"\Device\MemFsVolume0";
 pub const DOS_DRIVE_FIXED: u8 = 3;
 
+/// Build the process drive view from live DOS links whose targets are registered devices.
+/// Missing or unregistered aliases do not contribute a drive bit.
+pub fn process_device_map_from_links<'a>(
+    links: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    mut registered_drive_type: impl FnMut(&[u8]) -> Option<u8>,
+) -> (u32, [u8; 32]) {
+    let mut drive_map = 0u32;
+    let mut drive_type = [0u8; 32];
+    for (name, target) in links {
+        if name.len() != 2 || name[1] != b':' {
+            continue;
+        }
+        let letter = name[0].to_ascii_uppercase();
+        if !letter.is_ascii_uppercase() {
+            continue;
+        }
+        let Some(kind) = registered_drive_type(target) else {
+            continue;
+        };
+        let index = usize::from(letter - b'A');
+        drive_map |= 1u32 << index;
+        drive_type[index] = kind;
+    }
+    (drive_map, drive_type)
+}
+
 /// One namespace mount: `prefix` → `target` (a volume-device-relative root) (spec §6.4).
 struct Mount {
     prefix: String,

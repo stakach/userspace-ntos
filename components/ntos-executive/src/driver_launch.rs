@@ -38083,6 +38083,24 @@ fn io_manager_mut() -> &'static mut ExecutiveIoManager {
     }
 }
 
+pub(crate) fn registered_dos_drive_type(target: &[u8]) -> Option<u8> {
+    let wide: alloc::vec::Vec<u16> = target.iter().map(|&byte| u16::from(byte)).collect();
+    let io = io_manager_mut();
+    let (device_id, _) = io.device_prefix_for_file_name(&wide, true)?;
+    let device = io.device(device_id)?;
+    if !matches!(device.device_type, DeviceType::DISK | DeviceType::DISK_FILE_SYSTEM) {
+        return Some(0);
+    }
+    Some(if device
+        .characteristics
+        .contains(DeviceCharacteristics::REMOVABLE_MEDIA)
+    {
+        2
+    } else {
+        nt_fs::DOS_DRIVE_FIXED
+    })
+}
+
 fn pump_io_manager() -> usize {
     let io = io_manager_mut();
     hosted_file_capture::redrive(io);

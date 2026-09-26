@@ -190,6 +190,15 @@ pub(crate) unsafe fn take() -> DispatcherBootstrapSeed {
         .expect("dispatcher bootstrap must transfer its original stores exactly once")
 }
 
+/// Bootstrap-only namespace access. The closure must not call into another component.
+pub(crate) unsafe fn with_object_namespace<R>(
+    operation: impl FnOnce(&mut Vec<ObjEntry>) -> R,
+) -> Result<R, u32> {
+    (&mut *core::ptr::addr_of_mut!(BOOTSTRAP))
+        .with_mut(|seed| operation(&mut seed.obj_ns))
+        .map_err(|_| 0xC000_00A3u32)
+}
+
 /// Memory-only field access. Absence means bootstrap does not own these stores, not empty stores.
 /// No dispatcher reference may survive the callback or cross a provider/hardware effect.
 pub(crate) unsafe fn with_provider_objects<R>(
