@@ -624,6 +624,10 @@ mod tests {
         let om = bootstrapped();
         let root = om.lookup_path(&path("\\"), CI).unwrap();
         assert!(root.is_permanent());
+        assert_eq!(
+            om.lookup_path(&path("\\DosDevices"), CI).unwrap().id(),
+            om.lookup_path(&path("\\??"), CI).unwrap().id()
+        );
         for p in [
             "\\Device",
             "\\Driver",
@@ -927,6 +931,14 @@ mod tests {
 
         assert_eq!(
             om.resolve_file_target(uni("\\??\\c:\\Folder\\Leaf").as_units(), CI)
+                .unwrap(),
+            FilePathTarget {
+                device_object: volume.id(),
+                remaining_name: uni("\\Folder\\Leaf").as_units().to_vec()
+            }
+        );
+        assert_eq!(
+            om.resolve_file_target(uni("\\DosDevices\\c:\\Folder\\Leaf").as_units(), CI)
                 .unwrap(),
             FilePathTarget {
                 device_object: volume.id(),

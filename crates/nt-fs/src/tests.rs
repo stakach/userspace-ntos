@@ -728,6 +728,25 @@ use nt_hive_core::{HiveIoProvider, HiveKind, HiveLogOp, HiveManager, RegistryVal
 const SYSTEM_HIVE: &str = r"\SystemRoot\System32\Config\SYSTEM";
 
 #[test]
+fn process_device_map_reflects_only_registered_dos_links() {
+    let links = [
+        (b"c:".as_slice(), b"\\Device\\VolumeA".as_slice()),
+        (b"D:".as_slice(), b"\\Device\\VolumeB".as_slice()),
+        (b"E:".as_slice(), b"\\Device\\Missing".as_slice()),
+        (b"PRN".as_slice(), b"\\Device\\Printer".as_slice()),
+    ];
+    let (map, types) = process_device_map_from_links(links, |target| match target {
+        b"\\Device\\VolumeA" => Some(DOS_DRIVE_FIXED),
+        b"\\Device\\VolumeB" => Some(2),
+        _ => None,
+    });
+    assert_eq!(map, (1 << 2) | (1 << 3));
+    assert_eq!(types[2], DOS_DRIVE_FIXED);
+    assert_eq!(types[3], 2);
+    assert_eq!(types[4], 0);
+}
+
+#[test]
 fn mount_resolver() {
     let mm = MountManager::new();
     // \SystemRoot → \Device\MemFsVolume0\Windows (spec §13.2, M1 success).

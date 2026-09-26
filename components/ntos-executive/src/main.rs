@@ -20,6 +20,7 @@ extern crate alloc;
 pub use sel4_rt::*;
 
 mod acpi_platform;
+mod boot_namespace;
 mod ahci_maintenance;
 mod allocator;
 mod alpc_selftest;
@@ -29331,7 +29332,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut mounted_volume_install_root = None;
     if let Some(fs) = exec_fs() {
         match mounted_volume::register_mounted_volume(fs) {
-            Ok((device_id, file_ok, installed_root)) => {
+            Ok((device_id, file_ok, installed_root, device_path)) => {
+                // The current boot-image assignment makes the mounted system volume drive C:.
+                // The physical installation directory is discovered, never inferred from C:.
+                let boot_paths = nt_fs::BootPaths::new(b'C', &installed_root)
+                    .expect("validated installation root must fit hosted process paths");
+                boot_namespace::publish(&device_path, &boot_paths)
+                    .expect("mounted system volume aliases must publish before hosted startup");
+                img_spawn::publish_boot_paths(boot_paths);
                 mounted_volume_device_id = Some(device_id);
                 mounted_volume_file_ok = file_ok;
                 mounted_volume_install_root = Some(installed_root);
@@ -30714,7 +30722,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 RW_NX,
                 CAP_INIT_THREAD_VSPACE,
             );
-            img_spawn::initialize_kuser_snapshot(win32k_subsystem::WIN32K_KUSER_SCRATCH_VA);
+            img_spawn::initialize_kuser_snapshot(
+                win32k_subsystem::WIN32K_KUSER_SCRATCH_VA,
+                img_spawn::published_boot_system_root(),
+            );
             if !kuser_kernel_alias_register(win32k_subsystem::WIN32K_KUSER_SCRATCH_VA) {
                 panic!("win32k KUSER publisher registration failed");
             }

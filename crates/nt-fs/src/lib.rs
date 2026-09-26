@@ -12,6 +12,7 @@
 extern crate alloc;
 
 mod byte_lock;
+mod boot_paths;
 mod directory;
 mod fat_directory;
 mod fat_directory_walk;
@@ -34,6 +35,7 @@ mod status;
 mod volume;
 
 pub use byte_lock::*;
+pub use boot_paths::*;
 pub use directory::*;
 pub use fat_directory::*;
 pub use fat_directory_walk::*;
@@ -63,7 +65,8 @@ pub use partition::*;
 pub use path::{
     is_named_pipe_path, is_under_prefix, normalize_separators, nt_file_relative_path_into,
     nt_path_to_volume_relative, nt_path_to_volume_relative_into, writable_mount_relative,
-    writable_mount_relative_into, MountError, MountManager, DOS_DRIVE_FIXED, MEMFS_VOLUME,
+    writable_mount_relative_into, process_device_map_from_links, MountError, MountManager,
+    DOS_DRIVE_FIXED, MEMFS_VOLUME,
 };
 pub use query::*;
 pub use snapshot_store::{

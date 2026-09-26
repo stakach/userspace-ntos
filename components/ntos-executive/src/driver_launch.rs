@@ -37535,7 +37535,10 @@ unsafe fn hosted_kuser_frame() -> Result<u64, nt_status::NtStatus> {
         let _ = cnode_delete_recycle_r(frame);
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
-    crate::img_spawn::initialize_kuser_snapshot(HOSTED_KUSER_SCRATCH_VA);
+    crate::img_spawn::initialize_kuser_snapshot(
+        HOSTED_KUSER_SCRATCH_VA,
+        crate::img_spawn::published_boot_system_root(),
+    );
     if !crate::kuser_kernel_alias_register(HOSTED_KUSER_SCRATCH_VA) {
         let _ = page_unmap_r(scratch_cap);
         let _ = cnode_delete_recycle_r(scratch_cap);
@@ -38078,6 +38081,24 @@ fn io_manager_mut() -> &'static mut ExecutiveIoManager {
         }
         (*slot).assume_init_mut()
     }
+}
+
+pub(crate) fn registered_dos_drive_type(target: &[u8]) -> Option<u8> {
+    let wide: alloc::vec::Vec<u16> = target.iter().map(|&byte| u16::from(byte)).collect();
+    let io = io_manager_mut();
+    let (device_id, _) = io.device_prefix_for_file_name(&wide, true)?;
+    let device = io.device(device_id)?;
+    if !matches!(device.device_type, DeviceType::DISK | DeviceType::DISK_FILE_SYSTEM) {
+        return Some(0);
+    }
+    Some(if device
+        .characteristics
+        .contains(DeviceCharacteristics::REMOVABLE_MEDIA)
+    {
+        2
+    } else {
+        nt_fs::DOS_DRIVE_FIXED
+    })
 }
 
 fn pump_io_manager() -> usize {

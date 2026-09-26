@@ -3090,7 +3090,6 @@ pub(super) fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
         b"knowndlls",
         b"basenamedobjects",
         b"sessions",
-        b"dosdevices",
         b"windows",
         b"objecttypes",
         b"driver",
@@ -3099,6 +3098,8 @@ pub(super) fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
     ] {
         ObjEntry::push_dir(&mut v, d, 0, true).expect("initial object directory");
     }
+    ObjEntry::push_symlink(&mut v, b"dosdevices", 0, b"\\??", true)
+        .expect("initial DosDevices alias");
     let bno = v
         .iter()
         .position(|entry| entry.parent == 0 && entry.name() == b"basenamedobjects")
@@ -15706,7 +15707,27 @@ impl ExecNtHandler {
                     handle,
                     nt_process::PROCESS_QUERY_INFORMATION,
                 )?;
-                let (drive_map, drive_type) = nt_fs::MountManager::new().process_device_map();
+                let dos_parent = self
+                    .obj_ns
+                    .iter()
+                    .position(|entry| {
+                        entry.kind == OBJ_KIND_DIRECTORY
+                            && entry.parent == 0
+                            && entry.name() == b"??"
+                    })
+                    .ok_or(nt_fs::STATUS_OBJECT_PATH_NOT_FOUND)?;
+                let (drive_map, drive_type) = nt_fs::process_device_map_from_links(
+                    self.obj_ns
+                        .iter()
+                        .filter(|entry| {
+                            entry.is_live()
+                                && entry.kind == OBJ_KIND_SYMBOLIC_LINK
+                                && entry.parent == dos_parent
+                                && entry.payload != 0
+                        })
+                        .map(|entry| (entry.name(), entry.target())),
+                    driver_launch::registered_dos_drive_type,
+                );
                 put_u32(&mut output, 0, drive_map);
                 output[4..0x24].copy_from_slice(&drive_type);
                 0x24
