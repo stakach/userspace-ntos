@@ -2,11 +2,9 @@
 
 use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
+use nt_io_manager::file_read_query_wire::{self as wire, FileReadQueryRequest, FileReadQueryWireError};
 use nt_process::native_handle::{NativeHandleCaller, NativeThreadProcessReference};
 
-const HEADER_BYTES: usize = 40;
-const READ: u32 = 1;
-const QUERY: u32 = 2;
 const STATUS_NOT_SUPPORTED_LOCAL: i32 = 0xc000_00bbu32 as i32;
 const STATUS_INVALID_INFO_CLASS_LOCAL: i32 = 0xc000_0003u32 as i32;
 const STATUS_INFO_LENGTH_MISMATCH_LOCAL: i32 = 0xc000_0004u32 as i32;
@@ -14,14 +12,16 @@ const FILE_READ_DATA: u32 = 0x0000_0001;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_ALL: u32 = 0x1000_0000;
 
-const KIND_OFF: u64 = 0;
-const CODE_OFF: u64 = 4;
-const OFFSET_OFF: u64 = 8;
-const KEY_OFF: u64 = 16;
-const LENGTH_OFF: u64 = 20;
 const COMPLETED_OFF: u64 = 24;
-const STATUS_OFF: u64 = 28;
-const INFORMATION_OFF: u64 = 32;
+
+fn wire_status(error: FileReadQueryWireError) -> u32 {
+    match error {
+        FileReadQueryWireError::InvalidClass => STATUS_INVALID_INFO_CLASS_LOCAL as u32,
+        FileReadQueryWireError::LengthMismatch => STATUS_INFO_LENGTH_MISMATCH_LOCAL as u32,
+        FileReadQueryWireError::BufferTooSmall => STATUS_INVALID_BUFFER_SIZE as u32,
+        FileReadQueryWireError::Malformed => STATUS_INVALID_PARAMETER as u32,
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Operation {
@@ -70,38 +70,19 @@ fn capture_packet(
     packet_length: u64,
 ) -> Result<(Operation, Vec<u8>), u32> {
     let total = usize::try_from(packet_length).map_err(|_| STATUS_INVALID_BUFFER_SIZE as u32)?;
-    if total < HEADER_BYTES || packet_length >= FSD_POOL_FRAMES * 0x1000 {
+    if total < wire::HEADER_BYTES || packet_length >= FSD_POOL_FRAMES * 0x1000 {
         return Err(STATUS_INVALID_BUFFER_SIZE as u32);
     }
     let exec =
         unsafe { hosted_instance_pool_allocation_exec_if_live(instance, packet, packet_length) }
             .ok_or(STATUS_INVALID_PARAMETER as u32)?;
-    let kind = unsafe { read_unaligned((exec + KIND_OFF) as *const u32) };
-    let code = unsafe { read_unaligned((exec + CODE_OFF) as *const u32) };
-    let offset = unsafe { read_unaligned((exec + OFFSET_OFF) as *const u64) };
-    let key = unsafe { read_unaligned((exec + KEY_OFF) as *const u32) };
-    let length = unsafe { read_unaligned((exec + LENGTH_OFF) as *const u32) } as usize;
-    if HEADER_BYTES.checked_add(length) != Some(total) {
-        return Err(STATUS_INVALID_BUFFER_SIZE as u32);
-    }
-    let operation = match kind {
-        READ if code as usize == length && (offset as i64) >= 0 => {
-            Operation::Read(ReadWriteParameters {
-                length: code,
-                key,
-                offset,
-            })
-        }
-        QUERY if offset == 0 && key == 0 => {
-            let contract = nt_io_manager::query_information_contract(code)
-                .ok_or(STATUS_INVALID_INFO_CLASS_LOCAL as u32)?;
-            if length < contract.minimum_length() {
-                return Err(STATUS_INFO_LENGTH_MISMATCH_LOCAL as u32);
-            }
-            Operation::Query(code)
-        }
-        _ => return Err(STATUS_INVALID_PARAMETER as u32),
+    let request = wire::decode_request(unsafe { core::slice::from_raw_parts(exec as *const u8, total) })
+        .map_err(wire_status)?;
+    let operation = match request {
+        FileReadQueryRequest::Read(parameters) => Operation::Read(parameters),
+        FileReadQueryRequest::Query { class, .. } => Operation::Query(class),
     };
+    let length = request.output_len() as usize;
     let mut output = Vec::new();
     output
         .try_reserve_exact(length)
@@ -427,14 +408,10 @@ impl Work {
         else {
             return false;
         };
-        core::ptr::copy_nonoverlapping(
-            self.output.as_ptr(),
-            (exec + HEADER_BYTES as u64) as *mut u8,
-            self.output.len(),
-        );
-        write_unaligned((exec + STATUS_OFF) as *mut u32, status);
-        write_unaligned((exec + INFORMATION_OFF) as *mut u64, information);
-        write_unaligned((exec + COMPLETED_OFF) as *mut u32, 1);
+        let packet = core::slice::from_raw_parts_mut(exec as *mut u8, self.packet_length as usize);
+        if wire::publish_completion(packet, &self.output, status, information).is_err() {
+            crate::provider_bugcheck::report(0xc4, [self.packet, self.packet_length, self.file.file_id(), status as u64]);
+        }
         (*handler)
             .file_completion
             .set_signaled(self.file.file_id(), true)
@@ -492,27 +469,24 @@ fn invoke(handle: u64, iosb: u64, output: u64, length: u32, operation: Operation
     if iosb == 0 || (length != 0 && output == 0) {
         return STATUS_INVALID_PARAMETER;
     }
-    let total = match HEADER_BYTES.checked_add(length as usize) {
-        Some(total) if (total as u64) < FSD_POOL_FRAMES * 0x1000 => total,
+    let total = match wire::packet_len(length) {
+        Ok(total) if (total as u64) < FSD_POOL_FRAMES * 0x1000 => total,
         _ => return STATUS_INVALID_BUFFER_SIZE as i32,
     };
     let packet = unsafe { pool_alloc(total as u64) };
     if packet == 0 {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    unsafe {
-        let (kind, code, offset, key) = match operation {
-            Operation::Read(parameters) => {
-                (READ, parameters.length, parameters.offset, parameters.key)
-            }
-            Operation::Query(class) => (QUERY, class, 0, 0),
-        };
-        write_unaligned((packet + KIND_OFF) as *mut u32, kind);
-        write_unaligned((packet + CODE_OFF) as *mut u32, code);
-        write_unaligned((packet + OFFSET_OFF) as *mut u64, offset);
-        write_unaligned((packet + KEY_OFF) as *mut u32, key);
-        write_unaligned((packet + LENGTH_OFF) as *mut u32, length);
-        write_unaligned((packet + COMPLETED_OFF) as *mut u32, 0);
+    let request = match operation {
+        Operation::Read(parameters) => FileReadQueryRequest::Read(parameters),
+        Operation::Query(class) => FileReadQueryRequest::Query { class, length },
+    };
+    if let Err(error) = wire::encode_request(
+        request,
+        unsafe { core::slice::from_raw_parts_mut(packet as *mut u8, total) },
+    ) {
+        unsafe { pool_free(packet) };
+        return wire_status(error) as i32;
     }
     let (label, status, _, _, _) = unsafe {
         call_on4(
@@ -532,8 +506,14 @@ fn invoke(handle: u64, iosb: u64, output: u64, length: u32, operation: Operation
         }
     }
     let result = if unsafe { read_unaligned((packet + COMPLETED_OFF) as *const u32) } == 1 {
-        let terminal = unsafe { read_unaligned((packet + STATUS_OFF) as *const u32) };
-        let information = unsafe { read_unaligned((packet + INFORMATION_OFF) as *const u64) };
+        let (terminal, information, bytes) = match wire::decode_completion(unsafe {
+            core::slice::from_raw_parts(packet as *const u8, total)
+        }) {
+            Ok(completion) => completion,
+            Err(_) => unsafe {
+                crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_ZW_READ_QUERY_FILE_LABEL, packet, total as u64, status])
+            },
+        };
         let copied = if nt_io_completion::file_io_status_copies_output(terminal) {
             nt_io_manager::completion_output_transfer_len(information, length as u64) as usize
         } else {
@@ -542,7 +522,7 @@ fn invoke(handle: u64, iosb: u64, output: u64, length: u32, operation: Operation
         unsafe {
             if copied != 0 {
                 core::ptr::copy_nonoverlapping(
-                    (packet + HEADER_BYTES as u64) as *const u8,
+                    bytes.as_ptr(),
                     output as *mut u8,
                     copied,
                 );
