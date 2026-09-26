@@ -9,3 +9,6 @@ authors.workspace = true
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
+
+[dev-dependencies]
+syn = { version = "2", features = ["full", "visit"] }

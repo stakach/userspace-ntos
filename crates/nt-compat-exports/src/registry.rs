@@ -158,6 +158,119 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use std::collections::BTreeSet;
+    use syn::visit::Visit;
+
+    struct ProductionBindings {
+        names: BTreeSet<std::string::String>,
+        data_export_loops: usize,
+    }
+
+    impl<'ast> Visit<'ast> for ProductionBindings {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "bind"
+                && matches!(&*call.receiver, syn::Expr::Path(path) if path.path.is_ident("reg"))
+            {
+                let name = call.args.first().expect("reg.bind requires a name");
+                match name {
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(name),
+                        ..
+                    }) => {
+                        self.names.insert(name.value());
+                    }
+                    syn::Expr::Field(field)
+                        if matches!(&field.member, syn::Member::Unnamed(index) if index.index == 0)
+                            && matches!(&*field.base, syn::Expr::Index(index)
+                                if matches!(&*index.expr, syn::Expr::Path(path)
+                                    if path.path.is_ident("DATA_EXPORTS"))) =>
+                    {
+                        self.data_export_loops += 1;
+                    }
+                    _ => panic!("unrecognized dynamic win32k export binding"),
+                }
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+
+    fn production_data_exports(source: &syn::File) -> std::vec::Vec<std::string::String> {
+        let item = source.items.iter().find_map(|item| match item {
+            syn::Item::Const(item) if item.ident == "DATA_EXPORTS" => Some(item),
+            _ => None,
+        });
+        let item = item.expect("production DATA_EXPORTS constant is absent");
+        let syn::Expr::Reference(reference) = &*item.expr else {
+            panic!("production DATA_EXPORTS is not a slice");
+        };
+        let syn::Expr::Array(array) = &*reference.expr else {
+            panic!("production DATA_EXPORTS is not an array");
+        };
+        array
+            .elems
+            .iter()
+            .map(|entry| {
+                let syn::Expr::Tuple(tuple) = entry else {
+                    panic!("production data export is not a name/value pair");
+                };
+                let Some(syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(name),
+                    ..
+                })) = tuple.elems.first()
+                else {
+                    panic!("production data export name is not a string literal");
+                };
+                name.value()
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "issue #88: win32k production bindings are incomplete"]
+    fn win32k_production_bindings_cover_required_imports() {
+        // Parse the actual executive registration code. A descriptor's Available status does not
+        // prove that the production win32k registry binds a trampoline for it.
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../components/ntos-executive/src/win32k_subsystem.rs"
+        ));
+        let source = syn::parse_file(source).expect("production win32k source must parse");
+        let register = source.items.iter().find_map(|item| match item {
+            syn::Item::Fn(item) if item.sig.ident == "register_trampolines" => Some(item),
+            _ => None,
+        });
+        let register = register.expect("production register_trampolines function is absent");
+        let mut bindings = ProductionBindings {
+            names: BTreeSet::new(),
+            data_export_loops: 0,
+        };
+        bindings.visit_block(&register.block);
+        assert_eq!(
+            bindings.data_export_loops, 1,
+            "production data-export registration loop changed"
+        );
+
+        let production_data = production_data_exports(&source);
+        let production_data_names: std::vec::Vec<_> =
+            production_data.iter().map(std::string::String::as_str).collect();
+        assert_eq!(
+            production_data_names.as_slice(),
+            crate::WIN32K_DATA_EXPORTS,
+            "production data-export cell order differs from the declared contract"
+        );
+        bindings.names.extend(production_data);
+
+        let absent: std::vec::Vec<_> = crate::WIN32K_NTOSKRNL_IMPORTS
+            .iter()
+            .chain(crate::WIN32K_HAL_IMPORTS.iter())
+            .filter(|name| !bindings.names.contains(**name))
+            .copied()
+            .collect();
+        assert!(
+            absent.is_empty(),
+            "win32k required imports without production bindings: {absent:?}"
+        );
+    }
 
     #[test]
     fn resolves_known_exports() {

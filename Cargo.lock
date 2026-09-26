@@ -216,6 +216,9 @@ version = "0.1.0"
 [[package]]
 name = "nt-compat-exports"
 version = "0.1.0"
+dependencies = [
+ "syn",
+]
 
 [[package]]
 name = "nt-component-suspension"
