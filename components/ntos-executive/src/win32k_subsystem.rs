@@ -1183,6 +1183,7 @@ pub const W32_DEVICE_PROPERTY_LABEL: u64 = 0x780;
 pub const W32_DEVICE_POINTER_LABEL: u64 = 0x781;
 /// Pointer-free staged Object Manager directory requests.
 pub const W32_DIRECTORY_LABEL: u64 = 0x782;
+pub const W32_FILE_CLOSE_LABEL: u64 = 0x790;
 /// Root-authenticated kernel activation handoff before entering provider code.
 pub const W32_KERNEL_ACTIVATION_LABEL: u64 = 0x78E;
 pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
@@ -3503,6 +3504,7 @@ static mut OBJ_TABLE: ObHandleTable = ObHandleTable::new();
 
 mod object_security;
 mod directory_object;
+mod file_close;
 pub(crate) use object_security::census as object_security_census;
 
 /// Duplicate a handle owned by win32k's USER object table. Native `NtDuplicateObject` calls this
@@ -3763,6 +3765,13 @@ extern "win64" fn s_zw_close(handle: u64) -> i32 {
         let (status, _, _) =
             unsafe { win32k_registry_broker_call(WIN32K_REGISTRY_OP_CLOSE, handle) };
         return status;
+    }
+    if ObHandleTable::is_handle_namespace_value(handle) {
+        return s_ob_close_handle(handle, 0);
+    }
+    let file_status = unsafe { file_close::close(handle) };
+    if !matches!(file_status as u32, 0xC000_0008 | 0xC000_0024) {
+        return file_status;
     }
     let directory_status = unsafe { directory_object::close(handle) };
     if !matches!(directory_status as u32, 0xC000_0008 | 0xC000_0024) {

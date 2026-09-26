@@ -325,9 +325,10 @@ pub(super) unsafe fn service_event(
     result.unwrap_or_else(|status| (status as i32, 0, 0, 0))
 }
 
-pub(super) unsafe fn validate_directory_service_call(
+pub(super) unsafe fn validate_win32k_service_call(
     channel: &spawn_hosts::PumpChannel,
     envelope: nt_user_host::provider_kernel_activation::KernelProviderServiceEnvelope,
+    expected_message_info: u64,
 ) -> Result<(), u32> {
     let caller = authenticated_channel_caller(channel)?;
     with_provider_process_manager(|pm| {
@@ -337,7 +338,7 @@ pub(super) unsafe fn validate_directory_service_call(
             &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
             &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
             envelope,
-            (win32k_subsystem::W32_DIRECTORY_LABEL << 12) | 4,
+            expected_message_info,
         )
     })
 }

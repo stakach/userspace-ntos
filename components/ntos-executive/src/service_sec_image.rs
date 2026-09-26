@@ -4403,7 +4403,7 @@ pub(crate) unsafe fn service_win32k_directory_request(
             message_info: mi,
             reply_cap,
         };
-        if let Err(status) = kernel_provider_activation::validate_directory_service_call(channel, envelope) {
+        if let Err(status) = kernel_provider_activation::validate_win32k_service_call(channel, envelope, mi) {
             return (status as i32, 0, 0, 0);
         }
     }
@@ -4416,6 +4416,53 @@ pub(crate) unsafe fn service_win32k_directory_request(
         return (NOT_READY, 0, 0, 0);
     }
     crate::provider_directory_broker::dispatch(&mut *pointer, route, dispatch, caller, op, m1, m2, m3)
+}
+
+pub(crate) unsafe fn service_win32k_file_close_request(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    handle: u64,
+    spare: [u64; 3],
+) -> crate::hosted_routed_file_close_work::SubmitResult {
+    use crate::hosted_routed_file_close_work::SubmitResult;
+    use spawn_hosts::shared_ingress::owner::runtime;
+    const INVALID: i32 = nt_process::STATUS_INVALID_PARAMETER as i32;
+    if channel.caps.kind != spawn_hosts::ReqKind::Syscall
+        || mi != ((crate::win32k_subsystem::W32_FILE_CLOSE_LABEL << 12) | 4)
+        || reply_cap != channel.reply_cap
+        || spare != [0; 3]
+    {
+        return SubmitResult::Ready(INVALID);
+    }
+    let Ok(Some(route)) = runtime::channel_route(channel) else {
+        return SubmitResult::Ready(INVALID);
+    };
+    if route.badge() != badge
+        || !matches!(runtime::current_reply(route), Ok(current) if current == reply_cap)
+        || runtime::dispatch(route).is_err()
+    {
+        return SubmitResult::Ready(INVALID);
+    }
+    if channel.kernel_caller.is_some() {
+        let envelope = nt_user_host::provider_kernel_activation::KernelProviderServiceEnvelope {
+            badge,
+            message_info: mi,
+            reply_cap,
+        };
+        if let Err(status) = kernel_provider_activation::validate_win32k_service_call(channel, envelope, mi) {
+            return SubmitResult::Ready(status as i32);
+        }
+    }
+    let caller = match crate::provider_registry_caller::resolve(channel) {
+        Ok(caller) => caller,
+        Err(status) => return SubmitResult::Ready(status as i32),
+    };
+    if SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) == 0 {
+        return SubmitResult::Ready(0xC000_00A3u32 as i32);
+    }
+    crate::hosted_routed_file_close_work::submit(channel, caller, handle)
 }
 
 /// The canonical shared-ingress completion owns final cleanup of unpublished stages.

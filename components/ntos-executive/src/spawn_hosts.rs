@@ -2408,6 +2408,31 @@ unsafe fn component_pump_loop(
                 }
             }
             continue;
+        } else if label == crate::win32k_subsystem::W32_FILE_CLOSE_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let result = if shared_pump::authenticated_badge(ch, msg.badge) {
+                crate::service_sec_image::service_win32k_file_close_request(
+                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, [msg.m1, msg.m2, msg.m3],
+                )
+            } else {
+                crate::hosted_routed_file_close_work::SubmitResult::Ready(
+                    nt_process::STATUS_INVALID_PARAMETER as i32,
+                )
+            };
+            match result {
+                crate::hosted_routed_file_close_work::SubmitResult::Ready(status) => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+                }
+                crate::hosted_routed_file_close_work::SubmitResult::Deferred => {
+                    if shared_pump::autonomous(ch) {
+                        outcome.provider_wait_suspended = true;
+                        break;
+                    }
+                    msg = pump_recv(ch, *reply_cap);
+                }
+            }
+            continue;
         } else if label == crate::win32k_subsystem::W32_DIRECTORY_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
