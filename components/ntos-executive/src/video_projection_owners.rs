@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
 
-use nt_io_manager::{FileId, HostedFileIdentity, WdmFileObjectInit, WDM_X64_FILE_OBJECT_SIZE};
+use nt_io_manager::{FileId, HostedFileIdentity, WDM_X64_FILE_OBJECT_SIZE};
 use nt_status::NtStatus;
 
 #[derive(Clone, Copy)]
@@ -107,7 +107,7 @@ pub(super) unsafe fn prepare(
         return Err(NtStatus::INVALID_PARAMETER);
     }
     rows_mut()[index].as_mut().unwrap().in_flight = true;
-    let result = prepare_inner(index, device_id, device_address, allocate);
+    let result = prepare_inner(index, device_id, allocate);
     let row = rows_mut()[index].as_mut().unwrap();
     row.in_flight = false;
     if row.retiring {
@@ -119,15 +119,9 @@ pub(super) unsafe fn prepare(
 unsafe fn prepare_inner(
     index: usize,
     device_id: u64,
-    device_address: u64,
     allocate: unsafe fn(u64) -> u64,
 ) -> Result<u64, NtStatus> {
     let file = snapshot(index).file;
-    let metadata = crate::driver_launch::owned_hosted_file_metadata(file)
-        .map_err(|status| NtStatus(status as i32))?;
-    if metadata.device_id.raw() != device_id {
-        return Err(NtStatus::INVALID_DEVICE_REQUEST);
-    }
     let address = allocate(WDM_X64_FILE_OBJECT_SIZE as u64);
     if address == 0 {
         return Err(NtStatus::INSUFFICIENT_RESOURCES);
@@ -137,21 +131,6 @@ unsafe fn prepare_inner(
     if snapshot(index).retiring {
         return Err(NtStatus::DELETE_PENDING);
     }
-    nt_io_manager::write_wdm_file_object(
-        core::slice::from_raw_parts_mut(address as *mut u8, WDM_X64_FILE_OBJECT_SIZE),
-        WdmFileObjectInit {
-            file_object_address: address,
-            opened_case_sensitive: metadata.opened_case_sensitive,
-            create_options: metadata.create_options.bits(),
-            device_object: device_address,
-            fs_context: file,
-            related_file_object: 0,
-            file_name_len: 0,
-            file_name_max_len: 0,
-            file_name_buffer: 0,
-        },
-    )
-    .map_err(|_| NtStatus::INVALID_PARAMETER)?;
     let identity = crate::driver_launch::win32k_device_consumer::bind_file_projection(
         address,
         FileId(file),
@@ -159,6 +138,11 @@ unsafe fn prepare_inner(
     )
     .map_err(NtStatus)?;
     rows_mut()[index].as_mut().unwrap().identity = Some(identity);
+    crate::driver_launch::win32k_device_consumer::write_file_projection(
+        identity,
+        nt_io_manager::DeviceId(device_id),
+    )
+    .map_err(NtStatus)?;
     Ok(address)
 }
 

@@ -9,7 +9,7 @@ use nt_status::NtStatus;
 
 use crate::{
     DeviceId, FileId, FileReference, FileState, HostedDevicePointerRegistration, HostedFileIdentity,
-    HostedFileUnbindOutcome, IoManager,
+    HostedFileUnbindOutcome, IoManager, WdmFileObjectInit, WDM_X64_FILE_OBJECT_SIZE,
 };
 
 /// Fields that can be copied into a consumer-domain FILE_OBJECT. FsContext and the related
@@ -39,6 +39,42 @@ pub fn consumer_file_metadata<P>(
         create_options: file.create_options.bits(),
         opened_case_sensitive: file.opened_case_sensitive(),
     })
+}
+
+/// Initialize a File body in the consumer's address space from exact canonical bindings.
+/// Provider FsContext is deliberately not projected into a different address space.
+pub fn write_consumer_wdm_file_object<P>(
+    io: &IoManager<P>,
+    identity: HostedFileIdentity,
+    device: HostedDevicePointerRegistration,
+    bytes: &mut [u8],
+) -> Result<(), NtStatus> {
+    if identity.domain() != device.domain()
+        || io.hosted_file_identity_at(identity.domain(), identity.file_id(), identity.address())?
+            != Some(identity)
+        || io.hosted_device_pointer_registration(device.domain(), device.address()) != Some(device)
+    {
+        return Err(NtStatus::INVALID_HANDLE);
+    }
+    let metadata = consumer_file_metadata(io, identity.file_id(), device.device_id())?;
+    if bytes.len() < WDM_X64_FILE_OBJECT_SIZE {
+        return Err(NtStatus::BUFFER_TOO_SMALL);
+    }
+    crate::write_wdm_file_object(
+        bytes,
+        WdmFileObjectInit {
+            file_object_address: identity.address(),
+            opened_case_sensitive: metadata.opened_case_sensitive,
+            create_options: metadata.create_options,
+            device_object: device.address(),
+            fs_context: 0,
+            related_file_object: 0,
+            file_name_len: 0,
+            file_name_max_len: 0,
+            file_name_buffer: 0,
+        },
+    )
+    .map_err(|_| NtStatus::INVALID_PARAMETER)
 }
 
 #[derive(Debug)]
@@ -268,6 +304,38 @@ mod tests {
         assert!(!projection.is_ready_to_retire());
         projection.dereference(&mut io, identity).unwrap();
         projection.retire(&mut io).unwrap();
+    }
+
+    #[test]
+    fn consumer_file_body_uses_local_device_and_never_provider_context() {
+        let (mut io, identity, device) = opened();
+        io.file_mut(identity.file_id()).unwrap().driver_context = Some(0xdead_beef);
+        let mut bytes = [0xa5; WDM_X64_FILE_OBJECT_SIZE];
+        write_consumer_wdm_file_object(&io, identity, device, &mut bytes).unwrap();
+        let word = |offset| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        assert_eq!(word(0x08), device.address());
+        assert_eq!(word(0x18), 0);
+        assert_eq!(word(0x98 + 8), identity.address() + 0x98 + 8);
+        assert_eq!(word(0x98 + 0x10), identity.address() + 0x98 + 8);
+        assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), 5);
+    }
+
+    #[test]
+    fn stale_file_binding_cannot_modify_consumer_file_body() {
+        let (mut io, stale, device) = opened();
+        assert_eq!(io.unbind_hosted_file_identity(stale), Ok(HostedFileUnbindOutcome::Removed));
+        let current = io
+            .bind_hosted_file_identity(stale.domain(), stale.address(), stale.file_id())
+            .unwrap();
+        assert_ne!(stale, current);
+        let mut bytes = [0xa5; WDM_X64_FILE_OBJECT_SIZE];
+        assert_eq!(
+            write_consumer_wdm_file_object(&io, stale, device, &mut bytes),
+            Err(NtStatus::INVALID_HANDLE),
+        );
+        assert!(bytes.iter().all(|byte| *byte == 0xa5));
+        write_consumer_wdm_file_object(&io, current, device, &mut bytes).unwrap();
+        assert_eq!(u64::from_le_bytes(bytes[0x08..0x10].try_into().unwrap()), device.address());
     }
 
     #[test]
