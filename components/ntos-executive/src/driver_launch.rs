@@ -43665,7 +43665,7 @@ pub(crate) fn open_io_device(
 ) -> Result<(u64, u64, u64, u64), nt_status::NtStatus> {
     let path = parse_nt_path(device_path).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let client = ClientId(IO_MANAGER_COMPONENT_ID);
-    let handle = io_manager_mut().open(
+    let (handle, file_id, device_id, file_object_id) = io_manager_mut().open_with_details(
         client,
         &path,
         desired_access,
@@ -43673,8 +43673,6 @@ pub(crate) fn open_io_device(
         CreateOptions::NON_DIRECTORY_FILE,
         1,
     )?;
-    let (file_id, device_id, file_object_id) =
-        io_manager_mut().reference_open_file_details(client, handle, AccessMask::empty())?;
     Ok((handle.0, file_id.raw(), device_id.raw(), file_object_id.0))
 }
 

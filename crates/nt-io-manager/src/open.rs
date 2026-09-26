@@ -44,6 +44,117 @@ enum DriverInstallKind {
     Peer,
 }
 
+#[cfg(test)]
+mod open_with_details_tests {
+    use super::*;
+    use crate::{MockDriverBackend, MockObjectPort};
+
+    fn path(name: &str) -> NtPath {
+        NtPath::parse_str(name).unwrap()
+    }
+
+    #[test]
+    fn resolves_two_registered_devices_and_a_symbolic_link() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let client = io.register_client();
+        let driver = io
+            .create_driver(
+                &path(r"\Driver\OpenDetails"),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        let first_path = path(r"\Device\OpenDetailsA");
+        let second_path = path(r"\Device\OpenDetailsB");
+        let first = io
+            .create_device(
+                driver,
+                Some(&first_path),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let second = io
+            .create_device(
+                driver,
+                Some(&second_path),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let link = path(r"\DosDevices\OpenDetailsB");
+        io.create_symbolic_link(&link, &second_path).unwrap();
+
+        let (first_handle, first_file, first_device, first_object) = io
+            .open_with_details(
+                client,
+                &first_path,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::NON_DIRECTORY_FILE,
+                1,
+            )
+            .unwrap();
+        let (second_handle, second_file, second_device, second_object) = io
+            .open_with_details(
+                client,
+                &link,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::NON_DIRECTORY_FILE,
+                1,
+            )
+            .unwrap();
+        assert_eq!((first_device, second_device), (first, second));
+        assert_ne!(first_file, second_file);
+        assert_ne!(first_object, second_object);
+        io.close(client, first_handle).unwrap();
+        io.close(client, second_handle).unwrap();
+        assert_eq!(io.port().live_handle_count(), 0);
+    }
+
+    #[test]
+    fn failed_identity_lookup_closes_the_transient_handle() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let client = io.register_client();
+        let driver = io
+            .create_driver(
+                &path(r"\Driver\OpenRollback"),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        let device_path = path(r"\Device\OpenRollback");
+        io.create_device(
+            driver,
+            Some(&device_path),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        io.port_mut().fail_next_file_reference();
+        assert!(matches!(
+            io.open_with_details(
+                client,
+                &device_path,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::NON_DIRECTORY_FILE,
+                1,
+            ),
+            Err(NtStatus::INVALID_HANDLE)
+        ));
+        assert_eq!(io.port().live_handle_count(), 0);
+        assert_eq!(io.port().retained_reference_count(), 0);
+        io.pump();
+        assert_eq!(io.file_count(), 0);
+    }
+}
+
 impl<P: ObjectManagerPort> IoManager<P> {
     /// Register an I/O client with the Object Manager (its handles live there).
     pub fn register_client(&mut self) -> ClientId {
@@ -293,6 +404,35 @@ impl<P: ObjectManagerPort> IoManager<P> {
     /// Delete a symbolic link through the Object Manager (spec §11.4).
     pub fn delete_symbolic_link(&mut self, link: &NtPath) -> Result<(), NtStatus> {
         self.port.delete_symbolic_link(link)
+    }
+
+    /// Open a device File and resolve the exact File, Device and Object Manager identities.
+    /// A failed post-open lookup closes the transient handle before reporting the failure.
+    pub fn open_with_details(
+        &mut self,
+        client: ClientId,
+        path: &NtPath,
+        desired_access: AccessMask,
+        share_access: ShareAccess,
+        create_options: CreateOptions,
+        create_disposition: u32,
+    ) -> Result<(HandleValue, FileId, DeviceId, ObjectId), NtStatus> {
+        let handle = self.open(
+            client,
+            path,
+            desired_access,
+            share_access,
+            create_options,
+            create_disposition,
+        )?;
+        match self.reference_open_file_details(client, handle, AccessMask::empty()) {
+            Ok((file, device, object)) => Ok((handle, file, device, object)),
+            Err(status) => {
+                self.close(client, handle)
+                    .expect("opened device File must remain closable after identity lookup failure");
+                Err(status)
+            }
+        }
     }
 
     /// Open (create) a file on a device `path` (spec §12.3). Returns the Object
