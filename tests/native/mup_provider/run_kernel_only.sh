@@ -43,6 +43,7 @@ fi
 # than the individual query trace for that proof.
 if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || ! grep -Fq 'PASS exec_mounted_volume_external_file_dispatch_font_read' "$RUN_LOG" \
+   || ! grep -Fq 'PASS exec_mounted_volume_directory_create_query_close' "$RUN_LOG" \
    || ! grep -Fq 'PASS exec_mounted_volume_external_overlay_create_write_read_close' "$RUN_LOG" \
    || ! grep -Fq 'PASS exec_mounted_volume_installed_file_copy_up_and_delete' "$RUN_LOG" \
    || grep -Fq '[win32k-import] reject image' "$RUN_LOG" \

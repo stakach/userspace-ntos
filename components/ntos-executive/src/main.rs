@@ -29722,6 +29722,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             mounted_volume_ingress_ok,
             &mut passed,
         );
+        let mounted_directory_open_ok = mounted_volume_device_id
+            .is_some_and(|device_id| mounted_volume_ingress_probe::run_directory(device_id));
+        check(
+            b"exec_mounted_volume_directory_create_query_close",
+            mounted_directory_open_ok,
+            &mut passed,
+        );
         let mounted_overlay_ingress_ok = mounted_volume_device_id
             .is_some_and(|device_id| mounted_volume_ingress_probe::run_overlay(device_id));
         check(
