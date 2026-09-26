@@ -26,14 +26,14 @@ const INFORMATION_OFF: u64 = 32;
 #[derive(Clone, Copy)]
 enum Operation {
     Read(ReadWriteParameters),
-    QueryStandard,
+    Query(u32),
 }
 
 impl Operation {
     fn major(self) -> u8 {
         match self {
             Self::Read(_) => major::IRP_MJ_READ,
-            Self::QueryStandard => major::IRP_MJ_QUERY_INFORMATION,
+            Self::Query(_) => major::IRP_MJ_QUERY_INFORMATION,
         }
     }
 }
@@ -92,13 +92,13 @@ fn capture_packet(
                 offset,
             })
         }
-        QUERY
-            if code == nt_fs::FILE_STANDARD_INFORMATION
-                && length >= 24
-                && offset == 0
-                && key == 0 =>
-        {
-            Operation::QueryStandard
+        QUERY if offset == 0 && key == 0 => {
+            let contract = nt_io_manager::query_information_contract(code)
+                .ok_or(STATUS_INVALID_INFO_CLASS_LOCAL as u32)?;
+            if length < contract.minimum_length() {
+                return Err(STATUS_INFO_LENGTH_MISMATCH_LOCAL as u32);
+            }
+            Operation::Query(code)
         }
         _ => return Err(STATUS_INVALID_PARAMETER as u32),
     };
@@ -343,10 +343,10 @@ impl Work {
                             &mut self.output,
                         )
                     }
-                    Operation::QueryStandard => dispatch_hosted_file_irp_result_exact(
+                    Operation::Query(class) => dispatch_hosted_file_irp_result_exact(
                         self.file.file_id(),
                         major::IRP_MJ_QUERY_INFORMATION as u64,
-                        nt_fs::FILE_STANDARD_INFORMATION as u64,
+                        class as u64,
                         self.caller,
                         &[],
                         &mut self.output,
@@ -505,7 +505,7 @@ fn invoke(handle: u64, iosb: u64, output: u64, length: u32, operation: Operation
             Operation::Read(parameters) => {
                 (READ, parameters.length, parameters.offset, parameters.key)
             }
-            Operation::QueryStandard => (QUERY, nt_fs::FILE_STANDARD_INFORMATION, 0, 0),
+            Operation::Query(class) => (QUERY, class, 0, 0),
         };
         write_unaligned((packet + KIND_OFF) as *mut u32, kind);
         write_unaligned((packet + CODE_OFF) as *mut u32, code);
@@ -565,13 +565,13 @@ pub(super) extern "win64" fn s_zw_query_information_file(
     length: u32,
     class: u32,
 ) -> i32 {
-    if class != nt_fs::FILE_STANDARD_INFORMATION {
+    let Some(contract) = nt_io_manager::query_information_contract(class) else {
         return STATUS_INVALID_INFO_CLASS_LOCAL;
-    }
-    if length < 24 {
+    };
+    if (length as usize) < contract.minimum_length() {
         return STATUS_INFO_LENGTH_MISMATCH_LOCAL;
     }
-    invoke(handle, iosb, output, length, Operation::QueryStandard)
+    invoke(handle, iosb, output, length, Operation::Query(class))
 }
 
 pub(super) extern "win64" fn s_zw_read_file(
