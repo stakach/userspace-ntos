@@ -188,7 +188,11 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
         if request.objects.iter().any(|object| {
             !matches!(
                 object.typed(),
-                Some(ProviderWaitObjectType::Event | ProviderWaitObjectType::Timer)
+                Some(
+                    ProviderWaitObjectType::Event
+                        | ProviderWaitObjectType::Timer
+                        | ProviderWaitObjectType::File
+                )
             )
         }) {
             return Err(ProviderDispatcherWaitError::UnsupportedObjectType);
@@ -831,6 +835,10 @@ mod tests {
         ProviderWaitObject::new(ProviderWaitObjectType::Timer, slot, 1)
     }
 
+    fn file(slot: u64) -> ProviderWaitObject {
+        ProviderWaitObject::new(ProviderWaitObjectType::File, slot, 1)
+    }
+
     fn request(
         owner: ProviderWaitOwner,
         wait_id: u64,
@@ -890,6 +898,46 @@ mod tests {
         assert!(backend.leases.is_empty());
         assert!(arbiter.is_empty());
         assert_eq!(arbiter.waiters.capacity(), 0);
+    }
+
+    #[test]
+    fn file_wait_is_admitted_and_selected_through_backend_readiness() {
+        let identity = owner(18);
+        let mut backend = Backend::default();
+        backend.insert(identity, event(1), false, false);
+        backend.insert(identity, file(2), true, true);
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
+        let poll = request(
+            identity,
+            27,
+            ProviderWaitType::Any,
+            ProviderWaitTimeoutKind::Poll,
+            0,
+            &[event(1), file(2)],
+        );
+        assert_eq!(arbiter.poll(&mut backend, &poll, identity), Ok(1));
+        assert_eq!(backend.lease_count(), 0);
+
+        backend.events.get_mut(&(2, 1)).unwrap().signaled = false;
+        let blocking = request(
+            identity,
+            28,
+            ProviderWaitType::Any,
+            ProviderWaitTimeoutKind::Infinite,
+            0,
+            &[event(1), file(2)],
+        );
+        assert_eq!(
+            arbiter.admit(&mut backend, &blocking, identity, 18, now(0, 0)),
+            Ok(ProviderDispatcherWaitAdmission::Parked { wait_id: 28 })
+        );
+        assert_eq!(backend.lease_count(), 2);
+        backend.set(file(2));
+        let completion = arbiter.pop_ready(&mut backend).unwrap();
+        assert_eq!(completion.wait_id, 28);
+        assert_eq!(completion.status, STATUS_WAIT_0 + 1);
+        assert_eq!(backend.lease_count(), 0);
+        assert!(arbiter.is_empty());
     }
 
     #[test]

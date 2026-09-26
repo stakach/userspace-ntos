@@ -4518,7 +4518,7 @@ pub(crate) unsafe fn service_win32k_file_object_request(
     use crate::win32k_subsystem::{
         W32_FILE_OBJECT_DEREFERENCE_POINTER, W32_FILE_OBJECT_LABEL,
         W32_FILE_OBJECT_REFERENCE_HANDLE, W32_FILE_OBJECT_REFERENCE_POINTER,
-        W32_FILE_OBJECT_RELATED_DEVICE,
+        W32_FILE_OBJECT_RELATED_DEVICE, W32_FILE_OBJECT_WAIT_IDENTITY,
     };
     let caller = match authenticate_win32k_service_request(
         channel, reply_cap, badge, mi, (W32_FILE_OBJECT_LABEL << 12) | 4,
@@ -4555,6 +4555,12 @@ pub(crate) unsafe fn service_win32k_file_object_request(
         W32_FILE_OBJECT_RELATED_DEVICE if access == 0 && mode == 0 => {
             match crate::driver_launch::win32k_file_owners::related_device_address(object) {
                 Ok(device) => (0, device, 0, 0),
+                Err(status) => (status, 0, 0, 0),
+            }
+        }
+        W32_FILE_OBJECT_WAIT_IDENTITY if access == 0 && mode == 0 => {
+            match crate::driver_launch::win32k_file_owners::wait_identity_for_event(object) {
+                Ok(identity) => (0, identity.file_id().raw(), identity.binding_generation(), 0),
                 Err(status) => (status, 0, 0, 0),
             }
         }
@@ -8628,6 +8634,7 @@ pub(crate) unsafe fn service_sec_image(
             crate::hosted_routed_file_close_work::redrive(&mut nt_handler);
             crate::driver_launch::hosted_consumer_file_objects::redrive();
             crate::driver_launch::win32k_file_owners::redrive();
+            crate::provider_file_wait::redrive(&mut nt_handler);
             crate::current_apc::redrive(&mut nt_handler);
             crate::current_apc::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
             crate::object_wait_reply::redrive(&mut nt_handler);

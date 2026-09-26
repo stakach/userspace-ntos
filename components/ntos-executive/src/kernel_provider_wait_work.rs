@@ -58,7 +58,10 @@ pub(crate) unsafe fn publish_runtime_waits(handler: &mut ExecNtHandler) {
             events: &mut handler.events,
             event_objects: &mut handler.event_objects,
             timers: None,
-            backing: NativeEventBacking(&mut handler.obj_ns),
+            backing: NativeEventBacking {
+                objects: &mut handler.obj_ns,
+                file_completion: Some(&mut handler.file_completion),
+            },
             access: None,
         },
         now,

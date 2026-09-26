@@ -12311,6 +12311,10 @@ impl ExecNtHandler {
         };
         if file_signaled {
             unsafe { wait_wake_dispatcher_set(self) };
+            unsafe {
+                let mut objects = self.dispatcher_objects(None);
+                crate::service_sec_image::provider_wait_select_ready(&mut objects);
+            }
         }
         nt_fs::STATUS_SUCCESS
     }
@@ -12549,7 +12553,7 @@ impl ExecNtHandler {
         }
     }
 
-    fn complete_file_reference_release(
+    pub(crate) fn complete_file_reference_release(
         &mut self,
         file_id: u64,
         release: nt_io_completion::FileReferenceRelease,
