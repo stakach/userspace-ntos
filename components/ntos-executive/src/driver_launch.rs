@@ -37535,7 +37535,10 @@ unsafe fn hosted_kuser_frame() -> Result<u64, nt_status::NtStatus> {
         let _ = cnode_delete_recycle_r(frame);
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
-    crate::img_spawn::initialize_kuser_snapshot(HOSTED_KUSER_SCRATCH_VA);
+    crate::img_spawn::initialize_kuser_snapshot(
+        HOSTED_KUSER_SCRATCH_VA,
+        crate::img_spawn::published_boot_system_root(),
+    );
     if !crate::kuser_kernel_alias_register(HOSTED_KUSER_SCRATCH_VA) {
         let _ = page_unmap_r(scratch_cap);
         let _ = cnode_delete_recycle_r(scratch_cap);

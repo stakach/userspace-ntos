@@ -22,6 +22,35 @@ pub(crate) static OUR_TP_WORKER_RVA: AtomicU64 = AtomicU64::new(0);
 /// RVA of ntdll's completion-only worker, hosted separately from the timer/wait scheduler.
 pub(crate) static OUR_TP_COMPLETION_WORKER_RVA: AtomicU64 = AtomicU64::new(0);
 
+static BOOT_PATHS: core::sync::atomic::AtomicPtr<nt_fs::BootPaths> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+pub(crate) fn publish_boot_paths(paths: nt_fs::BootPaths) {
+    let raw = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(paths));
+    if BOOT_PATHS
+        .compare_exchange(
+            core::ptr::null_mut(),
+            raw,
+            Ordering::Release,
+            Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        unsafe { drop(alloc::boxed::Box::from_raw(raw)) };
+        panic!("boot paths already published");
+    }
+}
+
+fn boot_paths() -> &'static nt_fs::BootPaths {
+    let raw = BOOT_PATHS.load(Ordering::Acquire);
+    assert!(!raw.is_null(), "hosted process requires validated boot paths");
+    unsafe { &*raw }
+}
+
+pub(crate) fn published_boot_system_root() -> &'static [u8] {
+    boot_paths().system_root()
+}
+
 /// The effective `LdrpInitialize` RVA for a spawn: the explicit `ldrpinit_rva` if the caller passed
 /// one, else the globally-derived OUR ntdll RVA. There is no real-ntdll fallback (our ntdll is THE
 /// ntdll); if neither is set the spawn can't produce a working trampoline, so 0 is returned and the
@@ -578,7 +607,7 @@ pub(crate) unsafe fn build_sec_image_text() -> alloc::vec::Vec<u8> {
     t
 }
 
-pub(crate) unsafe fn initialize_kuser_snapshot(scratch_va: u64) {
+pub(crate) unsafe fn initialize_kuser_snapshot(scratch_va: u64, system_root: &[u8]) {
     let interrupt_time = monotonic_time_100ns();
     let time = nt_time_snapshot_at(interrupt_time);
     let processor = exec_handler::native_processor_information();
@@ -600,6 +629,7 @@ pub(crate) unsafe fn initialize_kuser_snapshot(scratch_va: u64) {
         },
         interrupt_time,
         time.system_time_100ns,
+        system_root,
     );
     nt_ntdll_layout::kuser::update_time_zone(
         page,
@@ -716,7 +746,7 @@ pub(crate) unsafe fn spawn_pe_thread(
     let kuser = alloc_frame();
     checked_spawn_page_map(kuser, env_scratch + 0x3000, RW_NX, CAP_INIT_THREAD_VSPACE, b"pe-kuser-scratch");
     zero_scratch_page(env_scratch + 0x3000);
-    unsafe { initialize_kuser_snapshot(env_scratch + 0x3000) };
+    unsafe { initialize_kuser_snapshot(env_scratch + 0x3000, b"") };
     let _ = page_map(copy_cap(kuser), KUSER_VA, 2 | PAGE_EXECUTE_NEVER, pml4);
     // The provided "ntdll": a page of syscall stubs the PE's IAT resolves to, mapped RX.
     let ntdll = alloc_frame();
@@ -1332,14 +1362,10 @@ pub(crate) unsafe fn spawn_sec_image(
         // (UNICODE_STRING field, buffer offset, byte capacity, text).
         // ImagePathName + CommandLine are per-process (smss vs csrss) — the loader derives the DLL
         // search + the ".local" SxS probe from ImagePathName, and the image's entry parses CommandLine.
+        let boot_paths = boot_paths();
         let ustrs: [(u64, u64, u16, &[u8]); 4] = [
-            (0x38, CURDIR_BUFFER, CURDIR_CAPACITY, b"C:\\Windows"),
-            (
-                0x50,
-                DLL_PATH_BUFFER,
-                DLL_PATH_CAPACITY,
-                b"C:\\Windows\\System32",
-            ),
+            (0x38, CURDIR_BUFFER, CURDIR_CAPACITY, boot_paths.system_root()),
+            (0x50, DLL_PATH_BUFFER, DLL_PATH_CAPACITY, boot_paths.system32()),
             (0x60, IMAGE_PATH_BUFFER, IMAGE_PATH_CAPACITY, image_path),
             (0x70, COMMAND_LINE_BUFFER, COMMAND_LINE_CAPACITY, cmd_line),
         ];
@@ -1369,12 +1395,17 @@ pub(crate) unsafe fn spawn_sec_image(
         zero_scratch_page(env_scr);
         {
             let mut off: u64 = 0;
-            for var in [
-                b"SystemRoot=C:\\Windows".as_slice(),
-                b"SystemDrive=C:".as_slice(),
-                b"windir=C:\\Windows".as_slice(),
-                b"Path=C:\\Windows\\System32;C:\\Windows".as_slice(),
-            ] {
+            let system_root = [b"SystemRoot=".as_slice(), boot_paths.system_root()].concat();
+            let system_drive = [b"SystemDrive=".as_slice(), boot_paths.drive()].concat();
+            let windir = [b"windir=".as_slice(), boot_paths.system_root()].concat();
+            let path = [
+                b"Path=".as_slice(),
+                boot_paths.system32(),
+                b";".as_slice(),
+                boot_paths.system_root(),
+            ]
+            .concat();
+            for var in [&system_root[..], &system_drive[..], &windir[..], &path[..]] {
                 let len = wstr(env_scr + off, var);
                 off += len as u64;
                 core::ptr::write_volatile((env_scr + off) as *mut u16, 0); // wide NUL terminator
@@ -1457,7 +1488,7 @@ pub(crate) unsafe fn spawn_sec_image(
             b"kuser-scratch",
         );
         zero_scratch_page(kscr);
-        unsafe { initialize_kuser_snapshot(kscr) };
+        unsafe { initialize_kuser_snapshot(kscr, published_boot_system_root()) };
         let kuser_client = checked_spawn_copy_cap(kuser_f, b"kuser-target");
         let _ = checked_spawn_page_map(
             kuser_client,

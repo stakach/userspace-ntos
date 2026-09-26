@@ -182,6 +182,7 @@ pub fn build_kuser_shared_data_with_cookie(
         },
         u64::from(tick_count) * 10_000,
         system_time_100ns,
+        b"C:\\Windows",
     );
     k
 }

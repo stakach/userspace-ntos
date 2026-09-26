@@ -71,7 +71,9 @@ pub fn initialize_page(
     information: StaticInformation,
     interrupt_time_100ns: u64,
     system_time_100ns: u64,
+    system_root: &[u8],
 ) {
+    assert!(system_root.len() < 260 && system_root.iter().all(u8::is_ascii));
     page.fill(0);
     put_u32(page, TICK_COUNT_MULTIPLIER, TICK_COUNT_MULTIPLIER_ONE_MS);
     put_ksystem_time(page, INTERRUPT_TIME, interrupt_time_100ns);
@@ -79,7 +81,7 @@ pub fn initialize_page(
     update_time_zone(page, 0, 0);
     put_u16(page, IMAGE_NUMBER_LOW, information.image_number_low);
     put_u16(page, IMAGE_NUMBER_HIGH, information.image_number_high);
-    put_utf16_z(page, NT_SYSTEM_ROOT, b"C:\\Windows");
+    put_utf16_z(page, NT_SYSTEM_ROOT, system_root);
     put_u32(page, NT_PRODUCT_TYPE, information.nt_product_type);
     page[PRODUCT_TYPE_IS_VALID] = 1;
     put_u32(page, NT_MAJOR_VERSION, information.nt_major_version);
@@ -274,6 +276,15 @@ mod tests {
             },
             1_230_000,
             0x01da_0000_0012_3456,
+            b"C:\\reactos",
+        );
+        assert_eq!(
+            u16::from_le_bytes(page[NT_SYSTEM_ROOT..NT_SYSTEM_ROOT + 2].try_into().unwrap()),
+            b'C' as u16
+        );
+        assert_eq!(
+            u16::from_le_bytes(page[NT_SYSTEM_ROOT + 6..NT_SYSTEM_ROOT + 8].try_into().unwrap()),
+            b'r' as u16
         );
         assert_eq!(read_u32(&page, TICK_COUNT_MULTIPLIER), 1 << 24);
         assert_eq!(read_u32(&page, INTERRUPT_TIME), 1_230_000);
