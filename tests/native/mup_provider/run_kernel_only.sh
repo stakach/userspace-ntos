@@ -28,7 +28,7 @@ python3 scripts/run_with_timeout.py \
   --failure-file "$RUN_LOG" \
   --failure-text '[provider-bugcheck] terminal' \
   --completion-file "$RUN_LOG" \
-  --completion-text '[read-forward-verified-1]' \
+  --completion-text '[flush-forward-verified-1]' \
   --completion-grace-seconds 15 \
   -- ./scripts/run_specs.sh 2>&1 | tee -a "$RUN_LOG"
 rc=${PIPESTATUS[0]}
@@ -53,10 +53,16 @@ if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-read-pending-complete\] count=[1-9][0-9]* bytes=20' "$RUN_LOG" \
    || ! grep -Fq '[read-forward-verified-1]' "$RUN_LOG" \
    || [ "$(grep -Fc '[mup-provider-read-pending-complete]' "$RUN_LOG")" -ne 1 ] \
+   || ! grep -Fq '[mup-provider-flush] count=1' "$RUN_LOG" \
+   || ! grep -Fq '[flush-forward-verified-0]' "$RUN_LOG" \
+   || ! grep -Fq '[mup-provider-flush-pending-dispatch] status=0x00000103' "$RUN_LOG" \
+   || ! grep -Fq '[mup-provider-flush-pending-complete] count=2' "$RUN_LOG" \
+   || ! grep -Fq '[flush-forward-verified-1]' "$RUN_LOG" \
+   || [ "$(grep -Fc '[mup-provider-flush-pending-complete]' "$RUN_LOG")" -ne 1 ] \
    || ! grep -Eq '\[mup-provider-cleanup\] probe-file cleaned=[1-9][0-9]*' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-close\] probe-file closed=[1-9][0-9]*' "$RUN_LOG"; then
-  echo "Mup/provider registration, query, immediate/pending READ, WRITE, and File lifecycle proof incomplete: $RUN_LOG" >&2
+  echo "Mup/provider registration, query, immediate/pending READ and FLUSH, WRITE, and File lifecycle proof incomplete: $RUN_LOG" >&2
   exit 1
 fi
 
-echo "Mup/provider registration, query, File WRITE, immediate/pending cross-domain READ and CREATE/CLEANUP/CLOSE verified: $RUN_LOG"
+echo "Mup/provider registration, query, File WRITE, immediate/pending cross-domain READ and FLUSH, and CREATE/CLEANUP/CLOSE verified: $RUN_LOG"

@@ -45,6 +45,9 @@ KeInitializeEvent:
 .globl KeWaitForSingleObject
 KeWaitForSingleObject:
     ud2
+.globl KeSetEvent
+KeSetEvent:
+    ud2
 .globl ZwCreateFile
 ZwCreateFile:
     ud2

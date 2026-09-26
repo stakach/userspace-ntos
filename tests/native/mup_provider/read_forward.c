@@ -14,6 +14,7 @@ typedef void *HANDLE;
 #define STATUS_OBJECT_PATH_NOT_FOUND ((NTSTATUS)0xc000003au)
 #define NT_SUCCESS(status) ((status) >= 0)
 #define IRP_MJ_READ 0x03
+#define IRP_MJ_FLUSH_BUFFERS 0x09
 #define IRP_BUFFERED_IO 0x10
 #define IRP_DEALLOCATE_BUFFER 0x20
 #define IRP_INPUT_OPERATION 0x40
@@ -194,6 +195,43 @@ static NTSTATUS ForwardOnce(void *file, DEVICE_OBJECT *device, int64_t offset)
     return status;
 }
 
+static NTSTATUS FlushOnce(void *file, DEVICE_OBJECT *device, uint32_t ordinal)
+{
+    IRP *irp = IoAllocateIrp(device->StackSize, 0);
+    if (irp == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+    IO_STACK_LOCATION *stack = IoGetNextIrpStackLocation(irp);
+    if (stack == NULL) {
+        IoFreeIrp(irp);
+        return STATUS_UNSUCCESSFUL;
+    }
+    IO_STATUS_BLOCK flush_iosb = {0};
+    uint64_t completion_event[3] = {0};
+    KeInitializeEvent(completion_event, 1, 0);
+    irp->UserIosb = &flush_iosb;
+    irp->UserEvent = completion_event;
+    irp->OriginalFileObject = file;
+    stack->MajorFunction = IRP_MJ_FLUSH_BUFFERS;
+    stack->DeviceObject = device;
+    stack->FileObject = file;
+    DbgPrint("[flush-forward-stage] ordinal=%u dispatching IRP through IofCallDriver\n",
+             ordinal);
+    NTSTATUS call_status = IofCallDriver(device, irp);
+    NTSTATUS wait_status = STATUS_UNSUCCESSFUL;
+    if (call_status == STATUS_SUCCESS || call_status == STATUS_PENDING)
+        wait_status = KeWaitForSingleObject(completion_event, 0, 0, 0, NULL);
+    NTSTATUS status = call_status == (ordinal == 0 ? STATUS_SUCCESS : STATUS_PENDING) &&
+                      wait_status == STATUS_SUCCESS &&
+                      flush_iosb.Status == STATUS_SUCCESS &&
+                      flush_iosb.Information == 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    DbgPrint("[flush-forward-result] ordinal=%u call=0x%08x wait=0x%08x status=0x%08x iosb=0x%08x info=%u\n",
+             ordinal, (uint32_t)call_status, (uint32_t)wait_status,
+             (uint32_t)status, (uint32_t)flush_iosb.Status,
+             (uint32_t)flush_iosb.Information);
+    if (status == STATUS_SUCCESS)
+        DbgPrint("[flush-forward-verified-%u]\n", ordinal);
+    return status;
+}
+
 static void __stdcall ReadWorker(void *context)
 {
     (void)context;
@@ -228,6 +266,8 @@ static void __stdcall ReadWorker(void *context)
 
     status = ForwardOnce(file, device, 0);
     if (status == STATUS_SUCCESS) status = ForwardOnce(file, device, 1);
+    if (status == STATUS_SUCCESS) status = FlushOnce(file, device, 0);
+    if (status == STATUS_SUCCESS) status = FlushOnce(file, device, 1);
 dereference:
     ObfDereferenceObject(file);
 close:
