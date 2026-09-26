@@ -14,6 +14,7 @@ extern crate alloc;
 mod byte_lock;
 mod directory;
 mod fat_directory;
+mod fat_directory_walk;
 mod file_backing;
 mod flush;
 mod fs;
@@ -33,6 +34,7 @@ mod volume;
 pub use byte_lock::*;
 pub use directory::*;
 pub use fat_directory::*;
+pub use fat_directory_walk::*;
 pub use file_backing::FileBacking;
 pub use flush::file_flush_access_allowed;
 pub use fs::{
