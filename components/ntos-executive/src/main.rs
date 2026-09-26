@@ -15032,15 +15032,24 @@ pub(crate) unsafe fn object_manager_resolve_file_target(
     case_insensitive: bool,
     output: &mut [u16],
 ) -> Result<(nt_types::ObjectId, usize), nt_status::NtStatus> {
+    let (device_object, remaining_name) =
+        object_manager_resolve_file_target_owned(path, case_insensitive)?;
+    if remaining_name.len() > output.len() {
+        return Err(nt_status::NtStatus::OBJECT_NAME_INVALID);
+    }
+    output[..remaining_name.len()].copy_from_slice(&remaining_name);
+    Ok((device_object, remaining_name.len()))
+}
+
+pub(crate) unsafe fn object_manager_resolve_file_target_owned(
+    path: &[u16],
+    case_insensitive: bool,
+) -> Result<(nt_types::ObjectId, Vec<u16>), nt_status::NtStatus> {
     let client = OBJECT_CLIENT_PTR
         .as_mut()
         .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
     let target = client.resolve_file_target(path, case_insensitive)?;
-    if target.remaining_name.len() > output.len() {
-        return Err(nt_status::NtStatus::OBJECT_NAME_INVALID);
-    }
-    output[..target.remaining_name.len()].copy_from_slice(&target.remaining_name);
-    Ok((target.device_object, target.remaining_name.len()))
+    Ok((target.device_object, target.remaining_name))
 }
 
 pub(crate) unsafe fn object_manager_create_file_handle(

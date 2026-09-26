@@ -14,6 +14,20 @@ fn copy_name(name: &[u16]) -> Result<Vec<u16>, u32> {
     Ok(owned)
 }
 
+pub(super) fn resolve_absolute_name(
+    name: &[u16],
+    case_insensitive: bool,
+) -> Result<(u64, Vec<u16>), u32> {
+    let (object_id, relative_name) = unsafe {
+        crate::object_manager_resolve_file_target_owned(name, case_insensitive)
+    }
+    .map_err(|status| status.raw() as u32)?;
+    let device_id = unsafe { io_manager_mut() }
+        .device_id_by_object_id(object_id)
+        .ok_or(STATUS_OBJECT_NAME_NOT_FOUND as u32)?;
+    Ok((device_id.raw(), relative_name))
+}
+
 pub(super) struct CapturedCreate {
     pub caller: nt_process::native_handle::NativeHandleCaller,
     pub request: nt_io_manager::io_create_file::OwnedIoCreateFileRequest,
@@ -86,10 +100,9 @@ fn resolve_request(
 ) -> Result<CapturedCreate, u32> {
     let case_insensitive = request.object_attributes & 0x40 != 0;
     let (device_id, related_file_id, related_file, relative_name) = if request.root_directory == 0 {
-        let (device_id, prefix) = io_manager_mut()
-            .device_prefix_for_file_name(&request.name, case_insensitive)
-            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND as u32)?;
-        (device_id.raw(), None, None, copy_name(&request.name[prefix..])?)
+        let (device_id, relative_name) =
+            resolve_absolute_name(&request.name, case_insensitive)?;
+        (device_id, None, None, relative_name)
     } else {
         let (file_id, device_id) = unsafe {
             crate::service_sec_image::with_provider_process_manager(|pm| {
