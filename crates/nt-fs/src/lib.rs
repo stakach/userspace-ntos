@@ -18,6 +18,7 @@ mod file_backing;
 mod flush;
 mod fs;
 mod hive_provider;
+mod layered_open;
 mod notify;
 mod partition;
 mod path;
@@ -47,6 +48,10 @@ pub use fs::{
     SnapshotJournalOpenError, SnapshotJournalPhase, OwnedSnapshotJournal, OwnedSnapshotJournalOpenError,
 };
 pub use hive_provider::NtFileHiveIoProvider;
+pub use layered_open::{
+    LayeredOpenContextId, LayeredOpenRecord, LayeredOpenSource, LayeredOpenTable,
+    LAYERED_OPEN_NAME_CAP,
+};
 pub use notify::*;
 pub use partition::*;
 pub use path::{
