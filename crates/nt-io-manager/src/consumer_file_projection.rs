@@ -74,7 +74,11 @@ pub fn write_consumer_wdm_file_object<P>(
             file_name_buffer: 0,
         },
     )
-    .map_err(|_| NtStatus::INVALID_PARAMETER)
+    .map_err(|_| NtStatus::INVALID_PARAMETER)?;
+    // Normal CREATE has completed before a consumer receives this projection. The base
+    // WDM writer also serves pre-CREATE objects, whose Event must remain unsignaled.
+    bytes[0x9c..0xa0].copy_from_slice(&1u32.to_le_bytes());
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -317,6 +321,8 @@ mod tests {
         assert_eq!(word(0x18), 0);
         assert_eq!(word(0x98 + 8), identity.address() + 0x98 + 8);
         assert_eq!(word(0x98 + 0x10), identity.address() + 0x98 + 8);
+        assert_eq!(bytes[0x98], 0); // NotificationEvent
+        assert_eq!(u32::from_le_bytes(bytes[0x9c..0xa0].try_into().unwrap()), 1);
         assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), 5);
     }
 
