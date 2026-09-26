@@ -57,8 +57,8 @@ pub use hive_provider::NtFileHiveIoProvider;
 pub use installation_root::*;
 pub use layered_directory::merge_layered_directory_entries;
 pub use layered_open::{
-    LayeredOpenContextId, LayeredOpenRecord, LayeredOpenSource, LayeredOpenTable,
-    LAYERED_OPEN_NAME_CAP,
+    join_layered_relative_name_into, LayeredOpenContextId, LayeredOpenRecord, LayeredOpenSource,
+    LayeredOpenTable, LAYERED_OPEN_NAME_CAP,
 };
 pub use notify::*;
 pub use partition::*;

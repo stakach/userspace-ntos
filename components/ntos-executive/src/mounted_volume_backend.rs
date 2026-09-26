@@ -67,8 +67,7 @@ impl MountedVolumeBackend {
         let IoParameters::Create(parameters) = &irp.parameters else {
             return Err(NtStatus::INVALID_PARAMETER);
         };
-        if parameters.related_file.is_some()
-            || parameters.ea_length != 0
+        if parameters.ea_length != 0
             || irp.create_case_sensitive
             || parameters.create_options.bits() & nt_fs::FILE_OPEN_BY_FILE_ID != 0
         {
@@ -86,9 +85,29 @@ impl MountedVolumeBackend {
         )
         .map_err(status)?;
 
-        // FILE_OBJECT.FileName is device-relative. Preserve it verbatim in the File context, but
-        // use the existing bounded FAT canonicalizer for lookup and sharing.
-        let units = name.as_units();
+        // The IRP retains the parent File through completion. Resolve its generation-fenced
+        // driver open, while the child's FILE_OBJECT.FileName stays relative in the I/O Manager.
+        let mut effective_name = [0u16; PATH_CAP];
+        let units = if let Some(parent_file) = parameters.related_file {
+            let (context, parent) = self
+                .opens
+                .get_by_file_id(parent_file.raw())
+                .map_err(status)?;
+            self.bindings[context_index(context).ok_or(NtStatus::INVALID_HANDLE)?]
+                .filter(|binding| binding.context == context && binding.is_directory)
+                .ok_or(status(nt_fs::STATUS_NOT_A_DIRECTORY))?;
+            let length = nt_fs::join_layered_relative_name_into(
+                parent.name,
+                name.as_units(),
+                &mut effective_name,
+            )
+            .map_err(status)?;
+            &effective_name[..length]
+        } else {
+            name.as_units()
+        };
+        // The retained full name is device-relative; the bounded FAT canonicalizer is only used
+        // for lookup and sharing, not to replace the child's FILE_OBJECT spelling.
         let relative_name = units.strip_prefix(&[b'\\' as u16]).unwrap_or(units);
         let mut folded = [0; PATH_CAP];
         let mut relative = [0; PATH_CAP];

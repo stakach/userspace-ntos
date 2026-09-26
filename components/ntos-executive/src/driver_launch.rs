@@ -38109,6 +38109,11 @@ pub(crate) fn resolve_kernel_directory_file_name(
 ) -> Result<(u64, alloc::vec::Vec<u16>), u32> {
     let (device_id, relative) =
         hosted_io_create_file_ingress::resolve_absolute_name(name, case_insensitive)?;
+    require_registered_kernel_filesystem_device(device_id)?;
+    Ok((device_id, relative))
+}
+
+pub(crate) fn require_registered_kernel_filesystem_device(device_id: u64) -> Result<(), u32> {
     let device = io_manager_mut()
         .device(nt_io_manager::DeviceId(device_id))
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
@@ -38118,7 +38123,7 @@ pub(crate) fn resolve_kernel_directory_file_name(
     {
         return Err(STATUS_INVALID_DEVICE_REQUEST as u32);
     }
-    Ok((device_id, relative))
+    Ok(())
 }
 
 fn pump_io_manager() -> usize {
