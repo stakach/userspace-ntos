@@ -87,6 +87,7 @@ mod dispatcher_bootstrap;
 mod timer_deadline;
 mod provider_local_event;
 mod provider_dispatcher_backend;
+mod provider_file_wait;
 mod ps_object_retirement;
 mod provider_ps;
 mod sec_image_diagnostic;
@@ -24019,7 +24020,11 @@ impl ExecFileCompletion {
 
     fn set_signaled(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).set_signaled(file_id, signaled) }
+        unsafe {
+            (&mut *self.table).set_signaled(file_id, signaled)?;
+            driver_launch::win32k_file_owners::sync_event_signal(file_id, signaled);
+        }
+        Ok(())
     }
 
     fn is_signaled(&self, file_id: u64) -> Result<bool, u32> {
@@ -24029,12 +24034,22 @@ impl ExecFileCompletion {
 
     fn complete_file(&mut self, file_id: u64, status: u32) -> Result<bool, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).complete_file(file_id, status) }
+        unsafe {
+            let signaled = (&mut *self.table).complete_file(file_id, status)?;
+            let state = (&*self.table).is_signaled(file_id)?;
+            driver_launch::win32k_file_owners::sync_event_signal(file_id, state);
+            Ok(signaled)
+        }
     }
 
     fn signal_on_completion_association(&mut self, file_id: u64) -> Result<bool, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).signal_on_completion_association(file_id) }
+        unsafe {
+            let signaled = (&mut *self.table).signal_on_completion_association(file_id)?;
+            let state = (&*self.table).is_signaled(file_id)?;
+            driver_launch::win32k_file_owners::sync_event_signal(file_id, state);
+            Ok(signaled)
+        }
     }
 
     fn should_queue_completion_packet(
