@@ -245,6 +245,65 @@ pub(crate) unsafe fn write_file_projection(
     .map_err(|status| status.raw())
 }
 
+pub(crate) unsafe fn create_file_projection(
+    identity: nt_io_manager::HostedFileIdentity,
+    device: nt_io_manager::DeviceId,
+) -> Result<nt_io_manager::consumer_file_projection::ConsumerFileProjection, i32> {
+    let consumer = live_consumer()?;
+    if identity.domain() != consumer.domain {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    let registration = consumer
+        .projections
+        .iter()
+        .find(|projection| projection.device == device && projection.bound)
+        .and_then(|projection| projection.registration)
+        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    nt_io_manager::consumer_file_projection::ConsumerFileProjection::new(
+        io_manager_mut(),
+        identity,
+        registration,
+    )
+    .map_err(|status| status.raw())
+}
+
+pub(crate) unsafe fn reference_file_by_handle(
+    projection: &mut nt_io_manager::consumer_file_projection::ConsumerFileProjection,
+    identity: nt_io_manager::HostedFileIdentity,
+) -> Result<u64, i32> {
+    live_consumer()?;
+    projection
+        .reference_by_handle(io_manager_mut(), identity)
+        .map_err(|status| status.raw())
+}
+
+pub(crate) unsafe fn reference_file_by_pointer(
+    projection: &mut nt_io_manager::consumer_file_projection::ConsumerFileProjection,
+    identity: nt_io_manager::HostedFileIdentity,
+) -> Result<u64, i32> {
+    live_consumer()?;
+    projection
+        .reference_by_pointer(io_manager_mut(), identity)
+        .map_err(|status| status.raw())
+}
+
+pub(crate) unsafe fn dereference_file_owner(
+    projection: &mut nt_io_manager::consumer_file_projection::ConsumerFileProjection,
+    identity: nt_io_manager::HostedFileIdentity,
+) -> Result<(), i32> {
+    consumer_mut()?;
+    projection
+        .dereference(io_manager_mut(), identity)
+        .map_err(|status| status.raw())
+}
+
+pub(crate) unsafe fn retire_file_owner(
+    projection: &mut nt_io_manager::consumer_file_projection::ConsumerFileProjection,
+) -> Result<(), i32> {
+    consumer_mut()?;
+    projection.retire(io_manager_mut()).map_err(|status| status.raw())
+}
+
 /// Exact receipt retirement remains available after consumer admission has closed. Unbind does
 /// not free the native allocation; the owner must retain it until this call succeeds.
 pub(crate) unsafe fn retire_file_projection(

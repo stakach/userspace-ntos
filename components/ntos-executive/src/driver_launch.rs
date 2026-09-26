@@ -43696,15 +43696,17 @@ pub(crate) fn close_io_handle(handle: u64) -> Result<(), nt_status::NtStatus> {
     io_manager_mut().close(ClientId(IO_MANAGER_COMPONENT_ID), HandleValue(handle))
 }
 
-pub(crate) fn retain_io_handle_reference(
+/// Check the opening handle's grant and exact File identity without acquiring a transient token.
+pub(crate) fn lookup_io_handle_file(
     handle: u64,
     desired_access: AccessMask,
-) -> Result<(u64, u64), nt_status::NtStatus> {
-    unsafe { crate::object_manager_retain_handle(HandleValue(handle), desired_access) }
-}
-
-pub(crate) fn release_io_object_reference(reference: u64) -> Result<(), nt_status::NtStatus> {
-    unsafe { crate::object_manager_release_reference(reference) }
+) -> Result<(u64, u64, u64), nt_status::NtStatus> {
+    let (file, device, object) = io_manager_mut().reference_open_file_details(
+        ClientId(IO_MANAGER_COMPONENT_ID),
+        HandleValue(handle),
+        desired_access,
+    )?;
+    Ok((file.raw(), device.raw(), object.0))
 }
 
 unsafe fn validate_and_sync_hosted_device_projection(

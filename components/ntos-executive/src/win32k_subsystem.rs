@@ -3726,9 +3726,7 @@ extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
             as u64;
     }
     if unsafe { crate::video_device::video_file_projection_contains(object) } {
-        return unsafe {
-            crate::video_device::retain_video_file_projection(object, nt_types::AccessMask::empty())
-        }
+        return unsafe { crate::video_device::reference_video_file_pointer(object) }
         .unwrap_or_else(|status| panic!("video projection retain failed: {status:#010x}"));
     }
     if !provider_event_projection_contains(object) {
