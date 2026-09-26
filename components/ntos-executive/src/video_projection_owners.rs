@@ -3,16 +3,31 @@
 use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
 
-use nt_io_manager::{FileId, HostedFileIdentity, WDM_X64_FILE_OBJECT_SIZE};
+use nt_io_manager::{
+    consumer_file_projection::ConsumerFileProjection, FileId, HostedFileIdentity,
+    WDM_X64_FILE_OBJECT_SIZE,
+};
 use nt_status::NtStatus;
 
-#[derive(Clone, Copy)]
 struct Row {
     id: u64,
     handle: u64,
     file: u64,
     address: u64,
     identity: Option<HostedFileIdentity>,
+    projection: Option<ConsumerFileProjection>,
+    handle_closed: bool,
+    retiring: bool,
+    in_flight: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RowSnapshot {
+    handle: u64,
+    file: u64,
+    address: u64,
+    identity: Option<HostedFileIdentity>,
+    handle_closed: bool,
     retiring: bool,
     in_flight: bool,
 }
@@ -33,11 +48,22 @@ unsafe fn rows_mut() -> &'static mut Vec<Option<Row>> {
 unsafe fn index_for(id: u64) -> Option<usize> {
     rows()
         .iter()
-        .position(|row| row.is_some_and(|row| row.id == id))
+        .position(|row| row.as_ref().is_some_and(|row| row.id == id))
 }
 
-unsafe fn snapshot(index: usize) -> Row {
-    rows()[index].expect("in-flight video File owner must remain allocated")
+unsafe fn snapshot(index: usize) -> RowSnapshot {
+    let row = rows()[index]
+        .as_ref()
+        .expect("in-flight video File owner must remain allocated");
+    RowSnapshot {
+        handle: row.handle,
+        file: row.file,
+        address: row.address,
+        identity: row.identity,
+        handle_closed: row.handle_closed,
+        retiring: row.retiring,
+        in_flight: row.in_flight,
+    }
 }
 
 /// Establish a durable owner before opening a File or allocating its projection.
@@ -58,6 +84,8 @@ pub(super) unsafe fn reserve() -> Result<u64, NtStatus> {
         file: 0,
         address: 0,
         identity: None,
+        projection: None,
+        handle_closed: false,
         retiring: false,
         in_flight: false,
     });
@@ -143,7 +171,67 @@ unsafe fn prepare_inner(
         nt_io_manager::DeviceId(device_id),
     )
     .map_err(NtStatus)?;
+    let projection = crate::driver_launch::win32k_device_consumer::create_file_projection(
+        identity,
+        nt_io_manager::DeviceId(device_id),
+    )
+    .map_err(NtStatus)?;
+    rows_mut()[index].as_mut().unwrap().projection = Some(projection);
     Ok(address)
+}
+
+pub(super) unsafe fn pointer_reference_count(id: u64) -> Option<usize> {
+    let index = index_for(id)?;
+    rows()[index]
+        .as_ref()?
+        .projection
+        .as_ref()
+        .map(ConsumerFileProjection::pointer_reference_count)
+}
+
+pub(super) unsafe fn reference_by_handle(id: u64, address: u64) -> Result<u64, NtStatus> {
+    let index = index_for(id).ok_or(NtStatus::INVALID_HANDLE)?;
+    let row = rows_mut()[index].as_mut().unwrap();
+    if row.retiring || row.handle == 0 || row.address != address {
+        return Err(NtStatus::INVALID_HANDLE);
+    }
+    let identity = row.identity.ok_or(NtStatus::INVALID_HANDLE)?;
+    let projection = row.projection.as_mut().ok_or(NtStatus::INVALID_HANDLE)?;
+    let pointer = crate::driver_launch::win32k_device_consumer::reference_file_by_handle(
+        projection, identity,
+    )
+    .map_err(NtStatus)?;
+    assert_eq!(pointer, address, "video File reference changed projection address");
+    Ok((projection.pointer_reference_count() as u64).saturating_add(1))
+}
+
+pub(super) unsafe fn reference_by_pointer(id: u64, address: u64) -> Result<u64, NtStatus> {
+    let index = index_for(id).ok_or(NtStatus::INVALID_HANDLE)?;
+    let row = rows_mut()[index].as_mut().unwrap();
+    if row.retiring || row.address != address {
+        return Err(NtStatus::INVALID_HANDLE);
+    }
+    let identity = row.identity.ok_or(NtStatus::INVALID_HANDLE)?;
+    let projection = row.projection.as_mut().ok_or(NtStatus::INVALID_HANDLE)?;
+    let pointer = crate::driver_launch::win32k_device_consumer::reference_file_by_pointer(
+        projection, identity,
+    )
+    .map_err(NtStatus)?;
+    assert_eq!(pointer, address, "video File reference changed projection address");
+    Ok((projection.pointer_reference_count() as u64).saturating_add(1))
+}
+
+pub(super) unsafe fn dereference(id: u64, address: u64) -> Result<u64, NtStatus> {
+    let index = index_for(id).ok_or(NtStatus::INVALID_HANDLE)?;
+    let row = rows_mut()[index].as_mut().unwrap();
+    if row.address != address {
+        return Err(NtStatus::INVALID_HANDLE);
+    }
+    let identity = row.identity.ok_or(NtStatus::INVALID_HANDLE)?;
+    let projection = row.projection.as_mut().ok_or(NtStatus::INVALID_HANDLE)?;
+    crate::driver_launch::win32k_device_consumer::dereference_file_owner(projection, identity)
+        .map_err(NtStatus)?;
+    Ok((projection.pointer_reference_count() as u64).saturating_add(1))
 }
 
 /// Retire only after caller pointer references have drained. Failed stages retain their owners.
@@ -156,7 +244,7 @@ pub(super) unsafe fn retire(id: u64) -> bool {
 }
 
 unsafe fn retire_one(index: usize) -> bool {
-    let Some(row) = rows().get(index).copied().flatten() else {
+    let Some(row) = rows().get(index).and_then(Option::as_ref) else {
         return false;
     };
     if !row.retiring || row.in_flight {
@@ -179,6 +267,24 @@ unsafe fn retire_inner(index: usize) -> bool {
             return false;
         }
         rows_mut()[index].as_mut().unwrap().handle = 0;
+    }
+    if !snapshot(index).handle_closed {
+        if let Some(identity) = snapshot(index).identity {
+            let row = rows_mut()[index].as_mut().unwrap();
+            if let Some(projection) = row.projection.as_mut() {
+                if projection.handle_closed(identity).is_err() {
+                    return false;
+                }
+            }
+        }
+        rows_mut()[index].as_mut().unwrap().handle_closed = true;
+    }
+    if let Some(projection) = rows_mut()[index].as_mut().unwrap().projection.as_mut() {
+        if crate::driver_launch::win32k_device_consumer::retire_file_owner(projection).is_err() {
+            return false;
+        }
+        rows_mut()[index].as_mut().unwrap().projection = None;
+        rows_mut()[index].as_mut().unwrap().identity = None;
     }
     if let Some(identity) = snapshot(index).identity {
         if crate::driver_launch::win32k_device_consumer::retire_file_projection(identity).is_err() {
