@@ -4406,6 +4406,56 @@ fn installed_file_open_policy_has_one_owner_for_every_disposition() {
 }
 
 #[test]
+fn layered_regular_file_open_preserves_lookup_errors_and_source_choice() {
+    use LayeredFileOpenDecision::{CreateOverlay, Installed, UseOverlay};
+
+    for disposition in [FILE_OPEN, FILE_CREATE, FILE_OVERWRITE] {
+        assert_eq!(
+            layered_file_open_decision(Ok(true), true, FILE_READ_DATA, disposition, 0),
+            Ok(UseOverlay)
+        );
+    }
+    assert_eq!(
+        layered_file_open_decision(Ok(false), true, FILE_READ_DATA, FILE_OPEN, 0),
+        Ok(Installed(InstalledFileOpenAction::ReadOnly))
+    );
+    assert_eq!(
+        layered_file_open_decision(Ok(false), true, FILE_WRITE_DATA, FILE_OPEN, 0),
+        Ok(Installed(InstalledFileOpenAction::CopyContents))
+    );
+    assert_eq!(
+        layered_file_open_decision(Ok(false), true, FILE_WRITE_DATA, FILE_OVERWRITE, 0),
+        Ok(Installed(InstalledFileOpenAction::CopyMetadata))
+    );
+    assert_eq!(
+        layered_file_open_decision(Ok(false), true, FILE_READ_DATA, FILE_CREATE, 0),
+        Ok(Installed(InstalledFileOpenAction::NameCollision))
+    );
+    assert_eq!(
+        layered_file_open_decision(Ok(false), false, FILE_READ_DATA, FILE_OPEN, 0),
+        Err(STATUS_OBJECT_NAME_NOT_FOUND)
+    );
+    assert_eq!(
+        layered_file_open_decision(Ok(false), false, FILE_READ_DATA, FILE_OPEN_IF, 0),
+        Ok(CreateOverlay)
+    );
+    for status in [
+        STATUS_ACCESS_DENIED,
+        STATUS_NOT_A_DIRECTORY,
+        STATUS_INSUFFICIENT_RESOURCES,
+    ] {
+        assert_eq!(
+            layered_file_open_decision(Err(status), true, FILE_READ_DATA, FILE_OPEN, 0),
+            Err(status)
+        );
+    }
+    assert_eq!(
+        layered_file_open_decision(Ok(false), false, FILE_READ_DATA, 6, 0),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+}
+
+#[test]
 fn provisioned_file_extend_reads_zeroes_and_materializes_on_write() {
     let mut fs = FileSystem::new(MemFs::new());
     assert!(fs.provision_file(r"\??\C:\profiles\AppEvent.Evt", b"evt"));

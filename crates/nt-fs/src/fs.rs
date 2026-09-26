@@ -3495,6 +3495,14 @@ pub enum InstalledFileOpenAction {
     NameCollision,
 }
 
+/// Select the owner for a regular-file open in the overlay plus installed-volume namespace.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LayeredFileOpenDecision {
+    UseOverlay,
+    Installed(InstalledFileOpenAction),
+    CreateOverlay,
+}
+
 /// Validate the common `NtCreateFile`/`NtOpenFile` contract before namespace lookup or mutation.
 /// This is the NT5 I/O Manager parameter policy; filesystem entry points call it defensively as
 /// well so kernel-mode users cannot bypass destructive-disposition ordering.
@@ -3588,6 +3596,32 @@ pub fn installed_file_open_action(
         }
         _ => Err(STATUS_INVALID_PARAMETER),
     }
+}
+
+/// Decide only the source layer. The selected filesystem still enforces sharing, access, and
+/// create parameters; an overlay lookup error is never treated as an absent entry.
+pub fn layered_file_open_decision(
+    overlay_lookup: Result<bool, u32>,
+    installed_regular_file: bool,
+    desired_access: u32,
+    disposition: u32,
+    options: u32,
+) -> Result<LayeredFileOpenDecision, u32> {
+    let overlay_exists = overlay_lookup?;
+    if disposition > FILE_MAXIMUM_DISPOSITION {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if overlay_exists {
+        return Ok(LayeredFileOpenDecision::UseOverlay);
+    }
+    if installed_regular_file {
+        return installed_file_open_action(desired_access, disposition, options)
+            .map(LayeredFileOpenDecision::Installed);
+    }
+    if disposition == FILE_OPEN {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+    }
+    Ok(LayeredFileOpenDecision::CreateOverlay)
 }
 
 impl FileMetadata {
