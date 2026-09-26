@@ -3024,7 +3024,8 @@ unsafe fn component_pump_loop(
         } else if (label == crate::driver_launch::FSD_SERVICE_QUERY_PATH_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_WRITE_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_READ_FORWARD_LABEL
-            || label == crate::driver_launch::FSD_SERVICE_FLUSH_FORWARD_LABEL)
+            || label == crate::driver_launch::FSD_SERVICE_FLUSH_FORWARD_LABEL
+            || label == crate::driver_launch::FSD_SERVICE_QUERY_INFORMATION_FORWARD_LABEL)
             && ch.caps.kind == ReqKind::Irp
         {
             let reply = if msg.mi
@@ -3042,6 +3043,10 @@ unsafe fn component_pump_loop(
                         )
                     } else if label == crate::driver_launch::FSD_SERVICE_FLUSH_FORWARD_LABEL {
                         crate::driver_launch::service_hosted_flush_forward(
+                            ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
+                        )
+                    } else if label == crate::driver_launch::FSD_SERVICE_QUERY_INFORMATION_FORWARD_LABEL {
+                        crate::driver_launch::service_hosted_query_information_forward(
                             ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
                         )
                     } else {

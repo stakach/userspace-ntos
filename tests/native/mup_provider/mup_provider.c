@@ -19,10 +19,12 @@ typedef void *HANDLE;
 #define IRP_MJ_CLOSE 0x02
 #define IRP_MJ_READ 0x03
 #define IRP_MJ_WRITE 0x04
+#define IRP_MJ_QUERY_INFORMATION 0x05
 #define IRP_MJ_FLUSH_BUFFERS 0x09
 #define IRP_MJ_DEVICE_CONTROL 0x0e
 #define IRP_MJ_CLEANUP 0x12
 #define IRP_MJ_MAXIMUM_FUNCTION 0x1b
+#define FileStandardInformation 5
 #define SL_PENDING_RETURNED 0x01
 #define DO_DEVICE_INITIALIZING 0x80
 #define DO_BUFFERED_IO 0x04
@@ -61,6 +63,15 @@ typedef struct {
     uint32_t Reserved;
     uintptr_t Information;
 } IO_STATUS_BLOCK;
+
+typedef struct {
+    int64_t AllocationSize;
+    int64_t EndOfFile;
+    uint32_t NumberOfLinks;
+    uint8_t DeletePending;
+    uint8_t Directory;
+    uint8_t Reserved[2];
+} FILE_STANDARD_INFORMATION;
 
 typedef struct _DEVICE_OBJECT {
     uint8_t Reserved[0x30];
@@ -117,6 +128,12 @@ typedef struct _IO_STACK_LOCATION {
             int64_t ByteOffset;
             uint64_t Reserved2;
         } Read;
+        struct {
+            uint32_t Length;
+            uint32_t Reserved0;
+            uint32_t FileInformationClass;
+            uint8_t Reserved[20];
+        } QueryFile;
         uint8_t Bytes[32];
     } Parameters;
     DEVICE_OBJECT *DeviceObject;
@@ -124,6 +141,8 @@ typedef struct _IO_STACK_LOCATION {
     void *CompletionRoutine;
     void *Context;
 } IO_STACK_LOCATION;
+_Static_assert(offsetof(IO_STACK_LOCATION, Parameters.QueryFile.FileInformationClass) == 16,
+               "QueryFile class must use NT pointer alignment");
 
 typedef NTSTATUS (__stdcall *DRIVER_DISPATCH)(DEVICE_OBJECT *, IRP *);
 typedef void (__stdcall *DRIVER_UNLOAD)(void *);
@@ -155,6 +174,7 @@ typedef struct {
 
 _Static_assert(sizeof(UNICODE_STRING) == 16, "UNICODE_STRING x64 ABI");
 _Static_assert(sizeof(OBJECT_ATTRIBUTES) == 48, "OBJECT_ATTRIBUTES x64 ABI");
+_Static_assert(sizeof(FILE_STANDARD_INFORMATION) == 24, "FILE_STANDARD_INFORMATION x64 ABI");
 _Static_assert(sizeof(IRP) == 0xc0, "IRP prefix x64 ABI");
 _Static_assert(offsetof(IRP, IoStatus) == 0x30, "IRP IoStatus x64 ABI");
 _Static_assert(offsetof(IRP, AssociatedSystemBuffer) == 0x18, "IRP system buffer x64 ABI");
@@ -213,6 +233,7 @@ struct MupProviderEvidence {
     uint32_t probe_read_count;
     uint32_t probe_read_bytes;
     uint32_t probe_flush_count;
+    uint32_t probe_query_file_count;
     uint32_t query_count;
     uint32_t query_accepted;
     uint32_t query_rejected;
@@ -248,9 +269,14 @@ static const WCHAR ProbeRelativeName[] = {
 };
 static const uint8_t ProbeWriteBytes[] = {'n', 't', 'o', 's', '-', 'w', 'r', 'i', 't', 'e'};
 static const uint8_t ProbeReadBytes[] = {'n', 't', 'o', 's', '-', 'r', 'e', 'a', 'd', '!'};
+static const FILE_STANDARD_INFORMATION ProbeStandardInfo = {
+    0x1122334455667788ll, 0x0102030405060708ll, 0x13579bdfu, 1, 0, {0, 0}
+};
 static IRP *PendingReadIrp;
 static IRP *PendingFlushIrp;
 static uint8_t PendingFlushEvent[0x20] __attribute__((aligned(8)));
+static IRP *PendingQueryFileIrp;
+static uint8_t PendingQueryFileEvent[0x20] __attribute__((aligned(8)));
 
 static int IsProbeFileName(const UNICODE_STRING *name)
 {
@@ -411,6 +437,46 @@ static NTSTATUS __stdcall ProviderFlush(DEVICE_OBJECT *device, IRP *irp)
     if (count != 1) return Complete(irp, STATUS_INVALID_PARAMETER, 0);
     DbgPrint("[mup-provider-flush] count=%u\n", count);
     return Complete(irp, STATUS_SUCCESS, 0);
+}
+
+static void FillStandardInformation(IRP *irp)
+{
+    uint8_t *output = (uint8_t *)irp->AssociatedSystemBuffer;
+    const uint8_t *expected = (const uint8_t *)&ProbeStandardInfo;
+    for (uint32_t i = 0; i < sizeof(ProbeStandardInfo); i++) output[i] = expected[i];
+}
+
+static NTSTATUS __stdcall ProviderQueryInformation(DEVICE_OBJECT *device, IRP *irp)
+{
+    (void)device;
+    IO_STACK_LOCATION *stack = irp->CurrentStackLocation;
+    if (stack == NULL || stack->MajorFunction != IRP_MJ_QUERY_INFORMATION ||
+        stack->FileObject == NULL ||
+        (((FILE_OBJECT *)stack->FileObject)->FsContext != stack->FileObject &&
+         ((FILE_OBJECT *)stack->FileObject)->FileName.Length != 0) ||
+        stack->Parameters.QueryFile.Length != sizeof(ProbeStandardInfo) ||
+        stack->Parameters.QueryFile.FileInformationClass != FileStandardInformation ||
+        irp->AssociatedSystemBuffer == NULL) {
+        return Complete(irp, STATUS_INVALID_PARAMETER, 0);
+    }
+    uint32_t count = ++MupProviderEvidence.probe_query_file_count;
+    if (count == 2) {
+        IRP *empty = NULL;
+        stack->Control |= SL_PENDING_RETURNED;
+        if (!__atomic_compare_exchange_n(&PendingQueryFileIrp, &empty, irp, 0,
+                                         __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+            stack->Control &= (uint8_t)~SL_PENDING_RETURNED;
+            return Complete(irp, STATUS_DEVICE_BUSY, 0);
+        }
+        DbgPrint("[mup-provider-query-file-pending-dispatch] status=0x%08x\n",
+                 (uint32_t)STATUS_PENDING);
+        KeSetEvent(PendingQueryFileEvent, 0, 0);
+        return STATUS_PENDING;
+    }
+    if (count != 1) return Complete(irp, STATUS_INVALID_PARAMETER, 0);
+    FillStandardInformation(irp);
+    DbgPrint("[mup-provider-query-file] count=%u class=5 bytes=24\n", count);
+    return Complete(irp, STATUS_SUCCESS, sizeof(ProbeStandardInfo));
 }
 
 static NTSTATUS __stdcall ProviderDeviceControl(DEVICE_OBJECT *device, IRP *irp)
@@ -593,6 +659,17 @@ static void __stdcall RegistrationWorker(void *context)
                 Complete(pending, STATUS_SUCCESS, 0);
             }
         }
+        if (NT_SUCCESS(KeWaitForSingleObject(PendingQueryFileEvent, 0, 0, 0, NULL))) {
+            IRP *pending = __atomic_exchange_n(&PendingQueryFileIrp, NULL, __ATOMIC_ACQ_REL);
+            if (pending != NULL) {
+                int64_t delay = -1000000;
+                KeDelayExecutionThread(0, 0, &delay);
+                FillStandardInformation(pending);
+                DbgPrint("[mup-provider-query-file-pending-complete] count=%u bytes=24\n",
+                         MupProviderEvidence.probe_query_file_count);
+                Complete(pending, STATUS_SUCCESS, sizeof(ProbeStandardInfo));
+            }
+        }
         PsTerminateSystemThread(STATUS_SUCCESS);
         return;
     }
@@ -606,6 +683,7 @@ NTSTATUS __stdcall DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *registry_p
 {
     (void)registry_path;
     KeInitializeEvent(PendingFlushEvent, 1, 0);
+    KeInitializeEvent(PendingQueryFileEvent, 1, 0);
     MupProviderEvidence.driver_entry++;
     DbgPrint("[mup-provider-stage] entry\n");
     UNICODE_STRING provider_name = {
@@ -624,6 +702,7 @@ NTSTATUS __stdcall DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *registry_p
     driver->MajorFunction[IRP_MJ_READ] = ProviderRead;
     driver->MajorFunction[IRP_MJ_WRITE] = ProviderWrite;
     driver->MajorFunction[IRP_MJ_FLUSH_BUFFERS] = ProviderFlush;
+    driver->MajorFunction[IRP_MJ_QUERY_INFORMATION] = ProviderQueryInformation;
     driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = ProviderDeviceControl;
     driver->DriverUnload = ProviderUnload;
     ProviderDevice->Flags = (ProviderDevice->Flags | DO_BUFFERED_IO) & ~DO_DEVICE_INITIALIZING;
