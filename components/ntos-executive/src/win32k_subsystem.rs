@@ -1185,6 +1185,7 @@ pub const W32_DEVICE_POINTER_LABEL: u64 = 0x781;
 pub const W32_DIRECTORY_LABEL: u64 = 0x782;
 pub const W32_FILE_CLOSE_LABEL: u64 = 0x790;
 pub const W32_FILE_CREATE_LABEL: u64 = 0x791;
+pub const W32_FILE_QUERY_LABEL: u64 = 0x792;
 /// Root-authenticated kernel activation handoff before entering provider code.
 pub const W32_KERNEL_ACTIVATION_LABEL: u64 = 0x78E;
 pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
@@ -1445,6 +1446,61 @@ pub(crate) unsafe fn copy_provider_pool_allocation(p: u64, length: usize) -> Res
     bytes.resize(length, 0);
     core::ptr::copy_nonoverlapping(p as *const u8, bytes.as_mut_ptr(), length);
     Ok(bytes)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ProviderPoolPacketLease {
+    pointer: u64,
+    length: usize,
+    provider: nt_provider_wait::ProviderDomainIdentity,
+    allocation: shared_pool::AllocationIdentity,
+}
+
+pub(crate) unsafe fn capture_provider_pool_packet(
+    pointer: u64,
+    length: usize,
+) -> Result<(ProviderPoolPacketLease, Vec<u8>), u32> {
+    if !provider_pool_contains(pointer) || length == 0 || length as u64 >= WIN32K_POOL_FRAMES * 0x1000 {
+        return Err(STATUS_INVALID_PARAMETER_I32 as u32);
+    }
+    let provider = registered_provider_wait_domain().ok_or(STATUS_INVALID_PARAMETER_I32 as u32)?;
+    let _guard = provider_pool_lock().ok_or(STATUS_INSUFFICIENT_RESOURCES_I32 as u32)?;
+    let offset = pointer - WIN32K_POOL_VADDR;
+    let memory = ProviderPoolMemory;
+    let capacity = shared_pool::allocation_capacity(&memory, offset)
+        .map_err(|_| STATUS_INVALID_PARAMETER_I32 as u32)?;
+    if capacity < length as u64 {
+        return Err(STATUS_INVALID_PARAMETER_I32 as u32);
+    }
+    let allocation = shared_pool::allocation_identity(&memory, offset)
+        .map_err(|_| STATUS_INVALID_PARAMETER_I32 as u32)?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length).map_err(|_| STATUS_INSUFFICIENT_RESOURCES_I32 as u32)?;
+    bytes.resize(length, 0);
+    core::ptr::copy_nonoverlapping(pointer as *const u8, bytes.as_mut_ptr(), length);
+    Ok((ProviderPoolPacketLease { pointer, length, provider, allocation }, bytes))
+}
+
+pub(crate) unsafe fn publish_provider_pool_packet(
+    lease: ProviderPoolPacketLease,
+    bytes: &[u8],
+) -> bool {
+    if bytes.len() != lease.length || registered_provider_wait_domain() != Some(lease.provider) {
+        return false;
+    }
+    let Some(_guard) = provider_pool_lock() else { return false };
+    if registered_provider_wait_domain() != Some(lease.provider) {
+        return false;
+    }
+    let offset = lease.pointer - WIN32K_POOL_VADDR;
+    let memory = ProviderPoolMemory;
+    if shared_pool::allocation_identity(&memory, offset) != Ok(lease.allocation)
+        || !matches!(shared_pool::allocation_capacity(&memory, offset), Ok(capacity) if capacity >= lease.length as u64)
+    {
+        return false;
+    }
+    core::ptr::copy_nonoverlapping(bytes.as_ptr(), lease.pointer as *mut u8, bytes.len());
+    true
 }
 
 unsafe fn provider_pool_validate_owned(objects: &[(u64, u64)]) -> bool {
@@ -3524,6 +3580,7 @@ mod object_security;
 mod directory_object;
 mod file_close;
 mod file_open;
+mod file_query;
 pub(crate) use object_security::census as object_security_census;
 
 /// Duplicate a handle owned by win32k's USER object table. Native `NtDuplicateObject` calls this
@@ -14218,6 +14275,7 @@ fn register_trampolines() -> bool {
     );
     reg.bind("ZwOpenFile", file_open::open as *const () as usize as u64);
     reg.bind("ZwCreateFile", file_open::create as *const () as usize as u64);
+    reg.bind("ZwQueryInformationFile", file_query::query_information as *const () as usize as u64);
     reg.bind("ZwOpenKey", s_zw_open_key as usize as u64);
     reg.bind("NtOpenKey", s_nt_open_key as usize as u64);
     reg.bind(

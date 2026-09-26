@@ -46,8 +46,7 @@ struct Work {
     caller: NativeHandleCaller,
     actor: NativeThreadProcessReference,
     file: super::hosted_file_capture::Capture,
-    instance: DriverInstance,
-    domain: nt_io_manager::HostedTransportIdentity,
+    source: PacketSource,
     packet: u64,
     packet_length: u64,
     operation: Operation,
@@ -57,6 +56,17 @@ struct Work {
     terminal: Option<(u32, u64)>,
     cancel_requested: bool,
     reply_entered: bool,
+}
+
+enum PacketSource {
+    Fsd {
+        instance: DriverInstance,
+        domain: nt_io_manager::HostedTransportIdentity,
+    },
+    Win32k {
+        lease: crate::win32k_subsystem::ProviderPoolPacketLease,
+        packet: Vec<u8>,
+    },
 }
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
@@ -76,8 +86,11 @@ fn capture_packet(
     let exec =
         unsafe { hosted_instance_pool_allocation_exec_if_live(instance, packet, packet_length) }
             .ok_or(STATUS_INVALID_PARAMETER as u32)?;
-    let request = wire::decode_request(unsafe { core::slice::from_raw_parts(exec as *const u8, total) })
-        .map_err(wire_status)?;
+    parse_packet(unsafe { core::slice::from_raw_parts(exec as *const u8, total) })
+}
+
+fn parse_packet(packet: &[u8]) -> Result<(Operation, Vec<u8>), u32> {
+    let request = wire::decode_request(packet).map_err(wire_status)?;
     let operation = match request {
         FileReadQueryRequest::Read(parameters) => Operation::Read(parameters),
         FileReadQueryRequest::Query { class, .. } => Operation::Query(class),
@@ -111,6 +124,55 @@ pub(crate) unsafe fn submit(
         Ok(packet) => packet,
         Err(status) => return Some(status as i32),
     };
+    let source = PacketSource::Fsd {
+        instance,
+        domain: nt_io_manager::HostedTransportIdentity {
+            domain: channel.physical_domain.expect("authenticated hosted File I/O domain"),
+            endpoint: channel.fault_ep,
+            vspace: channel.pml4,
+            shared: channel.shared_va,
+        },
+    };
+    submit_captured(channel, packet, packet_length, handle, caller, operation, output, source)
+}
+
+pub(crate) unsafe fn submit_win32k(
+    channel: &crate::spawn_hosts::PumpChannel,
+    packet: u64,
+    packet_length: u64,
+    handle: u64,
+) -> Option<i32> {
+    let _durable = crate::allocator::enter_durable();
+    let caller = match crate::provider_registry_caller::resolve(channel) {
+        Ok(caller) => caller,
+        Err(status) => return Some(status as i32),
+    };
+    let Ok(length) = usize::try_from(packet_length) else { return Some(STATUS_INVALID_BUFFER_SIZE as i32) };
+    let (lease, bytes) = match crate::win32k_subsystem::capture_provider_pool_packet(packet, length) {
+        Ok(captured) => captured,
+        Err(status) => return Some(status as i32),
+    };
+    let (operation, output) = match parse_packet(&bytes) {
+        Ok(captured) => captured,
+        Err(status) => return Some(status as i32),
+    };
+    if !matches!(operation, Operation::Query(_)) {
+        return Some(STATUS_INVALID_PARAMETER);
+    }
+    submit_captured(channel, packet, packet_length, handle, caller, operation, output,
+        PacketSource::Win32k { lease, packet: bytes })
+}
+
+unsafe fn submit_captured(
+    channel: &crate::spawn_hosts::PumpChannel,
+    packet: u64,
+    packet_length: u64,
+    handle: u64,
+    caller: NativeHandleCaller,
+    operation: Operation,
+    output: Vec<u8>,
+    source: PacketSource,
+) -> Option<i32> {
     let route = match runtime::channel_route(channel) {
         Ok(Some(route)) => route,
         _ => return Some(STATUS_INVALID_HANDLE),
@@ -186,15 +248,7 @@ pub(crate) unsafe fn submit(
         caller,
         actor,
         file,
-        instance,
-        domain: nt_io_manager::HostedTransportIdentity {
-            domain: channel
-                .physical_domain
-                .expect("authenticated hosted File I/O domain"),
-            endpoint: channel.fault_ep,
-            vspace: channel.pml4,
-            shared: channel.shared_va,
-        },
+        source,
         packet,
         packet_length,
         operation,
@@ -386,31 +440,36 @@ impl Work {
             return self.finish_cancelled(handler);
         }
         let (status, information) = self.terminal.expect("hosted File read/query terminal");
-        let Some((_, live)) = instance_by_shared_va(self.domain.shared) else {
-            return false;
-        };
-        let Some(live_domain) = instance_domain_identity(live) else {
-            return false;
-        };
-        let live_transport = nt_io_manager::HostedTransportIdentity {
-            domain: live_domain,
-            endpoint: live.fault_ep,
-            vspace: live.pml4,
-            shared: live.exec_shared_va,
-        };
-        if !self.domain.matches_live(live_transport)
-            || live.exec_pool_va != self.instance.exec_pool_va
-        {
-            return false;
-        }
-        let Some(exec) =
-            hosted_instance_pool_allocation_exec_if_live(live, self.packet, self.packet_length)
-        else {
-            return false;
-        };
-        let packet = core::slice::from_raw_parts_mut(exec as *mut u8, self.packet_length as usize);
-        if wire::publish_completion(packet, &self.output, status, information).is_err() {
-            crate::provider_bugcheck::report(0xc4, [self.packet, self.packet_length, self.file.file_id(), status as u64]);
+        match &mut self.source {
+            PacketSource::Fsd { instance, domain } => {
+                let Some((_, live)) = instance_by_shared_va(domain.shared) else { return false };
+                let Some(live_domain) = instance_domain_identity(live) else { return false };
+                let live_transport = nt_io_manager::HostedTransportIdentity {
+                    domain: live_domain,
+                    endpoint: live.fault_ep,
+                    vspace: live.pml4,
+                    shared: live.exec_shared_va,
+                };
+                if !domain.matches_live(live_transport) || live.exec_pool_va != instance.exec_pool_va {
+                    return false;
+                }
+                let Some(exec) = hosted_instance_pool_allocation_exec_if_live(live, self.packet, self.packet_length) else {
+                    return false;
+                };
+                let packet = core::slice::from_raw_parts_mut(exec as *mut u8, self.packet_length as usize);
+                if wire::publish_completion(packet, &self.output, status, information).is_err() {
+                    crate::provider_bugcheck::report(0xc4, [self.packet, self.packet_length, self.file.file_id(), status as u64]);
+                }
+            }
+            PacketSource::Win32k { lease, packet } => {
+                if wire::publish_completion(packet, &self.output, status, information).is_err() {
+                    crate::provider_bugcheck::report(0xc4, [self.packet, self.packet_length, self.file.file_id(), status as u64]);
+                }
+                if !crate::win32k_subsystem::publish_provider_pool_packet(*lease, packet) {
+                    packet[24..40].fill(0);
+                    return false;
+                }
+            }
         }
         (*handler)
             .file_completion
