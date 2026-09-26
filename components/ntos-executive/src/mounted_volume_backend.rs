@@ -110,34 +110,36 @@ impl MountedVolumeBackend {
             }
         }
 
-        let share_open = self
-            .shares
-            .create(
-                installed.first_cluster,
-                installed.metadata.end_of_file.min(u32::MAX as u64) as u32,
-                relative,
-                access,
-                share,
-                options,
-                installed.metadata,
-                installed.alternate_name,
-            )
-            .map_err(status)?;
-        let context = match self.opens.insert(
-            file_id.raw(),
-            nt_fs::LayeredOpenSource::Installed {
-                first_cluster: installed.first_cluster,
-                metadata: installed.metadata,
-                alternate_name: installed.alternate_name,
-            },
-            units,
+        let context = self.opens.reserve(file_id.raw(), units).map_err(status)?;
+        let share_open = match self.shares.create(
+            installed.first_cluster,
+            installed.metadata.end_of_file.min(u32::MAX as u64) as u32,
+            relative,
+            access,
+            share,
+            options,
+            installed.metadata,
+            installed.alternate_name,
         ) {
-            Ok(context) => context,
+            Ok(share_open) => share_open,
             Err(error) => {
-                let _ = self.shares.release(share_open);
+                self.opens
+                    .cancel(context, file_id.raw())
+                    .expect("owned reservation");
                 return Err(status(error));
             }
         };
+        self.opens
+            .finish(
+                context,
+                file_id.raw(),
+                nt_fs::LayeredOpenSource::Installed {
+                    first_cluster: installed.first_cluster,
+                    metadata: installed.metadata,
+                    alternate_name: installed.alternate_name,
+                },
+            )
+            .expect("owned reservation");
         let index = context_index(context).expect("bounded layered table context index");
         debug_assert!(self.bindings[index].is_none());
         self.bindings[index] = Some(InstalledBinding {
