@@ -38123,6 +38123,10 @@ fn pump_io_manager() -> usize {
     progress
 }
 
+pub(crate) fn pump_registered_file_lifecycle() -> usize {
+    pump_io_manager()
+}
+
 /// Consume the manager's complete durable-allocation signal. Unlike the pump
 /// report, this includes canonical driver/device/File/IRP/domain records and
 /// their record-owned heap data regardless of which operation created them.
@@ -43347,6 +43351,50 @@ fn dispatch_external_irp_to_device_record_result_exact(
         read_write,
     )
     .ok_or(STATUS_INVALID_PARAMETER as u32)?;
+    if registered_file_target(device_id, major)? == RegisteredFileTarget::Kernel {
+        if initial_information != 0 || (!in_data.is_empty() && !out.is_empty()) {
+            return Err(nt_status::NtStatus::NOT_SUPPORTED.raw() as u32);
+        }
+        let mut buffer = Vec::new();
+        let capacity = in_data.len().max(out.len());
+        buffer
+            .try_reserve_exact(capacity)
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32)?;
+        buffer.resize(capacity, 0);
+        buffer[..in_data.len()].copy_from_slice(in_data);
+        let result = io_manager_mut()
+            .build_and_dispatch_external_to_device_with_stack_flags(
+                ClientId(IO_MANAGER_COMPONENT_ID),
+                nt_io_manager::DeviceId(device_id),
+                canonical_file_id,
+                file_id,
+                u64::from(caller.original_thread().thread_id()),
+                major,
+                params,
+                stack_flags,
+                input_len,
+                output_len,
+                &mut buffer,
+            )
+            .map_err(|status| status.raw() as u32)?;
+        return Ok(match result {
+            nt_io_manager::ExternalDispatchResult::Completed {
+                status,
+                information,
+                file_context,
+            } => {
+                let copied = nt_io_manager::completion_output_transfer_len(
+                    information,
+                    out.len() as u64,
+                ) as usize;
+                out[..copied].copy_from_slice(&buffer[..copied]);
+                (status.raw(), information, None, file_context)
+            }
+            nt_io_manager::ExternalDispatchResult::Pending { irp_id } => {
+                (STATUS_PENDING as i32, 0, Some(irp_id), None)
+            }
+        });
+    }
     let result = hosted_file_owners::dispatch(
         caller,
         nt_io_manager::detached_file_irp::ExternalFileIrpRequest {
@@ -43379,6 +43427,39 @@ fn dispatch_external_irp_to_device_record_result_exact(
         hosted_file_owners::DispatchResult::Outstanding { irp_id } => {
             Ok((STATUS_PENDING as i32, 0, Some(irp_id), None))
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegisteredFileTarget {
+    Kernel,
+    DriverPeer,
+}
+
+/// Classify the live top of the exact canonical device stack for this major.
+pub(crate) fn registered_file_target(
+    device_id: u64,
+    major: u8,
+) -> Result<RegisteredFileTarget, u32> {
+    let io = io_manager_mut();
+    let top = io
+        .top_of_device_stack(nt_io_manager::DeviceId(device_id))
+        .map_err(|status| status.raw() as u32)?;
+    let driver_id = io
+        .device(top)
+        .ok_or(STATUS_INVALID_HANDLE as u32)?
+        .driver_id;
+    let target = io
+        .driver(driver_id)
+        .ok_or(STATUS_INVALID_HANDLE as u32)?
+        .dispatch
+        .get(major);
+    if target.kernel_id().is_some() {
+        Ok(RegisteredFileTarget::Kernel)
+    } else if target.driver_peer_id().is_some() {
+        Ok(RegisteredFileTarget::DriverPeer)
+    } else {
+        Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw() as u32)
     }
 }
 
@@ -58899,7 +58980,7 @@ pub(crate) fn hosted_driver_video_port_initialized(driver_id: u64) -> bool {
 /// Whether the driver-declared `\Device\NamedPipe` route is ready to serve IRPs.
 pub(crate) fn npfs_ready() -> bool {
     device_id_by_name("\\Device\\NamedPipe")
-        .map(hosted_device_ready_for_dispatch)
+        .map(file_device_ready_for_dispatch)
         .unwrap_or(false)
 }
 
@@ -59553,7 +59634,7 @@ pub(crate) fn allocate_hosted_file(
     create_options: u32,
     file_name: &[u16],
 ) -> Result<u64, u32> {
-    require_hosted_device_ready_for_dispatch(device_id)?;
+    require_file_device_ready_for_dispatch(device_id)?;
     let file_name = nt_types::UnicodeString::from_units(file_name);
     io_manager_mut()
         .allocate_external_file(
@@ -59583,7 +59664,7 @@ pub(crate) fn allocate_hosted_relative_file(
         .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID) && file.state.is_open())
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
-    require_hosted_device_ready_for_dispatch(device_id)?;
+    require_file_device_ready_for_dispatch(device_id)?;
     io_manager_mut()
         .allocate_external_relative_file(
             ClientId(IO_MANAGER_COMPONENT_ID),
@@ -59606,7 +59687,7 @@ pub(crate) fn allocate_owned_hosted_relative_file(
     create_options: u32,
     file_name: &[u16],
 ) -> Result<u64, u32> {
-    require_hosted_device_ready_for_dispatch(parent.device_id())?;
+    require_file_device_ready_for_dispatch(parent.device_id())?;
     io_manager_mut()
         .allocate_owned_external_relative_file(
             ClientId(IO_MANAGER_COMPONENT_ID),
@@ -59712,7 +59793,7 @@ pub(crate) fn allocate_hosted_set_file_name_target(
     let file_id = match target {
         HostedFileNameTarget::RelatedFile(root_file_id) => {
             let device_id = owned_hosted_file_metadata(root_file_id)?.device_id.raw();
-            require_hosted_device_ready_for_dispatch(device_id)?;
+            require_file_device_ready_for_dispatch(device_id)?;
             io_manager_mut()
                 .allocate_owned_external_relative_file(
                     ClientId(IO_MANAGER_COMPONENT_ID),
@@ -59729,7 +59810,7 @@ pub(crate) fn allocate_hosted_set_file_name_target(
             let device_id = io_manager_mut()
                 .device_id_by_object_id(object_id)
                 .ok_or(nt_status::NtStatus::INVALID_PARAMETER.raw() as u32)?;
-            require_hosted_device_ready_for_dispatch(device_id.raw())?;
+            require_file_device_ready_for_dispatch(device_id.raw())?;
             io_manager_mut()
                 .allocate_external_file_by_device_object(
                     ClientId(IO_MANAGER_COMPONENT_ID),
@@ -59799,7 +59880,7 @@ pub(crate) unsafe fn dispatch_hosted_file_irp_result_exact(
         .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
-    require_hosted_device_ready_for_dispatch(device_id)?;
+    require_file_device_ready_for_dispatch(device_id)?;
     dispatch_external_irp_to_device_record_result_exact(
         device_id,
         Some(canonical_file_id),
@@ -59844,7 +59925,7 @@ pub(crate) unsafe fn dispatch_hosted_file_read_write_irp_result_exact(
         .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
-    require_hosted_device_ready_for_dispatch(device_id)?;
+    require_file_device_ready_for_dispatch(device_id)?;
     dispatch_external_irp_to_device_record_result_exact(
         device_id,
         Some(canonical_file_id),
@@ -59883,7 +59964,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_information_irp_result_exact(
         .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
-    require_hosted_device_ready_for_dispatch(device_id)?;
+    require_file_device_ready_for_dispatch(device_id)?;
     let mut output = [];
     dispatch_external_irp_to_device_record_result_exact(
         device_id,
@@ -59928,7 +60009,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_ea_irp_result_exact(
         .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
-    require_hosted_device_ready_for_dispatch(device_id)?;
+    require_file_device_ready_for_dispatch(device_id)?;
     dispatch_external_irp_to_device_record_result_exact(
         device_id,
         Some(canonical_file_id),
@@ -59965,7 +60046,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_ea_irp_result_exact(
         .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
-    require_hosted_device_ready_for_dispatch(device_id)?;
+    require_file_device_ready_for_dispatch(device_id)?;
     let mut output = [];
     dispatch_external_irp_to_device_record_result_exact(
         device_id,
@@ -60010,7 +60091,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_quota_irp_result_exact(
         .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
-    require_hosted_device_ready_for_dispatch(device_id)?;
+    require_file_device_ready_for_dispatch(device_id)?;
     dispatch_external_irp_to_device_record_result_exact(
         device_id,
         Some(canonical_file_id),
@@ -60047,7 +60128,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_quota_irp_result_exact(
         .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
-    require_hosted_device_ready_for_dispatch(device_id)?;
+    require_file_device_ready_for_dispatch(device_id)?;
     let mut output = [];
     dispatch_external_irp_to_device_record_result_exact(
         device_id,
@@ -60086,7 +60167,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_volume_information_irp_result_ex
         .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
-    require_hosted_device_ready_for_dispatch(device_id)?;
+    require_file_device_ready_for_dispatch(device_id)?;
     let mut input = [];
     dispatch_external_irp_to_device_record_result_exact(
         device_id,
@@ -60128,7 +60209,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_volume_information_irp_result_exac
         .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
-    require_hosted_device_ready_for_dispatch(device_id)?;
+    require_file_device_ready_for_dispatch(device_id)?;
     let mut output = [];
     dispatch_external_irp_to_device_record_result_exact(
         device_id,
@@ -60175,7 +60256,7 @@ pub(crate) unsafe fn dispatch_hosted_file_notify_directory_irp_result_exact(
         .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
-    require_hosted_device_ready_for_dispatch(device_id)?;
+    require_file_device_ready_for_dispatch(device_id)?;
     let mut input = [];
     dispatch_external_irp_to_device_record_result_exact(
         device_id,
@@ -60221,7 +60302,7 @@ pub(crate) unsafe fn dispatch_hosted_file_lock_control_irp_result_exact(
         .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
-    require_hosted_device_ready_for_dispatch(device_id)?;
+    require_file_device_ready_for_dispatch(device_id)?;
     let mut input = [];
     let mut output = [];
     dispatch_external_irp_to_device_record_result_exact(
@@ -60268,7 +60349,7 @@ pub(crate) unsafe fn dispatch_hosted_file_create_irp_result_exact(
         .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
-    require_hosted_device_ready_for_dispatch(device_id)?;
+    require_file_device_ready_for_dispatch(device_id)?;
     let stack_flags = parameters.case_sensitive_stack_flags(major);
     dispatch_external_irp_to_device_record_result_exact(
         device_id,
@@ -60309,7 +60390,7 @@ pub(crate) unsafe fn dispatch_hosted_target_directory_create_irp_result_exact(
         .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
         .map(|file| file.device_id.raw())
         .ok_or(STATUS_INVALID_HANDLE as u32)?;
-    require_hosted_device_ready_for_dispatch(device_id)?;
+    require_file_device_ready_for_dispatch(device_id)?;
     let stack_flags = parameters.case_sensitive_stack_flags(major::IRP_MJ_CREATE)
         | StackFlags::FORCE_ACCESS_CHECK
         | StackFlags::OPEN_TARGET_DIRECTORY;
@@ -60409,8 +60490,8 @@ fn release_hosted_file_with_provenance(file_id: u64, provenance: &[u8]) -> Resul
     result
 }
 
-fn hosted_device_ready_for_dispatch(device_id: u64) -> bool {
-    require_hosted_device_ready_for_dispatch(device_id).is_ok()
+fn file_device_ready_for_dispatch(device_id: u64) -> bool {
+    require_file_device_ready_for_dispatch(device_id).is_ok()
 }
 
 fn hosted_dispatch_instance_for_device_id(
@@ -60419,7 +60500,10 @@ fn hosted_dispatch_instance_for_device_id(
     hosted_driver_device_route_by_device_id(device_id).ok_or(STATUS_DEVICE_NOT_READY as u32)
 }
 
-fn require_hosted_device_ready_for_dispatch(device_id: u64) -> Result<(), u32> {
+fn require_file_device_ready_for_dispatch(device_id: u64) -> Result<(), u32> {
+    if registered_file_target(device_id, major::IRP_MJ_CREATE)? == RegisteredFileTarget::Kernel {
+        return Ok(());
+    }
     let (_, inst, device_object) = hosted_dispatch_instance_for_device_id(device_id)?;
     if !inst.ready || inst.driver_id == 0 || device_object == 0 {
         return Err(STATUS_DEVICE_NOT_READY as u32);

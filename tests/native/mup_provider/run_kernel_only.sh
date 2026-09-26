@@ -38,15 +38,16 @@ if [ "$rc" != 0 ] && [ "$rc" != 3 ]; then
   echo "Mup provider boot did not complete (runner status $rc): $RUN_LOG" >&2
   exit 1
 fi
-# An accepted MUP query requires completed provider registration; the long
-# registration DbgPrint can be interleaved with timer output on serial. Source
-# completion records are authoritative when an individual provider trace is split.
+# An accepted MUP query requires both completed provider registration and a non-null security
+# context. Serial DbgPrint can interleave within a line, so use the final probe's counters rather
+# than the individual query trace for that proof.
 if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
+   || ! grep -Fq 'PASS exec_mounted_volume_external_file_dispatch_font_read' "$RUN_LOG" \
    || grep -Fq '[win32k-import] reject image' "$RUN_LOG" \
    || grep -Fq '!@src/component_scheduler.rs:' "$RUN_LOG" \
-   || ! grep -Eq '\[mup-provider-query\] count=[1-9][0-9]* accepted=[1-9][0-9]* .*security=1' "$RUN_LOG" \
+   || ! grep -Eq '\[mup-provider-probe\] status=0x00000000 queries=[1-9][0-9]* accepted=[1-9][0-9]* ' "$RUN_LOG" \
    || { ! grep -Eq '\[mup-provider-create\] probe-file created=[1-9][0-9]*' "$RUN_LOG" \
-        && ! grep -Eq '\[mup-provider-probe\] status=0x00000000 .*file-created=[1-9][0-9]* cleaned=[1-9][0-9]* closed=[1-9][0-9]*' "$RUN_LOG"; } \
+        && ! grep -Eq '\[mup-provider-probe\] status=0x00000000 queries=[1-9][0-9]* accepted=[1-9][0-9]* .*file-created=[1-9][0-9]* cleaned=[1-9][0-9]* closed=[1-9][0-9]*' "$RUN_LOG"; } \
    || ! grep -Eq '\[mup-provider-write-result\] status=0x00000000 info=10' "$RUN_LOG" \
    || ! grep -Eq '\[mup-provider-read\] count=[1-9][0-9]* bytes=10' "$RUN_LOG" \
    || { ! grep -Fq '[read-forward-result] offset=0 call=0x00000000 wait=0x00000000 status=0x00000000 iosb=0x00000000 info=10 bytes-match=1' "$RUN_LOG" \
@@ -67,7 +68,7 @@ if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || ! grep -Fq '[mup-provider-query-file-pending-complete] count=2 bytes=24' "$RUN_LOG" \
    || ! grep -Fq '[query-forward-verified-1]' "$RUN_LOG" \
    || [ "$(grep -Fc '[mup-provider-query-file-pending-complete]' "$RUN_LOG")" -ne 1 ] \
-   || { ! grep -Eq '\[mup-provider-probe\] status=0x00000000 .*file-created=[1-9][0-9]* cleaned=[1-9][0-9]* closed=[1-9][0-9]*' "$RUN_LOG" \
+   || { ! grep -Eq '\[mup-provider-probe\] status=0x00000000 queries=[1-9][0-9]* accepted=[1-9][0-9]* .*file-created=[1-9][0-9]* cleaned=[1-9][0-9]* closed=[1-9][0-9]*' "$RUN_LOG" \
         && { ! grep -Eq '\[mup-provider-cleanup\] probe-file cleaned=[1-9][0-9]*' "$RUN_LOG" \
              || ! grep -Eq '\[mup-provider-close\] probe-file closed=[1-9][0-9]*' "$RUN_LOG"; }; }; then
   echo "Mup/provider registration, query, immediate/pending READ, FLUSH and QUERY_INFORMATION, WRITE, and File lifecycle proof incomplete: $RUN_LOG" >&2

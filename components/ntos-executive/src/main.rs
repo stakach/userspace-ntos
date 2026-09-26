@@ -70,6 +70,7 @@ mod executive_va;
 mod fs_loader;
 mod mounted_volume;
 mod mounted_volume_backend;
+mod mounted_volume_ingress_probe;
 pub(crate) use fs_loader::*;
 mod hosted_bootstrap;
 pub(crate) use hosted_bootstrap::*;
@@ -28679,6 +28680,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         found_storage,
         &mut passed,
     );
+    let mut mounted_volume_device_id = None;
     if found_storage {
         print_str(b"[ntos-exec] storage controller ABAR(BAR5)=");
         print_hex(storage_bar5);
@@ -29227,9 +29229,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let mut mounted_volume_file_ok = false;
             if let Some(fs) = fat32_mount(AHCI_VADDR, AHCI_DMA_VADDR, AHCI_IOVA)
                 .and_then(|fs| publish_exec_fs(fs).ok().map(|()| fs)) {
-                if let Ok((_, file_ok)) = mounted_volume::register_mounted_volume(fs) {
+                if let Ok((device_id, file_ok)) = mounted_volume::register_mounted_volume(fs) {
                     mounted_volume_provider_ok = true;
                     mounted_volume_file_ok = file_ok;
+                    mounted_volume_device_id = Some(device_id);
                 }
                 if let Some((va, sz)) = load_file_to_pool(&fs, b"reactos\\system32\\version.dll") {
                     let bytes = core::slice::from_raw_parts(va as *const u8, sz as usize);
@@ -29710,6 +29713,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b" load failed\n");
             }
         }
+        let mounted_volume_ingress_ok = mounted_volume_device_id
+            .is_some_and(|device_id| mounted_volume_ingress_probe::run(device_id));
+        check(
+            b"exec_mounted_volume_external_file_dispatch_font_read",
+            mounted_volume_ingress_ok,
+            &mut passed,
+        );
         if let Some((dc, driver_object_path)) = named_pipe_provider {
             publish_npfs_io_objects(&mut *c, &dc, driver_object_path.as_str(), &mut passed);
             // C1 checks: the general dynamic path loaded npfs isolated + ran its DriverEntry.
