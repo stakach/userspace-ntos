@@ -1,7 +1,10 @@
 use super::*;
+use crate::native_caller_subject::NativeCallerSubject;
 use crate::ps_bootstrap::{PsBootstrapParts, PsBootstrapState};
+use nt_process::native_handle::NativeHandleCaller;
 use nt_process::ImpersonationContext;
-use nt_security::{AccessToken, SecurityImpersonationLevel, TokenType};
+use nt_security::{AccessToken, ProcessorMode, SecurityImpersonationLevel, TokenType};
+use nt_types::AccessMode;
 
 fn fixture(mode: AccessMode) -> (PsBootstrapParts, NativeHandleCaller) {
     let mut parts = PsBootstrapState::try_new(0x1000, 0).unwrap().into_parts();
@@ -51,6 +54,27 @@ fn capture_retains_exact_actor_token_and_mode_until_explicit_release() {
         assert!(captured.resolve(&parts.token_store).is_err());
         assert!(captured.release(&mut parts.token_store).is_err());
     }
+}
+
+#[test]
+fn general_subject_and_registry_alias_capture_the_same_caller() {
+    let (mut parts, caller) = fixture(AccessMode::UserMode);
+    let primary = parts
+        .pm
+        .process_primary_token(caller.original_thread().process_id())
+        .unwrap();
+    let mut captured =
+        NativeCallerSubject::capture(&parts.pm, &mut parts.token_store, caller).unwrap();
+    assert_eq!(captured.caller(), caller);
+    assert_eq!(captured.mode(), ProcessorMode::UserMode);
+    assert_eq!(parts.token_store.reference_count(primary), Some(2));
+    assert_eq!(
+        captured.token_ids(&parts.token_store).unwrap(),
+        (primary, None)
+    );
+    captured.release(&mut parts.token_store).unwrap();
+    assert_eq!(parts.token_store.reference_count(primary), Some(1));
+    assert!(captured.token_ids(&parts.token_store).is_err());
 }
 
 #[test]
