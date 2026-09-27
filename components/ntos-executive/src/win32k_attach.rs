@@ -2,13 +2,23 @@
 use super::*;
 use nt_memory_manager::alias_transition::AliasTransitionIo;
 use nt_memory_manager::retained_alias::AliasRetirementIo;
+use nt_user_host::client_alias_window::WindowOwner;
+use nt_user_host::process_identity::ProcessGeneration;
 use nt_user_host::thread_alias_journal::ThreadAliasMapping as Mapping;
 
 pub(crate) static W32_CONNECTED_MASK: AtomicU64 = AtomicU64::new(0);
-pub(crate) static W32_ATTACHED_PI: AtomicU64 = AtomicU64::new(u32::MAX as u64);
 pub(crate) static W32_CLIENT_PI: AtomicU64 = AtomicU64::new(u64::MAX);
 
+static mut ATTACHED_OWNER: Option<WindowOwner> = None;
 static mut MAPPINGS: Vec<Mapping> = Vec::new();
+
+pub(crate) unsafe fn attached_owner() -> Option<WindowOwner> {
+    *core::ptr::addr_of!(ATTACHED_OWNER)
+}
+
+unsafe fn attached_pi() -> u64 {
+    attached_owner().map_or(u32::MAX as u64, |owner| owner.pi as u64)
+}
 
 #[path = "win32k_thread_aliases.rs"]
 mod thread_aliases;
@@ -91,7 +101,7 @@ pub(crate) unsafe fn w32_attach_mapped(page: u64) -> bool {
 }
 
 unsafe fn admit(pi: u64, page: u64) -> Result<(), u32> {
-    if W32_ATTACHED_PI.load(Ordering::Acquire) != pi || page & 0xfff != 0 {
+    if attached_pi() != pi || page & 0xfff != 0 {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     }
     hosted_thread_memory_access(pi, page, 4096)?;
@@ -139,7 +149,7 @@ pub(crate) unsafe fn detach_attached_client_page_with_access(
     access: &retirement_memory_access::Access<'_>,
 ) -> Result<(), u32> {
     access.check(pi, page)?;
-    if W32_ATTACHED_PI.load(Ordering::Acquire) != pi {
+    if attached_pi() != pi {
         return Ok(());
     }
     let mappings = &mut *core::ptr::addr_of_mut!(MAPPINGS);
@@ -156,10 +166,21 @@ pub(crate) unsafe fn detach_attached_client_page_with_access(
     Ok(())
 }
 
-pub(crate) unsafe fn detach_attached_client_process(pi: u64) -> Result<(), u32> {
-    if W32_ATTACHED_PI.load(Ordering::Acquire) != pi {
+pub(crate) unsafe fn detach_attached_client_process(owner: WindowOwner) -> Result<(), u32> {
+    let Some(current) = attached_owner() else {
+        return if (&*core::ptr::addr_of!(MAPPINGS)).is_empty() {
+            Ok(())
+        } else {
+            Err(nt_fs::STATUS_INVALID_HANDLE)
+        };
+    };
+    if current.pi != owner.pi {
         return Ok(());
     }
+    if current != owner {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
+    let pi = owner.pi as u64;
     // Preflight the entire attachment before detaching any unrelated page.
     if (&*core::ptr::addr_of!(MAPPINGS)).iter().any(|mapping| {
         mapping.is_claimed() || hosted_thread_memory_access(pi, mapping.page(), 4096).is_err()
@@ -175,20 +196,29 @@ pub(crate) unsafe fn detach_attached_client_process(pi: u64) -> Result<(), u32> 
         };
         detach_attached_client_page(pi, page)?;
     }
-    W32_ATTACHED_PI.store(u32::MAX as u64, Ordering::Release);
+    *core::ptr::addr_of_mut!(ATTACHED_OWNER) = None;
     Ok(())
 }
 
-pub(crate) unsafe fn w32_client_attach(pi: u64) -> bool {
-    let prev = W32_ATTACHED_PI.load(Ordering::Acquire);
+pub(crate) unsafe fn w32_client_attach(owner: WindowOwner) -> bool {
+    if !owner.is_valid() || owner.vspace != WIN32K_HOST_PML4.load(Ordering::Acquire) {
+        return false;
+    }
+    let prev = attached_owner();
     let mappings = &*core::ptr::addr_of!(MAPPINGS);
+    if prev.is_none() && !mappings.is_empty() {
+        return false;
+    }
     if mappings.iter().any(|mapping| {
-        mapping.is_claimed() || hosted_thread_memory_access(prev, mapping.page(), 4096).is_err()
+        mapping.is_claimed()
+            || prev.is_some_and(|old| {
+                hosted_thread_memory_access(old.pi as u64, mapping.page(), 4096).is_err()
+            })
     }) {
         return false;
     }
     let detached = mappings.len();
-    if prev == pi {
+    if prev == Some(owner) {
         let mappings = &mut *core::ptr::addr_of_mut!(MAPPINGS);
         let mut index = 0;
         while index < mappings.len() {
@@ -211,17 +241,19 @@ pub(crate) unsafe fn w32_client_attach(pi: u64) -> bool {
         }
         return true;
     }
-    if detach_attached_client_process(prev).is_err() {
-        return false;
+    if let Some(old) = prev {
+        if old.pi == owner.pi || detach_attached_client_process(old).is_err() {
+            return false;
+        }
     }
     print_str(b"[w32attach] client ");
-    print_u64(prev);
+    print_u64(prev.map_or(u32::MAX as u64, |old| old.pi as u64));
     print_str(b" -> ");
-    print_u64(pi);
+    print_u64(owner.pi as u64);
     print_str(b" (detached ");
     print_u64(detached as u64);
     print_str(b" client pages)\n");
-    W32_ATTACHED_PI.store(pi, Ordering::Release);
+    *core::ptr::addr_of_mut!(ATTACHED_OWNER) = Some(owner);
     true
 }
 
@@ -232,6 +264,15 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(
     pml4: u64,
     write: bool,
 ) -> Result<bool, u32> {
+    let Some(owner) = attached_owner() else {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    };
+    if owner.pi as u64 != pi
+        || owner.vspace != pml4
+        || owner.process.generation != ProcessGeneration::Hosted(generation)
+    {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
     admit(pi, page)?;
     if process_committed_mapping_basic_information(pi, page)
         .is_some_and(|info| info.type_ == nt_address_space::MEM_MAPPED)

@@ -1197,6 +1197,34 @@ pub(crate) unsafe fn win32k_client_context_is_admitted(client: Win32kClientConte
     crate::service_sec_image::validate_provider_logical_caller(caller)
 }
 
+fn authenticated_client_window_owner(
+    client: Win32kClientContext,
+) -> Option<nt_user_host::client_alias_window::WindowOwner> {
+    use nt_user_host::process_identity::ProcessGeneration;
+    let caller = client.logical_caller?;
+    let process = caller.process();
+    let ProcessGeneration::Hosted(generation) = process.generation else {
+        return None;
+    };
+    if caller.pi() != client.pi as usize
+        || u64::from(process.pid) != client.pid
+        || generation != client.generation
+    {
+        return None;
+    }
+    let owner = nt_user_host::client_alias_window::WindowOwner {
+        pi: client.pi as usize,
+        process,
+        vspace: WIN32K_HOST_PML4.load(Ordering::Acquire),
+    };
+    owner.is_valid().then_some(owner)
+}
+
+unsafe fn select_win32k_client_window(client: Win32kClientContext) -> bool {
+    authenticated_client_window_owner(client)
+        .is_some_and(|owner| unsafe { w32_client_attach(owner) })
+}
+
 fn win32k_dispatch_client_identity(
     dispatch_id: u64,
     client_pi: u32,
@@ -3606,6 +3634,11 @@ unsafe fn resume_suspended_user_callback_component(
     ) else {
         panic!("callback execution lane is absent from the physical catalog");
     };
+    if !crate::service_sec_image::component_external_resume_ready(lane, callback_token)
+        || !select_win32k_client_window(win32k_client_context_from_callback_client(client))
+    {
+        return crate::spawn_hosts::PumpResult::refused(0xC000_000Du32 as i32, 0);
+    }
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
     core::ptr::write_volatile(
         (sh + win32k_subsystem::SH_REQ_PROCESS_ID) as *mut u64,
@@ -3713,6 +3746,9 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     ) else {
         return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     };
+    if !select_win32k_client_window(pending.client) {
+        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+    }
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
     let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
         as *mut nt_provider_wait::ProviderWaitSharedPage;
@@ -3893,6 +3929,9 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
     ) else {
         return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     };
+    if !select_win32k_client_window(pending.client) {
+        return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+    }
     let lpc = win32k_subsystem::WIN32K_LPC_VADDR;
     core::ptr::write_volatile(
         (lpc + win32k_subsystem::LPC_WAIT_MESSAGE_ID) as *mut u32,
@@ -6214,7 +6253,7 @@ pub(crate) unsafe fn load_keyboard_layout_driver(
 pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (u64, bool) {
     let pi = W32_CLIENT_PI.load(Ordering::Relaxed) as u32;
     let (system_sid, system_sid_len) = local_system_sid_native();
-    win32k_dispatch_wide(
+    win32k_dispatch_wide_with_completion_args_and_kind(
         ssn,
         a0,
         a1,
@@ -6222,6 +6261,8 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
         a3,
         0,
         &[],
+        [a0, a1, a2, a3],
+        None,
         Win32kClientContext {
             pi,
             generation: 0,
@@ -6245,6 +6286,8 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
             token_user_sid: system_sid,
             token_user_sid_len: system_sid_len,
         },
+        win32k_subsystem::WIN32K_REQUEST_SSDT,
+        false,
     )
 }
 
@@ -6437,7 +6480,7 @@ unsafe fn win32k_dispatch_wide_observed(
             crate::teb_tail_watch(watch_pi, 4, ssn, client_pi);
         }
     }
-    if attach_client && !w32_client_attach(client_pi) {
+    if attach_client && !select_win32k_client_window(client) {
         return (0xC000_0001u64, false);
     }
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;

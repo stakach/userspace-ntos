@@ -1,5 +1,6 @@
 //! Exact-attempt ownership of win32k aliases of a protected thread construction.
 use super::*;
+use nt_user_host::process_identity::ProcessIdentity;
 use nt_user_host::thread_alias_journal::{JournalError, ThreadAliasJournal};
 use nt_user_host::thread_resources::ThreadMemoryLayout;
 use nt_user_host::thread_rollback::ThreadRollbackId;
@@ -17,6 +18,21 @@ fn status(error: JournalError) -> u32 {
     }
 }
 
+unsafe fn journal_attached_pi(id: ThreadRollbackId) -> Result<u64, u32> {
+    let Some(owner) = attached_owner() else {
+        return Ok(u32::MAX as u64);
+    };
+    let identity = id.identity();
+    let expected = ProcessIdentity {
+        pid: identity.pid,
+        generation: identity.process_generation,
+    };
+    if owner.pi == identity.pi && owner.process != expected {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    Ok(owner.pi as u64)
+}
+
 impl ThreadAliasCleanup {
     /// Pending access exclusions must already prevent alias admission for this geometry.
     /// Actual alias ownership stays in MAPPINGS; preparation performs no release or claim.
@@ -27,7 +43,7 @@ impl ThreadAliasCleanup {
         ThreadAliasJournal::prepare(
             id,
             layout,
-            W32_ATTACHED_PI.load(Ordering::Acquire),
+            journal_attached_pi(id)?,
             &*core::ptr::addr_of!(MAPPINGS),
         )
         .map(|journal| Self { journal })
@@ -53,7 +69,7 @@ impl ThreadAliasCleanup {
         self.journal
             .revalidate(
                 id,
-                W32_ATTACHED_PI.load(Ordering::Acquire),
+                journal_attached_pi(id)?,
                 &*core::ptr::addr_of!(MAPPINGS),
             )
             .map_err(status)
@@ -64,7 +80,7 @@ impl ThreadAliasCleanup {
         self.journal
             .claim(
                 id,
-                W32_ATTACHED_PI.load(Ordering::Acquire),
+                journal_attached_pi(id)?,
                 &mut *core::ptr::addr_of_mut!(MAPPINGS),
             )
             .map_err(status)
@@ -78,7 +94,7 @@ impl ThreadAliasCleanup {
         self.journal
             .retire(
                 id,
-                W32_ATTACHED_PI.load(Ordering::Acquire),
+                journal_attached_pi(id)?,
                 &mut *core::ptr::addr_of_mut!(MAPPINGS),
                 |page| Backend { page, pml4: 0, source: 0 },
             )

@@ -74,7 +74,17 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
             let _ = vm_page_lock_retire_owner(pi as u64);
             revoke_process_teb_tail_alias(pi);
             // These aliases can reference any client backing, including private COW frames.
-            if win32k_glue::detach_attached_client_process(pi as u64).is_err() {
+            let owner = nt_user_host::client_alias_window::WindowOwner {
+                pi,
+                process: nt_user_host::process_identity::ProcessIdentity {
+                    pid: self.candidate.pid,
+                    generation: nt_user_host::process_identity::ProcessGeneration::Hosted(
+                        self.candidate.generation,
+                    ),
+                },
+                vspace: WIN32K_HOST_PML4.load(Ordering::Acquire),
+            };
+            if win32k_glue::detach_attached_client_process(owner).is_err() {
                 return false;
             }
             let sections = &mut *ctx.generic_sections;
