@@ -132,6 +132,8 @@ mod hosted_kernel_file_control;
 mod hosted_kernel_file_read_query;
 #[path = "hosted_kernel_win32k_async_read.rs"]
 mod hosted_kernel_win32k_async_read;
+#[path = "hosted_kernel_win32k_buffered_ioctl.rs"]
+mod hosted_kernel_win32k_buffered_ioctl;
 #[path = "hosted_kernel_file_cancel.rs"]
 mod hosted_kernel_file_cancel;
 #[path = "hosted_kernel_file_write.rs"]
@@ -54508,6 +54510,31 @@ pub(crate) unsafe fn service_win32k_file_read_release(
     hosted_kernel_win32k_async_read::release_token(ch, token, handle)
 }
 
+pub(crate) unsafe fn service_win32k_file_ioctl(
+    ch: &crate::spawn_hosts::PumpChannel,
+    packet: u64,
+    packet_length: u64,
+    handle: u64,
+) -> Option<i32> {
+    hosted_kernel_win32k_buffered_ioctl::submit(ch, packet, packet_length, handle)
+}
+
+pub(crate) unsafe fn service_win32k_file_ioctl_completion(
+    ch: &crate::spawn_hosts::PumpChannel,
+    token: u64,
+    handle: u64,
+) -> i32 {
+    hosted_kernel_win32k_buffered_ioctl::completion_for_token(ch, token, handle)
+}
+
+pub(crate) unsafe fn service_win32k_file_ioctl_release(
+    ch: &crate::spawn_hosts::PumpChannel,
+    token: u64,
+    handle: u64,
+) -> i32 {
+    hosted_kernel_win32k_buffered_ioctl::release_token(ch, token, handle)
+}
+
 pub(crate) unsafe fn service_win32k_file_query_delivered(
     ch: &crate::spawn_hosts::PumpChannel,
     packet: u64,
@@ -54530,6 +54557,7 @@ pub(crate) unsafe fn service_win32k_file_cancel(
 pub(crate) unsafe fn redrive_hosted_driver_zw_read_query_file(handler: *mut ExecNtHandler) {
     hosted_kernel_file_read_query::redrive(handler);
     hosted_kernel_win32k_async_read::redrive(handler);
+    hosted_kernel_win32k_buffered_ioctl::redrive(handler);
     hosted_kernel_file_cancel::redrive(handler);
 }
 

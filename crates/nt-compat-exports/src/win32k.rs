@@ -153,7 +153,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ZwReadFile", Partial, "raw-input async reads route through authenticated File IRPs with pinned stack output/IOSB, File event delivery, and exact completion acknowledgement"),
     e("ZwCancelIoFile", Partial, "cancels and drains the current thread's canonical routed File IRPs before returning to win32k"),
     e("ZwQueryDefaultLocale", Implemented, "returns canonical live system or session default LCID state"),
-    e("ZwDeviceIoControlFile", StubSuccess, "file ops routed to nt-fs where mounted; else success with empty result (Phase 2 wiring)"),
+    e("ZwDeviceIoControlFile", Partial, "bounded METHOD_BUFFERED controls route through authenticated File IRPs with retained provider targets and exact terminal delivery"),
     e("ZwYieldExecution", Partial, "yields through the canonical executive scheduler only when another hosted thread is runnable; otherwise returns STATUS_NO_YIELD_PERFORMED"),
     e("ZwQueryInformationToken", Partial, "token open/query routed to nt-security"),
     e("ZwOpenThreadToken", Partial, "token open/query routed to nt-security"),

@@ -4,6 +4,7 @@ use super::*;
 
 pub(super) unsafe fn close(handle: u64) -> i32 {
     file_read::release_completed_for_handle(handle);
+    file_ioctl::release_completed_for_handle(handle);
     let (words, raw, _, _, _) = crate::driver_launch::call_on4_raw(
         (W32_FILE_CLOSE_LABEL << 12) | 4,
         handle,
@@ -16,5 +17,6 @@ pub(super) unsafe fn close(handle: u64) -> i32 {
         crate::provider_bugcheck::report(0xc4, [W32_FILE_CLOSE_LABEL, handle, words, raw]);
     }
     file_read::release_completed_for_handle(handle);
+    file_ioctl::release_completed_for_handle(handle);
     raw as u32 as i32
 }

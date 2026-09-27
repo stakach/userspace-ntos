@@ -16,6 +16,7 @@ pub(super) extern "win64" fn cancel_io_file(handle: u64, iosb: u64) -> i32 {
     }
     let status = raw as u32 as i32;
     unsafe { file_read::release_completed_for_handle(handle) };
+    unsafe { file_ioctl::release_completed_for_handle(handle) };
     if status == 0 {
         unsafe {
             write_unaligned(iosb as *mut u32, 0);
