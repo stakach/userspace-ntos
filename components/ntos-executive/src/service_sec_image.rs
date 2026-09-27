@@ -7045,6 +7045,7 @@ unsafe fn capture_client_devmodew_arg(
 
 unsafe fn capture_required_client_unicode_string_arg(
     pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
     descriptor: u64,
     filled_pages: &[u64],
     nfilled: usize,
@@ -7054,31 +7055,17 @@ unsafe fn capture_required_client_unicode_string_arg(
         return None;
     }
     let mut sd = [0u8; 16];
-    if !img_spawn::client_copyin_mapped(
-        pi,
-        descriptor,
-        &mut sd,
-        filled_pages,
-        nfilled,
-        scratch_base,
+    if !copy_client_string_bytes(
+        pi, Some(process), descriptor, &mut sd, filled_pages, nfilled, scratch_base,
     ) {
         return None;
     }
-    let length = u16::from_le_bytes([sd[0], sd[1]]) as usize;
-    let maximum = u16::from_le_bytes([sd[2], sd[3]]) as usize;
-    let buffer = u64::from_le_bytes(sd[8..16].try_into().unwrap());
-    if length & 1 != 0 || length > maximum || length + 2 > RC_ARG_BUF_CAP as usize || buffer == 0 {
-        return None;
-    }
-    let probe_len = length.max(2);
+    let input = nt_kernel_exec::user_string::required_unicode_string(&sd, RC_ARG_BUF_CAP as usize)?;
+    let length = input.length;
     let mut chars = [0u8; RC_ARG_BUF_CAP as usize];
-    if !img_spawn::client_copyin_mapped(
-        pi,
-        buffer,
-        &mut chars[..probe_len],
-        filled_pages,
-        nfilled,
-        scratch_base,
+    if !copy_client_string_bytes(
+        pi, Some(process), input.buffer, &mut chars[..input.probe_length],
+        filled_pages, nfilled, scratch_base,
     ) {
         return None;
     }
@@ -14618,69 +14605,51 @@ pub(crate) unsafe fn service_sec_image(
                             paintstruct_probe_failed = true;
                         }
                     }
-                } else if m0 == 0x125c && sp != 0 {
+                } else if m0 == 0x125c {
                     // NtUserLoadKeyboardLayoutEx has a client PUNICODE_STRING KLID in its stack
                     // tail. ReactOS probes/copies it before loading the layout; isolated win32k must
                     // see a provider-owned descriptor and tail, not the hosted caller's raw stack.
-                    let pusz_klid = client_read_u64_mapped(
-                        pi as u64,
-                        sp + 0x28,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    );
-                    let dw_new_kl = client_read_u64_mapped(
-                        pi as u64,
-                        sp + 0x30,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    );
-                    let flags = client_read_u64_mapped(
-                        pi as u64,
-                        sp + 0x38,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    );
-                    if let (Some(pusz_klid), Some(dw_new_kl), Some(flags)) =
-                        (pusz_klid, dw_new_kl, flags)
-                    {
-                        if let Some(staged_klid) = capture_required_client_unicode_string_arg(
-                            pi as u64,
-                            pusz_klid,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        ) {
-                            load_keyboard_layout_stack_args = [staged_klid, dw_new_kl, flags];
-                            load_keyboard_layout_stack_arg_count =
-                                load_keyboard_layout_stack_args.len();
-                            let n =
-                                LOAD_KEYBOARD_LAYOUT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
-                            if n < 8 {
-                                let length =
-                                    core::ptr::read_unaligned(staged_klid as *const u16) as u64;
-                                print_str(b"[w32marshal] NtUserLoadKeyboardLayoutEx pi=");
-                                print_u64(pi as u64);
-                                print_str(b" klid=0x");
-                                print_hex_u64(pusz_klid);
-                                print_str(b" bytes=");
-                                print_u64(length);
-                                print_str(b" new=0x");
-                                print_hex(dw_new_kl as u32);
-                                print_str(b" flags=0x");
-                                print_hex(flags as u32);
-                                print_str(b"\n");
-                            }
-                        } else {
-                            load_keyboard_layout_probe_failed = true;
+                    let captured = nt_handler.capture_process_identity(pi).and_then(|process| {
+                        let addresses = nt_kernel_exec::user_string::three_stack_tail_addresses(sp)?;
+                        let pusz_klid = client_read_u64_for(
+                            pi as u64, process, addresses[0],
+                            filled_pages, faults as usize, scratch_base,
+                        )?;
+                        let dw_new_kl = client_read_u64_for(
+                            pi as u64, process, addresses[1],
+                            filled_pages, faults as usize, scratch_base,
+                        )?;
+                        let flags = client_read_u64_for(
+                            pi as u64, process, addresses[2],
+                            filled_pages, faults as usize, scratch_base,
+                        )?;
+                        let staged_klid = capture_required_client_unicode_string_arg(
+                            pi as u64, process, pusz_klid,
+                            filled_pages, faults as usize, scratch_base,
+                        )?;
+                        Some((pusz_klid, staged_klid, dw_new_kl, flags))
+                    });
+                    if let Some((pusz_klid, staged_klid, dw_new_kl, flags)) = captured {
+                        load_keyboard_layout_stack_args = [staged_klid, dw_new_kl, flags];
+                        load_keyboard_layout_stack_arg_count = load_keyboard_layout_stack_args.len();
+                        let n = LOAD_KEYBOARD_LAYOUT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                        if n < 8 {
+                            let length = core::ptr::read_unaligned(staged_klid as *const u16) as u64;
+                            print_str(b"[w32marshal] NtUserLoadKeyboardLayoutEx pi=");
+                            print_u64(pi as u64);
+                            print_str(b" klid=0x");
+                            print_hex_u64(pusz_klid);
+                            print_str(b" bytes=");
+                            print_u64(length);
+                            print_str(b" new=0x");
+                            print_hex(dw_new_kl as u32);
+                            print_str(b" flags=0x");
+                            print_hex(flags as u32);
+                            print_str(b"\n");
                         }
                     } else {
                         load_keyboard_layout_probe_failed = true;
                     }
-                } else if m0 == 0x125c {
-                    load_keyboard_layout_probe_failed = true;
                 } else if m0 == NTUSER_MESSAGE_CALL_SSN && sp != 0 {
                     // NtUserMessageCall carries its final three arguments on the client stack:
                     // ResultInfo, dwType/FNID, and Ansi. During a real api0 WM_PAINT callback this is
