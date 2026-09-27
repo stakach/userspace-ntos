@@ -23,6 +23,7 @@ fn process(id: ThreadRollbackId) -> Option<PrefetchProcess> {
     match id.identity().process_generation {
         ProcessGeneration::Hosted(generation) => Some(PrefetchProcess {
             pi: id.identity().pi as u64,
+            pid: id.identity().pid,
             generation,
         }),
         ProcessGeneration::Temporary(_) => None,
@@ -40,11 +41,10 @@ impl ThreadPrefetchJournal {
             return Err(PrefetchJournalError::OwnerChanged);
         }
         let pi = id.identity().pi as u64;
-        let generation = current.map(|p| p.generation);
         let journal = if layout.stack().size == 0 {
             Ranges::WithoutStack(PrefetchJournal::prepare(
                 pi,
-                generation,
+                current,
                 [layout.ipc(), layout.teb(), layout.trampoline()]
                     .map(|range| (range.base, range.size)),
                 frames,
@@ -52,7 +52,7 @@ impl ThreadPrefetchJournal {
         } else {
             Ranges::WithStack(PrefetchJournal::prepare(
                 pi,
-                generation,
+                current,
                 layout.ranges().map(|range| (range.base, range.size)),
                 frames,
             )?)

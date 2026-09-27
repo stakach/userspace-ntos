@@ -21,13 +21,17 @@ pub(crate) fn page_is_unowned(pi: u64, page: u64) -> bool {
 }
 
 fn process(pi: u64) -> Result<(PrefetchProcess, u64), u32> {
-    let runtime = usize::try_from(pi)
-        .ok()
-        .and_then(hosted_process_runtime_for_pi)
+    let pi_index = usize::try_from(pi).map_err(|_| nt_fs::STATUS_INVALID_HANDLE)?;
+    let runtime = hosted_process_runtime_for_pi(pi_index).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    // The mechanism is retained through process retirement and carries the PM PID. Image
+    // generation alone is not unique when a bootstrap PI is rebound to a new process.
+    let mechanism = unsafe { (&*core::ptr::addr_of!(PROCESS_MECHANISM_WORK)).get(pi_index) }
+        .filter(|mechanism| mechanism.generation == runtime.generation)
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
     Ok((
         PrefetchProcess {
             pi,
+            pid: mechanism.pid,
             generation: runtime.generation,
         },
         runtime.scratch_base,
@@ -41,6 +45,20 @@ fn lookup(pi: u64, page: u64) -> Result<Option<PrefetchPage>, u32> {
     }
     let (process, _) = process(pi)?;
     unsafe { (&*core::ptr::addr_of!(FRAMES)).lookup(process, page) }
+}
+
+pub(crate) fn client_copyin_frame_lookup_for(
+    pi: u64,
+    identity: nt_memory_manager::ProcessIdentity,
+    page: u64,
+) -> Result<Option<PrefetchPage>, u32> {
+    hosted_thread_memory_access(pi, page, 4096)?;
+    let requested = PrefetchProcess::for_identity(pi, identity)?;
+    let (current, _) = process(pi)?;
+    if current != requested {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
+    unsafe { (&*core::ptr::addr_of!(FRAMES)).lookup(requested, page) }
 }
 
 pub(crate) fn client_copyin_frame_unavailable(pi: u64, page: u64) -> bool {

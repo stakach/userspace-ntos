@@ -1,7 +1,7 @@
 use super::*;
 
 fn prepare(table: &PrefetchFrames) -> PrefetchJournal<1> {
-    PrefetchJournal::prepare(2, Some(7), [(0x1000, 0x2000)], table).unwrap()
+    PrefetchJournal::prepare(2, Some(PROCESS), [(0x1000, 0x2000)], table).unwrap()
 }
 
 fn live(table: &mut PrefetchFrames, page: u64, cap: u64) -> PrefetchReservation {
@@ -64,7 +64,7 @@ fn separately_prepared_journal_cannot_steal_an_existing_claim() {
         Err(PrefetchJournalError::Claimed)
     );
     assert!(matches!(
-        PrefetchJournal::prepare(2, Some(7), [(0x1000, 4096)], &table),
+        PrefetchJournal::prepare(2, Some(PROCESS), [(0x1000, 4096)], &table),
         Err(PrefetchJournalError::Claimed)
     ));
 }
@@ -246,15 +246,15 @@ fn delete_acknowledged_slot_remains_owned_until_recycling_succeeds() {
 fn generation_absence_and_range_validation_fail_closed() {
     let mut table = PrefetchFrames::new();
     live(&mut table, 0x4000, 42);
-    for generation in [None, Some(0), Some(8)] {
+    for owner in [None, Some(PrefetchProcess { pid: 0, ..PROCESS }), Some(PrefetchProcess { pid: 43, ..PROCESS })] {
         assert!(matches!(
-            PrefetchJournal::prepare(2, generation, [(0x1000, 4096)], &table),
+            PrefetchJournal::prepare(2, owner, [(0x1000, 4096)], &table),
             Err(PrefetchJournalError::OwnerChanged)
         ));
     }
     for range in [(1, 4096), (0x1000, 0), (0x1000, 1), (u64::MAX - 4095, 4096)] {
         assert!(matches!(
-            PrefetchJournal::prepare(2, Some(7), [range], &table),
+            PrefetchJournal::prepare(2, Some(PROCESS), [range], &table),
             Err(PrefetchJournalError::InvalidRange)
         ));
     }

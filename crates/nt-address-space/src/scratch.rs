@@ -90,6 +90,7 @@ mod tests {
         let layout = ScratchWindowLayout::with_prepared(0x10000, 2, 1, 1).unwrap();
         let process = PrefetchProcess {
             pi: 2,
+            pid: 8,
             generation: 7,
         };
         let mut frames = PrefetchFrames::new();
@@ -120,10 +121,12 @@ mod tests {
         let layout = ScratchWindowLayout::with_prepared(0x10000, 2, 1, 1).unwrap();
         let first = PrefetchProcess {
             pi: 2,
+            pid: 8,
             generation: 7,
         };
         let other = PrefetchProcess {
             pi: 3,
+            pid: 9,
             generation: 8,
         };
         let mut frames = PrefetchFrames::new();

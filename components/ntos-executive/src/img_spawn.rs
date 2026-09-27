@@ -1987,10 +1987,18 @@ unsafe fn client_copyin_process_mapped_impl(
         let current = va + copied as u64;
         let page_remaining = 0x1000usize - (current as usize & 0xfff);
         let chunk = page_remaining.min(dst.len() - copied);
-        if client_copyin_frame_unavailable(pi, current & !0xfff) {
-            return false;
-        }
         let page = current & !0xfff;
+        let prefetch = if let Some(process) = process {
+            match client_copyin_frame_lookup_for(pi, process, page) {
+                Ok(prefetch) => prefetch,
+                Err(_) => return false,
+            }
+        } else {
+            if client_copyin_frame_unavailable(pi, page) {
+                return false;
+            }
+            None
+        };
         let backing = if let Some(process) = process {
             match nt_memory_manager::admit_client_copy_backing(
                 pi,
@@ -2041,7 +2049,11 @@ unsafe fn client_copyin_process_mapped_impl(
             source
         } else {
             let page = current & !0xfff;
-            let persistent_alias = client_copyin_frame_alias_get(pi, page);
+            let persistent_alias = if process.is_some() {
+                prefetch.map_or(0, |page| page.alias)
+            } else {
+                client_copyin_frame_alias_get(pi, page)
+            };
             if persistent_alias != 0 {
                 persistent_alias + (current & 0xfff)
             } else {
