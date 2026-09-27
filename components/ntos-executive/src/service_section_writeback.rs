@@ -202,27 +202,16 @@ pub(super) fn rearm_section_alias(
         let context = context
             .and_then(|ctx| ctx.for_process(alias.pi))
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-        let nt_memory_manager::MemoryLifetime::Process(process) = alias.lifetime else {
-            return Err(nt_fs::STATUS_INVALID_HANDLE);
-        };
-        if process.generation
-            != nt_memory_manager::ProcessGeneration::Hosted(context.owner_generation)
-        {
-            return Err(nt_fs::STATUS_INVALID_HANDLE);
-        }
-        if (&*context.generic_sections)
-            .view_for_page(alias.pi, alias.page)
-            .is_none_or(|(_, view)| view.lifetime != alias.lifetime)
-        {
-            return Err(nt_memory_manager::STATUS_NOT_MAPPED_VIEW);
-        }
+        let access = retirement_memory_access::Access::SectionWriteback { alias, context };
+        access.check(alias.pi as u64, alias.page)?;
         crate::hosted_thread_memory_access(alias.pi as u64, alias.page, 4096)?;
         let record = csrss_frame_get_exact_record(alias.pi as u64, alias.page);
-        if record.is_some_and(|record| record.lifetime != alias.lifetime) {
-            return Err(nt_fs::STATUS_INVALID_HANDLE);
-        }
         // An attachment can outlive client residency (or retain the pre-COW frame).
-        crate::win32k_glue::detach_attached_client_page(alias.pi as u64, alias.page)?;
+        crate::win32k_glue::detach_attached_client_page_with_access(
+            alias.pi as u64,
+            alias.page,
+            &access,
+        )?;
         let Some(record) = record else {
             return Ok(());
         };
@@ -238,6 +227,12 @@ pub(super) fn rearm_section_alias(
         }
         let protection =
             nt_address_space::mapped_view_fault_plan(info.protect, false).map_protection;
-        vm_reprotect_private_page(alias.pi, alias.page, info.protect, protection, context.pml4)
+        vm_reprotect_private_frame(
+            record.frame,
+            alias.page,
+            info.protect,
+            protection,
+            context.pml4,
+        )
     }
 }

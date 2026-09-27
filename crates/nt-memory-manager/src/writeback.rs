@@ -36,6 +36,28 @@ pub struct SectionPageAlias {
     pub lifetime: crate::MemoryLifetime,
 }
 
+/// Read-only admission before a native alias detach or page reprotection.
+pub fn admit_section_alias_rearm(
+    alias: SectionPageAlias,
+    current: Option<crate::ProcessIdentity>,
+    view: Option<crate::MemoryLifetime>,
+    frame: Option<crate::MemoryLifetime>,
+) -> Result<(), u32> {
+    let crate::MemoryLifetime::Process(owner) = alias.lifetime else {
+        return Err(crate::STATUS_INVALID_HANDLE);
+    };
+    if !owner.is_valid() || current != Some(owner) {
+        return Err(crate::STATUS_INVALID_HANDLE);
+    }
+    if view != Some(alias.lifetime) {
+        return Err(crate::STATUS_NOT_MAPPED_VIEW);
+    }
+    if frame.is_some_and(|lifetime| lifetime != alias.lifetime) {
+        return Err(crate::STATUS_INVALID_HANDLE);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 impl SectionPageAlias {
     pub(crate) const fn for_test(pi: usize, page: u64) -> Self {

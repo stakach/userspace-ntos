@@ -69,6 +69,7 @@ pub use runtime_section::{
     SECTION_ATTR_SEC_RESERVE,
 };
 pub mod writeback;
+pub use writeback::admit_section_alias_rearm;
 pub use working_set::{
     PagefilePage, PagefileProtectionPlan, PagefilePublishPlan, PagefileRetirement,
     PagefileRetirementIo, PagefileStore, PagefileStoreStats,
