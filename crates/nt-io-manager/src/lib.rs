@@ -75,6 +75,7 @@ pub mod source_irp_ledger;
 pub mod query_path_wire;
 pub mod io_create_file_wire;
 pub mod file_read_query_wire;
+pub mod win32k_async_read_wire;
 pub mod file_directory_query_wire;
 mod lock_control;
 mod set_information_completion;

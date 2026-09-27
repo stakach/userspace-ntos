@@ -67,8 +67,29 @@ struct Win32kPhysicalLane {
     stack_frames: u64,
     ipc_buffer_va: u64,
     stack_publication: Option<nt_provider_wait::ProviderStackReadyReceipt>,
+    stack_alias: Win32kStackAlias,
     // Allocation receipt only; canonical state owns live transport and mechanism retirement.
     worker: Option<crate::spawn_hosts::SpawnedComponentWorker>,
+}
+
+const WIN32K_STACK_ALIAS_BASE: u64 = 0x0000_0100_4820_0000;
+const WIN32K_STACK_ALIAS_END: u64 = 0x0000_0100_48A0_0000;
+const WIN32K_STACK_ALIAS_STRIDE: u64 = 0x20_000;
+const _: () = assert!(
+    crate::PE_SCRATCH_VADDR + crate::PE_SCRATCH_BYTES <= WIN32K_STACK_ALIAS_BASE
+);
+const _: () = assert!(
+    WIN32K_STACK_ALIAS_BASE
+        + (win32k_subsystem::WIN32K_LANE_CAPACITY as u64 + 1) * WIN32K_STACK_ALIAS_STRIDE
+        <= WIN32K_STACK_ALIAS_END
+);
+const _: () = assert!(WIN32K_STACK_ALIAS_END <= crate::driver_launch::FSD_EXEC_BASE);
+const _: () = assert!(win32k_subsystem::WIN32K_LANE_STACK_FRAMES * 0x1000 == WIN32K_STACK_ALIAS_STRIDE);
+
+enum Win32kStackAlias {
+    Unmapped,
+    // Copies remain owned by the physical lane, including on uncertain partial maps.
+    Retained { caps: Vec<u64>, complete: bool },
 }
 
 static mut WIN32K_PHYSICAL_LANES: Option<Vec<Win32kPhysicalLane>> = None;
@@ -138,6 +159,7 @@ pub(crate) unsafe fn register_primary_win32k_physical_lane(
         ipc_buffer_va: crate::IPCBUF_VADDR,
         worker: None,
         stack_publication: None,
+        stack_alias: Win32kStackAlias::Unmapped,
     });
     runtime::prepare(source.tcb).ok()?;
     let route = runtime::register(source, reply_cap, cnode, verify_win32k_worker_source).ok()?;
@@ -194,6 +216,96 @@ pub(crate) unsafe fn win32k_physical_lane_count() -> usize {
         .as_ref()
         .map(Vec::len)
         .unwrap_or(0)
+}
+
+/// Translate a stack target only through its retained physical peer. The returned VA is valid
+/// while the lane remains retained; callers must still pin the active stack range across async IO.
+pub(crate) unsafe fn win32k_stack_alias_for_route(
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    address: u64,
+    bytes: u64,
+) -> Option<u64> {
+    if WIN32K_RETIRED.load(Ordering::Acquire) != 0 || bytes == 0 {
+        return None;
+    }
+    let physical = crate::spawn_hosts::shared_ingress::owner::runtime::physical_source(route).ok()?;
+    if physical.pml4 != WIN32K_HOST_PML4.load(Ordering::Acquire)
+        || physical.tcb != route.identity().executor
+    {
+        return None;
+    }
+    let lanes = win32k_physical_lanes_mut();
+    let lane = lanes.iter_mut().find(|lane| {
+        lane.route == Some(route)
+            && lane.handle == Some(route.identity().lane)
+            && lane.tcb == route.identity().executor
+    })?;
+    if lane.stack_frames != win32k_subsystem::WIN32K_LANE_STACK_FRAMES
+        || (lane.primary.is_none() && lane.stack_publication.is_none())
+    {
+        return None;
+    }
+    let stack_end = lane.stack_base.checked_add(lane.stack_frames.checked_mul(0x1000)?)?;
+    let target_end = address.checked_add(bytes)?;
+    if address < lane.stack_base || target_end > stack_end {
+        return None;
+    }
+    let slot = lane.worker_ordinal.unwrap_or(0);
+    if slot > win32k_subsystem::WIN32K_LANE_CAPACITY as u64
+        || (slot == 0) != lane.primary.is_some()
+    {
+        return None;
+    }
+    let source_base = match slot {
+        0 => lane.primary.as_ref()?.stack_frame_base,
+        _ => lane.worker.as_ref()?.stack_frame_base,
+    };
+    if source_base == 0 {
+        return None;
+    }
+    let alias_base = WIN32K_STACK_ALIAS_BASE.checked_add(slot * WIN32K_STACK_ALIAS_STRIDE)?;
+    let alias = alias_base.checked_add(address - lane.stack_base)?;
+    if alias.checked_add(bytes)? > WIN32K_STACK_ALIAS_END {
+        return None;
+    }
+    if let Win32kStackAlias::Retained { complete, .. } = &lane.stack_alias {
+        return complete.then_some(alias);
+    }
+
+    let mut caps = Vec::new();
+    if caps.try_reserve_exact(lane.stack_frames as usize).is_err() {
+        return None;
+    }
+    lane.stack_alias = Win32kStackAlias::Retained {
+        caps,
+        complete: false,
+    };
+    let Win32kStackAlias::Retained { caps, complete } = &mut lane.stack_alias else {
+        unreachable!();
+    };
+    let mut mapped = 0;
+    for frame in 0..lane.stack_frames {
+        let page = alias_base + frame * 0x1000;
+        if !crate::ensure_executive_paging(page) {
+            break;
+        }
+        let (cap, copy_error) = copy_cap_r(source_base + frame);
+        if copy_error != 0 {
+            break;
+        }
+        caps.push(cap);
+        if page_map_r(cap, page, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+            break;
+        }
+        mapped += 1;
+    }
+    if mapped == lane.stack_frames {
+        *complete = true;
+        return Some(alias);
+    }
+    WIN32K_RETIRED.store(1, Ordering::Release);
+    let _ = crate::spawn_hosts::shared_ingress::owner::runtime::quarantine(route);
+    None
 }
 
 unsafe fn win32k_lane_channel(
@@ -348,6 +460,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
             ipc_buffer_va,
             worker: Some(worker),
             stack_publication: None,
+            stack_alias: Win32kStackAlias::Unmapped,
         });
         index
     };

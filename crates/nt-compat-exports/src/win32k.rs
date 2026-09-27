@@ -150,7 +150,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ZwSetValueKey", Partial, "registry ops routed to nt-config-manager"),
     e("ZwDuplicateObject", Partial, "handle/directory-object ops routed to nt-object-manager"),
     e("ZwOpenFile", StubSuccess, "file ops routed to nt-fs where mounted; else success with empty result (Phase 2 wiring)"),
-    e("ZwReadFile", StubSuccess, "file ops routed to nt-fs where mounted; else success with empty result (Phase 2 wiring)"),
+    e("ZwReadFile", Partial, "raw-input async reads route through authenticated File IRPs with pinned stack output/IOSB, File event delivery, and exact completion acknowledgement"),
     e("ZwCancelIoFile", Partial, "cancels and drains the current thread's canonical routed File IRPs before returning to win32k"),
     e("ZwQueryDefaultLocale", Implemented, "returns canonical live system or session default LCID state"),
     e("ZwDeviceIoControlFile", StubSuccess, "file ops routed to nt-fs where mounted; else success with empty result (Phase 2 wiring)"),
