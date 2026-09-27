@@ -3,6 +3,15 @@
 #![allow(clippy::all)]
 use crate::*;
 
+static NEXT_UNPUBLISHED_IMAGE_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn allocate_unpublished_image_lifetime() -> nt_memory_manager::MemoryLifetime {
+    let token = NEXT_UNPUBLISHED_IMAGE_TOKEN
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+        .expect("unpublished SEC_IMAGE lifetime exhausted");
+    nt_memory_manager::MemoryLifetime::UnpublishedImage(token)
+}
+
 /// OUR Rust ntdll's `LdrpInitialize` RVA, derived once at boot from the loaded ntdll's export table
 /// (main.rs) — our ntdll is `\reactos\system32\ntdll.dll` for EVERY process, so all SEC_IMAGE spawns
 /// call this RVA (never the retired real-ntdll fixed 0x8e70). 0 until set. Since it is non-zero for
@@ -241,6 +250,7 @@ unsafe fn checked_spawn_tcb_op(error: u64, tcb: u64, stage: &[u8]) {
 
 unsafe fn checked_spawn_frame_put_at(
     pi: u64,
+    lifetime: nt_memory_manager::MemoryLifetime,
     page: u64,
     mapped_cap: u64,
     alias: u64,
@@ -249,7 +259,7 @@ unsafe fn checked_spawn_frame_put_at(
     stage: &[u8],
 ) {
     if !csrss_frame_put_at_cap_source_backing(
-        pi, page, mapped_cap, alias, alias_cap, source_cap, true, source_cap,
+        pi, lifetime, page, mapped_cap, alias, alias_cap, source_cap, true, source_cap,
     ) {
         print_str(b"[spawn-frame] register ");
         print_str(stage);
@@ -473,6 +483,7 @@ impl HostedProcessVspaceCaps {
 
 #[derive(Clone, Copy)]
 pub(crate) struct SecImageSpawn {
+    pub(crate) lifetime: nt_memory_manager::MemoryLifetime,
     pub(crate) pml4: u64,
     pub(crate) main_tcb: u64,
     pub(crate) main_mechanism: HostedThreadMechanismCaps,
@@ -867,6 +878,7 @@ unsafe fn reserve_sec_image_page_tables(pi: u64, pml4: u64, image_va: u64, exten
 pub(crate) unsafe fn spawn_sec_image(
     pi: u64,
     generation: u64,
+    lifetime: nt_memory_manager::MemoryLifetime,
     pe: &nt_pe_loader::PeFile,
     fault_ep_c: u64,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
@@ -887,6 +899,10 @@ pub(crate) unsafe fn spawn_sec_image(
     // table (nt-pe-loader) and passes it here.
     ldrpinit_rva: u64,
 ) -> SecImageSpawn {
+    assert!(lifetime.is_valid(), "SEC_IMAGE spawn requires exact memory lifetime");
+    if let nt_memory_manager::MemoryLifetime::Process(process) = lifetime {
+        assert_eq!(u64::from(process.pid), client_process_id, "SEC_IMAGE PID differs from owner");
+    }
     trace_spawn_phase(pi, b"begin");
     crate::temporary_frame_alias::drain()
         .expect("process-slot reuse requires completed temporary-frame alias retirement");
@@ -1016,6 +1032,7 @@ pub(crate) unsafe fn spawn_sec_image(
         if setup_env {
             checked_spawn_frame_put_at(
                 pi,
+                lifetime,
                 STACK_BASE + i * 0x1000,
                 stack_cap,
                 stack_alias,
@@ -1100,7 +1117,7 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
         let teb_client = checked_spawn_copy_cap(teb, b"teb-target");
         let _ = checked_spawn_page_map(teb_client, SMSS_TEB_VA, RW_NX, pml4, b"teb-target");
-        checked_spawn_frame_put_at(pi, SMSS_TEB_VA, teb_client, scr, teb, teb, b"teb-head");
+        checked_spawn_frame_put_at(pi, lifetime, SMSS_TEB_VA, teb_client, scr, teb, teb, b"teb-head");
         // The x64 TEB is ~0x1818 bytes (TLS slots, ActiveFrame, FlsData …) — map a second page for
         // the TEB tail (StaticUnicodeString/Buffer), shared into the process like the first.
         let teb2 = alloc_frame();
@@ -1162,6 +1179,7 @@ pub(crate) unsafe fn spawn_sec_image(
         );
         checked_spawn_frame_put_at(
             pi,
+            lifetime,
             SMSS_TEB_VA + 0x1000,
             teb2_client_cap,
             scr + 0x5000,
@@ -1277,7 +1295,7 @@ pub(crate) unsafe fn spawn_sec_image(
         // NtWriteVirtualMemory. Register the live PEB frame and its persistent executive alias so
         // the generic remote-copy path updates the child rather than requiring an SSN-specific
         // synthetic success.
-        checked_spawn_frame_put_at(pi, SMSS_PEB_VA, peb_client, scr + 0x1000, peb, peb, b"peb");
+        checked_spawn_frame_put_at(pi, lifetime, SMSS_PEB_VA, peb_client, scr + 0x1000, peb, peb, b"peb");
         checked_register_spawn_private_mapping(
             pi,
             SMSS_PEB_VA,
@@ -1436,6 +1454,7 @@ pub(crate) unsafe fn spawn_sec_image(
         // dereferences resolve to this process's real pages.
         checked_spawn_frame_put_at(
             pi,
+            lifetime,
             SMSS_PARAMS_VA,
             params_client,
             pp,
@@ -1445,6 +1464,7 @@ pub(crate) unsafe fn spawn_sec_image(
         );
         checked_spawn_frame_put_at(
             pi,
+            lifetime,
             SMSS_PARAMS_VA + 0x1000,
             env_client,
             env_scr,
@@ -1657,6 +1677,7 @@ pub(crate) unsafe fn spawn_sec_image(
     }
     trace_spawn_phase(pi, b"done");
     SecImageSpawn {
+        lifetime,
         pml4,
         main_tcb: tcb,
         main_mechanism: HostedThreadMechanismCaps::new(raw, cnode, sched_context),

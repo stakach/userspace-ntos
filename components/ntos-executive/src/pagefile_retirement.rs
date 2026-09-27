@@ -1,6 +1,6 @@
 //! Transition backing remains in PagefileStore until checked physical ownership publication.
 use super::*;
-use nt_memory_manager::PagefileRetirementIo;
+use nt_memory_manager::{MemoryLifetime, PagefileRetirementIo};
 
 struct Io;
 fn checked(label: u64) -> Result<(), u32> {
@@ -32,6 +32,12 @@ pub(super) unsafe fn discard_with_access(
     if !(&*core::ptr::addr_of!(PROCESS_PAGEFILE)).contains(pi, page) {
         return Ok(());
     }
+    if access.expected_process().is_some_and(|process| {
+        (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).lifetime(pi, page)
+            != Some(MemoryLifetime::Process(process))
+    }) {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
     if hosted_thread_retains_page_backing(pi, page)
         || !service_sec_image::section_scratch_is_quiescent()
     {
@@ -39,7 +45,11 @@ pub(super) unsafe fn discard_with_access(
     }
     win32k_glue::detach_attached_client_page_with_access(pi, page, access)?;
     let store = &mut *core::ptr::addr_of_mut!(PROCESS_PAGEFILE);
-    let Some(mut retained) = store.begin_retirement(pi, page)? else {
+    let retirement = match access.expected_process() {
+        Some(process) => store.begin_retirement_for(pi, MemoryLifetime::Process(process), page),
+        None => store.begin_retirement(pi, page),
+    }?;
+    let Some(mut retained) = retirement else {
         return Ok(());
     };
     frame_recycle::prepare(retained.page().backing)?;
@@ -54,7 +64,7 @@ pub(super) unsafe fn retire_owner(pi: u64) -> Result<(), u32> {
     Ok(())
 }
 
-pub(super) unsafe fn retry_pending() {
+pub(super) unsafe fn retry_pending(handler: &ExecNtHandler) {
     if (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).retiring_count() == 0 {
         return;
     }
@@ -67,7 +77,15 @@ pub(super) unsafe fn retry_pending() {
             break;
         };
         let page = retained.page();
-        if let Err(status) = discard(page.owner, page.page) {
+        let result = match page.lifetime {
+            MemoryLifetime::Process(process) => discard_with_access(
+                page.owner,
+                page.page,
+                &retirement_memory_access::Access::Process { process, handler },
+            ),
+            MemoryLifetime::UnpublishedImage(_) => Err(nt_fs::STATUS_INVALID_HANDLE),
+        };
+        if let Err(status) = result {
             let count = RETRY_FAILURES
                 .fetch_add(1, Ordering::Relaxed)
                 .saturating_add(1);

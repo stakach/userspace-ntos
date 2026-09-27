@@ -122,7 +122,10 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
             {
                 return false;
             }
-            let _ = csrss_frame_drop_process_all(pi as u64);
+            let _ = csrss_frame_drop_process_all(
+                pi as u64,
+                nt_memory_manager::MemoryLifetime::Process(owner.process),
+            );
             if !client_frame_registry_process_is_empty(pi as u64) {
                 return false;
             }

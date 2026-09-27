@@ -1,6 +1,7 @@
 //! Exact resident ownership until checked release or pagefile publication completes.
 use super::*;
 use nt_memory_manager::{ClientFrameReclaimError, ClientFrameReclaimIntent, ClientFrameReclaimIo};
+use nt_memory_manager::MemoryLifetime;
 
 struct Io;
 fn checked(label: u64) -> Result<(), u32> {
@@ -36,6 +37,9 @@ impl ClientFrameReclaimIo for Io {
 
 unsafe fn admit(record: ClientFrameRecord, access: &retirement_memory_access::Access<'_>) -> Result<(), u32> {
     access.check(record.pi, record.page)?;
+    if access.expected_process().is_some_and(|process| record.lifetime != MemoryLifetime::Process(process)) {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
     if hosted_thread_retains_page_backing(record.pi, record.page) {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -99,7 +103,12 @@ pub(super) unsafe fn release_with_access(
     Ok(true)
 }
 
-pub(super) unsafe fn pageout(pi: u64, page: u64, protection: u32) -> Result<bool, u32> {
+pub(super) unsafe fn pageout(
+    pi: u64,
+    page: u64,
+    protection: u32,
+    access: &retirement_memory_access::Access<'_>,
+) -> Result<bool, u32> {
     let _durable = allocator::enter_durable();
     let Some(mut record) = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get(pi, page) else {
         return Ok(false);
@@ -107,7 +116,7 @@ pub(super) unsafe fn pageout(pi: u64, page: u64, protection: u32) -> Result<bool
     if !record.owns_frame {
         return Ok(false);
     }
-    admit(record, &retirement_memory_access::Access::Ordinary)?;
+    admit(record, access)?;
     let intent = ClientFrameReclaimIntent::Pageout { protection };
     let registry = &mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY);
     record = registry
@@ -119,6 +128,7 @@ pub(super) unsafe fn pageout(pi: u64, page: u64, protection: u32) -> Result<bool
     let pagefile = &mut *core::ptr::addr_of_mut!(PROCESS_PAGEFILE);
     let publish = pagefile.prepare_publish(nt_memory_manager::PagefilePage {
         owner: pi,
+        lifetime: record.lifetime,
         page,
         protection,
         backing: record.owned_backing_cap,
@@ -131,7 +141,7 @@ pub(super) unsafe fn pageout(pi: u64, page: u64, protection: u32) -> Result<bool
 
 /// Retry each pending cleanup at most once at the serialized event boundary. Ordinary memory
 /// admission remains closed until the exact row has transferred its backing or retired its caps.
-pub(super) unsafe fn retry_pending() {
+pub(super) unsafe fn retry_pending(handler: &ExecNtHandler) {
     if (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).reclaiming_count() == 0 {
         return;
     }
@@ -148,11 +158,17 @@ pub(super) unsafe fn retry_pending() {
             index += 1;
             continue;
         };
-        let result = match intent {
-            ClientFrameReclaimIntent::Release => release(record.pi, record.page),
-            ClientFrameReclaimIntent::Pageout { protection } => {
-                pageout(record.pi, record.page, protection)
+        let result = match record.lifetime {
+            MemoryLifetime::Process(process) => {
+                let access = retirement_memory_access::Access::Process { process, handler };
+                match intent {
+                    ClientFrameReclaimIntent::Release =>
+                        release_with_access(record.pi, record.page, &access),
+                    ClientFrameReclaimIntent::Pageout { protection } =>
+                        pageout(record.pi, record.page, protection, &access),
+                }
             }
+            MemoryLifetime::UnpublishedImage(_) => Err(nt_fs::STATUS_INVALID_HANDLE),
         };
         match result {
             Ok(true) => {} // swap_remove moved an unvisited row into this index.

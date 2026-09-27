@@ -8356,44 +8356,62 @@ fn client_frame_registry_process_is_empty(pi: u64) -> bool {
         && unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).is_process_empty(pi) }
 }
 /// Record GUI client `pi`'s frame cap `fr` for page VA `page` (once per (pi,page)).
-unsafe fn csrss_frame_put(pi: u64, page: u64, fr: u64) -> bool {
-    csrss_frame_put_at_cap_source(pi, page, fr, 0, 0, 0)
+unsafe fn csrss_frame_put(
+    pi: u64,
+    lifetime: nt_memory_manager::MemoryLifetime,
+    page: u64,
+    fr: u64,
+) -> bool {
+    csrss_frame_put_at_cap_source(pi, lifetime, page, fr, 0, 0, 0)
 }
 pub(crate) unsafe fn csrss_frame_put_with_source(
     pi: u64,
+    lifetime: nt_memory_manager::MemoryLifetime,
     page: u64,
     fr: u64,
     source_cap: u64,
 ) -> bool {
-    csrss_frame_put_at_cap_source_backing(pi, page, fr, 0, 0, source_cap, true, source_cap)
+    csrss_frame_put_at_cap_source_backing(
+        pi, lifetime, page, fr, 0, 0, source_cap, true, source_cap,
+    )
 }
 /// Record a client frame and, for image pages, its permanent executive scratch alias. Keeping the
 /// alias alongside the cap avoids remapping a copied cap merely to inspect live client data.
-unsafe fn csrss_frame_put_at_cap(pi: u64, page: u64, fr: u64, alias: u64, alias_cap: u64) -> bool {
-    csrss_frame_put_at_cap_source(pi, page, fr, alias, alias_cap, 0)
+unsafe fn csrss_frame_put_at_cap(
+    pi: u64,
+    lifetime: nt_memory_manager::MemoryLifetime,
+    page: u64,
+    fr: u64,
+    alias: u64,
+    alias_cap: u64,
+) -> bool {
+    csrss_frame_put_at_cap_source(pi, lifetime, page, fr, alias, alias_cap, 0)
 }
 unsafe fn csrss_frame_put_at_cap_source(
     pi: u64,
+    lifetime: nt_memory_manager::MemoryLifetime,
     page: u64,
     fr: u64,
     alias: u64,
     alias_cap: u64,
     source_cap: u64,
 ) -> bool {
-    csrss_frame_put_at_cap_source_owned(pi, page, fr, alias, alias_cap, source_cap, true)
+    csrss_frame_put_at_cap_source_owned(pi, lifetime, page, fr, alias, alias_cap, source_cap, true)
 }
 
 pub(crate) unsafe fn csrss_frame_put_section_mapping(
     pi: u64,
+    lifetime: nt_memory_manager::MemoryLifetime,
     page: u64,
     fr: u64,
     source_cap: u64,
 ) -> bool {
-    csrss_frame_put_at_cap_source_owned(pi, page, fr, 0, 0, source_cap, false)
+    csrss_frame_put_at_cap_source_owned(pi, lifetime, page, fr, 0, 0, source_cap, false)
 }
 
 pub(crate) unsafe fn csrss_frame_put_at_cap_source_owned(
     pi: u64,
+    lifetime: nt_memory_manager::MemoryLifetime,
     page: u64,
     fr: u64,
     alias: u64,
@@ -8402,13 +8420,14 @@ pub(crate) unsafe fn csrss_frame_put_at_cap_source_owned(
     owns_frame: bool,
 ) -> bool {
     csrss_frame_put_at_cap_source_backing(
-        pi, page, fr, alias, alias_cap, source_cap, owns_frame,
+        pi, lifetime, page, fr, alias, alias_cap, source_cap, owns_frame,
         if owns_frame { fr } else { 0 },
     )
 }
 
 pub(crate) unsafe fn csrss_frame_put_at_cap_source_backing(
     pi: u64,
+    lifetime: nt_memory_manager::MemoryLifetime,
     page: u64,
     fr: u64,
     alias: u64,
@@ -8430,6 +8449,7 @@ pub(crate) unsafe fn csrss_frame_put_at_cap_source_backing(
     let registry = &mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY);
     match registry.insert_at_age_with_backing(
         pi,
+        lifetime,
         page,
         fr,
         alias,
@@ -8476,6 +8496,19 @@ unsafe fn csrss_frame_take(pi: u64, page: u64) -> Option<(u64, u64, u64, bool)> 
         })
 }
 
+unsafe fn csrss_frame_take_for(
+    pi: u64,
+    lifetime: nt_memory_manager::MemoryLifetime,
+    page: u64,
+) -> Option<(u64, u64, u64, bool)> {
+    if !temporary_frame_alias::memory_available(pi, page, 0x1000) {
+        return None;
+    }
+    (&mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY))
+        .take_for(pi, lifetime, page)
+        .map(|record| (record.frame, record.alias_cap, record.source_cap, record.owns_frame))
+}
+
 unsafe fn csrss_frame_reclaim_exact(pi: u64, page: u64) -> bool {
     client_frame_cleanup::release(pi, page).is_ok()
 }
@@ -8513,13 +8546,21 @@ pub(crate) unsafe fn csrss_frame_drop_process_range(pi: u64, base: u64, size: u6
     dropped
 }
 
-pub(crate) unsafe fn csrss_frame_drop_process_all(pi: u64) -> u64 {
+pub(crate) unsafe fn csrss_frame_drop_process_all(
+    pi: u64,
+    lifetime: nt_memory_manager::MemoryLifetime,
+) -> u64 {
     let mut dropped = 0u64;
     loop {
         let Some(page) = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).first_page_for_process(pi)
         else {
             break;
         };
+        if csrss_frame_get_exact_record(pi, page)
+            .is_none_or(|record| record.lifetime != lifetime)
+        {
+            break;
+        }
         if vm_page_lock_is_locked(pi, page) {
             VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
             break;
@@ -9456,15 +9497,22 @@ unsafe fn process_working_set_resident_pages(
     Ok(pages)
 }
 
-unsafe fn process_working_set_pageout_mapping(pi: usize, page: u64) -> bool {
+unsafe fn process_working_set_pageout_mapping(
+    handler: &ExecNtHandler,
+    pi: usize,
+    process: nt_user_host::process_identity::ProcessIdentity,
+    page: u64,
+) -> bool {
     if vm_page_lock_is_locked(pi as u64, page) {
         return false;
     }
+    let access = retirement_memory_access::Access::Process { process, handler };
     if let Some(record) = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get(pi as u64, page) {
         return !record.owns_frame
-            && client_frame_cleanup::release(pi as u64, page).is_ok_and(|released| released);
+            && client_frame_cleanup::release_with_access(pi as u64, page, &access)
+                .is_ok_and(|released| released);
     }
-    if win32k_glue::detach_attached_client_page(pi as u64, page).is_err() {
+    if win32k_glue::detach_attached_client_page_with_access(pi as u64, page, &access).is_err() {
         return false;
     }
     if let Some(map_cap) = shared_image_mapping_take(pi as u64, page) {
@@ -11622,6 +11670,10 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
     {
         return;
     }
+    let Some(process) = handler.capture_process_identity(pi) else {
+        return;
+    };
+    let lifetime = nt_memory_manager::MemoryLifetime::Process(process);
     let page = PRIVATE_VM_LIMIT - 0x60_0000;
     let mut proof = 0u64;
     let mut source_frame = 0u64;
@@ -11751,7 +11803,7 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
     }
     proof |= MAPPED_SECTION_WRITECOPY_COW_MAPPED_SHARED;
     let source_cap = csrss_frame_create_source_copy(map_cap, pi as u64, page, b"mapped-cow");
-    if source_cap == 0 || !csrss_frame_put_section_mapping(pi as u64, page, map_cap, source_cap) {
+    if source_cap == 0 || !csrss_frame_put_section_mapping(pi as u64, lifetime, page, map_cap, source_cap) {
         if source_cap != 0 {
             let _ = cnode_delete_recycle_r(source_cap);
         }
@@ -11975,6 +12027,10 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
     {
         return;
     }
+    let Some(process) = handler.capture_process_identity(pi) else {
+        return;
+    };
+    let lifetime = nt_memory_manager::MemoryLifetime::Process(process);
     let page = PRIVATE_VM_LIMIT - 0x40_0000;
     let mut proof = 0u64;
     let mut source_frame = 0u64;
@@ -12103,6 +12159,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
 
     if let Err(status) = vm_promote_image_cow_page(
         pi,
+        lifetime,
         page,
         read_plan.map_protection,
         write_plan.map_protection,
@@ -12373,6 +12430,9 @@ unsafe fn vm_map_private_page(
     pml4: u64,
     scratch_base: u64,
 ) -> Result<(), u32> {
+    let process = handler.capture_process_identity(pi)
+        .ok_or(nt_address_space::STATUS_ACCESS_VIOLATION)?;
+    let lifetime = nt_memory_manager::MemoryLifetime::Process(process);
     hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
     if handler.restore_process_pagefile_page(pi, page, pml4, scratch_base)? {
         return Ok(());
@@ -12422,7 +12482,7 @@ unsafe fn vm_map_private_page(
         }
         alias_cap = copied;
     }
-    if !csrss_frame_put_at_cap(pi as u64, page, frame, alias, alias_cap) {
+    if !csrss_frame_put_at_cap(pi as u64, lifetime, page, frame, alias, alias_cap) {
         vm_frame_release(frame, alias_cap);
         VM_FAIL_REGISTRY.fetch_add(1, Ordering::Relaxed);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
@@ -12508,6 +12568,7 @@ unsafe fn vm_copy_frame_4k(source_cap: u64, dest_frame: u64, scratch_base: u64) 
 
 unsafe fn vm_restore_transition_mapping(
     pi: usize,
+    lifetime: nt_memory_manager::MemoryLifetime,
     page: u64,
     protection: u32,
     pml4: u64,
@@ -12531,7 +12592,7 @@ unsafe fn vm_restore_transition_mapping(
         }
         alias_cap = copied;
     }
-    if !csrss_frame_put_at_cap(pi as u64, page, frame, alias, alias_cap) {
+    if !csrss_frame_put_at_cap(pi as u64, lifetime, page, frame, alias, alias_cap) {
         let _ = page_unmap_r(frame);
         recycle_mapped_cap(alias_cap);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
@@ -12623,6 +12684,7 @@ unsafe fn vm_reprotect_shared_image_mapping(
 
 unsafe fn vm_promote_image_cow_page(
     pi: usize,
+    lifetime: nt_memory_manager::MemoryLifetime,
     page: u64,
     old_protection: u32,
     new_protection: u32,
@@ -12643,6 +12705,7 @@ unsafe fn vm_promote_image_cow_page(
 
     unsafe fn restore_old_image_mapping(
         pi: usize,
+        lifetime: nt_memory_manager::MemoryLifetime,
         page: u64,
         old_map_cap: u64,
         old_mapping: OldImageMapping,
@@ -12671,6 +12734,7 @@ unsafe fn vm_promote_image_cow_page(
                 assert!(
                     csrss_frame_put_at_cap_source_owned(
                         pi as u64,
+                        lifetime,
                         page,
                         old_map_cap,
                         alias,
@@ -12729,7 +12793,7 @@ unsafe fn vm_promote_image_cow_page(
 
     let (old_map_cap, old_mapping) = if let Some(record) = exact_record {
         let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) =
-            csrss_frame_take(pi as u64, page)
+            csrss_frame_take_for(pi as u64, lifetime, page)
         else {
             vm_frame_release(new_frame, 0);
             return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
@@ -12759,7 +12823,7 @@ unsafe fn vm_promote_image_cow_page(
     };
     let map_error = page_map_r(new_frame, page, vm_page_rights(new_protection), pml4);
     if map_error != 0 {
-        restore_old_image_mapping(pi, page, old_map_cap, old_mapping, old_protection, pml4);
+        restore_old_image_mapping(pi, lifetime, page, old_map_cap, old_mapping, old_protection, pml4);
         vm_frame_release(new_frame, 0);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -12772,14 +12836,14 @@ unsafe fn vm_promote_image_cow_page(
                 let _ = cnode_delete_recycle_r(alias_cap);
             }
             let _ = page_unmap_r(new_frame);
-            restore_old_image_mapping(pi, page, old_map_cap, old_mapping, old_protection, pml4);
+            restore_old_image_mapping(pi, lifetime, page, old_map_cap, old_mapping, old_protection, pml4);
             vm_frame_release(new_frame, 0);
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
         if page_map_r(alias_cap, retained_alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
             let _ = cnode_delete_recycle_r(alias_cap);
             let _ = page_unmap_r(new_frame);
-            restore_old_image_mapping(pi, page, old_map_cap, old_mapping, old_protection, pml4);
+            restore_old_image_mapping(pi, lifetime, page, old_map_cap, old_mapping, old_protection, pml4);
             vm_frame_release(new_frame, 0);
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
@@ -12788,6 +12852,7 @@ unsafe fn vm_promote_image_cow_page(
 
     if !csrss_frame_put_at_cap_source_owned(
         pi as u64,
+        lifetime,
         page,
         new_frame,
         retained_alias,
@@ -12801,7 +12866,7 @@ unsafe fn vm_promote_image_cow_page(
         }
         let _ = page_unmap_r(new_frame);
         vm_frame_release(new_frame, 0);
-        restore_old_image_mapping(pi, page, old_map_cap, old_mapping, old_protection, pml4);
+        restore_old_image_mapping(pi, lifetime, page, old_map_cap, old_mapping, old_protection, pml4);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
 
@@ -12832,9 +12897,13 @@ unsafe fn vm_promote_mapped_cow_page(
     pml4: u64,
     scratch_base: u64,
 ) -> Result<(), u32> {
+    let process = handler.capture_process_identity(pi)
+        .ok_or(nt_address_space::STATUS_ACCESS_VIOLATION)?;
+    let lifetime = nt_memory_manager::MemoryLifetime::Process(process);
     hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
     unsafe fn restore_old_mapped_mapping(
         pi: usize,
+        lifetime: nt_memory_manager::MemoryLifetime,
         page: u64,
         old_mapping: Option<(u64, u64, u64, bool)>,
         retained_alias: u64,
@@ -12857,6 +12926,7 @@ unsafe fn vm_promote_mapped_cow_page(
             assert!(
                 csrss_frame_put_at_cap_source_owned(
                     pi as u64,
+                    lifetime,
                     page,
                     old_frame,
                     retained_alias,
@@ -12897,7 +12967,7 @@ unsafe fn vm_promote_mapped_cow_page(
     let retained_alias = exact_record.map(|record| record.alias).unwrap_or(0);
     let old_mapping = if exact_record.is_some() {
         let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) =
-            csrss_frame_take(pi as u64, page)
+            csrss_frame_take_for(pi as u64, lifetime, page)
         else {
             vm_frame_release(new_frame, 0);
             return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
@@ -12912,14 +12982,14 @@ unsafe fn vm_promote_mapped_cow_page(
     };
 
     if let Err(status) = vm_ensure_private_pt(handler, pi, page, pml4) {
-        restore_old_mapped_mapping(pi, page, old_mapping, retained_alias, old_protection, pml4);
+        restore_old_mapped_mapping(pi, lifetime, page, old_mapping, retained_alias, old_protection, pml4);
         vm_frame_release(new_frame, 0);
         return Err(status);
     }
 
     let map_error = page_map_r(new_frame, page, vm_page_rights(new_protection), pml4);
     if map_error != 0 {
-        restore_old_mapped_mapping(pi, page, old_mapping, retained_alias, old_protection, pml4);
+        restore_old_mapped_mapping(pi, lifetime, page, old_mapping, retained_alias, old_protection, pml4);
         vm_frame_release(new_frame, 0);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -12932,14 +13002,14 @@ unsafe fn vm_promote_mapped_cow_page(
                 let _ = cnode_delete_recycle_r(alias_cap);
             }
             let _ = page_unmap_r(new_frame);
-            restore_old_mapped_mapping(pi, page, old_mapping, retained_alias, old_protection, pml4);
+            restore_old_mapped_mapping(pi, lifetime, page, old_mapping, retained_alias, old_protection, pml4);
             vm_frame_release(new_frame, 0);
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
         if page_map_r(alias_cap, retained_alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
             let _ = cnode_delete_recycle_r(alias_cap);
             let _ = page_unmap_r(new_frame);
-            restore_old_mapped_mapping(pi, page, old_mapping, retained_alias, old_protection, pml4);
+            restore_old_mapped_mapping(pi, lifetime, page, old_mapping, retained_alias, old_protection, pml4);
             vm_frame_release(new_frame, 0);
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
@@ -12948,6 +13018,7 @@ unsafe fn vm_promote_mapped_cow_page(
 
     if !csrss_frame_put_at_cap_source_owned(
         pi as u64,
+        lifetime,
         page,
         new_frame,
         retained_alias,
@@ -12961,7 +13032,7 @@ unsafe fn vm_promote_mapped_cow_page(
         }
         let _ = page_unmap_r(new_frame);
         vm_frame_release(new_frame, 0);
-        restore_old_mapped_mapping(pi, page, old_mapping, retained_alias, old_protection, pml4);
+        restore_old_mapped_mapping(pi, lifetime, page, old_mapping, retained_alias, old_protection, pml4);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
 
@@ -17850,6 +17921,9 @@ unsafe fn release_unpublished_sec_image_spawn(
     pi: usize,
     spawn: img_spawn::SecImageSpawn,
 ) -> bool {
+    if !matches!(spawn.lifetime, nt_memory_manager::MemoryLifetime::UnpublishedImage(_)) {
+        return false;
+    }
     if spawn.main_tcb <= 1
         || tcb_suspend_r(spawn.main_tcb) != 0
         || cnode_delete_recycle_r(spawn.main_tcb) != 0
@@ -17859,7 +17933,7 @@ unsafe fn release_unpublished_sec_image_spawn(
     if !release_hosted_thread_mechanism_caps(0, spawn.main_mechanism) {
         return false;
     }
-    let _ = csrss_frame_drop_process_all(pi as u64);
+    let _ = csrss_frame_drop_process_all(pi as u64, spawn.lifetime);
     let (_, copyin_failures) = client_copyin_frame_drop_process(pi as u64);
     if !kuser_page_alias_release(pi)
         || copyin_failures != 0
@@ -25628,7 +25702,12 @@ unsafe fn spawn_hosted_thread_mechanism(
                 CAP_INIT_THREAD_VSPACE,
             );
         }
-        let registered = csrss_frame_put(t.client_pi, page, f);
+        let registered = csrss_frame_put(
+            t.client_pi,
+            nt_memory_manager::MemoryLifetime::Process(binding.process),
+            page,
+            f,
+        );
         if registered { memory_progress.record_stack(index); }
         if target_map != 0 || mirror_map != 0 || !registered {
             print_str(b"[thread-life] stack publication failed pi=");
@@ -25685,6 +25764,7 @@ unsafe fn spawn_hosted_thread_mechanism(
     {
         let registered = csrss_frame_put_at_cap_source_backing(
                 t.client_pi,
+                nt_memory_manager::MemoryLifetime::Process(binding.process),
                 t.teb_va,
                 teb_client,
                 teb_live_alias,
@@ -25778,6 +25858,7 @@ unsafe fn spawn_hosted_thread_mechanism(
     {
         let registered = csrss_frame_put_at_cap_source_backing(
                 t.client_pi,
+                nt_memory_manager::MemoryLifetime::Process(binding.process),
                 t.teb_va + 0x1000,
                 teb2_client,
                 teb2_live_alias,
@@ -28404,6 +28485,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             .expect("SEC_IMAGE demo runtime layout must register before spawn");
         let spawn = spawn_hosted_sec_image_for_image(
             sec_image_test_image,
+            img_spawn::allocate_unpublished_image_lifetime(),
             &pe,
             si_fault_c,
             None,
@@ -31827,6 +31909,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         .expect("SMSS must own its canonical ClientId before spawn");
                     let spawn = spawn_hosted_sec_image_for_image(
                         smss_image,
+                        nt_memory_manager::MemoryLifetime::Process(
+                            nt_memory_manager::ProcessIdentity {
+                                pid: smss_client_id.unique_process,
+                                generation: nt_memory_manager::ProcessGeneration::Hosted(
+                                    smss_image.generation,
+                                ),
+                            },
+                        ),
                         &pe,
                         smss_fault_c,
                         Some((NTDLL_BASE, smss_ntdll_pe)),

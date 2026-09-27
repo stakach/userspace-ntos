@@ -16076,6 +16076,8 @@ impl ExecNtHandler {
         pi: usize,
         victims: &[u64],
     ) -> Result<(), u32> {
+        let process = self.capture_process_identity(pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         // Reject the whole victim set before its first pagefile, alias or mapping mutation.
         for &page in victims {
             hosted_thread_memory_access(pi as u64, page, 0x1000)
@@ -16094,7 +16096,7 @@ impl ExecNtHandler {
                     }
                 }
             }
-            if !process_working_set_pageout_mapping(pi, page) {
+            if !process_working_set_pageout_mapping(self, pi, process, page) {
                 return Err(nt_process::STATUS_INVALID_PARAMETER);
             }
         }
@@ -16107,12 +16109,19 @@ impl ExecNtHandler {
         page: u64,
         protection: u32,
     ) -> Result<bool, u32> {
+        let process = self.capture_process_identity(pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         hosted_thread_memory_retirement_access(pi as u64, page, 0x1000)
             .map_err(|_| nt_memory_manager::STATUS_BAD_WORKING_SET_LIMIT)?;
         if vm_page_lock_is_locked(pi as u64, page) {
             return Err(nt_memory_manager::STATUS_BAD_WORKING_SET_LIMIT);
         }
-        client_frame_cleanup::pageout(pi as u64, page, protection)
+        client_frame_cleanup::pageout(
+            pi as u64,
+            page,
+            protection,
+            &retirement_memory_access::Access::Process { process, handler: self },
+        )
     }
 
     unsafe fn prepare_process_working_set_policy(
@@ -16181,19 +16190,24 @@ impl ExecNtHandler {
         pml4: u64,
         scratch_base: u64,
     ) -> Result<bool, u32> {
+        let process = self.capture_process_identity(pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let lifetime = nt_memory_manager::MemoryLifetime::Process(process);
         hosted_thread_memory_access(pi as u64, page, 0x1000)?;
-        if !(&*core::ptr::addr_of!(PROCESS_PAGEFILE)).contains(pi as u64, page) {
-            return Ok(false);
+        match (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).lifetime(pi as u64, page) {
+            None => return Ok(false),
+            Some(owner) if owner != lifetime => return Err(nt_process::STATUS_INVALID_HANDLE),
+            Some(_) => {}
         }
         self.ensure_process_working_set_admission(pi, page, scratch_base)?;
         vm_ensure_private_pt(self, pi, page, pml4)?;
         let pagefile = &mut *core::ptr::addr_of_mut!(PROCESS_PAGEFILE);
         let transition = pagefile
-            .take(pi as u64, page)
+            .take_for(pi as u64, lifetime, page)
             .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?
             .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
         if let Err(status) =
-            vm_restore_transition_mapping(pi, page, transition.protection, pml4, transition.backing)
+            vm_restore_transition_mapping(pi, transition.lifetime, page, transition.protection, pml4, transition.backing)
         {
             pagefile
                 .restore(transition)

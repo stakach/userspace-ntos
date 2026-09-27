@@ -3459,6 +3459,7 @@ pub(crate) unsafe fn service_generic_section_fault(
     let process = nt_handler
         .capture_process_identity(pi)
         .ok_or(nt_address_space::STATUS_ACCESS_VIOLATION)?;
+    let lifetime = nt_memory_manager::MemoryLifetime::Process(process);
     hosted_thread_memory_access(pi as u64, page, 0x1000)?;
     let write_fault = fault_access == nt_address_space::FaultAccess::Write;
     let Some((section_index, view)) = generic_sections.view_for_page(pi, page) else {
@@ -3575,7 +3576,7 @@ pub(crate) unsafe fn service_generic_section_fault(
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     let source_cap = csrss_frame_create_source_copy(map_cap, pi as u64, page, b"section-map");
-    if source_cap == 0 || !csrss_frame_put_section_mapping(pi as u64, page, map_cap, source_cap) {
+    if source_cap == 0 || !csrss_frame_put_section_mapping(pi as u64, lifetime, page, map_cap, source_cap) {
         if source_cap != 0 {
             let _ = cnode_delete_recycle_r(source_cap);
         }
@@ -3636,6 +3637,9 @@ pub(crate) unsafe fn service_image_page_residency(
     filled_pages: &mut [u64; 512],
     faults: &mut u64,
 ) -> Result<(), u32> {
+    let process = nt_handler.capture_process_identity(pi)
+        .ok_or(nt_address_space::STATUS_ACCESS_VIOLATION)?;
+    let lifetime = nt_memory_manager::MemoryLifetime::Process(process);
     hosted_thread_memory_access(pi as u64, page, 0x1000)?;
     let info = process_committed_mapping_basic_information(pi as u64, page)
         .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;
@@ -3668,6 +3672,7 @@ pub(crate) unsafe fn service_image_page_residency(
         let prepared = nt_handler.prepare_private_mapping_backing(pi, page)?;
         vm_promote_image_cow_page(
             pi,
+            lifetime,
             page,
             read_protection,
             fault_plan.map_protection,
@@ -3802,6 +3807,7 @@ pub(crate) unsafe fn service_image_page_residency(
     } else if private_source_cap != 0 {
         if !csrss_frame_put_at_cap_source_backing(
             pi as u64,
+            lifetime,
             page,
             map_cap,
             private_alias,
@@ -6189,6 +6195,10 @@ unsafe fn spawn_requested_hosted_exe(
         .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
     let child_spawn = spawn_hosted_sec_image_for_image(
         spec.image,
+        nt_memory_manager::MemoryLifetime::Process(
+            nt_handler.capture_process_identity(pi)
+                .ok_or(nt_process::STATUS_INVALID_HANDLE)?,
+        ),
         spec.pe,
         mint_badged(fault_ep, spec.image.top_badge)?,
         Some(ntdll),
@@ -8879,8 +8889,8 @@ pub(crate) unsafe fn service_sec_image(
             print_hex(status);
             print_str(b"\n");
         }
-        crate::client_frame_cleanup::retry_pending();
-        crate::pagefile_retirement::retry_pending();
+        crate::client_frame_cleanup::retry_pending(&*nt_handler);
+        crate::pagefile_retirement::retry_pending(&*nt_handler);
         // CM retries run only between hosted events, never inside a timer callback or nested pump.
         crate::cm_key_ownership::retry_cleanup(monotonic_time_100ns());
         crate::cm_snapshot_ownership::retry_cleanup(monotonic_time_100ns());
@@ -10444,7 +10454,10 @@ pub(crate) unsafe fn service_sec_image(
                         retype_error
                     };
                     if retype_error == 0 && map_error == 0 {
-                        let registered = csrss_frame_put_with_source(2, page, map_cap, frame);
+                        let registered = nt_handler.capture_process_identity(2)
+                            .is_some_and(|process| csrss_frame_put_with_source(
+                                2, nt_memory_manager::MemoryLifetime::Process(process), page, map_cap, frame,
+                            ));
                         if registered && csrss_frame_get_exact(2, page).0 == map_cap {
                             let teb_alias =
                                 WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000;
@@ -10523,7 +10536,9 @@ pub(crate) unsafe fn service_sec_image(
                         if pi == 0 {
                             let map_error = page_map_r(f, page, RW_NX, pml4);
                             if map_error == 0 {
-                                csrss_frame_put(pi as u64, page, f);
+                                if let Some(process) = nt_handler.capture_process_identity(pi) {
+                                    csrss_frame_put(pi as u64, nt_memory_manager::MemoryLifetime::Process(process), page, f);
+                                }
                                 registered = csrss_frame_get_exact(pi as u64, page).0 == f;
                             }
                         } else {
@@ -10534,7 +10549,10 @@ pub(crate) unsafe fn service_sec_image(
                                 // remain reachable after the stack grows below its fixed executive
                                 // mirror. GUI clients also keep an unmapped source cap for
                                 // win32k/client temporary aliases.
-                                registered = csrss_frame_put_with_source(pi as u64, page, map_cap, f);
+                                registered = nt_handler.capture_process_identity(pi)
+                                    .is_some_and(|process| csrss_frame_put_with_source(
+                                        pi as u64, nt_memory_manager::MemoryLifetime::Process(process), page, map_cap, f,
+                                    ));
                             }
                         }
                         if registered {
@@ -21817,7 +21835,14 @@ pub(crate) unsafe fn service_sec_image(
                 peb_mapped && page_map_r(peb_alias, peb_win, RW_NX, CAP_INIT_THREAD_VSPACE) == 0;
             let peb_registered = peb_win_ok
                 && brk_test_claim.is_some()
-                && csrss_frame_put_at_cap(test_pi as u64, SMSS_PEB_VA, peb_frame, peb_win, peb_alias);
+                && csrss_frame_put_at_cap(
+                    test_pi as u64,
+                    nt_memory_manager::MemoryLifetime::Process(brk_test_claim.unwrap().identity()),
+                    SMSS_PEB_VA,
+                    peb_frame,
+                    peb_win,
+                    peb_alias,
+                );
             // The marker page (target-only) + the executive's window on the same frame.
             let mark_frame = make!(OBJ_X86_4K_PAGE, PAGING_BITS);
             let mark_mapped = page_map_r(

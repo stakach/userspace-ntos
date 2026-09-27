@@ -316,11 +316,18 @@ impl ExecNtHandler {
             .filter(|target| target.pml4 != 0 && target.scratch_base != 0)
             .ok_or(STATUS_INVALID_HANDLE)?;
         let page = plan.page;
+        let process = self.capture_process_identity(pi).ok_or(STATUS_INVALID_HANDLE)?;
         let pagefile = &mut *core::ptr::addr_of_mut!(PROCESS_PAGEFILE);
         // Transition records own private frames, including already-promoted write-copy pages.
         // Use current metadata rather than retaining protection from an earlier trim.
         let transition_protection = nt_address_space::private_backing_protection(plan.protection);
-        let transition = pagefile.prepare_protection(pi as u64, page, transition_protection)?;
+        let transition = pagefile.prepare_protection_range_for(
+            pi as u64,
+            nt_memory_manager::MemoryLifetime::Process(process),
+            page,
+            nt_memory_manager::WORKING_SET_PAGE_SIZE,
+            transition_protection,
+        )?;
 
         if process_committed_mapping_basic_information(pi as u64, page).is_some() {
             let before = &mut *core::ptr::addr_of_mut!(COMMITTED_MAP_BEFORE);

@@ -4,6 +4,7 @@ use super::*;
 
 struct ProtectionTarget {
     pi: usize,
+    lifetime: nt_memory_manager::MemoryLifetime,
     pml4: u64,
     mapping_type: u32,
 }
@@ -38,8 +39,9 @@ impl ProtectionTarget {
         old_protection: impl Fn(u64) -> Result<u32, u32>,
     ) -> Result<Option<nt_memory_manager::PagefileProtectionPlan>, u32> {
         hosted_thread_memory_access(self.pi as u64, base, size)?;
-        let transition = (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).prepare_protection_range(
+        let transition = (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).prepare_protection_range_for(
             self.pi as u64,
+            self.lifetime,
             base,
             size,
             nt_address_space::private_backing_protection(new_protection),
@@ -107,6 +109,11 @@ impl ExecNtHandler {
                 Ok(target) => target,
                 Err(status) => return status,
             };
+        let Some(process) = self.capture_process_identity(target_pi)
+            .filter(|process| process.pid == target_pid) else {
+            return nt_process::STATUS_INVALID_HANDLE;
+        };
+        let lifetime = nt_memory_manager::MemoryLifetime::Process(process);
         if self.pm.process(target_pid).is_some_and(|process| {
             matches!(
                 process.state,
@@ -174,6 +181,7 @@ impl ExecNtHandler {
             let mapping_type = first.type_;
             let transition = match (ProtectionTarget {
                 pi: target_pi,
+                lifetime,
                 pml4: target.pml4,
                 mapping_type,
             })
@@ -241,6 +249,7 @@ impl ExecNtHandler {
         );
         let transition = match (ProtectionTarget {
             pi: target_pi,
+            lifetime,
             pml4: target.pml4,
             mapping_type: nt_address_space::MEM_PRIVATE,
         })
