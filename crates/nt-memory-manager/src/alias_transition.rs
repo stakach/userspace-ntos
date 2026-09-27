@@ -46,6 +46,7 @@ impl Cap {
 enum Phase {
     Empty,
     Live,
+    Suspended,
     Rollback,
     Commit,
     Retiring,
@@ -104,6 +105,11 @@ impl AliasTransition {
         (self.phase == Phase::Live).then_some((self.old.slot, self.rights))
     }
 
+    /// The exact cap and rights retained while this VA is unavailable.
+    pub fn suspended(&self) -> Option<(u64, u64)> {
+        (self.phase == Phase::Suspended).then_some((self.old.slot, self.rights))
+    }
+
     pub fn snapshot(&self) -> AliasTransitionSnapshot {
         AliasTransitionSnapshot {
             old: self.old,
@@ -116,6 +122,32 @@ impl AliasTransition {
 
     pub fn is_empty(&self) -> bool {
         self.phase == Phase::Empty
+    }
+
+    /// Unmap a live alias without releasing its cap. A successful unmap is recorded before
+    /// another operation can run, so retrying cannot replay it.
+    pub fn suspend(&mut self, io: &mut impl AliasRetirementIo) -> Result<(), u32> {
+        match self.phase {
+            Phase::Suspended => return Ok(()),
+            Phase::Live => {}
+            _ => return Err(INVALID),
+        }
+        self.old.unmap(io)?;
+        self.phase = Phase::Suspended;
+        Ok(())
+    }
+
+    /// Restore the retained cap at its original rights; a failed map leaves it suspended.
+    pub fn resume(&mut self, io: &mut impl AliasTransitionIo) -> Result<(), u32> {
+        match self.phase {
+            Phase::Live => return Ok(()),
+            Phase::Suspended => {}
+            _ => return Err(INVALID),
+        }
+        io.map(self.old.slot, self.rights)?;
+        self.old.mapped = true;
+        self.phase = Phase::Live;
+        Ok(())
     }
 
     /// Install into an empty reserved row, or replace the live backing. Capture the new copy
@@ -188,7 +220,7 @@ impl AliasTransition {
                 self.phase = Phase::Live;
             }
             Phase::Retiring => self.retire(io)?,
-            Phase::Live | Phase::Empty => {}
+            Phase::Live | Phase::Suspended | Phase::Empty => {}
         }
         Ok(())
     }
