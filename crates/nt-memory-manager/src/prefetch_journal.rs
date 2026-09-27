@@ -71,13 +71,13 @@ struct Held {
 }
 
 /// A non-cloneable claim journal, not a frame owner. The caller retains its own identity and
-/// excludes new admission to these ranges until final commit. None generation asserts absence
-/// of all prefetch rows for the PI; it never substitutes another process generation.
+/// excludes new admission to these ranges until final commit. None owner asserts absence
+/// of all prefetch rows for the PI; it never substitutes another process identity.
 #[derive(Debug)]
 pub struct PrefetchJournal<const RANGES: usize> {
     claim: u64,
     pi: u64,
-    generation: Option<u64>,
+    owner: Option<PrefetchProcess>,
     ranges: [(u64, u64); RANGES],
     entries: Vec<Held>,
     phase: Cell<Phase>,
@@ -86,11 +86,11 @@ pub struct PrefetchJournal<const RANGES: usize> {
 impl<const RANGES: usize> PrefetchJournal<RANGES> {
     pub fn prepare(
         pi: u64,
-        generation: Option<u64>,
+        owner: Option<PrefetchProcess>,
         ranges: [(u64, u64); RANGES],
         frames: &PrefetchFrames,
     ) -> Result<Self, PrefetchJournalError> {
-        if generation == Some(0) {
+        if owner.is_some_and(|owner| owner.pi != pi || owner.pid == 0 || owner.generation == 0) {
             return Err(PrefetchJournalError::OwnerChanged);
         }
         if ranges.iter().any(|&(base, size)| {
@@ -102,12 +102,12 @@ impl<const RANGES: usize> PrefetchJournal<RANGES> {
             claim: allocate_id(&NEXT_CLAIM)
                 .map_err(|_| PrefetchJournalError::InsufficientResources)?,
             pi,
-            generation,
+            owner,
             ranges,
             entries: Vec::new(),
             phase: Cell::new(Phase::Prepared),
         };
-        journal.validate_generation(frames)?;
+        journal.validate_owner(frames)?;
         let count = frames
             .entries
             .iter()
@@ -147,9 +147,9 @@ impl<const RANGES: usize> PrefetchJournal<RANGES> {
                 .any(|&(base, size)| base < entry.page + 4096 && entry.page < base + size)
     }
 
-    fn validate_generation(&self, frames: &PrefetchFrames) -> Result<(), PrefetchJournalError> {
+    fn validate_owner(&self, frames: &PrefetchFrames) -> Result<(), PrefetchJournalError> {
         if frames.entries.iter().flatten().any(|entry| {
-            entry.process.pi == self.pi && Some(entry.process.generation) != self.generation
+            entry.process.pi == self.pi && Some(entry.process) != self.owner
         }) {
             return Err(PrefetchJournalError::OwnerChanged);
         }
@@ -165,7 +165,7 @@ impl<const RANGES: usize> PrefetchJournal<RANGES> {
     }
 
     pub fn revalidate(&self, frames: &PrefetchFrames) -> Result<(), PrefetchJournalError> {
-        self.validate_generation(frames)?;
+        self.validate_owner(frames)?;
         let remaining = self.entries.iter().filter(|held| !held.complete.get());
         if frames
             .entries

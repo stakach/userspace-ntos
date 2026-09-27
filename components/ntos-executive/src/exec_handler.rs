@@ -22650,37 +22650,57 @@ impl ExecNtHandler {
             },
             None => None,
         };
-        if let Some(ctx) = context
-            .as_ref()
-            .filter(|_| self.current_hosted_thread_user_stack_contains(va, dst.len()))
-        {
-            return client_copyin_mapped(
-                self.pi as u64,
-                va,
-                dst,
-                &*ctx.filled_pages,
-                *ctx.faults as usize,
-                ctx.scratch_base,
-            );
-        }
-        if smss_copyin(va, dst) {
-            return true;
-        }
         let ctx = match context.as_ref() {
             Some(c) => c,
-            None => return false,
+            None => return smss_copyin(va, dst),
         };
+        let Some(process) = self.capture_process_identity(self.pi) else {
+            return false;
+        };
+        if process.generation != nt_memory_manager::ProcessGeneration::Hosted(ctx.owner_generation) {
+            return false;
+        }
         let filled_pages = &*ctx.filled_pages;
         let faults = *ctx.faults as usize;
-        if client_copyin_mapped(
+        let stack_read = self.current_hosted_thread_user_stack_contains(va, dst.len());
+        if client_copyin_process_mapped_for(
             self.pi as u64,
+            process,
             va,
             dst,
             filled_pages,
             faults,
             ctx.scratch_base,
+            true,
         ) {
             return true;
+        }
+        if stack_read {
+            return false;
+        }
+        if hosted_thread_memory_access(self.pi as u64, va, dst.len() as u64).is_err() {
+            return false;
+        }
+        let Some(chunks) = nt_address_space::page_chunks(va, dst.len()) else {
+            return false;
+        };
+        for chunk in chunks {
+            let page = chunk.page_base;
+            let backing = match nt_memory_manager::admit_client_copy_backing(
+                self.pi as u64,
+                process,
+                page,
+                &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+                shared_image_mapping_identity(self.pi as u64, page),
+            ) {
+                Ok(backing) => backing,
+                Err(_) => return false,
+            };
+            if backing.resident.is_some() || backing.shared_image
+                || !matches!(client_copyin_frame_lookup_for(self.pi as u64, process, page), Ok(None))
+            {
+                return false;
+            }
         }
         let reg = &*ctx.reg;
         let dll_pes = ctx.dll_pes();
@@ -42183,7 +42203,7 @@ impl ExecNtHandler {
                     return 0xC000_0005;
                 }
                 let mut raw = [0u8; 16];
-                if !smss_copyin(client_id_ptr, &mut raw) {
+                if !self.xas_read(client_id_ptr, &mut raw) {
                     return 0xC000_0005;
                 }
                 let client_id = nt_process::ClientId {

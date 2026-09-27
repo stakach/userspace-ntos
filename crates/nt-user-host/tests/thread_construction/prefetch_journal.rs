@@ -7,6 +7,7 @@ use nt_user_host::thread_prefetch_journal::ThreadPrefetchJournal;
 
 const PROCESS: PrefetchProcess = PrefetchProcess {
     pi: 2,
+    pid: 8,
     generation: 7,
 };
 struct Io<'a>(&'a Cell<usize>);

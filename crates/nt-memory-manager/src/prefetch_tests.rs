@@ -6,8 +6,39 @@ mod journal_tests;
 
 const PROCESS: PrefetchProcess = PrefetchProcess {
     pi: 2,
+    pid: 42,
     generation: 7,
 };
+
+#[test]
+fn exact_identity_cannot_reuse_a_previous_prefetch_alias() {
+    let old = ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Hosted(7),
+    };
+    let new = ProcessIdentity {
+        pid: 43,
+        generation: ProcessGeneration::Hosted(7),
+    };
+    let old_process = PrefetchProcess::for_identity(2, old).unwrap();
+    let new_process = PrefetchProcess::for_identity(2, new).unwrap();
+    let mut table = PrefetchFrames::new();
+    let ticket = table
+        .reserve(old_process, 0x1000, |_| Some(0x100000))
+        .unwrap();
+    table.build(ticket, &mut Io::default()).unwrap();
+    assert_eq!(table.lookup(new_process, 0x1000), Err(RESOURCES));
+    assert_eq!(
+        table.reserve(new_process, 0x2000, |_| Some(0x200000)),
+        Err(RESOURCES)
+    );
+    assert!(table.lookup(old_process, 0x1000).unwrap().is_some());
+    assert_eq!(PrefetchProcess::for_identity(2, ProcessIdentity::empty()), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(PrefetchProcess::for_identity(2, ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Temporary(7),
+    }), Err(STATUS_INVALID_HANDLE));
+}
 
 #[test]
 fn mapped_frame_recycle_failure_holds_row_and_alias_until_publication() {

@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::retained_alias::{AliasRetirementIo, RetainedAlias};
+use crate::{ProcessGeneration, ProcessIdentity, STATUS_INVALID_HANDLE};
 
 const RESOURCES: u32 = 0xc000_009a;
 const INVALID: u32 = 0xc000_000d;
@@ -33,7 +34,24 @@ pub struct PrefetchPage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefetchProcess {
     pub pi: u64,
+    pub pid: u32,
     pub generation: u64,
+}
+
+impl PrefetchProcess {
+    pub fn for_identity(pi: u64, identity: ProcessIdentity) -> Result<Self, u32> {
+        if !identity.is_valid() {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let ProcessGeneration::Hosted(generation) = identity.generation else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        Ok(Self {
+            pi,
+            pid: identity.pid,
+            generation,
+        })
+    }
 }
 
 pub trait PrefetchIo: AliasRetirementIo {
@@ -102,7 +120,11 @@ impl PrefetchFrames {
         page: u64,
         address: impl FnOnce(usize) -> Option<u64>,
     ) -> Result<PrefetchReservation, u32> {
-        if process.generation == 0 || page & 0xfff != 0 || page.checked_add(4096).is_none() {
+        if process.pid == 0
+            || process.generation == 0
+            || page & 0xfff != 0
+            || page.checked_add(4096).is_none()
+        {
             return Err(INVALID);
         }
         if self.find(process.pi, page).is_some()

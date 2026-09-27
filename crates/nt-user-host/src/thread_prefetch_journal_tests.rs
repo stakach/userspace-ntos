@@ -15,6 +15,7 @@ fn layout() -> ThreadMemoryLayout {
 }
 const PROCESS: PrefetchProcess = PrefetchProcess {
     pi: 2,
+    pid: 8,
     generation: 7,
 };
 
@@ -45,12 +46,15 @@ fn exact_attempt_and_current_process_are_required_for_every_projection() {
         None,
         Some(PrefetchProcess {
             pi: 2,
+            pid: 8,
             generation: 8,
         }),
         Some(PrefetchProcess {
             pi: 3,
+            pid: 8,
             generation: 7,
         }),
+        Some(PrefetchProcess { pid: 9, ..PROCESS }),
     ] {
         assert_eq!(
             journal.claim(owner, current, &mut frames),
