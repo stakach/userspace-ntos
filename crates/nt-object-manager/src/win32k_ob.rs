@@ -832,6 +832,41 @@ impl ObHandleTable {
             .is_some_and(|entry| entry.set_security_descriptor(descriptor))
     }
 
+    /// Assign security to an exact live object body, including one awaiting `ObInsertObject`.
+    /// Reject duplicate bodies even when their modeled kinds differ; a pointer alone cannot
+    /// authorize mutation of an ambiguous object.
+    pub fn set_security_descriptor_by_body(
+        &mut self,
+        body: u64,
+        kind: ObKind,
+        descriptor: &[u8],
+    ) -> bool {
+        if body == 0 || descriptor.len() > OB_SECURITY_DESCRIPTOR_MAX {
+            return false;
+        }
+        let mut match_slot = None;
+        for (index, entry) in self.slots.iter().enumerate() {
+            if entry.as_ref().is_some_and(|entry| entry.body == body) {
+                if match_slot.replace(index).is_some() {
+                    return false;
+                }
+            }
+        }
+        let pending_matches = self
+            .pending
+            .as_ref()
+            .is_some_and(|entry| entry.body == body);
+        if pending_matches && match_slot.is_some() {
+            return false;
+        }
+        let entry = if pending_matches {
+            self.pending.as_mut()
+        } else {
+            match_slot.and_then(|index| self.slots[index].as_mut())
+        };
+        entry.is_some_and(|entry| entry.kind == kind && entry.set_security_descriptor(descriptor))
+    }
+
     /// Latch a (kind, body) from `ObCreateObject` for the following `ObInsertObject`.
     pub fn latch_pending(&mut self, kind: ObKind, body: u64) {
         self.pending = Some(ObjectEntry::new(kind, body));
