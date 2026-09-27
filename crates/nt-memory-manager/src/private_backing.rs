@@ -22,6 +22,12 @@ pub fn private_backing_pages<'a>(
 
 #[cfg(test)]
 mod tests {
+    const MEMORY_PROCESS: crate::MemoryLifetime =
+        crate::MemoryLifetime::Process(crate::ProcessIdentity {
+            pid: 1,
+            generation: crate::ProcessGeneration::Hosted(1),
+        });
+
     use super::*;
     use crate::PagefilePage;
     use alloc::vec::Vec;
@@ -35,13 +41,16 @@ mod tests {
             (2, 0x3000, 11, true),
             (1, 0x4000, 9, true),
         ] {
-            frames.insert(owner, page, frame, 0, 0, 0, owned).unwrap();
+            frames
+                .insert(owner, MEMORY_PROCESS, page, frame, 0, 0, 0, owned)
+                .unwrap();
         }
         let mut transitions = PagefileStore::new();
         for (owner, page, backing) in [(1, 0x1000, 9), (1, 0x2000, 12), (2, 0x5000, 13)] {
             let plan = transitions
                 .prepare_publish(PagefilePage {
                     owner,
+                    lifetime: MEMORY_PROCESS,
                     page,
                     backing,
                     protection: 2,

@@ -318,6 +318,7 @@ fn select_victims(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PagefilePage {
     pub owner: WorkingSetOwnerId,
+    pub lifetime: crate::MemoryLifetime,
     pub page: u64,
     pub protection: u32,
     pub backing: u64,
@@ -373,6 +374,7 @@ pub struct PagefileProtectionPlan {
     generation: u64,
     next_generation: u64,
     owner: WorkingSetOwnerId,
+    lifetime: Option<crate::MemoryLifetime>,
     base: u64,
     end: u64,
     protection: u32,
@@ -426,6 +428,12 @@ impl PagefileStore {
         self.index_for(owner, page).is_some()
     }
 
+    /// Retained owner identity is visible through retirement, when `page` is not.
+    pub fn lifetime(&self, owner: WorkingSetOwnerId, page: u64) -> Option<crate::MemoryLifetime> {
+        self.index_for(owner, page)
+            .map(|index| self.records[index].page.lifetime)
+    }
+
     pub fn prepare_publish(&mut self, page: PagefilePage) -> Result<PagefilePublishPlan, u32> {
         self.prepare_publish_with_counter(page, &NEXT_PAGEFILE_ID)
     }
@@ -438,6 +446,7 @@ impl PagefileStore {
         if page.page & (WORKING_SET_PAGE_SIZE - 1) != 0
             || page.page.checked_add(WORKING_SET_PAGE_SIZE).is_none()
             || page.backing == 0
+            || !page.lifetime.is_valid()
             || self.index_for(page.owner, page.page).is_some()
         {
             return Err(STATUS_INVALID_PARAMETER);
@@ -497,6 +506,16 @@ impl PagefileStore {
         (record.state == PagefileState::Available).then_some(record.page)
     }
 
+    pub fn page_for(
+        &self,
+        owner: WorkingSetOwnerId,
+        lifetime: crate::MemoryLifetime,
+        page: u64,
+    ) -> Option<PagefilePage> {
+        self.page(owner, page)
+            .filter(|record| lifetime.is_valid() && record.lifetime == lifetime)
+    }
+
     /// Reserve the fallible generation change before altering resident or VAD protection.
     pub fn prepare_protection(
         &self,
@@ -542,10 +561,38 @@ impl PagefileStore {
             generation: self.generation,
             next_generation,
             owner,
+            lifetime: None,
             base,
             end,
             protection,
         }))
+    }
+
+    pub fn prepare_protection_range_for(
+        &self,
+        owner: WorkingSetOwnerId,
+        lifetime: crate::MemoryLifetime,
+        base: u64,
+        size: u64,
+        protection: u32,
+    ) -> Result<Option<PagefileProtectionPlan>, u32> {
+        if !lifetime.is_valid() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let mut plan = self.prepare_protection_range(owner, base, size, protection)?;
+        let end = base + size;
+        if self.records.iter().any(|record| {
+            record.page.owner == owner
+                && record.page.page >= base
+                && record.page.page < end
+                && record.page.lifetime != lifetime
+        }) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if let Some(plan) = &mut plan {
+            plan.lifetime = Some(lifetime);
+        }
+        Ok(plan)
     }
 
     pub fn commit_protection(&mut self, plan: PagefileProtectionPlan) -> Result<(), u32> {
@@ -553,6 +600,14 @@ impl PagefileStore {
             || self.identity != plan.store_id
             || self.generation != plan.generation
             || !self.memory_available(plan.owner, plan.base, plan.end - plan.base)
+            || self.records.iter().any(|record| {
+                record.page.owner == plan.owner
+                    && record.page.page >= plan.base
+                    && record.page.page < plan.end
+                    && plan
+                        .lifetime
+                        .is_some_and(|lifetime| record.page.lifetime != lifetime)
+            })
         {
             self.stats.stale_commits = self.stats.stale_commits.saturating_add(1);
             return Err(STATUS_INVALID_PARAMETER);
@@ -591,6 +646,23 @@ impl PagefileStore {
         Ok(Some(record.page))
     }
 
+    pub fn take_for(
+        &mut self,
+        owner: WorkingSetOwnerId,
+        lifetime: crate::MemoryLifetime,
+        page: u64,
+    ) -> Result<Option<PagefilePage>, u32> {
+        if !lifetime.is_valid() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        match self.index_for(owner, page) {
+            Some(index) if self.records[index].page.lifetime != lifetime => {
+                Err(STATUS_INVALID_PARAMETER)
+            }
+            _ => self.take(owner, page),
+        }
+    }
+
     pub fn restore(&mut self, page: PagefilePage) -> Result<(), u32> {
         let plan = self.prepare_publish(page)?;
         self.commit_insert(plan, true)
@@ -624,6 +696,11 @@ impl Default for PagefileStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const MEMORY_PROCESS: crate::MemoryLifetime =
+        crate::MemoryLifetime::Process(crate::ProcessIdentity {
+            pid: 1,
+            generation: crate::ProcessGeneration::Hosted(1),
+        });
 
     fn page(page: u64, age: u64) -> WorkingSetPage {
         WorkingSetPage {
@@ -745,6 +822,7 @@ mod tests {
     fn pagefile_transition_is_reserved_before_publication_and_restorable() {
         let mut store = PagefileStore::new();
         let page = PagefilePage {
+            lifetime: MEMORY_PROCESS,
             owner: 7,
             page: 0x20_000,
             protection: 0x04,
@@ -765,6 +843,7 @@ mod tests {
         let mut store = PagefileStore::new();
         let old = store
             .prepare_publish(PagefilePage {
+                lifetime: MEMORY_PROCESS,
                 owner: 7,
                 page: 0x20_000,
                 protection: 0x04,
@@ -773,6 +852,7 @@ mod tests {
             .unwrap();
         let new = store
             .prepare_publish(PagefilePage {
+                lifetime: MEMORY_PROCESS,
                 owner: 7,
                 page: 0x30_000,
                 protection: 0x04,
@@ -788,6 +868,7 @@ mod tests {
     fn pagefile_protection_change_is_prepared_without_mutating_backing() {
         let mut store = PagefileStore::new();
         let original = PagefilePage {
+            lifetime: MEMORY_PROCESS,
             owner: 7,
             page: 0x1000,
             protection: 0x104,
@@ -802,6 +883,7 @@ mod tests {
         assert_eq!(
             updated,
             PagefilePage {
+                lifetime: MEMORY_PROCESS,
                 protection: 0x04,
                 ..original
             }
@@ -815,6 +897,7 @@ mod tests {
     fn stale_protection_plan_cannot_change_replaced_transition_backing() {
         let mut store = PagefileStore::new();
         let original = PagefilePage {
+            lifetime: MEMORY_PROCESS,
             owner: 7,
             page: 0x1000,
             protection: 0x104,
@@ -825,6 +908,7 @@ mod tests {
         let change = store.prepare_protection(7, 0x1000, 0x04).unwrap().unwrap();
         store.take(7, 0x1000).unwrap();
         let replacement = PagefilePage {
+            lifetime: MEMORY_PROCESS,
             backing: 2,
             ..original
         };
@@ -842,6 +926,7 @@ mod tests {
         for owner in [7, 8] {
             let publish = store
                 .prepare_publish(PagefilePage {
+                    lifetime: MEMORY_PROCESS,
                     owner,
                     page: 0x1000,
                     protection: 0x104,
@@ -852,6 +937,7 @@ mod tests {
         }
         let publish = store
             .prepare_publish(PagefilePage {
+                lifetime: MEMORY_PROCESS,
                 owner: 7,
                 page: 0x2000,
                 protection: 0x04,
@@ -874,6 +960,7 @@ mod tests {
     fn protection_generation_exhaustion_fails_before_any_mutation() {
         let mut store = PagefileStore::new();
         let original = PagefilePage {
+            lifetime: MEMORY_PROCESS,
             owner: 7,
             page: 0x1000,
             protection: 0x104,
@@ -900,6 +987,7 @@ mod tests {
         ] {
             let publish = store
                 .prepare_publish(PagefilePage {
+                    lifetime: MEMORY_PROCESS,
                     owner,
                     page,
                     protection,
@@ -921,6 +1009,7 @@ mod tests {
             let record = record.page;
             let expected = if record.owner == 7 && record.page < 0x4000 {
                 PagefilePage {
+                    lifetime: MEMORY_PROCESS,
                     protection: 0x02,
                     ..record
                 }
@@ -941,6 +1030,7 @@ mod tests {
         for page in [0x1000, 0x2000] {
             let publish = store
                 .prepare_publish(PagefilePage {
+                    lifetime: MEMORY_PROCESS,
                     owner: 7,
                     page,
                     protection: 0x104,
@@ -970,6 +1060,7 @@ mod tests {
         let mut store = PagefileStore::new();
         let publish = store
             .prepare_publish(PagefilePage {
+                lifetime: MEMORY_PROCESS,
                 owner: 7,
                 page: 0x1000,
                 protection: 0x104,
@@ -1014,6 +1105,7 @@ mod tests {
         for (owner, page, backing) in [(2, 0x1000, 1), (2, 0x2000, 2), (3, 0x1000, 3)] {
             let plan = store
                 .prepare_publish(PagefilePage {
+                    lifetime: MEMORY_PROCESS,
                     owner,
                     page,
                     protection: 0x04,
@@ -1047,6 +1139,7 @@ mod tests {
         for (owner, page, backing) in [(2, 0x1000, 1), (2, 0x2000, 2), (3, 0x1000, 3)] {
             let plan = store
                 .prepare_publish(PagefilePage {
+                    lifetime: MEMORY_PROCESS,
                     owner,
                     page,
                     protection: 0x04,

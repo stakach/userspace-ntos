@@ -1,3 +1,8 @@
+const MEMORY_PROCESS: nt_memory_manager::MemoryLifetime =
+    nt_memory_manager::MemoryLifetime::Process(nt_memory_manager::ProcessIdentity {
+        pid: 1,
+        generation: nt_memory_manager::ProcessGeneration::Hosted(1),
+    });
 use nt_user_host::process_identity::{ProcessGeneration, ProcessIdentity};
 use nt_user_host::thread_binding::{
     admit_thread_binding, ThreadBinding, ThreadRuntimeReservations,
@@ -290,7 +295,9 @@ fn registry_preparation_oom_and_revalidation_keep_pending_ownership() {
     partial.memory_progress.record_stack(0);
     partial.memory_progress.retain_empty_slot(601).unwrap();
     let mut registry = ClientFrameRegistry::new();
-    registry.insert(2, 0x1000, 200, 0, 201, 202, false).unwrap();
+    registry
+        .insert(2, MEMORY_PROCESS, 0x1000, 200, 0, 201, 202, false)
+        .unwrap();
     let id = without_allocation(|| slot.retain_failed_construction(ticket, partial)).unwrap();
     {
         let runtime = slot.owner().unwrap();

@@ -1,10 +1,101 @@
+const MEMORY_PROCESS: crate::MemoryLifetime =
+    crate::MemoryLifetime::Process(crate::ProcessIdentity {
+        pid: 1,
+        generation: crate::ProcessGeneration::Hosted(1),
+    });
 use super::*;
+use crate::{ProcessGeneration, ProcessIdentity};
 const RELEASE: ClientFrameReclaimIntent = ClientFrameReclaimIntent::Release;
+
+#[test]
+fn unpublished_image_token_is_exact_and_nonzero() {
+    let old = crate::MemoryLifetime::UnpublishedImage(11);
+    let new = crate::MemoryLifetime::UnpublishedImage(12);
+    let mut registry = ClientFrameRegistry::new();
+    assert_eq!(
+        registry.insert(
+            0,
+            crate::MemoryLifetime::UnpublishedImage(0),
+            0x1000,
+            11,
+            0,
+            0,
+            0,
+            true
+        ),
+        Err(ClientFrameInsertError::InvalidRecord)
+    );
+    registry.insert(0, old, 0x1000, 11, 0, 0, 0, true).unwrap();
+    let retained = registry.get_for(0, old, 0x1000).unwrap();
+    assert_eq!(registry.get_for(0, new, 0x1000), None);
+    assert_eq!(registry.take_for(0, new, 0x1000), None);
+    assert_eq!(
+        registry.insert(0, new, 0x1000, 11, 0, 0, 0, true),
+        Err(ClientFrameInsertError::ConflictingLifetime)
+    );
+    assert_eq!(registry.get_for(0, old, 0x1000), Some(retained));
+}
+
+#[test]
+fn reused_pi_and_page_cannot_adopt_a_previous_process_frame() {
+    let old = ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Hosted(1),
+    };
+    let new = ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Hosted(2),
+    };
+    let mut registry = ClientFrameRegistry::new();
+    registry
+        .insert_with_backing(
+            7,
+            crate::MemoryLifetime::Process(old),
+            0x1000,
+            11,
+            0,
+            0,
+            0,
+            true,
+            11,
+        )
+        .unwrap();
+    let retained = registry
+        .get_for(7, crate::MemoryLifetime::Process(old), 0x1000)
+        .unwrap();
+
+    assert_eq!(retained.lifetime, crate::MemoryLifetime::Process(old));
+    assert_eq!(
+        registry.get_for(7, crate::MemoryLifetime::Process(new), 0x1000),
+        None
+    );
+    assert!(registry
+        .insert_with_backing(
+            7,
+            crate::MemoryLifetime::Process(new),
+            0x1000,
+            11,
+            0,
+            0,
+            0,
+            true,
+            11
+        )
+        .is_err());
+    assert_eq!(
+        registry.get_for(7, crate::MemoryLifetime::Process(old), 0x1000),
+        Some(retained)
+    );
+    assert_eq!(
+        registry.get_for(7, crate::MemoryLifetime::Process(new), 0x1000),
+        None
+    );
+}
 
 fn populated() -> (ClientFrameRegistry, ClientFrameRecord) {
     let mut registry = ClientFrameRegistry::new();
     registry
-        .insert_at_age(7, 0x1000, 11, 0x2000, 12, 13, false, 40)
+        .insert_at_age(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 12, 13, false, 40)
         .unwrap();
     let record = registry.get(7, 0x1000).unwrap();
     (registry, record)
@@ -15,15 +106,26 @@ fn invalid_registration_never_creates_or_enriches_a_row() {
     let mut registry = ClientFrameRegistry::new();
     for (frame, alias, alias_cap) in [(0, 0, 0), (11, 0x2000, 0)] {
         assert_eq!(
-            registry.insert(7, 0x1000, frame, alias, alias_cap, 13, false),
+            registry.insert(
+                7,
+                MEMORY_PROCESS,
+                0x1000,
+                frame,
+                alias,
+                alias_cap,
+                13,
+                false
+            ),
             Err(ClientFrameInsertError::InvalidRecord),
         );
         assert!(registry.is_process_empty(7));
     }
-    registry.insert(7, 0x1000, 11, 0, 0, 0, false).unwrap();
+    registry
+        .insert(7, MEMORY_PROCESS, 0x1000, 11, 0, 0, 0, false)
+        .unwrap();
     let before = registry.get(7, 0x1000).unwrap();
     assert_eq!(
-        registry.insert(7, 0x1000, 11, 0x2000, 0, 13, false),
+        registry.insert(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 0, 13, false),
         Err(ClientFrameInsertError::InvalidRecord),
     );
     assert_eq!(registry.get(7, 0x1000), Some(before));
@@ -35,7 +137,7 @@ fn alias_conflicts_leave_the_whole_row_unchanged() {
     let (mut registry, before) = populated();
     for (alias, cap) in [(0x3000, 12), (0x2000, 14), (0x3000, 14), (0, 14)] {
         assert_eq!(
-            registry.insert_at_age(7, 0x1000, 11, alias, cap, 13, false, 999),
+            registry.insert_at_age(7, MEMORY_PROCESS, 0x1000, 11, alias, cap, 13, false, 999),
             Err(ClientFrameInsertError::ConflictingAlias),
         );
         assert_eq!(registry.get(7, 0x1000), Some(before));
@@ -46,10 +148,12 @@ fn alias_conflicts_leave_the_whole_row_unchanged() {
 #[test]
 fn source_conflict_cannot_partially_enrich_an_alias() {
     let mut registry = ClientFrameRegistry::new();
-    registry.insert(7, 0x1000, 11, 0, 0, 13, false).unwrap();
+    registry
+        .insert(7, MEMORY_PROCESS, 0x1000, 11, 0, 0, 13, false)
+        .unwrap();
     let before = registry.get(7, 0x1000).unwrap();
     assert_eq!(
-        registry.insert(7, 0x1000, 11, 0x2000, 12, 14, false),
+        registry.insert(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 12, 14, false),
         Err(ClientFrameInsertError::ConflictingSource),
     );
     assert_eq!(registry.get(7, 0x1000), Some(before));
@@ -61,7 +165,7 @@ fn replay_and_omissions_preserve_richer_ownership() {
     let (mut registry, before) = populated();
     for (alias, cap, source) in [(0x2000, 12, 13), (0, 0, 0), (0, 12, 0), (0, 0, 13)] {
         assert_eq!(
-            registry.insert_at_age(7, 0x1000, 11, alias, cap, source, false, 40),
+            registry.insert_at_age(7, MEMORY_PROCESS, 0x1000, 11, alias, cap, source, false, 40),
             Ok(ClientFrameInsert::Updated),
         );
         assert_eq!(registry.get(7, 0x1000), Some(before));
@@ -71,7 +175,9 @@ fn replay_and_omissions_preserve_richer_ownership() {
 #[test]
 fn dormant_alias_requires_the_same_explicit_cap_for_address_enrichment() {
     let mut registry = ClientFrameRegistry::new();
-    registry.insert(7, 0x1000, 11, 0, 12, 13, false).unwrap();
+    registry
+        .insert(7, MEMORY_PROCESS, 0x1000, 11, 0, 12, 13, false)
+        .unwrap();
     let before = registry.get(7, 0x1000).unwrap();
     assert_eq!(before.mapped_alias(), None);
     for (cap, error) in [
@@ -79,13 +185,13 @@ fn dormant_alias_requires_the_same_explicit_cap_for_address_enrichment() {
         (14, ClientFrameInsertError::ConflictingAlias),
     ] {
         assert_eq!(
-            registry.insert(7, 0x1000, 11, 0x2000, cap, 13, false),
+            registry.insert(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, cap, 13, false),
             Err(error)
         );
         assert_eq!(registry.get(7, 0x1000), Some(before));
     }
     registry
-        .insert(7, 0x1000, 11, 0x2000, 12, 0, false)
+        .insert(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 12, 0, false)
         .unwrap();
     let mapped = registry.get(7, 0x1000).unwrap();
     assert_eq!(mapped.mapped_alias(), Some(0x2000));
@@ -97,7 +203,17 @@ fn dormant_alias_requires_the_same_explicit_cap_for_address_enrichment() {
 fn refused_registration_does_not_advance_working_set_age() {
     let (mut registry, before) = populated();
     assert_eq!(
-        registry.insert_at_age(7, 0x1000, 11, 0x3000, 12, 13, false, u64::MAX),
+        registry.insert_at_age(
+            7,
+            MEMORY_PROCESS,
+            0x1000,
+            11,
+            0x3000,
+            12,
+            13,
+            false,
+            u64::MAX
+        ),
         Err(ClientFrameInsertError::ConflictingAlias),
     );
     assert_eq!(registry.get(7, 0x1000), Some(before));
@@ -139,7 +255,7 @@ fn retiring_rows_refuse_replay_enrichment_and_replacement() {
         (21, 0x3000, 22, 23, true),
     ] {
         assert_eq!(
-            registry.insert(7, 0x1000, frame, alias, cap, source, owned),
+            registry.insert(7, MEMORY_PROCESS, 0x1000, frame, alias, cap, source, owned),
             Err(ClientFrameInsertError::Reclaiming),
         );
         assert_eq!(registry.get(7, 0x1000), Some(retiring));
@@ -162,7 +278,7 @@ fn completed_cleanup_cannot_resurrect_after_clearing_capability_progress() {
     assert!(!cleared.is_resident());
     assert_eq!(cleared.clone_source_cap(), None);
     assert_eq!(
-        registry.insert(7, 0x1000, 11, 0x2000, 14, 13, false),
+        registry.insert(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 14, 13, false),
         Err(ClientFrameInsertError::Reclaiming),
     );
 }
@@ -186,7 +302,7 @@ fn identical_key_caps_and_age_reuse_cannot_accept_an_old_snapshot() {
     let (mut registry, old) = populated();
     assert_eq!(registry.take_exact(old), Some(old));
     registry
-        .insert_at_age(7, 0x1000, 11, 0x2000, 12, 13, false, 40)
+        .insert_at_age(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 12, 13, false, 40)
         .unwrap();
     let new = registry.get(7, 0x1000).unwrap();
     assert_ne!(new.record_id, old.record_id);
@@ -215,7 +331,7 @@ fn replacement_after_retirement_has_a_fresh_live_identity() {
         Ok(ready)
     );
     registry
-        .insert_at_age(7, 0x1000, 11, 0x2000, 12, 13, false, 40)
+        .insert_at_age(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 12, 13, false, 40)
         .unwrap();
     let new = registry.get(7, 0x1000).unwrap();
     assert!(new.is_resident());

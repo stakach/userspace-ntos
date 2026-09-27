@@ -3,40 +3,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMPORARY_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-/// The two authorities have independent counters; equal numeric values are not equal lifetimes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProcessGeneration {
-    Hosted(u64),
-    Temporary(u64),
-}
-
-impl ProcessGeneration {
-    pub const fn is_valid(self) -> bool {
-        match self {
-            Self::Hosted(value) | Self::Temporary(value) => value != 0,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProcessIdentity {
-    pub pid: u32,
-    pub generation: ProcessGeneration,
-}
-
-impl ProcessIdentity {
-    pub const fn empty() -> Self {
-        Self {
-            pid: 0,
-            generation: ProcessGeneration::Hosted(0),
-        }
-    }
-
-    pub const fn is_valid(self) -> bool {
-        self.pid != 0 && self.generation.is_valid()
-    }
-}
+pub use nt_types::{ProcessGeneration, ProcessIdentity};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TemporaryProcessClaim {

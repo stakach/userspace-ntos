@@ -368,7 +368,19 @@ fn partial_registry_transfer_survives_failed_cap_cleanup_until_final_acknowledge
     memory.stack_target[0] = 100;
     let mut registry = ClientFrameRegistry::new();
     registry
-        .insert(identity().pi as u64, 0x1000, 100, 0, 0, 200, true)
+        .insert(
+            identity().pi as u64,
+            nt_memory_manager::MemoryLifetime::Process(nt_memory_manager::ProcessIdentity {
+                pid: identity().pid,
+                generation: identity().process_generation,
+            }),
+            0x1000,
+            100,
+            0,
+            0,
+            200,
+            true,
+        )
         .unwrap();
     let snapshot = ThreadRegistrySnapshot::capture_partial(&memory, &registry, &[0x1000]).unwrap();
     let mut owner = ThreadRollback::prepare(identity(), snapshot.rollback_resources()).unwrap();

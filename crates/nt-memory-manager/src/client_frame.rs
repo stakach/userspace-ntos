@@ -1,3 +1,4 @@
+use crate::MemoryLifetime;
 use alloc::vec::Vec;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +25,7 @@ pub struct ClientFrameRecord {
     // Independent of working-set age and cap values, which may recur after row/cap-slot reuse.
     record_id: u64,
     pub pi: u64,
+    pub lifetime: MemoryLifetime,
     pub page: u64,
     pub frame: u64,
     pub alias: u64,
@@ -74,6 +76,7 @@ pub enum ClientFrameInsertError {
     ConflictingOwnership,
     ConflictingAlias,
     ConflictingSource,
+    ConflictingLifetime,
     Reclaiming,
     IdentityExhausted,
     AllocationFailed,
@@ -149,6 +152,7 @@ impl ClientFrameRegistry {
     pub fn insert(
         &mut self,
         pi: u64,
+        lifetime: MemoryLifetime,
         page: u64,
         frame: u64,
         alias: u64,
@@ -158,7 +162,7 @@ impl ClientFrameRegistry {
     ) -> Result<ClientFrameInsert, ClientFrameInsertError> {
         let age = self.next_age;
         self.insert_at_age(
-            pi, page, frame, alias, alias_cap, source_cap, owns_frame, age,
+            pi, lifetime, page, frame, alias, alias_cap, source_cap, owns_frame, age,
         )
     }
 
@@ -166,6 +170,7 @@ impl ClientFrameRegistry {
     pub fn insert_with_backing(
         &mut self,
         pi: u64,
+        lifetime: MemoryLifetime,
         page: u64,
         frame: u64,
         alias: u64,
@@ -176,6 +181,7 @@ impl ClientFrameRegistry {
     ) -> Result<ClientFrameInsert, ClientFrameInsertError> {
         self.insert_at_age_with_backing(
             pi,
+            lifetime,
             page,
             frame,
             alias,
@@ -191,6 +197,7 @@ impl ClientFrameRegistry {
     pub fn insert_at_age(
         &mut self,
         pi: u64,
+        lifetime: MemoryLifetime,
         page: u64,
         frame: u64,
         alias: u64,
@@ -201,6 +208,7 @@ impl ClientFrameRegistry {
     ) -> Result<ClientFrameInsert, ClientFrameInsertError> {
         self.insert_at_age_with_backing(
             pi,
+            lifetime,
             page,
             frame,
             alias,
@@ -216,6 +224,7 @@ impl ClientFrameRegistry {
     pub fn insert_at_age_with_backing(
         &mut self,
         pi: u64,
+        lifetime: MemoryLifetime,
         page: u64,
         frame: u64,
         alias: u64,
@@ -225,12 +234,19 @@ impl ClientFrameRegistry {
         age: u64,
         owned_backing_cap: u64,
     ) -> Result<ClientFrameInsert, ClientFrameInsertError> {
-        if frame == 0 || (alias != 0 && alias_cap == 0) || owns_frame != (owned_backing_cap != 0) {
+        if !lifetime.is_valid()
+            || frame == 0
+            || (alias != 0 && alias_cap == 0)
+            || owns_frame != (owned_backing_cap != 0)
+        {
             self.invalid_records = self.invalid_records.saturating_add(1);
             return Err(ClientFrameInsertError::InvalidRecord);
         }
         if let Some(index) = self.index_for(pi, page) {
             let record = &mut self.records[index];
+            if record.lifetime != lifetime {
+                return Err(ClientFrameInsertError::ConflictingLifetime);
+            }
             if record.is_reclaiming() {
                 self.reclaim_refusals = self.reclaim_refusals.saturating_add(1);
                 return Err(ClientFrameInsertError::Reclaiming);
@@ -290,6 +306,7 @@ impl ClientFrameRegistry {
         self.records.push(ClientFrameRecord {
             record_id,
             pi,
+            lifetime,
             page,
             frame,
             alias,
@@ -315,6 +332,16 @@ impl ClientFrameRegistry {
         self.get_with_index(pi, page).map(|(_, record)| record)
     }
 
+    pub fn get_for(
+        &self,
+        pi: u64,
+        lifetime: MemoryLifetime,
+        page: u64,
+    ) -> Option<ClientFrameRecord> {
+        self.get(pi, page)
+            .filter(|record| lifetime.is_valid() && record.lifetime == lifetime)
+    }
+
     pub fn touch(&mut self, pi: u64, page: u64) -> bool {
         let Some(index) = self.index_for(pi, page) else {
             return false;
@@ -333,6 +360,16 @@ impl ClientFrameRegistry {
             return None;
         }
         Some(self.records.swap_remove(index))
+    }
+
+    pub fn take_for(
+        &mut self,
+        pi: u64,
+        lifetime: MemoryLifetime,
+        page: u64,
+    ) -> Option<ClientFrameRecord> {
+        self.get_for(pi, lifetime, page)?;
+        self.take(pi, page)
     }
 
     pub fn take_exact(&mut self, expected: ClientFrameRecord) -> Option<ClientFrameRecord> {
@@ -448,10 +485,18 @@ mod lifetime_tests;
 
 #[cfg(test)]
 mod tests {
+    const MEMORY_PROCESS: crate::MemoryLifetime =
+        crate::MemoryLifetime::Process(crate::ProcessIdentity {
+            pid: 1,
+            generation: crate::ProcessGeneration::Hosted(1),
+        });
+
     use super::*;
 
     fn insert(registry: &mut ClientFrameRegistry, pi: u64, page: u64, frame: u64) {
-        registry.insert(pi, page, frame, 0, 0, 0, true).unwrap();
+        registry
+            .insert(pi, MEMORY_PROCESS, page, frame, 0, 0, 0, true)
+            .unwrap();
     }
 
     #[test]
@@ -479,11 +524,11 @@ mod tests {
     fn duplicate_registration_enriches_missing_caps() {
         let mut registry = ClientFrameRegistry::new();
         assert_eq!(
-            registry.insert(2, 0x1000, 0x40, 0, 0, 0, true),
+            registry.insert(2, MEMORY_PROCESS, 0x1000, 0x40, 0, 0, 0, true),
             Ok(ClientFrameInsert::Inserted { grew: true })
         );
         assert_eq!(
-            registry.insert(2, 0x1000, 0x40, 0x2000, 0x44, 0x48, true),
+            registry.insert(2, MEMORY_PROCESS, 0x1000, 0x40, 0x2000, 0x44, 0x48, true),
             Ok(ClientFrameInsert::Updated)
         );
         let record = registry.get(2, 0x1000).unwrap();
@@ -497,13 +542,13 @@ mod tests {
         let mut registry = ClientFrameRegistry::new();
         insert(&mut registry, 2, 0x1000, 0x40);
         assert_eq!(
-            registry.insert(2, 0x1000, 0x44, 0x2000, 0x48, 0x4c, true),
+            registry.insert(2, MEMORY_PROCESS, 0x1000, 0x44, 0x2000, 0x48, 0x4c, true),
             Err(ClientFrameInsertError::ConflictingFrame)
         );
         assert_eq!(registry.get(2, 0x1000).unwrap().alias, 0);
         assert_eq!(registry.stats().frame_conflicts, 1);
         assert_eq!(
-            registry.insert(2, 0x1000, 0x40, 0x2000, 0x48, 0x4c, false),
+            registry.insert(2, MEMORY_PROCESS, 0x1000, 0x40, 0x2000, 0x48, 0x4c, false),
             Err(ClientFrameInsertError::ConflictingOwnership)
         );
         assert_eq!(registry.get(2, 0x1000).unwrap().alias, 0);
@@ -540,7 +585,7 @@ mod tests {
     fn exact_reclaim_progress_rejects_stale_snapshots() {
         let mut registry = ClientFrameRegistry::new();
         registry
-            .insert(7, 0x1000, 11, 0x2000, 12, 13, false)
+            .insert(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 12, 13, false)
             .unwrap();
         let initial = registry.get(7, 0x1000).unwrap();
         let intent = ClientFrameReclaimIntent::Release;
@@ -569,7 +614,7 @@ mod tests {
     fn copy_access_requires_owned_alias_and_live_backing() {
         let mut registry = ClientFrameRegistry::new();
         registry
-            .insert(7, 0x1000, 11, 0x2000, 12, 13, false)
+            .insert(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 12, 13, false)
             .unwrap();
         let record = registry.get(7, 0x1000).unwrap();
         assert_eq!(record.mapped_alias(), Some(0x2000));
@@ -601,10 +646,10 @@ mod tests {
     fn copy_access_tracks_replacement_eviction_and_process_identity() {
         let mut registry = ClientFrameRegistry::new();
         registry
-            .insert(7, 0x1000, 11, 0x2000, 12, 13, false)
+            .insert(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 12, 13, false)
             .unwrap();
         registry
-            .insert(8, 0x1000, 21, 0x3000, 22, 23, false)
+            .insert(8, MEMORY_PROCESS, 0x1000, 21, 0x3000, 22, 23, false)
             .unwrap();
         registry.take(7, 0x1000).unwrap();
         assert!(registry.get(7, 0x1000).is_none());
@@ -613,14 +658,16 @@ mod tests {
             Some(0x3000)
         );
         registry
-            .insert(7, 0x1000, 31, 0x4000, 32, 33, true)
+            .insert(7, MEMORY_PROCESS, 0x1000, 31, 0x4000, 32, 33, true)
             .unwrap();
         let replacement = registry.get(7, 0x1000).unwrap();
         assert_eq!(replacement.mapped_alias(), Some(0x4000));
         assert_eq!(replacement.clone_source_cap(), Some(33));
         registry.take_exact(replacement).unwrap();
         assert!(registry.get(7, 0x1000).is_none());
-        registry.insert(7, 0x1000, 41, 0, 0, 0, true).unwrap();
+        registry
+            .insert(7, MEMORY_PROCESS, 0x1000, 41, 0, 0, 0, true)
+            .unwrap();
         let restored = registry.get(7, 0x1000).unwrap();
         assert_eq!(restored.mapped_alias(), None);
         assert_eq!(restored.clone_source_cap(), Some(41));

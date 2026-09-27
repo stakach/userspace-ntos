@@ -1,3 +1,8 @@
+const MEMORY_PROCESS: nt_memory_manager::MemoryLifetime =
+    nt_memory_manager::MemoryLifetime::Process(nt_memory_manager::ProcessIdentity {
+        pid: 1,
+        generation: nt_memory_manager::ProcessGeneration::Hosted(1),
+    });
 use super::*;
 use crate::process_identity::ProcessGeneration;
 use crate::thread_construction::{MemoryConstructionProgress, ThreadConstructionInventory};
@@ -43,8 +48,12 @@ fn fixture() -> (
     progress.record_stack(0);
     progress.record_teb(0);
     let mut registry = ClientFrameRegistry::new();
-    registry.insert(7, 0x1000, 10, 0, 12, 13, false).unwrap();
-    registry.insert(7, 0x5000, 21, 0, 22, 23, false).unwrap();
+    registry
+        .insert(7, MEMORY_PROCESS, 0x1000, 10, 0, 12, 13, false)
+        .unwrap();
+    registry
+        .insert(7, MEMORY_PROCESS, 0x5000, 21, 0, 22, 23, false)
+        .unwrap();
     (resources, progress, registry)
 }
 
@@ -97,7 +106,9 @@ fn exact_provenance_survives_transfer_without_revalidating_recycled_cap_numbers(
         .reconcile(id, &resources, &progress, &retirement, &registry)
         .is_err());
     registry.finish_transfer(transfer).unwrap();
-    registry.insert(8, 0xa000, 10, 0, 12, 13, false).unwrap();
+    registry
+        .insert(8, MEMORY_PROCESS, 0xa000, 10, 0, 12, 13, false)
+        .unwrap();
     assert!(core::ptr::eq(
         snapshot,
         state.retained_snapshot(id).unwrap()
@@ -120,7 +131,9 @@ fn missing_published_page_is_not_inferred_away_and_preparation_can_retry() {
         ))
     ));
     assert!(!state.is_prepared());
-    registry.insert(7, 0x5000, 21, 0, 22, 23, false).unwrap();
+    registry
+        .insert(7, MEMORY_PROCESS, 0x5000, 21, 0, 22, 23, false)
+        .unwrap();
     assert!(state
         .reconcile(id, &resources, &progress, &retirement, &registry)
         .is_ok());
@@ -138,7 +151,9 @@ fn changed_registry_never_replaces_a_prepared_snapshot() {
         .records()
         .to_vec();
     registry.take(7, 0x5000).unwrap();
-    registry.insert(7, 0x5000, 21, 0, 24, 25, false).unwrap();
+    registry
+        .insert(7, MEMORY_PROCESS, 0x5000, 21, 0, 24, 25, false)
+        .unwrap();
     for _ in 0..3 {
         assert!(matches!(
             state.reconcile(id, &resources, &progress, &retirement, &registry),
@@ -177,7 +192,9 @@ fn empty_slot_cannot_be_hidden_in_live_resources_or_registry() {
     for cap in [10, 11, 22, 99] {
         let (resources, mut progress, mut registry) = fixture();
         if cap == 99 {
-            registry.insert(8, 0xa000, 90, 0, 0, cap, false).unwrap();
+            registry
+                .insert(8, MEMORY_PROCESS, 0xa000, 90, 0, 0, cap, false)
+                .unwrap();
         }
         progress.retain_empty_slot(cap).unwrap();
         let state = ThreadRegistryReconciliation::empty();
@@ -227,7 +244,9 @@ fn new_unselected_rows_and_shared_caps_invalidate_without_refreshing() {
         state
             .reconcile(id, &resources, &progress, &retirement, &registry)
             .unwrap();
-        registry.insert(pi, page, frame, 0, 0, 0, false).unwrap();
+        registry
+            .insert(pi, MEMORY_PROCESS, page, frame, 0, 0, 0, false)
+            .unwrap();
         let error = state
             .reconcile(id, &resources, &progress, &retirement, &registry)
             .unwrap_err();
@@ -432,7 +451,9 @@ fn registered_retry_rejects_changed_attempt_coverage_resources_and_registry() {
         ))
     ));
     registry.take(7, 0x5000).unwrap();
-    registry.insert(7, 0x5000, 21, 0, 24, 25, false).unwrap();
+    registry
+        .insert(7, MEMORY_PROCESS, 0x5000, 21, 0, 24, 25, false)
+        .unwrap();
     assert!(matches!(
         state.reconcile_registered(id, &resources, &[0x1000, 0x5000], &registry),
         Err(ReconciliationError::Registry(
@@ -461,7 +482,9 @@ fn registered_terminal_provenance_survives_transfer_and_numeric_cap_reuse() {
         .reconcile_registered(id, &resources, &[0x1000, 0x5000], &registry)
         .is_err());
     registry.finish_transfer(transfer).unwrap();
-    registry.insert(8, 0xa000, 10, 0, 12, 13, false).unwrap();
+    registry
+        .insert(8, MEMORY_PROCESS, 0xa000, 10, 0, 12, 13, false)
+        .unwrap();
     assert!(core::ptr::eq(
         snapshot,
         state.retained_snapshot(id).unwrap()
@@ -489,7 +512,9 @@ fn registered_coverage_is_explicit_even_for_pi_zero_and_empty_registration() {
         .unwrap();
     assert!(snapshot.records().is_empty());
     assert!(!snapshot.rollback_resources().is_empty());
-    registry.insert(0, 0x1000, 10, 0, 12, 13, false).unwrap();
+    registry
+        .insert(0, MEMORY_PROCESS, 0x1000, 10, 0, 12, 13, false)
+        .unwrap();
     assert!(matches!(
         state.reconcile_registered(id, &resources, &[], &registry),
         Err(ReconciliationError::Registry(

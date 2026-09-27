@@ -85,6 +85,7 @@ pub(crate) unsafe fn run(
         assert!(
             csrss_frame_put_at_cap_source_backing(
                 image.pi as u64,
+                spawn.lifetime,
                 page,
                 target,
                 scratch,

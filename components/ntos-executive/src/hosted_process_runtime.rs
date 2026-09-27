@@ -378,6 +378,7 @@ pub(crate) fn hosted_heap_mirror_for_pi(pi: usize) -> u64 {
 
 pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
     image: nt_exe_image::HostedProcessImageRef<'_>,
+    lifetime: nt_memory_manager::MemoryLifetime,
     pe: &nt_pe_loader::PeFile,
     fault_ep_c: u64,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
@@ -391,6 +392,7 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
     spawn_sec_image(
         image.pi as u64,
         image.generation,
+        lifetime,
         pe,
         fault_ep_c,
         ntdll,

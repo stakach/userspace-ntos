@@ -1,3 +1,8 @@
+const MEMORY_PROCESS: nt_memory_manager::MemoryLifetime =
+    nt_memory_manager::MemoryLifetime::Process(nt_memory_manager::ProcessIdentity {
+        pid: 1,
+        generation: nt_memory_manager::ProcessGeneration::Hosted(1),
+    });
 use super::*;
 use nt_memory_manager::ClientFrameRegistry;
 use nt_user_host::thread_reconciliation::{ReconciliationError, ThreadRegistryReconciliation};
@@ -179,8 +184,12 @@ fn foreign_attempt_cannot_recycle_or_supply_reconciliation_phase() {
 fn recycled_slot_reuse_elsewhere_preserves_original_snapshot_but_not_stale_rows() {
     let (mut slot, id, _) = retained(None, true);
     let mut registry = ClientFrameRegistry::new();
-    registry.insert(2, 0x1000, 200, 0, 201, 202, false).unwrap();
-    registry.insert(3, 0xa000, 601, 0, 0, 0, false).unwrap();
+    registry
+        .insert(2, MEMORY_PROCESS, 0x1000, 200, 0, 201, 202, false)
+        .unwrap();
+    registry
+        .insert(3, MEMORY_PROCESS, 0xa000, 601, 0, 0, 0, false)
+        .unwrap();
     assert!(matches!(
         reconcile(&slot, &registry),
         Err(ReconciliationError::Registry(
@@ -205,7 +214,9 @@ fn recycled_slot_reuse_elsewhere_preserves_original_snapshot_but_not_stale_rows(
     backend.fail = None;
     slot.advance_construction_retirement(id, &mut backend)
         .unwrap();
-    registry.insert(3, 0xa000, 601, 0, 0, 0, false).unwrap();
+    registry
+        .insert(3, MEMORY_PROCESS, 0xa000, 601, 0, 0, 0, false)
+        .unwrap();
     assert_eq!(
         without_allocation(|| reconcile(&slot, &registry)).unwrap() as *const _,
         original

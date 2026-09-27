@@ -1,7 +1,95 @@
+const MEMORY_PROCESS: crate::MemoryLifetime =
+    crate::MemoryLifetime::Process(crate::ProcessIdentity {
+        pid: 1,
+        generation: crate::ProcessGeneration::Hosted(1),
+    });
+
+#[test]
+fn exact_pagefile_operations_retain_foreign_lifetime() {
+    let old = crate::MemoryLifetime::Process(crate::ProcessIdentity {
+        pid: 42,
+        generation: crate::ProcessGeneration::Hosted(1),
+    });
+    let new = crate::MemoryLifetime::Process(crate::ProcessIdentity {
+        pid: 42,
+        generation: crate::ProcessGeneration::Hosted(2),
+    });
+    let original = PagefilePage {
+        owner: 7,
+        lifetime: old,
+        page: 0x1000,
+        protection: 4,
+        backing: 11,
+    };
+    let mut store = PagefileStore::new();
+    let plan = store.prepare_publish(original).unwrap();
+    store.commit_publish(plan).unwrap();
+    assert_eq!(store.lifetime(7, 0x1000), Some(old));
+    assert_eq!(
+        store.take_for(7, new, 0x1000),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        store.begin_retirement_for(7, new, 0x1000),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        store.prepare_protection_range_for(7, new, 0x1000, 0x1000, 8),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(store.page_for(7, old, 0x1000), Some(original));
+}
 use super::super::{allocate_pagefile_id, PagefileStoreStats};
 use super::*;
+use crate::{ProcessGeneration, ProcessIdentity};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+
+#[test]
+fn reused_pi_and_page_cannot_read_or_replace_previous_process_pagefile_backing() {
+    let old = ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Hosted(1),
+    };
+    let new = ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Hosted(2),
+    };
+    let original = PagefilePage {
+        owner: 7,
+        lifetime: crate::MemoryLifetime::Process(old),
+        page: 0x1000,
+        protection: 4,
+        backing: 11,
+    };
+    let mut store = PagefileStore::new();
+    let plan = store.prepare_publish(original).unwrap();
+    store.commit_publish(plan).unwrap();
+
+    assert_eq!(
+        store.page_for(7, crate::MemoryLifetime::Process(old), 0x1000),
+        Some(original)
+    );
+    assert_eq!(
+        store.page_for(7, crate::MemoryLifetime::Process(new), 0x1000),
+        None
+    );
+    assert!(store
+        .prepare_publish(PagefilePage {
+            lifetime: crate::MemoryLifetime::Process(new),
+            backing: 12,
+            ..original
+        })
+        .is_err());
+    assert_eq!(
+        store.page_for(7, crate::MemoryLifetime::Process(old), 0x1000),
+        Some(original)
+    );
+    assert_eq!(
+        store.page_for(7, crate::MemoryLifetime::Process(new), 0x1000),
+        None
+    );
+}
 
 #[derive(Default)]
 struct Io {
@@ -31,6 +119,7 @@ impl PagefileRetirementIo for Io {
 
 fn page(owner: u64, address: u64, backing: u64) -> PagefilePage {
     PagefilePage {
+        lifetime: MEMORY_PROCESS,
         owner,
         page: address,
         protection: 4,

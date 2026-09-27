@@ -1,3 +1,8 @@
+const MEMORY_PROCESS: crate::MemoryLifetime =
+    crate::MemoryLifetime::Process(crate::ProcessIdentity {
+        pid: 1,
+        generation: crate::ProcessGeneration::Hosted(1),
+    });
 use super::*;
 use crate::client_frame::ClientFrameInsertError;
 
@@ -5,7 +10,16 @@ fn fixture() -> (ClientFrameRegistry, Vec<ClientFrameRecord>) {
     let mut registry = ClientFrameRegistry::new();
     for (pi, page, cap) in [(7, 0x1000, 10), (7, 0x2000, 20), (8, 0x1000, 30)] {
         registry
-            .insert(pi, page, cap, page + 0x10000, cap + 1, cap + 2, false)
+            .insert(
+                pi,
+                MEMORY_PROCESS,
+                page,
+                cap,
+                page + 0x10000,
+                cap + 1,
+                cap + 2,
+                false,
+            )
             .unwrap();
     }
     let records = registry.records().to_vec();
@@ -162,6 +176,7 @@ fn transferred_rows_cannot_be_republished_touched_or_used_for_resident_access() 
     assert_eq!(
         registry.insert(
             held.pi,
+            MEMORY_PROCESS,
             held.page,
             held.frame,
             held.alias,
@@ -173,7 +188,9 @@ fn transferred_rows_cannot_be_republished_touched_or_used_for_resident_access() 
     );
     assert_eq!(registry.get(held.pi, held.page), Some(held));
     registry.finish_transfer(transfer).unwrap();
-    registry.insert(7, 0x1000, 99, 0, 0, 0, true).unwrap();
+    registry
+        .insert(7, MEMORY_PROCESS, 0x1000, 99, 0, 0, 0, true)
+        .unwrap();
     assert!(registry.get(7, 0x1000).unwrap().is_resident());
 }
 
@@ -237,7 +254,16 @@ fn unrelated_vector_growth_and_swap_removal_do_not_change_transfer_ownership() {
     registry.take(7, 0x1000).unwrap();
     for i in 0..50 {
         registry
-            .insert(9, 0x1000 + i * 0x1000, 100 + i, 0, 0, 0, true)
+            .insert(
+                9,
+                MEMORY_PROCESS,
+                0x1000 + i * 0x1000,
+                100 + i,
+                0,
+                0,
+                0,
+                true,
+            )
             .unwrap();
     }
     registry.take(8, 0x1000).unwrap();
@@ -267,6 +293,7 @@ fn identical_replacement_cannot_reuse_pretransfer_snapshots() {
     registry
         .insert_at_age(
             old.pi,
+            MEMORY_PROCESS,
             old.page,
             old.frame,
             old.alias,
