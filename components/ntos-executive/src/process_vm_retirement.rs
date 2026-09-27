@@ -88,7 +88,10 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
                 return false;
             }
             let sections = &mut *ctx.generic_sections;
-            while let Some(view) = sections.first_view_for_process(pi) {
+            while let Some(view) = sections.first_view_for_process_exact(
+                pi,
+                nt_memory_manager::MemoryLifetime::Process(owner.process),
+            ) {
                 let writeback = service_sec_image::service_generic_section_writeback_view(
                     sections,
                     view,
@@ -110,8 +113,11 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
                     return false;
                 }
                 sections
-                    .unmap_view(pi, view.base)
+                    .unmap_view_exact(pi, view.lifetime, view.base)
                     .expect("checked mapping teardown retains its exact section view");
+            }
+            if sections.first_view_for_process(pi).is_some() {
+                return false;
             }
             let (_, failures) = shared_image_mapping_unmap_process(pi as u64);
             if failures != 0 || !shared_image_mapping_process_is_empty(pi) {

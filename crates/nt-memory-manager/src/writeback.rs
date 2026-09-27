@@ -33,6 +33,21 @@ pub struct SectionWritebackPage {
 pub struct SectionPageAlias {
     pub pi: usize,
     pub page: u64,
+    pub lifetime: crate::MemoryLifetime,
+}
+
+#[cfg(test)]
+impl SectionPageAlias {
+    pub(crate) const fn for_test(pi: usize, page: u64) -> Self {
+        Self {
+            pi,
+            page,
+            lifetime: crate::MemoryLifetime::Process(crate::ProcessIdentity {
+                pid: pi as u32 + 1,
+                generation: crate::ProcessGeneration::Hosted(1),
+            }),
+        }
+    }
 }
 
 pub trait SectionWritebackIo {

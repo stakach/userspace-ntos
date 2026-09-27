@@ -69,6 +69,43 @@ fn fixture() -> (GenericSectionTable, GenericSectionFlushPlan) {
 }
 
 #[test]
+fn writeback_alias_retains_original_process_generation_after_slot_reuse() {
+    let (mut table, plan) = fixture();
+    let original = crate::MemoryLifetime::Process(crate::ProcessIdentity {
+        pid: 41,
+        generation: ProcessGeneration::Hosted(7),
+    });
+    let replacement = crate::MemoryLifetime::Process(crate::ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Hosted(8),
+    });
+    assert!(table.map_view_with_lifetime(
+        8,
+        original,
+        plan.view.section_index,
+        0x20000,
+        0x1000,
+        0,
+    ));
+    let ticket = table.prepare_writeback(plan).unwrap()[0];
+    assert!(table.writeback_aliases(ticket).unwrap().iter().any(|alias| {
+        alias.pi == 8 && alias.page == 0x20000 && alias.lifetime == original
+    }));
+    assert!(table.first_view_for_process_exact(8, replacement).is_none());
+    assert_eq!(
+        table.first_view_for_process_exact(8, original).unwrap().lifetime,
+        original
+    );
+    assert!(table.unmap_view_exact(8, replacement, 0x20000).is_none());
+    assert!(table.unmap_view_exact(8, original, 0x20000).is_some());
+    assert!(!table
+        .writeback_aliases(ticket)
+        .unwrap()
+        .iter()
+        .any(|alias| alias.pi == 8));
+}
+
+#[test]
 fn aliases_follow_section_offsets_across_processes_and_views() {
     let (mut table, plan) = fixture();
     let section = plan.view.section_index;
@@ -79,18 +116,9 @@ fn aliases_follow_section_offsets_across_processes_and_views() {
     assert_eq!(
         table.writeback_aliases(ticket).unwrap(),
         vec![
-            SectionPageAlias {
-                pi: 3,
-                page: 0x11000
-            },
-            SectionPageAlias {
-                pi: 8,
-                page: 0x20000
-            },
-            SectionPageAlias {
-                pi: 3,
-                page: 0x30000
-            },
+            SectionPageAlias::for_test(3, 0x11000),
+            SectionPageAlias::for_test(8, 0x20000),
+            SectionPageAlias::for_test(3, 0x30000),
         ]
     );
 }
@@ -115,14 +143,8 @@ fn aliases_exclude_dead_views_but_include_sibling_sections_of_the_same_file() {
     assert_eq!(
         table.writeback_aliases(ticket).unwrap(),
         vec![
-            SectionPageAlias {
-                pi: 3,
-                page: 0x10000
-            },
-            SectionPageAlias {
-                pi: 8,
-                page: 0x20000
-            }
+            SectionPageAlias::for_test(3, 0x10000),
+            SectionPageAlias::for_test(8, 0x20000)
         ]
     );
 }
@@ -208,10 +230,7 @@ fn second_dirty_write_is_rearmed_and_checkpointed_again() {
     assert_eq!(table.writeback(plan, &mut io).bytes_written, 0x1000);
     assert_eq!(
         io.aliases,
-        vec![SectionPageAlias {
-            pi: 3,
-            page: 0x11000
-        }]
+        vec![SectionPageAlias::for_test(3, 0x11000)]
     );
     assert_eq!(io.events, vec!['r', 'w', 'p']);
 }

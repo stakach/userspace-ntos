@@ -103,18 +103,9 @@ fn file_flush_covers_all_pages_and_rearms_offset_siblings_before_writing() {
     assert_eq!(
         io.events,
         vec![
-            Event::Rearm(SectionPageAlias {
-                pi: 4,
-                page: 0x20000
-            }),
-            Event::Rearm(SectionPageAlias {
-                pi: 3,
-                page: 0x10000
-            }),
-            Event::Rearm(SectionPageAlias {
-                pi: 3,
-                page: 0x11000
-            }),
+            Event::Rearm(SectionPageAlias::for_test(4, 0x20000)),
+            Event::Rearm(SectionPageAlias::for_test(3, 0x10000)),
+            Event::Rearm(SectionPageAlias::for_test(3, 0x11000)),
             Event::Write(0, 0x1000),
             Event::Write(0x1000, 0x1000),
             Event::Write(0x2000, 0x800),
