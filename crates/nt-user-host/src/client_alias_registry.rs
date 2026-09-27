@@ -5,6 +5,48 @@ use alloc::vec::Vec;
 use nt_memory_manager::alias_transition::AliasTransitionIo;
 use nt_memory_manager::retained_alias::AliasRetirementIo;
 
+/// Copy into one previously reserved destination slot. `Err` proves that slot is empty; an
+/// uncertain copy result must be resolved or retained by the caller, never reported as `Err`.
+/// The registry checks the destination against every retained alias before invoking this trait.
+pub trait ReservedAliasTransitionIo: AliasRetirementIo {
+    fn copy_into(&mut self, destination_cap: u64) -> Result<(), u32>;
+    fn map(&mut self, cap: u64, rights: u64) -> Result<(), u32>;
+}
+
+struct ReservedBackend<'a, I> {
+    io: &'a mut I,
+    destination_cap: u64,
+}
+
+impl<I: ReservedAliasTransitionIo> AliasRetirementIo for ReservedBackend<'_, I> {
+    fn unmap(&mut self, cap: u64) -> Result<(), u32> {
+        self.io.unmap(cap)
+    }
+    fn delete(&mut self, cap: u64) -> Result<(), u32> {
+        self.io.delete(cap)
+    }
+    fn recycle_slot(&mut self, slot: u64) -> Result<(), u32> {
+        self.io.recycle_slot(slot)
+    }
+    fn recycle_unretyped_slot(&mut self, slot: u64) -> Result<(), u32> {
+        self.io.recycle_unretyped_slot(slot)
+    }
+}
+
+impl<I: ReservedAliasTransitionIo> AliasTransitionIo for ReservedBackend<'_, I> {
+    fn copy(&mut self) -> (u64, u32) {
+        let status = match self.io.copy_into(self.destination_cap) {
+            Ok(()) => 0,
+            Err(0) => nt_memory_manager::STATUS_INVALID_HANDLE,
+            Err(status) => status,
+        };
+        (self.destination_cap, status)
+    }
+    fn map(&mut self, cap: u64, rights: u64) -> Result<(), u32> {
+        self.io.map(cap, rights)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegistryError {
     InvalidOwner,
@@ -42,6 +84,7 @@ impl From<WindowError> for RegistryError {
 struct OwnerRows {
     window: ClientAliasWindow,
     rows: Vec<ThreadAliasMapping>,
+    retiring: bool,
 }
 
 /// Retains every alias row, including caps hidden behind suspended or blocked owners. The
@@ -80,6 +123,10 @@ impl ClientAliasRegistry {
 
     pub fn state(&self, owner: WindowOwner) -> Result<WindowState, RegistryError> {
         Ok(self.owners[self.index(owner)?].window.state())
+    }
+
+    pub fn is_retiring(&self, owner: WindowOwner) -> Result<bool, RegistryError> {
+        Ok(self.owners[self.index(owner)?].retiring)
     }
 
     pub fn active_owner(&self) -> Option<WindowOwner> {
@@ -129,7 +176,7 @@ impl ClientAliasRegistry {
         page: u64,
     ) -> Result<&ThreadAliasMapping, RegistryError> {
         let index = self.index(owner)?;
-        if self.owners[index].window.state() != WindowState::Active {
+        if self.owners[index].retiring || self.owners[index].window.state() != WindowState::Active {
             return Err(RegistryError::Busy);
         }
         let row = self.page(owner, page)?;
@@ -140,6 +187,120 @@ impl ClientAliasRegistry {
             return Err(RegistryError::StaleMappings);
         }
         Ok(row)
+    }
+
+    fn check_candidate(&self, candidate_cap: u64) -> Result<(), RegistryError> {
+        if candidate_cap == 0 {
+            return Err(RegistryError::StaleMappings);
+        }
+        if self.owns_cap(candidate_cap) {
+            return Err(RegistryError::SharedCapability(candidate_cap));
+        }
+        Ok(())
+    }
+
+    /// Replace one active page after the caller has reserved an exclusive destination slot.
+    /// The backend can only copy into that slot, rather than choosing a cap after preflight.
+    /// On backend error the row retains every slot whose cleanup is still unacknowledged.
+    pub fn replace_active_page(
+        &mut self,
+        owner: WindowOwner,
+        page: u64,
+        candidate_cap: u64,
+        rights: u64,
+        backend: &mut impl ReservedAliasTransitionIo,
+    ) -> Result<(), RegistryError> {
+        let index = self.index(owner)?;
+        if self.owners[index].retiring || self.owners[index].window.state() != WindowState::Active {
+            return Err(RegistryError::Busy);
+        }
+        let row_index = self.owners[index]
+            .rows
+            .iter()
+            .position(|row| row.page() == page)
+            .ok_or(RegistryError::MissingPage(page))?;
+        if self.owners[index].rows[row_index].is_claimed() {
+            return Err(RegistryError::Claimed);
+        }
+        if self.owners[index].rows[row_index].live().is_none() {
+            return Err(RegistryError::StaleMappings);
+        }
+        self.check_candidate(candidate_cap)?;
+        self.owners[index].rows[row_index]
+            .replace(
+                rights,
+                &mut ReservedBackend {
+                    io: backend,
+                    destination_cap: candidate_cap,
+                },
+            )
+            .map_err(|status| RegistryError::Backend { page, status })
+    }
+
+    /// Admit a new active page. Reserve the row before copying or mapping a cap so failure
+    /// cannot lose a partially constructed alias. Retry cleanup with `recover_page`.
+    pub fn admit_active_page(
+        &mut self,
+        owner: WindowOwner,
+        page: u64,
+        candidate_cap: u64,
+        rights: u64,
+        backend: &mut impl ReservedAliasTransitionIo,
+    ) -> Result<(), RegistryError> {
+        let index = self.index(owner)?;
+        if self.owners[index].retiring || self.owners[index].window.state() != WindowState::Active {
+            return Err(RegistryError::Busy);
+        }
+        if self.owners[index].rows.iter().any(|row| row.page() == page) {
+            return Err(RegistryError::DuplicatePage(page));
+        }
+        self.check_candidate(candidate_cap)?;
+        let row = ThreadAliasMapping::new(page).ok_or(RegistryError::StaleMappings)?;
+        let rows = &mut self.owners[index].rows;
+        rows.try_reserve(1)
+            .map_err(|_| RegistryError::InsufficientResources)?;
+        rows.push(row);
+        let result = rows.last_mut().expect("reserved row").replace(
+            rights,
+            &mut ReservedBackend {
+                io: backend,
+                destination_cap: candidate_cap,
+            },
+        );
+        if rows.last().expect("reserved row").is_empty() {
+            rows.pop();
+        }
+        result.map_err(|status| RegistryError::Backend { page, status })
+    }
+
+    /// Retry an interrupted replacement or admission without making another copy. Empty
+    /// admitted rows are removed only after cleanup is acknowledged.
+    pub fn recover_page(
+        &mut self,
+        owner: WindowOwner,
+        page: u64,
+        backend: &mut impl AliasTransitionIo,
+    ) -> Result<(), RegistryError> {
+        let index = self.index(owner)?;
+        let entry = &mut self.owners[index];
+        if entry.retiring || entry.window.state() != WindowState::Active {
+            return Err(RegistryError::Busy);
+        }
+        let row_index = entry
+            .rows
+            .iter()
+            .position(|row| row.page() == page)
+            .ok_or(RegistryError::MissingPage(page))?;
+        if entry.rows[row_index].is_claimed() {
+            return Err(RegistryError::Claimed);
+        }
+        entry.rows[row_index]
+            .recover(backend)
+            .map_err(|status| RegistryError::Backend { page, status })?;
+        if entry.rows[row_index].is_empty() {
+            entry.rows.swap_remove(row_index);
+        }
+        Ok(())
     }
 
     fn check_rows(&self, rows: &[ThreadAliasMapping]) -> Result<(), RegistryError> {
@@ -200,6 +361,7 @@ impl ClientAliasRegistry {
         self.owners.push(OwnerRows {
             window,
             rows: core::mem::take(rows),
+            retiring: false,
         });
         Ok(())
     }
@@ -212,7 +374,7 @@ impl ClientAliasRegistry {
         backend: impl FnMut(u64) -> I,
     ) -> Result<(), RegistryError> {
         let index = self.index(owner)?;
-        if self.owners[index].window.state() != WindowState::Active {
+        if self.owners[index].retiring || self.owners[index].window.state() != WindowState::Active {
             return Err(RegistryError::Busy);
         }
         let entry = &mut self.owners[index];
@@ -239,13 +401,25 @@ impl ClientAliasRegistry {
             }
         }
         let entry = &mut self.owners[index];
+        if entry.retiring {
+            return Err(RegistryError::Busy);
+        }
         entry
             .window
             .restore_all(owner, &mut entry.rows, backend)
             .map_err(Into::into)
     }
 
-    /// Retire only exact active-owner rows. A failed physical cleanup retains the row and cap.
+    /// After the caller proves execution quiescence and excludes new admission, begin terminal
+    /// process cleanup. Suspended rows can then be deleted without remapping their fixed VAs.
+    pub fn begin_retirement(&mut self, owner: WindowOwner) -> Result<(), RegistryError> {
+        let index = self.index(owner)?;
+        self.owners[index].retiring = true;
+        Ok(())
+    }
+
+    /// Ordinary retirement requires an active owner. Terminal process cleanup may retire
+    /// suspended or blocked rows after `begin_retirement`; failure retains the exact row/cap.
     pub fn retire_page(
         &mut self,
         owner: WindowOwner,
@@ -254,7 +428,7 @@ impl ClientAliasRegistry {
     ) -> Result<(), RegistryError> {
         let index = self.index(owner)?;
         let entry = &mut self.owners[index];
-        if entry.window.state() != WindowState::Active {
+        if !entry.retiring && entry.window.state() != WindowState::Active {
             return Err(RegistryError::Busy);
         }
         let row_index = entry
@@ -275,7 +449,9 @@ impl ClientAliasRegistry {
     pub fn remove_empty_owner(&mut self, owner: WindowOwner) -> Result<(), RegistryError> {
         let index = self.index(owner)?;
         let entry = &self.owners[index];
-        if entry.window.state() != WindowState::Active || !entry.rows.is_empty() {
+        if (!entry.retiring && entry.window.state() != WindowState::Active)
+            || !entry.rows.is_empty()
+        {
             return Err(RegistryError::Busy);
         }
         self.owners.swap_remove(index);
