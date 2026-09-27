@@ -24,6 +24,18 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
 }
 
 #[test]
+fn apc_state_index_has_reactos_x64_offset_and_survives_activation_refresh() {
+    assert_eq!(KTHREAD_APC_STATE_INDEX, 0x1e4);
+    let init = thread();
+    let mut bytes = [0; ETHREAD_BODY_BYTES];
+    initialize_thread(&mut bytes, init).unwrap();
+    assert_eq!(bytes[KTHREAD_APC_STATE_INDEX], 0);
+    bytes[KTHREAD_APC_STATE_INDEX] = 1;
+    refresh_thread_activation(&mut bytes, init).unwrap();
+    assert_eq!(bytes[KTHREAD_APC_STATE_INDEX], 1);
+}
+
+#[test]
 fn activation_refresh_preserves_all_bytes_except_teb_and_system_thread_bit() {
     let init = thread();
     let mut bytes = [0xa5; ETHREAD_BODY_BYTES + 16];
