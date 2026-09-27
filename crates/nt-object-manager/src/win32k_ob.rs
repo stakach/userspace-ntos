@@ -439,6 +439,17 @@ impl ObjectEntry {
         true
     }
 
+    fn transfer_pointer_to_handle(&mut self) -> bool {
+        if self.pointer_count <= self.handle_count {
+            return false;
+        }
+        let Some(handle_count) = self.handle_count.checked_add(1) else {
+            return false;
+        };
+        self.handle_count = handle_count;
+        true
+    }
+
     fn close_handle(&mut self) -> bool {
         if self.handle_count <= 1 || self.pointer_count < self.handle_count {
             return false;
@@ -646,6 +657,23 @@ impl ObHandleTable {
     pub fn duplicate_by_body(&mut self, kind: ObKind, body: u64) -> Option<u64> {
         let handle = self.handle_for_body(kind, body)?;
         self.duplicate(handle)
+    }
+
+    /// Turn a callback-owned `ObReferenceObject` pointer into a closeable alias without acquiring
+    /// another pointer reference. Failure leaves the callback reference for its caller to release.
+    pub fn transfer_reference_to_alias(&mut self, kind: ObKind, body: u64) -> Option<u64> {
+        self.handle_for_body(kind, body)?;
+        let index = self.aliases.iter().position(Option::is_none)?;
+        let canonical = self
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.kind == kind && entry.body == body)?;
+        if !canonical.transfer_pointer_to_handle() {
+            return None;
+        }
+        self.aliases[index] = Some((kind, body));
+        Some(OB_ALIAS_HANDLE_BASE + (index as u64) * 4)
     }
 
     /// Create a distinct alias for an existing win32k object.
@@ -1024,8 +1052,9 @@ impl ObHandleTable {
     }
 
     /// Admit only the exact Desktop body returned by the WindowStation parse callout. A created
-    /// body must still own its provisional reference; an opened body must already be published.
-    /// Rejection does not consume pending state, so the caller can release its creator reference.
+    /// body transfers its provisional creator reference; an opened body transfers the reference
+    /// that ReactOS takes before returning it. Rejection leaves that reference for the caller to
+    /// release, including when alias capacity is exhausted.
     pub fn admit_desktop_parse_result(
         &mut self,
         status: NtStatus,
@@ -1044,7 +1073,7 @@ impl ObHandleTable {
         if self.kind_by_body(object) != Some(ObKind::Desktop) {
             return Err(NtStatus::OBJECT_TYPE_MISMATCH);
         }
-        let Some((_, handle_count)) = self.counts_by_body(object) else {
+        let Some((pointer_count, handle_count)) = self.counts_by_body(object) else {
             return Err(NtStatus::INVALID_PARAMETER);
         };
         let handle = if created {
@@ -1053,10 +1082,11 @@ impl ObHandleTable {
             }
             self.insert_pending(object)
         } else {
-            if handle_count == 0 {
+            if handle_count == 0 || pointer_count <= handle_count {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
-            self.duplicate_by_body(ObKind::Desktop, object).unwrap_or(0)
+            self.transfer_reference_to_alias(ObKind::Desktop, object)
+                .unwrap_or(0)
         };
         if handle == 0 {
             return Err(NtStatus::INSUFFICIENT_RESOURCES);
@@ -1462,6 +1492,7 @@ mod tests {
     fn desktop_parse_existing_result_mints_alias_and_preserves_openif_status() {
         let mut t = ObHandleTable::new();
         let original = t.register(ObKind::Desktop, 0x7000);
+        assert_eq!(t.reference_by_body(0x7000), Some(2));
         let admitted = t
             .admit_desktop_parse_result(NtStatus::OBJECT_NAME_EXISTS, 0x7000, false)
             .unwrap();
@@ -1471,6 +1502,54 @@ mod tests {
         assert_eq!(t.counts_by_body(0x7000), Some((2, 2)));
         assert!(t.close(admitted.handle));
         assert_eq!(t.lookup(original), Some((ObKind::Desktop, 0x7000)));
+    }
+
+    #[test]
+    fn desktop_parse_requires_and_consumes_one_callback_pointer_reference() {
+        let mut t = ObHandleTable::new();
+        let original = t.register(ObKind::Desktop, 0x7000);
+        assert_eq!(
+            t.admit_desktop_parse_result(NtStatus::SUCCESS, 0x7000, false),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(t.reference_by_body(0x7000), Some(2));
+        let alias = t
+            .admit_desktop_parse_result(NtStatus::SUCCESS, 0x7000, false)
+            .unwrap()
+            .handle;
+        assert_eq!(t.counts_by_body(0x7000), Some((2, 2)));
+        assert_eq!(t.dereference_by_body(0x7000), None);
+        assert!(t.close(alias));
+        assert_eq!(t.lookup(original), Some((ObKind::Desktop, 0x7000)));
+        assert_eq!(t.counts_by_body(0x7000), Some((1, 1)));
+    }
+
+    #[test]
+    fn desktop_parse_alias_exhaustion_retains_callback_pointer_for_release() {
+        let mut t = ObHandleTable::new();
+        let original = t.register(ObKind::Desktop, 0x7000);
+        let mut aliases = [0; OB_ALIASES_LEN];
+        for alias in &mut aliases {
+            *alias = t.duplicate(original).unwrap();
+        }
+        assert_eq!(
+            t.reference_by_body(0x7000),
+            Some((OB_ALIASES_LEN + 2) as u32)
+        );
+        let before = t.counts_by_body(0x7000);
+        assert_eq!(
+            t.admit_desktop_parse_result(NtStatus::SUCCESS, 0x7000, false),
+            Err(NtStatus::INSUFFICIENT_RESOURCES)
+        );
+        assert_eq!(t.counts_by_body(0x7000), before);
+        assert_eq!(
+            t.dereference_by_body(0x7000),
+            Some((OB_ALIASES_LEN + 1) as u32)
+        );
+        for alias in aliases {
+            assert!(t.close(alias));
+        }
+        assert_eq!(t.counts_by_body(0x7000), Some((1, 1)));
     }
 
     #[test]
