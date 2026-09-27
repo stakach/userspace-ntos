@@ -7,6 +7,17 @@ pub const CS_GLOBALCLASS: u32 = 0x4000;
 pub const FNID_BUILTIN_FIRST: u32 = 0x02a1;
 pub const FNID_BUILTIN_LAST: u32 = 0x02aa;
 pub const CLASS_ATOM_NAME_CAP: usize = 255;
+
+pub fn register_class_tail_addresses(sp: u64) -> Option<[u64; 3]> {
+    if sp == 0 {
+        return None;
+    }
+    Some([
+        sp.checked_add(0x28)?,
+        sp.checked_add(0x30)?,
+        sp.checked_add(0x38)?,
+    ])
+}
 pub const SCROLLBAR_CLASS_NAME: [u16; 9] = [
     b'S' as u16,
     b'c' as u16,
@@ -151,6 +162,16 @@ pub fn integer_atom_name(atom: u16, out: &mut [u16]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_class_tail_requires_a_nonwrapping_stack_pointer() {
+        assert_eq!(
+            register_class_tail_addresses(0x1000),
+            Some([0x1028, 0x1030, 0x1038])
+        );
+        assert_eq!(register_class_tail_addresses(0), None);
+        assert_eq!(register_class_tail_addresses(u64::MAX - 0x30), None);
+    }
 
     fn wnd_class() -> [u8; WNDCLASSEXW_SIZE] {
         let mut raw = [0u8; WNDCLASSEXW_SIZE];
