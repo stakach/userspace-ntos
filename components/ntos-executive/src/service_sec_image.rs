@@ -13096,23 +13096,38 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     a0
                 };
+                let mut userconnect_capture_status = 0u32;
                 let (mut d_a1, blen) = if has_buf {
                     let arg = win32k_subsystem::WIN32K_ARG_VADDR;
-                    let n = a2.min(win32k_subsystem::WIN32K_ARG_GENERAL_BYTES);
+                    let n = if a2 <= win32k_subsystem::WIN32K_ARG_GENERAL_BYTES {
+                        a2
+                    } else {
+                        userconnect_capture_status = nt_process::STATUS_INVALID_PARAMETER;
+                        0
+                    };
                     core::ptr::write_bytes(
                         arg as *mut u8,
                         0,
                         win32k_subsystem::WIN32K_ARG_GENERAL_BYTES as usize,
                     );
                     let input = core::slice::from_raw_parts_mut(arg as *mut u8, n as usize);
-                    if !img_spawn::client_copyin_mapped(
-                        pi as u64,
-                        a1,
-                        input,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    ) {
+                    if userconnect_capture_status == 0
+                        && !nt_handler.capture_process_identity(pi).is_some_and(|process| {
+                            img_spawn::client_copyin_process_mapped_for(
+                                pi as u64,
+                                process,
+                                a1,
+                                input,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                                true,
+                            )
+                        })
+                    {
+                        userconnect_capture_status = nt_address_space::STATUS_ACCESS_VIOLATION;
+                    }
+                    if userconnect_capture_status != 0 {
                         let failures = USERCONNECT_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                         if failures < 8 {
                             print_str(
@@ -13123,7 +13138,9 @@ pub(crate) unsafe fn service_sec_image(
                             print_hex((a1 >> 32) as u32);
                             print_hex(a1 as u32);
                             print_str(b" bytes=");
-                            print_u64(n);
+                            print_u64(a2);
+                            print_str(b" status=0x");
+                            print_hex(userconnect_capture_status);
                             print_str(b"\n");
                         }
                     }
@@ -16072,6 +16089,8 @@ pub(crate) unsafe fn service_sec_image(
                     (0, false)
                 } else if message_output_stage_failed {
                     (0xC000_009A, true)
+                } else if userconnect_capture_status != 0 {
+                    (u64::from(userconnect_capture_status), true)
                 } else if register_window_message_probe_failed {
                     (0, true)
                 } else if let Some(handle) = session_cursor_hit {
