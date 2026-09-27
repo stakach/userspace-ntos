@@ -31,12 +31,16 @@ pub fn copy_bookkeeping(
 pub fn live_checkpoint_matches(
     current_pi: usize,
     live_pi: usize,
+    live_pid: u32,
+    stored_pid: Option<u32>,
     live_pml4: u64,
     stored_pml4: u64,
     live_generation: u64,
     stored_generation: Option<u64>,
 ) -> bool {
     current_pi == live_pi
+        && live_pid != 0
+        && stored_pid == Some(live_pid)
         && live_pml4 != 0
         && live_pml4 == stored_pml4
         && stored_generation == Some(live_generation)
@@ -104,16 +108,18 @@ mod tests {
 
     #[test]
     fn checkpoint_requires_restored_owner_and_same_address_space() {
-        assert!(live_checkpoint_matches(2, 2, 100, 100, 1, Some(1)));
-        assert!(!live_checkpoint_matches(4, 2, 100, 100, 1, Some(1)));
-        assert!(!live_checkpoint_matches(2, 2, 100, 200, 1, Some(1)));
-        assert!(!live_checkpoint_matches(2, 2, 100, 0, 1, Some(1)));
-        assert!(!live_checkpoint_matches(2, 2, 0, 0, 1, Some(1)));
+        assert!(live_checkpoint_matches(2, 2, 8, Some(8), 100, 100, 1, Some(1)));
+        assert!(!live_checkpoint_matches(4, 2, 8, Some(8), 100, 100, 1, Some(1)));
+        assert!(!live_checkpoint_matches(2, 2, 8, Some(8), 100, 200, 1, Some(1)));
+        assert!(!live_checkpoint_matches(2, 2, 8, Some(8), 100, 0, 1, Some(1)));
+        assert!(!live_checkpoint_matches(2, 2, 8, Some(8), 0, 0, 1, Some(1)));
     }
 
     #[test]
     fn recycled_capability_does_not_revive_retired_generation() {
-        assert!(!live_checkpoint_matches(2, 2, 100, 100, 1, Some(2)));
-        assert!(!live_checkpoint_matches(2, 2, 100, 100, 1, None));
+        assert!(!live_checkpoint_matches(2, 2, 8, Some(8), 100, 100, 1, Some(2)));
+        assert!(!live_checkpoint_matches(2, 2, 8, Some(8), 100, 100, 1, None));
+        assert!(!live_checkpoint_matches(2, 2, 8, Some(9), 100, 100, 1, Some(1)));
+        assert!(!live_checkpoint_matches(2, 2, 8, None, 100, 100, 1, Some(1)));
     }
 }

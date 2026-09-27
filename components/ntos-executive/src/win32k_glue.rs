@@ -2312,18 +2312,26 @@ unsafe fn trace_user_callback_stack_words(
         print_str(b" +");
         print_u64(i * 8);
         print_str(b"=");
-        match crate::img_spawn::client_read_u64_mapped(
+        let Some(process) = callback_process_identity(client.callback_client()) else {
+            print_str(b"invalid-owner");
+            continue;
+        };
+        let mut bytes = [0u8; 8];
+        match crate::img_spawn::client_copyin_process_mapped_for(
             client.pi as u64,
+            process,
             va,
+            &mut bytes,
             &[],
             0,
             client.scratch_base,
+            true,
         ) {
-            Some(value) => {
+            true => {
                 print_str(b"0x");
-                print_crash_hex64(value);
+                print_crash_hex64(u64::from_le_bytes(bytes));
             }
-            None => print_str(b"miss"),
+            false => print_str(b"miss"),
         }
     }
     print_str(b"\n");
@@ -2680,8 +2688,7 @@ unsafe fn callback_payload_result_u64(
 }
 
 unsafe fn copy_callback_result_to_shared(
-    client_pi: u32,
-    client_scratch_base: u64,
+    client: crate::spawn_hosts::UserCallbackClient,
     result_pointer: u64,
     result_length: u64,
 ) -> bool {
@@ -2694,14 +2701,30 @@ unsafe fn copy_callback_result_to_shared(
         core::ptr::addr_of_mut!((*frame).payload) as *mut u8,
         result_length as usize,
     );
-    crate::img_spawn::client_copyin_mapped(
-        client_pi as u64,
+    let Some(process) = callback_process_identity(client) else {
+        return false;
+    };
+    crate::img_spawn::client_copyin_process_mapped_for(
+        client.pi as u64,
+        process,
         result_pointer,
         output,
         &[],
         0,
-        client_scratch_base,
+        client.scratch_base,
+        true,
     )
+}
+
+fn callback_process_identity(
+    client: crate::spawn_hosts::UserCallbackClient,
+) -> Option<nt_memory_manager::ProcessIdentity> {
+    let pid = u32::try_from(client.pid).ok()?;
+    let identity = nt_memory_manager::ProcessIdentity {
+        pid,
+        generation: nt_memory_manager::ProcessGeneration::Hosted(client.generation),
+    };
+    identity.is_valid().then_some(identity)
 }
 
 unsafe fn callback_payload_write_u64(
@@ -2719,18 +2742,12 @@ unsafe fn callback_payload_write_u64(
 
 unsafe fn publish_callback_reply(
     request: nt_user_callback::CallbackHeader,
-    client_pi: u32,
-    client_scratch_base: u64,
+    client: crate::spawn_hosts::UserCallbackClient,
     result_pointer: u64,
     result_length: u64,
     callback_status: u64,
 ) -> bool {
-    if !copy_callback_result_to_shared(
-        client_pi,
-        client_scratch_base,
-        result_pointer,
-        result_length,
-    ) {
+    if !copy_callback_result_to_shared(client, result_pointer, result_length) {
         return false;
     }
     let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
@@ -4587,8 +4604,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     }
     if result_length != 0 {
         if !copy_callback_result_to_shared(
-            client_pi,
-            active_frame.client_scratch_base(),
+            completed_client,
             result_pointer,
             result_length,
         ) {
@@ -4624,25 +4640,33 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             .unwrap_or(0);
             let mut returned_result = [0u8; 8];
             let returned_read = result_length >= 0x40
-                && crate::img_spawn::client_copyin_mapped(
-                    client_pi as u64,
-                    result_pointer + 0x38,
-                    &mut returned_result,
-                    &[],
-                    0,
-                    active_frame.client_scratch_base(),
-                );
+                && callback_process_identity(completed_client).is_some_and(|process| {
+                    crate::img_spawn::client_copyin_process_mapped_for(
+                        client_pi as u64,
+                        process,
+                        result_pointer + 0x38,
+                        &mut returned_result,
+                        &[],
+                        0,
+                        active_frame.client_scratch_base(),
+                        true,
+                    )
+                });
             let mut expected_result = [0u8; 8];
             let expected_read = expected != 0
                 && request.input_length >= 0x40
-                && crate::img_spawn::client_copyin_mapped(
-                    client_pi as u64,
-                    expected + 0x38,
-                    &mut expected_result,
-                    &[],
-                    0,
-                    active_frame.client_scratch_base(),
-                );
+                && callback_process_identity(completed_client).is_some_and(|process| {
+                    crate::img_spawn::client_copyin_process_mapped_for(
+                        client_pi as u64,
+                        process,
+                        expected + 0x38,
+                        &mut expected_result,
+                        &[],
+                        0,
+                        active_frame.client_scratch_base(),
+                        true,
+                    )
+                });
             print_str(b"[callback-result] WM_NCCREATE pointer=0x");
             print_hex((result_pointer >> 32) as u32);
             print_hex(result_pointer as u32);
@@ -4743,8 +4767,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     // continuation consumes the result for THIS callback, not the last nested dispatch's header.
     if !publish_callback_reply(
         request,
-        client_pi,
-        active_frame.client_scratch_base(),
+        completed_client,
         result_pointer,
         result_length,
         callback_status,

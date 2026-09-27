@@ -22657,7 +22657,8 @@ impl ExecNtHandler {
         let Some(process) = self.capture_process_identity(self.pi) else {
             return false;
         };
-        if process.generation != nt_memory_manager::ProcessGeneration::Hosted(ctx.owner_generation) {
+        if process.pid != ctx.owner_pid
+            || process.generation != nt_memory_manager::ProcessGeneration::Hosted(ctx.owner_generation) {
             return false;
         }
         let filled_pages = &*ctx.filled_pages;
