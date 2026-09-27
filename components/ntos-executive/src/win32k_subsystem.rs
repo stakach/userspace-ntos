@@ -3615,7 +3615,7 @@ extern "win64" fn s_establish_win32_callouts(callout_data: u64) -> i32 {
 // window-station cache) live in the crate.
 use nt_object_manager::win32k_ob::{
     init_desktop_body, link_thread_to_desktop, unlink_thread_from_desktop, ObHandleTable, ObKind,
-    DESKTOP_BODY_SIZE,
+    PendingObjectRelease, DESKTOP_BODY_SIZE,
 };
 
 /// The single win32k object registry (single-threaded host; handle→(type, body) lives in the crate).
@@ -3801,6 +3801,26 @@ extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
 }
 
 extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
+    let pending = unsafe {
+        (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).release_pending_by_body(object)
+    };
+    match pending {
+        Some(PendingObjectRelease::Retained(count)) => return count as u64,
+        Some(PendingObjectRelease::Final(kind)) => unsafe {
+            let offset = match kind {
+                ObKind::Desktop => 10 * 8,
+                ObKind::WindowStation => 13 * 8,
+                ObKind::Other => panic!("pending USER object lacks a registered type delete method"),
+            };
+            let routine = read_volatile((WIN32_CALLOUTS + offset) as *const u64);
+            assert_ne!(routine, 0, "pending USER object delete method is unregistered");
+            let parameters = object;
+            let _ = call_win32k_pe(routine, &[(&parameters as *const u64) as u64]);
+            assert!(provider_pool_free(object), "pending USER object body retirement failed");
+            return 0;
+        },
+        None => {}
+    }
     if unsafe { (&*core::ptr::addr_of!(OBJ_TABLE)).counts_by_body(object) }.is_some() {
         return unsafe {
             (&mut *core::ptr::addr_of_mut!(OBJ_TABLE))
@@ -6162,12 +6182,14 @@ extern "win64" fn s_ob_create_object(
         if body == 0 {
             return STATUS_INSUFFICIENT_RESOURCES_I32;
         }
-        let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
         let kind = classify_type(obj_type).unwrap_or(ObKind::Other);
         let security = if matches!(kind, ObKind::Desktop | ObKind::WindowStation) {
             match object_attributes_security_descriptor(object_attributes) {
                 Ok(security) => security,
-                Err(status) => return status,
+                Err(status) => {
+                    assert!(provider_pool_free(body), "failed USER object capture leaked its body");
+                    return status;
+                }
             }
         } else {
             None
@@ -6177,12 +6199,16 @@ extern "win64" fn s_ob_create_object(
         let descriptor = security
             .as_ref()
             .map(CapturedUserObjectSecurityDescriptor::as_slice);
-        let latched = if uncached_winsta {
-            table.latch_pending_uncached_with_security(kind, body, descriptor)
-        } else {
-            table.latch_pending_with_security(kind, body, descriptor)
+        let latched = {
+            let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
+            if uncached_winsta {
+                table.latch_pending_uncached_with_security(kind, body, descriptor)
+            } else {
+                table.latch_pending_with_security(kind, body, descriptor)
+            }
         };
         if !latched {
+            assert!(provider_pool_free(body), "failed USER object latch leaked its body");
             return STATUS_INSUFFICIENT_RESOURCES_I32;
         }
         if !object_out.is_null() {
@@ -6204,8 +6230,17 @@ extern "win64" fn s_ob_insert_object(
     handle: *mut u64,
 ) -> i32 {
     unsafe {
-        let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
-        let Some((h, cache_window_station)) = table.insert_pending_with_cache_policy(object) else {
+        let insertion = (&mut *core::ptr::addr_of_mut!(OBJ_TABLE))
+            .insert_pending_with_cache_policy(object);
+        let Some((h, cache_window_station)) = insertion else {
+            let pending_owned = (&*core::ptr::addr_of!(OBJ_TABLE))
+                .counts_by_body(object)
+                .is_some_and(|(_, handles)| handles == 0);
+            if pending_owned {
+                // ObInsertObject consumes the creator reference even when handle publication fails.
+                s_ob_dereference_object(object);
+                return STATUS_INSUFFICIENT_RESOURCES_I32;
+            }
             return STATUS_INVALID_HANDLE_I32;
         };
         if !cache_window_station {
