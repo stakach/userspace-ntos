@@ -11,21 +11,36 @@ struct ProtectionTarget {
 
 impl ProtectionTarget {
     unsafe fn remap(&self, page: u64, old: u32, new: u32) -> Result<(), u32> {
-        let record = csrss_frame_get_exact_record(self.pi as u64, page);
+        let nt_memory_manager::MemoryLifetime::Process(process) = self.lifetime else {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        };
+        let record = nt_memory_manager::admit_resident_reprotect(
+            self.pi as u64,
+            process,
+            page,
+            &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+        )?;
         let owned = record.is_some_and(|record| record.owns_frame);
         let effective = |protection| {
             nt_address_space::resident_backing_protection(self.mapping_type, protection, owned)
         };
-        if self.mapping_type == nt_address_space::MEM_IMAGE {
-            vm_reprotect_resident_image_page(
+        if let Some(record) = record {
+            hosted_thread_memory_access(self.pi as u64, page, nt_address_space::PAGE_SIZE)?;
+            vm_reprotect_private_frame(
+                record.frame,
+                page,
+                effective(old),
+                effective(new),
+                self.pml4,
+            )
+        } else if self.mapping_type == nt_address_space::MEM_IMAGE {
+            vm_reprotect_shared_image_mapping(
                 self.pi,
                 page,
                 effective(old),
                 effective(new),
                 self.pml4,
             )
-        } else if record.is_some() {
-            vm_reprotect_private_page(self.pi, page, effective(old), effective(new), self.pml4)
         } else {
             Ok(())
         }

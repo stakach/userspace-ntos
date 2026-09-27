@@ -92,6 +92,51 @@ fn reused_pi_and_page_cannot_adopt_a_previous_process_frame() {
     );
 }
 
+#[test]
+fn resident_reprotect_refuses_foreign_generation_before_mapping_effect() {
+    let old = ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Hosted(1),
+    };
+    let new = ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Hosted(2),
+    };
+    let mut registry = ClientFrameRegistry::new();
+    registry
+        .insert(
+            7,
+            crate::MemoryLifetime::Process(old),
+            0x1000,
+            11,
+            0,
+            0,
+            0,
+            true,
+        )
+        .unwrap();
+    let mut mapping_effects = 0;
+    let result = crate::admit_resident_reprotect(7, new, 0x1000, &registry).map(|record| {
+        if record.is_some() {
+            mapping_effects += 1;
+        }
+    });
+    assert_eq!(result, Err(crate::STATUS_INVALID_HANDLE));
+    assert_eq!(mapping_effects, 0);
+    assert_eq!(registry.get(7, 0x1000).unwrap().frame, 11);
+    assert_eq!(
+        crate::admit_resident_reprotect(7, old, 0x1000, &registry)
+            .unwrap()
+            .unwrap()
+            .frame,
+        11,
+    );
+    assert_eq!(
+        crate::admit_resident_reprotect(7, new, 0x2000, &registry),
+        Ok(None)
+    );
+}
+
 fn populated() -> (ClientFrameRegistry, ClientFrameRecord) {
     let mut registry = ClientFrameRegistry::new();
     registry
