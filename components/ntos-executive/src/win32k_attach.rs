@@ -287,6 +287,9 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     }
     admit(pi, page)?;
+    let frames = &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY);
+    let resident_source =
+        nt_memory_manager::admit_client_alias_source(pi, owner.process, page, frames)?;
     if process_committed_mapping_basic_information(pi, page)
         .is_some_and(|info| info.type_ == nt_address_space::MEM_MAPPED)
     {
@@ -295,22 +298,20 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(
         let rights =
             service_sec_image::service_admit_section_alias(pi, page, write, Some(generation))?
                 .ok_or(nt_memory_manager::STATUS_NOT_MAPPED_VIEW)?;
-        let source = csrss_frame_get_exact_record(pi, page)
-            .and_then(|record| record.clone_source_cap())
-            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let source = nt_memory_manager::admit_client_alias_source(
+            pi,
+            owner.process,
+            page,
+            &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+        )?
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
         replace(pi, page, source, rights, pml4)?;
         return Ok(true);
     }
     if w32_attach_mapped(page) {
         return Ok(true);
     }
-    let source = if let Some(record) = csrss_frame_get_exact_record(pi, page) {
-        record
-            .clone_source_cap()
-            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
-    } else {
-        csrss_frame_get(pi, page)
-    };
+    let source = resident_source.unwrap_or_else(|| csrss_frame_get(pi, page));
     if source == 0 {
         return Ok(false);
     }
