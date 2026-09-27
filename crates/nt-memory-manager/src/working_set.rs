@@ -675,6 +675,20 @@ impl PagefileStore {
             .map(|record| record.page)
     }
 
+    pub fn first_for_owner_for(
+        &self,
+        owner: WorkingSetOwnerId,
+        lifetime: crate::MemoryLifetime,
+    ) -> Result<Option<PagefilePage>, u32> {
+        if !lifetime.is_valid() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        match self.first_for_owner(owner) {
+            Some(page) if page.lifetime != lifetime => Err(STATUS_INVALID_PARAMETER),
+            page => Ok(page),
+        }
+    }
+
     pub fn pages_for_owner(&self, owner: WorkingSetOwnerId) -> impl Iterator<Item = u64> + '_ {
         self.records
             .iter()

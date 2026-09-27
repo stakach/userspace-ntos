@@ -109,7 +109,9 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
                     print_str(b"\n");
                     return false;
                 }
-                if service_sec_image::service_unmap_section_view_mappings(view).is_err() {
+                if service_sec_image::service_unmap_section_view_mappings(view, self.handler)
+                    .is_err()
+                {
                     return false;
                 }
                 sections
@@ -128,10 +130,9 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
             {
                 return false;
             }
-            let _ = csrss_frame_drop_process_all(
-                pi as u64,
-                nt_memory_manager::MemoryLifetime::Process(owner.process),
-            );
+            if csrss_frame_drop_process_all(pi as u64, owner.process, self.handler).is_err() {
+                return false;
+            }
             if !client_frame_registry_process_is_empty(pi as u64) {
                 return false;
             }
@@ -149,7 +150,7 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
             }
             // Transition backing is physical ownership, not metadata cleanup. Complete it while
             // a failure can still retain the exact process and its page tables/VSpace.
-            process_working_set_retire(pi).is_ok()
+            process_working_set_retire_for(pi, owner.process, self.handler).is_ok()
         }
     }
 

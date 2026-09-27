@@ -64,6 +64,36 @@ pub(super) unsafe fn retire_owner(pi: u64) -> Result<(), u32> {
     Ok(())
 }
 
+pub(super) unsafe fn retire_owner_with_access(
+    pi: u64,
+    access: &retirement_memory_access::Access<'_>,
+) -> Result<(), u32> {
+    let process = access.expected_process().ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    let lifetime = MemoryLifetime::Process(process);
+    while let Some(page) = (&*core::ptr::addr_of!(PROCESS_PAGEFILE))
+        .first_for_owner_for(pi, lifetime)?
+    {
+        discard_with_access(pi, page.page, access)?;
+    }
+    Ok(())
+}
+
+pub(super) unsafe fn retire_owner_unpublished(
+    pi: u64,
+    lifetime: MemoryLifetime,
+) -> Result<(), u32> {
+    if !matches!(lifetime, MemoryLifetime::UnpublishedImage(token) if token != 0) {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
+    while let Some(page) = (&*core::ptr::addr_of!(PROCESS_PAGEFILE))
+        .first_for_owner_for(pi, lifetime)?
+    {
+        hosted_thread_memory_retirement_access(pi, page.page, 4096)?;
+        discard(pi, page.page)?;
+    }
+    Ok(())
+}
+
 pub(super) unsafe fn retry_pending(handler: &ExecNtHandler) {
     if (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).retiring_count() == 0 {
         return;

@@ -30181,7 +30181,7 @@ impl ExecNtHandler {
         if after.unmap_mapped(view.base).is_err() {
             return;
         }
-        if service_unmap_section_view_mappings(view).is_err() {
+        if service_unmap_section_view_mappings(view, self).is_err() {
             return;
         }
         *vm_map = *after;
@@ -36408,7 +36408,7 @@ impl ExecNtHandler {
                             return status;
                         }
                         let _ = vm_page_lock_retire_range(target_pi as u64, plan.base, plan.size);
-                        if let Err(status) = service_unmap_section_view_mappings(view) {
+                        if let Err(status) = service_unmap_section_view_mappings(view, self) {
                             return status;
                         }
                         *vm_map = *after;
