@@ -55,6 +55,7 @@ pub mod slot_recycle;
 pub mod frame_recycle;
 pub mod thread_binding;
 pub mod thread_alias_journal;
+pub mod client_alias_window;
 pub mod thread_prefetch_journal;
 pub mod thread_construction;
 pub mod thread_endpoint;
