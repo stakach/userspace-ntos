@@ -37,13 +37,14 @@ pub struct ProviderStackLaneBinding {
     pub stack_bytes: u64,
 }
 
-/// Catalog-local receipt retaining one physical stack lane across an asynchronous operation.
+/// Catalog-local receipt retaining one activation's stack frame across an asynchronous operation.
 /// Native adapters must separately retain the stack owner and authenticate the provider lifetime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use = "release the exact stack lane pin after completion or cancellation"]
 pub struct ProviderStackLanePin {
     catalog: StackCatalogIdentity,
     handle: ProviderStackLaneHandle,
+    activation: ProviderStackEventActivation,
     id: u64,
     address: u64,
     bytes: u64,
@@ -61,6 +62,7 @@ impl ProviderStackLanePin {
 
 struct ProviderStackLanePinRecord {
     handle: ProviderStackLaneHandle,
+    activation: ProviderStackEventActivation,
     id: u64,
     address: u64,
     bytes: u64,
@@ -305,8 +307,8 @@ impl ProviderStackActivationCatalog {
             .ok_or(ProviderStackActivationError::AddressOutsideLane)
     }
 
-    /// Retain the exact lane generation containing the entire nonempty target range. The
-    /// receipt fences catalog retirement, not execution-frame reuse within the live lane.
+    /// Retain the active execution frame containing the entire nonempty target range.
+    /// The receipt fences both activation completion and lane retirement.
     pub fn pin_active_range(
         &mut self,
         activation: ProviderStackEventActivation,
@@ -319,11 +321,12 @@ impl ProviderStackActivationCatalog {
         if binding.handle != activation.lane {
             return Err(ProviderStackActivationError::CrossLaneStorage);
         }
-        self.pin_range(address, bytes)
+        self.pin_range(activation, address, bytes)
     }
 
     fn pin_range(
         &mut self,
+        activation: ProviderStackEventActivation,
         address: u64,
         bytes: u64,
     ) -> Result<(ProviderStackLaneBinding, ProviderStackLanePin), ProviderStackActivationError>
@@ -338,6 +341,7 @@ impl ProviderStackActivationCatalog {
             .map_err(|_| ProviderStackActivationError::NoCapacity)?;
         self.pins.push(ProviderStackLanePinRecord {
             handle: binding.handle,
+            activation,
             id,
             address,
             bytes,
@@ -348,6 +352,7 @@ impl ProviderStackActivationCatalog {
             ProviderStackLanePin {
                 catalog: self.identity,
                 handle: binding.handle,
+                activation,
                 id,
                 address,
                 bytes,
@@ -363,13 +368,23 @@ impl ProviderStackActivationCatalog {
             || !self.pins.iter().any(|record| {
                 record.id == pin.id
                     && record.handle == pin.handle
+                    && record.activation == pin.activation
                     && record.address == pin.address
                     && record.bytes == pin.bytes
             })
         {
             return Err(ProviderStackActivationError::StalePin);
         }
-        self.binding(pin.handle)
+        let binding = self.binding(pin.handle)?;
+        if !self
+            .lane(pin.handle)?
+            .activations
+            .iter()
+            .any(|record| record.identity == pin.activation)
+        {
+            return Err(ProviderStackActivationError::StalePin);
+        }
+        Ok(binding)
     }
 
     pub fn release_pin(
@@ -574,6 +589,9 @@ impl ProviderStackActivationCatalog {
     ) -> Result<(), ProviderStackActivationError> {
         if self.activation(activation)?.irql.current() != PASSIVE_LEVEL {
             return Err(ProviderStackActivationError::UnbalancedIrql);
+        }
+        if self.pins.iter().any(|pin| pin.activation == activation) {
+            return Err(ProviderStackActivationError::LanePinned);
         }
         let lane = self.lane_mut(activation.lane)?;
         lane.activations.pop();
