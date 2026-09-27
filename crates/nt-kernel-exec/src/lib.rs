@@ -50,6 +50,7 @@ mod timer;
 pub mod timezone;
 pub mod user_class;
 pub mod user_cursor;
+pub mod user_string;
 mod work_item;
 pub mod x86_io;
 
