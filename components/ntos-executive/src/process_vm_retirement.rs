@@ -121,7 +121,7 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
             if sections.first_view_for_process(pi).is_some() {
                 return false;
             }
-            let (_, failures) = shared_image_mapping_unmap_process(pi as u64);
+            let (_, failures) = shared_image_mapping_unmap_process(pi as u64, owner.process);
             if failures != 0 || !shared_image_mapping_process_is_empty(pi) {
                 return false;
             }

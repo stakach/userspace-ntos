@@ -1651,10 +1651,20 @@ unsafe fn vm_page_lock_retire_owner(owner: u64) -> usize {
     (&mut *core::ptr::addr_of_mut!(VM_PAGE_LOCKS)).retire_owner(owner)
 }
 
-unsafe fn vm_page_is_resident(pi: usize, page: u64) -> bool {
-    page == KUSER_VA && kuser_page_alias_get(pi) != 0
-        || csrss_frame_get_exact(pi as u64, page).0 != 0
-        || shared_image_mapping_contains(pi as u64, page)
+unsafe fn vm_page_is_resident(
+    pi: usize,
+    process: nt_memory_manager::ProcessIdentity,
+    page: u64,
+) -> Result<bool, u32> {
+    let frame = nt_memory_manager::admit_resident_reprotect(
+        pi as u64,
+        process,
+        page,
+        &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+    )?;
+    Ok(page == KUSER_VA && kuser_page_alias_get(pi) != 0
+        || frame.is_some()
+        || shared_image_mapping_contains_for(pi as u64, process, page)?)
 }
 
 fn process_user_page_table_stats() -> nt_address_space::VmPageTableOwnershipStats {
@@ -8864,8 +8874,7 @@ impl SharedImageMappingCap {
 
 #[derive(Clone, Copy)]
 struct SharedImageMapping {
-    pi: u8,
-    page: u64,
+    identity: nt_memory_manager::SharedImageMappingIdentity,
     age: u64,
     cap: SharedImageMappingCap,
 }
@@ -8873,8 +8882,7 @@ struct SharedImageMapping {
 impl SharedImageMapping {
     const fn empty() -> Self {
         Self {
-            pi: 0,
-            page: 0,
+            identity: nt_memory_manager::SharedImageMappingIdentity::empty(),
             age: 0,
             cap: SharedImageMappingCap::empty(),
         }
@@ -9118,13 +9126,27 @@ unsafe fn shared_image_mapping_find(pi: u64, page: u64) -> Option<(usize, usize)
         let mut entry_index = 0usize;
         while entry_index < len {
             let mapping = chunk.entries[entry_index];
-            if mapping.pi as u64 == pi && mapping.page == page {
+            if mapping.identity.pi == pi && mapping.identity.page == page {
                 return Some((chunk_index, entry_index));
             }
             entry_index += 1;
         }
     }
     None
+}
+
+unsafe fn shared_image_mapping_find_for(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    page: u64,
+) -> Result<Option<(usize, usize)>, u32> {
+    let Some((chunk, index)) = shared_image_mapping_find(pi, page) else {
+        return Ok(None);
+    };
+    let chunks = (*core::ptr::addr_of!(SHARED_IMAGE_MAPPING_CHUNKS)).as_ref().unwrap();
+    let identity = (*chunks[chunk]).entries[index].identity;
+    identity.admit(pi, process, page)?;
+    Ok(Some((chunk, index)))
 }
 
 unsafe fn shared_image_mapping_remove_at(
@@ -9215,12 +9237,15 @@ fn print_image_map_cap_bank_top_pi() {
     }
 }
 
-unsafe fn shared_image_mapping_prepare_insert(pi: u64, page: u64, map_cap: u64) -> bool {
-    if pi > u8::MAX as u64 || map_cap == 0 {
+unsafe fn shared_image_mapping_prepare_insert(
+    identity: nt_memory_manager::SharedImageMappingIdentity,
+    map_cap: u64,
+) -> bool {
+    if identity.pi > u8::MAX as u64 || map_cap == 0 || !identity.process.is_valid() {
         SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    if shared_image_mapping_find(pi, page).is_some() {
+    if shared_image_mapping_find(identity.pi, identity.page).is_some() {
         SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -9228,8 +9253,7 @@ unsafe fn shared_image_mapping_prepare_insert(pi: u64, page: u64, map_cap: u64) 
 }
 
 unsafe fn shared_image_mapping_push_prepared(
-    pi: u64,
-    page: u64,
+    identity: nt_memory_manager::SharedImageMappingIdentity,
     cap: SharedImageMappingCap,
 ) -> bool {
     let chunks = shared_image_mapping_chunks_mut();
@@ -9254,8 +9278,7 @@ unsafe fn shared_image_mapping_push_prepared(
         return false;
     }
     chunk.entries[index] = SharedImageMapping {
-        pi: pi as u8,
-        page,
+        identity,
         age: next_working_set_age(),
         cap,
     };
@@ -9265,22 +9288,38 @@ unsafe fn shared_image_mapping_push_prepared(
     true
 }
 
-unsafe fn shared_image_mapping_put(pi: u64, page: u64, map_cap: u64) -> bool {
-    if !shared_image_mapping_prepare_insert(pi, page, map_cap) {
+unsafe fn shared_image_mapping_put(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    page: u64,
+    map_cap: u64,
+) -> bool {
+    let Ok(identity) = nt_memory_manager::SharedImageMappingIdentity::new(pi, process, page) else {
+        return false;
+    };
+    if !shared_image_mapping_prepare_insert(identity, map_cap) {
         return false;
     }
-    shared_image_mapping_push_prepared(pi, page, SharedImageMappingCap::Root(map_cap))
+    shared_image_mapping_push_prepared(identity, SharedImageMappingCap::Root(map_cap))
 }
 
-unsafe fn shared_image_mapping_put_banked(pi: u64, page: u64, map_cap: u64) -> bool {
-    if !shared_image_mapping_prepare_insert(pi, page, map_cap) {
+unsafe fn shared_image_mapping_put_banked(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    page: u64,
+    map_cap: u64,
+) -> bool {
+    let Ok(identity) = nt_memory_manager::SharedImageMappingIdentity::new(pi, process, page) else {
+        return false;
+    };
+    if !shared_image_mapping_prepare_insert(identity, map_cap) {
         return false;
     }
     let Some(cap) = image_map_cap_bank_store(pi, map_cap) else {
         SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
         return false;
     };
-    if shared_image_mapping_push_prepared(pi, page, cap) {
+    if shared_image_mapping_push_prepared(identity, cap) {
         true
     } else {
         shared_image_mapping_delete_cap(pi as u8, cap);
@@ -9288,19 +9327,36 @@ unsafe fn shared_image_mapping_put_banked(pi: u64, page: u64, map_cap: u64) -> b
     }
 }
 
-unsafe fn shared_image_mapping_replace_banked_after_map(pi: u64, page: u64, map_cap: u64) -> bool {
+unsafe fn shared_image_mapping_replace_banked_after_map(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    page: u64,
+    map_cap: u64,
+) -> bool {
     if pi > u8::MAX as u64 || map_cap == 0 {
         SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    if let Some(old_map_cap) = shared_image_mapping_take(pi, page) {
+    if shared_image_mapping_find_for(pi, process, page).is_err() {
+        SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    if let Ok(Some(old_map_cap)) = shared_image_mapping_take_for(pi, process, page) {
         let _ = cnode_delete_recycle_r(old_map_cap);
         IMAGE_MAP_CAP_REPLACEMENTS.fetch_add(1, Ordering::Relaxed);
     }
-    shared_image_mapping_put_banked(pi, page, map_cap)
+    shared_image_mapping_put_banked(pi, process, page, map_cap)
 }
 
-unsafe fn shared_image_mapping_contains(pi: u64, page: u64) -> bool {
+unsafe fn shared_image_mapping_contains_for(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    page: u64,
+) -> Result<bool, u32> {
+    shared_image_mapping_find_for(pi, process, page).map(|found| found.is_some())
+}
+
+unsafe fn shared_image_mapping_contains_pi_unchecked(pi: u64, page: u64) -> bool {
     shared_image_mapping_find(pi, page).is_some()
 }
 
@@ -9310,22 +9366,31 @@ unsafe fn shared_image_mapping_debug(pi: u64, page: u64) -> Option<SharedImageMa
     Some((*chunks[chunk]).entries[index].cap)
 }
 
-unsafe fn shared_image_mapping_take(pi: u64, page: u64) -> Option<u64> {
-    let (chunk, index) = shared_image_mapping_find(pi, page)?;
-    let chunks = (*core::ptr::addr_of_mut!(SHARED_IMAGE_MAPPING_CHUNKS)).as_mut()?;
+unsafe fn shared_image_mapping_take_for(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    page: u64,
+) -> Result<Option<u64>, u32> {
+    let Some((chunk, index)) = shared_image_mapping_find_for(pi, process, page)? else {
+        return Ok(None);
+    };
+    let chunks = (*core::ptr::addr_of_mut!(SHARED_IMAGE_MAPPING_CHUNKS)).as_mut().unwrap();
     let mapping = (*chunks[chunk]).entries[index];
     match mapping.cap {
         SharedImageMappingCap::Root(map_cap) => {
-            shared_image_mapping_remove_at(chunks, chunk, index)?;
-            Some(map_cap)
+            if shared_image_mapping_remove_at(chunks, chunk, index).is_none() {
+                return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+            }
+            Ok(Some(map_cap))
         }
         SharedImageMappingCap::Bank { cnode, slot } => {
-            let map_cap = image_map_cap_bank_take_root(mapping.pi, cnode, slot).ok()?;
+            let map_cap = image_map_cap_bank_take_root(mapping.identity.pi as u8, cnode, slot)
+                .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
             if shared_image_mapping_remove_at(chunks, chunk, index).is_none() {
                 let _ = cnode_delete_recycle_r(map_cap);
-                return None;
+                return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
             }
-            Some(map_cap)
+            Ok(Some(map_cap))
         }
     }
 }
@@ -9344,7 +9409,33 @@ unsafe fn shared_image_mapping_delete_cap(pi: u8, cap: SharedImageMappingCap) ->
     }
 }
 
-unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) -> Result<(), u32> {
+unsafe fn shared_image_mapping_validate_range_for(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    base: u64,
+    end: u64,
+) -> Result<(), u32> {
+    let Some(chunks) = (*core::ptr::addr_of!(SHARED_IMAGE_MAPPING_CHUNKS)).as_ref() else {
+        return Ok(());
+    };
+    for chunk in chunks.iter().copied() {
+        let len = shared_image_mapping_chunk_len(chunk);
+        for mapping in &(&(*chunk).entries)[..len] {
+            if mapping.identity.pi == pi && mapping.identity.page >= base && mapping.identity.page < end {
+                mapping.identity.admit(pi, process, mapping.identity.page)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+unsafe fn shared_image_mapping_unmap_range(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    base: u64,
+    end: u64,
+) -> Result<(), u32> {
+    shared_image_mapping_validate_range_for(pi, process, base, end)?;
     let Some(chunks) = (*core::ptr::addr_of_mut!(SHARED_IMAGE_MAPPING_CHUNKS)).as_mut() else {
         return Ok(());
     };
@@ -9355,13 +9446,12 @@ unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) -> Resu
             && entry_index < shared_image_mapping_chunk_len(chunks[chunk_index])
         {
             let mapping = (*chunks[chunk_index]).entries[entry_index];
-            if mapping.pi as u64 == pi && mapping.page >= base && mapping.page < end {
-                if shared_image_mapping_delete_cap(mapping.pi, mapping.cap) {
+            if mapping.identity.pi == pi && mapping.identity.page >= base && mapping.identity.page < end {
+                if shared_image_mapping_delete_cap(mapping.identity.pi as u8, mapping.cap) {
                     let removed =
                         shared_image_mapping_remove_at(chunks, chunk_index, entry_index);
                     assert!(removed.is_some_and(|removed| {
-                        removed.pi == mapping.pi
-                            && removed.page == mapping.page
+                        removed.identity == mapping.identity
                             && removed.cap == mapping.cap
                     }));
                 } else {
@@ -9376,7 +9466,10 @@ unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) -> Resu
     Ok(())
 }
 
-unsafe fn shared_image_mapping_unmap_process(pi: u64) -> (u64, u64) {
+unsafe fn shared_image_mapping_unmap_process(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+) -> (u64, u64) {
     let Some(chunks) = (*core::ptr::addr_of_mut!(SHARED_IMAGE_MAPPING_CHUNKS)).as_mut() else {
         return (0, 0);
     };
@@ -9389,13 +9482,12 @@ unsafe fn shared_image_mapping_unmap_process(pi: u64) -> (u64, u64) {
             && entry_index < shared_image_mapping_chunk_len(chunks[chunk_index])
         {
             let mapping = (*chunks[chunk_index]).entries[entry_index];
-            if mapping.pi as u64 == pi {
-                if shared_image_mapping_delete_cap(mapping.pi, mapping.cap) {
+            if mapping.identity.pi == pi && mapping.identity.process == process {
+                if shared_image_mapping_delete_cap(mapping.identity.pi as u8, mapping.cap) {
                     let removed_mapping =
                         shared_image_mapping_remove_at(chunks, chunk_index, entry_index);
                     assert!(removed_mapping.is_some_and(|removed| {
-                        removed.pi == mapping.pi
-                            && removed.page == mapping.page
+                        removed.identity == mapping.identity
                             && removed.cap == mapping.cap
                     }));
                     removed = removed.saturating_add(1);
@@ -9421,7 +9513,7 @@ unsafe fn shared_image_mapping_process_is_empty(pi: usize) -> bool {
     bank_empty && (&*core::ptr::addr_of!(SHARED_IMAGE_MAPPING_CHUNKS)).as_ref()
         .is_none_or(|chunks| chunks.iter().all(|&chunk| {
             let len = shared_image_mapping_chunk_len(chunk);
-            !(&(*chunk).entries)[..len].iter().any(|mapping| mapping.pi as usize == pi)
+            !(&(*chunk).entries)[..len].iter().any(|mapping| mapping.identity.pi as usize == pi)
         }))
 }
 
@@ -9439,17 +9531,17 @@ unsafe fn process_working_set_register(pi: usize) -> Result<(), u32> {
 
 unsafe fn process_working_set_resident_pages(
     pi: usize,
+    process: nt_memory_manager::ProcessIdentity,
 ) -> Result<Vec<nt_memory_manager::WorkingSetPage>, u32> {
     let frames = &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY);
     let mut pages = Vec::new();
     pages
         .try_reserve(frames.records().len().saturating_add(1))
         .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
-    for record in frames
-        .records()
-        .iter()
-        .filter(|record| record.pi == pi as u64)
-    {
+    for record in frames.records().iter().filter(|record| record.pi == pi as u64) {
+        if record.lifetime != nt_memory_manager::MemoryLifetime::Process(process) {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
+        }
         pages.push(nt_memory_manager::WorkingSetPage {
             page: record.page,
             age: record.age,
@@ -9462,15 +9554,16 @@ unsafe fn process_working_set_resident_pages(
             let len = shared_image_mapping_chunk_len(chunk);
             for mapping in (&(*chunk).entries)[..len]
                 .iter()
-                .filter(|mapping| mapping.pi as usize == pi)
+                .filter(|mapping| mapping.identity.pi as usize == pi)
             {
+                mapping.identity.admit(pi as u64, process, mapping.identity.page)?;
                 pages
                     .try_reserve(1)
                     .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
                 pages.push(nt_memory_manager::WorkingSetPage {
-                    page: mapping.page,
+                    page: mapping.identity.page,
                     age: mapping.age,
-                    locked: vm_page_lock_is_locked(pi as u64, mapping.page),
+                    locked: vm_page_lock_is_locked(pi as u64, mapping.identity.page),
                     evictable: true,
                 });
             }
@@ -9505,10 +9598,13 @@ unsafe fn process_working_set_pageout_mapping(
             && client_frame_cleanup::release_with_access(pi as u64, page, &access)
                 .is_ok_and(|released| released);
     }
+    if shared_image_mapping_contains_for(pi as u64, process, page).is_err() {
+        return false;
+    }
     if win32k_glue::detach_attached_client_page_with_access(pi as u64, page, &access).is_err() {
         return false;
     }
-    if let Some(map_cap) = shared_image_mapping_take(pi as u64, page) {
+    if let Ok(Some(map_cap)) = shared_image_mapping_take_for(pi as u64, process, page) {
         recycle_mapped_cap(map_cap);
         return true;
     }
@@ -12033,7 +12129,7 @@ unsafe fn finish_image_writecopy_cow_selftest(
     status: u32,
 ) {
     let mut loose_map_cap = loose_map_cap;
-    if let Some(map_cap) = shared_image_mapping_take(pi as u64, page) {
+    if let Ok(Some(map_cap)) = shared_image_mapping_take_for(pi as u64, process, page) {
         let _ = page_unmap_r(map_cap);
         let _ = cnode_delete_recycle_r(map_cap);
         if loose_map_cap == map_cap {
@@ -12046,7 +12142,7 @@ unsafe fn finish_image_writecopy_cow_selftest(
     }
     let _ = vm_unmap_private_page(pi, process, page, handler);
     let clean = csrss_frame_get_exact(pi as u64, page).0 == 0
-        && !shared_image_mapping_contains(pi as u64, page);
+        && shared_image_mapping_contains_for(pi as u64, process, page) == Ok(false);
     if source_frame != 0 {
         vm_frame_release(source_frame, 0);
     }
@@ -12087,7 +12183,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
     let mut proof = 0u64;
     let mut source_frame = 0u64;
     let mut loose_map_cap = 0u64;
-    if let Some(map_cap) = shared_image_mapping_take(pi as u64, page) {
+    if let Ok(Some(map_cap)) = shared_image_mapping_take_for(pi as u64, process, page) {
         let _ = page_unmap_r(map_cap);
         let _ = cnode_delete_recycle_r(map_cap);
     }
@@ -12207,7 +12303,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
         return;
     }
     proof |= IMAGE_WRITECOPY_COW_MAPPED_SHARED;
-    if !shared_image_mapping_put(pi as u64, page, map_cap) {
+    if !shared_image_mapping_put(pi as u64, process, page, map_cap) {
         finish_image_writecopy_cow_selftest(
             handler,
             process,
@@ -12251,7 +12347,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
     };
     if record.owns_frame
         && record.frame != source_frame
-        && !shared_image_mapping_contains(pi as u64, page)
+        && shared_image_mapping_contains_for(pi as u64, process, page) == Ok(false)
     {
         proof |= IMAGE_WRITECOPY_COW_PROMOTED;
     }
@@ -12730,26 +12826,28 @@ unsafe fn vm_unmap_shared_image_mapping_range(
         VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
+    shared_image_mapping_validate_range_for(pi as u64, process, base, end)?;
     let mut page = base;
     while page < end {
         vm_unmap_private_page(pi, process, page, handler)?;
         page += 0x1000;
     }
-    shared_image_mapping_unmap_range(pi as u64, base, end)
+    shared_image_mapping_unmap_range(pi as u64, process, base, end)
 }
 
 unsafe fn vm_reprotect_shared_image_mapping(
     pi: usize,
+    process: nt_memory_manager::ProcessIdentity,
     page: u64,
     old_protection: u32,
     new_protection: u32,
     pml4: u64,
 ) -> Result<(), u32> {
     hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
-    if !shared_image_mapping_contains(pi as u64, page) {
+    if !shared_image_mapping_contains_for(pi as u64, process, page)? {
         return Ok(());
     }
-    let Some(map_cap) = shared_image_mapping_take(pi as u64, page) else {
+    let Some(map_cap) = shared_image_mapping_take_for(pi as u64, process, page)? else {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     };
     let new_rights = vm_page_rights(new_protection);
@@ -12761,7 +12859,7 @@ unsafe fn vm_reprotect_shared_image_mapping(
     let old_rights = vm_page_rights(old_protection);
     let _ = page_unmap_r(map_cap);
     if page_map_r(map_cap, page, new_rights, pml4) == 0 {
-        if !shared_image_mapping_put(pi as u64, page, map_cap) {
+        if !shared_image_mapping_put(pi as u64, process, page, map_cap) {
             let _ = page_unmap_r(map_cap);
             let _ = cnode_delete_recycle_r(map_cap);
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
@@ -12774,7 +12872,7 @@ unsafe fn vm_reprotect_shared_image_mapping(
             "failed to restore shared image protection"
         );
         assert!(
-            shared_image_mapping_put(pi as u64, page, map_cap),
+            shared_image_mapping_put(pi as u64, process, page, map_cap),
             "failed to restore shared image mapping identity"
         );
         Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
@@ -12848,8 +12946,11 @@ unsafe fn vm_promote_image_cow_page(
                 );
             }
             OldImageMapping::Shared => {
+                let nt_memory_manager::MemoryLifetime::Process(process) = lifetime else {
+                    panic!("shared image restore requires a process lifetime");
+                };
                 assert!(
-                    shared_image_mapping_put(pi as u64, page, old_map_cap),
+                    shared_image_mapping_put(pi as u64, process, page, old_map_cap),
                     "failed to restore pre-COW shared image identity"
                 );
             }
@@ -12882,7 +12983,7 @@ unsafe fn vm_promote_image_cow_page(
         } else {
             record.frame
         }
-    } else if let Some(map_cap) = shared_image_mapping_take(pi as u64, page) {
+    } else if let Some(map_cap) = shared_image_mapping_take_for(pi as u64, process, page)? {
         shared_source_cap = map_cap;
         map_cap
     } else {
@@ -12892,7 +12993,7 @@ unsafe fn vm_promote_image_cow_page(
         Ok(frame) => frame,
         Err(status) => {
             if shared_source_cap != 0 {
-                let _ = shared_image_mapping_put(pi as u64, page, shared_source_cap);
+                let _ = shared_image_mapping_put(pi as u64, process, page, shared_source_cap);
             }
             return Err(status);
         }
@@ -12900,7 +13001,7 @@ unsafe fn vm_promote_image_cow_page(
     if let Err(status) = vm_copy_frame_4k(source_cap, new_frame, scratch_base) {
         vm_frame_release(new_frame, 0);
         if shared_source_cap != 0 {
-            let _ = shared_image_mapping_put(pi as u64, page, shared_source_cap);
+            let _ = shared_image_mapping_put(pi as u64, process, page, shared_source_cap);
         }
         return Err(status);
     }
@@ -13199,10 +13300,10 @@ unsafe fn vm_reprotect_resident_image_page(
             pml4,
         );
     }
-    if !shared_image_mapping_contains(pi as u64, page) {
+    if !shared_image_mapping_contains_for(pi as u64, process, page)? {
         return Ok(());
     }
-    vm_reprotect_shared_image_mapping(pi, page, old_protection, new_protection, pml4)
+    vm_reprotect_shared_image_mapping(pi, process, page, old_protection, new_protection, pml4)
 }
 
 unsafe fn copy_cap(src: u64) -> u64 {
