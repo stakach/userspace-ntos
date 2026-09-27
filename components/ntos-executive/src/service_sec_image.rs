@@ -6807,7 +6807,9 @@ struct CapturedStringArg {
 /// Returns the ARG-frame VA of the captured descriptor, or `sp_va` UNCHANGED when capture is
 /// impossible. Even `Length == 0` atom/resource forms are staged: win32k still probes the descriptor
 /// before interpreting `Buffer` as the atom. For nonzero strings, both descriptor and bytes are copied
-/// unconditionally when readable. Falling back to the original pointer keeps this strictly fail-safe.
+/// unconditionally when readable. Legacy callers leave the original pointer for the provider's
+/// own probe when capture fails; exact-witness callers use `try_capture_client_string_arg_for`
+/// and fail the request before provider dispatch instead.
 unsafe fn capture_client_string_arg(
     pi: u64,
     sp_va: u64,
@@ -6830,11 +6832,60 @@ unsafe fn try_capture_client_string_arg(
     nfilled: usize,
     scratch_base: u64,
 ) -> Option<CapturedStringArg> {
+    try_capture_client_string_arg_impl(
+        pi, None, sp_va, large, capture_empty_buffer, filled_pages, nfilled, scratch_base,
+    )
+}
+
+unsafe fn try_capture_client_string_arg_for(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    sp_va: u64,
+    large: bool,
+    capture_empty_buffer: bool,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<CapturedStringArg> {
+    try_capture_client_string_arg_impl(
+        pi, Some(process), sp_va, large, capture_empty_buffer, filled_pages, nfilled, scratch_base,
+    )
+}
+
+unsafe fn copy_client_string_bytes(
+    pi: u64,
+    process: Option<nt_memory_manager::ProcessIdentity>,
+    va: u64,
+    dst: &mut [u8],
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> bool {
+    match process {
+        Some(process) => img_spawn::client_copyin_process_mapped_for(
+            pi, process, va, dst, filled_pages, nfilled, scratch_base, true,
+        ),
+        None => img_spawn::client_copyin_mapped(
+            pi, va, dst, filled_pages, nfilled, scratch_base,
+        ),
+    }
+}
+
+unsafe fn try_capture_client_string_arg_impl(
+    pi: u64,
+    process: Option<nt_memory_manager::ProcessIdentity>,
+    sp_va: u64,
+    large: bool,
+    capture_empty_buffer: bool,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<CapturedStringArg> {
     if sp_va == 0 {
         return None;
     }
     let mut sd = [0u8; 16];
-    if !img_spawn::client_copyin_mapped(pi, sp_va, &mut sd, filled_pages, nfilled, scratch_base) {
+    if !copy_client_string_bytes(pi, process, sp_va, &mut sd, filled_pages, nfilled, scratch_base) {
         return None;
     }
     let (length, maximum, ansi) = if large {
@@ -6869,8 +6920,9 @@ unsafe fn try_capture_client_string_arg(
     let captured_buffer = if stage_buffer {
         let mut chars = [0u8; RC_ARG_BUF_CAP as usize];
         if length != 0
-            && !img_spawn::client_copyin_mapped(
+            && !copy_client_string_bytes(
                 pi,
+                process,
                 buffer,
                 &mut chars[..length as usize],
                 filled_pages,
@@ -13235,6 +13287,7 @@ pub(crate) unsafe fn service_sec_image(
                 let mut get_class_info_probe_failed = false;
                 let mut def_set_text_probe_failed = false;
                 let mut find_cursor_icon_probe_failed = false;
+                let mut register_window_message_probe_failed = false;
                 let mut set_cursor_icon_data_probe_failed = false;
                 if m0 == 0x103d {
                     // NtUserFindExistingCursorIcon probes two client UNICODE_STRING descriptors and
@@ -13328,16 +13381,20 @@ pub(crate) unsafe fn service_sec_image(
                     // captures it before adding the atom; isolated win32k needs the same cross-VSpace
                     // capture or shell message registration can fault on a foreign user pointer while
                     // inside an explorer callback.
-                    let captured = capture_client_string_arg(
-                        pi as u64,
-                        d_a0,
-                        false,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    );
-                    if captured != d_a0 {
-                        d_a0 = captured;
+                    let capture = nt_handler.capture_process_identity(pi).and_then(|process| {
+                        try_capture_client_string_arg_for(
+                            pi as u64,
+                            process,
+                            d_a0,
+                            false,
+                            false,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        )
+                    });
+                    if let Some(capture) = capture {
+                        d_a0 = capture.desc;
                         if explorer_gui_client {
                             if EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES
                                 .fetch_add(1, Ordering::Relaxed)
@@ -13348,6 +13405,8 @@ pub(crate) unsafe fn service_sec_image(
                                 );
                             }
                         }
+                    } else {
+                        register_window_message_probe_failed = true;
                     }
                 } else if m0 == 0x101b && sp != 0 {
                     // NtUserBuildHwndList writes both the needed count and the HWND array through
@@ -16005,6 +16064,8 @@ pub(crate) unsafe fn service_sec_image(
                     (0, false)
                 } else if message_output_stage_failed {
                     (0xC000_009A, true)
+                } else if register_window_message_probe_failed {
+                    (0, true)
                 } else if let Some(handle) = session_cursor_hit {
                     (handle as u64, true)
                 } else if let Some(atom) = session_builtin_class_atom {
