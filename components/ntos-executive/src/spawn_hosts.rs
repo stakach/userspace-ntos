@@ -2476,6 +2476,18 @@ unsafe fn component_pump_loop(
                 msg = pump_recv(ch, *reply_cap);
             }
             continue;
+        } else if label == crate::win32k_subsystem::W32_FILE_QUERY_DELIVERED_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let status = if shared_pump::authenticated_badge(ch, msg.badge) {
+                crate::service_sec_image::service_win32k_file_query_delivered(
+                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, [msg.m2, msg.m3],
+                )
+            } else {
+                nt_process::STATUS_INVALID_PARAMETER as i32
+            };
+            pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+            continue;
         } else if label == crate::win32k_subsystem::W32_FILE_CANCEL_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {

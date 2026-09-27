@@ -1188,6 +1188,7 @@ pub const W32_FILE_CREATE_LABEL: u64 = 0x791;
 pub const W32_FILE_QUERY_LABEL: u64 = 0x792;
 pub const W32_FILE_OBJECT_LABEL: u64 = 0x793;
 pub const W32_FILE_CANCEL_LABEL: u64 = 0x794;
+pub const W32_FILE_QUERY_DELIVERED_LABEL: u64 = 0x795;
 pub const W32_FILE_OBJECT_REFERENCE_HANDLE: u64 = 1;
 pub const W32_FILE_OBJECT_REFERENCE_POINTER: u64 = 2;
 pub const W32_FILE_OBJECT_DEREFERENCE_POINTER: u64 = 3;
@@ -1509,6 +1510,17 @@ pub(crate) unsafe fn publish_provider_pool_packet(
     }
     core::ptr::copy_nonoverlapping(bytes.as_ptr(), lease.pointer as *mut u8, bytes.len());
     true
+}
+
+pub(crate) unsafe fn provider_pool_packet_lease_live(lease: ProviderPoolPacketLease) -> bool {
+    if registered_provider_wait_domain() != Some(lease.provider) {
+        return false;
+    }
+    let Some(_guard) = provider_pool_lock() else { return false };
+    let offset = lease.pointer - WIN32K_POOL_VADDR;
+    let memory = ProviderPoolMemory;
+    shared_pool::allocation_identity(&memory, offset) == Ok(lease.allocation)
+        && matches!(shared_pool::allocation_capacity(&memory, offset), Ok(capacity) if capacity >= lease.length as u64)
 }
 
 unsafe fn provider_pool_validate_owned(objects: &[(u64, u64)]) -> bool {
@@ -14379,6 +14391,7 @@ fn register_trampolines() -> bool {
     reg.bind("ZwOpenFile", file_open::open as *const () as usize as u64);
     reg.bind("ZwCreateFile", file_open::create as *const () as usize as u64);
     reg.bind("ZwQueryInformationFile", file_query::query_information as *const () as usize as u64);
+    reg.bind("ZwQueryDirectoryFile", file_query::query_directory as *const () as usize as u64);
     reg.bind("ZwCancelIoFile", file_cancel::cancel_io_file as *const () as usize as u64);
     reg.bind("ZwQueryObject", file_object_query::query_object as *const () as usize as u64);
     reg.bind("ZwOpenKey", s_zw_open_key as usize as u64);
