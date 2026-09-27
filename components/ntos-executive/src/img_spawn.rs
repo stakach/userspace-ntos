@@ -906,20 +906,30 @@ pub(crate) unsafe fn spawn_sec_image(
     trace_spawn_phase(pi, b"begin");
     crate::temporary_frame_alias::drain()
         .expect("process-slot reuse requires completed temporary-frame alias retirement");
-    // A hosted slot can first carry an unpublished diagnostic image and later a real process. End
-    // that old address-space lifetime before any new paging structure is installed; published
-    // process teardown uses the commitment-aware reclaim path instead.
-    process_working_set_retire(pi as usize)
-        .expect("process-slot reuse requires completed transition backing retirement");
-    let stale_page_tables = reclaim_unpublished_process_page_tables(pi as usize);
-    process_committed_mapping_reset(pi as usize);
-    if stale_page_tables != 0 {
-        print_str(b"[spawn-vspace] reclaimed unpublished page tables pi=");
-        print_u64(pi);
-        print_str(b" count=");
-        print_u64(stale_page_tables);
-        print_str(b"\n");
-    }
+    nt_memory_manager::admit_empty_process_slot(
+        pi,
+        &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+        &*core::ptr::addr_of!(PROCESS_PAGEFILE),
+    )
+    .expect("SEC_IMAGE spawn requires completed prior frame and pagefile retirement");
+    assert!(
+        client_frame_registry_process_is_empty(pi)
+            && client_copyin_frame_process_is_empty(pi)
+            && shared_image_mapping_process_is_empty(pi as usize)
+            && kuser_page_alias_get(pi as usize) == 0
+            && (&*core::ptr::addr_of!(PROCESS_USER_PAGE_TABLES))
+                .first_for_process(pi)
+                .is_none()
+            && !(&*core::ptr::addr_of!(VM_PAGE_LOCKS)).has_owner(pi)
+            && (&*core::ptr::addr_of!(PROCESS_WORKING_SETS))
+                .limits(pi)
+                .is_none()
+            && process_committed_mapping_table(pi as usize)
+                .is_some_and(|table| table.range_count() == 0)
+            && process_vm_region_map(pi as usize)
+                .is_some_and(|map| map.extent_count() == 0),
+        "SEC_IMAGE spawn requires an empty process slot before VSpace allocation"
+    );
     let pml4 = alloc_slot();
     spawn_paging_retype(pml4, OBJ_X86_PML4, b"secimage-pml4");
     // ★ Give the VSpace a real ASID BEFORE anything is mapped into it. Without one, seL4's
@@ -929,22 +939,6 @@ pub(crate) unsafe fn spawn_sec_image(
     checked_spawn_asid(pml4);
     trace_spawn_phase(pi, b"vspace");
     let main_image_size = image_extent(pe);
-    let mut dropped_image_frames =
-        csrss_frame_drop_process_range(pi, PE_LOAD_BASE, main_image_size);
-    if let Some((ntdll_base, ntdll_pe)) = ntdll {
-        dropped_image_frames = dropped_image_frames.saturating_add(csrss_frame_drop_process_range(
-            pi,
-            ntdll_base,
-            image_extent(ntdll_pe),
-        ));
-    }
-    if dropped_image_frames != 0 {
-        print_str(b"[frame-reg] dropped stale SEC_IMAGE frames pi=");
-        print_u64(pi);
-        print_str(b" count=");
-        print_u64(dropped_image_frames);
-        print_str(b"\n");
-    }
     let pdpt = alloc_slot();
     spawn_paging_retype(pdpt, OBJ_X86_PDPT, b"image-pdpt");
     let pd = alloc_slot();

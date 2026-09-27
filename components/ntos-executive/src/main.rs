@@ -8513,39 +8513,6 @@ unsafe fn csrss_frame_reclaim_exact(pi: u64, page: u64) -> bool {
     client_frame_cleanup::release(pi, page).is_ok()
 }
 
-pub(crate) unsafe fn csrss_frame_drop_process_range(pi: u64, base: u64, size: u64) -> u64 {
-    if size == 0 {
-        return 0;
-    }
-    let start = base & !0xfff;
-    let end = base.saturating_add(size.saturating_sub(1)) & !0xfff;
-    let mut page = start;
-    let mut dropped = 0u64;
-    loop {
-        if vm_page_lock_is_locked(pi, page) {
-            VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
-        } else {
-            if process_pagefile_discard(pi, page).is_err() {
-                break;
-            }
-            if csrss_frame_get_exact_record(pi, page).is_some()
-                && csrss_frame_reclaim_exact(pi, page)
-            {
-                dropped = dropped.saturating_add(1);
-            }
-        }
-        if page >= end {
-            break;
-        }
-        let next = page.saturating_add(0x1000);
-        if next <= page {
-            break;
-        }
-        page = next;
-    }
-    dropped
-}
-
 pub(crate) unsafe fn csrss_frame_drop_process_all(
     pi: u64,
     process: nt_memory_manager::ProcessIdentity,

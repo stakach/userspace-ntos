@@ -2308,12 +2308,17 @@ fn page_lock_table_retires_explicit_ranges_and_processes() {
     let mut locks = VmPageLockTable::new();
     locks.lock_range(10, three, MAP_PROCESS).unwrap();
     locks.lock_range(11, three, MAP_SYSTEM).unwrap();
+    assert!(locks.has_owner(10));
+    assert!(locks.has_owner(11));
+    assert!(!locks.has_owner(12));
 
     assert_eq!(locks.retire_range(10, 0x5000, 0x1000), 1);
     assert!(locks.is_locked(10, 0x4000));
     assert!(!locks.is_locked(10, 0x5000));
     assert!(locks.is_locked(10, 0x6000));
     assert_eq!(locks.retire_owner(10), 2);
+    assert!(!locks.has_owner(10));
+    assert!(locks.has_owner(11));
     assert_eq!(locks.retire_owner(10), 0);
     assert_eq!(locks.stats().pages, 3);
     assert_eq!(locks.retire_owner(11), 3);
