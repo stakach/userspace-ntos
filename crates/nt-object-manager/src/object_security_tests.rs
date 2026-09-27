@@ -333,6 +333,52 @@ fn pending_body_exposes_kind_and_security_before_handle_publication() {
 }
 
 #[test]
+fn assigned_pending_desktop_security_survives_handle_publication() {
+    let mut table = ObHandleTable::new();
+    table.latch_pending(ObKind::Desktop, 0x7000);
+    assert!(table.set_security_descriptor_by_body(0x7000, ObKind::Desktop, &[1, 2, 3]));
+    assert_eq!(
+        table.security_descriptor_by_body(0x7000),
+        Some((ObKind::Desktop, Some([1, 2, 3].as_slice())))
+    );
+    let handle = table.insert_pending(0x7000);
+    assert_ne!(handle, 0);
+    assert_eq!(
+        table.security_descriptor(handle),
+        Some([1, 2, 3].as_slice())
+    );
+}
+
+#[test]
+fn body_security_assignment_rejects_wrong_kind_ambiguity_and_oversize_atomically() {
+    let mut table = ObHandleTable::new();
+    table.latch_pending(ObKind::Desktop, 0x7000);
+    assert!(table.set_security_descriptor_by_body(0x7000, ObKind::Desktop, &[1, 2]));
+    let oversized = [3; crate::win32k_ob::OB_SECURITY_DESCRIPTOR_MAX + 1];
+    for (body, kind, descriptor) in [
+        (0, ObKind::Desktop, &[3][..]),
+        (0x7000, ObKind::WindowStation, &[3][..]),
+        (0x8000, ObKind::Desktop, &[3][..]),
+        (0x7000, ObKind::Desktop, oversized.as_slice()),
+    ] {
+        assert!(!table.set_security_descriptor_by_body(body, kind, descriptor));
+        assert_eq!(
+            table.security_descriptor_by_body(0x7000),
+            Some((ObKind::Desktop, Some([1, 2].as_slice())))
+        );
+    }
+
+    table.register(ObKind::Desktop, 0x7000);
+    assert!(!table.set_security_descriptor_by_body(0x7000, ObKind::Desktop, &[4]));
+    table.latch_pending(ObKind::Other, 0x9000);
+    let handle = table.insert_pending(0x9000);
+    assert_ne!(handle, 0);
+    assert!(table.set_security_descriptor_by_body(0x7000, ObKind::Desktop, &[4]));
+    table.register(ObKind::WindowStation, 0x7000);
+    assert!(!table.set_security_descriptor_by_body(0x7000, ObKind::Desktop, &[4]));
+}
+
+#[test]
 fn aliases_resolve_only_one_canonical_body_and_observe_security_replacement() {
     let mut table = ObHandleTable::new();
     let handle = table.register(ObKind::Desktop, 0x7000);
