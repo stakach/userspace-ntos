@@ -6172,18 +6172,19 @@ extern "win64" fn s_ob_create_object(
         } else {
             None
         };
-        if !table.latch_pending_with_security(
-            kind,
-            body,
-            security
-                .as_ref()
-                .map(CapturedUserObjectSecurityDescriptor::as_slice),
-        ) {
-            return STATUS_INSUFFICIENT_RESOURCES_I32;
-        }
         let uncached_winsta = kind == ObKind::WindowStation
             && object_attributes_name_contains_ascii(object_attributes, b"service-");
-        WIN32K_PENDING_OB_UNCACHED_WINSTA.store(uncached_winsta as u64, Ordering::Relaxed);
+        let descriptor = security
+            .as_ref()
+            .map(CapturedUserObjectSecurityDescriptor::as_slice);
+        let latched = if uncached_winsta {
+            table.latch_pending_uncached_with_security(kind, body, descriptor)
+        } else {
+            table.latch_pending_with_security(kind, body, descriptor)
+        };
+        if !latched {
+            return STATUS_INSUFFICIENT_RESOURCES_I32;
+        }
         if !object_out.is_null() {
             write_unaligned(object_out, body);
         }
@@ -6204,13 +6205,10 @@ extern "win64" fn s_ob_insert_object(
 ) -> i32 {
     unsafe {
         let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
-        let uncached_winsta = WIN32K_PENDING_OB_UNCACHED_WINSTA.swap(0, Ordering::Relaxed) != 0;
-        let h = if uncached_winsta {
-            table.insert_pending_uncached(object)
-        } else {
-            table.insert_pending(object)
+        let Some((h, cache_window_station)) = table.insert_pending_with_cache_policy(object) else {
+            return STATUS_INVALID_HANDLE_I32;
         };
-        if uncached_winsta {
+        if !cache_window_station {
             record_service_window_station(h);
         }
         if !handle.is_null() {
@@ -8579,7 +8577,6 @@ static WIN32K_CLIENT_PEB_INSTALLS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_WALL_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_TOKEN_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_PRIMARY_TOKEN_REFERENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
-static WIN32K_PENDING_OB_UNCACHED_WINSTA: AtomicU64 = AtomicU64::new(0);
 const WIN32K_SERVICE_WINSTA_INITIAL_CAP: u64 = 4;
 static WIN32K_SERVICE_WINSTA_RECORDS_PTR: AtomicU64 = AtomicU64::new(0);
 static WIN32K_SERVICE_WINSTA_RECORDS_LEN: AtomicU64 = AtomicU64::new(0);

@@ -331,6 +331,9 @@ pub const DESKTOPINFO_SIZE: u64 = 0x120;
 
 /// Number of live win32k objects the table can hold. Slot 0 is reserved (handle 0 == `NULL`).
 pub const OB_TABLE_LEN: usize = 32;
+/// Maximum objects created but not yet inserted. Each pending body retains its own security and
+/// window-station cache policy across nested object-manager callouts.
+pub const OB_PENDING_LEN: usize = OB_TABLE_LEN;
 
 /// Number of externally visible aliases created by `NtDuplicateObject` for USER objects.
 pub const OB_ALIASES_LEN: usize = 32;
@@ -354,6 +357,12 @@ struct ObjectEntry {
     handle_count: u32,
     security_len: usize,
     security: [u8; OB_SECURITY_DESCRIPTOR_MAX],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PendingObjectEntry {
+    entry: ObjectEntry,
+    cache_window_station: bool,
 }
 
 impl ObjectEntry {
@@ -383,10 +392,6 @@ impl ObjectEntry {
 
     fn pair(self) -> (ObKind, u64) {
         (self.kind, self.body)
-    }
-
-    fn set_body(&mut self, body: u64) {
-        self.body = body;
     }
 
     fn reference(&mut self) -> Option<u32> {
@@ -475,13 +480,12 @@ impl NamedDesktopEntry {
 ///
 /// Canonical handles are `OB_HANDLE_BASE + idx * 4`; aliases have their own bounded range. The
 /// low two tag bits remain clear, and native ProcessManager handles cannot share these values.
-/// Single-threaded host: a plain struct suffices.
+/// The provider synchronizes access; callbacks must not retain a table borrow across reentry.
 pub struct ObHandleTable {
     slots: [Option<ObjectEntry>; OB_TABLE_LEN],
     next: usize,
-    /// Latches `ObCreateObject`'s body, type, and captured security descriptor so the following
-    /// `ObInsertObject` can register it under a fresh handle.
-    pending: Option<ObjectEntry>,
+    /// Created objects are keyed by exact body until `ObInsertObject` consumes that body.
+    pending: [Option<PendingObjectEntry>; OB_PENDING_LEN],
     /// The one input window station once created; a later `ObOpenObjectByName(WINSTA)` OPENs it
     /// (returns this handle) instead of reporting NOT_FOUND (which would create a duplicate).
     winsta_handle: u64,
@@ -527,7 +531,7 @@ impl ObHandleTable {
         Self {
             slots: [None; OB_TABLE_LEN],
             next: 1,
-            pending: None,
+            pending: [None; OB_PENDING_LEN],
             winsta_handle: 0,
             winsta_body: 0,
             aliases: [None; OB_ALIASES_LEN],
@@ -813,7 +817,7 @@ impl ObHandleTable {
             .slots
             .iter()
             .flatten()
-            .chain(self.pending.iter())
+            .chain(self.pending.iter().flatten().map(|pending| &pending.entry))
             .filter(|entry| entry.body == body);
         let entry = entries.next()?;
         if entries.next().is_some() {
@@ -852,15 +856,21 @@ impl ObHandleTable {
                 }
             }
         }
-        let pending_matches = self
-            .pending
-            .as_ref()
-            .is_some_and(|entry| entry.body == body);
-        if pending_matches && match_slot.is_some() {
+        let mut match_pending = None;
+        for (index, pending) in self.pending.iter().enumerate() {
+            if pending.is_some_and(|pending| pending.entry.body == body) {
+                if match_pending.replace(index).is_some() {
+                    return false;
+                }
+            }
+        }
+        if match_pending.is_some() && match_slot.is_some() {
             return false;
         }
-        let entry = if pending_matches {
-            self.pending.as_mut()
+        let entry = if let Some(index) = match_pending {
+            self.pending[index]
+                .as_mut()
+                .map(|pending| &mut pending.entry)
         } else {
             match_slot.and_then(|index| self.slots[index].as_mut())
         };
@@ -868,8 +878,8 @@ impl ObHandleTable {
     }
 
     /// Latch a (kind, body) from `ObCreateObject` for the following `ObInsertObject`.
-    pub fn latch_pending(&mut self, kind: ObKind, body: u64) {
-        self.pending = Some(ObjectEntry::new(kind, body));
+    pub fn latch_pending(&mut self, kind: ObKind, body: u64) -> bool {
+        self.latch_pending_with_security(kind, body, None)
     }
 
     /// Latch a (kind, body, security descriptor) from `ObCreateObject` for the following
@@ -880,34 +890,79 @@ impl ObHandleTable {
         body: u64,
         descriptor: Option<&[u8]>,
     ) -> bool {
+        self.latch_pending_inner(kind, body, descriptor, true)
+    }
+
+    /// A service window station must not replace the cached interactive station when inserted.
+    pub fn latch_pending_uncached_with_security(
+        &mut self,
+        kind: ObKind,
+        body: u64,
+        descriptor: Option<&[u8]>,
+    ) -> bool {
+        self.latch_pending_inner(kind, body, descriptor, false)
+    }
+
+    fn latch_pending_inner(
+        &mut self,
+        kind: ObKind,
+        body: u64,
+        descriptor: Option<&[u8]>,
+        cache_window_station: bool,
+    ) -> bool {
+        if body == 0
+            || self.slots.iter().flatten().any(|entry| entry.body == body)
+            || self
+                .pending
+                .iter()
+                .flatten()
+                .any(|pending| pending.entry.body == body)
+        {
+            return false;
+        }
         let Some(entry) = ObjectEntry::with_security(kind, body, descriptor) else {
             return false;
         };
-        self.pending = Some(entry);
+        let Some(slot) = self.pending.iter_mut().find(|slot| slot.is_none()) else {
+            return false;
+        };
+        *slot = Some(PendingObjectEntry {
+            entry,
+            cache_window_station,
+        });
         true
     }
 
-    fn insert_pending_inner(&mut self, object: u64, cache_window_station: bool) -> u64 {
-        let entry = match self.pending.take() {
-            Some(mut entry) => {
-                entry.set_body(object);
-                entry
-            }
-            None => ObjectEntry::new(ObKind::Other, object),
-        };
-        self.register_entry(entry, cache_window_station)
-    }
-
-    /// Register the latched object under a fresh handle (`ObInsertObject`). Uses the kind latched by
-    /// [`latch_pending`](Self::latch_pending), defaulting to [`ObKind::Other`] if none was latched,
-    /// clears the latch, and returns the new handle.
+    /// Insert only the exact body previously created. Failure leaves unrelated pending objects
+    /// untouched, including when the handle table is full.
     pub fn insert_pending(&mut self, object: u64) -> u64 {
-        self.insert_pending_inner(object, true)
+        self.insert_pending_with_cache_policy(object)
+            .map_or(0, |(handle, _)| handle)
     }
 
-    /// Register the latched object without replacing the cached input window station.
-    pub fn insert_pending_uncached(&mut self, object: u64) -> u64 {
-        self.insert_pending_inner(object, false)
+    /// Return the inserted handle and whether it may replace the cached input station.
+    pub fn insert_pending_with_cache_policy(&mut self, object: u64) -> Option<(u64, bool)> {
+        if object == 0
+            || self
+                .slots
+                .iter()
+                .flatten()
+                .any(|entry| entry.body == object)
+            || (self.next >= OB_TABLE_LEN
+                && (1..self.next).all(|index| self.slots[index].is_some()))
+        {
+            return None;
+        }
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| pending.is_some_and(|pending| pending.entry.body == object))
+        else {
+            return None;
+        };
+        let pending = self.pending[index].take().unwrap();
+        let handle = self.register_entry(pending.entry, pending.cache_window_station);
+        (handle != 0).then_some((handle, pending.cache_window_station))
     }
 
     /// The cached input window-station handle (0 if none has been created yet).
@@ -1232,12 +1287,76 @@ mod tests {
     fn create_then_insert_latches_the_type() {
         let mut t = ObHandleTable::new();
         // ObCreateObject(WINDOWSTATION) → latch, then ObInsertObject(body) → register.
-        t.latch_pending(ObKind::WindowStation, 0x7700_0000);
+        assert!(t.latch_pending(ObKind::WindowStation, 0x7700_0000));
         let h = t.insert_pending(0x7700_0000);
         assert_eq!(t.lookup(h), Some((ObKind::WindowStation, 0x7700_0000)));
-        // The latch is consumed; a bare insert with no latch defaults to Other.
+        // An unowned insertion cannot manufacture an object or a handle.
         let h2 = t.insert_pending(0x8800_0000);
-        assert_eq!(t.lookup(h2), Some((ObKind::Other, 0x8800_0000)));
+        assert_eq!(h2, 0);
+        assert_eq!(t.insert_pending(0x7700_0000), 0);
+    }
+
+    #[test]
+    fn nested_pending_objects_insert_by_exact_body_out_of_order() {
+        let mut t = ObHandleTable::new();
+        assert!(t.latch_pending(ObKind::WindowStation, 0x7700));
+        assert!(t.latch_pending_with_security(ObKind::Desktop, 0x8800, Some(&[1, 2])));
+        assert_eq!(t.insert_pending(0x9900), 0);
+        let desktop = t.insert_pending(0x8800);
+        assert_eq!(t.lookup(desktop), Some((ObKind::Desktop, 0x8800)));
+        assert_eq!(t.security_descriptor(desktop), Some([1, 2].as_slice()));
+        let station = t.insert_pending(0x7700);
+        assert_eq!(t.lookup(station), Some((ObKind::WindowStation, 0x7700)));
+        assert_eq!(t.insert_pending(0x8800), 0);
+    }
+
+    #[test]
+    fn pending_window_station_cache_policy_follows_its_body() {
+        let mut t = ObHandleTable::new();
+        assert!(t.latch_pending(ObKind::WindowStation, 0x7700));
+        assert!(t.latch_pending_uncached_with_security(ObKind::WindowStation, 0x8800, None));
+        let (service, service_cached) = t.insert_pending_with_cache_policy(0x8800).unwrap();
+        assert!(!service_cached);
+        assert_eq!(t.cached_winsta_handle(), 0);
+        let (input, input_cached) = t.insert_pending_with_cache_policy(0x7700).unwrap();
+        assert!(input_cached);
+        assert_ne!(input, service);
+        assert_eq!(t.cached_winsta_handle(), input);
+    }
+
+    #[test]
+    fn pending_create_rejects_duplicate_and_capacity_without_displacing_owners() {
+        let mut t = ObHandleTable::new();
+        for index in 0..OB_PENDING_LEN {
+            assert!(t.latch_pending(ObKind::Desktop, 0x1000 + index as u64));
+        }
+        assert!(!t.latch_pending(ObKind::Desktop, 0x1000));
+        assert!(!t.latch_pending(ObKind::Desktop, 0x2000));
+        assert_ne!(t.insert_pending(0x1000), 0);
+        assert!(t.latch_pending(ObKind::Desktop, 0x2000));
+        assert_ne!(t.insert_pending(0x2000), 0);
+    }
+
+    #[test]
+    fn failed_pending_promotion_retains_exact_body_and_security() {
+        let mut t = ObHandleTable::new();
+        assert!(t.latch_pending_with_security(ObKind::Desktop, 0x7000, Some(&[1, 2])));
+        let duplicate = t.register(ObKind::WindowStation, 0x7000);
+        assert_ne!(duplicate, 0);
+        assert_eq!(t.insert_pending(0x7000), 0);
+        assert_eq!(t.lookup(duplicate), Some((ObKind::WindowStation, 0x7000)));
+        assert_eq!(t.security_descriptor_by_body(0x7000), None);
+
+        let mut full = ObHandleTable::new();
+        assert!(full.latch_pending_with_security(ObKind::Desktop, 0x9000, Some(&[3, 4])));
+        for index in 1..OB_TABLE_LEN {
+            assert_ne!(full.register(ObKind::Other, index as u64), 0);
+        }
+        assert_eq!(full.insert_pending(0x9000), 0);
+        assert_eq!(
+            full.security_descriptor_by_body(0x9000),
+            Some((ObKind::Desktop, Some([3, 4].as_slice())))
+        );
     }
 
     #[test]
