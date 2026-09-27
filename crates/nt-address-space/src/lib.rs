@@ -1014,6 +1014,10 @@ impl VmPageLockTable {
         self.classes_at(owner, page) != 0
     }
 
+    pub fn has_owner(&self, owner: u64) -> bool {
+        self.locks.iter().any(|lock| lock.owner == owner)
+    }
+
     pub fn retire_range(&mut self, owner: u64, base: u64, size: u64) -> usize {
         let Some(end) = base.checked_add(size) else {
             return 0;

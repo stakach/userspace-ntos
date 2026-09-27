@@ -24,6 +24,8 @@ pub use nt_types::{ProcessGeneration, ProcessIdentity};
 mod client_frame;
 mod memory_lifetime;
 pub use memory_lifetime::MemoryLifetime;
+mod process_slot_reuse;
+pub use process_slot_reuse::{admit_empty_process_slot, ProcessSlotBlocker};
 pub mod alias_transition;
 pub mod frame_acquisition;
 mod commit;
