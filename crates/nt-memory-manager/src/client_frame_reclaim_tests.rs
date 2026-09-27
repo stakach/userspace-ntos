@@ -1,3 +1,8 @@
+const MEMORY_PROCESS: crate::MemoryLifetime =
+    crate::MemoryLifetime::Process(crate::ProcessIdentity {
+        pid: 1,
+        generation: crate::ProcessGeneration::Hosted(1),
+    });
 use super::*;
 use alloc::{vec, vec::Vec};
 
@@ -45,7 +50,7 @@ impl ClientFrameReclaimIo for Io {
 fn fixture(owned: bool) -> (ClientFrameRegistry, ClientFrameRecord) {
     let mut registry = ClientFrameRegistry::new();
     registry
-        .insert_at_age(7, 0x1000, 11, 0x2000, 12, 13, owned, 40)
+        .insert_at_age(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 12, 13, owned, 40)
         .unwrap();
     let row = registry.get(7, 0x1000).unwrap();
     (registry, row)
@@ -138,6 +143,7 @@ fn equal_cap_roles_are_normalized_and_canonical_owned_frame_is_never_deleted() {
                 registry
                     .insert(
                         7,
+                        MEMORY_PROCESS,
                         0x1000,
                         11,
                         if alias == 0 { 0 } else { 0x2000 },
@@ -191,7 +197,7 @@ fn equal_cap_roles_are_normalized_and_canonical_owned_frame_is_never_deleted() {
 fn equal_deleted_roles_remain_grouped_through_recycle_failure() {
     let mut registry = ClientFrameRegistry::new();
     registry
-        .insert(7, 0x1000, 11, 0x2000, 11, 11, false)
+        .insert(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 11, 11, false)
         .unwrap();
     let start = registry
         .begin_reclaim_exact(registry.get(7, 0x1000).unwrap(), RELEASE)
@@ -461,7 +467,7 @@ fn stale_rows_cannot_cleanup_convert_or_publish_replacement_owners() {
     let (mut registry, old) = fixture(true);
     registry.take_exact(old).unwrap();
     registry
-        .insert_at_age(7, 0x1000, 11, 0x2000, 12, 13, true, 40)
+        .insert_at_age(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 12, 13, true, 40)
         .unwrap();
     let current = registry.get(7, 0x1000).unwrap();
     let mut io = Io::default();
@@ -567,7 +573,9 @@ fn terminal_memory_exclusions_are_half_open_process_exact_and_overflow_safe() {
 #[test]
 fn mixed_transfer_and_reclaim_counts_survive_partial_row_removal() {
     let (mut registry, initial) = fixture(true);
-    registry.insert(7, 0x3000, 21, 0, 0, 0, true).unwrap();
+    registry
+        .insert(7, MEMORY_PROCESS, 0x3000, 21, 0, 0, 0, true)
+        .unwrap();
     let other = registry.get(7, 0x3000).unwrap();
     let transfer = registry.prepare_transfer_exact(&[other]).unwrap();
     let start = registry.begin_reclaim_exact(initial, RELEASE).unwrap();
@@ -591,7 +599,9 @@ fn mixed_transfer_and_reclaim_counts_survive_partial_row_removal() {
 #[test]
 fn malformed_terminal_page_bounds_fail_closed_for_the_owning_process() {
     let mut registry = ClientFrameRegistry::new();
-    registry.insert(7, u64::MAX, 11, 0, 0, 0, true).unwrap();
+    registry
+        .insert(7, MEMORY_PROCESS, u64::MAX, 11, 0, 0, 0, true)
+        .unwrap();
     let row = registry.get(7, u64::MAX).unwrap();
     registry.begin_reclaim_exact(row, RELEASE).unwrap();
     assert!(!registry.memory_available(7, 0x1000, 1));
@@ -603,7 +613,7 @@ fn explicit_backing_can_be_frame_alias_or_source_without_deleting_the_canonical_
     for backing in [11, 12, 13] {
         let mut registry = ClientFrameRegistry::new();
         registry
-            .insert_with_backing(7, 0x1000, 11, 0x2000, 12, 13, true, backing)
+            .insert_with_backing(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 12, 13, true, backing)
             .unwrap();
         let start = registry
             .begin_reclaim_exact(registry.get(7, 0x1000).unwrap(), PAGEOUT)
@@ -639,7 +649,7 @@ fn explicit_backing_can_be_frame_alias_or_source_without_deleting_the_canonical_
 fn source_alias_backing_is_kept_through_copied_frame_delete_and_recycle_failure() {
     let mut registry = ClientFrameRegistry::new();
     registry
-        .insert_with_backing(7, 0x1000, 11, 0x2000, 12, 12, true, 12)
+        .insert_with_backing(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 12, 12, true, 12)
         .unwrap();
     let start = registry
         .begin_reclaim_exact(registry.get(7, 0x1000).unwrap(), RELEASE)
@@ -678,22 +688,32 @@ fn invalid_or_conflicting_backing_provenance_cannot_partially_publish_a_record()
     let mut registry = ClientFrameRegistry::new();
     for (owns, backing) in [(true, 0), (false, 12), (true, 14)] {
         assert_eq!(
-            registry.insert_with_backing(7, 0x1000, 11, 0x2000, 12, 13, owns, backing),
+            registry.insert_with_backing(
+                7,
+                MEMORY_PROCESS,
+                0x1000,
+                11,
+                0x2000,
+                12,
+                13,
+                owns,
+                backing
+            ),
             Err(crate::ClientFrameInsertError::InvalidRecord)
         );
         assert!(registry.records().is_empty());
     }
     registry
-        .insert_at_age_with_backing(7, 0x1000, 11, 0x2000, 12, 13, true, 40, 12)
+        .insert_at_age_with_backing(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 12, 13, true, 40, 12)
         .unwrap();
     let before = registry.get(7, 0x1000).unwrap();
     assert_eq!(
-        registry.insert_at_age_with_backing(7, 0x1000, 11, 0, 0, 0, true, 999, 11),
+        registry.insert_at_age_with_backing(7, MEMORY_PROCESS, 0x1000, 11, 0, 0, 0, true, 999, 11),
         Err(crate::ClientFrameInsertError::ConflictingOwnership)
     );
     assert_eq!(registry.get(7, 0x1000), Some(before));
     assert_eq!(
-        registry.insert_at_age_with_backing(7, 0x1000, 11, 0, 0, 0, true, 40, 12),
+        registry.insert_at_age_with_backing(7, MEMORY_PROCESS, 0x1000, 11, 0, 0, 0, true, 40, 12),
         Ok(crate::ClientFrameInsert::Updated)
     );
     assert_eq!(registry.get(7, 0x1000), Some(before));

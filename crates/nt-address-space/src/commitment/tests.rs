@@ -1,3 +1,8 @@
+const MEMORY_PROCESS: nt_memory_manager::MemoryLifetime =
+    nt_memory_manager::MemoryLifetime::Process(nt_memory_manager::ProcessIdentity {
+        pid: 1,
+        generation: nt_memory_manager::ProcessGeneration::Hosted(1),
+    });
 use super::*;
 use nt_memory_manager::{
     private_backing_pages, ClientFrameRegistry, PagefilePage, PagefileStore, ProcessCommitLedger,
@@ -122,14 +127,21 @@ fn actual_owner_union_survives_pageout_failed_restore_and_unmap() {
     let mut mapping = table(PAGE_WRITECOPY, MEM_IMAGE);
     let mut frames = ClientFrameRegistry::new();
     let mut pages = PagefileStore::new();
-    frames.insert(1, 0x1000, 42, 0, 0, 0, true).unwrap();
-    frames.insert(2, 0x2000, 43, 0, 0, 0, true).unwrap();
-    frames.insert(1, 0x3000, 44, 0, 0, 0, false).unwrap();
+    frames
+        .insert(1, MEMORY_PROCESS, 0x1000, 42, 0, 0, 0, true)
+        .unwrap();
+    frames
+        .insert(2, MEMORY_PROCESS, 0x2000, 43, 0, 0, 0, true)
+        .unwrap();
+    frames
+        .insert(1, MEMORY_PROCESS, 0x3000, 44, 0, 0, 0, false)
+        .unwrap();
     assert_eq!(charge(&mapping, &frames, &pages), 0x4000);
     mapping.protect(0x1000, 0x4000, PAGE_READONLY).unwrap();
     assert_eq!(charge(&mapping, &frames, &pages), PAGE_SIZE);
     let publish = pages
         .prepare_publish(PagefilePage {
+            lifetime: MEMORY_PROCESS,
             owner: 1,
             page: 0x1000,
             protection: PAGE_READONLY,
@@ -144,7 +156,7 @@ fn actual_owner_union_survives_pageout_failed_restore_and_unmap() {
     assert_eq!(charge(&mapping, &frames, &pages), PAGE_SIZE);
     let transition = pages.take(1, 0x1000).unwrap().unwrap();
     frames
-        .insert(1, 0x1000, transition.backing, 0, 0, 0, true)
+        .insert(1, MEMORY_PROCESS, 0x1000, transition.backing, 0, 0, 0, true)
         .unwrap();
     assert_eq!(charge(&mapping, &frames, &pages), PAGE_SIZE);
     let release = mapping.allocation_process_commit_bytes_with_private_pages(
@@ -168,7 +180,9 @@ fn direct_writable_image_admission_precedes_ownership_and_can_fail_cleanly() {
     let bytes = private_backing_admission_bytes(info, false);
     let prepared = ledger.prepare_charge(1, bytes).unwrap();
     assert_eq!(charge(&mapping, &frames, &pages), 0);
-    frames.insert(1, 0x1000, 42, 0, 0, 0, true).unwrap();
+    frames
+        .insert(1, MEMORY_PROCESS, 0x1000, 42, 0, 0, 0, true)
+        .unwrap();
     ledger.commit_charge(prepared).unwrap();
     assert_eq!(charge(&mapping, &frames, &pages), PAGE_SIZE);
     assert_eq!(

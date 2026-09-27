@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 nt-cache-manager = { workspace = true }
+nt-types = { workspace = true }
 
 [dev-dependencies]
 nt-fs = { workspace = true }

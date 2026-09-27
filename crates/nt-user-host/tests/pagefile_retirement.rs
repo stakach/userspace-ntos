@@ -75,6 +75,12 @@ fn transition_backing_failure_retains_process_roots_until_checked_pool_publicati
     let mut store = nt_memory_manager::PagefileStore::new();
     let publish = store
         .prepare_publish(nt_memory_manager::PagefilePage {
+            lifetime: nt_memory_manager::MemoryLifetime::Process(
+                nt_memory_manager::ProcessIdentity {
+                    pid: 1,
+                    generation: nt_memory_manager::ProcessGeneration::Hosted(1),
+                },
+            ),
             owner: 7,
             page: 0x1000,
             protection: 4,

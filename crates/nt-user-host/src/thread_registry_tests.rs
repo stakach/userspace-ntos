@@ -1,3 +1,8 @@
+const MEMORY_PROCESS: nt_memory_manager::MemoryLifetime =
+    nt_memory_manager::MemoryLifetime::Process(nt_memory_manager::ProcessIdentity {
+        pid: 1,
+        generation: nt_memory_manager::ProcessGeneration::Hosted(1),
+    });
 use super::*;
 use crate::thread_resources::ThreadMemoryLayout;
 use crate::thread_rollback::{
@@ -29,11 +34,12 @@ fn main_transport_transfer_leaves_private_stack_in_registry() {
     assert_eq!(registered.pages().collect::<Vec<_>>(), [0x13000, 0x14000]);
     let mut registry = ClientFrameRegistry::new();
     registry
-        .insert(27, 0x10000, 11, 0x100000, 12, 10, true)
+        .insert(27, MEMORY_PROCESS, 0x10000, 11, 0x100000, 12, 10, true)
         .unwrap();
     registry
         .insert(
             27,
+            MEMORY_PROCESS,
             0x13000,
             main.teb_target,
             0x101000,
@@ -45,6 +51,7 @@ fn main_transport_transfer_leaves_private_stack_in_registry() {
     registry
         .insert(
             27,
+            MEMORY_PROCESS,
             0x14000,
             main.teb2_target,
             0x102000,
@@ -89,10 +96,10 @@ fn partial_teb_alias_inventory_survives_exact_registry_publication() {
     let before = ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[]).unwrap();
     assert_eq!(before.rollback_resources().len(), 10);
     registry
-        .insert(27, 0x13000, 31, 0x100000, 33, 34, true)
+        .insert(27, MEMORY_PROCESS, 0x13000, 31, 0x100000, 33, 34, true)
         .unwrap();
     registry
-        .insert(27, 0x14000, 41, 0x101000, 43, 44, true)
+        .insert(27, MEMORY_PROCESS, 0x14000, 41, 0x101000, 43, 44, true)
         .unwrap();
     // Registry insertion acknowledges ownership of these two copies per page.
     resources.teb_local_mirror = 0;
@@ -122,7 +129,9 @@ fn unpublished_teb_caps_cannot_be_shared_with_an_unselected_registry_row() {
         resources.teb2_local_mirror = 43;
         resources.teb2_local_source = 44;
         let mut registry = ClientFrameRegistry::new();
-        registry.insert(28, 0x20000, 100, 0, 0, cap, false).unwrap();
+        registry
+            .insert(28, MEMORY_PROCESS, 0x20000, 100, 0, 0, cap, false)
+            .unwrap();
         assert!(
             matches!(ThreadRegistrySnapshot::capture(&resources, &registry, &[]),
             Err(ThreadRegistryError::SharedCapability { cap: found }) if found == cap)
@@ -166,7 +175,7 @@ fn partial_capture_merges_only_constructed_backing_and_exact_registered_aliases(
     resources.ipc_owner = 60;
     let mut registry = ClientFrameRegistry::new();
     registry
-        .insert(27, 0x10000, 11, 0x100000, 12, 13, true)
+        .insert(27, MEMORY_PROCESS, 0x10000, 11, 0x100000, 12, 13, true)
         .unwrap();
     let snapshot =
         ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[0x10000]).unwrap();
@@ -223,7 +232,9 @@ fn partial_capture_checks_unbuilt_geometry_for_unexpected_rows() {
     let mut resources = partial();
     resources.stack_owner[0] = 10;
     let mut registry = ClientFrameRegistry::new();
-    registry.insert(27, 0x14000, 40, 0, 0, 40, true).unwrap();
+    registry
+        .insert(27, MEMORY_PROCESS, 0x14000, 40, 0, 0, 40, true)
+        .unwrap();
     assert!(matches!(
         ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[]),
         Err(ThreadRegistryError::UnexpectedRecord { page: 0x14000 })
@@ -243,7 +254,9 @@ fn partial_snapshot_rejects_later_construction_or_new_aliases_before_transfer() 
         Err(ThreadRegistryError::StaleResources)
     );
     resources.teb_owner = 0;
-    registry.insert(27, 0x14000, 40, 0, 0, 40, true).unwrap();
+    registry
+        .insert(27, MEMORY_PROCESS, 0x14000, 40, 0, 0, 40, true)
+        .unwrap();
     assert!(matches!(
         snapshot.prepare_transfer(&resources, &mut registry),
         Err(ThreadRegistryError::UnexpectedRecord { page: 0x14000 })
@@ -257,7 +270,7 @@ fn partial_inventory_rejects_capabilities_shared_by_foreign_registry_rows() {
     resources.stack_target[0] = 11;
     let mut registry = ClientFrameRegistry::new();
     registry
-        .insert(28, 0x80000, 100, 0x90000, 11, 100, false)
+        .insert(28, MEMORY_PROCESS, 0x80000, 100, 0x90000, 11, 100, false)
         .unwrap();
     assert!(matches!(
         ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[]),
@@ -294,7 +307,16 @@ fn registry(pi: usize) -> ClientFrameRegistry {
         (0x14000, 41, 43, 44),
     ] {
         registry
-            .insert(pi as u64, page, frame, page + 0x100000, alias, source, true)
+            .insert(
+                pi as u64,
+                MEMORY_PROCESS,
+                page,
+                frame,
+                page + 0x100000,
+                alias,
+                source,
+                true,
+            )
             .unwrap();
     }
     registry
@@ -342,7 +364,7 @@ fn owner_and_target_representations_use_runtime_authority_not_registry_flags() {
         let mut registry = registry(27);
         registry.take(27, 0x13000).unwrap();
         registry
-            .insert(27, 0x13000, 30, 0, 0, 30, owns_frame)
+            .insert(27, MEMORY_PROCESS, 0x13000, 30, 0, 0, 30, owns_frame)
             .unwrap();
         let snapshot = ThreadRegistrySnapshot::capture(&resources, &registry, &REGISTERED).unwrap();
         assert_eq!(
@@ -370,7 +392,9 @@ fn same_page_dormant_and_duplicate_registry_aliases_are_retained_once() {
     let resources = resources(27);
     let mut registry = registry(27);
     registry.take(27, 0x13000).unwrap();
-    registry.insert(27, 0x13000, 31, 0, 33, 33, true).unwrap();
+    registry
+        .insert(27, MEMORY_PROCESS, 0x13000, 31, 0, 33, 33, true)
+        .unwrap();
     let snapshot = ThreadRegistrySnapshot::capture(&resources, &registry, &REGISTERED).unwrap();
     assert_eq!(
         snapshot
@@ -425,7 +449,9 @@ fn arbitrary_backing_pages_can_be_explicitly_registered_without_role_policy() {
     let mut registry = ClientFrameRegistry::new();
     let mut pages = Vec::new();
     for (page, owner, _) in resources.backing_pages() {
-        registry.insert(0, page, owner, 0, 0, owner, false).unwrap();
+        registry
+            .insert(0, MEMORY_PROCESS, page, owner, 0, 0, owner, false)
+            .unwrap();
         pages.push(page);
     }
     pages.reverse();
@@ -448,7 +474,9 @@ fn empty_coverage_is_revalidated_before_reporting_no_registry_transfer() {
     let resources = resources(27);
     let mut registry = ClientFrameRegistry::new();
     let snapshot = ThreadRegistrySnapshot::capture(&resources, &registry, &[]).unwrap();
-    registry.insert(27, 0x13000, 31, 0, 0, 0, true).unwrap();
+    registry
+        .insert(27, MEMORY_PROCESS, 0x13000, 31, 0, 0, 0, true)
+        .unwrap();
     let before = registry.records().to_vec();
     assert!(matches!(
         snapshot.prepare_transfer(&resources, &mut registry),
@@ -507,7 +535,9 @@ fn registry_frame_must_match_the_pages_owner_or_target_not_an_arbitrary_copy() {
     for wrong in [32, 99, 40] {
         let mut registry = registry(27);
         registry.take(27, 0x13000).unwrap();
-        registry.insert(27, 0x13000, wrong, 0, 0, 0, true).unwrap();
+        registry
+            .insert(27, MEMORY_PROCESS, 0x13000, wrong, 0, 0, 0, true)
+            .unwrap();
         assert!(matches!(
             ThreadRegistrySnapshot::capture(&resources, &registry, &REGISTERED),
             Err(ThreadRegistryError::WrongFrame { page: 0x13000 })
@@ -520,7 +550,9 @@ fn every_unselected_geometry_page_and_overlapping_unaligned_row_is_checked() {
     let resources = resources(27);
     for page in [0x12000, 0x15000, 0x16000, 0x10001] {
         let mut registry = registry(27);
-        registry.insert(27, page, 99, 0, 0, 0, true).unwrap();
+        registry
+            .insert(27, MEMORY_PROCESS, page, 99, 0, 0, 0, true)
+            .unwrap();
         assert!(matches!(
             ThreadRegistrySnapshot::capture(&resources, &registry, &REGISTERED),
             Err(ThreadRegistryError::UnexpectedRecord { .. })
@@ -534,7 +566,9 @@ fn cross_page_capability_reuse_is_rejected_even_for_the_same_capability_kind() {
     for cap in [10, 11, 12, 20, 40, 41, 43, 50, 51, 60, 70, 71] {
         let mut registry = registry(27);
         registry.take(27, 0x13000).unwrap();
-        registry.insert(27, 0x13000, 31, 0, cap, cap, true).unwrap();
+        registry
+            .insert(27, MEMORY_PROCESS, 0x13000, 31, 0, cap, cap, true)
+            .unwrap();
         assert!(matches!(
             ThreadRegistrySnapshot::capture(&resources, &registry, &REGISTERED),
             Err(ThreadRegistryError::Resources(
@@ -554,7 +588,16 @@ fn unselected_registry_rows_must_not_share_any_captured_capability() {
                 let mut caps = [101, 102, 103];
                 caps[field] = cap;
                 registry
-                    .insert(pi, 0x90000, caps[0], 0, caps[1], caps[2], false)
+                    .insert(
+                        pi,
+                        MEMORY_PROCESS,
+                        0x90000,
+                        caps[0],
+                        0,
+                        caps[1],
+                        caps[2],
+                        false,
+                    )
                     .unwrap();
                 assert!(
                     matches!(ThreadRegistrySnapshot::capture(&resources, &registry, &REGISTERED), Err(ThreadRegistryError::SharedCapability { cap: found }) if found == cap)
@@ -575,7 +618,9 @@ fn reclaiming_or_already_transferred_records_cannot_be_captured() {
         Err(ThreadRegistryError::UnavailableRecord { page: 0x13000 })
     ));
     registry.finish_transfer(transfer).unwrap();
-    registry.insert(27, 0x13000, 31, 0, 0, 0, true).unwrap();
+    registry
+        .insert(27, MEMORY_PROCESS, 0x13000, 31, 0, 0, 0, true)
+        .unwrap();
     let row = registry.get(27, 0x13000).unwrap();
     registry
         .begin_reclaim_exact(row, nt_memory_manager::ClientFrameReclaimIntent::Release)
@@ -601,6 +646,7 @@ fn exact_record_replacement_and_resource_changes_invalidate_capture() {
     registry
         .insert_at_age(
             old.pi,
+            MEMORY_PROCESS,
             old.page,
             old.frame,
             old.alias,
@@ -623,7 +669,9 @@ fn newly_present_unselected_pages_prevent_handoff_without_claiming_selected_rows
     let resources = resources(27);
     let mut registry = registry(27);
     let snapshot = ThreadRegistrySnapshot::capture(&resources, &registry, &REGISTERED).unwrap();
-    registry.insert(27, 0x12000, 60, 0, 0, 0, true).unwrap();
+    registry
+        .insert(27, MEMORY_PROCESS, 0x12000, 60, 0, 0, 0, true)
+        .unwrap();
     let before = registry.records().to_vec();
     assert!(matches!(
         snapshot.prepare_transfer(&resources, &mut registry),
@@ -637,13 +685,17 @@ fn newly_shared_caps_prevent_handoff_but_unrelated_registry_growth_does_not() {
     let resources = resources(27);
     let mut registry = registry(27);
     let snapshot = ThreadRegistrySnapshot::capture(&resources, &registry, &REGISTERED).unwrap();
-    registry.insert(28, 0x90000, 100, 0, 0, 34, false).unwrap();
+    registry
+        .insert(28, MEMORY_PROCESS, 0x90000, 100, 0, 0, 34, false)
+        .unwrap();
     assert!(matches!(
         snapshot.prepare_transfer(&resources, &mut registry),
         Err(ThreadRegistryError::SharedCapability { cap: 34 })
     ));
     registry.take(28, 0x90000).unwrap();
-    registry.insert(28, 0x90000, 100, 0, 0, 101, false).unwrap();
+    registry
+        .insert(28, MEMORY_PROCESS, 0x90000, 100, 0, 0, 101, false)
+        .unwrap();
     let transfer = snapshot
         .prepare_transfer(&resources, &mut registry)
         .unwrap()

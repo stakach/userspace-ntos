@@ -19,8 +19,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use nt_cache_manager::{CachedStreamBacking, SharedCacheMap};
+pub use nt_types::{ProcessGeneration, ProcessIdentity};
 
 mod client_frame;
+mod memory_lifetime;
+pub use memory_lifetime::MemoryLifetime;
 pub mod alias_transition;
 pub mod frame_acquisition;
 mod commit;

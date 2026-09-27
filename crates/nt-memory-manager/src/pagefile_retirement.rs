@@ -44,6 +44,23 @@ pub trait PagefileRetirementIo {
 }
 
 impl PagefileStore {
+    pub fn begin_retirement_for(
+        &mut self,
+        owner: WorkingSetOwnerId,
+        lifetime: crate::MemoryLifetime,
+        page: u64,
+    ) -> Result<Option<PagefileRetirement>, u32> {
+        if !lifetime.is_valid() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        match self.index_for(owner, page) {
+            Some(index) if self.records[index].page.lifetime != lifetime => {
+                Err(STATUS_INVALID_PARAMETER)
+            }
+            _ => self.begin_retirement(owner, page),
+        }
+    }
+
     pub fn begin_retirement(
         &mut self,
         owner: WorkingSetOwnerId,

@@ -17,6 +17,7 @@ extern crate alloc;
 mod object;
 #[cfg(feature = "alloc")]
 mod path;
+mod process_identity;
 
 #[cfg(feature = "alloc")]
 pub use object::ObjectAttributes;
@@ -25,6 +26,7 @@ pub use object::{
 };
 #[cfg(feature = "alloc")]
 pub use path::{join_object_directory_name_into, NtPath, UnicodeString};
+pub use process_identity::{ProcessGeneration, ProcessIdentity};
 
 bitflags::bitflags! {
     /// A Windows access mask. The named bits are the standard + generic rights

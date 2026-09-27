@@ -1,3 +1,8 @@
+const MEMORY_PROCESS: nt_memory_manager::MemoryLifetime =
+    nt_memory_manager::MemoryLifetime::Process(nt_memory_manager::ProcessIdentity {
+        pid: 1,
+        generation: nt_memory_manager::ProcessGeneration::Hosted(1),
+    });
 use super::*;
 use nt_memory_manager::{
     ClientFrameRegistry, GenericSectionBacking, PendingSectionFrames, SectionRetirementIo,
@@ -180,7 +185,9 @@ fn registry_owner_survives_publication_failure_with_unmap_acknowledged() {
     let mut pool = RecycledFramePool::new();
     assert!(pool.reserve(1));
     let mut registry = ClientFrameRegistry::new();
-    registry.insert(2, 0x1000, 70, 0, 0, 0, true).unwrap();
+    registry
+        .insert(2, MEMORY_PROCESS, 0x1000, 70, 0, 0, 0, true)
+        .unwrap();
     storage.view().check_reserved(70, &pool).unwrap();
     let record = registry.get(2, 0x1000).unwrap();
     let record = registry.begin_reclaim_exact(record, intent).unwrap();
