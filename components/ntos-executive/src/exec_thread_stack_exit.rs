@@ -84,9 +84,7 @@ impl ExecNtHandler {
         let mut page = plan.base;
         while page < end {
             // A reserved page may still have a retained transition or failed backing operation.
-            if !vm_unmap_private_page(runtime.pi, page) {
-                return Err(STATUS_INSUFFICIENT_RESOURCES);
-            }
+            vm_unmap_private_page(runtime.pi, runtime.process, page, self)?;
             page += nt_address_space::PAGE_SIZE;
         }
         self.release_process_commit(runtime.process.pid, released_commit);

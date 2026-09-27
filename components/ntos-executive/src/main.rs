@@ -8509,10 +8509,6 @@ unsafe fn csrss_frame_take_for(
         .map(|record| (record.frame, record.alias_cap, record.source_cap, record.owns_frame))
 }
 
-unsafe fn csrss_frame_reclaim_exact(pi: u64, page: u64) -> bool {
-    client_frame_cleanup::release(pi, page).is_ok()
-}
-
 pub(crate) unsafe fn csrss_frame_drop_process_all(
     pi: u64,
     process: nt_memory_manager::ProcessIdentity,
@@ -9360,7 +9356,6 @@ unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) -> Resu
         {
             let mapping = (*chunks[chunk_index]).entries[entry_index];
             if mapping.pi as u64 == pi && mapping.page >= base && mapping.page < end {
-                process_pagefile_discard(pi, mapping.page)?;
                 if shared_image_mapping_delete_cap(mapping.pi, mapping.cap) {
                     let removed =
                         shared_image_mapping_remove_at(chunks, chunk_index, entry_index);
@@ -9544,10 +9539,6 @@ unsafe fn process_working_set_clear_metadata(pi: usize) {
     assert!((&*core::ptr::addr_of!(PROCESS_PAGEFILE)).first_for_owner(pi as u64).is_none(),
         "working-set metadata cannot forget retained transition backing");
     let _ = (&mut *core::ptr::addr_of_mut!(PROCESS_WORKING_SETS)).unregister(pi as u64);
-}
-
-unsafe fn process_pagefile_discard(pi: u64, page: u64) -> Result<(), u32> {
-    pagefile_retirement::discard(pi, page)
 }
 
 mod client_prefetch;
@@ -11262,6 +11253,7 @@ pub(crate) unsafe fn private_vm_unmap_selftest(
     if pml4 == 0 || scratch_base == 0 {
         return;
     }
+    let Some(process) = handler.capture_process_identity(pi) else { return; };
     let page = PRIVATE_VM_LIMIT - 0x1000;
     let mut proof = 0u64;
     if vm_map_private_page(
@@ -11280,7 +11272,7 @@ pub(crate) unsafe fn private_vm_unmap_selftest(
     if first != 0 {
         proof |= VM_UNMAP_SELFTEST_REGISTERED;
     }
-    vm_unmap_private_page(pi, page);
+    let _ = vm_unmap_private_page(pi, process, page, handler);
     if csrss_frame_get_exact(pi as u64, page).0 == 0 {
         proof |= VM_UNMAP_SELFTEST_RELEASED;
     }
@@ -11300,7 +11292,7 @@ pub(crate) unsafe fn private_vm_unmap_selftest(
     if second != 0 && second == first {
         proof |= VM_UNMAP_SELFTEST_RECYCLED;
     }
-    vm_unmap_private_page(pi, page);
+    let _ = vm_unmap_private_page(pi, process, page, handler);
     if csrss_frame_get_exact(pi as u64, page).0 == 0 {
         proof |= VM_UNMAP_SELFTEST_CLEAN;
     }
@@ -11332,11 +11324,12 @@ pub(crate) unsafe fn working_set_transition_selftest(
     {
         return;
     }
+    let Some(process) = handler.capture_process_identity(pi) else { return; };
     let page = PRIVATE_VM_LIMIT - 0x2000;
     let mut proof = 0u64;
     let mut first_frame = 0u64;
     let result = (|| -> Result<(), u32> {
-        vm_unmap_private_page(pi, page);
+        vm_unmap_private_page(pi, process, page, handler)?;
         vm_map_private_page(
             handler,
             pi,
@@ -11393,7 +11386,7 @@ pub(crate) unsafe fn working_set_transition_selftest(
         Ok(())
     })();
 
-    vm_unmap_private_page(pi, page);
+    let _ = vm_unmap_private_page(pi, process, page, handler);
     if csrss_frame_get_exact(pi as u64, page).0 == 0
         && !(&*core::ptr::addr_of!(PROCESS_PAGEFILE)).contains(pi as u64, page)
     {
@@ -11648,6 +11641,8 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
 }
 
 unsafe fn finish_mapped_section_writecopy_cow_selftest(
+    handler: &ExecNtHandler,
+    process: nt_user_host::process_identity::ProcessIdentity,
     pi: usize,
     page: u64,
     source_frame: u64,
@@ -11659,7 +11654,7 @@ unsafe fn finish_mapped_section_writecopy_cow_selftest(
         let _ = page_unmap_r(loose_map_cap);
         let _ = cnode_delete_recycle_r(loose_map_cap);
     }
-    vm_unmap_private_page(pi, page);
+    let _ = vm_unmap_private_page(pi, process, page, handler);
     let clean = csrss_frame_get_exact(pi as u64, page).0 == 0;
     if source_frame != 0 {
         vm_frame_release(source_frame, 0);
@@ -11701,12 +11696,14 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
     let mut proof = 0u64;
     let mut source_frame = 0u64;
     let mut loose_map_cap = 0u64;
-    vm_unmap_private_page(pi, page);
+    let _ = vm_unmap_private_page(pi, process, page, handler);
 
     match vm_frame_acquire(scratch_base) {
         Ok(frame) => source_frame = frame,
         Err(status) => {
             finish_mapped_section_writecopy_cow_selftest(
+                handler,
+                process,
                 pi,
                 page,
                 source_frame,
@@ -11725,6 +11722,8 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
         MAPPED_SECTION_WRITECOPY_COW_PATTERN,
     ) {
         finish_mapped_section_writecopy_cow_selftest(
+            handler,
+            process,
             pi,
             page,
             source_frame,
@@ -11743,6 +11742,8 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
         Ok(true) => {}
         Ok(false) => {
             finish_mapped_section_writecopy_cow_selftest(
+                handler,
+                process,
                 pi,
                 page,
                 source_frame,
@@ -11754,6 +11755,8 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
         }
         Err(status) => {
             finish_mapped_section_writecopy_cow_selftest(
+                handler,
+                process,
                 pi,
                 page,
                 source_frame,
@@ -11771,6 +11774,8 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
         nt_address_space::mapped_view_fault_plan(nt_address_space::PAGE_WRITECOPY, true);
     if !write_plan.copy_on_write || write_plan.mark_dirty {
         finish_mapped_section_writecopy_cow_selftest(
+            handler,
+            process,
             pi,
             page,
             source_frame,
@@ -11782,6 +11787,8 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
     }
     if let Err(status) = vm_ensure_private_pt(handler, pi, page, pml4) {
         finish_mapped_section_writecopy_cow_selftest(
+            handler,
+            process,
             pi,
             page,
             source_frame,
@@ -11797,6 +11804,8 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
             let _ = cnode_delete_recycle_r(map_cap);
         }
         finish_mapped_section_writecopy_cow_selftest(
+            handler,
+            process,
             pi,
             page,
             source_frame,
@@ -11815,6 +11824,8 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
     ) != 0
     {
         finish_mapped_section_writecopy_cow_selftest(
+            handler,
+            process,
             pi,
             page,
             source_frame,
@@ -11831,6 +11842,8 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
             let _ = cnode_delete_recycle_r(source_cap);
         }
         finish_mapped_section_writecopy_cow_selftest(
+            handler,
+            process,
             pi,
             page,
             source_frame,
@@ -11854,6 +11867,8 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
         scratch_base,
     ) {
         finish_mapped_section_writecopy_cow_selftest(
+            handler,
+            process,
             pi,
             page,
             source_frame,
@@ -11866,6 +11881,8 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
 
     let Some(record) = csrss_frame_get_exact_record(pi as u64, page) else {
         finish_mapped_section_writecopy_cow_selftest(
+            handler,
+            process,
             pi,
             page,
             source_frame,
@@ -11887,6 +11904,8 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
         Ok(false) => {}
         Err(status) => {
             finish_mapped_section_writecopy_cow_selftest(
+                handler,
+                process,
                 pi,
                 page,
                 source_frame,
@@ -11901,6 +11920,8 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
     let mutated = MAPPED_SECTION_WRITECOPY_COW_PATTERN[0] ^ 0xff;
     if let Err(status) = cow_write_frame_byte(record.frame, scratch_base, 0, mutated) {
         finish_mapped_section_writecopy_cow_selftest(
+            handler,
+            process,
             pi,
             page,
             source_frame,
@@ -11915,6 +11936,8 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
         Ok(_) => {}
         Err(status) => {
             finish_mapped_section_writecopy_cow_selftest(
+                handler,
+                process,
                 pi,
                 page,
                 source_frame,
@@ -11932,6 +11955,8 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
         Ok(_) => {}
         Err(status) => {
             finish_mapped_section_writecopy_cow_selftest(
+                handler,
+                process,
                 pi,
                 page,
                 source_frame,
@@ -11951,6 +11976,8 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
         STATUS_UNSUCCESSFUL
     };
     finish_mapped_section_writecopy_cow_selftest(
+        handler,
+        process,
         pi,
         page,
         source_frame,
@@ -11996,6 +12023,8 @@ unsafe fn cow_write_frame_byte(
 }
 
 unsafe fn finish_image_writecopy_cow_selftest(
+    handler: &ExecNtHandler,
+    process: nt_user_host::process_identity::ProcessIdentity,
     pi: usize,
     page: u64,
     source_frame: u64,
@@ -12015,7 +12044,7 @@ unsafe fn finish_image_writecopy_cow_selftest(
         let _ = page_unmap_r(loose_map_cap);
         let _ = cnode_delete_recycle_r(loose_map_cap);
     }
-    vm_unmap_private_page(pi, page);
+    let _ = vm_unmap_private_page(pi, process, page, handler);
     let clean = csrss_frame_get_exact(pi as u64, page).0 == 0
         && !shared_image_mapping_contains(pi as u64, page);
     if source_frame != 0 {
@@ -12062,12 +12091,14 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
         let _ = page_unmap_r(map_cap);
         let _ = cnode_delete_recycle_r(map_cap);
     }
-    vm_unmap_private_page(pi, page);
+    let _ = vm_unmap_private_page(pi, process, page, handler);
 
     match vm_frame_acquire(scratch_base) {
         Ok(frame) => source_frame = frame,
         Err(status) => {
             finish_image_writecopy_cow_selftest(
+                handler,
+                process,
                 pi,
                 page,
                 source_frame,
@@ -12083,7 +12114,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
     if let Err(status) =
         cow_seed_source_frame(source_frame, scratch_base, IMAGE_WRITECOPY_COW_PATTERN)
     {
-        finish_image_writecopy_cow_selftest(pi, page, source_frame, loose_map_cap, proof, status);
+        finish_image_writecopy_cow_selftest(handler, process, pi, page, source_frame, loose_map_cap, proof, status);
         return;
     }
     proof |= IMAGE_WRITECOPY_COW_SEEDED;
@@ -12091,6 +12122,8 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
         Ok(true) => {}
         Ok(false) => {
             finish_image_writecopy_cow_selftest(
+                handler,
+                process,
                 pi,
                 page,
                 source_frame,
@@ -12102,6 +12135,8 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
         }
         Err(status) => {
             finish_image_writecopy_cow_selftest(
+                handler,
+                process,
                 pi,
                 page,
                 source_frame,
@@ -12119,6 +12154,8 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
         nt_address_space::image_view_fault_plan(nt_address_space::PAGE_EXECUTE_WRITECOPY, true);
     if !write_plan.copy_on_write {
         finish_image_writecopy_cow_selftest(
+            handler,
+            process,
             pi,
             page,
             source_frame,
@@ -12129,7 +12166,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
         return;
     }
     if let Err(status) = vm_ensure_private_pt(handler, pi, page, pml4) {
-        finish_image_writecopy_cow_selftest(pi, page, source_frame, loose_map_cap, proof, status);
+        finish_image_writecopy_cow_selftest(handler, process, pi, page, source_frame, loose_map_cap, proof, status);
         return;
     }
     let (map_cap, copy_error) = copy_cap_r(source_frame);
@@ -12138,6 +12175,8 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
             let _ = cnode_delete_recycle_r(map_cap);
         }
         finish_image_writecopy_cow_selftest(
+            handler,
+            process,
             pi,
             page,
             source_frame,
@@ -12156,6 +12195,8 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
     ) != 0
     {
         finish_image_writecopy_cow_selftest(
+            handler,
+            process,
             pi,
             page,
             source_frame,
@@ -12168,6 +12209,8 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
     proof |= IMAGE_WRITECOPY_COW_MAPPED_SHARED;
     if !shared_image_mapping_put(pi as u64, page, map_cap) {
         finish_image_writecopy_cow_selftest(
+            handler,
+            process,
             pi,
             page,
             source_frame,
@@ -12189,12 +12232,14 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
         pml4,
         scratch_base,
     ) {
-        finish_image_writecopy_cow_selftest(pi, page, source_frame, loose_map_cap, proof, status);
+        finish_image_writecopy_cow_selftest(handler, process, pi, page, source_frame, loose_map_cap, proof, status);
         return;
     }
 
     let Some(record) = csrss_frame_get_exact_record(pi as u64, page) else {
         finish_image_writecopy_cow_selftest(
+            handler,
+            process,
             pi,
             page,
             source_frame,
@@ -12215,6 +12260,8 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
         Ok(false) => {}
         Err(status) => {
             finish_image_writecopy_cow_selftest(
+                handler,
+                process,
                 pi,
                 page,
                 source_frame,
@@ -12228,7 +12275,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
 
     let mutated = IMAGE_WRITECOPY_COW_PATTERN[0] ^ 0xff;
     if let Err(status) = cow_write_frame_byte(record.frame, scratch_base, 0, mutated) {
-        finish_image_writecopy_cow_selftest(pi, page, source_frame, loose_map_cap, proof, status);
+        finish_image_writecopy_cow_selftest(handler, process, pi, page, source_frame, loose_map_cap, proof, status);
         return;
     }
     match cow_frame_byte(record.frame, scratch_base, 0) {
@@ -12236,6 +12283,8 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
         Ok(_) => {}
         Err(status) => {
             finish_image_writecopy_cow_selftest(
+                handler,
+                process,
                 pi,
                 page,
                 source_frame,
@@ -12253,6 +12302,8 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
         Ok(_) => {}
         Err(status) => {
             finish_image_writecopy_cow_selftest(
+                handler,
+                process,
                 pi,
                 page,
                 source_frame,
@@ -12270,7 +12321,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
     } else {
         STATUS_UNSUCCESSFUL
     };
-    finish_image_writecopy_cow_selftest(pi, page, source_frame, loose_map_cap, proof, status);
+    finish_image_writecopy_cow_selftest(handler, process, pi, page, source_frame, loose_map_cap, proof, status);
 }
 
 unsafe fn alloc_frame() -> u64 {
@@ -12537,24 +12588,33 @@ fn vm_watch(what: &[u8], pi: usize, page: u64, frame: u64) {
     print_str(b"\n");
 }
 
-unsafe fn vm_unmap_private_page(pi: usize, page: u64) -> bool {
-    if hosted_thread_memory_retirement_access(pi as u64, page, nt_address_space::PAGE_SIZE).is_err() {
-        return false;
-    }
+unsafe fn vm_unmap_private_page(
+    pi: usize,
+    process: nt_user_host::process_identity::ProcessIdentity,
+    page: u64,
+    handler: &ExecNtHandler,
+) -> Result<(), u32> {
+    let access = retirement_memory_access::Access::Process { process, handler };
+    access.check(pi as u64, page)?;
     if vm_page_lock_is_locked(pi as u64, page) {
         VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
-        return false;
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
-    if process_pagefile_discard(pi as u64, page).is_err() {
-        return false;
-    }
+    nt_memory_manager::admit_private_page_retirement(
+        pi as u64,
+        process,
+        page,
+        &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+        &*core::ptr::addr_of!(PROCESS_PAGEFILE),
+    )?;
+    pagefile_retirement::discard_with_access(pi as u64, page, &access)?;
     if let Some(record) = csrss_frame_get_exact_record(pi as u64, page) {
         vm_watch(b"unmap", pi, page, record.frame);
-        csrss_frame_reclaim_exact(pi as u64, page)
+        client_frame_cleanup::release_with_access(pi as u64, page, &access)?;
     } else {
         vm_watch(b"unmap-miss", pi, page, 0);
-        true
     }
+    Ok(())
 }
 
 unsafe fn vm_reprotect_private_page(
@@ -12643,23 +12703,25 @@ unsafe fn recycle_unmapped_frame_record_caps(
     }
 }
 
-unsafe fn vm_unmap_shared_image_mapping_range(pi: usize, base: u64, end: u64) -> bool {
-    let Some(size) = end.checked_sub(base) else { return false; };
-    if hosted_thread_memory_retirement_access(pi as u64, base, size).is_err() {
-        return false;
-    }
+unsafe fn vm_unmap_shared_image_mapping_range(
+    pi: usize,
+    process: nt_user_host::process_identity::ProcessIdentity,
+    base: u64,
+    end: u64,
+    handler: &ExecNtHandler,
+) -> Result<(), u32> {
+    let size = end.checked_sub(base).ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
+    hosted_thread_memory_retirement_access(pi as u64, base, size)?;
     if vm_page_lock_range_is_locked(pi as u64, base, end) {
         VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
-        return false;
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     let mut page = base;
     while page < end {
-        if !vm_unmap_private_page(pi, page) {
-            return false;
-        }
+        vm_unmap_private_page(pi, process, page, handler)?;
         page += 0x1000;
     }
-    shared_image_mapping_unmap_range(pi as u64, base, end).is_ok()
+    shared_image_mapping_unmap_range(pi as u64, base, end)
 }
 
 unsafe fn vm_reprotect_shared_image_mapping(
