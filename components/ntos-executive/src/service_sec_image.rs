@@ -6773,8 +6773,12 @@ unsafe fn observe_completed_dialog_modal_dispatch(
 /// upper pages. Slots are handed out ROUND-ROBIN: window creation re-enters win32k through user-mode
 /// callbacks (WM_NCCREATE/WM_CREATE ...), so a nested dispatch must not clobber an outer capture.
 const RC_ARG_CAPTURE_BASE: u64 = 0x1000;
-const RC_ARG_CAPTURE_SLOT: u64 = 0x0220;
+const RC_ARG_CAPTURE_SLOT: u64 = 0x0240;
 const RC_ARG_CAPTURE_SLOTS: u64 = 0x0010;
+const _: () = assert!(
+    RC_ARG_CAPTURE_BASE + RC_ARG_CAPTURE_SLOT * RC_ARG_CAPTURE_SLOTS
+        <= win32k_subsystem::WIN32K_ARG_GENERAL_BYTES
+);
 const RC_CLASS_MENU_DESC_OFF: u64 = 0x0080;
 const RC_CLASS_MENU_BUF_OFF: u64 = 0x00A0;
 const GET_ICON_INFO_ICONINFO_BYTES: usize = 32;
@@ -6784,9 +6788,9 @@ const GET_ICON_INFO_STRING_STAGE_CAP: u64 = RC_ARG_CAPTURE_SLOT - GET_ICON_INFO_
 const DEVMODEW_DMSIZE_OFF: usize = 0x44;
 const DEVMODEW_DMDRIVEREXTRA_OFF: usize = 0x46;
 const DEVMODEW_MIN_BYTES: usize = 0x48;
-/// Maximum bytes captured per string. `RTL_MAXIMUM_ATOM_LENGTH` is 255 chars, so 0x200 bytes covers
-/// every legal class/window name; anything longer is passed through untouched.
-const RC_ARG_BUF_CAP: u64 = 0x0200;
+/// Covers a MAX_PATH UTF-16 wallpaper name plus its terminator within one capture slot.
+const RC_ARG_BUF_CAP: u64 = RC_ARG_CAPTURE_SLOT - 0x20;
+const RC_WALLPAPER_MAX_BYTES: u64 = 260 * 2;
 static RC_ARG_CAPTURE_NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
@@ -6907,23 +6911,10 @@ unsafe fn try_capture_client_string_arg_impl(
         let input = nt_kernel_exec::user_string::large_string_input(&sd, RC_ARG_BUF_CAP)?;
         (input.length, input.maximum, input.ansi, input.buffer)
     } else {
-        (
-            u16::from_le_bytes([sd[0], sd[1]]) as u64,
-            u16::from_le_bytes([sd[2], sd[3]]) as u64,
-            false,
-            u64::from_le_bytes(sd[8..16].try_into().unwrap()),
-        )
+        let input = nt_kernel_exec::user_string::unicode_string_input(&sd, RC_ARG_BUF_CAP)?;
+        (input.length, input.maximum, false, input.buffer)
     };
     let terminator_bytes = if ansi { 1 } else { 2 };
-    if (!ansi && length & 1 != 0)
-        || maximum < length
-        || length.checked_add(terminator_bytes).is_none()
-        || length + terminator_bytes > RC_ARG_BUF_CAP
-        || (length != 0 && buffer == 0)
-        || buffer.checked_add(length).is_none()
-    {
-        return None;
-    }
     let stage_buffer = length != 0 || (capture_empty_buffer && buffer != 0);
     let slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed) % RC_ARG_CAPTURE_SLOTS;
     let desc = rc_arg_slot_base(slot);
@@ -13233,6 +13224,7 @@ pub(crate) unsafe fn service_sec_image(
                 let mut get_atom_name_probe_failed = false;
                 let mut get_class_info_probe_failed = false;
                 let mut def_set_text_probe_failed = false;
+                let mut wallpaper_spi_probe_failed = false;
                 let mut find_cursor_icon_probe_failed = false;
                 let mut register_window_message_probe_failed = false;
                 let mut set_cursor_icon_data_probe_failed = false;
@@ -15537,27 +15529,31 @@ pub(crate) unsafe fn service_sec_image(
                     // SystemParametersInfoW(SPI_SETDESKWALLPAPER) passes a user-mode UNICODE_STRING
                     // descriptor, and that descriptor's Buffer is another user pointer. Capture the graph
                     // at the executive boundary before isolated win32k's SpiSetWallpaper probes it.
-                    let captured = capture_client_string_arg(
-                        pi as u64,
-                        d_a2,
-                        false,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    );
-                    if captured != d_a2 {
-                        d_a2 = captured;
-                        if userinit_gui_client {
-                            let n = USERINIT_WALLPAPER_SPI_CAPTURES.fetch_add(1, Ordering::Relaxed);
-                            if n < 4 {
-                                print_str(b"[w32marshal] userinit captured SPI_SETDESKWALLPAPER UNICODE_STRING arg=0x");
-                                print_hex((a2 >> 32) as u32);
-                                print_hex(a2 as u32);
-                                print_str(b" -> 0x");
-                                print_hex((captured >> 32) as u32);
-                                print_hex(captured as u32);
-                                print_str(b"\n");
+                    if d_a2 != 0 {
+                        let captured = nt_handler.capture_process_identity(pi).and_then(|process| {
+                            try_capture_client_string_arg_for(
+                                pi as u64, process, d_a2, false, false,
+                                filled_pages, faults as usize, scratch_base,
+                            )
+                        });
+                        if let Some(capture) =
+                            captured.filter(|capture| capture.length <= RC_WALLPAPER_MAX_BYTES)
+                        {
+                            d_a2 = capture.desc;
+                            if userinit_gui_client {
+                                let n = USERINIT_WALLPAPER_SPI_CAPTURES.fetch_add(1, Ordering::Relaxed);
+                                if n < 4 {
+                                    print_str(b"[w32marshal] userinit captured SPI_SETDESKWALLPAPER UNICODE_STRING arg=0x");
+                                    print_hex((a2 >> 32) as u32);
+                                    print_hex(a2 as u32);
+                                    print_str(b" -> 0x");
+                                    print_hex((capture.desc >> 32) as u32);
+                                    print_hex(capture.desc as u32);
+                                    print_str(b"\n");
+                                }
                             }
+                        } else {
+                            wallpaper_spi_probe_failed = true;
                         }
                     }
                 } else if m0 == 0x10a8 {
@@ -15946,6 +15942,8 @@ pub(crate) unsafe fn service_sec_image(
                 } else if message_output_stage_failed {
                     (0xC000_009A, true)
                 } else if register_class_probe_failed {
+                    (0, true)
+                } else if wallpaper_spi_probe_failed {
                     (0, true)
                 } else if userconnect_capture_status != 0 {
                     (u64::from(userconnect_capture_status), true)

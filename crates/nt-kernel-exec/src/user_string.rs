@@ -15,6 +15,32 @@ pub struct LargeStringInput {
     pub ansi: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnicodeStringInput {
+    pub buffer: u64,
+    pub length: u64,
+    pub maximum: u64,
+}
+
+pub fn unicode_string_input(raw: &[u8; 16], capture_cap: u64) -> Option<UnicodeStringInput> {
+    let length = u16::from_le_bytes([raw[0], raw[1]]) as u64;
+    let maximum = u16::from_le_bytes([raw[2], raw[3]]) as u64;
+    let buffer = u64::from_le_bytes(raw[8..16].try_into().ok()?);
+    if length & 1 != 0
+        || maximum < length
+        || length.checked_add(2)? > capture_cap
+        || (length != 0 && buffer == 0)
+        || buffer.checked_add(length).is_none()
+    {
+        return None;
+    }
+    Some(UnicodeStringInput {
+        buffer,
+        length,
+        maximum,
+    })
+}
+
 pub fn large_string_input(raw: &[u8; 16], capture_cap: u64) -> Option<LargeStringInput> {
     let length = u32::from_le_bytes(raw[0..4].try_into().ok()?) as u64;
     let maximum_and_ansi = u32::from_le_bytes(raw[4..8].try_into().ok()?);
@@ -119,6 +145,23 @@ mod tests {
             large_string_input(&large_descriptor(0x200, 0x200, false, 0x1000), 0x200).is_none()
         );
         assert!(large_string_input(&large_descriptor(2, 2, false, u64::MAX), 0x200).is_none());
+    }
+
+    #[test]
+    fn unicode_string_covers_reactos_wallpaper_limit_without_truncation() {
+        assert_eq!(
+            unicode_string_input(&descriptor(520, 520, 0x1000), 0x220),
+            Some(UnicodeStringInput {
+                buffer: 0x1000,
+                length: 520,
+                maximum: 520
+            })
+        );
+        assert!(unicode_string_input(&descriptor(520, 520, 0x1000), 0x200).is_none());
+        assert!(unicode_string_input(&descriptor(522, 522, 0x1000), 0x220).is_some());
+        assert!(unicode_string_input(&descriptor(3, 4, 0x1000), 0x220).is_none());
+        assert!(unicode_string_input(&descriptor(4, 2, 0x1000), 0x220).is_none());
+        assert!(unicode_string_input(&descriptor(4, 4, u64::MAX), 0x220).is_none());
     }
 
     #[test]
