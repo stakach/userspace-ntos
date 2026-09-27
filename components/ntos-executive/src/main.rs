@@ -8548,8 +8548,11 @@ pub(crate) unsafe fn csrss_frame_drop_process_range(pi: u64, base: u64, size: u6
 
 pub(crate) unsafe fn csrss_frame_drop_process_all(
     pi: u64,
-    lifetime: nt_memory_manager::MemoryLifetime,
-) -> u64 {
+    process: nt_memory_manager::ProcessIdentity,
+    handler: &ExecNtHandler,
+) -> Result<u64, u32> {
+    let lifetime = nt_memory_manager::MemoryLifetime::Process(process);
+    let access = retirement_memory_access::Access::Process { process, handler };
     let mut dropped = 0u64;
     loop {
         let Some(page) = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).first_page_for_process(pi)
@@ -8559,23 +8562,51 @@ pub(crate) unsafe fn csrss_frame_drop_process_all(
         if csrss_frame_get_exact_record(pi, page)
             .is_none_or(|record| record.lifetime != lifetime)
         {
-            break;
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
         }
         if vm_page_lock_is_locked(pi, page) {
             VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
-            break;
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
-        if win32k_glue::detach_attached_client_page(pi, page).is_err() {
-            break;
-        }
-        if !csrss_frame_reclaim_exact(pi, page) {
-            break;
+        access.check(pi, page)?;
+        win32k_glue::detach_attached_client_page_with_access(pi, page, &access)?;
+        if !client_frame_cleanup::release_with_access(pi, page, &access)? {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
         }
         if csrss_frame_get_exact_record(pi, page).is_none() {
             dropped = dropped.saturating_add(1);
         }
     }
-    dropped
+    Ok(dropped)
+}
+
+unsafe fn csrss_frame_drop_unpublished_process_all(
+    pi: u64,
+    lifetime: nt_memory_manager::MemoryLifetime,
+) -> Result<u64, u32> {
+    if !matches!(lifetime, nt_memory_manager::MemoryLifetime::UnpublishedImage(token) if token != 0) {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
+    let mut dropped = 0u64;
+    while let Some(page) =
+        (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).first_page_for_process(pi)
+    {
+        if csrss_frame_get_exact_record(pi, page)
+            .is_none_or(|record| record.lifetime != lifetime)
+        {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
+        }
+        if vm_page_lock_is_locked(pi, page) {
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        hosted_thread_memory_retirement_access(pi, page, 0x1000)?;
+        win32k_glue::detach_attached_client_page(pi, page)?;
+        if !client_frame_cleanup::release(pi, page)? {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
+        }
+        dropped = dropped.saturating_add(1);
+    }
+    Ok(dropped)
 }
 /// Exact per-process frame lookup. Unlike `csrss_frame_get`, this never falls back to the shared
 /// executable-page cache, which is important when deciding whether a writable client page has a
@@ -9524,6 +9555,26 @@ unsafe fn process_working_set_pageout_mapping(
 
 unsafe fn process_working_set_retire(pi: usize) -> Result<(), u32> {
     pagefile_retirement::retire_owner(pi as u64)?;
+    process_working_set_clear_metadata(pi);
+    Ok(())
+}
+
+unsafe fn process_working_set_retire_for(
+    pi: usize,
+    process: nt_memory_manager::ProcessIdentity,
+    handler: &ExecNtHandler,
+) -> Result<(), u32> {
+    let access = retirement_memory_access::Access::Process { process, handler };
+    pagefile_retirement::retire_owner_with_access(pi as u64, &access)?;
+    process_working_set_clear_metadata(pi);
+    Ok(())
+}
+
+unsafe fn process_working_set_retire_unpublished(
+    pi: usize,
+    lifetime: nt_memory_manager::MemoryLifetime,
+) -> Result<(), u32> {
+    pagefile_retirement::retire_owner_unpublished(pi as u64, lifetime)?;
     process_working_set_clear_metadata(pi);
     Ok(())
 }
@@ -17944,7 +17995,9 @@ unsafe fn release_unpublished_sec_image_spawn(
     if !release_hosted_thread_mechanism_caps(0, spawn.main_mechanism) {
         return false;
     }
-    let _ = csrss_frame_drop_process_all(pi as u64, spawn.lifetime);
+    if csrss_frame_drop_unpublished_process_all(pi as u64, spawn.lifetime).is_err() {
+        return false;
+    }
     let (_, copyin_failures) = client_copyin_frame_drop_process(pi as u64);
     if !kuser_page_alias_release(pi)
         || copyin_failures != 0
@@ -17953,7 +18006,7 @@ unsafe fn release_unpublished_sec_image_spawn(
     {
         return false;
     }
-    if process_working_set_retire(pi).is_err() {
+    if process_working_set_retire_unpublished(pi, spawn.lifetime).is_err() {
         return false;
     }
     process_committed_mapping_reset(pi);

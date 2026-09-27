@@ -38,6 +38,8 @@ fn exact_pagefile_operations_retain_foreign_lifetime() {
         Err(STATUS_INVALID_PARAMETER)
     );
     assert_eq!(store.page_for(7, old, 0x1000), Some(original));
+    assert_eq!(store.first_for_owner_for(7, new), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(store.first_for_owner_for(7, old), Ok(Some(original)));
 }
 use super::super::{allocate_pagefile_id, PagefileStoreStats};
 use super::*;

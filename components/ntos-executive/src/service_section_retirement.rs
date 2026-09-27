@@ -53,7 +53,20 @@ pub(crate) unsafe fn service_drain_section_retirement(
 /// Partial capability cleanup retains exact registry progress for a later retry.
 pub(crate) unsafe fn service_unmap_section_view_mappings(
     view: GenericSectionView,
+    handler: &ExecNtHandler,
 ) -> Result<(), u32> {
+    let nt_memory_manager::MemoryLifetime::Process(process) = view.lifetime else {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    };
+    if handler.capture_process_identity(view.pi) != Some(process)
+        || handler
+            .loop_ctx
+            .and_then(|ctx| (&*ctx.generic_sections).view_for_page(view.pi, view.base))
+            .is_none_or(|(_, current)| current != view)
+    {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
+    let access = retirement_memory_access::Access::Process { process, handler };
     hosted_thread_memory_retirement_access(view.pi as u64, view.base, view.size)?;
     let end = view
         .base
@@ -61,13 +74,25 @@ pub(crate) unsafe fn service_unmap_section_view_mappings(
         .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
     let mut page = view.base;
     while page < end {
-        crate::win32k_glue::detach_attached_client_page(view.pi as u64, page)?;
-        if vm_page_lock_is_locked(view.pi as u64, page)
-            || !csrss_frame_reclaim_exact(view.pi as u64, page)
-        {
+        access.check(view.pi as u64, page)?;
+        if !view.permits_retirement_page(
+            process,
+            page,
+            csrss_frame_get_exact_record(view.pi as u64, page).map(|record| record.lifetime),
+            (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).lifetime(view.pi as u64, page),
+        ) {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
+        }
+        if vm_page_lock_is_locked(view.pi as u64, page) {
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
-        process_pagefile_discard(view.pi as u64, page)?;
+        crate::win32k_glue::detach_attached_client_page_with_access(
+            view.pi as u64,
+            page,
+            &access,
+        )?;
+        client_frame_cleanup::release_with_access(view.pi as u64, page, &access)?;
+        pagefile_retirement::discard_with_access(view.pi as u64, page, &access)?;
         page = page
             .checked_add(0x1000)
             .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;

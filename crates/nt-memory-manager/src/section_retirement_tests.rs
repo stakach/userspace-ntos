@@ -68,6 +68,36 @@ fn section(table: &mut GenericSectionTable) -> usize {
 }
 
 #[test]
+fn view_retirement_admission_rejects_reused_process_and_foreign_backing() {
+    let mut table = GenericSectionTable::new();
+    let section = section(&mut table);
+    let old = crate::ProcessIdentity {
+        pid: 42,
+        generation: crate::ProcessGeneration::Hosted(7),
+    };
+    let new = crate::ProcessIdentity {
+        pid: 42,
+        generation: crate::ProcessGeneration::Hosted(8),
+    };
+    let old_lifetime = crate::MemoryLifetime::Process(old);
+    let new_lifetime = crate::MemoryLifetime::Process(new);
+    assert!(table.map_view_with_lifetime(
+        3,
+        old_lifetime,
+        section,
+        0x10000,
+        0x1000,
+        0,
+    ));
+    let view = table.view_for_page(3, 0x10000).unwrap().1;
+    assert!(view.permits_retirement_page(old, 0x10000, Some(old_lifetime), Some(old_lifetime)));
+    assert!(!view.permits_retirement_page(new, 0x10000, None, None));
+    assert!(!view.permits_retirement_page(old, 0x10000, Some(new_lifetime), None));
+    assert!(!view.permits_retirement_page(old, 0x10000, None, Some(new_lifetime)));
+    assert!(!view.permits_retirement_page(old, 0x11000, None, None));
+}
+
+#[test]
 fn final_handle_waits_for_every_cross_process_view() {
     let mut table = GenericSectionTable::new();
     let section = section(&mut table);

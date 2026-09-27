@@ -183,6 +183,23 @@ impl GenericSectionView {
             && page >= self.base
             && page < self.base.saturating_add(self.size)
     }
+
+    pub fn permits_retirement_page(
+        self,
+        process: crate::ProcessIdentity,
+        page: u64,
+        frame_lifetime: Option<MemoryLifetime>,
+        pagefile_lifetime: Option<MemoryLifetime>,
+    ) -> bool {
+        let expected = MemoryLifetime::Process(process);
+        self.live
+            && process.is_valid()
+            && self.lifetime == expected
+            && page >= self.base
+            && self.base.checked_add(self.size).is_some_and(|end| page < end)
+            && frame_lifetime.is_none_or(|lifetime| lifetime == expected)
+            && pagefile_lifetime.is_none_or(|lifetime| lifetime == expected)
+    }
 }
 
 #[derive(Clone, Copy)]
