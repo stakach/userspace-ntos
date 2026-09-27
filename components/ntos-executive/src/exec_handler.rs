@@ -16143,7 +16143,8 @@ impl ExecNtHandler {
         increase_ok: bool,
     ) -> Result<nt_memory_manager::WorkingSetAdjustmentPlan, u32> {
         process_working_set_register(pi)?;
-        let pages = process_working_set_resident_pages(pi)?;
+        let process = self.capture_process_identity(pi).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let pages = process_working_set_resident_pages(pi, process)?;
         let plan = (&mut *core::ptr::addr_of_mut!(PROCESS_WORKING_SETS)).prepare_adjustment(
             pi as u64,
             minimum_bytes,
@@ -16184,10 +16185,14 @@ impl ExecNtHandler {
         let Some(limits) = table.limits(pi as u64) else {
             return Ok(());
         };
-        if !limits.hard_limit || vm_page_is_resident(pi, page) {
+        if !limits.hard_limit {
             return Ok(());
         }
-        let pages = process_working_set_resident_pages(pi)?;
+        let process = self.capture_process_identity(pi).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        if vm_page_is_resident(pi, process, page)? {
+            return Ok(());
+        }
+        let pages = process_working_set_resident_pages(pi, process)?;
         let plan = table.prepare_admission(pi as u64, page, &pages)?;
         self.pageout_working_set_victims(pi, plan.victims())?;
         (&*core::ptr::addr_of!(PROCESS_WORKING_SETS)).validate_admission(&plan)
@@ -17738,7 +17743,6 @@ impl ExecNtHandler {
                 Ok(request) => request,
                 Err(status) => return status,
             };
-
         let status = 'operation: {
             // Validate the complete mapping before causing any residency side effects. This is the
             // address-space-lock phase of MiLockVirtualMemory, expressed through the common mapping
@@ -17796,6 +17800,9 @@ impl ExecNtHandler {
                 Ok(request) => request,
                 Err(status) => return status,
             };
+        let Some(process) = self.capture_process_identity(target_pi) else {
+            return nt_fs::STATUS_INVALID_HANDLE;
+        };
 
         let status = 'operation: {
             // Lock exclusion guarantees residency until unlock. Still validate the whole range
@@ -17805,6 +17812,10 @@ impl ExecNtHandler {
                     Ok(information) => information,
                     Err(_) => break 'operation nt_address_space::STATUS_NOT_LOCKED,
                 };
+                let resident = match vm_page_is_resident(target_pi, process, page) {
+                    Ok(resident) => resident,
+                    Err(status) => break 'operation status,
+                };
                 if information.state != nt_address_space::MEM_COMMIT
                     || !matches!(
                         information.type_,
@@ -17812,7 +17823,7 @@ impl ExecNtHandler {
                             | nt_address_space::MEM_MAPPED
                             | nt_address_space::MEM_IMAGE
                     )
-                    || !vm_page_is_resident(target_pi, page)
+                    || !resident
                 {
                     break 'operation nt_address_space::STATUS_NOT_LOCKED;
                 }

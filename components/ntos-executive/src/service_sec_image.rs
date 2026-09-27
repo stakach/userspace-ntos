@@ -3682,7 +3682,7 @@ pub(crate) unsafe fn service_image_page_residency(
         .checked_sub(base)
         .and_then(|offset| u32::try_from(offset).ok())
         .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
-    let shared_mapping_registered = shared_image_mapping_contains(pi as u64, page);
+    let shared_mapping_registered = shared_image_mapping_contains_for(pi as u64, process, page)?;
 
     if fault_plan.requires_private_backing()
         && (resident.is_some() || shared_mapping_registered)
@@ -3827,7 +3827,7 @@ pub(crate) unsafe fn service_image_page_residency(
     }
 
     if shareable {
-        if !shared_image_mapping_replace_banked_after_map(pi as u64, page, map_cap) {
+        if !shared_image_mapping_replace_banked_after_map(pi as u64, process, page, map_cap) {
             let _ = page_unmap_r(map_cap);
             let _ = cnode_delete_recycle_r(map_cap);
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
@@ -11100,8 +11100,15 @@ pub(crate) unsafe fn service_sec_image(
                     SEC_IMAGE_PRIVATE_PREFETCH_SKIPS.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+                let Some(process) = nt_handler.capture_process_identity(pi) else {
+                    break;
+                };
+                let shared_present = match shared_image_mapping_contains_for(pi as u64, process, bpage) {
+                    Ok(present) => present,
+                    Err(_) => break,
+                };
                 if csrss_frame_get_exact_record(pi as u64, bpage).is_some()
-                    || shared_image_mapping_contains(pi as u64, bpage)
+                    || shared_present
                     || (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).contains(pi as u64, bpage)
                     || (shareable && dll_cache_get(bpage) != 0)
                 {

@@ -30,6 +30,8 @@ mod private_page_retirement;
 pub use private_page_retirement::admit_private_page_retirement;
 mod resident_reprotect;
 pub use resident_reprotect::{admit_client_alias_source, admit_resident_reprotect};
+mod shared_image_mapping;
+pub use shared_image_mapping::SharedImageMappingIdentity;
 pub mod alias_transition;
 pub mod frame_acquisition;
 mod commit;

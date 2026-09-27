@@ -36,6 +36,7 @@ impl ProtectionTarget {
         } else if self.mapping_type == nt_address_space::MEM_IMAGE {
             vm_reprotect_shared_image_mapping(
                 self.pi,
+                process,
                 page,
                 effective(old),
                 effective(new),

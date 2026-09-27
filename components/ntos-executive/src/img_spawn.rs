@@ -1785,7 +1785,7 @@ unsafe fn with_recorded_frame_alias(
 
     let clone_source = match csrss_frame_get_exact_record(pi, page) {
         Some(record) => record.clone_source_cap().unwrap_or(0),
-        None if !writable && shared_image_mapping_contains(pi, page) => dll_cache_get(page),
+        None if !writable && shared_image_mapping_contains_pi_unchecked(pi, page) => dll_cache_get(page),
         None => 0,
     };
     if clone_source == 0 || scratch_base == 0 {
@@ -1929,7 +1929,7 @@ pub(crate) unsafe fn client_copyin_process_mapped(
         // An exact record is authoritative, including a record undergoing reclamation.
         // Never substitute shared-cache or historical scratch backing for that record.
         if csrss_frame_get_exact_record(pi, current & !0xfff).is_some()
-            || shared_image_mapping_contains(pi, current & !0xfff)
+            || shared_image_mapping_contains_pi_unchecked(pi, current & !0xfff)
         {
             if !recorded_frame_copyin(pi, current, &mut dst[copied..copied + chunk], scratch_base) {
                 return false;
