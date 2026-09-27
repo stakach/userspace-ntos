@@ -149,8 +149,21 @@ pub(crate) unsafe fn detach_attached_client_page_with_access(
     access: &retirement_memory_access::Access<'_>,
 ) -> Result<(), u32> {
     access.check(pi, page)?;
-    if attached_pi() != pi {
+    let Some(owner) = attached_owner() else {
+        return if (&*core::ptr::addr_of!(MAPPINGS)).is_empty() {
+            Ok(())
+        } else {
+            Err(nt_fs::STATUS_INVALID_HANDLE)
+        };
+    };
+    if owner.pi as u64 != pi {
         return Ok(());
+    }
+    if access
+        .expected_process()
+        .is_some_and(|expected| owner.process != expected)
+    {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
     }
     let mappings = &mut *core::ptr::addr_of_mut!(MAPPINGS);
     let Some(index) = mappings.iter().position(|mapping| mapping.page() == page) else {

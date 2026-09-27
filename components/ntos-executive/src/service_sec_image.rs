@@ -3456,6 +3456,9 @@ pub(crate) unsafe fn service_generic_section_fault(
     scratch_base: u64,
     fault_access: nt_address_space::FaultAccess,
 ) -> Result<bool, u32> {
+    let process = nt_handler
+        .capture_process_identity(pi)
+        .ok_or(nt_address_space::STATUS_ACCESS_VIOLATION)?;
     hosted_thread_memory_access(pi as u64, page, 0x1000)?;
     let write_fault = fault_access == nt_address_space::FaultAccess::Write;
     let Some((section_index, view)) = generic_sections.view_for_page(pi, page) else {
@@ -3487,7 +3490,14 @@ pub(crate) unsafe fn service_generic_section_fault(
             return Ok(true);
         }
         if write_fault && fault_plan.copy_on_write {
-            crate::win32k_glue::detach_attached_client_page(pi as u64, page)?;
+            crate::win32k_glue::detach_attached_client_page_with_access(
+                pi as u64,
+                page,
+                &crate::retirement_memory_access::Access::Process {
+                    process,
+                    handler: &*nt_handler,
+                },
+            )?;
             let old_protection =
                 nt_address_space::mapped_view_fault_plan(view_info.protect, false).map_protection;
             vm_promote_mapped_cow_page(
