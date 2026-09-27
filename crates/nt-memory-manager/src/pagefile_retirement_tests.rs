@@ -41,6 +41,31 @@ fn exact_pagefile_operations_retain_foreign_lifetime() {
     assert_eq!(store.first_for_owner_for(7, new), Err(STATUS_INVALID_PARAMETER));
     assert_eq!(store.first_for_owner_for(7, old), Ok(Some(original)));
 }
+
+#[test]
+fn temporary_process_slot_reuse_cannot_retire_prior_generation() {
+    let old = crate::MemoryLifetime::Process(crate::ProcessIdentity {
+        pid: 55,
+        generation: crate::ProcessGeneration::Temporary(7),
+    });
+    let new = crate::MemoryLifetime::Process(crate::ProcessIdentity {
+        pid: 55,
+        generation: crate::ProcessGeneration::Temporary(8),
+    });
+    let original = PagefilePage {
+        owner: 12,
+        lifetime: old,
+        page: 0x3000,
+        protection: 4,
+        backing: 77,
+    };
+    let mut store = PagefileStore::new();
+    let plan = store.prepare_publish(original).unwrap();
+    store.commit_publish(plan).unwrap();
+    assert_eq!(store.first_for_owner_for(12, new), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(store.page_for(12, old, 0x3000), Some(original));
+    assert_eq!(store.first_for_owner_for(12, old), Ok(Some(original)));
+}
 use super::super::{allocate_pagefile_id, PagefileStoreStats};
 use super::*;
 use crate::{ProcessGeneration, ProcessIdentity};

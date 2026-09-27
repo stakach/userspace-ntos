@@ -57,13 +57,6 @@ pub(super) unsafe fn discard_with_access(
     store.complete_retirement_with(retained, |backing| frame_recycle::publish(backing))
 }
 
-pub(super) unsafe fn retire_owner(pi: u64) -> Result<(), u32> {
-    while let Some(page) = (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).first_for_owner(pi) {
-        discard(pi, page.page)?;
-    }
-    Ok(())
-}
-
 pub(super) unsafe fn retire_owner_with_access(
     pi: u64,
     access: &retirement_memory_access::Access<'_>,

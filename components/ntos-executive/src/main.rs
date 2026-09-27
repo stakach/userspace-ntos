@@ -9520,12 +9520,6 @@ unsafe fn process_working_set_pageout_mapping(
     false
 }
 
-unsafe fn process_working_set_retire(pi: usize) -> Result<(), u32> {
-    pagefile_retirement::retire_owner(pi as u64)?;
-    process_working_set_clear_metadata(pi);
-    Ok(())
-}
-
 unsafe fn process_working_set_retire_for(
     pi: usize,
     process: nt_memory_manager::ProcessIdentity,

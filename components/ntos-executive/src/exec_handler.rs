@@ -8282,16 +8282,26 @@ impl ExecNtHandler {
         if self.process_mechanisms.pid_for_pi(pi).is_some()
             || self.thread_runtime.has_process(pi)
             || self.temporary_process_slots.get(pi) != Some(claim)
+            || !client_frame_registry_process_is_empty(pi as u64)
+            || unsafe {
+                (&*core::ptr::addr_of!(PROCESS_USER_PAGE_TABLES))
+                    .first_for_process(pi as u64)
+                    .is_some()
+                    || (&*core::ptr::addr_of!(VM_PAGE_LOCKS)).has_owner(pi as u64)
+                    || !shared_image_mapping_process_is_empty(pi)
+                    || process_committed_mapping_table(pi)
+                        .is_none_or(|table| table.range_count() != 0)
+                    || process_vm_region_map(pi).is_none_or(|map| map.extent_count() != 0)
+            }
         {
             return false;
         }
-        if unsafe { process_working_set_retire(pi) }.is_err() {
+        if unsafe { process_working_set_retire_for(pi, claim.identity(), self) }.is_err() {
             return false;
         }
         self.temporary_process_slots.release_exact(claim)
             .expect("serialized cleanup retains the exact temporary process claim");
         self.process_vspaces[pi] = 0;
-        unsafe { process_committed_mapping_reset(pi) };
         self.clear_hosted_tp_worker_windows(pi);
         true
     }
