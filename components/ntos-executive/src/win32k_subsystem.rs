@@ -1183,6 +1183,8 @@ pub const W32_DEVICE_PROPERTY_LABEL: u64 = 0x780;
 pub const W32_DEVICE_POINTER_LABEL: u64 = 0x781;
 /// Pointer-free staged Object Manager directory requests.
 pub const W32_DIRECTORY_LABEL: u64 = 0x782;
+/// Exact-job retained security subject for win32k Object Manager parse work.
+pub const W32_SUBJECT_LABEL: u64 = 0x783;
 pub const W32_FILE_CLOSE_LABEL: u64 = 0x790;
 pub const W32_FILE_CREATE_LABEL: u64 = 0x791;
 pub const W32_FILE_QUERY_LABEL: u64 = 0x792;
@@ -5974,7 +5976,79 @@ unsafe fn service_window_station_handle_for_current_token() -> u64 {
 /// - WINDOWSTATION (IntCreateWindowStation's "try open existing", ParseContext == NULL): if we have
 ///   already created the input winsta, OPEN it (write its handle, SUCCESS); otherwise report
 ///   STATUS_OBJECT_NAME_NOT_FOUND so IntCreateWindowStation falls through to ObCreateObject/Insert.
+struct DesktopOpenSubjectLease(u64);
+
+impl DesktopOpenSubjectLease {
+    unsafe fn begin() -> Result<Self, i32> {
+        let (words, raw, id, spare, reserved) = crate::driver_launch::call_on4_raw(
+            (W32_SUBJECT_LABEL << 12) | 4,
+            1,
+            0,
+            0,
+            0,
+        );
+        let canonical = raw == raw as u32 as u64 || raw == raw as u32 as i32 as i64 as u64;
+        if words != 4 || !canonical || spare != 0 || reserved != 0 || (raw != 0 && id != 0) {
+            crate::provider_bugcheck::report(0xc4, [W32_SUBJECT_LABEL, 1, words, raw]);
+        }
+        if raw != 0 {
+            return Err(raw as u32 as i32);
+        }
+        if id == 0 {
+            crate::provider_bugcheck::report(0xc4, [W32_SUBJECT_LABEL, 1, words, id]);
+        }
+        Ok(Self(id))
+    }
+}
+
+impl Drop for DesktopOpenSubjectLease {
+    fn drop(&mut self) {
+        let (words, raw, first, second, third) = unsafe {
+            crate::driver_launch::call_on4_raw(
+                (W32_SUBJECT_LABEL << 12) | 4,
+                2,
+                self.0,
+                0,
+                0,
+            )
+        };
+        if words != 4 || raw != 0 || first != 0 || second != 0 || third != 0 {
+            unsafe { crate::provider_bugcheck::report(0xc4, [W32_SUBJECT_LABEL, 2, words, raw]) };
+        }
+    }
+}
+
 extern "win64" fn s_ob_open_object_by_name(
+    object_attributes: u64,
+    obj_type: u64,
+    access_mode: u64,
+    access_state: u64,
+    desired_access: u64,
+    parse_context: u64,
+    handle: *mut u64,
+) -> i32 {
+    let lease = if classify_type(obj_type) == Some(ObKind::Desktop) && parse_context != 0 {
+        match unsafe { DesktopOpenSubjectLease::begin() } {
+            Ok(lease) => Some(lease),
+            Err(status) => return status,
+        }
+    } else {
+        None
+    };
+    let status = ob_open_object_by_name_existing(
+        object_attributes,
+        obj_type,
+        access_mode,
+        access_state,
+        desired_access,
+        parse_context,
+        handle,
+    );
+    drop(lease);
+    status
+}
+
+fn ob_open_object_by_name_existing(
     object_attributes: u64,
     obj_type: u64,
     _access_mode: u64,

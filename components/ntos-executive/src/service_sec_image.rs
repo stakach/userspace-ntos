@@ -4431,6 +4431,32 @@ pub(crate) unsafe fn service_win32k_directory_request(
     crate::provider_directory_broker::dispatch(&mut *pointer, route, dispatch, caller, op, m1, m2, m3)
 }
 
+/// Capture and release a canonical subject for one exact win32k Object Manager parse job.
+pub(crate) unsafe fn service_win32k_subject_request(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    op: u64,
+    first: u64,
+    second: u64,
+    third: u64,
+) -> (i32, u64, u64, u64) {
+    let (route, dispatch, caller) = match authenticate_win32k_service_request(
+        channel,
+        reply_cap,
+        badge,
+        mi,
+        (crate::win32k_subsystem::W32_SUBJECT_LABEL << 12) | 4,
+    ) {
+        Ok(owner) => owner,
+        Err(status) => return (status as i32, 0, 0, 0),
+    };
+    crate::provider_win32k_subject::dispatch(
+        route, dispatch, caller, op, first, second, third,
+    )
+}
+
 pub(crate) unsafe fn service_win32k_file_close_request(
     channel: &spawn_hosts::PumpChannel,
     reply_cap: u64,
