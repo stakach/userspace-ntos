@@ -17336,6 +17336,9 @@ impl ExecNtHandler {
                 Ok(target) => target,
                 Err(status) => return status,
             };
+        let Some(target_process) = self.capture_process_identity(target_pi) else {
+            return nt_process::STATUS_INVALID_HANDLE;
+        };
         if self.pm.process(target_pid).is_some_and(|process| {
             matches!(
                 process.state,
@@ -17565,7 +17568,7 @@ impl ExecNtHandler {
                         extent.state == nt_address_space::VmExtentState::Committed
                     })
                 {
-                    vm_unmap_private_page(target_pi, page);
+                    let _ = vm_unmap_private_page(target_pi, target_process, page, self);
                 } else if let (Some(old), Some(new)) = (old, new) {
                     if old.state == nt_address_space::VmExtentState::Committed
                         && new.state == nt_address_space::VmExtentState::Committed
@@ -18000,6 +18003,9 @@ impl ExecNtHandler {
                 Ok(target) => target,
                 Err(status) => return status,
             };
+        let Some(target_process) = self.capture_process_identity(target_pi) else {
+            return nt_process::STATUS_INVALID_HANDLE;
+        };
         if self.pm.process(target_pid).is_some_and(|process| {
             matches!(
                 process.state,
@@ -18052,8 +18058,8 @@ impl ExecNtHandler {
                 && new
                     .is_none_or(|extent| extent.state != nt_address_space::VmExtentState::Committed)
             {
-                if !vm_unmap_private_page(target_pi, page) {
-                    return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
+                if let Err(status) = vm_unmap_private_page(target_pi, target_process, page, self) {
+                    return status;
                 }
             }
             page += 0x1000;
@@ -36470,21 +36476,28 @@ impl ExecNtHandler {
                                 return status;
                             }
                         }
-                        if reg.clear_mapped(target_pi, slot) {
-                            if let Some(allocation) = allocation {
-                                let _ = vm_page_lock_retire_range(
-                                    target_pi as u64,
-                                    allocation.allocation_base,
-                                    allocation
-                                        .allocation_end
-                                        .saturating_sub(allocation.allocation_base),
-                                );
-                                let _ = vm_unmap_shared_image_mapping_range(
-                                    target_pi,
-                                    allocation.allocation_base,
-                                    allocation.allocation_end,
-                                );
+                        let Some(target_process) = self.capture_process_identity(target_pi) else {
+                            return nt_process::STATUS_INVALID_HANDLE;
+                        };
+                        if let Some(allocation) = allocation {
+                            let _ = vm_page_lock_retire_range(
+                                target_pi as u64,
+                                allocation.allocation_base,
+                                allocation
+                                    .allocation_end
+                                    .saturating_sub(allocation.allocation_base),
+                            );
+                            if let Err(status) = vm_unmap_shared_image_mapping_range(
+                                target_pi,
+                                target_process,
+                                allocation.allocation_base,
+                                allocation.allocation_end,
+                                self,
+                            ) {
+                                return status;
                             }
+                        }
+                        if reg.clear_mapped(target_pi, slot) {
                             let _ = process_committed_mapping_unregister_allocation(
                                 target_pi as u64,
                                 image_base,
