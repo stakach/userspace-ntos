@@ -4569,6 +4569,74 @@ pub(crate) unsafe fn service_win32k_file_read_release(
     crate::driver_launch::service_win32k_file_read_release(channel, token, handle)
 }
 
+pub(crate) unsafe fn service_win32k_file_ioctl_request(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    packet: u64,
+    length: u64,
+    handle: u64,
+    reserved: u64,
+) -> Option<i32> {
+    if reserved != 0 {
+        return Some(nt_process::STATUS_INVALID_PARAMETER as i32);
+    }
+    if let Err(status) = authenticate_win32k_service_request(
+        channel, reply_cap, badge, mi, (crate::win32k_subsystem::W32_FILE_IOCTL_LABEL << 12) | 4,
+    ) {
+        return Some(status as i32);
+    }
+    if SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) == 0 {
+        return Some(0xC000_00A3u32 as i32);
+    }
+    crate::driver_launch::service_win32k_file_ioctl(channel, packet, length, handle)
+}
+
+pub(crate) unsafe fn service_win32k_file_ioctl_completion(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    token: u64,
+    handle: u64,
+    reserved1: u64,
+    reserved2: u64,
+) -> i32 {
+    if reserved1 != 0 || reserved2 != 0 {
+        return nt_process::STATUS_INVALID_PARAMETER as i32;
+    }
+    if let Err(status) = authenticate_win32k_service_request(
+        channel, reply_cap, badge, mi,
+        (crate::win32k_subsystem::W32_FILE_IOCTL_COMPLETION_LABEL << 12) | 4,
+    ) {
+        return status as i32;
+    }
+    crate::driver_launch::service_win32k_file_ioctl_completion(channel, token, handle)
+}
+
+pub(crate) unsafe fn service_win32k_file_ioctl_release(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    token: u64,
+    handle: u64,
+    reserved1: u64,
+    reserved2: u64,
+) -> i32 {
+    if reserved1 != 0 || reserved2 != 0 {
+        return nt_process::STATUS_INVALID_PARAMETER as i32;
+    }
+    if let Err(status) = authenticate_win32k_service_request(
+        channel, reply_cap, badge, mi,
+        (crate::win32k_subsystem::W32_FILE_IOCTL_RELEASE_LABEL << 12) | 4,
+    ) {
+        return status as i32;
+    }
+    crate::driver_launch::service_win32k_file_ioctl_release(channel, token, handle)
+}
+
 pub(crate) unsafe fn service_win32k_file_query_delivered(
     channel: &spawn_hosts::PumpChannel,
     reply_cap: u64,
