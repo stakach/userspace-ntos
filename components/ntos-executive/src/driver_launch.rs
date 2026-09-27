@@ -130,6 +130,8 @@ mod hosted_io_create_file_work;
 mod hosted_kernel_file_control;
 #[path = "hosted_kernel_file_read_query.rs"]
 mod hosted_kernel_file_read_query;
+#[path = "hosted_kernel_file_cancel.rs"]
+mod hosted_kernel_file_cancel;
 #[path = "hosted_kernel_file_write.rs"]
 mod hosted_kernel_file_write;
 #[path = "driver_share_access.rs"]
@@ -54479,8 +54481,16 @@ pub(crate) unsafe fn service_win32k_file_query(
     hosted_kernel_file_read_query::submit_win32k(ch, packet, packet_length, handle, expected_file)
 }
 
+pub(crate) unsafe fn service_win32k_file_cancel(
+    ch: &crate::spawn_hosts::PumpChannel,
+    handle: u64,
+) -> Option<i32> {
+    hosted_kernel_file_cancel::submit_win32k(ch, handle, 0)
+}
+
 pub(crate) unsafe fn redrive_hosted_driver_zw_read_query_file(handler: *mut ExecNtHandler) {
     hosted_kernel_file_read_query::redrive(handler);
+    hosted_kernel_file_cancel::redrive(handler);
 }
 
 pub(crate) unsafe fn service_hosted_query_path_forward(

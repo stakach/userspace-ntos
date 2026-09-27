@@ -4501,6 +4501,30 @@ pub(crate) unsafe fn service_win32k_file_query_request(
     crate::driver_launch::service_win32k_file_query(channel, packet, length, handle, spare)
 }
 
+pub(crate) unsafe fn service_win32k_file_cancel_request(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    handle: u64,
+    reserved1: u64,
+    reserved2: u64,
+    reserved3: u64,
+) -> Option<i32> {
+    if let Err(status) = authenticate_win32k_service_request(
+        channel, reply_cap, badge, mi, (crate::win32k_subsystem::W32_FILE_CANCEL_LABEL << 12) | 4,
+    ) {
+        return Some(status as i32);
+    }
+    if reserved1 != 0 || reserved2 != 0 || reserved3 != 0 {
+        return Some(nt_process::STATUS_INVALID_PARAMETER as i32);
+    }
+    if SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) == 0 {
+        return Some(0xC000_00A3u32 as i32);
+    }
+    crate::driver_launch::service_win32k_file_cancel(channel, handle)
+}
+
 /// Resolve only canonical routed File handles or exact win32k consumer pointer receipts.
 pub(crate) unsafe fn service_win32k_file_object_request(
     channel: &spawn_hosts::PumpChannel,
