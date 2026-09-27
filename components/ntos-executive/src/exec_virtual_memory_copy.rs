@@ -328,6 +328,12 @@ impl ExecNtHandler {
             nt_memory_manager::WORKING_SET_PAGE_SIZE,
             transition_protection,
         )?;
+        let resident = nt_memory_manager::admit_resident_reprotect(
+            pi as u64,
+            process,
+            page,
+            &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+        )?;
 
         if process_committed_mapping_basic_information(pi as u64, page).is_some() {
             let before = &mut *core::ptr::addr_of_mut!(COMMITTED_MAP_BEFORE);
@@ -338,16 +344,29 @@ impl ExecNtHandler {
             debug_assert_eq!(change.new_protection, plan.protection);
             let mut new = old;
             new.protect = plan.protection;
-            let owned = csrss_frame_get_exact_record(pi as u64, page)
-                .is_some_and(|record| record.owns_frame);
+            let owned = resident.is_some_and(|record| record.owns_frame);
             let old_rights =
                 nt_address_space::resident_backing_protection(old.type_, old.protect, owned);
             let new_rights =
                 nt_address_space::resident_backing_protection(new.type_, new.protect, owned);
             if old.type_ == nt_address_space::MEM_IMAGE {
-                vm_reprotect_resident_image_page(pi, page, old_rights, new_rights, target.pml4)?;
-            } else if csrss_frame_get_exact(pi as u64, page).0 != 0 {
-                vm_reprotect_private_page(pi, page, old_rights, new_rights, target.pml4)?;
+                vm_reprotect_resident_image_page(
+                    pi,
+                    process,
+                    page,
+                    old_rights,
+                    new_rights,
+                    target.pml4,
+                )?;
+            } else if resident.is_some() {
+                vm_reprotect_private_page(
+                    pi,
+                    process,
+                    page,
+                    old_rights,
+                    new_rights,
+                    target.pml4,
+                )?;
             }
             assert!(
                 process_committed_mapping_replace(pi as u64, *after),
@@ -358,8 +377,15 @@ impl ExecNtHandler {
             let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
             *after = *map;
             after.protect(page, PAGE_SIZE, plan.protection)?;
-            if csrss_frame_get_exact(pi as u64, page).0 != 0 {
-                vm_reprotect_private_page(pi, page, old.protect, plan.protection, target.pml4)?;
+            if resident.is_some() {
+                vm_reprotect_private_page(
+                    pi,
+                    process,
+                    page,
+                    old.protect,
+                    plan.protection,
+                    target.pml4,
+                )?;
             }
             *map = *after;
         }

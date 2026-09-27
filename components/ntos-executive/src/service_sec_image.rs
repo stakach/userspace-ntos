@@ -3481,14 +3481,20 @@ pub(crate) unsafe fn service_generic_section_fault(
     if nt_handler.restore_process_pagefile_page(pi, page, pml4, scratch_base)? {
         return Ok(true);
     }
-    if csrss_frame_get_exact(pi as u64, page).0 != 0 {
+    let resident = nt_memory_manager::admit_resident_reprotect(
+        pi as u64,
+        process,
+        page,
+        &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+    )?;
+    if resident.is_some() {
         if fault_access == nt_address_space::FaultAccess::Lock {
             return Ok(true);
         }
         let fault_plan = nt_address_space::mapped_view_fault_plan(view_info.protect, write_fault);
-        if write_fault && csrss_frame_get_exact_record(pi as u64, page).is_some_and(|record| record.owns_frame) {
+        if write_fault && resident.is_some_and(|record| record.owns_frame) {
             let protection = nt_address_space::private_backing_protection(view_info.protect);
-            vm_reprotect_private_page(pi, page, protection, protection, pml4)?;
+            vm_reprotect_private_page(pi, process, page, protection, protection, pml4)?;
             return Ok(true);
         }
         if write_fault && fault_plan.copy_on_write {
@@ -3523,7 +3529,14 @@ pub(crate) unsafe fn service_generic_section_fault(
                 section,
                 page_index,
             )?;
-            vm_reprotect_private_page(pi, page, old_protection, view_info.protect, pml4)?;
+            vm_reprotect_private_page(
+                pi,
+                process,
+                page,
+                old_protection,
+                view_info.protect,
+                pml4,
+            )?;
             return Ok(true);
         }
         return Err(0xC000_0005); // STATUS_ACCESS_VIOLATION
@@ -3858,6 +3871,15 @@ unsafe fn service_private_guard_page_fault(
     faults: usize,
 ) -> Result<bool, u32> {
     hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
+    let process = nt_handler
+        .capture_process_identity(pi)
+        .ok_or(nt_address_space::STATUS_ACCESS_VIOLATION)?;
+    let resident = nt_memory_manager::admit_resident_reprotect(
+        pi as u64,
+        process,
+        page,
+        &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+    )?;
     let Some(vm_map) = process_vm_region_map_mut(pi) else {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -3880,8 +3902,15 @@ unsafe fn service_private_guard_page_fault(
     };
     *after = *before;
     let plan = after.protect(page, nt_address_space::PAGE_SIZE, new_protection)?;
-    let map_result = if csrss_frame_get_exact(pi as u64, page).0 != 0 {
-        vm_reprotect_private_page(pi, page, old_protection, plan.new_protection, pml4)
+    let map_result = if resident.is_some() {
+        vm_reprotect_private_page(
+            pi,
+            process,
+            page,
+            old_protection,
+            plan.new_protection,
+            pml4,
+        )
     } else {
         vm_map_private_page(
             nt_handler,
