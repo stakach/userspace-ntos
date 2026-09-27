@@ -73,6 +73,8 @@ macro_rules! statuses {
 statuses! {
     /// The operation completed successfully.
     SUCCESS = 0x0000_0000u32;
+    /// An existing named object was opened because OBJ_OPENIF was specified.
+    OBJECT_NAME_EXISTS = 0x4000_0000u32;
     /// The operation is pending / asynchronous.
     PENDING = 0x0000_0103u32;
     /// The I/O manager must restart name resolution using the driver's reparse target.

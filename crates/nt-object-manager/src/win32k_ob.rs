@@ -20,6 +20,14 @@
 //! OBJECT_HEADER/OBJECT_TYPE); DESKTOP layout: `references/reactos/win32ss/user/ntuser/desktop.c`.
 
 use alloc::vec::Vec;
+use nt_status::NtStatus;
+
+/// A Desktop parse result admitted as one closeable object handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DesktopParseAdmission {
+    pub status: NtStatus,
+    pub handle: u64,
+}
 
 /// Pointer and handle counts for a provider-owned object projection. The provider retains one
 /// owner reference for the lifetime of the projection; every published handle owns one additional
@@ -1015,6 +1023,47 @@ impl ObHandleTable {
         (handle != 0).then_some((handle, pending.cache_window_station))
     }
 
+    /// Admit only the exact Desktop body returned by the WindowStation parse callout. A created
+    /// body must still own its provisional reference; an opened body must already be published.
+    /// Rejection does not consume pending state, so the caller can release its creator reference.
+    pub fn admit_desktop_parse_result(
+        &mut self,
+        status: NtStatus,
+        object: u64,
+        created: bool,
+    ) -> Result<DesktopParseAdmission, NtStatus> {
+        if status.is_error() {
+            return Err(status);
+        }
+        if (created && status != NtStatus::SUCCESS)
+            || (!created && status != NtStatus::SUCCESS && status != NtStatus::OBJECT_NAME_EXISTS)
+            || object == 0
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if self.kind_by_body(object) != Some(ObKind::Desktop) {
+            return Err(NtStatus::OBJECT_TYPE_MISMATCH);
+        }
+        let Some((_, handle_count)) = self.counts_by_body(object) else {
+            return Err(NtStatus::INVALID_PARAMETER);
+        };
+        let handle = if created {
+            if handle_count != 0 {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            self.insert_pending(object)
+        } else {
+            if handle_count == 0 {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            self.duplicate_by_body(ObKind::Desktop, object).unwrap_or(0)
+        };
+        if handle == 0 {
+            return Err(NtStatus::INSUFFICIENT_RESOURCES);
+        }
+        Ok(DesktopParseAdmission { status, handle })
+    }
+
     /// The cached input window-station handle (0 if none has been created yet).
     pub fn cached_winsta_handle(&self) -> u64 {
         self.winsta_handle
@@ -1393,6 +1442,85 @@ mod tests {
         assert_eq!(t.security_descriptor(handle), Some([3, 4].as_slice()));
         assert_eq!(t.release_pending_by_body(0x7000), None);
         assert_eq!(t.dereference_by_body(0x7000), Some(1));
+    }
+
+    #[test]
+    fn desktop_parse_created_result_promotes_only_returned_pending_body() {
+        let mut t = ObHandleTable::new();
+        assert!(t.latch_pending(ObKind::Desktop, 0x7000));
+        assert!(t.latch_pending(ObKind::Desktop, 0x8000));
+        let admitted = t
+            .admit_desktop_parse_result(NtStatus::SUCCESS, 0x8000, true)
+            .unwrap();
+        assert_eq!(admitted.status, NtStatus::SUCCESS);
+        assert_eq!(t.lookup(admitted.handle), Some((ObKind::Desktop, 0x8000)));
+        assert_eq!(t.counts_by_body(0x8000), Some((1, 1)));
+        assert_eq!(t.counts_by_body(0x7000), Some((1, 0)));
+    }
+
+    #[test]
+    fn desktop_parse_existing_result_mints_alias_and_preserves_openif_status() {
+        let mut t = ObHandleTable::new();
+        let original = t.register(ObKind::Desktop, 0x7000);
+        let admitted = t
+            .admit_desktop_parse_result(NtStatus::OBJECT_NAME_EXISTS, 0x7000, false)
+            .unwrap();
+        assert_eq!(admitted.status, NtStatus::OBJECT_NAME_EXISTS);
+        assert_ne!(admitted.handle, original);
+        assert_eq!(t.lookup(admitted.handle), Some((ObKind::Desktop, 0x7000)));
+        assert_eq!(t.counts_by_body(0x7000), Some((2, 2)));
+        assert!(t.close(admitted.handle));
+        assert_eq!(t.lookup(original), Some((ObKind::Desktop, 0x7000)));
+    }
+
+    #[test]
+    fn desktop_parse_rejects_inconsistent_results_without_consuming_pending_body() {
+        let mut t = ObHandleTable::new();
+        assert!(t.latch_pending(ObKind::Desktop, 0x7000));
+        let published = t.register(ObKind::Desktop, 0x8000);
+        let winsta = t.register(ObKind::WindowStation, 0x9000);
+        for (status, body, created, expected) in [
+            (
+                NtStatus::OBJECT_NAME_COLLISION,
+                0x7000,
+                true,
+                NtStatus::OBJECT_NAME_COLLISION,
+            ),
+            (NtStatus::SUCCESS, 0, true, NtStatus::INVALID_PARAMETER),
+            (
+                NtStatus::OBJECT_NAME_EXISTS,
+                0x7000,
+                true,
+                NtStatus::INVALID_PARAMETER,
+            ),
+            (
+                NtStatus::SUCCESS,
+                0x7000,
+                false,
+                NtStatus::INVALID_PARAMETER,
+            ),
+            (NtStatus::SUCCESS, 0x8000, true, NtStatus::INVALID_PARAMETER),
+            (
+                NtStatus::SUCCESS,
+                0x9000,
+                false,
+                NtStatus::OBJECT_TYPE_MISMATCH,
+            ),
+            (
+                NtStatus::SUCCESS,
+                0xa000,
+                true,
+                NtStatus::OBJECT_TYPE_MISMATCH,
+            ),
+        ] {
+            assert_eq!(
+                t.admit_desktop_parse_result(status, body, created),
+                Err(expected)
+            );
+        }
+        assert_eq!(t.counts_by_body(0x7000), Some((1, 0)));
+        assert_eq!(t.lookup(published), Some((ObKind::Desktop, 0x8000)));
+        assert_eq!(t.lookup(winsta), Some((ObKind::WindowStation, 0x9000)));
     }
 
     #[test]
