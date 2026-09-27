@@ -14534,14 +14534,18 @@ pub(crate) unsafe fn service_sec_image(
                             arg as *mut u8,
                             WIN32K_RECT_STAGE_BYTES,
                         );
-                        if img_spawn::client_copyin_mapped(
-                            pi as u64,
-                            rect_ptr,
-                            input,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        ) {
+                        if nt_handler.capture_process_identity(pi).is_some_and(|process| {
+                            img_spawn::client_copyin_process_mapped_for(
+                                pi as u64,
+                                process,
+                                rect_ptr,
+                                input,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                                true,
+                            )
+                        }) {
                             d_a1 = arg;
                             let n = USER_RECT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
                             if n < 48 {
@@ -14640,14 +14644,18 @@ pub(crate) unsafe fn service_sec_image(
                             arg as *mut u8,
                             WIN32K_PAINTSTRUCT_STAGE_BYTES,
                         );
-                        if img_spawn::client_copyin_mapped(
-                            pi as u64,
-                            d_a1,
-                            input,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        ) {
+                        if nt_handler.capture_process_identity(pi).is_some_and(|process| {
+                            img_spawn::client_copyin_process_mapped_for(
+                                pi as u64,
+                                process,
+                                d_a1,
+                                input,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                                true,
+                            )
+                        }) {
                             d_a1 = arg;
                             let n = PAINTSTRUCT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
                             if n < 32 {
