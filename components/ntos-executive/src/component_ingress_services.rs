@@ -102,12 +102,18 @@ pub(crate) unsafe fn park_retained_service(route: PeerRoute, token: u64) -> Resu
     park(route, token, WaitKind::RetainedSemantic)
 }
 
+fn service_source_supported(kind: PhysicalSourceKind) -> bool {
+    matches!(
+        kind,
+        PhysicalSourceKind::Primary
+            | PhysicalSourceKind::DispatchWorker { ordinal: 1.. }
+            | PhysicalSourceKind::SystemThread { .. }
+    )
+}
+
 unsafe fn park(route: PeerRoute, token: u64, kind: WaitKind) -> Result<(), Error> {
     let source = physical_source(route)?;
-    if !matches!(
-        source.kind,
-        PhysicalSourceKind::Primary | PhysicalSourceKind::SystemThread { .. }
-    ) {
+    if !service_source_supported(source.kind) {
         return Err(Error::Protocol);
     }
     let dispatch = dispatch(route)?;
@@ -661,7 +667,18 @@ pub(crate) unsafe fn retire_stopped_acknowledged_retained_service(
 
 #[cfg(test)]
 mod tests {
-    use super::WaitPhase;
+    use super::{service_source_supported, PhysicalSourceKind, WaitPhase};
+
+    #[test]
+    fn retained_services_accept_registered_dispatch_workers_but_not_interrupts() {
+        assert!(service_source_supported(PhysicalSourceKind::Primary));
+        assert!(service_source_supported(PhysicalSourceKind::DispatchWorker { ordinal: 1 }));
+        assert!(!service_source_supported(PhysicalSourceKind::DispatchWorker { ordinal: 0 }));
+        assert!(service_source_supported(PhysicalSourceKind::SystemThread { handle: 1 }));
+        assert!(!service_source_supported(PhysicalSourceKind::Interrupt(
+            nt_hosted_runtime::HostedIrqLaneIdentity::new(1, 1, 1).unwrap(),
+        )));
+    }
 
     #[test]
     fn completed_semantic_tombstone_does_not_block_next_dispatch() {
