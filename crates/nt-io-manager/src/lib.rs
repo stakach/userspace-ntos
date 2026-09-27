@@ -56,6 +56,7 @@ mod hosted_file;
 mod hosted_file_lifetime_tests;
 mod hosted_device_pointer;
 pub mod hosted_pool_range;
+pub mod hosted_kernel_read_delivery;
 pub mod inline_file_retirement;
 mod irp;
 pub mod io_create_file;
