@@ -365,6 +365,18 @@ struct PendingObjectEntry {
     cache_window_station: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PendingObjectRelease {
+    Retained(u32),
+    Final(ObKind),
+}
+
+#[derive(Clone, Copy)]
+enum BodyLocation {
+    Published(usize),
+    Pending(usize),
+}
+
 impl ObjectEntry {
     const fn new(kind: ObKind, body: u64) -> Self {
         Self {
@@ -689,29 +701,43 @@ impl ObHandleTable {
 
     /// Return `(pointer_count, handle_count)` for the canonical object containing `body`.
     pub fn counts_by_body(&self, body: u64) -> Option<(u32, u32)> {
-        self.slots
-            .iter()
-            .flatten()
-            .find(|entry| entry.body == body)
-            .map(|entry| (entry.pointer_count, entry.handle_count))
+        let entry = match self.unique_body_location(body)? {
+            BodyLocation::Published(index) => self.slots[index].as_ref()?,
+            BodyLocation::Pending(index) => &self.pending[index].as_ref()?.entry,
+        };
+        Some((entry.pointer_count, entry.handle_count))
     }
 
     /// Return the canonical USER object kind containing `body`.
     pub fn kind_by_body(&self, body: u64) -> Option<ObKind> {
-        self.slots
-            .iter()
-            .flatten()
-            .find(|entry| entry.body == body)
-            .map(|entry| entry.kind)
+        match self.unique_body_location(body)? {
+            BodyLocation::Published(index) => Some(self.slots[index].as_ref()?.kind),
+            BodyLocation::Pending(index) => Some(self.pending[index].as_ref()?.entry.kind),
+        }
     }
 
     /// Acquire one pointer reference by object body, as `ObReferenceObject` does.
     pub fn reference_by_body(&mut self, body: u64) -> Option<u32> {
-        self.slots
-            .iter_mut()
-            .flatten()
-            .find(|entry| entry.body == body)?
-            .reference()
+        match self.unique_body_location(body)? {
+            BodyLocation::Published(index) => self.slots[index].as_mut()?.reference(),
+            BodyLocation::Pending(index) => self.pending[index].as_mut()?.entry.reference(),
+        }
+    }
+
+    /// Consume one provisional creator/pointer reference. `Final` transfers cleanup ownership to
+    /// the caller; it must invoke the type delete procedure and retire the body allocation.
+    pub fn release_pending_by_body(&mut self, body: u64) -> Option<PendingObjectRelease> {
+        let BodyLocation::Pending(index) = self.unique_body_location(body)? else {
+            return None;
+        };
+        let pending = self.pending[index].as_mut()?;
+        if pending.entry.pointer_count > 1 {
+            pending.entry.pointer_count -= 1;
+            return Some(PendingObjectRelease::Retained(pending.entry.pointer_count));
+        }
+        let kind = pending.entry.kind;
+        self.pending[index] = None;
+        Some(PendingObjectRelease::Final(kind))
     }
 
     /// Release one non-handle pointer reference by object body. The handle-owned floor cannot be
@@ -722,6 +748,28 @@ impl ObHandleTable {
             .flatten()
             .find(|entry| entry.body == body)?
             .dereference()
+    }
+
+    fn unique_body_location(&self, body: u64) -> Option<BodyLocation> {
+        if body == 0 {
+            return None;
+        }
+        let mut location = None;
+        for (index, entry) in self.slots.iter().enumerate() {
+            if entry.is_some_and(|entry| entry.body == body) {
+                if location.replace(BodyLocation::Published(index)).is_some() {
+                    return None;
+                }
+            }
+        }
+        for (index, pending) in self.pending.iter().enumerate() {
+            if pending.is_some_and(|pending| pending.entry.body == body) {
+                if location.replace(BodyLocation::Pending(index)).is_some() {
+                    return None;
+                }
+            }
+        }
+        location
     }
 
     fn window_station_body_for_handle(&self, root_handle: u64) -> Option<u64> {
@@ -920,9 +968,10 @@ impl ObHandleTable {
         {
             return false;
         }
-        let Some(entry) = ObjectEntry::with_security(kind, body, descriptor) else {
+        let Some(mut entry) = ObjectEntry::with_security(kind, body, descriptor) else {
             return false;
         };
+        entry.handle_count = 0;
         let Some(slot) = self.pending.iter_mut().find(|slot| slot.is_none()) else {
             return false;
         };
@@ -960,7 +1009,8 @@ impl ObHandleTable {
         else {
             return None;
         };
-        let pending = self.pending[index].take().unwrap();
+        let mut pending = self.pending[index].take().unwrap();
+        pending.entry.handle_count = 1;
         let handle = self.register_entry(pending.entry, pending.cache_window_station);
         (handle != 0).then_some((handle, pending.cache_window_station))
     }
@@ -1311,6 +1361,57 @@ mod tests {
     }
 
     #[test]
+    fn pending_creator_reference_retires_only_its_exact_body() {
+        let mut t = ObHandleTable::new();
+        assert!(t.latch_pending_with_security(ObKind::Desktop, 0x7000, Some(&[1, 2])));
+        assert!(t.latch_pending(ObKind::WindowStation, 0x8000));
+        assert_eq!(t.counts_by_body(0x7000), Some((1, 0)));
+        assert_eq!(t.reference_by_body(0x7000), Some(2));
+        assert_eq!(
+            t.release_pending_by_body(0x7000),
+            Some(PendingObjectRelease::Retained(1))
+        );
+        assert_eq!(
+            t.release_pending_by_body(0x7000),
+            Some(PendingObjectRelease::Final(ObKind::Desktop))
+        );
+        assert_eq!(t.counts_by_body(0x7000), None);
+        assert_eq!(t.security_descriptor_by_body(0x7000), None);
+        assert_eq!(t.counts_by_body(0x8000), Some((1, 0)));
+        assert_eq!(t.insert_pending(0x7000), 0);
+        assert_ne!(t.insert_pending(0x8000), 0);
+    }
+
+    #[test]
+    fn pending_promotion_consumes_creator_reference_as_handle() {
+        let mut t = ObHandleTable::new();
+        assert!(t.latch_pending_with_security(ObKind::Desktop, 0x7000, Some(&[3, 4])));
+        assert_eq!(t.reference_by_body(0x7000), Some(2));
+        let handle = t.insert_pending(0x7000);
+        assert_ne!(handle, 0);
+        assert_eq!(t.counts_by_body(0x7000), Some((2, 1)));
+        assert_eq!(t.security_descriptor(handle), Some([3, 4].as_slice()));
+        assert_eq!(t.release_pending_by_body(0x7000), None);
+        assert_eq!(t.dereference_by_body(0x7000), Some(1));
+    }
+
+    #[test]
+    fn pending_release_rejects_ambiguous_or_published_bodies() {
+        let mut t = ObHandleTable::new();
+        assert!(t.latch_pending(ObKind::Desktop, 0x7000));
+        let other = t.register(ObKind::WindowStation, 0x7000);
+        assert_ne!(other, 0);
+        assert_eq!(t.release_pending_by_body(0x7000), None);
+        assert_eq!(t.lookup(other), Some((ObKind::WindowStation, 0x7000)));
+
+        let mut published = ObHandleTable::new();
+        assert!(published.latch_pending(ObKind::Desktop, 0x8000));
+        assert_ne!(published.insert_pending(0x8000), 0);
+        assert_eq!(published.release_pending_by_body(0x8000), None);
+        assert_eq!(published.counts_by_body(0x8000), Some((1, 1)));
+    }
+
+    #[test]
     fn pending_window_station_cache_policy_follows_its_body() {
         let mut t = ObHandleTable::new();
         assert!(t.latch_pending(ObKind::WindowStation, 0x7700));
@@ -1357,6 +1458,11 @@ mod tests {
             full.security_descriptor_by_body(0x9000),
             Some((ObKind::Desktop, Some([3, 4].as_slice())))
         );
+        assert_eq!(
+            full.release_pending_by_body(0x9000),
+            Some(PendingObjectRelease::Final(ObKind::Desktop))
+        );
+        assert_eq!(full.security_descriptor_by_body(0x9000), None);
     }
 
     #[test]
