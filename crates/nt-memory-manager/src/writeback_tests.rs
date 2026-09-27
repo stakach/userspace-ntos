@@ -20,11 +20,22 @@ struct Io {
     aliases: Vec<SectionPageAlias>,
     fail_alias: Option<usize>,
     events: Vec<char>,
+    rearm_current: Option<ProcessIdentity>,
+    rearm_view: Option<MemoryLifetime>,
+    rearm_frame: Option<MemoryLifetime>,
 }
 
 impl SectionWritebackIo for Io {
     fn rearm_alias(&mut self, alias: SectionPageAlias) -> Result<(), u32> {
         self.events.push('r');
+        if self.rearm_current.is_some() {
+            crate::admit_section_alias_rearm(
+                alias,
+                self.rearm_current,
+                self.rearm_view,
+                self.rearm_frame,
+            )?;
+        }
         if self.fail_alias == Some(self.aliases.len()) {
             return Err(IO_ERROR);
         }
@@ -44,6 +55,114 @@ impl SectionWritebackIo for Io {
         self.barriers += 1;
         self.barrier_status
     }
+}
+
+#[test]
+fn stale_alias_rearm_has_no_write_effect_and_preserves_dirty_retry() {
+    let old = ProcessIdentity {
+        pid: 41,
+        generation: ProcessGeneration::Hosted(7),
+    };
+    let new = ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Hosted(8),
+    };
+    let mut table = GenericSectionTable::new();
+    let section = table
+        .create(
+            2,
+            0x40,
+            0x1000,
+            PAGE_READWRITE,
+            SECTION_ATTR_SEC_COMMIT,
+            GenericSectionBacking::overlay(7, file_identity(7), 0x1000),
+        )
+        .unwrap();
+    assert!(table.map_view_with_lifetime(
+        8,
+        MemoryLifetime::Process(old),
+        section,
+        0x20000,
+        0x1000,
+        0,
+    ));
+    assert!(table.set_page_frame(section, 0, 100));
+    assert!(table.mark_page_dirty(section, 0));
+    let plan = table.plan_flush(8, 0x20000, 0).unwrap();
+    let mut stale = Io {
+        rearm_current: Some(new),
+        rearm_view: Some(MemoryLifetime::Process(old)),
+        rearm_frame: Some(MemoryLifetime::Process(old)),
+        ..Io::default()
+    };
+    assert_eq!(
+        table.writeback(plan, &mut stale).status,
+        STATUS_INVALID_HANDLE
+    );
+    assert_eq!(stale.events, vec!['r']);
+    assert!(stale.aliases.is_empty());
+    assert_eq!(table.prepare_writeback(plan).unwrap().len(), 1);
+
+    assert!(table
+        .unmap_view_exact(8, MemoryLifetime::Process(old), 0x20000)
+        .is_some());
+    assert!(table.map_view_with_lifetime(
+        8,
+        MemoryLifetime::Process(new),
+        section,
+        0x20000,
+        0x1000,
+        0,
+    ));
+    let retry_plan = table.plan_flush(8, 0x20000, 0).unwrap();
+    let mut retry = Io {
+        rearm_current: Some(new),
+        rearm_view: Some(MemoryLifetime::Process(new)),
+        rearm_frame: None,
+        ..Io::default()
+    };
+    assert_eq!(table.writeback(retry_plan, &mut retry).status, 0);
+    assert_eq!(retry.events, vec!['r', 'w', 'p']);
+    assert!(table.prepare_writeback(retry_plan).unwrap().is_empty());
+}
+
+#[test]
+fn section_alias_rearm_rejects_foreign_view_or_resident_frame() {
+    let owner = ProcessIdentity {
+        pid: 41,
+        generation: ProcessGeneration::Hosted(7),
+    };
+    let replacement = ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Hosted(8),
+    };
+    let alias = SectionPageAlias {
+        pi: 8,
+        page: 0x20000,
+        lifetime: MemoryLifetime::Process(owner),
+    };
+    assert_eq!(
+        crate::admit_section_alias_rearm(
+            alias,
+            Some(owner),
+            Some(MemoryLifetime::Process(replacement)),
+            None,
+        ),
+        Err(STATUS_NOT_MAPPED_VIEW),
+    );
+    assert_eq!(
+        crate::admit_section_alias_rearm(
+            alias,
+            Some(owner),
+            Some(alias.lifetime),
+            Some(MemoryLifetime::Process(replacement)),
+        ),
+        Err(STATUS_INVALID_HANDLE),
+    );
+    assert_eq!(
+        crate::admit_section_alias_rearm(alias, Some(owner), Some(alias.lifetime), None),
+        Ok(()),
+    );
 }
 
 fn fixture() -> (GenericSectionTable, GenericSectionFlushPlan) {

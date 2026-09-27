@@ -9,6 +9,10 @@ pub(crate) enum Access<'a> {
         process: ProcessIdentity,
         handler: &'a ExecNtHandler,
     },
+    SectionWriteback {
+        alias: nt_memory_manager::writeback::SectionPageAlias,
+        context: ExecLoopCtx,
+    },
     UserStack {
         permit: &'a UserStackRetirementPermit<'a>,
         handler: &'a ExecNtHandler,
@@ -20,12 +24,37 @@ impl Access<'_> {
         match self {
             Self::Ordinary => hosted_thread_memory_retirement_access(pi, page, 4096),
             Self::Process { process, handler } => {
-                let pi = usize::try_from(pi)
-                    .map_err(|_| nt_address_space::STATUS_ACCESS_VIOLATION)?;
+                let pi =
+                    usize::try_from(pi).map_err(|_| nt_address_space::STATUS_ACCESS_VIOLATION)?;
                 if !process.is_valid() || handler.capture_process_identity(pi) != Some(*process) {
                     return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
                 }
                 hosted_thread_memory_retirement_access(pi as u64, page, 4096)
+            }
+            Self::SectionWriteback { alias, context } => {
+                if pi != alias.pi as u64 || page != alias.page {
+                    return Err(nt_fs::STATUS_INVALID_HANDLE);
+                }
+                let selected =
+                    unsafe { context.for_process(alias.pi) }.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                let current = u32::try_from(
+                    unsafe { (&*selected.procs).get(alias.pi) }
+                        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+                        .pid,
+                )
+                .ok()
+                .map(|pid| ProcessIdentity {
+                    pid,
+                    generation: nt_user_host::process_identity::ProcessGeneration::Hosted(
+                        selected.owner_generation,
+                    ),
+                });
+                let view = unsafe { (&*selected.generic_sections).view_for_page(alias.pi, page) }
+                    .map(|(_, view)| view.lifetime);
+                let frame =
+                    unsafe { csrss_frame_get_exact_record(pi, page) }.map(|record| record.lifetime);
+                nt_memory_manager::admit_section_alias_rearm(*alias, current, view, frame)?;
+                hosted_thread_memory_retirement_access(pi, page, 4096)
             }
             Self::UserStack { permit, handler } => {
                 let pi =
@@ -59,6 +88,10 @@ impl Access<'_> {
         match self {
             Self::Ordinary => None,
             Self::Process { process, .. } => Some(*process),
+            Self::SectionWriteback { alias, .. } => match alias.lifetime {
+                nt_memory_manager::MemoryLifetime::Process(process) => Some(process),
+                nt_memory_manager::MemoryLifetime::UnpublishedImage(_) => None,
+            },
             Self::UserStack { permit, .. } => {
                 let identity = permit.owner().identity();
                 Some(ProcessIdentity {

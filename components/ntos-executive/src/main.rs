@@ -12629,6 +12629,16 @@ unsafe fn vm_reprotect_private_page(
     if frame == 0 {
         return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
     }
+    vm_reprotect_private_frame(frame, page, old_protection, new_protection, pml4)
+}
+
+unsafe fn vm_reprotect_private_frame(
+    frame: u64,
+    page: u64,
+    old_protection: u32,
+    new_protection: u32,
+    pml4: u64,
+) -> Result<(), u32> {
     if page_unmap_r(frame) != 0 {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
