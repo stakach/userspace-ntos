@@ -373,9 +373,13 @@ fn body_security_assignment_rejects_wrong_kind_ambiguity_and_oversize_atomically
     table.latch_pending(ObKind::Other, 0x9000);
     let handle = table.insert_pending(0x9000);
     assert_ne!(handle, 0);
-    assert!(table.set_security_descriptor_by_body(0x7000, ObKind::Desktop, &[4]));
-    table.register(ObKind::WindowStation, 0x7000);
     assert!(!table.set_security_descriptor_by_body(0x7000, ObKind::Desktop, &[4]));
+
+    let mut unique = ObHandleTable::new();
+    unique.register(ObKind::Desktop, 0x7000);
+    assert!(unique.set_security_descriptor_by_body(0x7000, ObKind::Desktop, &[4]));
+    unique.register(ObKind::WindowStation, 0x7000);
+    assert!(!unique.set_security_descriptor_by_body(0x7000, ObKind::Desktop, &[5]));
 }
 
 #[test]
@@ -407,9 +411,12 @@ fn duplicate_canonical_or_pending_bodies_are_rejected_as_ambiguous() {
     table.register(ObKind::WindowStation, 0x7000);
     assert_eq!(table.security_descriptor_by_body(0x7000), None);
     table.register(ObKind::Desktop, 0x8000);
-    table.latch_pending(ObKind::Desktop, 0x8000);
-    assert_eq!(table.security_descriptor_by_body(0x8000), None);
-    table.latch_pending(ObKind::Other, 0x9000);
+    assert!(!table.latch_pending(ObKind::Desktop, 0x8000));
+    assert_eq!(
+        table.security_descriptor_by_body(0x8000),
+        Some((ObKind::Desktop, None))
+    );
+    assert!(table.latch_pending(ObKind::Other, 0x9000));
     assert_eq!(
         table.security_descriptor_by_body(0x8000),
         Some((ObKind::Desktop, None))
