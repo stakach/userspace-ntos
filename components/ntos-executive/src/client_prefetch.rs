@@ -38,6 +38,18 @@ fn process(pi: u64) -> Result<(PrefetchProcess, u64), u32> {
     ))
 }
 
+fn process_for(
+    pi: u64,
+    identity: nt_memory_manager::ProcessIdentity,
+) -> Result<(PrefetchProcess, u64), u32> {
+    let requested = PrefetchProcess::for_identity(pi, identity)?;
+    let current = process(pi)?;
+    if current.0 != requested {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
+    Ok(current)
+}
+
 fn lookup(pi: u64, page: u64) -> Result<Option<PrefetchPage>, u32> {
     hosted_thread_memory_access(pi, page, 4096)?;
     if !unsafe { (&*core::ptr::addr_of!(FRAMES)).contains(pi, page) } {
@@ -144,6 +156,16 @@ pub(crate) fn client_copyin_frame_retry_retirement(pi: u64, page: u64) -> Result
     unsafe { (&mut *core::ptr::addr_of_mut!(FRAMES)).retry_retirement(process, page, &mut Cleanup) }
 }
 
+pub(crate) fn client_copyin_frame_retry_retirement_for(
+    pi: u64,
+    identity: nt_memory_manager::ProcessIdentity,
+    page: u64,
+) -> Result<(), u32> {
+    hosted_thread_memory_access(pi, page, 4096)?;
+    let (process, _) = process_for(pi, identity)?;
+    unsafe { (&mut *core::ptr::addr_of_mut!(FRAMES)).retry_retirement(process, page, &mut Cleanup) }
+}
+
 pub(crate) fn client_copyin_frame_build(
     pi: u64,
     page: u64,
@@ -162,6 +184,28 @@ pub(crate) fn client_copyin_frame_build(
             EXECUTIVE_SCRATCH_LAYOUT.alias_address(owner_scratch, index as u64)
         })?;
         // The backend only uses direct capability syscalls and the immutable PE; no registry reentry.
+        frames.build(reservation, &mut Fill { pe, rva })
+    }
+}
+
+pub(crate) fn client_copyin_frame_build_for(
+    pi: u64,
+    identity: nt_memory_manager::ProcessIdentity,
+    page: u64,
+    scratch_base: u64,
+    pe: &nt_pe_loader::PeFile,
+    rva: u32,
+) -> Result<(), u32> {
+    hosted_thread_memory_access(pi, page, 4096)?;
+    let (process, owner_scratch) = process_for(pi, identity)?;
+    if scratch_base != owner_scratch {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
+    unsafe {
+        let frames = &mut *core::ptr::addr_of_mut!(FRAMES);
+        let reservation = frames.reserve(process, page, |index| {
+            EXECUTIVE_SCRATCH_LAYOUT.alias_address(owner_scratch, index as u64)
+        })?;
         frames.build(reservation, &mut Fill { pe, rva })
     }
 }

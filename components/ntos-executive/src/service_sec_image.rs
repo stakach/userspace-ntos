@@ -6903,21 +6903,17 @@ unsafe fn try_capture_client_string_arg_impl(
     if !copy_client_string_bytes(pi, process, sp_va, &mut sd, filled_pages, nfilled, scratch_base) {
         return None;
     }
-    let (length, maximum, ansi) = if large {
-        let maximum_and_ansi = u32::from_le_bytes(sd[4..8].try_into().unwrap());
-        (
-            u32::from_le_bytes(sd[0..4].try_into().unwrap()) as u64,
-            (maximum_and_ansi & 0x7fff_ffff) as u64,
-            maximum_and_ansi & 0x8000_0000 != 0,
-        )
+    let (length, maximum, ansi, buffer) = if large {
+        let input = nt_kernel_exec::user_string::large_string_input(&sd, RC_ARG_BUF_CAP)?;
+        (input.length, input.maximum, input.ansi, input.buffer)
     } else {
         (
             u16::from_le_bytes([sd[0], sd[1]]) as u64,
             u16::from_le_bytes([sd[2], sd[3]]) as u64,
             false,
+            u64::from_le_bytes(sd[8..16].try_into().unwrap()),
         )
     };
-    let buffer = u64::from_le_bytes(sd[8..16].try_into().unwrap());
     let terminator_bytes = if ansi { 1 } else { 2 };
     if (!ansi && length & 1 != 0)
         || maximum < length
@@ -15493,29 +15489,22 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         EXPLORER_CREATE_WINDOW_STRING_CAPTURES.fetch_add(1, Ordering::Relaxed);
                     }
-                } else if m0 == 0x1080 && interactive_gui_client {
+                } else if m0 == 0x1080 {
                     // NtUserDefSetText takes HWND plus a client PLARGE_STRING. It often runs from
                     // DefWindowProc while win32k is parked in a user callback; capture the counted
                     // string before isolated win32k probes the client's raw pointer graph.
                     if d_a1 != 0 {
-                        prefill_client_large_string_pages(
-                            pi as u64,
-                            d_a1,
-                            scratch_base,
-                            &mut faults,
-                            filled_pages,
-                            &reg,
-                            dll_pe_store.as_slice(),
-                        );
-                        match try_capture_client_string_arg(
-                            pi as u64,
-                            d_a1,
-                            true,
-                            true,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        ) {
+                        let capture = nt_handler.capture_process_identity(pi).and_then(|process| {
+                            prefill_client_large_string_pages_for(
+                                pi as u64, process, d_a1, scratch_base,
+                                filled_pages, faults as usize, &reg, dll_pe_store.as_slice(),
+                            );
+                            try_capture_client_string_arg_for(
+                                pi as u64, process, d_a1, true, true,
+                                filled_pages, faults as usize, scratch_base,
+                            )
+                        });
+                        match capture {
                             Some(capture) => {
                                 d_a1 = capture.desc;
                                 let n = DEF_SET_TEXT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
@@ -26693,6 +26682,47 @@ unsafe fn ensure_client_copyin_dll_page(
     client_copyin_frame_build(pi, page, scratch_base, tpe, rva).is_ok()
 }
 
+unsafe fn ensure_client_copyin_dll_page_for(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    page: u64,
+    scratch_base: u64,
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
+) -> bool {
+    if hosted_thread_memory_access(pi, page, nt_address_space::PAGE_SIZE).is_err()
+        || client_copyin_frame_retry_retirement_for(pi, process, page).is_err()
+    {
+        return false;
+    }
+    let Ok(prefetch) = client_copyin_frame_lookup_for(pi, process, page) else {
+        return false;
+    };
+    let Ok(backing) = nt_memory_manager::admit_client_copy_backing(
+        pi,
+        process,
+        page,
+        &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+        shared_image_mapping_identity(pi, page),
+    ) else {
+        return false;
+    };
+    if backing.resident.is_some()
+        || backing.shared_image
+        || prefetch.is_some()
+        || dll_cache_get(page) != 0
+    {
+        return true;
+    }
+    let Some((index, rva)) = reg.dll_for_page(pi as usize, page) else {
+        return false;
+    };
+    let Some(pe) = dll_pes.get(index).and_then(Option::as_ref) else {
+        return false;
+    };
+    client_copyin_frame_build_for(pi, process, page, scratch_base, pe, rva).is_ok()
+}
+
 unsafe fn prefill_client_copyin_dll_range_pages(
     pi: u64,
     va: u64,
@@ -26759,6 +26789,41 @@ unsafe fn prefill_client_large_string_pages(
         }
         let page_remaining = 0x1000usize - (current as usize & 0xfff);
         offset += page_remaining.min(length - offset);
+    }
+}
+
+unsafe fn prefill_client_large_string_pages_for(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    descriptor_va: u64,
+    scratch_base: u64,
+    filled_pages: &[u64; 512],
+    nfilled: usize,
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
+) {
+    let mut raw = [0u8; 16];
+    if !img_spawn::client_copyin_process_mapped_for(
+        pi, process, descriptor_va, &mut raw, filled_pages, nfilled, scratch_base, true,
+    ) {
+        return;
+    }
+    let Some(input) = nt_kernel_exec::user_string::large_string_input(&raw, RC_ARG_BUF_CAP) else {
+        return;
+    };
+    if input.length == 0
+        || hosted_thread_memory_access(pi, input.buffer, input.length).is_err()
+    {
+        return;
+    }
+    let mut page = input.buffer & !0xfffu64;
+    let last_page = (input.buffer + input.length - 1) & !0xfffu64;
+    loop {
+        let _ = ensure_client_copyin_dll_page_for(pi, process, page, scratch_base, reg, dll_pes);
+        if page == last_page {
+            break;
+        }
+        page += 0x1000;
     }
 }
 

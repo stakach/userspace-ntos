@@ -7,6 +7,37 @@ pub struct RequiredUnicodeString {
     pub probe_length: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LargeStringInput {
+    pub buffer: u64,
+    pub length: u64,
+    pub maximum: u64,
+    pub ansi: bool,
+}
+
+pub fn large_string_input(raw: &[u8; 16], capture_cap: u64) -> Option<LargeStringInput> {
+    let length = u32::from_le_bytes(raw[0..4].try_into().ok()?) as u64;
+    let maximum_and_ansi = u32::from_le_bytes(raw[4..8].try_into().ok()?);
+    let maximum = (maximum_and_ansi & 0x7fff_ffff) as u64;
+    let ansi = maximum_and_ansi & 0x8000_0000 != 0;
+    let buffer = u64::from_le_bytes(raw[8..16].try_into().ok()?);
+    let terminator = if ansi { 1 } else { 2 };
+    if (!ansi && length & 1 != 0)
+        || maximum < length
+        || length.checked_add(terminator)? > capture_cap
+        || (length != 0 && buffer == 0)
+        || buffer.checked_add(length).is_none()
+    {
+        return None;
+    }
+    Some(LargeStringInput {
+        buffer,
+        length,
+        maximum,
+        ansi,
+    })
+}
+
 pub fn required_unicode_string(
     raw: &[u8; 16],
     capture_cap: usize,
@@ -51,6 +82,43 @@ mod tests {
         raw[2..4].copy_from_slice(&maximum.to_le_bytes());
         raw[8..16].copy_from_slice(&buffer.to_le_bytes());
         raw
+    }
+
+    fn large_descriptor(length: u32, maximum: u32, ansi: bool, buffer: u64) -> [u8; 16] {
+        let mut raw = [0; 16];
+        raw[0..4].copy_from_slice(&length.to_le_bytes());
+        raw[4..8].copy_from_slice(&(maximum | if ansi { 0x8000_0000 } else { 0 }).to_le_bytes());
+        raw[8..16].copy_from_slice(&buffer.to_le_bytes());
+        raw
+    }
+
+    #[test]
+    fn large_string_accepts_bounded_ansi_unicode_and_empty_inputs() {
+        assert_eq!(
+            large_string_input(&large_descriptor(3, 3, true, 0x1000), 0x200),
+            Some(LargeStringInput {
+                buffer: 0x1000,
+                length: 3,
+                maximum: 3,
+                ansi: true
+            })
+        );
+        assert_eq!(
+            large_string_input(&large_descriptor(0x1fe, 0x1fe, false, 0x1000), 0x200),
+            Some(LargeStringInput {
+                buffer: 0x1000,
+                length: 0x1fe,
+                maximum: 0x1fe,
+                ansi: false
+            })
+        );
+        assert!(large_string_input(&large_descriptor(0, 0, false, 0), 0x200).is_some());
+        assert!(large_string_input(&large_descriptor(3, 3, false, 0x1000), 0x200).is_none());
+        assert!(large_string_input(&large_descriptor(4, 2, false, 0x1000), 0x200).is_none());
+        assert!(
+            large_string_input(&large_descriptor(0x200, 0x200, false, 0x1000), 0x200).is_none()
+        );
+        assert!(large_string_input(&large_descriptor(2, 2, false, u64::MAX), 0x200).is_none());
     }
 
     #[test]
