@@ -1,9 +1,14 @@
 //! Narrow dynamic-stack cleanup admission through the retained runtime, never ordinary mapping.
 use super::*;
+use nt_user_host::process_identity::ProcessIdentity;
 use nt_user_host::thread_memory_retirement_access::UserStackRetirementPermit;
 
 pub(crate) enum Access<'a> {
     Ordinary,
+    Process {
+        process: ProcessIdentity,
+        handler: &'a ExecNtHandler,
+    },
     UserStack {
         permit: &'a UserStackRetirementPermit<'a>,
         handler: &'a ExecNtHandler,
@@ -14,6 +19,14 @@ impl Access<'_> {
     pub(crate) fn check(&self, pi: u64, page: u64) -> Result<(), u32> {
         match self {
             Self::Ordinary => hosted_thread_memory_retirement_access(pi, page, 4096),
+            Self::Process { process, handler } => {
+                let pi = usize::try_from(pi)
+                    .map_err(|_| nt_address_space::STATUS_ACCESS_VIOLATION)?;
+                if !process.is_valid() || handler.capture_process_identity(pi) != Some(*process) {
+                    return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
+                }
+                hosted_thread_memory_retirement_access(pi as u64, page, 4096)
+            }
             Self::UserStack { permit, handler } => {
                 let pi =
                     usize::try_from(pi).map_err(|_| nt_address_space::STATUS_ACCESS_VIOLATION)?;
@@ -38,6 +51,20 @@ impl Access<'_> {
                     return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
                 }
                 Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn expected_process(&self) -> Option<ProcessIdentity> {
+        match self {
+            Self::Ordinary => None,
+            Self::Process { process, .. } => Some(*process),
+            Self::UserStack { permit, .. } => {
+                let identity = permit.owner().identity();
+                Some(ProcessIdentity {
+                    pid: identity.pid,
+                    generation: identity.process_generation,
+                })
             }
         }
     }
