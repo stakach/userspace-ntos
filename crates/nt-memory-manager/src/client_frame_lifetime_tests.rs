@@ -137,6 +137,50 @@ fn resident_reprotect_refuses_foreign_generation_before_mapping_effect() {
     );
 }
 
+#[test]
+fn client_alias_source_requires_exact_live_generation() {
+    let old = ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Hosted(1),
+    };
+    let new = ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Hosted(2),
+    };
+    let mut registry = ClientFrameRegistry::new();
+    registry
+        .insert(
+            7,
+            crate::MemoryLifetime::Process(old),
+            0x1000,
+            11,
+            0,
+            0,
+            0,
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        crate::admit_client_alias_source(7, new, 0x1000, &registry),
+        Err(crate::STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        crate::admit_client_alias_source(7, old, 0x1000, &registry),
+        Ok(Some(11))
+    );
+    assert_eq!(
+        crate::admit_client_alias_source(7, new, 0x2000, &registry),
+        Ok(None)
+    );
+    let record = registry.get(7, 0x1000).unwrap();
+    registry.begin_reclaim_exact(record, RELEASE).unwrap();
+    assert_eq!(
+        crate::admit_client_alias_source(7, old, 0x1000, &registry),
+        Err(crate::STATUS_INVALID_HANDLE)
+    );
+    assert!(registry.get(7, 0x1000).unwrap().is_reclaiming());
+}
+
 fn populated() -> (ClientFrameRegistry, ClientFrameRecord) {
     let mut registry = ClientFrameRegistry::new();
     registry

@@ -19,3 +19,19 @@ pub fn admit_resident_reprotect(
         record => Ok(record),
     }
 }
+
+/// Select a clone source only when the exact process still owns a live resident row.
+pub fn admit_client_alias_source(
+    pi: u64,
+    process: ProcessIdentity,
+    page: u64,
+    frames: &ClientFrameRegistry,
+) -> Result<Option<u64>, u32> {
+    match admit_resident_reprotect(pi, process, page, frames)? {
+        Some(record) => record
+            .clone_source_cap()
+            .map(Some)
+            .ok_or(STATUS_INVALID_HANDLE),
+        None => Ok(None),
+    }
+}
