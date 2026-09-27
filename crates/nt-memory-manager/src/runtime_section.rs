@@ -18,7 +18,7 @@ pub use retirement::{
     PendingSectionFrames, SectionRetirement, SectionRetirementIo, SectionRetirementResource,
 };
 
-use crate::{PAGE_NOACCESS, STATUS_INVALID_PARAMETER_2, STATUS_NOT_MAPPED_VIEW};
+use crate::{MemoryLifetime, PAGE_NOACCESS, STATUS_INVALID_PARAMETER_2, STATUS_NOT_MAPPED_VIEW};
 
 pub const GENERIC_SECTION_BACKING_NONE: u8 = 0;
 pub const GENERIC_SECTION_BACKING_ANON: u8 = 1;
@@ -147,6 +147,7 @@ impl GenericSection {
 pub struct GenericSectionView {
     pub live: bool,
     pub pi: usize,
+    pub lifetime: MemoryLifetime,
     pub section_index: usize,
     pub base: u64,
     pub size: u64,
@@ -168,6 +169,7 @@ impl GenericSectionView {
         Self {
             live: false,
             pi: 0,
+            lifetime: MemoryLifetime::UnpublishedImage(0),
             section_index: usize::MAX,
             base: 0,
             size: 0,
@@ -496,20 +498,22 @@ impl GenericSectionTable {
             .filter(|section| section.live)
     }
 
-    pub fn map_view(
+    pub fn map_view_with_lifetime(
         &mut self,
         pi: usize,
+        lifetime: MemoryLifetime,
         section_index: usize,
         base: u64,
         size: u64,
         section_offset: u64,
     ) -> bool {
-        if self.section(section_index).is_none() || base == 0 || size == 0 {
+        if !lifetime.is_valid() || self.section(section_index).is_none() || base == 0 || size == 0 {
             return false;
         }
         let view = GenericSectionView {
             live: true,
             pi,
+            lifetime,
             section_index,
             base,
             size,
@@ -523,6 +527,46 @@ impl GenericSectionTable {
         }
     }
 
+    #[cfg(test)]
+    pub fn map_view(
+        &mut self,
+        pi: usize,
+        section_index: usize,
+        base: u64,
+        size: u64,
+        section_offset: u64,
+    ) -> bool {
+        self.map_view_with_lifetime(
+            pi,
+            MemoryLifetime::Process(crate::ProcessIdentity {
+                pid: pi as u32 + 1,
+                generation: crate::ProcessGeneration::Hosted(1),
+            }),
+            section_index,
+            base,
+            size,
+            section_offset,
+        )
+    }
+
+    pub fn unmap_view_exact(
+        &mut self,
+        pi: usize,
+        lifetime: MemoryLifetime,
+        base: u64,
+    ) -> Option<GenericSectionView> {
+        for view in &mut self.views {
+            if view.live && view.pi == pi && view.lifetime == lifetime && view.base == base {
+                let removed = *view;
+                *view = GenericSectionView::empty();
+                self.clear_section_if_unreferenced(removed.section_index);
+                return Some(removed);
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
     pub fn unmap_view(&mut self, pi: usize, base: u64) -> Option<GenericSectionView> {
         for view in &mut self.views {
             if view.live && view.pi == pi && view.base == base {
@@ -540,6 +584,17 @@ impl GenericSectionTable {
             .iter()
             .copied()
             .find(|view| view.live && view.pi == pi)
+    }
+
+    pub fn first_view_for_process_exact(
+        &self,
+        pi: usize,
+        lifetime: MemoryLifetime,
+    ) -> Option<GenericSectionView> {
+        self.views
+            .iter()
+            .copied()
+            .find(|view| view.live && view.pi == pi && view.lifetime == lifetime)
     }
 
     pub fn view_for_page(&self, pi: usize, page: u64) -> Option<(usize, GenericSectionView)> {

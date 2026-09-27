@@ -35,10 +35,7 @@ fn growth_zeroes_only_newly_valid_tail_and_preserves_dirty_prefix() {
     assert_eq!(
         io.events,
         [
-            Event::Rearm(SectionPageAlias {
-                pi: 1,
-                page: 0x11000
-            }),
+            Event::Rearm(SectionPageAlias::for_test(1, 0x11000)),
             Event::Prepare(101),
             Event::Resize(0x1a00),
             Event::Zero(101, 0x800, 0x200),

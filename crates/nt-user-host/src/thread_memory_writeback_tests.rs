@@ -3,8 +3,12 @@ use alloc::vec::Vec;
 use nt_memory_manager::writeback::{SectionPageAlias, SectionWritebackIo, SectionWritebackPage};
 use nt_memory_manager::{
     GenericSectionBacking, GenericSectionTable, SectionFileIdentity, SectionMountIds,
-    PAGE_READWRITE, SECTION_ATTR_SEC_COMMIT, STATUS_ACCESS_VIOLATION,
+    MemoryLifetime, PAGE_READWRITE, SECTION_ATTR_SEC_COMMIT, STATUS_ACCESS_VIOLATION,
 };
+
+fn process_lifetime(pid: u32, generation: ProcessGeneration) -> MemoryLifetime {
+    MemoryLifetime::Process(ProcessIdentity { pid, generation })
+}
 
 struct Writeback<'a> {
     slots: &'a [ThreadRuntimeSlot<Runtime>],
@@ -55,8 +59,22 @@ fn dirty_shared_page() -> (GenericSectionTable, GenericSectionBacking) {
     assert!(table.set_page_frame(section, 0, 1000));
     assert!(table.mark_page_dirty(section, 0));
     // The flush initiator is disjoint, but the same frame also has an excluded alias in PI 2.
-    table.map_view(4, section, 0x50000, 4096, 0);
-    table.map_view(2, section, 0x1000, 4096, 0);
+    assert!(table.map_view_with_lifetime(
+        4,
+        process_lifetime(9, ProcessGeneration::Hosted(1)),
+        section,
+        0x50000,
+        4096,
+        0,
+    ));
+    assert!(table.map_view_with_lifetime(
+        2,
+        process_lifetime(8, ProcessGeneration::Hosted(7)),
+        section,
+        0x1000,
+        4096,
+        0,
+    ));
     (table, backing)
 }
 
@@ -91,7 +109,8 @@ fn excluded_alias_preserves_writeback(file_wide: bool) {
             io.rearmed.as_slice(),
             &[SectionPageAlias {
                 pi: 4,
-                page: 0x50000
+                page: 0x50000,
+                lifetime: process_lifetime(9, ProcessGeneration::Hosted(1)),
             }]
         );
         assert_eq!(table.prepare_writeback(plan).unwrap(), tickets);

@@ -179,18 +179,9 @@ fn cross_page_write_prepares_all_clean_pages_before_backend_mutation() {
     assert_eq!(
         io.events,
         vec![
-            Event::Rearm(SectionPageAlias {
-                pi: 1,
-                page: 0x10000
-            }),
-            Event::Rearm(SectionPageAlias {
-                pi: 1,
-                page: 0x11000
-            }),
-            Event::Rearm(SectionPageAlias {
-                pi: 1,
-                page: 0x12000
-            }),
+            Event::Rearm(SectionPageAlias::for_test(1, 0x10000)),
+            Event::Rearm(SectionPageAlias::for_test(1, 0x11000)),
+            Event::Rearm(SectionPageAlias::for_test(1, 0x12000)),
             Event::Prepare(100),
             Event::Prepare(101),
             Event::Prepare(102),
@@ -364,10 +355,7 @@ fn rearm_failure_never_prepares_or_writes_and_still_finishes() {
     assert_eq!(
         io.events,
         [
-            Event::Rearm(SectionPageAlias {
-                pi: 1,
-                page: 0x10000
-            }),
+            Event::Rearm(SectionPageAlias::for_test(1, 0x10000)),
             Event::Finish
         ]
     );
@@ -529,14 +517,8 @@ fn sibling_sections_rearm_offset_views_but_use_only_canonical_frames() {
     assert_eq!(
         &io.events[..2],
         &[
-            Event::Rearm(SectionPageAlias {
-                pi: 2,
-                page: 0x20000
-            }),
-            Event::Rearm(SectionPageAlias {
-                pi: 3,
-                page: 0x30000
-            }),
+            Event::Rearm(SectionPageAlias::for_test(2, 0x20000)),
+            Event::Rearm(SectionPageAlias::for_test(3, 0x30000)),
         ]
     );
     assert!(io.frames[&999].iter().all(|b| *b == 0xaa));

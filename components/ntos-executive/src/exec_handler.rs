@@ -29666,6 +29666,10 @@ impl ExecNtHandler {
         let target_pid = self
             .pm_pid_for_pi(target_pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let target_lifetime = nt_memory_manager::MemoryLifetime::Process(
+            self.capture_process_identity(target_pi)
+                .ok_or(nt_process::STATUS_INVALID_HANDLE)?,
+        );
         if self.pm.process(target_pid).is_some_and(|process| {
             matches!(
                 process.state,
@@ -29748,8 +29752,9 @@ impl ExecNtHandler {
         };
         let prepared_commit =
             self.prepare_process_commit_charge(target_pid, target_pi, mapped_commit)?;
-        if !generic_sections.map_view(
+        if !generic_sections.map_view_with_lifetime(
             target_pi,
+            target_lifetime,
             section_index,
             plan.base,
             plan.size,
@@ -29762,7 +29767,7 @@ impl ExecNtHandler {
             target_pi as u64,
             nt_address_space::VmCommittedRange::mapped(plan.base, plan.size, view_protection),
         ) {
-            let _ = generic_sections.unmap_view(target_pi, plan.base);
+            let _ = generic_sections.unmap_view_exact(target_pi, target_lifetime, plan.base);
             *vm_map = *before;
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
@@ -30181,7 +30186,7 @@ impl ExecNtHandler {
         }
         *vm_map = *after;
         let _ = process_committed_mapping_unregister_range(pi as u64, view.base, view.size);
-        let _ = generic_sections.unmap_view(pi, view.base);
+        let _ = generic_sections.unmap_view_exact(pi, view.lifetime, view.base);
         if let Some(pid) = target_pid {
             self.release_process_commit(pid, mapped_commit);
         }
@@ -36412,7 +36417,7 @@ impl ExecNtHandler {
                             view.base,
                             view.size,
                         );
-                        let _ = generic_sections.unmap_view(target_pi, view.base);
+                        let _ = generic_sections.unmap_view_exact(target_pi, view.lifetime, view.base);
                         self.release_process_commit(target_pid, mapped_commit);
                         return 0;
                     }

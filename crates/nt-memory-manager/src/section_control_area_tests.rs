@@ -175,14 +175,8 @@ fn short_sibling_flushes_the_full_file_page_and_rearms_all_sibling_aliases() {
     assert_eq!(
         io.aliases,
         vec![
-            SectionPageAlias {
-                pi: 3,
-                page: 0x10000
-            },
-            SectionPageAlias {
-                pi: 4,
-                page: 0x20000
-            }
+            SectionPageAlias::for_test(3, 0x10000),
+            SectionPageAlias::for_test(4, 0x20000)
         ]
     );
     assert!(table

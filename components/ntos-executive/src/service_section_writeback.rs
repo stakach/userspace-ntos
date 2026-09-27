@@ -43,6 +43,65 @@ impl SectionWritebackIo for WritebackIo {
     }
 }
 
+// The checkpoint diagnostic has a canonical frame but no process mapping to rearm.
+struct UnpublishedWritebackIo {
+    inner: WritebackIo,
+    lifetime: nt_memory_manager::MemoryLifetime,
+}
+
+impl SectionWritebackIo for UnpublishedWritebackIo {
+    fn rearm_alias(&mut self, alias: SectionPageAlias) -> Result<(), u32> {
+        if alias.pi != 0
+            || alias.lifetime != self.lifetime
+            || unsafe { csrss_frame_get_exact_record(alias.pi as u64, alias.page) }.is_some()
+        {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
+        }
+        Ok(())
+    }
+
+    fn write_page(&mut self, page: SectionWritebackPage) -> (u32, usize) {
+        self.inner.write_page(page)
+    }
+
+    fn persist(&mut self) -> u32 {
+        self.inner.persist()
+    }
+}
+
+pub(crate) unsafe fn service_generic_section_writeback_unpublished_selftest(
+    table: &mut GenericSectionTable,
+    view: GenericSectionView,
+    scratch_base: u64,
+) -> WritebackResult {
+    if view.pi != 0
+        || !matches!(view.lifetime, nt_memory_manager::MemoryLifetime::UnpublishedImage(token) if token != 0)
+    {
+        return WritebackResult::failure(nt_fs::STATUS_INVALID_HANDLE);
+    }
+    let Some(section) = table.section(view.section_index) else {
+        return WritebackResult::failure(nt_fs::STATUS_INVALID_HANDLE);
+    };
+    writeback_plan_with_io(
+        table,
+        GenericSectionFlushPlan {
+            view,
+            section,
+            base: view.base,
+            size: view.size,
+            section_offset: view.section_offset,
+        },
+        &mut UnpublishedWritebackIo {
+            inner: WritebackIo {
+                file_id: section.backing.overlay_file_id,
+                scratch_base,
+                context: None,
+            },
+            lifetime: view.lifetime,
+        },
+    )
+}
+
 pub(crate) unsafe fn service_generic_section_writeback_view(
     table: &mut GenericSectionTable,
     view: GenericSectionView,
@@ -72,6 +131,22 @@ pub(crate) unsafe fn service_generic_section_writeback_plan(
     scratch_base: u64,
     context: Option<ExecLoopCtx>,
 ) -> WritebackResult {
+    writeback_plan_with_io(
+        table,
+        plan,
+        &mut WritebackIo {
+            file_id: plan.section.backing.overlay_file_id,
+            scratch_base,
+            context,
+        },
+    )
+}
+
+unsafe fn writeback_plan_with_io(
+    table: &mut GenericSectionTable,
+    plan: GenericSectionFlushPlan,
+    io: &mut impl SectionWritebackIo,
+) -> WritebackResult {
     if table.section(plan.view.section_index) != Some(plan.section) {
         return WritebackResult::failure(nt_memory_manager::STATUS_NOT_MAPPED_VIEW);
     }
@@ -86,14 +161,7 @@ pub(crate) unsafe fn service_generic_section_writeback_plan(
     if let Err(status) = table.refresh_file_extent(plan.view.section_index, info.end_of_file) {
         return WritebackResult::failure(status);
     }
-    let result = table.writeback(
-        plan,
-        &mut WritebackIo {
-            file_id: plan.section.backing.overlay_file_id,
-            scratch_base,
-            context,
-        },
-    );
+    let result = table.writeback(plan, io);
     record_writeback(result)
 }
 
@@ -131,18 +199,36 @@ pub(super) fn rearm_section_alias(
     context: Option<ExecLoopCtx>,
 ) -> Result<(), u32> {
     unsafe {
+        let context = context
+            .and_then(|ctx| ctx.for_process(alias.pi))
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let nt_memory_manager::MemoryLifetime::Process(process) = alias.lifetime else {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
+        };
+        if process.generation
+            != nt_memory_manager::ProcessGeneration::Hosted(context.owner_generation)
+        {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
+        }
+        if (&*context.generic_sections)
+            .view_for_page(alias.pi, alias.page)
+            .is_none_or(|(_, view)| view.lifetime != alias.lifetime)
+        {
+            return Err(nt_memory_manager::STATUS_NOT_MAPPED_VIEW);
+        }
         crate::hosted_thread_memory_access(alias.pi as u64, alias.page, 4096)?;
+        let record = csrss_frame_get_exact_record(alias.pi as u64, alias.page);
+        if record.is_some_and(|record| record.lifetime != alias.lifetime) {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
+        }
         // An attachment can outlive client residency (or retain the pre-COW frame).
         crate::win32k_glue::detach_attached_client_page(alias.pi as u64, alias.page)?;
-        let Some(record) = csrss_frame_get_exact_record(alias.pi as u64, alias.page) else {
+        let Some(record) = record else {
             return Ok(());
         };
         if record.owns_frame {
             return Ok(());
         }
-        let context = context
-            .and_then(|ctx| ctx.for_process(alias.pi))
-            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
         let info = process_committed_mapping_basic_information(alias.pi as u64, alias.page)
             .filter(|info| info.type_ == nt_address_space::MEM_MAPPED)
             .ok_or(nt_memory_manager::STATUS_NOT_MAPPED_VIEW)?;

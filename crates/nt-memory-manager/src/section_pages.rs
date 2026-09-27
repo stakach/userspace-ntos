@@ -288,7 +288,11 @@ impl GenericSectionTable {
                 .checked_add(displacement)
                 .ok_or(STATUS_INVALID_PARAMETER_2)?;
             aliases.try_reserve(1).map_err(|_| 0xC000_009Au32)?;
-            aliases.push(crate::writeback::SectionPageAlias { pi: view.pi, page });
+            aliases.push(crate::writeback::SectionPageAlias {
+                pi: view.pi,
+                page,
+                lifetime: view.lifetime,
+            });
         }
         Ok(aliases)
     }

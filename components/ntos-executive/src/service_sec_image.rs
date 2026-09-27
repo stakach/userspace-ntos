@@ -3445,6 +3445,7 @@ pub(crate) use section_retirement::{service_drain_section_retirement, service_un
 pub(crate) use section_writeback::{
     service_generic_section_writeback_file, service_generic_section_writeback_plan,
     service_generic_section_writeback_view,
+    service_generic_section_writeback_unpublished_selftest,
 };
 
 pub(crate) unsafe fn service_generic_section_fault(

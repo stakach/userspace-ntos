@@ -11521,7 +11521,14 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
     };
     section_index = created_section;
     let view_base = PRIVATE_VM_LIMIT - 0x20_0000;
-    if !table.map_view(0, section_index, view_base, 0x1000, 0) {
+    if !table.map_view_with_lifetime(
+        0,
+        nt_memory_manager::MemoryLifetime::UnpublishedImage(1),
+        section_index,
+        view_base,
+        0x1000,
+        0,
+    ) {
         status = STATUS_UNSUCCESSFUL;
         cleanup(table, section_index, frame, file_id);
         MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
@@ -11584,7 +11591,11 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
     }
     proof |= MAPPED_SECTION_WRITEBACK_DIRTY;
 
-    let writeback = service_generic_section_writeback_view(table, view, scratch_base, None);
+    let writeback = service_sec_image::service_generic_section_writeback_unpublished_selftest(
+        table,
+        view,
+        scratch_base,
+    );
     bytes_written = writeback.bytes_written;
     if writeback.status != 0 {
         status = writeback.status;
