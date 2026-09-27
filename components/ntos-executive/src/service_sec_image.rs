@@ -6871,6 +6871,21 @@ unsafe fn copy_client_string_bytes(
     }
 }
 
+unsafe fn client_read_u64_for(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    va: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<u64> {
+    let mut bytes = [0u8; 8];
+    img_spawn::client_copyin_process_mapped_for(
+        pi, process, va, &mut bytes, filled_pages, nfilled, scratch_base, true,
+    )
+    .then_some(u64::from_le_bytes(bytes))
+}
+
 unsafe fn try_capture_client_string_arg_impl(
     pi: u64,
     process: Option<nt_memory_manager::ProcessIdentity>,
@@ -7085,6 +7100,7 @@ unsafe fn capture_required_client_unicode_string_arg(
 
 unsafe fn stage_unicode_string_descriptor_for_win32k(
     pi: u64,
+    process: Option<nt_memory_manager::ProcessIdentity>,
     descriptor: u64,
     desc_out: u64,
     buf_out: u64,
@@ -7098,13 +7114,8 @@ unsafe fn stage_unicode_string_descriptor_for_win32k(
         return true;
     }
     let mut sd = [0u8; 16];
-    if !img_spawn::client_copyin_mapped(
-        pi,
-        descriptor,
-        &mut sd,
-        filled_pages,
-        nfilled,
-        scratch_base,
+    if !copy_client_string_bytes(
+        pi, process, descriptor, &mut sd, filled_pages, nfilled, scratch_base,
     ) {
         return false;
     }
@@ -7120,7 +7131,9 @@ unsafe fn stage_unicode_string_descriptor_for_win32k(
     core::ptr::copy_nonoverlapping(sd.as_ptr(), desc_out as *mut u8, sd.len());
     if length != 0 {
         let out = core::slice::from_raw_parts_mut(buf_out as *mut u8, length as usize);
-        if !img_spawn::client_copyin_mapped(pi, buffer, out, filled_pages, nfilled, scratch_base) {
+        if !copy_client_string_bytes(
+            pi, process, buffer, out, filled_pages, nfilled, scratch_base,
+        ) {
             return false;
         }
         core::ptr::write_volatile((buf_out + length) as *mut u16, 0);
@@ -7220,6 +7233,7 @@ unsafe fn capture_get_class_info_graph(
     core::ptr::write_bytes(out_base as *mut u8, 0, RC_ARG_CAPTURE_SLOT as usize);
     if !stage_unicode_string_descriptor_for_win32k(
         pi,
+        None,
         class_name,
         class_base,
         class_base + 0x20,
@@ -7621,36 +7635,27 @@ unsafe fn copy_back_get_icon_info(
 
 unsafe fn capture_register_class_graph(
     pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
     wnd_class: u64,
     class_menu: u64,
     filled_pages: &[u64],
     nfilled: usize,
     scratch_base: u64,
-) -> Option<(u64, u64)> {
+) -> Option<CapturedRegisterClassGraph> {
     use nt_kernel_exec::user_class::WNDCLASSEXW_SIZE;
 
     let mut wnd = [0u8; WNDCLASSEXW_SIZE];
     if wnd_class == 0
-        || !img_spawn::client_copyin_mapped(
-            pi,
-            wnd_class,
-            &mut wnd,
-            filled_pages,
-            nfilled,
-            scratch_base,
+        || !copy_client_string_bytes(
+            pi, Some(process), wnd_class, &mut wnd, filled_pages, nfilled, scratch_base,
         )
     {
         return None;
     }
     let mut menu = [0u8; 24];
     if class_menu == 0
-        || !img_spawn::client_copyin_mapped(
-            pi,
-            class_menu,
-            &mut menu,
-            filled_pages,
-            nfilled,
-            scratch_base,
+        || !copy_client_string_bytes(
+            pi, Some(process), class_menu, &mut menu, filled_pages, nfilled, scratch_base,
         )
     {
         return None;
@@ -7668,8 +7673,12 @@ unsafe fn capture_register_class_graph(
     core::ptr::copy_nonoverlapping(wnd.as_ptr(), wnd_out as *mut u8, wnd.len());
 
     let menu_descriptor = u64::from_le_bytes(menu[16..24].try_into().unwrap());
+    if menu_descriptor == 0 {
+        return None;
+    }
     if !stage_unicode_string_descriptor_for_win32k(
         pi,
+        Some(process),
         menu_descriptor,
         menu_desc_out,
         menu_buf_out,
@@ -7682,7 +7691,20 @@ unsafe fn capture_register_class_graph(
     }
     menu[16..24].copy_from_slice(&menu_desc_out.to_le_bytes());
     core::ptr::copy_nonoverlapping(menu.as_ptr(), menu_out as *mut u8, menu.len());
-    Some((wnd_out, menu_out))
+    Some(CapturedRegisterClassGraph {
+        wnd: wnd_out,
+        menu: menu_out,
+        menu_desc: menu_desc_out,
+        menu_buffer: menu_buf_out,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct CapturedRegisterClassGraph {
+    wnd: u64,
+    menu: u64,
+    menu_desc: u64,
+    menu_buffer: u64,
 }
 
 enum CapturedCursorString {
@@ -7720,12 +7742,7 @@ unsafe fn capture_cursor_counted_string(
     let mut raw = [0u8; 16];
     if descriptor == 0
         || !img_spawn::client_copyin_mapped(
-            pi,
-            descriptor,
-            &mut raw,
-            filled_pages,
-            nfilled,
-            scratch_base,
+            pi, descriptor, &mut raw, filled_pages, nfilled, scratch_base,
         )
     {
         return None;
@@ -7736,44 +7753,54 @@ unsafe fn capture_cursor_counted_string(
     };
     let mut bytes = [0u8; nt_kernel_exec::user_cursor::CURSOR_TEXT_CAP * 2];
     if !img_spawn::client_copyin_mapped(
-        pi,
-        buffer,
-        &mut bytes[..length],
-        filled_pages,
-        nfilled,
-        scratch_base,
+        pi, buffer, &mut bytes[..length], filled_pages, nfilled, scratch_base,
     ) {
         return None;
     }
     decode_utf16(&bytes[..length], units).map(CapturedCursorString::Text)
 }
 
-unsafe fn capture_registered_class_atom_name(
-    pi: u64,
-    class_name_descriptor: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
-    scratch_base: u64,
-) -> Option<CapturedClassAtomName> {
-    let mut captured = [0u16; nt_kernel_exec::user_cursor::CURSOR_TEXT_CAP];
-    let len = match capture_cursor_counted_string(
-        pi,
-        class_name_descriptor,
-        true,
-        &mut captured,
-        filled_pages,
-        nfilled,
-        scratch_base,
-    )? {
-        CapturedCursorString::Text(len) => len,
-        CapturedCursorString::Atom(_) => return None,
+unsafe fn staged_class_name_identity(
+    descriptor: u64,
+    staged_buffer: u64,
+    buffer_cap: u64,
+    allow_none: bool,
+) -> Option<(
+    nt_kernel_exec::user_class::ClassNameIdentity,
+    Option<CapturedClassAtomName>,
+)> {
+    use nt_kernel_exec::user_class::{ClassNameIdentity, CLASS_ATOM_NAME_CAP};
+    use nt_kernel_exec::user_cursor::{
+        decode_utf16, parse_string_descriptor, CursorStringDescriptor, CURSOR_TEXT_CAP,
     };
-    if len > nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP {
-        return None;
+
+    let mut raw = [0u8; 16];
+    core::ptr::copy_nonoverlapping(descriptor as *const u8, raw.as_mut_ptr(), raw.len());
+    let length = u16::from_le_bytes([raw[0], raw[1]]);
+    let buffer = u64::from_le_bytes(raw[8..16].try_into().ok()?);
+    if allow_none && length == 0 && buffer == 0 {
+        return Some((ClassNameIdentity::none(), None));
     }
-    let mut units = [0u16; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP];
-    units[..len].copy_from_slice(&captured[..len]);
-    Some(CapturedClassAtomName { len, units })
+    match parse_string_descriptor(&raw, true)? {
+        CursorStringDescriptor::Atom(atom) => Some((ClassNameIdentity::atom(atom), None)),
+        CursorStringDescriptor::Text { byte_len, buffer } => {
+            if buffer != staged_buffer || (byte_len as u64).checked_add(2)? > buffer_cap {
+                return None;
+            }
+            let bytes = core::slice::from_raw_parts(buffer as *const u8, byte_len);
+            let mut captured = [0u16; CURSOR_TEXT_CAP];
+            let len = decode_utf16(bytes, &mut captured)?;
+            let identity = ClassNameIdentity::name(&captured[..len])?;
+            let atom_name = if len <= CLASS_ATOM_NAME_CAP {
+                let mut units = [0u16; CLASS_ATOM_NAME_CAP];
+                units[..len].copy_from_slice(&captured[..len]);
+                Some(CapturedClassAtomName { len, units })
+            } else {
+                None
+            };
+            Some((identity, atom_name))
+        }
+    }
 }
 
 unsafe fn capture_cursor_identity_key(
@@ -8172,112 +8199,27 @@ unsafe fn stage_cursor_icon_data_args(
     Some((staged_module, staged_resource, base))
 }
 
-unsafe fn capture_class_name_identity(
-    pi: u64,
-    descriptor: u64,
-    allow_none: bool,
-    filled_pages: &[u64],
-    nfilled: usize,
-    scratch_base: u64,
-) -> Option<nt_kernel_exec::user_class::ClassNameIdentity> {
-    use nt_kernel_exec::user_class::ClassNameIdentity;
-    use nt_kernel_exec::user_cursor::CURSOR_TEXT_CAP;
-
-    if descriptor == 0 && allow_none {
-        return Some(ClassNameIdentity::none());
-    }
-    let mut descriptor_bytes = [0u8; 16];
-    if descriptor == 0
-        || !img_spawn::client_copyin_mapped(
-            pi,
-            descriptor,
-            &mut descriptor_bytes,
-            filled_pages,
-            nfilled,
-            scratch_base,
-        )
-    {
-        return None;
-    }
-    let length = u16::from_le_bytes([descriptor_bytes[0], descriptor_bytes[1]]);
-    let buffer = u64::from_le_bytes(descriptor_bytes[8..16].try_into().unwrap());
-    if allow_none && length == 0 && buffer == 0 {
-        return Some(ClassNameIdentity::none());
-    }
-    let mut name = [0u16; CURSOR_TEXT_CAP];
-    match capture_cursor_counted_string(
-        pi,
-        descriptor,
-        true,
-        &mut name,
-        filled_pages,
-        nfilled,
-        scratch_base,
-    )? {
-        CapturedCursorString::Atom(atom) => Some(ClassNameIdentity::atom(atom)),
-        CapturedCursorString::Text(len) => ClassNameIdentity::name(&name[..len]),
-    }
-}
-
 unsafe fn capture_builtin_class_key(
-    pi: u64,
-    wnd_class: u64,
-    class_name: u64,
-    class_version: u64,
-    class_menu: u64,
+    graph: CapturedRegisterClassGraph,
+    class_name: CapturedStringArg,
+    class_version: CapturedStringArg,
     fn_id: u32,
     flags: u32,
-    filled_pages: &[u64],
-    nfilled: usize,
-    scratch_base: u64,
 ) -> Option<nt_kernel_exec::user_class::BuiltinClassKey> {
     use nt_kernel_exec::user_class::{BuiltinClassKey, WNDCLASSEXW_SIZE};
 
     let mut wnd = [0u8; WNDCLASSEXW_SIZE];
-    if wnd_class == 0
-        || !img_spawn::client_copyin_mapped(
-            pi,
-            wnd_class,
-            &mut wnd,
-            filled_pages,
-            nfilled,
-            scratch_base,
-        )
-    {
-        return None;
-    }
-    let class_name =
-        capture_class_name_identity(pi, class_name, false, filled_pages, nfilled, scratch_base)?;
-    let class_version = capture_class_name_identity(
-        pi,
-        class_version,
-        false,
-        filled_pages,
-        nfilled,
-        scratch_base,
-    )?;
-    let mut menu_graph = [0u8; 24];
-    if class_menu == 0
-        || !img_spawn::client_copyin_mapped(
-            pi,
-            class_menu,
-            &mut menu_graph,
-            filled_pages,
-            nfilled,
-            scratch_base,
-        )
-    {
-        return None;
-    }
-    let menu_descriptor = u64::from_le_bytes(menu_graph[16..24].try_into().unwrap());
-    let menu_name = capture_class_name_identity(
-        pi,
-        menu_descriptor,
-        true,
-        filled_pages,
-        nfilled,
-        scratch_base,
-    )?;
+    core::ptr::copy_nonoverlapping(graph.wnd as *const u8, wnd.as_mut_ptr(), wnd.len());
+    let class_name = staged_class_name_identity(
+        class_name.desc, class_name.desc + 0x20, RC_ARG_BUF_CAP, false,
+    )?.0;
+    let class_version = staged_class_name_identity(
+        class_version.desc, class_version.desc + 0x20, RC_ARG_BUF_CAP, false,
+    )?.0;
+    let menu_name = staged_class_name_identity(
+        graph.menu_desc, graph.menu_buffer,
+        RC_ARG_CAPTURE_SLOT - RC_CLASS_MENU_BUF_OFF, true,
+    )?.0;
     BuiltinClassKey::decode(&wnd, class_name, class_version, menu_name, fn_id, flags)
 }
 
@@ -13218,11 +13160,16 @@ pub(crate) unsafe fn service_sec_image(
                 // stage a bounded descriptor for atoms/resources too, and stage readable nonzero buffers
                 // regardless of whether they live in the main image, a DLL, stack, or heap.
                 //
-                // The shared ARG frame is mapped in both VSpaces (already the proven mechanism for
-                // `NtUserProcessConnect`). If a string graph is unreadable or oversized, the original
-                // pointer is forwarded and win32k's normal probe/error path decides the result.
+                // The shared ARG frame is mapped in both VSpaces. Required capture failures must
+                // stop provider dispatch rather than forwarding a raw foreign user pointer.
                 let mut d_a2 = a2;
                 let mut d_a3 = a3;
+                let register_class_process = (m0 == 0x10b4)
+                    .then(|| nt_handler.capture_process_identity(pi))
+                    .flatten();
+                let mut register_class_probe_failed = false;
+                let mut register_class_strings = None;
+                let mut register_class_graph = None;
                 let mut register_class_stack_args = [0u64; 3];
                 let mut register_class_stack_arg_count = 0usize;
                 let mut create_window_stack_args = [0u64; 11];
@@ -13348,50 +13295,31 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 } else if m0 == 0x10b4 {
-                    d_a1 = capture_client_string_arg(
-                        pi as u64,
-                        d_a1,
-                        false,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    );
-                    d_a2 = capture_client_string_arg(
-                        pi as u64,
-                        d_a2,
-                        false,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    );
-                    if sp != 0 {
-                        let fn_id = client_read_u64_mapped(
-                            pi as u64,
-                            sp + 0x28,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        );
-                        let class_flags = client_read_u64_mapped(
-                            pi as u64,
-                            sp + 0x30,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        );
-                        let p_wow = client_read_u64_mapped(
-                            pi as u64,
-                            sp + 0x38,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        );
-                        if let (Some(fn_id), Some(class_flags), Some(p_wow)) =
-                            (fn_id, class_flags, p_wow)
-                        {
-                            register_class_stack_args = [fn_id, class_flags, p_wow];
-                            register_class_stack_arg_count = register_class_stack_args.len();
-                        }
+                    let captured = register_class_process.and_then(|process| {
+                        let name = try_capture_client_string_arg_for(
+                            pi as u64, process, d_a1, false, false,
+                            filled_pages, faults as usize, scratch_base,
+                        )?;
+                        let version = try_capture_client_string_arg_for(
+                            pi as u64, process, d_a2, false, false,
+                            filled_pages, faults as usize, scratch_base,
+                        )?;
+                        let addresses = nt_kernel_exec::user_class::register_class_tail_addresses(sp)?;
+                        let tail = addresses.map(|va| {
+                            client_read_u64_for(
+                                pi as u64, process, va, filled_pages, faults as usize, scratch_base,
+                            )
+                        });
+                        Some((name, version, [tail[0]?, tail[1]?, tail[2]?]))
+                    });
+                    if let Some((name, version, tail)) = captured {
+                        d_a1 = name.desc;
+                        d_a2 = version.desc;
+                        register_class_strings = Some((name, version));
+                        register_class_stack_args = tail;
+                        register_class_stack_arg_count = tail.len();
+                    } else {
+                        register_class_probe_failed = true;
                     }
                 } else if m0 == 0x1036 {
                     // NtUserRegisterWindowMessage takes one client PUNICODE_STRING. ReactOS probes and
@@ -15699,17 +15627,18 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
-                if m0 == 0x10b4 {
-                    if let Some((class_arg, menu_arg)) = capture_register_class_graph(
-                        pi as u64,
-                        a0,
-                        a3,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    ) {
-                        d_a0 = class_arg;
-                        d_a3 = menu_arg;
+                if m0 == 0x10b4 && !register_class_probe_failed {
+                    if let Some(graph) = register_class_process.and_then(|process| {
+                        capture_register_class_graph(
+                            pi as u64, process, a0, a3,
+                            filled_pages, faults as usize, scratch_base,
+                        )
+                    }) {
+                        d_a0 = graph.wnd;
+                        d_a3 = graph.menu;
+                        register_class_graph = Some(graph);
+                    } else {
+                        register_class_probe_failed = true;
                     }
                 }
                 let cursor_identity_key = if m0 == 0x103d {
@@ -15735,34 +15664,14 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     None
                 };
-                let builtin_class_args = if m0 == 0x10b4 {
-                    if register_class_stack_arg_count == register_class_stack_args.len() {
-                        Some((
-                            register_class_stack_args[0] as u32,
-                            register_class_stack_args[1] as u32,
-                        ))
-                    } else {
-                        let sp = get_recv_mr(16);
-                        match (
-                            client_read_u64_mapped(
-                                pi as u64,
-                                sp + 0x28,
-                                filled_pages,
-                                faults as usize,
-                                scratch_base,
-                            ),
-                            client_read_u64_mapped(
-                                pi as u64,
-                                sp + 0x30,
-                                filled_pages,
-                                faults as usize,
-                                scratch_base,
-                            ),
-                        ) {
-                            (Some(fn_id), Some(flags)) => Some((fn_id as u32, flags as u32)),
-                            _ => None,
-                        }
-                    }
+                let builtin_class_args = if m0 == 0x10b4
+                    && !register_class_probe_failed
+                    && register_class_stack_arg_count == register_class_stack_args.len()
+                {
+                    Some((
+                        register_class_stack_args[0] as u32,
+                        register_class_stack_args[1] as u32,
+                    ))
                 } else {
                     None
                 };
@@ -15773,27 +15682,16 @@ pub(crate) unsafe fn service_sec_image(
                         && flags == 0
                 });
                 let builtin_class_key = builtin_class_args.and_then(|(fn_id, flags)| {
-                    capture_builtin_class_key(
-                        pi as u64,
-                        a0,
-                        a1,
-                        a2,
-                        a3,
-                        fn_id,
-                        flags,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    )
+                    let graph = register_class_graph?;
+                    let (name, version) = register_class_strings?;
+                    capture_builtin_class_key(graph, name, version, fn_id, flags)
                 });
-                let registered_class_atom_name = if m0 == 0x10b4 {
-                    capture_registered_class_atom_name(
-                        pi as u64,
-                        a1,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    )
+                let registered_class_atom_name = if m0 == 0x10b4 && !register_class_probe_failed {
+                    register_class_strings.and_then(|(name, _)| {
+                        staged_class_name_identity(
+                            name.desc, name.desc + 0x20, RC_ARG_BUF_CAP, false,
+                        ).and_then(|(_, atom_name)| atom_name)
+                    })
                 } else {
                     None
                 };
@@ -16089,6 +15987,8 @@ pub(crate) unsafe fn service_sec_image(
                     (0, false)
                 } else if message_output_stage_failed {
                     (0xC000_009A, true)
+                } else if register_class_probe_failed {
+                    (0, true)
                 } else if userconnect_capture_status != 0 {
                     (u64::from(userconnect_capture_status), true)
                 } else if register_window_message_probe_failed {
