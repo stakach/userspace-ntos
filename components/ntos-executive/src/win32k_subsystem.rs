@@ -1187,6 +1187,7 @@ pub const W32_FILE_CLOSE_LABEL: u64 = 0x790;
 pub const W32_FILE_CREATE_LABEL: u64 = 0x791;
 pub const W32_FILE_QUERY_LABEL: u64 = 0x792;
 pub const W32_FILE_OBJECT_LABEL: u64 = 0x793;
+pub const W32_FILE_CANCEL_LABEL: u64 = 0x794;
 pub const W32_FILE_OBJECT_REFERENCE_HANDLE: u64 = 1;
 pub const W32_FILE_OBJECT_REFERENCE_POINTER: u64 = 2;
 pub const W32_FILE_OBJECT_DEREFERENCE_POINTER: u64 = 3;
@@ -3607,6 +3608,7 @@ mod directory_object;
 mod file_close;
 mod file_open;
 mod file_query;
+mod file_cancel;
 mod file_object_query;
 pub(crate) use object_security::census as object_security_census;
 
@@ -14377,6 +14379,7 @@ fn register_trampolines() -> bool {
     reg.bind("ZwOpenFile", file_open::open as *const () as usize as u64);
     reg.bind("ZwCreateFile", file_open::create as *const () as usize as u64);
     reg.bind("ZwQueryInformationFile", file_query::query_information as *const () as usize as u64);
+    reg.bind("ZwCancelIoFile", file_cancel::cancel_io_file as *const () as usize as u64);
     reg.bind("ZwQueryObject", file_object_query::query_object as *const () as usize as u64);
     reg.bind("ZwOpenKey", s_zw_open_key as usize as u64);
     reg.bind("NtOpenKey", s_nt_open_key as usize as u64);

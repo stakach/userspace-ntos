@@ -151,7 +151,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ZwDuplicateObject", Partial, "handle/directory-object ops routed to nt-object-manager"),
     e("ZwOpenFile", StubSuccess, "file ops routed to nt-fs where mounted; else success with empty result (Phase 2 wiring)"),
     e("ZwReadFile", StubSuccess, "file ops routed to nt-fs where mounted; else success with empty result (Phase 2 wiring)"),
-    e("ZwCancelIoFile", StubSuccess, "file ops routed to nt-fs where mounted; else success with empty result (Phase 2 wiring)"),
+    e("ZwCancelIoFile", Partial, "cancels and drains the current thread's canonical routed File IRPs before returning to win32k"),
     e("ZwQueryDefaultLocale", Implemented, "returns canonical live system or session default LCID state"),
     e("ZwDeviceIoControlFile", StubSuccess, "file ops routed to nt-fs where mounted; else success with empty result (Phase 2 wiring)"),
     e("ZwYieldExecution", Partial, "yields through the canonical executive scheduler only when another hosted thread is runnable; otherwise returns STATUS_NO_YIELD_PERFORMED"),
