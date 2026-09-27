@@ -1189,6 +1189,9 @@ pub const W32_FILE_QUERY_LABEL: u64 = 0x792;
 pub const W32_FILE_OBJECT_LABEL: u64 = 0x793;
 pub const W32_FILE_CANCEL_LABEL: u64 = 0x794;
 pub const W32_FILE_QUERY_DELIVERED_LABEL: u64 = 0x795;
+pub const W32_FILE_READ_LABEL: u64 = 0x796;
+pub const W32_FILE_READ_COMPLETION_LABEL: u64 = 0x797;
+pub const W32_FILE_READ_RELEASE_LABEL: u64 = 0x798;
 pub const W32_FILE_OBJECT_REFERENCE_HANDLE: u64 = 1;
 pub const W32_FILE_OBJECT_REFERENCE_POINTER: u64 = 2;
 pub const W32_FILE_OBJECT_DEREFERENCE_POINTER: u64 = 3;
@@ -3621,6 +3624,7 @@ mod file_close;
 mod file_open;
 mod file_query;
 mod file_cancel;
+mod file_read;
 mod file_object_query;
 pub(crate) use object_security::census as object_security_census;
 
@@ -4026,6 +4030,7 @@ unsafe fn finish_provider_stack_event_activation(
     {
         return false;
     }
+    file_read::release_completed_for_activation(activation);
     // Event retirement may broker IPC. Keep no catalog borrow across reentrant execution.
     if !retire_provider_local_events_for_backing(activation.backing()) {
         return false;
@@ -14393,6 +14398,7 @@ fn register_trampolines() -> bool {
     reg.bind("ZwQueryInformationFile", file_query::query_information as *const () as usize as u64);
     reg.bind("ZwQueryDirectoryFile", file_query::query_directory as *const () as usize as u64);
     reg.bind("ZwCancelIoFile", file_cancel::cancel_io_file as *const () as usize as u64);
+    reg.bind("ZwReadFile", file_read::read as *const () as usize as u64);
     reg.bind("ZwQueryObject", file_object_query::query_object as *const () as usize as u64);
     reg.bind("ZwOpenKey", s_zw_open_key as usize as u64);
     reg.bind("NtOpenKey", s_nt_open_key as usize as u64);
