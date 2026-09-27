@@ -138,6 +138,35 @@ fn resident_reprotect_refuses_foreign_generation_before_mapping_effect() {
 }
 
 #[test]
+fn image_fixup_does_not_treat_a_foreign_frame_as_a_cache_miss() {
+    let old = ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Hosted(1),
+    };
+    let new = ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Hosted(2),
+    };
+    let mut registry = ClientFrameRegistry::new();
+    registry
+        .insert(7, crate::MemoryLifetime::Process(old), 0x1000, 11, 0, 0, 0, true)
+        .unwrap();
+
+    let mut remap_sources = Vec::new();
+    let remap = |page, remap_sources: &mut Vec<u64>| {
+        let resident = crate::admit_resident_reprotect(7, new, page, &registry)?;
+        let source = resident.map(|record| record.frame).unwrap_or(23);
+        remap_sources.push(source);
+        Ok::<_, u32>(())
+    };
+    assert_eq!(remap(0x1000, &mut remap_sources), Err(crate::STATUS_INVALID_HANDLE));
+    assert!(remap_sources.is_empty());
+    assert_eq!(registry.get(7, 0x1000).unwrap().frame, 11);
+    assert_eq!(remap(0x2000, &mut remap_sources), Ok(()));
+    assert_eq!(remap_sources, [23]);
+}
+
+#[test]
 fn client_alias_source_requires_exact_live_generation() {
     let old = ProcessIdentity {
         pid: 42,

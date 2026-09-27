@@ -3665,6 +3665,12 @@ pub(crate) unsafe fn service_image_page_residency(
     if nt_handler.restore_process_pagefile_page(pi, page, pml4, scratch_base)? {
         return Ok(());
     }
+    let resident = nt_memory_manager::admit_resident_reprotect(
+        pi as u64,
+        process,
+        page,
+        &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+    )?;
 
     let write_fault = fault_access == nt_address_space::FaultAccess::Write;
     let fault_plan = nt_address_space::image_view_fault_plan(info.protect, write_fault);
@@ -3679,7 +3685,7 @@ pub(crate) unsafe fn service_image_page_residency(
     let shared_mapping_registered = shared_image_mapping_contains(pi as u64, page);
 
     if fault_plan.requires_private_backing()
-        && (csrss_frame_get_exact_record(pi as u64, page).is_some() || shared_mapping_registered)
+        && (resident.is_some() || shared_mapping_registered)
     {
         let read_protection =
             nt_address_space::image_view_fault_plan(info.protect, false).map_protection;
@@ -3707,7 +3713,7 @@ pub(crate) unsafe fn service_image_page_residency(
     let cached = if shareable { dll_cache_get(page) } else { 0 };
 
     if !fault_observed
-        && (csrss_frame_get_exact_record(pi as u64, page).is_some() || shared_mapping_registered)
+        && (resident.is_some() || shared_mapping_registered)
     {
         return Ok(());
     }
@@ -3715,7 +3721,15 @@ pub(crate) unsafe fn service_image_page_residency(
     nt_handler.ensure_process_working_set_admission(pi, page, scratch_base)?;
 
     if !shareable {
-        let existing = csrss_frame_get(pi as u64, page);
+        let resident = nt_memory_manager::admit_resident_reprotect(
+            pi as u64,
+            process,
+            page,
+            &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+        )?;
+        let existing = resident
+            .map(|record| record.frame)
+            .unwrap_or_else(|| dll_cache_get(page));
         if existing != 0 && existing != dll_cache_get(page) {
             if !fault_observed {
                 return Ok(());
