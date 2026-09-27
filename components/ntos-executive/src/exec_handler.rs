@@ -29822,15 +29822,16 @@ impl ExecNtHandler {
                 let procs = &*ctx.procs;
                 let filled = &*ctx.pfilled;
                 pi < MAX_PI
-                    && client_copyin_process_mapped(
+                    && self.capture_process_identity(pi).is_some_and(|process| client_copyin_process_mapped_for(
                         pi as u64,
+                        process,
                         va,
                         dst,
                         &filled[pi],
                         procs[pi].faults as usize,
                         procs[pi].scratch_base,
                         false,
-                    )
+                    ))
             }
         }
     }

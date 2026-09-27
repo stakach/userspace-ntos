@@ -1728,6 +1728,7 @@ pub(crate) unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
         }
         None => recorded_frame_copyin(
             ACTIVE_CLIENT_PI.load(Ordering::Relaxed),
+            None,
             va,
             dst,
             ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
@@ -1768,6 +1769,7 @@ unsafe fn has_managed_section_page(pi: u64, va: u64, length: usize) -> bool {
 
 unsafe fn with_recorded_frame_alias(
     pi: u64,
+    process: Option<nt_memory_manager::ProcessIdentity>,
     page: u64,
     scratch_base: u64,
     writable: bool,
@@ -1777,16 +1779,42 @@ unsafe fn with_recorded_frame_alias(
         || hosted_thread_memory_access(pi, page, 0x1000).is_err() {
         return false;
     }
-    let persistent_alias = csrss_frame_alias_get(pi, page);
+    let backing = if let Some(process) = process {
+        match nt_memory_manager::admit_client_copy_backing(
+            pi,
+            process,
+            page,
+            &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+            shared_image_mapping_identity(pi, page),
+        ) {
+            Ok(backing) => Some(backing),
+            Err(_) => return false,
+        }
+    } else {
+        None
+    };
+    let persistent_alias = if let Some(backing) = backing {
+        backing.resident.and_then(|record| record.mapped_alias()).unwrap_or(0)
+    } else {
+        csrss_frame_alias_get(pi, page)
+    };
     if persistent_alias != 0 {
         access(persistent_alias);
         return true;
     }
 
-    let clone_source = match csrss_frame_get_exact_record(pi, page) {
-        Some(record) => record.clone_source_cap().unwrap_or(0),
-        None if !writable && shared_image_mapping_contains_pi_unchecked(pi, page) => dll_cache_get(page),
-        None => 0,
+    let clone_source = if let Some(backing) = backing {
+        match backing.resident {
+            Some(record) => record.clone_source_cap().unwrap_or(0),
+            None if !writable && backing.shared_image => dll_cache_get(page),
+            None => 0,
+        }
+    } else {
+        match csrss_frame_get_exact_record(pi, page) {
+            Some(record) => record.clone_source_cap().unwrap_or(0),
+            None if !writable && shared_image_mapping_contains_pi_unchecked(pi, page) => dll_cache_get(page),
+            None => 0,
+        }
     };
     if clone_source == 0 || scratch_base == 0 {
         return false;
@@ -1803,7 +1831,13 @@ unsafe fn with_recorded_frame_alias(
     ).is_ok()
 }
 
-unsafe fn recorded_frame_copyin(pi: u64, va: u64, dst: &mut [u8], scratch_base: u64) -> bool {
+unsafe fn recorded_frame_copyin(
+    pi: u64,
+    process: Option<nt_memory_manager::ProcessIdentity>,
+    va: u64,
+    dst: &mut [u8],
+    scratch_base: u64,
+) -> bool {
     if crate::temporary_frame_alias::drain().is_err()
         || hosted_thread_memory_access(pi, va, dst.len() as u64).is_err() {
         return false;
@@ -1813,7 +1847,7 @@ unsafe fn recorded_frame_copyin(pi: u64, va: u64, dst: &mut [u8], scratch_base: 
     };
     let mut copied = 0usize;
     for chunk in chunks {
-        let ok = with_recorded_frame_alias(pi, chunk.page_base, scratch_base, false, |alias| {
+        let ok = with_recorded_frame_alias(pi, process, chunk.page_base, scratch_base, false, |alias| {
             core::ptr::copy_nonoverlapping(
                 (alias + chunk.page_offset as u64) as *const u8,
                 dst.as_mut_ptr().add(copied),
@@ -1845,7 +1879,7 @@ unsafe fn recorded_frame_copyout_impl(pi: u64, va: u64, src: &[u8], scratch_base
         if !admitted && crate::service_sec_image::service_admit_section_alias(pi, chunk.page_base, true, None).is_err() {
             return false;
         }
-        let ok = with_recorded_frame_alias(pi, chunk.page_base, scratch_base, true, |alias| {
+        let ok = with_recorded_frame_alias(pi, None, chunk.page_base, scratch_base, true, |alias| {
             core::ptr::copy_nonoverlapping(
                 src.as_ptr().add(copied),
                 (alias + chunk.page_offset as u64) as *mut u8,
@@ -1893,14 +1927,44 @@ pub(crate) unsafe fn client_copyin_mapped(
     nfilled: usize,
     scratch_base: u64,
 ) -> bool {
-    client_copyin_process_mapped(pi, va, dst, filled_pages, nfilled, scratch_base, true)
+    client_copyin_process_mapped_pi_unchecked(pi, va, dst, filled_pages, nfilled, scratch_base, true)
 }
 
-/// Explicit-process variant used by `NtRead/WriteVirtualMemory`. `allow_active_mirrors` must be
-/// false for a remote process because hosted processes reuse identical stack/heap VAs.
+/// Legacy active-client bootstrap path. Callers with a process witness use the exact variant.
 #[inline(always)]
-pub(crate) unsafe fn client_copyin_process_mapped(
+unsafe fn client_copyin_process_mapped_pi_unchecked(
     pi: u64,
+    va: u64,
+    dst: &mut [u8],
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+    allow_active_mirrors: bool,
+) -> bool {
+    client_copyin_process_mapped_impl(
+        pi, None, va, dst, filled_pages, nfilled, scratch_base, allow_active_mirrors,
+    )
+}
+
+/// Exact process copy-in. Remote callers disable active mirrors because hosted VAs are reused.
+pub(crate) unsafe fn client_copyin_process_mapped_for(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    va: u64,
+    dst: &mut [u8],
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+    allow_active_mirrors: bool,
+) -> bool {
+    client_copyin_process_mapped_impl(
+        pi, Some(process), va, dst, filled_pages, nfilled, scratch_base, allow_active_mirrors,
+    )
+}
+
+unsafe fn client_copyin_process_mapped_impl(
+    pi: u64,
+    process: Option<nt_memory_manager::ProcessIdentity>,
     va: u64,
     dst: &mut [u8],
     filled_pages: &[u64],
@@ -1926,12 +1990,37 @@ pub(crate) unsafe fn client_copyin_process_mapped(
         if client_copyin_frame_unavailable(pi, current & !0xfff) {
             return false;
         }
+        let page = current & !0xfff;
+        let backing = if let Some(process) = process {
+            match nt_memory_manager::admit_client_copy_backing(
+                pi,
+                process,
+                page,
+                &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+                shared_image_mapping_identity(pi, page),
+            ) {
+                Ok(backing) => Some(backing),
+                Err(_) => return false,
+            }
+        } else {
+            None
+        };
         // An exact record is authoritative, including a record undergoing reclamation.
         // Never substitute shared-cache or historical scratch backing for that record.
-        if csrss_frame_get_exact_record(pi, current & !0xfff).is_some()
-            || shared_image_mapping_contains_pi_unchecked(pi, current & !0xfff)
-        {
-            if !recorded_frame_copyin(pi, current, &mut dst[copied..copied + chunk], scratch_base) {
+        let recorded = if let Some(backing) = backing {
+            backing.resident.is_some() || backing.shared_image
+        } else {
+            csrss_frame_get_exact_record(pi, page).is_some()
+                || shared_image_mapping_contains_pi_unchecked(pi, page)
+        };
+        if recorded {
+            if !recorded_frame_copyin(
+                pi,
+                process,
+                current,
+                &mut dst[copied..copied + chunk],
+                scratch_base,
+            ) {
                 return false;
             }
             copied += chunk;
