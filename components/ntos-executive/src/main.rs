@@ -12619,17 +12619,21 @@ unsafe fn vm_unmap_private_page(
 
 unsafe fn vm_reprotect_private_page(
     pi: usize,
+    process: nt_memory_manager::ProcessIdentity,
     page: u64,
     old_protection: u32,
     new_protection: u32,
     pml4: u64,
 ) -> Result<(), u32> {
     hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
-    let frame = csrss_frame_get_exact(pi as u64, page).0;
-    if frame == 0 {
-        return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
-    }
-    vm_reprotect_private_frame(frame, page, old_protection, new_protection, pml4)
+    let record = nt_memory_manager::admit_resident_reprotect(
+        pi as u64,
+        process,
+        page,
+        &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+    )?
+    .ok_or(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED)?;
+    vm_reprotect_private_frame(record.frame, page, old_protection, new_protection, pml4)
 }
 
 unsafe fn vm_reprotect_private_frame(
@@ -12786,6 +12790,9 @@ unsafe fn vm_promote_image_cow_page(
     pml4: u64,
     scratch_base: u64,
 ) -> Result<(), u32> {
+    let nt_memory_manager::MemoryLifetime::Process(process) = lifetime else {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    };
     hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
     #[derive(Clone, Copy)]
     enum OldImageMapping {
@@ -12849,10 +12856,22 @@ unsafe fn vm_promote_image_cow_page(
         }
     }
 
-    let exact_record = csrss_frame_get_exact_record(pi as u64, page);
+    let exact_record = nt_memory_manager::admit_resident_reprotect(
+        pi as u64,
+        process,
+        page,
+        &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+    )?;
     if let Some(record) = exact_record {
         if record.owns_frame {
-            return vm_reprotect_private_page(pi, page, old_protection, new_protection, pml4);
+            return vm_reprotect_private_page(
+                pi,
+                process,
+                page,
+                old_protection,
+                new_protection,
+                pml4,
+            );
         }
     }
 
@@ -13034,10 +13053,22 @@ unsafe fn vm_promote_mapped_cow_page(
         }
     }
 
-    let exact_record = csrss_frame_get_exact_record(pi as u64, page);
+    let exact_record = nt_memory_manager::admit_resident_reprotect(
+        pi as u64,
+        process,
+        page,
+        &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+    )?;
     if let Some(record) = exact_record {
         if record.owns_frame {
-            return vm_reprotect_private_page(pi, page, old_protection, new_protection, pml4);
+            return vm_reprotect_private_page(
+                pi,
+                process,
+                page,
+                old_protection,
+                new_protection,
+                pml4,
+            );
         }
     }
 
@@ -13144,14 +13175,29 @@ unsafe fn vm_promote_mapped_cow_page(
 
 unsafe fn vm_reprotect_resident_image_page(
     pi: usize,
+    process: nt_memory_manager::ProcessIdentity,
     page: u64,
     old_protection: u32,
     new_protection: u32,
     pml4: u64,
 ) -> Result<(), u32> {
     hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
-    if csrss_frame_get_exact_record(pi as u64, page).is_some() {
-        return vm_reprotect_private_page(pi, page, old_protection, new_protection, pml4);
+    if nt_memory_manager::admit_resident_reprotect(
+        pi as u64,
+        process,
+        page,
+        &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+    )?
+    .is_some()
+    {
+        return vm_reprotect_private_page(
+            pi,
+            process,
+            page,
+            old_protection,
+            new_protection,
+            pml4,
+        );
     }
     if !shared_image_mapping_contains(pi as u64, page) {
         return Ok(());

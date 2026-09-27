@@ -17539,6 +17539,7 @@ impl ExecNtHandler {
                     while page < run_end {
                         if let Err(status) = vm_reprotect_private_page(
                             target_pi,
+                            target_process,
                             page,
                             old.unwrap().protection,
                             new.unwrap().protection,
@@ -17576,6 +17577,7 @@ impl ExecNtHandler {
                     {
                         let _ = vm_reprotect_private_page(
                             target_pi,
+                            target_process,
                             page,
                             new.protection,
                             old.protection,
