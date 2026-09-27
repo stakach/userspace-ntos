@@ -90,6 +90,9 @@ impl<P: Clone + Eq> ProcessAttachState<P> {
         transition: impl FnOnce(&P, &P) -> Result<(), E>,
     ) -> Result<(), AttachError<E>> {
         self.check_thread(thread)?;
+        if !self.is_attached() {
+            return Ok(());
+        }
         let Some(frame) = self.frames.last() else {
             return Ok(());
         };
@@ -218,6 +221,11 @@ mod tests {
             })
             .unwrap();
         assert!(!state.is_attached());
+        state
+            .detach(7, |_, _| -> Result<(), ()> {
+                panic!("unattached detach")
+            })
+            .unwrap();
         state
             .unstack_detach(7, original, |_, _| -> Result<(), ()> {
                 panic!("same original process")
