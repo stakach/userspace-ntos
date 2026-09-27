@@ -2917,6 +2917,37 @@ extern "win64" fn s_ps_get_current_thread_id() -> u64 {
     WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed)
 }
 
+/// `BOOLEAN KeIsAttachedProcess()` reads the selected KTHREAD's APC environment.
+extern "win64" fn s_ke_is_attached_process() -> u8 {
+    unsafe {
+        let ethread = current_ethread();
+        let tid = WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed);
+        let selected = thread_context_index_for_ethread(ethread)
+            .is_some_and(|index| {
+                thread_ctx_tid(index) == tid
+                    && thread_ctx_generation(index) != 0
+                    && process_context_index_for_pid(thread_ctx_pid(index)).is_some_and(
+                        |process| {
+                            process_ctx_generation(process) == thread_ctx_generation(index)
+                        },
+                    )
+            })
+            || crate::ps_bootstrap::initial_system_projection().is_some_and(|system| {
+                system.thread_body == ethread && u64::from(system.identity.thread_id()) == tid
+            });
+        if ethread == 0 || tid == 0 || !selected {
+            crate::provider_bugcheck::report(0xc4, [0x4b454941, ethread, tid, 1]);
+        }
+        let index = read_volatile(
+            (ethread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_INDEX as u64) as *const u8,
+        );
+        if index > 1 {
+            crate::provider_bugcheck::report(0xc4, [0x4b454941, ethread, u64::from(index), 2]);
+        }
+        index
+    }
+}
+
 /// `HANDLE PsGetThreadId(PETHREAD Thread)` — resolve a thread body back to its selected TID.
 extern "win64" fn s_ps_get_thread_id(thread: u64) -> u64 {
     unsafe {
@@ -14579,6 +14610,7 @@ fn register_trampolines() -> bool {
         s_ps_get_current_thread_id as usize as u64,
     );
     reg.bind("PsGetThreadId", s_ps_get_thread_id as usize as u64);
+    reg.bind("KeIsAttachedProcess", s_ke_is_attached_process as usize as u64);
     reg.bind(
         "PsGetThreadProcessId",
         s_ps_get_thread_process_id as usize as u64,

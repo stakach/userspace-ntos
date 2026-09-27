@@ -23,6 +23,7 @@ pub const KTHREAD_APC_STATE: usize = 0x48;
 pub const KTHREAD_APC_STATE_PROCESS: usize = 0x68;
 pub const KTHREAD_TEB: usize = 0xb0;
 pub const KTHREAD_PREVIOUS_MODE: usize = 0x153;
+pub const KTHREAD_APC_STATE_INDEX: usize = 0x1e4;
 pub const KTHREAD_PROCESS: usize = 0x200;
 pub const KTHREAD_APC_STATE_POINTERS: usize = 0x210;
 pub const KTHREAD_SAVED_APC_STATE: usize = 0x220;

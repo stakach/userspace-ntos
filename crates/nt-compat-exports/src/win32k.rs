@@ -101,7 +101,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("KeSetPriorityThread", Partial, "atomically returns and updates canonical ETHREAD priority through the executive Ps broker"),
     e("KeWaitForMultipleObjects", Partial, "single-threaded host: satisfied-or-poll-timeout wait via nt-kernel-exec; blocking waits require executive wait-broker wiring"),
     e("KeBugCheckEx", TrapIfCalled, "bugcheck: logs the code + panics (fail-loud)"),
-    e("KeIsAttachedProcess", Partial, "process-context attach tracked by nt-process; single address space on the host"),
+    e("KeIsAttachedProcess", Implemented, "reads the authenticated current KTHREAD ApcStateIndex from its ReactOS x64 projection"),
     e("KeSetTimer", Partial, "timer via nt-kernel-exec TimerQueue"),
     e("KePulseEvent", Partial, "event state via nt-kernel-exec EventStore"),
     e("KeWaitForSingleObject", Partial, "single-threaded host: satisfied-or-poll-timeout wait via nt-kernel-exec; blocking waits require executive wait-broker wiring"),
