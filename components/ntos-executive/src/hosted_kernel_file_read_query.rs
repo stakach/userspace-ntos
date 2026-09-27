@@ -1,8 +1,11 @@
-//! Driver ZwReadFile and ZwQueryInformationFile on an authenticated routed File.
+//! Driver File reads and information/directory queries on an authenticated routed File.
 
 use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
-use nt_io_manager::file_read_query_wire::{self as wire, FileReadQueryRequest, FileReadQueryWireError};
+use nt_io_manager::file_directory_query_wire as directory_wire;
+use nt_io_manager::file_read_query_wire::{
+    self as wire, FileReadQueryRequest, FileReadQueryWireError,
+};
 use nt_process::native_handle::{NativeHandleCaller, NativeThreadProcessReference};
 
 const STATUS_NOT_SUPPORTED_LOCAL: i32 = 0xc000_00bbu32 as i32;
@@ -23,17 +26,21 @@ fn wire_status(error: FileReadQueryWireError) -> u32 {
     }
 }
 
-#[derive(Clone, Copy)]
 enum Operation {
     Read(ReadWriteParameters),
     Query(u32),
+    Directory {
+        parameters: nt_io_manager::DirectoryQueryParameters,
+        flags: StackFlags,
+    },
 }
 
 impl Operation {
-    fn major(self) -> u8 {
+    fn major(&self) -> u8 {
         match self {
             Self::Read(_) => major::IRP_MJ_READ,
             Self::Query(_) => major::IRP_MJ_QUERY_INFORMATION,
+            Self::Directory { .. } => major::IRP_MJ_DIRECTORY_CONTROL,
         }
     }
 }
@@ -44,6 +51,7 @@ struct Work {
     reply: u64,
     token: u64,
     caller: NativeHandleCaller,
+    handle: u64,
     actor: NativeThreadProcessReference,
     file: super::hosted_file_capture::Capture,
     source: PacketSource,
@@ -54,8 +62,12 @@ struct Work {
     entered: bool,
     pending_irp: Option<IrpId>,
     terminal: Option<(u32, u64)>,
+    terminal_inline: bool,
+    prior_file_signal: Option<bool>,
     cancel_requested: bool,
     reply_entered: bool,
+    delivery_required: bool,
+    delivery_acked: bool,
 }
 
 enum PacketSource {
@@ -104,6 +116,61 @@ fn parse_packet(packet: &[u8]) -> Result<(Operation, Vec<u8>), u32> {
     Ok((operation, output))
 }
 
+fn parse_win32k_packet(packet: &[u8]) -> Result<(Operation, Vec<u8>), u32> {
+    if packet.len() < 4 {
+        return Err(STATUS_INVALID_BUFFER_SIZE);
+    }
+    if u32::from_le_bytes(packet[..4].try_into().unwrap()) != directory_wire::KIND_DIRECTORY {
+        return parse_packet(packet);
+    }
+    let request = directory_wire::decode_request(packet).map_err(|error| match error {
+        directory_wire::DirectoryQueryWireError::InvalidClass => {
+            STATUS_INVALID_INFO_CLASS_LOCAL as u32
+        }
+        directory_wire::DirectoryQueryWireError::LengthMismatch => {
+            STATUS_INFO_LENGTH_MISMATCH_LOCAL as u32
+        }
+        directory_wire::DirectoryQueryWireError::BufferTooSmall => STATUS_INVALID_BUFFER_SIZE,
+        directory_wire::DirectoryQueryWireError::Malformed => STATUS_INVALID_PARAMETER as u32,
+    })?;
+    let pattern = if let Some(encoded) = request.pattern {
+        let mut units = Vec::new();
+        units
+            .try_reserve_exact(encoded.len())
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES as u32)?;
+        for index in 0..encoded.len() {
+            units.push(encoded.unit(index).ok_or(STATUS_INVALID_PARAMETER as u32)?);
+        }
+        Some(nt_types::UnicodeString::from_owned_units(units))
+    } else {
+        None
+    };
+    let mut flags = StackFlags::empty();
+    if request.restart_scan {
+        flags |= StackFlags::RESTART_SCAN;
+    }
+    if request.return_single_entry {
+        flags |= StackFlags::RETURN_SINGLE_ENTRY;
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(request.output_len as usize)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES as u32)?;
+    output.resize(request.output_len as usize, 0);
+    Ok((
+        Operation::Directory {
+            parameters: nt_io_manager::DirectoryQueryParameters {
+                length: request.output_len,
+                information_class: nt_fs::FILE_DIRECTORY_INFORMATION,
+                file_index: 0,
+                pattern,
+            },
+            flags,
+        },
+        output,
+    ))
+}
+
 pub(crate) unsafe fn submit(
     channel: &crate::spawn_hosts::PumpChannel,
     packet: u64,
@@ -127,13 +194,25 @@ pub(crate) unsafe fn submit(
     let source = PacketSource::Fsd {
         instance,
         domain: nt_io_manager::HostedTransportIdentity {
-            domain: channel.physical_domain.expect("authenticated hosted File I/O domain"),
+            domain: channel
+                .physical_domain
+                .expect("authenticated hosted File I/O domain"),
             endpoint: channel.fault_ep,
             vspace: channel.pml4,
             shared: channel.shared_va,
         },
     };
-    submit_captured(channel, packet, packet_length, handle, 0, caller, operation, output, source)
+    submit_captured(
+        channel,
+        packet,
+        packet_length,
+        handle,
+        0,
+        caller,
+        operation,
+        output,
+        source,
+    )
 }
 
 pub(crate) unsafe fn submit_win32k(
@@ -148,20 +227,35 @@ pub(crate) unsafe fn submit_win32k(
         Ok(caller) => caller,
         Err(status) => return Some(status as i32),
     };
-    let Ok(length) = usize::try_from(packet_length) else { return Some(STATUS_INVALID_BUFFER_SIZE as i32) };
-    let (lease, bytes) = match crate::win32k_subsystem::capture_provider_pool_packet(packet, length) {
+    let Ok(length) = usize::try_from(packet_length) else {
+        return Some(STATUS_INVALID_BUFFER_SIZE as i32);
+    };
+    let (lease, bytes) = match crate::win32k_subsystem::capture_provider_pool_packet(packet, length)
+    {
         Ok(captured) => captured,
         Err(status) => return Some(status as i32),
     };
-    let (operation, output) = match parse_packet(&bytes) {
+    let (operation, output) = match parse_win32k_packet(&bytes) {
         Ok(captured) => captured,
         Err(status) => return Some(status as i32),
     };
-    if !matches!(operation, Operation::Query(_)) {
+    if !matches!(operation, Operation::Query(_) | Operation::Directory { .. }) {
         return Some(STATUS_INVALID_PARAMETER);
     }
-    submit_captured(channel, packet, packet_length, handle, expected_file, caller, operation, output,
-        PacketSource::Win32k { lease, packet: bytes })
+    submit_captured(
+        channel,
+        packet,
+        packet_length,
+        handle,
+        expected_file,
+        caller,
+        operation,
+        output,
+        PacketSource::Win32k {
+            lease,
+            packet: bytes,
+        },
+    )
 }
 
 unsafe fn submit_captured(
@@ -202,7 +296,7 @@ unsafe fn submit_captured(
                 .information()
                 .granted_access
                 .ok_or(STATUS_INVALID_HANDLE as u32)?;
-            if matches!(operation, Operation::Read(_))
+            if matches!(operation, Operation::Read(_) | Operation::Directory { .. })
                 && granted & (FILE_READ_DATA | GENERIC_READ | GENERIC_ALL) == 0
             {
                 return Err(STATUS_ACCESS_DENIED as u32);
@@ -251,6 +345,7 @@ unsafe fn submit_captured(
         reply,
         token,
         caller,
+        handle,
         actor,
         file,
         source,
@@ -261,8 +356,12 @@ unsafe fn submit_captured(
         entered: false,
         pending_irp: None,
         terminal: None,
+        terminal_inline: false,
+        prior_file_signal: None,
         cancel_requested: false,
         reply_entered: false,
+        delivery_required: false,
+        delivery_acked: false,
     };
     let index = if let Some(index) = slot {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
@@ -285,7 +384,11 @@ unsafe fn submit_captured(
 
 impl Work {
     fn checked_terminal(&self, status: u32, information: u64) -> (u32, u64) {
-        if matches!(self.operation, Operation::Read(_)) && information > self.output.len() as u64 {
+        if matches!(
+            self.operation,
+            Operation::Read(_) | Operation::Directory { .. }
+        ) && information > self.output.len() as u64
+        {
             (nt_fs::STATUS_DATA_ERROR, 0)
         } else {
             (status, information)
@@ -343,6 +446,9 @@ impl Work {
                 }
                 return false;
             }
+            if self.delivery_required && !self.delivery_acked {
+                return false;
+            }
             if let Some(irp) = self.pending_irp {
                 if acknowledge_completed_irp(irp.raw()).is_err() {
                     return false;
@@ -366,19 +472,26 @@ impl Work {
             if let Err(status) = self.actor.validate(&(*handler).pm) {
                 self.entered = true;
                 self.terminal = Some((status, 0));
+                self.terminal_inline = true;
             } else {
+                self.prior_file_signal = Some(
+                    (*handler)
+                        .file_completion
+                        .is_signaled(self.file.file_id())
+                        .expect("live hosted File read/query signal"),
+                );
                 (*handler)
                     .file_completion
                     .set_signaled(self.file.file_id(), false)
                     .expect("live hosted File read/query signal");
                 self.entered = true;
-                let result = match self.operation {
+                let result = match &self.operation {
                     Operation::Read(parameters) => {
                         dispatch_hosted_file_read_write_irp_result_exact(
                             self.file.file_id(),
                             major::IRP_MJ_READ,
                             self.caller,
-                            parameters,
+                            *parameters,
                             &[],
                             &mut self.output,
                         )
@@ -386,19 +499,33 @@ impl Work {
                     Operation::Query(class) => dispatch_hosted_file_irp_result_exact(
                         self.file.file_id(),
                         major::IRP_MJ_QUERY_INFORMATION as u64,
-                        class as u64,
+                        *class as u64,
                         self.caller,
                         &[],
                         &mut self.output,
                         0,
                     ),
+                    Operation::Directory { parameters, flags } => {
+                        dispatch_hosted_file_directory_query_result_exact(
+                            self.file.file_id(),
+                            self.caller,
+                            parameters.clone(),
+                            *flags,
+                            &mut self.output,
+                        )
+                        .map(|(status, information, irp)| (status, information, irp, None))
+                    }
                 };
                 match result {
                     Ok((_, _, Some(irp), _)) => self.pending_irp = Some(irp),
                     Ok((status, information, None, _)) => {
                         self.terminal = Some(self.checked_terminal(status as u32, information));
+                        self.terminal_inline = true;
                     }
-                    Err(status) => self.terminal = Some((status, 0)),
+                    Err(status) => {
+                        self.terminal = Some((status, 0));
+                        self.terminal_inline = true;
+                    }
                 }
             }
         }
@@ -445,30 +572,85 @@ impl Work {
             return self.finish_cancelled(handler);
         }
         let (status, information) = self.terminal.expect("hosted File read/query terminal");
+        if !nt_io_completion::file_io_status_publishes_completion(status, self.terminal_inline) {
+            if let Some(previous) = self.prior_file_signal {
+                (*handler)
+                    .file_completion
+                    .set_signaled(self.file.file_id(), previous)
+                    .expect("restore File signal after inline error");
+                if previous {
+                    let mut objects = (*handler).dispatcher_objects(None);
+                    crate::service_sec_image::provider_wait_select_ready(&mut objects);
+                }
+            }
+            self.reply_entered = true;
+            let _ = runtime::wake_service(
+                self.route,
+                self.dispatch,
+                self.reply,
+                self.token,
+                status as i32,
+            );
+            return false;
+        }
         match &mut self.source {
             PacketSource::Fsd { instance, domain } => {
-                let Some((_, live)) = instance_by_shared_va(domain.shared) else { return false };
-                let Some(live_domain) = instance_domain_identity(live) else { return false };
+                let Some((_, live)) = instance_by_shared_va(domain.shared) else {
+                    return false;
+                };
+                let Some(live_domain) = instance_domain_identity(live) else {
+                    return false;
+                };
                 let live_transport = nt_io_manager::HostedTransportIdentity {
                     domain: live_domain,
                     endpoint: live.fault_ep,
                     vspace: live.pml4,
                     shared: live.exec_shared_va,
                 };
-                if !domain.matches_live(live_transport) || live.exec_pool_va != instance.exec_pool_va {
+                if !domain.matches_live(live_transport)
+                    || live.exec_pool_va != instance.exec_pool_va
+                {
                     return false;
                 }
-                let Some(exec) = hosted_instance_pool_allocation_exec_if_live(live, self.packet, self.packet_length) else {
+                let Some(exec) = hosted_instance_pool_allocation_exec_if_live(
+                    live,
+                    self.packet,
+                    self.packet_length,
+                ) else {
                     return false;
                 };
-                let packet = core::slice::from_raw_parts_mut(exec as *mut u8, self.packet_length as usize);
+                let packet =
+                    core::slice::from_raw_parts_mut(exec as *mut u8, self.packet_length as usize);
                 if wire::publish_completion(packet, &self.output, status, information).is_err() {
-                    crate::provider_bugcheck::report(0xc4, [self.packet, self.packet_length, self.file.file_id(), status as u64]);
+                    crate::provider_bugcheck::report(
+                        0xc4,
+                        [
+                            self.packet,
+                            self.packet_length,
+                            self.file.file_id(),
+                            status as u64,
+                        ],
+                    );
                 }
             }
             PacketSource::Win32k { lease, packet } => {
-                if wire::publish_completion(packet, &self.output, status, information).is_err() {
-                    crate::provider_bugcheck::report(0xc4, [self.packet, self.packet_length, self.file.file_id(), status as u64]);
+                self.delivery_required = true;
+                let published = if matches!(self.operation, Operation::Directory { .. }) {
+                    directory_wire::publish_completion(packet, &self.output, status, information)
+                        .is_ok()
+                } else {
+                    wire::publish_completion(packet, &self.output, status, information).is_ok()
+                };
+                if !published {
+                    crate::provider_bugcheck::report(
+                        0xc4,
+                        [
+                            self.packet,
+                            self.packet_length,
+                            self.file.file_id(),
+                            status as u64,
+                        ],
+                    );
                 }
                 if !crate::win32k_subsystem::publish_provider_pool_packet(*lease, packet) {
                     packet[24..40].fill(0);
@@ -476,12 +658,14 @@ impl Work {
                 }
             }
         }
-        (*handler)
-            .file_completion
-            .set_signaled(self.file.file_id(), true)
-            .expect("terminal hosted File read/query signal");
-        let mut objects = (*handler).dispatcher_objects(None);
-        crate::service_sec_image::provider_wait_select_ready(&mut objects);
+        if matches!(self.source, PacketSource::Fsd { .. }) {
+            (*handler)
+                .file_completion
+                .set_signaled(self.file.file_id(), true)
+                .expect("terminal hosted File read/query signal");
+            let mut objects = (*handler).dispatcher_objects(None);
+            crate::service_sec_image::provider_wait_select_ready(&mut objects);
+        }
         self.reply_entered = true;
         let _ = runtime::wake_service(
             self.route,
@@ -531,6 +715,56 @@ pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
     );
 }
 
+/// Win32k calls this only after copying the completed packet into the caller's buffer and IOSB.
+/// The File event must not become ready while those writes are still outstanding.
+pub(crate) unsafe fn acknowledge_win32k_delivery(
+    channel: &crate::spawn_hosts::PumpChannel,
+    packet: u64,
+    handle: u64,
+    handler: *mut ExecNtHandler,
+) -> i32 {
+    let _durable = crate::allocator::enter_durable();
+    let route = match runtime::channel_route(channel) {
+        Ok(Some(route)) => route,
+        _ => return STATUS_INVALID_HANDLE,
+    };
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
+    let Some((index, work)) = rows.iter_mut().enumerate().find_map(|(index, row)| {
+        row.as_mut()
+            .filter(|work| {
+                work.route == route
+                    && work.handle == handle
+                    && work.packet == packet
+                    && matches!(work.source, PacketSource::Win32k { .. })
+            })
+            .map(|work| (index, work))
+    }) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if (&*core::ptr::addr_of!(EXECUTING)).contains(&index)
+        || !work.reply_entered
+        || !work.delivery_required
+        || work.delivery_acked
+        || work.cancelled()
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let PacketSource::Win32k { lease, .. } = &work.source else {
+        unreachable!()
+    };
+    if !crate::win32k_subsystem::provider_pool_packet_lease_live(*lease) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    (*handler)
+        .file_completion
+        .set_signaled(work.file.file_id(), true)
+        .expect("delivered win32k File query signal");
+    let mut objects = (*handler).dispatcher_objects(None);
+    crate::service_sec_image::provider_wait_select_ready(&mut objects);
+    work.delivery_acked = true;
+    STATUS_SUCCESS
+}
+
 fn invoke(handle: u64, iosb: u64, output: u64, length: u32, operation: Operation) -> i32 {
     if iosb == 0 || (length != 0 && output == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -546,11 +780,11 @@ fn invoke(handle: u64, iosb: u64, output: u64, length: u32, operation: Operation
     let request = match operation {
         Operation::Read(parameters) => FileReadQueryRequest::Read(parameters),
         Operation::Query(class) => FileReadQueryRequest::Query { class, length },
+        Operation::Directory { .. } => return STATUS_NOT_SUPPORTED_LOCAL,
     };
-    if let Err(error) = wire::encode_request(
-        request,
-        unsafe { core::slice::from_raw_parts_mut(packet as *mut u8, total) },
-    ) {
+    if let Err(error) = wire::encode_request(request, unsafe {
+        core::slice::from_raw_parts_mut(packet as *mut u8, total)
+    }) {
         unsafe { pool_free(packet) };
         return wire_status(error) as i32;
     }
@@ -577,7 +811,15 @@ fn invoke(handle: u64, iosb: u64, output: u64, length: u32, operation: Operation
         }) {
             Ok(completion) => completion,
             Err(_) => unsafe {
-                crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_ZW_READ_QUERY_FILE_LABEL, packet, total as u64, status])
+                crate::provider_bugcheck::report(
+                    0xc4,
+                    [
+                        FSD_SERVICE_ZW_READ_QUERY_FILE_LABEL,
+                        packet,
+                        total as u64,
+                        status,
+                    ],
+                )
             },
         };
         let copied = if nt_io_completion::file_io_status_copies_output(terminal) {
@@ -587,11 +829,7 @@ fn invoke(handle: u64, iosb: u64, output: u64, length: u32, operation: Operation
         };
         unsafe {
             if copied != 0 {
-                core::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    output as *mut u8,
-                    copied,
-                );
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), output as *mut u8, copied);
             }
             write_unaligned(iosb as *mut u32, terminal);
             write_unaligned((iosb + 8) as *mut u64, information);

@@ -164,7 +164,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ZwQuerySystemInformation", Partial, "returns live NT5 SystemBasicInformation and CPUID-derived SystemProcessorInformation with shared size policy"),
     e("ZwQueryKey", Partial, "leased SYSTEM keys use the complete native key-information layouts and sizing policy; non-SYSTEM dynamic keys remain"),
     e("ZwQueryObject", Partial, "File ObjectNameInformation uses live FileNameInformation and canonical Device name; other classes unsupported"),
-    e("ZwQueryDirectoryFile", StubSuccess, "file ops routed to nt-fs where mounted; else success with empty result (Phase 2 wiring)"),
+    e("ZwQueryDirectoryFile", Partial, "authenticated win32k FileDirectoryInformation IRP with bounded wildcard, retained completion, and delivery-acknowledged File event"),
     e("ZwQueryInformationFile", Partial, "authenticated win32k kernel-handle queries retain real routed File IRP completion and exact pool ownership"),
     e("ZwUnmapViewOfSection", Partial, "virtual-memory/section ops routed to nt-memory-manager/nt-address-space"),
     e("ZwMapViewOfSection", Partial, "virtual-memory/section ops routed to nt-memory-manager/nt-address-space"),

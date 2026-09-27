@@ -4501,6 +4501,28 @@ pub(crate) unsafe fn service_win32k_file_query_request(
     crate::driver_launch::service_win32k_file_query(channel, packet, length, handle, spare)
 }
 
+pub(crate) unsafe fn service_win32k_file_query_delivered(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    packet: u64,
+    handle: u64,
+    spare: [u64; 2],
+) -> i32 {
+    if spare != [0; 2] {
+        return nt_process::STATUS_INVALID_PARAMETER as i32;
+    }
+    if let Err(status) = authenticate_win32k_service_request(
+        channel, reply_cap, badge, mi,
+        (crate::win32k_subsystem::W32_FILE_QUERY_DELIVERED_LABEL << 12) | 4,
+    ) {
+        return status as i32;
+    }
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    crate::driver_launch::service_win32k_file_query_delivered(channel, packet, handle, handler)
+}
+
 pub(crate) unsafe fn service_win32k_file_cancel_request(
     channel: &spawn_hosts::PumpChannel,
     reply_cap: u64,
