@@ -342,6 +342,63 @@ fn remap_reuses_same_cap_without_copy_or_delete() {
 }
 
 #[test]
+fn suspend_and_resume_reuse_exact_cap_and_rights_without_replaying_success() {
+    let (mut owner, mut io) = live();
+    owner.suspend(&mut io).unwrap();
+    assert_eq!(owner.live(), None);
+    assert_eq!(owner.suspended(), Some((42, 1)));
+    assert_eq!(io.mapped, None);
+    assert_eq!(owner.snapshot().capabilities().collect::<Vec<_>>(), vec![42]);
+    owner.suspend(&mut io).unwrap();
+    owner.resume(&mut io).unwrap();
+    owner.resume(&mut io).unwrap();
+    assert_eq!(owner.live(), Some((42, 1)));
+    assert_eq!(owner.suspended(), None);
+    assert_eq!(io.calls, vec![Call::Unmap(42), Call::Map(42, 1)]);
+}
+
+#[test]
+fn failed_suspend_keeps_live_mapping_and_does_not_publish_suspension() {
+    let (mut owner, mut io) = live();
+    io.fail_unmap = Some(42);
+    assert_eq!(owner.suspend(&mut io), Err(4));
+    assert_eq!(owner.live(), Some((42, 1)));
+    assert_eq!(owner.suspended(), None);
+    assert_eq!(io.mapped, Some((42, 1)));
+    assert_eq!(owner.resume(&mut io), Ok(()));
+    assert_eq!(io.calls, vec![Call::Unmap(42)]);
+}
+
+#[test]
+fn failed_resume_retains_unmapped_cap_and_retries_only_the_map() {
+    let (mut owner, mut io) = live();
+    owner.suspend(&mut io).unwrap();
+    io.fail_maps.push((42, 1));
+    assert_eq!(owner.resume(&mut io), Err(3));
+    assert_eq!(owner.live(), None);
+    assert_eq!(owner.suspended(), Some((42, 1)));
+    assert_eq!(io.mapped, None);
+    assert_eq!(owner.replace(2, &mut io), Err(INVALID));
+    assert_eq!(owner.remap(2, &mut io), Err(INVALID));
+    owner.recover(&mut io).unwrap();
+    assert_eq!(io.calls, vec![Call::Unmap(42), Call::Map(42, 1)]);
+    io.fail_maps.clear();
+    owner.resume(&mut io).unwrap();
+    assert_eq!(io.calls, vec![Call::Unmap(42), Call::Map(42, 1), Call::Map(42, 1)]);
+    assert_eq!(owner.live(), Some((42, 1)));
+}
+
+#[test]
+fn retirement_while_suspended_skips_unmap_and_releases_exact_cap() {
+    let (mut owner, mut io) = live();
+    owner.suspend(&mut io).unwrap();
+    owner.retire(&mut io).unwrap();
+    assert!(owner.is_empty());
+    assert_eq!(io.calls, vec![Call::Unmap(42), Call::Delete(42), Call::Recycle(42)]);
+    assert_eq!(owner.resume(&mut io), Err(INVALID));
+}
+
+#[test]
 fn remap_failure_restores_exact_old_rights_and_returns_failure() {
     let (mut owner, mut io) = live();
     io.fail_maps.push((42, 2));

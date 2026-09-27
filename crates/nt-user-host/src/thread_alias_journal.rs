@@ -44,6 +44,13 @@ impl ThreadAliasMapping {
             self.alias.live()
         }
     }
+    pub fn suspended(&self) -> Option<(u64, u64)> {
+        if self.is_claimed() {
+            None
+        } else {
+            self.alias.suspended()
+        }
+    }
     /// Ordinary removal cannot discard a claim, even if all physical slots are already empty.
     pub fn is_empty(&self) -> bool {
         !self.is_claimed() && self.alias.is_empty()
@@ -60,6 +67,12 @@ impl ThreadAliasMapping {
     }
     pub fn remap(&mut self, rights: u64, io: &mut impl AliasTransitionIo) -> Result<(), u32> {
         self.ordinary()?.remap(rights, io)
+    }
+    pub fn suspend(&mut self, io: &mut impl AliasRetirementIo) -> Result<(), u32> {
+        self.ordinary()?.suspend(io)
+    }
+    pub fn resume(&mut self, io: &mut impl AliasTransitionIo) -> Result<(), u32> {
+        self.ordinary()?.resume(io)
     }
     pub fn recover(&mut self, io: &mut impl AliasTransitionIo) -> Result<(), u32> {
         self.ordinary()?.recover(io)

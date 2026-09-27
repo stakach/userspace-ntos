@@ -160,6 +160,8 @@ fn claim_rejects_all_ordinary_operations_without_effects() {
         assert!(!row.is_empty());
         assert_eq!(row.replace(2, &mut backend), Err(INVALID));
         assert_eq!(row.remap(2, &mut backend), Err(INVALID));
+        assert_eq!(row.suspend(&mut backend), Err(INVALID));
+        assert_eq!(row.resume(&mut backend), Err(INVALID));
         assert_eq!(row.recover(&mut backend), Err(INVALID));
         assert_eq!(row.retire(&mut backend), Err(INVALID));
     }
