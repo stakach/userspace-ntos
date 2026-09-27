@@ -13100,15 +13100,18 @@ pub(crate) unsafe fn service_sec_image(
                     } else {
                         let input =
                             core::slice::from_raw_parts_mut(arg as *mut u8, WIN32K_MSG_BYTES);
-                        if img_spawn::client_copyin_process_mapped(
-                            pi as u64,
-                            a0,
-                            input,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                            false,
-                        ) {
+                        if nt_handler.capture_process_identity(pi).is_some_and(|process| {
+                            img_spawn::client_copyin_process_mapped_for(
+                                pi as u64,
+                                process,
+                                a0,
+                                input,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                                false,
+                            )
+                        }) {
                             d_a0 = arg;
                         } else {
                             let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -17168,15 +17171,18 @@ pub(crate) unsafe fn service_sec_image(
                             ));
                             true
                         } else {
-                            img_spawn::client_copyin_process_mapped(
-                                pi as u64,
-                                a0,
-                                &mut msg,
-                                filled_pages,
-                                faults as usize,
-                                scratch_base,
-                                false,
-                            )
+                            nt_handler.capture_process_identity(pi).is_some_and(|process| {
+                                img_spawn::client_copyin_process_mapped_for(
+                                    pi as u64,
+                                    process,
+                                    a0,
+                                    &mut msg,
+                                    filled_pages,
+                                    faults as usize,
+                                    scratch_base,
+                                    false,
+                                )
+                            })
                         };
                         let hwnd = u64::from_le_bytes(msg[0..8].try_into().unwrap_or([0; 8]));
                         let message = u32::from_le_bytes(msg[8..12].try_into().unwrap_or([0; 4]));
@@ -23134,6 +23140,7 @@ unsafe fn dump_hosted_thread_quiesce(
     procs: &[ProcExec],
     pfilled: &[[u64; 512]],
 ) {
+    let process = nt_handler.capture_process_identity(pi);
     let mut regs = [0u64; 20];
     crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
     let rip = regs[nt_user_callback::USER_CONTEXT_RIP];
@@ -23228,7 +23235,7 @@ unsafe fn dump_hosted_thread_quiesce(
                 ));
             }
             let mut bytes = [0u8; 8];
-            quiesce_copyin_process_bytes(pi, va, &mut bytes, procs, pfilled)
+            quiesce_copyin_process_bytes(pi, process, va, &mut bytes, procs, pfilled)
                 .then(|| u64::from_le_bytes(bytes))
         }
     };
@@ -23291,6 +23298,7 @@ unsafe fn dump_hosted_thread_quiesce(
                 label,
                 value,
                 pi,
+                process,
                 loaded_images,
                 reg,
                 ntdll,
@@ -23313,16 +23321,21 @@ unsafe fn dump_hosted_thread_quiesce(
 #[inline]
 unsafe fn quiesce_copyin_process_bytes(
     pi: usize,
+    process: Option<nt_memory_manager::ProcessIdentity>,
     va: u64,
     dst: &mut [u8],
     procs: &[ProcExec],
     pfilled: &[[u64; 512]],
 ) -> bool {
+    let Some(process) = process else {
+        return false;
+    };
     if pi >= MAX_PI {
         return false;
     }
-    img_spawn::client_copyin_process_mapped(
+    img_spawn::client_copyin_process_mapped_for(
         pi as u64,
+        process,
         va,
         dst,
         &pfilled[pi],
@@ -23337,6 +23350,7 @@ unsafe fn print_quiesce_iat_call_site(
     label: &[u8],
     return_address: u64,
     pi: usize,
+    process: Option<nt_memory_manager::ProcessIdentity>,
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
     ntdll: (u64, &nt_pe_loader::PeFile),
@@ -23347,7 +23361,7 @@ unsafe fn print_quiesce_iat_call_site(
         return false;
     };
     let mut insn = [0u8; 6];
-    if !quiesce_copyin_process_bytes(pi, insn_address, &mut insn, procs, pfilled) {
+    if !quiesce_copyin_process_bytes(pi, process, insn_address, &mut insn, procs, pfilled) {
         return false;
     }
     if insn[0] != 0xff || insn[1] != 0x15 {
@@ -23364,7 +23378,7 @@ unsafe fn print_quiesce_iat_call_site(
     };
     let mut target_bytes = [0u8; 8];
     let target =
-        if quiesce_copyin_process_bytes(pi, slot_address, &mut target_bytes, procs, pfilled) {
+        if quiesce_copyin_process_bytes(pi, process, slot_address, &mut target_bytes, procs, pfilled) {
             Some(u64::from_le_bytes(target_bytes))
         } else {
             None

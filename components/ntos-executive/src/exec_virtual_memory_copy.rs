@@ -470,8 +470,10 @@ impl ExecNtHandler {
             .loop_ctx
             .and_then(|ctx| ctx.for_process(pi))
             .ok_or(STATUS_INVALID_HANDLE)?;
-        if client_copyin_process_mapped(
+        let process = self.capture_process_identity(pi).ok_or(STATUS_INVALID_HANDLE)?;
+        if client_copyin_process_mapped_for(
             pi as u64,
+            process,
             address,
             output,
             &*ctx.filled_pages,

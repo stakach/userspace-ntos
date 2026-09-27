@@ -9360,6 +9360,15 @@ unsafe fn shared_image_mapping_contains_pi_unchecked(pi: u64, page: u64) -> bool
     shared_image_mapping_find(pi, page).is_some()
 }
 
+unsafe fn shared_image_mapping_identity(
+    pi: u64,
+    page: u64,
+) -> Option<nt_memory_manager::SharedImageMappingIdentity> {
+    let (chunk, index) = shared_image_mapping_find(pi, page)?;
+    let chunks = (*core::ptr::addr_of!(SHARED_IMAGE_MAPPING_CHUNKS)).as_ref()?;
+    Some((*chunks[chunk]).entries[index].identity)
+}
+
 unsafe fn shared_image_mapping_debug(pi: u64, page: u64) -> Option<SharedImageMappingCap> {
     let (chunk, index) = shared_image_mapping_find(pi, page)?;
     let chunks = (*core::ptr::addr_of!(SHARED_IMAGE_MAPPING_CHUNKS)).as_ref()?;

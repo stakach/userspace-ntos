@@ -2556,15 +2556,25 @@ unsafe fn callback_payload_u32(frame: *mut nt_user_callback::CallbackFrame, offs
     callback_payload_u64(frame, offset) as u32
 }
 
-unsafe fn client_copyin_process_u64(pi: u64, scratch_base: u64, va: u64) -> Option<u64> {
+unsafe fn client_copyin_process_u64(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    scratch_base: u64,
+    va: u64,
+) -> Option<u64> {
     let mut bytes = [0u8; 8];
-    crate::img_spawn::client_copyin_process_mapped(pi, va, &mut bytes, &[], 0, scratch_base, false)
+    crate::img_spawn::client_copyin_process_mapped_for(pi, process, va, &mut bytes, &[], 0, scratch_base, false)
         .then_some(u64::from_le_bytes(bytes))
 }
 
-unsafe fn client_copyin_process_u32(pi: u64, scratch_base: u64, va: u64) -> Option<u32> {
+unsafe fn client_copyin_process_u32(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    scratch_base: u64,
+    va: u64,
+) -> Option<u32> {
     let mut bytes = [0u8; 4];
-    crate::img_spawn::client_copyin_process_mapped(pi, va, &mut bytes, &[], 0, scratch_base, false)
+    crate::img_spawn::client_copyin_process_mapped_for(pi, process, va, &mut bytes, &[], 0, scratch_base, false)
         .then_some(u32::from_le_bytes(bytes))
 }
 
@@ -2572,9 +2582,16 @@ unsafe fn explorer_atl_create_data_for_tid(
     client: crate::spawn_hosts::UserCallbackClient,
 ) -> Option<(u64, u64)> {
     let pi = callback_client_owner_pi(client)?;
+    let process = nt_memory_manager::ProcessIdentity {
+        pid: u32::try_from(client.pid).ok()?,
+        generation: nt_memory_manager::ProcessGeneration::Hosted(client.generation),
+    };
+    if !process.is_valid() {
+        return None;
+    }
     let list_head_va =
         crate::PE_LOAD_BASE + EXPLORER_ATL_WIN_MODULE_RVA + ATL_CREATE_WND_LIST_OFFSET;
-    let mut entry = client_copyin_process_u64(pi as u64, client.scratch_base, list_head_va)?;
+    let mut entry = client_copyin_process_u64(pi as u64, process, client.scratch_base, list_head_va)?;
 
     for _ in 0..8 {
         if entry == 0 {
@@ -2582,12 +2599,14 @@ unsafe fn explorer_atl_create_data_for_tid(
         }
         let entry_tid = client_copyin_process_u32(
             pi as u64,
+            process,
             client.scratch_base,
             entry + ATL_CREATE_WND_DATA_TID_OFFSET,
         )
         .unwrap_or(u32::MAX);
         let p_this = client_copyin_process_u64(
             pi as u64,
+            process,
             client.scratch_base,
             entry + ATL_CREATE_WND_DATA_THIS_OFFSET,
         )
@@ -2597,6 +2616,7 @@ unsafe fn explorer_atl_create_data_for_tid(
         }
         entry = client_copyin_process_u64(
             pi as u64,
+            process,
             client.scratch_base,
             entry + ATL_CREATE_WND_DATA_NEXT_OFFSET,
         )
