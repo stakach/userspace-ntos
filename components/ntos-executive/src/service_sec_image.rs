@@ -8879,6 +8879,8 @@ pub(crate) unsafe fn service_sec_image(
     CENSUS_LAST_DUMP.store(last_progress_t, Ordering::Relaxed);
     let memory_context = ExecLoopCtx {
         owner_pi: primary_pi,
+        owner_pid: nt_handler.capture_process_identity(primary_pi)
+            .expect("primary process retains its mechanism identity").pid,
         owner_generation: primary_image.generation,
         live_paging: None,
         pml4,
@@ -9542,11 +9544,15 @@ pub(crate) unsafe fn service_sec_image(
         *filled_pages = pfilled[pi];
         let memory_generation = exe_image_catalog.get_by_pi(pi)
             .expect("event process retains its executable identity").generation;
+        let memory_pid = nt_handler.capture_process_identity(pi)
+            .expect("event process retains its mechanism identity").pid;
         nt_handler.loop_ctx = Some(ExecLoopCtx {
             owner_pi: pi,
+            owner_pid: memory_pid,
             owner_generation: memory_generation,
             live_paging: Some(LiveProcessPaging {
                 pi,
+                pid: memory_pid,
                 pml4,
                 generation: memory_generation,
                 filled_pages: filled_pages as *mut [u64; 512],

@@ -22785,6 +22785,7 @@ impl ObjEntry {
 #[derive(Clone, Copy)]
 struct LiveProcessPaging {
     pi: usize,
+    pid: u32,
     pml4: u64,
     generation: u64,
     filled_pages: *mut [u64; 512],
@@ -22798,6 +22799,7 @@ struct LiveProcessPaging {
 struct ExecLoopCtx {
     /// Identity of the selected process, distinct from the loop's live local bookkeeping.
     owner_pi: usize,
+    owner_pid: u32,
     owner_generation: u64,
     live_paging: Option<LiveProcessPaging>,
     /// The faulting process's PML4 (page_map target for COMMIT frames / demand-filled pages).
@@ -22863,13 +22865,19 @@ impl ExecLoopCtx {
             return None;
         }
         let generation = (&*self.exe_image_catalog).get_by_pi(pi)?.generation;
+        let pid = (&*core::ptr::addr_of!(PROCESS_MECHANISM_WORK))
+            .get(pi)
+            .filter(|mechanism| mechanism.generation == generation)?
+            .pid;
         if selection == nt_memory_manager::CopyBookkeeping::Current {
-            return (target.pml4 == self.pml4 && generation == self.owner_generation).then_some(self);
+            return (target.pml4 == self.pml4
+                && pid == self.owner_pid
+                && generation == self.owner_generation).then_some(self);
         }
         let pe = (&*self.hosted_loaded_images).pe_by_pi(pi)?;
         let (filled_pages, faults) = if selection == nt_memory_manager::CopyBookkeeping::Live {
             let live = self.live_paging?;
-            if target.pml4 != live.pml4 || generation != live.generation {
+            if target.pml4 != live.pml4 || pid != live.pid || generation != live.generation {
                 return None;
             }
             (live.filled_pages, live.faults)
@@ -22881,6 +22889,7 @@ impl ExecLoopCtx {
         };
         Some(Self {
             owner_pi: pi,
+            owner_pid: pid,
             owner_generation: generation,
             pml4: target.pml4,
             scratch_base: target.scratch_base,
@@ -22896,8 +22905,11 @@ impl ExecLoopCtx {
             let target = (&mut *self.procs).get_mut(live.pi)
                 .expect("live paging owner remains in the process table");
             assert_eq!(self.owner_pi, live.pi, "paging checkpoint requires the restored live owner");
+            let current_pid = (&*core::ptr::addr_of!(PROCESS_MECHANISM_WORK))
+                .get(live.pi)
+                .map(|mechanism| mechanism.pid);
             if !nt_memory_manager::live_checkpoint_matches(
-                self.owner_pi, live.pi, live.pml4, target.pml4,
+                self.owner_pi, live.pi, live.pid, current_pid, live.pml4, target.pml4,
                 live.generation,
                 (&*self.exe_image_catalog).get_by_pi(live.pi).map(|image| image.generation),
             ) {
@@ -22921,6 +22933,8 @@ impl ExecLoopCtx {
     unsafe fn main_image(&self) -> Option<&nt_pe_loader::PeFile<'static>> {
         let target = (&*self.procs).get(self.owner_pi)?;
         if self.pml4 == 0 || target.pml4 != self.pml4
+            || (&*core::ptr::addr_of!(PROCESS_MECHANISM_WORK)).get(self.owner_pi)
+                .map(|mechanism| mechanism.pid) != Some(self.owner_pid)
             || (&*self.exe_image_catalog).get_by_pi(self.owner_pi)?.generation != self.owner_generation
         {
             return None;
