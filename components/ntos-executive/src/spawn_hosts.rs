@@ -2166,7 +2166,7 @@ unsafe fn component_pump_enter(
     resume: PumpResume,
     accounting: nt_user_host::component_pump::ComponentPumpAccounting,
 ) -> PumpResult {
-    // (Step 4, win32k) The request fill — `w32_client_attach(client_pi)`, the SSN/args write, and the
+    // (Step 4, win32k) The request fill - exact-owner client attach, SSN/args write, and the
     // wide-arg source selection — caller RSP for real syscalls or explicit SH_REQ_A4.. staging for
     // executive-originated calls — is done by the win32k caller wrapper `win32k_dispatch_wide`
     // BEFORE this pump runs (exactly as the FSD `dispatch_irp` fills the IRP fields before the pump).
