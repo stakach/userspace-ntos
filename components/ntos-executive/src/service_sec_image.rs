@@ -13187,9 +13187,9 @@ pub(crate) unsafe fn service_sec_image(
                 let mut ext_text_out_stack_args = [0u64; 5];
                 let mut ext_text_out_stack_arg_count = 0usize;
                 let mut ext_text_out_probe_failed = false;
-                let mut paintstruct_copyout = (0u64, 0u64);
+                let mut paintstruct_copyout = None;
                 let mut paintstruct_probe_failed = false;
-                let mut user_rect_copyout = (0u64, 0u64);
+                let mut user_rect_copyout = None;
                 let mut user_rect_probe_failed = false;
                 let mut text_metrics_copyout = (0u64, 0u64, 0usize);
                 let mut text_metrics_probe_failed = false;
@@ -14500,21 +14500,25 @@ pub(crate) unsafe fn service_sec_image(
                     // co_UserGetUpdateRect, even when the return value is FALSE. Stage the output
                     // so win32k writes provider-owned memory, then copy it back after dispatch.
                     if d_a1 != 0 {
-                        let arg = win32k_subsystem::WIN32K_ARG_VADDR;
-                        core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_RECT_STAGE_BYTES);
-                        d_a1 = arg;
-                        user_rect_copyout = (a1, arg);
-                        let n = USER_RECT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
-                        if n < 48 {
-                            print_str(b"[w32marshal] NtUserGetUpdateRect pi=");
-                            print_u64(pi as u64);
-                            print_str(b" hwnd=0x");
-                            print_hex_u64(a0);
-                            print_str(b" rect=0x");
-                            print_hex_u64(a1);
-                            print_str(b" staged=0x");
-                            print_hex_u64(arg);
-                            print_str(b"\n");
+                        if let Some(process) = nt_handler.capture_process_identity(pi) {
+                            let arg = win32k_subsystem::WIN32K_ARG_VADDR;
+                            core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_RECT_STAGE_BYTES);
+                            d_a1 = arg;
+                            user_rect_copyout = Some((process, a1, arg));
+                            let n = USER_RECT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                            if n < 48 {
+                                print_str(b"[w32marshal] NtUserGetUpdateRect pi=");
+                                print_u64(pi as u64);
+                                print_str(b" hwnd=0x");
+                                print_hex_u64(a0);
+                                print_str(b" rect=0x");
+                                print_hex_u64(a1);
+                                print_str(b" staged=0x");
+                                print_hex_u64(arg);
+                                print_str(b"\n");
+                            }
+                        } else {
+                            user_rect_probe_failed = true;
                         }
                     }
                 } else if m0 == NTUSER_BEGIN_PAINT_SSN {
@@ -14523,11 +14527,11 @@ pub(crate) unsafe fn service_sec_image(
                     // receives an explorer/winlogon stack VA.
                     if d_a1 == 0 {
                         paintstruct_probe_failed = true;
-                    } else {
+                    } else if let Some(process) = nt_handler.capture_process_identity(pi) {
                         let arg = win32k_subsystem::WIN32K_ARG_VADDR;
                         core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_PAINTSTRUCT_STAGE_BYTES);
                         d_a1 = arg;
-                        paintstruct_copyout = (a1, arg);
+                        paintstruct_copyout = Some((process, a1, arg));
                         let n = PAINTSTRUCT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
                         if n < 32 {
                             print_str(b"[w32marshal] NtUserBeginPaint pi=");
@@ -14540,6 +14544,8 @@ pub(crate) unsafe fn service_sec_image(
                             print_hex_u64(arg);
                             print_str(b"\n");
                         }
+                    } else {
+                        paintstruct_probe_failed = true;
                     }
                 } else if m0 == NTUSER_END_PAINT_SSN {
                     // NtUserEndPaint probes and copies the caller's PAINTSTRUCT before IntEndPaint.
@@ -16555,19 +16561,19 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                     if m0 == NTUSER_BEGIN_PAINT_SSN && r.1 && r.0 != 0 {
-                        let (client_ps, staged_ps) = paintstruct_copyout;
-                        let ps_ok = client_ps != 0
-                            && img_spawn::client_copyout_mapped(
+                        let ps_ok = paintstruct_copyout.is_some_and(|(process, client_ps, staged_ps)| {
+                            img_spawn::client_write_process_mapped_for(
+                                nt_handler,
                                 pi as u64,
+                                process,
                                 client_ps,
                                 core::slice::from_raw_parts(
                                     staged_ps as *const u8,
                                     WIN32K_PAINTSTRUCT_STAGE_BYTES,
                                 ),
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
-                            );
+                            )
+                        });
                         if !ps_ok {
                             let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                             if failures < 8 {
@@ -16576,23 +16582,23 @@ pub(crate) unsafe fn service_sec_image(
                                 print_str(b" hwnd=0x");
                                 print_hex_u64(a0);
                                 print_str(b" ps=0x");
-                                print_hex_u64(client_ps);
+                                print_hex_u64(paintstruct_copyout.map_or(0, |(_, client, _)| client));
                                 print_str(b"\n");
                             }
                             r = (0, true);
                         }
                     }
-                    if m0 == NTUSER_GET_UPDATE_RECT_SSN && r.1 && user_rect_copyout.0 != 0 {
-                        let (client_rect, staged_rect) = user_rect_copyout;
-                        let rect_ok = img_spawn::client_copyout_mapped(
+                    if m0 == NTUSER_GET_UPDATE_RECT_SSN && r.1 && user_rect_copyout.is_some() {
+                        let (process, client_rect, staged_rect) = user_rect_copyout.unwrap();
+                        let rect_ok = img_spawn::client_write_process_mapped_for(
+                            nt_handler,
                             pi as u64,
+                            process,
                             client_rect,
                             core::slice::from_raw_parts(
                                 staged_rect as *const u8,
                                 WIN32K_RECT_STAGE_BYTES,
                             ),
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         );
                         if !rect_ok {
