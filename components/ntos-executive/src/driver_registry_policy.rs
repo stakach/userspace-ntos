@@ -160,7 +160,7 @@ pub(crate) unsafe fn finish_driver_registry_close(
 
 pub(crate) unsafe fn service_hosted_driver_open_registry_path(
     caller: nt_process::native_handle::NativeHandleCaller,
-    path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
+    path: &str,
     metadata: &DriverRegistryOpenMetadata,
     subject: &nt_user_host::registry_subject::RegistrySubject,
 ) -> (i32, u64, u64) {
@@ -185,15 +185,14 @@ pub(crate) unsafe fn service_hosted_driver_open_registry_path(
     }
 }
 
-pub(super) fn hosted_registry_path_is_system(path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>) -> bool {
-    let path = path.as_str();
+pub(super) fn hosted_registry_path_is_system(path: &str) -> bool {
     path.eq_ignore_ascii_case(r"\Registry\Machine\System")
         || ascii_prefix_eq_ignore_case(path, r"\Registry\Machine\System\")
 }
 
 pub(crate) unsafe fn service_hosted_driver_create_registry_path(
     caller: nt_process::native_handle::NativeHandleCaller,
-    path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
+    path: &str,
     options: u32,
     metadata: &DriverRegistryOpenMetadata,
     subject: &nt_user_host::registry_subject::RegistrySubject,
@@ -217,7 +216,7 @@ pub(crate) unsafe fn service_hosted_driver_create_registry_path(
 
 unsafe fn create_registry_path(
     caller: nt_process::native_handle::NativeHandleCaller,
-    path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
+    path: &str,
     options: u32,
     metadata: &DriverRegistryOpenMetadata,
     subject: &nt_user_host::registry_subject::RegistrySubject,
@@ -266,9 +265,9 @@ unsafe fn create_registry_path(
     }
     let absolute_system = root.is_none() && hosted_registry_path_is_system(path);
     let physical = if root.is_some() {
-        alloc::string::String::from(path.as_str())
+        alloc::string::String::from(path)
     } else if absolute_system {
-        let resolved = match crate::config_manager_resolve_system_hive_path(path.as_str()) {
+        let resolved = match crate::config_manager_resolve_system_hive_path(path) {
             Ok(resolved) => resolved,
             Err(status) => return Ready((status, 0, 0)),
         };
@@ -277,16 +276,13 @@ unsafe fn create_registry_path(
         }
         resolved.physical_path
     } else {
-        alloc::string::String::from(path.as_str())
+        alloc::string::String::from(path)
     };
     let separator = physical.rfind('\\');
     if separator.is_none() && root.is_none() {
         return Ready((STATUS_OBJECT_PATH_NOT_FOUND, 0, 0));
     }
-    let mut parent_path = HostedAscii::empty();
-    if !parent_path.push_str(separator.map_or("", |index| &physical[..index])) {
-        return Ready((STATUS_INSUFFICIENT_RESOURCES, 0, 0));
-    }
+    let parent_path = separator.map_or("", |index| &physical[..index]);
     let mut prepared = None;
     let mut parent_revision = None;
     let mut hosted_parent = None;
@@ -369,6 +365,13 @@ unsafe fn create_registry_path(
     } else {
         physical
     };
+    if physical.len() > HOSTED_REGISTRY_PATH_MAX
+        || nt_hive_core::canon_path(&physical).len() > HOSTED_REGISTRY_PATH_MAX
+    {
+        retire_driver_registry_handle(metadata.dispatch, caller, parent_owner.handle)
+            .expect("overlong child still retains its parent publication");
+        return Ready((0xc000_0106u32 as i32, 0, 0));
+    }
     if let Some(parent) = hosted_parent {
         let created = driver_registry_live_handler().and_then(|handler| {
             handler
