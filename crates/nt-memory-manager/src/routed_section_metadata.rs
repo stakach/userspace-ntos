@@ -18,7 +18,7 @@ pub struct CompletedFileQuery<'a> {
 }
 
 impl<'a> CompletedFileQuery<'a> {
-    fn exact(self, length: usize) -> Result<&'a [u8], u32> {
+    pub(crate) fn exact(self, length: usize) -> Result<&'a [u8], u32> {
         if self.status == STATUS_PENDING {
             return Err(STATUS_IO_DEVICE_ERROR);
         }
@@ -45,18 +45,14 @@ impl RoutedSectionMetadata {
         standard: CompletedFileQuery<'_>,
         internal: CompletedFileQuery<'_>,
     ) -> Result<Self, u32> {
-        let standard = standard.exact(24)?;
+        let (end_of_file, is_directory) = decode_standard_query(standard)?;
         let internal = internal.exact(8)?;
-        let end_of_file = i64::from_le_bytes(standard[8..16].try_into().unwrap());
-        if end_of_file < 0 {
-            return Err(STATUS_DATA_ERROR);
-        }
         let file =
             SectionFileIdentity::from_file_internal(mount, internal).ok_or(STATUS_DATA_ERROR)?;
         Ok(Self {
             file,
-            end_of_file: end_of_file as u64,
-            is_directory: standard[21] != 0,
+            end_of_file,
+            is_directory,
         })
     }
 
@@ -74,6 +70,15 @@ impl RoutedSectionMetadata {
             &mut ReadOnlyRoutedFile(self),
         )
     }
+}
+
+pub(crate) fn decode_standard_query(query: CompletedFileQuery<'_>) -> Result<(u64, bool), u32> {
+    let standard = query.exact(24)?;
+    let end_of_file = i64::from_le_bytes(standard[8..16].try_into().unwrap());
+    if end_of_file < 0 {
+        return Err(STATUS_DATA_ERROR);
+    }
+    Ok((end_of_file as u64, standard[21] != 0))
 }
 
 struct ReadOnlyRoutedFile(RoutedSectionMetadata);

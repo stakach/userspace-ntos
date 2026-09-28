@@ -43600,6 +43600,10 @@ pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
         if !matches!(create, ExternalDispatchResult::Completed { status: nt_status::NtStatus::SUCCESS, file_context: Some(_), .. }) {
             return Ok(false);
         }
+        let mut metadata_work = nt_memory_manager::PendingSectionMetadataQueries::<(), u64>::new();
+        let Ok(metadata_id) = metadata_work.reserve(mount, ()) else {
+            return Ok(false);
+        };
         let mut standard = [0u8; 24];
         let query = io.build_and_dispatch_external_to_device(
             client,
@@ -43623,6 +43627,18 @@ pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
         } = query else {
             return Ok(false);
         };
+        if !metadata_work.complete_inline(
+            metadata_id,
+            nt_memory_manager::CompletedFileQuery {
+                status: standard_status.raw() as u32,
+                information: standard_information,
+                output: &standard,
+            },
+        ) || metadata_work.next_query(metadata_id)
+            != Some(nt_memory_manager::pending_section_metadata::FILE_INTERNAL_INFORMATION_CLASS)
+        {
+            return Ok(false);
+        }
         let mut internal = [0u8; 8];
         let query = io.build_and_dispatch_external_to_device(
             client,
@@ -43646,20 +43662,17 @@ pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
         } = query else {
             return Ok(false);
         };
-        let metadata = nt_memory_manager::RoutedSectionMetadata::from_queries(
-            mount,
-            nt_memory_manager::CompletedFileQuery {
-                status: standard_status.raw() as u32,
-                information: standard_information,
-                output: &standard,
-            },
+        if !metadata_work.complete_inline(
+            metadata_id,
             nt_memory_manager::CompletedFileQuery {
                 status: internal_status.raw() as u32,
                 information: internal_information,
                 output: &internal,
             },
-        );
-        let Ok(metadata) = metadata else {
+        ) {
+            return Ok(false);
+        }
+        let Some(((), Ok(metadata))) = metadata_work.take_terminal(metadata_id) else {
             return Ok(false);
         };
         if metadata.end_of_file < 4 || metadata.prepare_readonly(0, 0x02, 0x8000_0000).is_err() {

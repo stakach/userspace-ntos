@@ -83,6 +83,8 @@ pub mod writeback;
 pub use writeback::admit_section_alias_rearm;
 pub mod routed_section_metadata;
 pub use routed_section_metadata::{CompletedFileQuery, RoutedSectionMetadata};
+pub mod pending_section_metadata;
+pub use pending_section_metadata::{PendingSectionMetadataId, PendingSectionMetadataQueries};
 pub use working_set::{
     PagefilePage, PagefileProtectionPlan, PagefilePublishPlan, PagefileRetirement,
     PagefileRetirementIo, PagefileStore, PagefileStoreStats,
