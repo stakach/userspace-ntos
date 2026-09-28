@@ -103,6 +103,26 @@ impl DeviceRegistryKeyType {
     }
 }
 
+/// CM's DevicePropertyDriverKeyName is a REG_SZ payload, including one UTF-16 NUL terminator.
+/// Keep its counted code units intact; registry path authority is checked separately.
+pub fn decode_driver_key_property(bytes: &[u8]) -> Result<Vec<u16>, u32> {
+    if bytes.len() < 4 || bytes.len() & 1 != 0 {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+    }
+    let mut units = Vec::new();
+    units
+        .try_reserve_exact(bytes.len() / 2 - 1)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    for pair in bytes.chunks_exact(2) {
+        units.push(u16::from_le_bytes([pair[0], pair[1]]));
+    }
+    if units.pop() != Some(0) {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+    }
+    validate_relative_name(&units)?;
+    Ok(units)
+}
+
 const CURRENT_CONTROL_SET: &str = r"\Registry\Machine\System\CurrentControlSet";
 const CURRENT_PROFILE: &str = r"\Registry\Machine\System\CurrentControlSet\Hardware Profiles\Current\System\CurrentControlSet";
 
@@ -136,6 +156,11 @@ impl DeviceRegistryKeyPlan {
     }
     pub fn name(&self) -> &[u16] {
         &self.name
+    }
+    /// Components created relative to `base` (or the separately opened `parent`). NT5 first
+    /// attempts the whole name, then walks these components when intermediate keys are missing.
+    pub fn creation_components(&self) -> impl Iterator<Item = &[u16]> {
+        self.name.split(|unit| *unit == b'\\' as u16)
     }
     pub const fn requested_access(&self) -> u32 {
         self.access
@@ -295,5 +320,73 @@ mod tests {
             DeviceRegistryKeyType::Driver.plan(&[], Some(&too_long), 1),
             Err(STATUS_NAME_TOO_LONG)
         );
+    }
+
+    #[test]
+    fn driver_property_requires_one_terminated_relative_reg_sz() {
+        let name: Vec<u16> = r"{1234}\0002".encode_utf16().collect();
+        let mut bytes = Vec::new();
+        for unit in name.iter().copied().chain([0]) {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(decode_driver_key_property(&bytes), Ok(name));
+        for invalid in [
+            vec![],
+            vec![0, 0],
+            vec![b'A', 0],
+            vec![b'A', 0, 0],
+            vec![b'A', 0, 0, 0, 0, 0],
+            vec![b'\\', 0, b'A', 0, 0, 0],
+        ] {
+            assert!(decode_driver_key_property(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn driver_property_preserves_unicode_code_units() {
+        let units = [0x03bb, b'\\' as u16, 0x4e2d, 0];
+        let bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        assert_eq!(decode_driver_key_property(&bytes), Ok(units[..3].to_vec()));
+    }
+
+    #[test]
+    fn creation_components_keep_parent_separate_and_preserve_unicode() {
+        let instance = [0x03bb, b'\\' as u16, 0x4e2d, b'\\' as u16, b'1' as u16];
+        let driver = [0x03bb, b'\\' as u16, b'2' as u16];
+        let first = String::from_utf16(&[0x03bb]).unwrap();
+        let second = String::from_utf16(&[0x4e2d]).unwrap();
+        let expected = [
+            vec![String::from("Device Parameters")],
+            vec![
+                String::from("Control"),
+                String::from("Class"),
+                first.clone(),
+                String::from("2"),
+            ],
+            vec![
+                String::from("Enum"),
+                first.clone(),
+                second,
+                String::from("1"),
+            ],
+            vec![
+                String::from("Control"),
+                String::from("Class"),
+                first,
+                String::from("2"),
+            ],
+        ];
+        for (index, flags) in [1, 2, 5, 6].into_iter().enumerate() {
+            let plan = DeviceRegistryKeyType::from_flags(flags)
+                .unwrap()
+                .plan(&instance, Some(&driver), 0)
+                .unwrap();
+            let components: Vec<String> = plan
+                .creation_components()
+                .map(|component| String::from_utf16(component).unwrap())
+                .collect();
+            assert_eq!(components, expected[index]);
+            assert_eq!(plan.parent().is_some(), flags == 1);
+        }
     }
 }
