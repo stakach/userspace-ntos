@@ -14724,30 +14724,20 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 } else if m0 == NTUSER_MESSAGE_CALL_SSN {
                     message_call_probe_failed = true;
-                } else if m0 == NTUSER_SET_WINDOW_POS_SSN && sp != 0 {
+                } else if m0 == NTUSER_SET_WINDOW_POS_SSN {
                     // NtUserSetWindowPos' cx/cy/uFlags tail is part of the syscall trap frame.
                     // Stage it explicitly so isolated win32k consumes the real geometry rather
                     // than probing a hosted user stack from the wrong VSpace.
-                    let mut tail = [0u64; 3];
-                    let mut tail_ok = true;
-                    let mut i = 0usize;
-                    while i < tail.len() {
-                        match client_read_u64_mapped(
-                            pi as u64,
-                            sp + 0x28 + i as u64 * 8,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        ) {
-                            Some(value) => tail[i] = value,
-                            None => {
-                                tail_ok = false;
-                                break;
-                            }
-                        }
-                        i += 1;
-                    }
-                    if tail_ok {
+                    let tail = nt_handler.capture_process_identity(pi).and_then(|process| {
+                        let addresses = nt_kernel_exec::user_string::three_stack_tail_addresses(sp)?;
+                        nt_kernel_exec::user_string::capture_stack_tail(addresses, |address| {
+                            client_read_u64_for(
+                                pi as u64, process, address,
+                                filled_pages, faults as usize, scratch_base,
+                            )
+                        })
+                    });
+                    if let Some(tail) = tail {
                         d_a2 = a2 as i32 as i64 as u64;
                         d_a3 = a3 as i32 as i64 as u64;
                         set_window_pos_stack_args = [
@@ -14779,33 +14769,21 @@ pub(crate) unsafe fn service_sec_image(
                     } else {
                         set_window_pos_probe_failed = true;
                     }
-                } else if m0 == NTUSER_SET_WINDOW_POS_SSN {
-                    set_window_pos_probe_failed = true;
-                } else if m0 == NTUSER_DEFER_WINDOW_POS_SSN && sp != 0 {
+                } else if m0 == NTUSER_DEFER_WINDOW_POS_SSN {
                     // NtUserDeferWindowPos' final four scalar arguments are part of the syscall
                     // trap frame on NT. Isolated win32k cannot rely on a hosted caller stack being
                     // mapped in its VSpace, so capture the tail at the executive boundary and pass a
                     // normal staged stack tail through the registered win32k service table arity.
-                    let mut tail = [0u64; 4];
-                    let mut tail_ok = true;
-                    let mut i = 0usize;
-                    while i < tail.len() {
-                        match client_read_u64_mapped(
-                            pi as u64,
-                            sp + 0x28 + i as u64 * 8,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        ) {
-                            Some(value) => tail[i] = value,
-                            None => {
-                                tail_ok = false;
-                                break;
-                            }
-                        }
-                        i += 1;
-                    }
-                    if tail_ok {
+                    let tail = nt_handler.capture_process_identity(pi).and_then(|process| {
+                        let addresses = nt_kernel_exec::user_string::four_stack_tail_addresses(sp)?;
+                        nt_kernel_exec::user_string::capture_stack_tail(addresses, |address| {
+                            client_read_u64_for(
+                                pi as u64, process, address,
+                                filled_pages, faults as usize, scratch_base,
+                            )
+                        })
+                    });
+                    if let Some(tail) = tail {
                         d_a3 = a3 as i32 as i64 as u64;
                         defer_window_pos_stack_args = [
                             tail[0] as i32 as i64 as u64,
@@ -14839,8 +14817,6 @@ pub(crate) unsafe fn service_sec_image(
                     } else {
                         defer_window_pos_probe_failed = true;
                     }
-                } else if m0 == NTUSER_DEFER_WINDOW_POS_SSN {
-                    defer_window_pos_probe_failed = true;
                 } else if m0 == NTGDI_GET_TEXT_METRICS_W_SSN && uses_client_gdi {
                     // NtGdiGetTextMetricsW writes a caller-owned TMW_INTERNAL. Let win32k probe and
                     // fill provider-owned memory, then copy the exact caller-requested byte count
