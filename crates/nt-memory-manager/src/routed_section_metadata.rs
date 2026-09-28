@@ -72,7 +72,7 @@ impl RoutedSectionMetadata {
     }
 }
 
-pub(crate) fn decode_standard_query(query: CompletedFileQuery<'_>) -> Result<(u64, bool), u32> {
+pub fn decode_standard_query(query: CompletedFileQuery<'_>) -> Result<(u64, bool), u32> {
     let standard = query.exact(24)?;
     let end_of_file = i64::from_le_bytes(standard[8..16].try_into().unwrap());
     if end_of_file < 0 {

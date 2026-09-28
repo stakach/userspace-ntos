@@ -113,7 +113,7 @@ pub(crate) fn register_mounted_volume(
     crate::print_str(b"\n");
     let probe_ok = crate::driver_launch::probe_kernel_volume_file(&device_path);
     crate::print_str(
-        b"[mounted-volume] canonical font CREATE/QUERY-standard/QUERY-internal/READ/CLOSE proof=",
+        b"[mounted-volume] canonical font metadata/retained-after-close read proof=",
     );
     crate::print_u64(probe_ok as u64);
     crate::print_str(b"\n");

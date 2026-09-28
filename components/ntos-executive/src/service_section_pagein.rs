@@ -7,19 +7,22 @@ use nt_memory_manager::data_section::{
     DataSectionReadIo, DATA_PAGE_SIZE, STATUS_IO_DEVICE_ERROR,
 };
 
-struct BackingIo(GenericSectionBacking);
+struct BackingIo {
+    backing: GenericSectionBacking,
+    route: Option<crate::hosted_routed_section_capture::Route>,
+}
 
 impl DataSectionFileIo for BackingIo {
     fn query_file(&mut self) -> Result<DataSectionFileInfo, u32> {
-        match self.0.kind {
+        match self.backing.kind {
             GENERIC_SECTION_BACKING_DISK => Ok(DataSectionFileInfo {
-                end_of_file: self.0.file_size as u64,
+                end_of_file: self.backing.file_size as u64,
                 is_directory: false,
                 read_only_volume: true,
             }),
             GENERIC_SECTION_BACKING_OVERLAY => {
                 let info =
-                    unsafe { crate::writable_fs::file_object_information(self.0.overlay_file_id) }?
+                    unsafe { crate::writable_fs::file_object_information(self.backing.overlay_file_id) }?
                         .metadata;
                 Ok(DataSectionFileInfo {
                     end_of_file: info.end_of_file,
@@ -27,17 +30,21 @@ impl DataSectionFileIo for BackingIo {
                     read_only_volume: false,
                 })
             }
+            nt_memory_manager::GENERIC_SECTION_BACKING_ROUTED => {
+                let route = self.route.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                crate::routed_section_io::query_standard(route.file_id, route.device_id)
+            }
             _ => Err(0xc000_0024), // STATUS_OBJECT_TYPE_MISMATCH
         }
     }
 
     fn extend_file(&mut self, size: u64) -> Result<(), u32> {
-        if self.0.kind != GENERIC_SECTION_BACKING_OVERLAY {
+        if self.backing.kind != GENERIC_SECTION_BACKING_OVERLAY {
             return Err(0xc000_00a2); // The boot FAT mount is read-only.
         }
         let status = unsafe {
             crate::writable_fs::set_information(
-                self.0.overlay_file_id,
+                self.backing.overlay_file_id,
                 nt_fs::FILE_END_OF_FILE_INFORMATION,
                 &size.to_le_bytes(),
             )
@@ -52,7 +59,7 @@ impl DataSectionFileIo for BackingIo {
 impl DataSectionReadIo for BackingIo {
     fn read(&mut self, offset: u64, output: &mut [u8]) -> (u32, usize) {
         unsafe {
-            match self.0.kind {
+            match self.backing.kind {
                 GENERIC_SECTION_BACKING_DISK => {
                     let Some(fs) = exec_fs() else {
                         return (0xc000_00a3, 0);
@@ -64,15 +71,21 @@ impl DataSectionReadIo for BackingIo {
                         0,
                         fat_read_file_range(
                             &fs,
-                            self.0.first_cluster,
-                            self.0.file_size,
+                            self.backing.first_cluster,
+                            self.backing.file_size,
                             offset,
                             output,
                         ),
                     )
                 }
                 GENERIC_SECTION_BACKING_OVERLAY => {
-                    crate::writable_fs::read_into(self.0.overlay_file_id, Some(offset), output)
+                    crate::writable_fs::read_into(self.backing.overlay_file_id, Some(offset), output)
+                }
+                nt_memory_manager::GENERIC_SECTION_BACKING_ROUTED => {
+                    let Some(route) = self.route else {
+                        return (nt_fs::STATUS_INVALID_HANDLE, 0);
+                    };
+                    crate::routed_section_io::read(route.file_id, route.device_id, offset, output)
                 }
                 _ => (0xc000_0024, 0),
             }
@@ -90,7 +103,7 @@ pub(crate) unsafe fn service_prepare_data_section_file(
         maximum_size,
         protection,
         granted_access,
-        &mut BackingIo(backing),
+        &mut BackingIo { backing, route: None },
     )
     .map(|extent| {
         (
@@ -114,7 +127,18 @@ pub(super) unsafe fn service_generic_section_frame(
         .checked_mul(DATA_PAGE_SIZE as u64)
         .filter(|offset| *offset < section.size)
         .ok_or(nt_memory_manager::STATUS_INVALID_VIEW_SIZE)?;
-    let mut io = BackingIo(section.backing);
+    let route = if let Some(lease) = section.backing.routed_lease {
+        let identity = generic_sections
+            .section_identity(section_index)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        Some(
+            crate::hosted_routed_section_capture::route(lease, identity)
+                .ok_or(nt_fs::STATUS_INVALID_HANDLE)?,
+        )
+    } else {
+        None
+    };
+    let mut io = BackingIo { backing: section.backing, route };
     let file_size = if section.backing.kind != GENERIC_SECTION_BACKING_ANON {
         let info = io.query_file()?;
         generic_sections.refresh_file_extent(section_index, info.end_of_file)?;
