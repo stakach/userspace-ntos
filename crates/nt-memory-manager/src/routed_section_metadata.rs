@@ -143,6 +143,24 @@ mod tests {
     }
 
     #[test]
+    fn admitted_readonly_extent_bounds_later_page_reads() {
+        let (mount, standard, internal) = metadata(0x2345, false, 0x321);
+        let metadata =
+            RoutedSectionMetadata::from_queries(mount, query(&standard), query(&internal))
+                .unwrap();
+        let extent = metadata.prepare_readonly(0, 0x08, 0x01).unwrap();
+        assert_eq!(extent.file_size, metadata.end_of_file);
+        let tail = crate::data_section::plan_data_section_page_read(
+            2,
+            extent.section_size,
+            extent.file_size,
+        )
+        .unwrap();
+        assert_eq!(tail.offset(), 0x2000);
+        assert_eq!(tail.length(), 0x345);
+    }
+
+    #[test]
     fn terminal_queries_must_be_successful_and_exact() {
         let (mount, standard, internal) = metadata(4096, false, 7);
         let pending = CompletedFileQuery {
