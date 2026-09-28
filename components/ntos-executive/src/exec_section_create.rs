@@ -3,6 +3,11 @@
 use super::*;
 use nt_process::native_handle::NativeHandleCaller;
 
+pub(crate) struct RoutedSectionAdmission {
+    pub(crate) capture: crate::driver_launch::hosted_file_capture::Capture,
+    pub(crate) metadata: nt_memory_manager::RoutedSectionMetadata,
+}
+
 #[must_use = "reserved Section must be published or aborted"]
 pub(crate) struct ReservedGenericDataSection {
     publication: nt_process::NativeSectionHandlePublication,
@@ -65,6 +70,7 @@ impl ExecNtHandler {
         page_protection: u32,
         allocation_attrs: u32,
         sec_file: u64,
+        mut routed_admission: Option<RoutedSectionAdmission>,
     ) -> Result<ReservedGenericDataSection, u32> {
         const STATUS_INVALID_FILE_FOR_SECTION: u32 = 0xC000_0020;
         nt_memory_manager::data_section::data_section_file_access(page_protection)?;
@@ -74,6 +80,9 @@ impl ExecNtHandler {
         let generic_sections = self.loop_ctx.ok_or(0xC000_00A3u32)?.generic_sections;
         let mut routed_lease = None;
         let (backing, backing_size) = if sec_file == 0 {
+            if routed_admission.is_some() {
+                return Err(nt_fs::STATUS_INVALID_HANDLE);
+            }
             if maxsize == 0 {
                 return Err(0xC000_00F2); // STATUS_INVALID_PARAMETER_4
             }
@@ -82,11 +91,18 @@ impl ExecNtHandler {
             }
             (GenericSectionBacking::anonymous(), maxsize)
         } else {
-            let source = self
-                .pm
-                .lookup_native_section_file_source(caller, sec_file)?;
-            let object = source.object();
-            let access = source.granted_access();
+            let (object, access) = if let Some(admission) = routed_admission.as_ref() {
+                (
+                    nt_process::HandleObject::RoutedFile {
+                        file_id: admission.capture.file_id(),
+                        device_id: admission.capture.device_id(),
+                    },
+                    admission.capture.granted_access(),
+                )
+            } else {
+                let source = self.pm.lookup_native_section_file_source(caller, sec_file)?;
+                (source.object(), source.granted_access())
+            };
             nt_memory_manager::data_section::check_data_section_file_access(
                 page_protection,
                 access,
@@ -117,11 +133,19 @@ impl ExecNtHandler {
                 nt_process::HandleObject::RoutedFile { file_id, device_id } => {
                     let mount = crate::mounted_volume::mount_id_for_live_device(device_id)
                         .ok_or(STATUS_INVALID_FILE_FOR_SECTION)?;
-                    let capture = crate::driver_launch::hosted_file_capture::capture(
-                        file_id, device_id, access,
-                    )?;
-                    let metadata =
-                        crate::routed_section_io::query_metadata(file_id, device_id, mount)?;
+                    let (capture, metadata) = if let Some(admission) = routed_admission.take() {
+                        if admission.metadata.file.mount != mount {
+                            return Err(STATUS_INVALID_FILE_FOR_SECTION);
+                        }
+                        (admission.capture, admission.metadata)
+                    } else {
+                        let capture = crate::driver_launch::hosted_file_capture::capture(
+                            file_id, device_id, access,
+                        )?;
+                        let metadata =
+                            crate::routed_section_io::query_metadata(file_id, device_id, mount)?;
+                        (capture, metadata)
+                    };
                     let extent = metadata.prepare_readonly(maxsize, page_protection, access)?;
                     let lease = crate::hosted_routed_section_capture::reserve(capture)
                         .map_err(|_capture| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;

@@ -76,6 +76,7 @@ mod mounted_volume_backend;
 mod mounted_volume_ingress_probe;
 mod hosted_routed_section_capture;
 mod routed_section_io;
+mod section_metadata_work;
 pub(crate) use fs_loader::*;
 mod hosted_bootstrap;
 pub(crate) use hosted_bootstrap::*;
@@ -3127,6 +3128,7 @@ const DELAY_TIMER_SOURCE_HOSTED_FILE_RETRY: u64 = 17;
 const DELAY_TIMER_SOURCE_COMPONENT_RESUME: u64 = 18;
 const DELAY_TIMER_SOURCE_HOSTED_DPC: u64 = 19;
 const DELAY_TIMER_SOURCE_REGISTRY_MUTATION: u64 = 20;
+const DELAY_TIMER_SOURCE_SECTION_METADATA: u64 = 21;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -7065,7 +7067,7 @@ pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SCHED_RUNTIME_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to independently timed wake paths;
 /// one of them owns the whole boot, so they are timed individually.
-pub(crate) const SUBDRAIN_N: usize = 18;
+pub(crate) const SUBDRAIN_N: usize = 19;
 pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
@@ -17220,6 +17222,7 @@ unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
         + subdrain!(15, cm_snapshot_ownership::wake_due(now_100ns))
         + subdrain!(16, driver_launch::hosted_file_retry_wake_due(now_100ns))
         + subdrain!(17, registry_mutation_work::wake_due(now_100ns))
+        + subdrain!(18, section_metadata_work::wake_due(now_100ns))
 }
 
 /// May reply to driver waiters and establish DPC lanes; never use from ACK-only paths.
@@ -18488,6 +18491,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         || pending_file_apc::has_thread(tid)
         || current_apc::has_thread(tid)
         || registry_mutation_work::has_thread(tid)
+        || section_metadata_work::has_thread(tid)
     {
         return false;
     }
@@ -18530,6 +18534,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         || pending_file_apc::has_thread(tid)
         || current_apc::has_thread(tid)
         || registry_mutation_work::has_thread(tid)
+        || section_metadata_work::has_thread(tid)
     {
         return false;
     }
@@ -18651,6 +18656,7 @@ unsafe fn terminate_hosted_process_mechanisms(
         || pending_file_apc::has_process(process_index as usize, preserve_tid)
         || current_apc::has_process(process_index as usize, preserve_tid)
         || registry_mutation_work::has_process(process_index as usize, preserve_tid)
+        || section_metadata_work::has_process(process_index as usize, preserve_tid)
     {
         return 0;
     }

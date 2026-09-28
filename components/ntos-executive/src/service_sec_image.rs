@@ -8908,6 +8908,7 @@ pub(crate) unsafe fn service_sec_image(
                 )
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-waiting")
                 && crate::registry_mutation_work::next_deadline().is_none()
+                && crate::section_metadata_work::next_deadline().is_none()
             {
                 print_str(
                     b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n",
@@ -9015,6 +9016,7 @@ pub(crate) unsafe fn service_sec_image(
         {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
+            crate::section_metadata_work::redrive(&mut nt_handler, delay_queue);
             crate::driver_launch::redrive_hosted_driver_io_create_file(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_path_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_write_forward(nt_handler as *mut _);
@@ -11489,6 +11491,7 @@ pub(crate) unsafe fn service_sec_image(
                     || crate::object_wait_reply::owns_thread(current_tid)
                     || crate::pending_file_apc::owns_thread(current_tid)
                     || crate::current_apc::owns_thread(current_tid)
+                    || crate::section_metadata_work::has_thread(current_tid)
             }
             {
                 // An uncertain earlier retry is not a fresh File acquisition. Reject only this
@@ -12123,6 +12126,20 @@ pub(crate) unsafe fn service_sec_image(
                         // STATUS_PENDING is internal state, never the syscall's terminal reply.
                         mark_wait_parked!(pi, resume_ip);
                         crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
+                        let _ = finalize_service_loop_state(&mut nt_handler);
+                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                        badge = nb;
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
+                    if crate::section_metadata_work::take_transferred() {
+                        mark_wait_parked!(pi, resume_ip);
+                        crate::section_metadata_work::redrive(&mut nt_handler, delay_queue);
                         let _ = finalize_service_loop_state(&mut nt_handler);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
@@ -23913,6 +23930,69 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64) {
         heap_mirror,
         scratch_base,
     )
+}
+
+pub(crate) unsafe fn with_section_metadata_context<R>(
+    handler: &mut ExecNtHandler,
+    pi: usize,
+    tid: u64,
+    badge: u64,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+    native_call_transport: bool,
+    service_number: u32,
+    run: impl FnOnce(&mut ExecNtHandler) -> R,
+) -> Option<R> {
+    let saved_ctx = handler.loop_ctx;
+    let ctx = saved_ctx?.for_process(pi)?;
+    let saved_mirrors = (
+        ACTIVE_STACK_BASE.load(Ordering::Relaxed),
+        ACTIVE_STACK_SIZE.load(Ordering::Relaxed),
+        ACTIVE_STACK_MIRROR.load(Ordering::Relaxed),
+        ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed),
+        ACTIVE_CLIENT_PI.load(Ordering::Relaxed),
+        ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+    );
+    let saved_caller = (
+        handler.pi, handler.current_tid, handler.current_badge,
+        handler.current_resume_ip, handler.current_sp, handler.current_flags,
+        handler.current_native_call_transport, handler.current_service_number,
+    );
+    let (stack_base, stack_size, stack_mirror, heap_mirror, scratch_base) =
+        mirror_ctx_for(badge, pi);
+    ACTIVE_STACK_BASE.store(stack_base, Ordering::Relaxed);
+    ACTIVE_STACK_SIZE.store(stack_size, Ordering::Relaxed);
+    ACTIVE_STACK_MIRROR.store(stack_mirror, Ordering::Relaxed);
+    ACTIVE_HEAP_MIRROR.store(heap_mirror, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+    handler.loop_ctx = Some(ctx);
+    handler.pi = pi;
+    handler.current_tid = tid;
+    handler.current_badge = badge;
+    handler.current_resume_ip = resume_ip;
+    handler.current_sp = sp;
+    handler.current_flags = flags;
+    handler.current_native_call_transport = native_call_transport;
+    handler.current_service_number = service_number;
+    let result = run(handler);
+    ACTIVE_STACK_BASE.store(saved_mirrors.0, Ordering::Relaxed);
+    ACTIVE_STACK_SIZE.store(saved_mirrors.1, Ordering::Relaxed);
+    ACTIVE_STACK_MIRROR.store(saved_mirrors.2, Ordering::Relaxed);
+    ACTIVE_HEAP_MIRROR.store(saved_mirrors.3, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(saved_mirrors.4, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(saved_mirrors.5, Ordering::Relaxed);
+    handler.pi = saved_caller.0;
+    handler.current_tid = saved_caller.1;
+    handler.current_badge = saved_caller.2;
+    handler.current_resume_ip = saved_caller.3;
+    handler.current_sp = saved_caller.4;
+    handler.current_flags = saved_caller.5;
+    handler.current_native_call_transport = saved_caller.6;
+    handler.current_service_number = saved_caller.7;
+    handler.loop_ctx = saved_ctx;
+    Some(result)
 }
 
 unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {

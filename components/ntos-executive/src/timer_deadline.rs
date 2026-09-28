@@ -66,6 +66,10 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             DELAY_TIMER_SOURCE_REGISTRY_MUTATION,
         ),
         (
+            section_metadata_work::next_deadline(),
+            DELAY_TIMER_SOURCE_SECTION_METADATA,
+        ),
+        (
             driver_launch::hosted_file_retry_deadline(now.monotonic_100ns),
             DELAY_TIMER_SOURCE_HOSTED_FILE_RETRY,
         ),

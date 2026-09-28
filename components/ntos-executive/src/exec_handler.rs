@@ -9243,6 +9243,7 @@ impl ExecNtHandler {
                 || crate::pending_file_apc::has_thread(tid)
                 || crate::current_apc::has_thread(tid)
                 || crate::registry_mutation_work::has_thread(tid)
+                || crate::section_metadata_work::has_thread(tid)
         }
         {
             return None;
@@ -20400,7 +20401,7 @@ impl ExecNtHandler {
 
     /// Close one canonical table entry in the same serialized dispatch as its File preflight.
     /// The removed entry still needs its host-owned object and side-table release procedures.
-    fn close_native_table_handle(
+    pub(crate) fn close_native_table_handle(
         &mut self,
         caller: nt_process::native_handle::NativeHandleCaller,
         value: u64,
@@ -41480,10 +41481,26 @@ impl ExecNtHandler {
                     return nt_fs::STATUS_INVALID_HANDLE;
                 }
 
+                if sec_file != 0 {
+                    let source = match self.pm.lookup_native_section_file_source(caller, sec_file) {
+                        Ok(source) => source,
+                        Err(status) => return status,
+                    };
+                    if matches!(source.object(), nt_process::HandleObject::RoutedFile { .. }) {
+                        return match crate::section_metadata_work::submit_hosted(
+                            self, caller, source, out, desired_access, attributes, maxsize,
+                            page_protection, allocation_attrs, sec_file,
+                        ) {
+                            Ok(()) => 0x0000_0103,
+                            Err(status) => status,
+                        };
+                    }
+                }
+
                 let owner_pi = self.pi;
                 let mut reserved = match self.reserve_generic_data_section(
                     caller, owner_pi, desired_access, attributes, maxsize,
-                    page_protection, allocation_attrs, sec_file,
+                    page_protection, allocation_attrs, sec_file, None,
                 ) {
                     Ok(reserved) => reserved,
                     Err(status) => return status,
