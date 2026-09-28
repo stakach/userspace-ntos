@@ -253,7 +253,7 @@ impl ExecNtHandler {
         Ok(if write { RW_NX } else { RO_NX })
     }
 
-    unsafe fn prepare_copy_page(
+    pub(crate) unsafe fn prepare_copy_page(
         &mut self,
         pi: usize,
         address: u64,

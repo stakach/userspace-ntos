@@ -1874,6 +1874,9 @@ unsafe fn recorded_frame_copyout_impl(pi: u64, va: u64, src: &[u8], scratch_base
     let Some(chunks) = nt_address_space::page_chunks(va, src.len()) else {
         return false;
     };
+    let Ok(pi_index) = usize::try_from(pi) else {
+        return false;
+    };
     let mut copied = 0usize;
     for chunk in chunks {
         if !admitted && crate::service_sec_image::service_admit_section_alias(pi, chunk.page_base, true, None).is_err() {
@@ -2105,6 +2108,87 @@ pub(crate) unsafe fn client_write_mapped(
         return true;
     }
     ACTIVE_CLIENT_PI.load(Ordering::Relaxed) == pi && smss_copyout(va, src)
+}
+
+/// Copy out under the process lifetime captured when the syscall entered. A failed exact
+/// admission never falls through to the active-client mirror of a replacement PI.
+pub(crate) unsafe fn client_write_process_mapped_for(
+    handler: &mut ExecNtHandler,
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    va: u64,
+    src: &[u8],
+    scratch_base: u64,
+) -> bool {
+    if crate::temporary_frame_alias::drain().is_err()
+        || hosted_thread_memory_access(pi, va, src.len() as u64).is_err()
+    {
+        return false;
+    }
+    let Some(chunks) = nt_address_space::page_chunks(va, src.len()) else {
+        return false;
+    };
+    let mut copied = 0usize;
+    for chunk in chunks {
+        let prefetch = match client_copyin_frame_lookup_for(pi, process, chunk.page_base) {
+            Ok(prefetch) => prefetch,
+            Err(_) => return false,
+        };
+        if handler.capture_process_identity(pi_index) != Some(process)
+            || handler
+                .prepare_copy_page(pi_index, chunk.page_base, nt_address_space::FaultAccess::Write)
+                .is_err()
+            || handler.capture_process_identity(pi_index) != Some(process)
+        {
+            return false;
+        }
+        let backing = match nt_memory_manager::admit_client_copyout_backing(
+            pi,
+            process,
+            chunk.page_base,
+            &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+            shared_image_mapping_identity(pi, chunk.page_base),
+        ) {
+            Ok(backing) => backing,
+            Err(_) => return false,
+        };
+        let source = &src[copied..copied + chunk.length];
+        match backing {
+            nt_memory_manager::ClientCopyoutBacking::Resident(_) => {
+                if !with_recorded_frame_alias(
+                    pi, Some(process), chunk.page_base, scratch_base, true, |alias| {
+                        core::ptr::copy_nonoverlapping(
+                            source.as_ptr(),
+                            (alias + chunk.page_offset as u64) as *mut u8,
+                            chunk.length,
+                        );
+                    },
+                ) {
+                    return false;
+                }
+            }
+            nt_memory_manager::ClientCopyoutBacking::Unrecorded => {
+                if prefetch.is_some() || unregistered_image_mapping(pi, chunk.page_base) {
+                    return false;
+                }
+                let current = chunk.page_base + chunk.page_offset as u64;
+                let destination = (ACTIVE_CLIENT_PI.load(Ordering::Relaxed) == pi
+                    && !(pi == 2 && wl_listener_stack_contains(current, chunk.length)))
+                .then(|| smss_mirror(current, chunk.length as u64))
+                .flatten();
+                let Some(destination) = destination else {
+                    return false;
+                };
+                core::ptr::copy_nonoverlapping(
+                    source.as_ptr(),
+                    destination as *mut u8,
+                    chunk.length,
+                );
+            }
+        }
+        copied += chunk.length;
+    }
+    true
 }
 
 pub(crate) unsafe fn client_write_u64_mapped(

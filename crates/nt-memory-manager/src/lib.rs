@@ -23,7 +23,10 @@ pub use nt_types::{ProcessGeneration, ProcessIdentity};
 
 mod client_frame;
 mod client_copy_backing;
-pub use client_copy_backing::{admit_client_copy_backing, ClientCopyBacking};
+pub use client_copy_backing::{
+    admit_client_copy_backing, admit_client_copyout_backing, ClientCopyBacking,
+    ClientCopyoutBacking,
+};
 mod memory_lifetime;
 pub use memory_lifetime::MemoryLifetime;
 mod process_slot_reuse;
