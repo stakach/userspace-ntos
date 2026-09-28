@@ -2475,6 +2475,19 @@ unsafe fn process_completed_user_callback_outer_dispatch(
     completion_faults: usize,
     completion_scratch_base: u64,
 ) -> bool {
+    if let Some(claim) = dispatch.paint_output {
+        if !copy_completed_paint_output(
+            nt_handler,
+            completion_pi,
+            dispatch.ssn,
+            claim,
+            dispatch.provider_output_len,
+            &dispatch.arg_snapshot,
+            completion_scratch_base,
+        ) {
+            return false;
+        }
+    }
     if matches!(
         dispatch.ssn,
         nt_user_callback::NTUSER_GET_MESSAGE_SSN | nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
@@ -2637,6 +2650,36 @@ unsafe fn process_completed_user_callback_outer_dispatch(
         observe_completed_dialog_modal_dispatch(dispatch, completion_badge, completion_tid);
     }
     true
+}
+
+unsafe fn copy_completed_paint_output(
+    nt_handler: &mut ExecNtHandler,
+    pi: usize,
+    ssn: u64,
+    claim: nt_user_callback::PaintOutputClaim,
+    published_len: u32,
+    output: &[u8],
+    scratch_base: u64,
+) -> bool {
+    let expected = match ssn {
+        NTUSER_BEGIN_PAINT_SSN => WIN32K_PAINTSTRUCT_STAGE_BYTES,
+        NTUSER_GET_UPDATE_RECT_SSN => WIN32K_RECT_STAGE_BYTES,
+        _ => return false,
+    };
+    if published_len == 0 {
+        return true;
+    }
+    if published_len as usize != expected || output.len() < expected {
+        return false;
+    }
+    img_spawn::client_write_process_mapped_for(
+        nt_handler,
+        pi as u64,
+        claim.process,
+        claim.client_pointer,
+        &output[..expected],
+        scratch_base,
+    )
 }
 
 unsafe fn sync_completed_user_callback_win32k_context(
@@ -5558,6 +5601,7 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
     stack_args: &[u64],
     completion_args: [u64; 4],
     output_stage: Option<nt_user_callback::DispatchOutputStage>,
+    paint_output: Option<nt_user_callback::PaintOutputClaim>,
     client: win32k_glue::Win32kClientContext,
 ) -> (u64, bool) {
     let result = win32k_glue::win32k_dispatch_wide_with_completion_args(
@@ -5570,6 +5614,7 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
         stack_args,
         completion_args,
         output_stage,
+        paint_output,
         client,
     );
     if sync_win32k_context_to_process_manager(
@@ -13355,9 +13400,10 @@ pub(crate) unsafe fn service_sec_image(
                 let mut ext_text_out_stack_args = [0u64; 5];
                 let mut ext_text_out_stack_arg_count = 0usize;
                 let mut ext_text_out_probe_failed = false;
-                let mut paintstruct_copyout = None;
+                let mut paint_output_stage = None;
+                let mut paint_output_claim = None;
+                let mut paint_output_stage_failed = false;
                 let mut paintstruct_probe_failed = false;
-                let mut user_rect_copyout = None;
                 let mut user_rect_probe_failed = false;
                 let mut text_metrics_copyout = (0u64, 0u64, 0usize);
                 let mut text_metrics_probe_failed = false;
@@ -14669,21 +14715,15 @@ pub(crate) unsafe fn service_sec_image(
                     // so win32k writes provider-owned memory, then copy it back after dispatch.
                     if d_a1 != 0 {
                         if let Some(process) = nt_handler.capture_process_identity(pi) {
-                            let arg = win32k_subsystem::WIN32K_ARG_VADDR;
-                            core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_RECT_STAGE_BYTES);
-                            d_a1 = arg;
-                            user_rect_copyout = Some((process, a1, arg));
-                            let n = USER_RECT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
-                            if n < 48 {
-                                print_str(b"[w32marshal] NtUserGetUpdateRect pi=");
-                                print_u64(pi as u64);
-                                print_str(b" hwnd=0x");
-                                print_hex_u64(a0);
-                                print_str(b" rect=0x");
-                                print_hex_u64(a1);
-                                print_str(b" staged=0x");
-                                print_hex_u64(arg);
-                                print_str(b"\n");
+                            if let Some(stage) = win32k_glue::acquire_win32k_paint_stage() {
+                                d_a1 = stage.provider_pointer;
+                                paint_output_stage = Some(stage);
+                                paint_output_claim = Some(nt_user_callback::PaintOutputClaim {
+                                    process,
+                                    client_pointer: a1,
+                                });
+                            } else {
+                                paint_output_stage_failed = true;
                             }
                         } else {
                             user_rect_probe_failed = true;
@@ -14696,21 +14736,15 @@ pub(crate) unsafe fn service_sec_image(
                     if d_a1 == 0 {
                         paintstruct_probe_failed = true;
                     } else if let Some(process) = nt_handler.capture_process_identity(pi) {
-                        let arg = win32k_subsystem::WIN32K_ARG_VADDR;
-                        core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_PAINTSTRUCT_STAGE_BYTES);
-                        d_a1 = arg;
-                        paintstruct_copyout = Some((process, a1, arg));
-                        let n = PAINTSTRUCT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
-                        if n < 32 {
-                            print_str(b"[w32marshal] NtUserBeginPaint pi=");
-                            print_u64(pi as u64);
-                            print_str(b" hwnd=0x");
-                            print_hex_u64(a0);
-                            print_str(b" ps=0x");
-                            print_hex_u64(a1);
-                            print_str(b" staged=0x");
-                            print_hex_u64(arg);
-                            print_str(b"\n");
+                        if let Some(stage) = win32k_glue::acquire_win32k_paint_stage() {
+                            d_a1 = stage.provider_pointer;
+                            paint_output_stage = Some(stage);
+                            paint_output_claim = Some(nt_user_callback::PaintOutputClaim {
+                                process,
+                                client_pointer: a1,
+                            });
+                        } else {
+                            paint_output_stage_failed = true;
                         }
                     } else {
                         paintstruct_probe_failed = true;
@@ -16087,6 +16121,8 @@ pub(crate) unsafe fn service_sec_image(
                     (0, false)
                 } else if message_output_stage_failed {
                     (0xC000_009A, true)
+                } else if paint_output_stage_failed {
+                    (0xC000_009A, true)
                 } else if register_class_probe_failed {
                     (0, true)
                 } else if wallpaper_spi_probe_failed {
@@ -16593,7 +16629,8 @@ pub(crate) unsafe fn service_sec_image(
                         dispatch_sp,
                         dispatch_stack_args,
                         [a0, a1, a2, a3],
-                        message_output_stage,
+                        message_output_stage.or(paint_output_stage),
+                        paint_output_claim,
                         client,
                     );
                     if explorer_direct_gdi_draw && r.1 {
@@ -16728,61 +16765,25 @@ pub(crate) unsafe fn service_sec_image(
                             r = (0, true);
                         }
                     }
-                    if m0 == NTUSER_BEGIN_PAINT_SSN && r.1 && r.0 != 0 {
-                        let ps_ok = paintstruct_copyout.is_some_and(|(process, client_ps, staged_ps)| {
-                            img_spawn::client_write_process_mapped_for(
-                                nt_handler,
-                                pi as u64,
-                                process,
-                                client_ps,
-                                core::slice::from_raw_parts(
-                                    staged_ps as *const u8,
-                                    WIN32K_PAINTSTRUCT_STAGE_BYTES,
-                                ),
+                    if r.1 {
+                        if let (Some(stage), Some(claim)) = (paint_output_stage, paint_output_claim) {
+                            let published = win32k_glue::published_win32k_paint_output_length(stage)
+                                .unwrap_or(u32::MAX);
+                            let bytes = core::slice::from_raw_parts(
+                                stage.provider_pointer as *const u8,
+                                stage.capacity as usize,
+                            );
+                            if !copy_completed_paint_output(
+                                &mut nt_handler,
+                                pi,
+                                m0,
+                                claim,
+                                published,
+                                bytes,
                                 scratch_base,
-                            )
-                        });
-                        if !ps_ok {
-                            let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
-                            if failures < 8 {
-                                print_str(b"[win32k-svc] NtUserBeginPaint PAINTSTRUCT copy-out failed pi=");
-                                print_u64(pi as u64);
-                                print_str(b" hwnd=0x");
-                                print_hex_u64(a0);
-                                print_str(b" ps=0x");
-                                print_hex_u64(paintstruct_copyout.map_or(0, |(_, client, _)| client));
-                                print_str(b"\n");
+                            ) {
+                                r = (0, true);
                             }
-                            r = (0, true);
-                        }
-                    }
-                    if m0 == NTUSER_GET_UPDATE_RECT_SSN && r.1 && user_rect_copyout.is_some() {
-                        let (process, client_rect, staged_rect) = user_rect_copyout.unwrap();
-                        let rect_ok = img_spawn::client_write_process_mapped_for(
-                            nt_handler,
-                            pi as u64,
-                            process,
-                            client_rect,
-                            core::slice::from_raw_parts(
-                                staged_rect as *const u8,
-                                WIN32K_RECT_STAGE_BYTES,
-                            ),
-                            scratch_base,
-                        );
-                        if !rect_ok {
-                            let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
-                            if failures < 8 {
-                                print_str(
-                                    b"[win32k-svc] NtUserGetUpdateRect RECT copy-out failed pi=",
-                                );
-                                print_u64(pi as u64);
-                                print_str(b" hwnd=0x");
-                                print_hex_u64(a0);
-                                print_str(b" rect=0x");
-                                print_hex_u64(client_rect);
-                                print_str(b"\n");
-                            }
-                            r = (0, true);
                         }
                     }
                     if m0 == NTGDI_GET_TEXT_METRICS_W_SSN && r.1 && r.0 != 0 {
@@ -17317,6 +17318,9 @@ pub(crate) unsafe fn service_sec_image(
                 if !callback_suspended && !component_suspension_park_request {
                     if let Some(stage) = message_output_stage {
                         let _ = win32k_glue::release_win32k_message_stage(stage);
+                    }
+                    if let Some(stage) = paint_output_stage {
+                        let _ = win32k_glue::release_win32k_paint_stage(stage);
                     }
                 }
                 if ok && !redirected_user_callback {

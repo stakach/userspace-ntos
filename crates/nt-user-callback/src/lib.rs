@@ -255,6 +255,10 @@ pub const NTUSER_REGISTER_HOT_KEY_SSN: u64 = 0x126b;
 pub const NTUSER_PEEK_MESSAGE_SSN: u64 = 0x1001;
 pub const NTUSER_GET_MESSAGE_SSN: u64 = 0x1006;
 pub const NTUSER_DISPATCH_MESSAGE_SSN: u64 = 0x1035;
+pub const NTUSER_BEGIN_PAINT_SSN: u64 = 0x1016;
+pub const NTUSER_GET_UPDATE_RECT_SSN: u64 = 0x1053;
+pub const BEGIN_PAINT_OUTPUT_BYTES: u32 = 72;
+pub const GET_UPDATE_RECT_OUTPUT_BYTES: u32 = 16;
 pub const WM_QUIT: u32 = 0x0012;
 pub const DISPATCH_MESSAGE_OUTPUT_BYTES: u32 = 48;
 
@@ -295,6 +299,25 @@ pub const fn message_dispatch_output_length_matches_result(
         0
     };
     output_length == expected
+}
+
+/// Paint output belongs to a completed call that resolved its HWND. The returned HDC or BOOL is
+/// not a write witness: BeginPaint can copy with a NULL HDC, and GetUpdateRect can copy FALSE.
+pub const fn paint_dispatch_output_length(
+    ssn: u64,
+    _raw_result: u64,
+    completed: bool,
+    window_valid: bool,
+) -> Option<u32> {
+    let bytes = match ssn {
+        NTUSER_BEGIN_PAINT_SSN => BEGIN_PAINT_OUTPUT_BYTES,
+        NTUSER_GET_UPDATE_RECT_SSN => GET_UPDATE_RECT_OUTPUT_BYTES,
+        _ => return None,
+    };
+    if !completed {
+        return None;
+    }
+    Some(if window_valid { bytes } else { 0 })
 }
 
 /// `w32ksvc64.h`: `SVC_(UserPostMessage, 4)` — the REAL keyboard/message post path. Used both for
@@ -1171,6 +1194,13 @@ pub struct DispatchContext {
     pub args: [u64; 4],
     pub caller_sp: u64,
     pub output_stage: Option<DispatchOutputStage>,
+    pub paint_output: Option<PaintOutputClaim>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PaintOutputClaim {
+    pub process: nt_types::ProcessIdentity,
+    pub client_pointer: u64,
 }
 
 /// A provider-visible output buffer leased to one win32k dispatch. The lease stays attached to the
@@ -1189,6 +1219,7 @@ impl DispatchContext {
         args: [0; 4],
         caller_sp: 0,
         output_stage: None,
+        paint_output: None,
     };
 }
 
@@ -1410,6 +1441,7 @@ impl ActiveCallbackFrame {
         self.dispatch_context.args.fill(0);
         self.dispatch_context.caller_sp = 0;
         self.dispatch_context.output_stage = None;
+        self.dispatch_context.paint_output = None;
         self.arg_snapshot_len = 0;
         self.arg_snapshot.fill(0);
         self.bridged_window.fill(0);
@@ -3302,12 +3334,19 @@ mod tests {
                         generation: 1,
                     },
                     dispatch_id: 10,
-                    ssn: 0x1050,
+                    ssn: 0x1016,
                     args: [1, 2, 3, 4],
                     caller_sp: 0x1000,
                     output_stage: Some(DispatchOutputStage {
                         provider_pointer: 0x3000,
-                        capacity: DISPATCH_MESSAGE_OUTPUT_BYTES,
+                        capacity: 120,
+                    }),
+                    paint_output: Some(PaintOutputClaim {
+                        process: nt_types::ProcessIdentity {
+                            pid: 0x51,
+                            generation: nt_types::ProcessGeneration::Hosted(7),
+                        },
+                        client_pointer: 0x9000,
                     }),
                 },
             )
@@ -3325,6 +3364,7 @@ mod tests {
                     args: [5, 6, 7, 8],
                     caller_sp: 0x2000,
                     output_stage: None,
+                    paint_output: None,
                 },
             )
             .unwrap();
@@ -3347,12 +3387,22 @@ mod tests {
         assert_eq!(popped_a.client_token_authentication_id(), 0xb1);
         assert_eq!(popped_a.client_token_user_sid()[0], 0xaa);
         assert_eq!(popped_a.client_token_user_sid_len(), 0x12);
-        assert_eq!(popped_a.dispatch_context().ssn, 0x1050);
+        assert_eq!(popped_a.dispatch_context().ssn, 0x1016);
         assert_eq!(
             popped_a.dispatch_context().output_stage,
             Some(DispatchOutputStage {
                 provider_pointer: 0x3000,
-                capacity: DISPATCH_MESSAGE_OUTPUT_BYTES,
+                capacity: 120,
+            })
+        );
+        assert_eq!(
+            popped_a.dispatch_context().paint_output,
+            Some(PaintOutputClaim {
+                process: nt_types::ProcessIdentity {
+                    pid: 0x51,
+                    generation: nt_types::ProcessGeneration::Hosted(7),
+                },
+                client_pointer: 0x9000,
             })
         );
         assert_eq!(popped_a.outer_resume_ip(), 7);
@@ -3940,5 +3990,26 @@ mod message_result_tests {
             0,
             DISPATCH_MESSAGE_OUTPUT_BYTES,
         ));
+    }
+
+    #[test]
+    fn paint_publication_tracks_completion_and_window_not_return_value() {
+        assert_eq!(
+            paint_dispatch_output_length(NTUSER_GET_UPDATE_RECT_SSN, 1, true, false),
+            Some(0),
+        );
+        assert_eq!(
+            paint_dispatch_output_length(NTUSER_GET_UPDATE_RECT_SSN, 0, true, true),
+            Some(GET_UPDATE_RECT_OUTPUT_BYTES),
+        );
+        assert_eq!(
+            paint_dispatch_output_length(NTUSER_BEGIN_PAINT_SSN, 0, true, true),
+            Some(BEGIN_PAINT_OUTPUT_BYTES),
+        );
+        assert_eq!(
+            paint_dispatch_output_length(NTUSER_BEGIN_PAINT_SSN, 1, false, true),
+            None,
+        );
+        assert_eq!(paint_dispatch_output_length(0x1035, 1, true, true), None);
     }
 }

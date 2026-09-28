@@ -111,6 +111,7 @@ static USER_CALLBACK_CLIENT_LOOKUP_FAILURES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_INVALID_REQUEST_TRACES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_DISPATCHER: AtomicU64 = AtomicU64::new(0);
 static WIN32K_MESSAGE_STAGE_LEASES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_PAINT_STAGE_LEASES: AtomicU64 = AtomicU64::new(0);
 const _: () = assert!(
     nt_user_callback::CLIENT_TOKEN_USER_SID_MAX == win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX
 );
@@ -806,6 +807,7 @@ pub(crate) struct CompletedWin32kDispatch {
     pub caller_sp: u64,
     pub status: u64,
     pub provider_output_len: u32,
+    pub paint_output: Option<nt_user_callback::PaintOutputClaim>,
     pub arg_snapshot_len: u32,
     pub arg_snapshot: [u8; COMPLETED_ARG_SNAPSHOT_BYTES],
 }
@@ -822,6 +824,7 @@ impl CompletedWin32kDispatch {
             caller_sp,
             status,
             provider_output_len: 0,
+            paint_output: None,
             arg_snapshot_len: 0,
             arg_snapshot: [0; COMPLETED_ARG_SNAPSHOT_BYTES],
         }
@@ -855,6 +858,72 @@ impl CompletedWin32kDispatch {
         self.arg_snapshot[snapshot.len()..].fill(0);
         true
     }
+}
+
+pub(crate) fn acquire_win32k_paint_stage() -> Option<nt_user_callback::DispatchOutputStage> {
+    let mut leases = WIN32K_PAINT_STAGE_LEASES.load(Ordering::Acquire);
+    loop {
+        let free = (!leases).trailing_zeros() as u64;
+        if free >= win32k_subsystem::WIN32K_PAINT_STAGE_SLOTS {
+            return None;
+        }
+        let bit = 1u64 << free;
+        match WIN32K_PAINT_STAGE_LEASES.compare_exchange_weak(
+            leases,
+            leases | bit,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                let stage = nt_user_callback::DispatchOutputStage {
+                    provider_pointer: win32k_subsystem::WIN32K_PAINT_STAGE_BASE
+                        + free * win32k_subsystem::WIN32K_PAINT_STAGE_SLOT_BYTES,
+                    capacity: win32k_subsystem::WIN32K_PAINT_STAGE_OUTPUT_LENGTH_OFFSET as u32,
+                };
+                unsafe {
+                    core::ptr::write_bytes(stage.provider_pointer as *mut u8, 0, stage.capacity as usize);
+                    core::ptr::write_volatile(
+                        (stage.provider_pointer
+                            + win32k_subsystem::WIN32K_PAINT_STAGE_OUTPUT_LENGTH_OFFSET)
+                            as *mut u64,
+                        u64::MAX,
+                    );
+                }
+                return Some(stage);
+            }
+            Err(current) => leases = current,
+        }
+    }
+}
+
+pub(crate) fn release_win32k_paint_stage(stage: nt_user_callback::DispatchOutputStage) -> bool {
+    let Some(offset) = stage.provider_pointer.checked_sub(win32k_subsystem::WIN32K_PAINT_STAGE_BASE) else {
+        return false;
+    };
+    if stage.capacity != win32k_subsystem::WIN32K_PAINT_STAGE_OUTPUT_LENGTH_OFFSET as u32
+        || offset % win32k_subsystem::WIN32K_PAINT_STAGE_SLOT_BYTES != 0
+    {
+        return false;
+    }
+    let index = offset / win32k_subsystem::WIN32K_PAINT_STAGE_SLOT_BYTES;
+    if index >= win32k_subsystem::WIN32K_PAINT_STAGE_SLOTS {
+        return false;
+    }
+    let bit = 1u64 << index;
+    WIN32K_PAINT_STAGE_LEASES.fetch_and(!bit, Ordering::AcqRel) & bit != 0
+}
+
+pub(crate) unsafe fn published_win32k_paint_output_length(
+    stage: nt_user_callback::DispatchOutputStage,
+) -> Option<u32> {
+    if stage.capacity != win32k_subsystem::WIN32K_PAINT_STAGE_OUTPUT_LENGTH_OFFSET as u32 {
+        return None;
+    }
+    let len = core::ptr::read_volatile(
+        (stage.provider_pointer + win32k_subsystem::WIN32K_PAINT_STAGE_OUTPUT_LENGTH_OFFSET)
+            as *const u64,
+    );
+    matches!(len, 0 | 16 | 72).then_some(len as u32)
 }
 
 pub(crate) fn acquire_win32k_message_stage() -> Option<nt_user_callback::DispatchOutputStage> {
@@ -924,8 +993,34 @@ pub(crate) unsafe fn published_win32k_output_length(
 
 unsafe fn release_dispatch_output_stage(context: nt_user_callback::DispatchContext) {
     if let Some(stage) = context.output_stage {
-        let _ = release_win32k_message_stage(stage);
+        if context.paint_output.is_some() {
+            let _ = release_win32k_paint_stage(stage);
+        } else {
+            let _ = release_win32k_message_stage(stage);
+        }
     }
+}
+
+unsafe fn capture_paint_dispatch_output(
+    context: nt_user_callback::DispatchContext,
+    completed: &mut CompletedWin32kDispatch,
+) {
+    completed.paint_output = context.paint_output;
+    let Some(stage) = context.output_stage else {
+        completed.provider_output_len = u32::MAX;
+        return;
+    };
+    completed.provider_output_len = match published_win32k_paint_output_length(stage) {
+        Some(len) => {
+            if len != 0 && !completed.capture_arg_snapshot_from(stage.provider_pointer, len as u64) {
+                u32::MAX
+            } else {
+                len
+            }
+        }
+        None => u32::MAX,
+    };
+    let _ = release_win32k_paint_stage(stage);
 }
 
 #[derive(Clone, Copy)]
@@ -3902,7 +3997,9 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         pending.dispatch.caller_sp,
         pump.result,
     );
-    if matches!(
+    if pending.dispatch.paint_output.is_some() {
+        capture_paint_dispatch_output(pending.dispatch, &mut completed);
+    } else if matches!(
         pending.dispatch.ssn,
         nt_user_callback::NTUSER_GET_MESSAGE_SSN | nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
     ) {
@@ -4118,7 +4215,9 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         pending.dispatch.caller_sp,
         pump.result,
     );
-    if matches!(
+    if pending.dispatch.paint_output.is_some() {
+        capture_paint_dispatch_output(pending.dispatch, &mut completed);
+    } else if matches!(
         pending.dispatch.ssn,
         nt_user_callback::NTUSER_GET_MESSAGE_SSN | nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
     ) {
@@ -4980,7 +5079,9 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         dispatch_context.caller_sp,
         component.result,
     );
-    if matches!(
+    if dispatch_context.paint_output.is_some() {
+        capture_paint_dispatch_output(dispatch_context, &mut outer_dispatch);
+    } else if matches!(
         dispatch_context.ssn,
         nt_user_callback::NTUSER_GET_MESSAGE_SSN | nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
     ) {
@@ -6306,6 +6407,7 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
         &[],
         [a0, a1, a2, a3],
         None,
+        None,
         Win32kClientContext {
             pi,
             generation: 0,
@@ -6358,6 +6460,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
         stack_args,
         [a0, a1, a2, a3],
         None,
+        None,
         client,
     )
 }
@@ -6391,6 +6494,7 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
     stack_args: &[u64],
     completion_args: [u64; 4],
     output_stage: Option<nt_user_callback::DispatchOutputStage>,
+    paint_output: Option<nt_user_callback::PaintOutputClaim>,
     client: Win32kClientContext,
 ) -> (u64, bool) {
     win32k_dispatch_wide_with_completion_args_and_kind(
@@ -6403,6 +6507,7 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
         stack_args,
         completion_args,
         output_stage,
+        paint_output,
         client,
         win32k_subsystem::WIN32K_REQUEST_SSDT,
         true,
@@ -6424,6 +6529,7 @@ pub(crate) unsafe fn win32k_dispatch_ps_provider_command(
         0,
         &[],
         [command, expected_provider_state, flags, 0],
+        None,
         None,
         client,
         win32k_subsystem::WIN32K_REQUEST_PS_PROVIDER,
@@ -6451,6 +6557,7 @@ pub(crate) unsafe fn win32k_finalize_ps_provider_process_objects(
         &[],
         [command, 0, 0, 0],
         None,
+        None,
         client,
         win32k_subsystem::WIN32K_REQUEST_PS_PROVIDER,
         false,
@@ -6475,13 +6582,14 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
     stack_args: &[u64],
     completion_args: [u64; 4],
     output_stage: Option<nt_user_callback::DispatchOutputStage>,
+    paint_output: Option<nt_user_callback::PaintOutputClaim>,
     client: Win32kClientContext,
     request_kind: u64,
     attach_client: bool,
 ) -> (u64, bool) {
     win32k_dispatch_wide_observed(
         ssn, a0, a1, a2, a3, caller_sp, stack_args, completion_args,
-        output_stage, client, request_kind, attach_client, None,
+        output_stage, paint_output, client, request_kind, attach_client, None,
     )
 }
 
@@ -6495,6 +6603,7 @@ unsafe fn win32k_dispatch_wide_observed(
     stack_args: &[u64],
     completion_args: [u64; 4],
     output_stage: Option<nt_user_callback::DispatchOutputStage>,
+    paint_output: Option<nt_user_callback::PaintOutputClaim>,
     client: Win32kClientContext,
     request_kind: u64,
     attach_client: bool,
@@ -6605,6 +6714,7 @@ unsafe fn win32k_dispatch_wide_observed(
             args: completion_args,
             caller_sp,
             output_stage,
+            paint_output,
         },
     );
     core::ptr::write_volatile(
@@ -6806,6 +6916,7 @@ unsafe fn win32k_dispatch_wide_observed(
                     args: completion_args,
                     caller_sp,
                     output_stage,
+                    paint_output,
                 },
                 client,
                 nested_user_callback,
@@ -6847,6 +6958,7 @@ unsafe fn win32k_dispatch_wide_observed(
                     args: completion_args,
                     caller_sp,
                     output_stage,
+                    paint_output,
                 },
                 client,
                 nested_user_callback,

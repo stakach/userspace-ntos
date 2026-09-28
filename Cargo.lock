@@ -747,6 +747,7 @@ name = "nt-user-callback"
 version = "0.1.0"
 dependencies = [
  "nt-component-suspension",
+ "nt-types",
 ]
 
 [[package]]
