@@ -51,12 +51,20 @@ struct Wait {
 #[derive(Clone, Copy)]
 enum ServiceCompletion {
     Status(i32),
-    QueryPath { status: i32, accepted: bool },
+    QueryPath {
+        status: i32,
+        accepted: bool,
+    },
     FileCreate(nt_io_manager::io_create_file_reply::IoCreateFileReply),
     Registry {
         status: i32,
         handle: u64,
         disposition: u64,
+    },
+    SectionCreate {
+        status: i32,
+        token: u64,
+        handle: u64,
     },
 }
 
@@ -73,6 +81,11 @@ impl ServiceCompletion {
                 handle,
                 disposition,
             } => (4, [status as u32 as u64, handle, disposition, 0]),
+            Self::SectionCreate {
+                status,
+                token,
+                handle,
+            } => (4, [status as u32 as u64, token, handle, 0]),
         }
     }
 }
@@ -121,11 +134,9 @@ unsafe fn park(route: PeerRoute, token: u64, kind: WaitKind) -> Result<(), Error
     let autonomous = matches!(source.kind, PhysicalSourceKind::SystemThread { .. });
     let waits = &mut *core::ptr::addr_of_mut!(WAITS);
     if token == 0
-        || waits
-            .iter()
-            .any(|row| {
-                row.route == route && row.phase.blocks_new_dispatch(row.dispatch == dispatch)
-            })
+        || waits.iter().any(|row| {
+            row.route == route && row.phase.blocks_new_dispatch(row.dispatch == dispatch)
+        })
     {
         return Err(Error::Admission);
     }
@@ -213,6 +224,47 @@ pub(crate) unsafe fn wake_registry_service(
     )
 }
 
+pub(crate) unsafe fn wake_section_create_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    status: i32,
+    handle: u64,
+) -> Result<(), Error> {
+    wake_with_completion(
+        route,
+        dispatch,
+        reply,
+        token,
+        ServiceCompletion::SectionCreate {
+            status,
+            token: if status == 0 { token } else { 0 },
+            handle: if status == 0 { handle } else { 0 },
+        },
+    )
+}
+
+/// Only Parked proves that a retained Reply has not entered its native send.
+pub(crate) unsafe fn retained_service_reply_not_entered(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+) -> Result<bool, Error> {
+    let wait = (&*core::ptr::addr_of!(WAITS))
+        .iter()
+        .find(|wait| {
+            wait.kind == WaitKind::RetainedSemantic
+                && wait.route == route
+                && wait.dispatch == dispatch
+                && wait.reply == reply
+                && wait.token == token
+        })
+        .ok_or(Error::Admission)?;
+    Ok(wait.phase == WaitPhase::Parked)
+}
+
 pub(crate) unsafe fn wake_query_path_service(
     route: PeerRoute,
     dispatch: LaneDispatchIdentity,
@@ -221,8 +273,14 @@ pub(crate) unsafe fn wake_query_path_service(
     status: i32,
 ) -> Result<(), Error> {
     wake_with_completion(
-        route, dispatch, reply, token,
-        ServiceCompletion::QueryPath { status, accepted: true },
+        route,
+        dispatch,
+        reply,
+        token,
+        ServiceCompletion::QueryPath {
+            status,
+            accepted: true,
+        },
     )
 }
 
@@ -234,8 +292,14 @@ pub(crate) unsafe fn wake_query_path_rejected_service(
     status: i32,
 ) -> Result<(), Error> {
     wake_with_completion(
-        route, dispatch, reply, token,
-        ServiceCompletion::QueryPath { status, accepted: false },
+        route,
+        dispatch,
+        reply,
+        token,
+        ServiceCompletion::QueryPath {
+            status,
+            accepted: false,
+        },
     )
 }
 
@@ -509,15 +573,7 @@ pub(crate) unsafe fn cancel_parked_service(route: PeerRoute) -> Result<(), Error
     let Some((dispatch, reply, token, phase, kind)) = (&*core::ptr::addr_of!(WAITS))
         .iter()
         .find(|row| row.route == route && row.phase.has_cancellable_call())
-        .map(|wait| {
-            (
-                wait.dispatch,
-                wait.reply,
-                wait.token,
-                wait.phase,
-                wait.kind,
-            )
-        })
+        .map(|wait| (wait.dispatch, wait.reply, wait.token, wait.phase, wait.kind))
     else {
         return Ok(());
     };
@@ -672,9 +728,15 @@ mod tests {
     #[test]
     fn retained_services_accept_registered_dispatch_workers_but_not_interrupts() {
         assert!(service_source_supported(PhysicalSourceKind::Primary));
-        assert!(service_source_supported(PhysicalSourceKind::DispatchWorker { ordinal: 1 }));
-        assert!(!service_source_supported(PhysicalSourceKind::DispatchWorker { ordinal: 0 }));
-        assert!(service_source_supported(PhysicalSourceKind::SystemThread { handle: 1 }));
+        assert!(service_source_supported(
+            PhysicalSourceKind::DispatchWorker { ordinal: 1 }
+        ));
+        assert!(!service_source_supported(
+            PhysicalSourceKind::DispatchWorker { ordinal: 0 }
+        ));
+        assert!(service_source_supported(PhysicalSourceKind::SystemThread {
+            handle: 1
+        }));
         assert!(!service_source_supported(PhysicalSourceKind::Interrupt(
             nt_hosted_runtime::HostedIrqLaneIdentity::new(1, 1, 1).unwrap(),
         )));

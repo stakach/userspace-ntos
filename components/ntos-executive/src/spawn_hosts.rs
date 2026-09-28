@@ -2661,14 +2661,25 @@ unsafe fn component_pump_loop(
         } else if label == crate::win32k_subsystem::W32_SECTION_CREATE_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
-            let (status, out1, out2, out3) = unsafe {
+            let result = unsafe {
                 crate::service_sec_image::service_win32k_section_create_request(
                     ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3,
                 )
             };
-            pump_reply_recv4_into!(
-                ch, *reply_cap, msg, 4, status as u32 as u64, out1, out2, out3
-            );
+            match result {
+                crate::provider_section_broker::SubmitResult::Ready((status, out1, out2, out3)) => {
+                    pump_reply_recv4_into!(
+                        ch, *reply_cap, msg, 4, status as u32 as u64, out1, out2, out3
+                    );
+                }
+                crate::provider_section_broker::SubmitResult::Deferred => {
+                    if shared_pump::autonomous(ch) {
+                        outcome.provider_wait_suspended = true;
+                        break;
+                    }
+                    msg = pump_recv(ch, *reply_cap);
+                }
+            }
             continue;
         } else if label == crate::win32k_subsystem::W32_SUBJECT_LABEL
             && ch.caps.kind == ReqKind::Syscall

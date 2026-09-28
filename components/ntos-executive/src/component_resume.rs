@@ -163,6 +163,7 @@ unsafe fn reconcile_runtime(handler: &mut ExecNtHandler) -> Option<nt_kernel_exe
         && acpi_deadline.is_none()
         && crate::registry_mutation_work::next_deadline().is_none()
         && crate::section_metadata_work::next_deadline().is_none()
+        && crate::provider_section_broker::next_deadline().is_none()
     {
         return None;
     }

@@ -4513,7 +4513,8 @@ pub(crate) unsafe fn service_win32k_section_create_request(
     first: u64,
     second: u64,
     third: u64,
-) -> (i32, u64, u64, u64) {
+) -> crate::provider_section_broker::SubmitResult {
+    use crate::provider_section_broker::SubmitResult;
     let (route, dispatch, caller) = match authenticate_win32k_service_request(
         channel,
         reply_cap,
@@ -4522,14 +4523,14 @@ pub(crate) unsafe fn service_win32k_section_create_request(
         (crate::win32k_subsystem::W32_SECTION_CREATE_LABEL << 12) | 4,
     ) {
         Ok(owner) => owner,
-        Err(status) => return (status as i32, 0, 0, 0),
+        Err(status) => return SubmitResult::Ready((status as i32, 0, 0, 0)),
     };
     let handler = match registry_live_handler() {
         Ok(handler) if handler.loop_ctx.is_some() => handler,
-        _ => return (0xC000_00A3u32 as i32, 0, 0, 0),
+        _ => return SubmitResult::Ready((0xC000_00A3u32 as i32, 0, 0, 0)),
     };
-    crate::provider_section_broker::dispatch(
-        handler, route, dispatch, caller, op, first, second, third,
+    crate::provider_section_broker::submit(
+        handler, channel, route, dispatch, caller, op, first, second, third,
     )
 }
 
@@ -8909,6 +8910,7 @@ pub(crate) unsafe fn service_sec_image(
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-waiting")
                 && crate::registry_mutation_work::next_deadline().is_none()
                 && crate::section_metadata_work::next_deadline().is_none()
+                && crate::provider_section_broker::next_deadline().is_none()
             {
                 print_str(
                     b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n",
@@ -9017,6 +9019,7 @@ pub(crate) unsafe fn service_sec_image(
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
             crate::section_metadata_work::redrive(&mut nt_handler, delay_queue);
+            crate::provider_section_broker::redrive(&mut nt_handler);
             crate::driver_launch::redrive_hosted_driver_io_create_file(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_path_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_write_forward(nt_handler as *mut _);
