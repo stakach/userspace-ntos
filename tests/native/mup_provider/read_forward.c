@@ -17,6 +17,7 @@ typedef void *HANDLE;
 #define IRP_MJ_FLUSH_BUFFERS 0x09
 #define IRP_MJ_QUERY_INFORMATION 0x05
 #define FileStandardInformation 5
+#define FileInternalInformation 6
 #define IRP_BUFFERED_IO 0x10
 #define IRP_DEALLOCATE_BUFFER 0x20
 #define IRP_INPUT_OPERATION 0x40
@@ -160,10 +161,19 @@ static WCHAR ProviderName[] = {
     '\\', 'D', 'e', 'v', 'i', 'c', 'e', '\\', 'N', 't', 'o', 's', 'U', 'n', 'c', 'P',
     'r', 'o', 'b', 'e', 0
 };
+static WCHAR SectionName[] = {
+    '\\', 'D', 'e', 'v', 'i', 'c', 'e', '\\', 'M', 'u', 'p',
+    '\\', 'n', 't', 'o', 's', '-', 'p', 'r', 'o', 'b', 'e',
+    '\\', 's', 'e', 'c', 't', 'i', 'o', 'n', 0
+};
 static const uint8_t ExpectedBytes[] = {'n', 't', 'o', 's', '-', 'r', 'e', 'a', 'd', '!'};
 static const FILE_STANDARD_INFORMATION ExpectedStandardInfo = {
     0x1122334455667788ll, 0x0102030405060708ll, 0x13579bdfu, 1, 0, {0, 0}
 };
+static const FILE_STANDARD_INFORMATION ExpectedSectionStandardInfo = {
+    4096, 4096, 1, 0, 0, {0, 0}
+};
+static const uint64_t ExpectedSectionInternalIndex = 0x53656374696f6e31ull;
 
 static NTSTATUS ForwardOnce(void *file, DEVICE_OBJECT *device, int64_t offset)
 {
@@ -372,6 +382,149 @@ static NTSTATUS ReadThroughZw(HANDLE handle)
     return status;
 }
 
+static NTSTATUS SectionQueryOnce(void *file, DEVICE_OBJECT *device, uint32_t info_class)
+{
+    const uint32_t length = info_class == FileStandardInformation
+        ? sizeof(ExpectedSectionStandardInfo) : sizeof(ExpectedSectionInternalIndex);
+    uint8_t output[sizeof(ExpectedSectionStandardInfo)];
+    for (uint32_t i = 0; i < sizeof(output); i++) output[i] = 0xcc;
+    void *system_buffer = ExAllocatePoolWithTag(PagedPool, length, 0x53716e74);
+    if (system_buffer == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+    for (uint32_t i = 0; i < length; i++) ((uint8_t *)system_buffer)[i] = 0xa5;
+    IRP *irp = IoAllocateIrp(device->StackSize, 0);
+    if (irp == NULL) {
+        ExFreePoolWithTag(system_buffer, 0x53716e74);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    IO_STACK_LOCATION *stack = IoGetNextIrpStackLocation(irp);
+    if (stack == NULL) {
+        IoFreeIrp(irp);
+        ExFreePoolWithTag(system_buffer, 0x53716e74);
+        return STATUS_UNSUCCESSFUL;
+    }
+    IO_STATUS_BLOCK iosb = {0};
+    uint64_t completion_event[3] = {0};
+    KeInitializeEvent(completion_event, 1, 0);
+    irp->Flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION;
+    irp->AssociatedSystemBuffer = system_buffer;
+    irp->UserBuffer = output;
+    irp->UserIosb = &iosb;
+    irp->UserEvent = completion_event;
+    irp->OriginalFileObject = file;
+    stack->MajorFunction = IRP_MJ_QUERY_INFORMATION;
+    stack->Parameters.QueryFile.Length = length;
+    stack->Parameters.QueryFile.FileInformationClass = info_class;
+    stack->DeviceObject = device;
+    stack->FileObject = file;
+    NTSTATUS call = IofCallDriver(device, irp);
+    NTSTATUS wait = call == STATUS_SUCCESS || call == STATUS_PENDING
+        ? KeWaitForSingleObject(completion_event, 0, 0, 0, NULL) : STATUS_UNSUCCESSFUL;
+    NTSTATUS status = call == (info_class == FileStandardInformation ? STATUS_PENDING : STATUS_SUCCESS) &&
+                      wait == STATUS_SUCCESS && iosb.Status == STATUS_SUCCESS &&
+                      iosb.Information == length ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    const uint8_t *expected = info_class == FileStandardInformation
+        ? (const uint8_t *)&ExpectedSectionStandardInfo
+        : (const uint8_t *)&ExpectedSectionInternalIndex;
+    if (status == STATUS_SUCCESS) {
+        for (uint32_t i = 0; i < length; i++) {
+            if (output[i] != expected[i]) { status = STATUS_UNSUCCESSFUL; break; }
+        }
+    }
+    DbgPrint("[section-query-result] class=%u call=0x%08x wait=0x%08x iosb=0x%08x info=%u match=%u\n",
+             info_class, (uint32_t)call, (uint32_t)wait, (uint32_t)iosb.Status,
+             (uint32_t)iosb.Information, status == STATUS_SUCCESS);
+    if (status == STATUS_SUCCESS) DbgPrint("[section-query-verified-%u]\n", info_class);
+    return status;
+}
+
+static NTSTATUS SectionReadOnce(void *file, DEVICE_OBJECT *device)
+{
+    uint8_t *output = ExAllocatePoolWithTag(PagedPool, 4096, 0x53726e74);
+    if (output == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+    for (uint32_t i = 0; i < 4096; i++) output[i] = 0xcc;
+    void *system_buffer = ExAllocatePoolWithTag(PagedPool, 4096, 0x53736e74);
+    if (system_buffer == NULL) {
+        ExFreePoolWithTag(output, 0x53726e74);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    for (uint32_t i = 0; i < 4096; i++) ((uint8_t *)system_buffer)[i] = 0xa5;
+    IRP *irp = IoAllocateIrp(device->StackSize, 0);
+    if (irp == NULL) {
+        ExFreePoolWithTag(system_buffer, 0x53736e74);
+        ExFreePoolWithTag(output, 0x53726e74);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    IO_STACK_LOCATION *stack = IoGetNextIrpStackLocation(irp);
+    if (stack == NULL) {
+        IoFreeIrp(irp);
+        ExFreePoolWithTag(system_buffer, 0x53736e74);
+        ExFreePoolWithTag(output, 0x53726e74);
+        return STATUS_UNSUCCESSFUL;
+    }
+    IO_STATUS_BLOCK iosb = {0};
+    uint64_t completion_event[3] = {0};
+    KeInitializeEvent(completion_event, 1, 0);
+    irp->Flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION;
+    irp->AssociatedSystemBuffer = system_buffer;
+    irp->UserBuffer = output;
+    irp->UserIosb = &iosb;
+    irp->UserEvent = completion_event;
+    irp->OriginalFileObject = file;
+    stack->MajorFunction = IRP_MJ_READ;
+    stack->Parameters.Read.Length = 4096;
+    stack->Parameters.Read.ByteOffset = 0;
+    stack->DeviceObject = device;
+    stack->FileObject = file;
+    NTSTATUS call = IofCallDriver(device, irp);
+    NTSTATUS wait = call == STATUS_PENDING
+        ? KeWaitForSingleObject(completion_event, 0, 0, 0, NULL) : STATUS_UNSUCCESSFUL;
+    NTSTATUS status = call == STATUS_PENDING && wait == STATUS_SUCCESS &&
+                      iosb.Status == STATUS_SUCCESS && iosb.Information == 4096
+        ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    if (status == STATUS_SUCCESS) {
+        for (uint32_t i = 0; i < 4096; i++) {
+            if (output[i] != (uint8_t)i) { status = STATUS_UNSUCCESSFUL; break; }
+        }
+    }
+    DbgPrint("[section-read-result] call=0x%08x wait=0x%08x iosb=0x%08x info=%u match=%u\n",
+             (uint32_t)call, (uint32_t)wait, (uint32_t)iosb.Status,
+             (uint32_t)iosb.Information, status == STATUS_SUCCESS);
+    if (status == STATUS_SUCCESS) DbgPrint("[section-read-verified]\n");
+    ExFreePoolWithTag(output, 0x53726e74);
+    return status;
+}
+
+static NTSTATUS CheckSectionFile(void)
+{
+    UNICODE_STRING name = {
+        (uint16_t)(sizeof(SectionName) - sizeof(WCHAR)),
+        (uint16_t)sizeof(SectionName), SectionName
+    };
+    OBJECT_ATTRIBUTES attrs = {sizeof(attrs), NULL, &name, OBJ_CASE_INSENSITIVE, NULL, NULL};
+    HANDLE handle = NULL;
+    IO_STATUS_BLOCK open_iosb = {0};
+    NTSTATUS status = ZwCreateFile(&handle, FILE_READ_DATA, &attrs, &open_iosb, NULL, 0,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN, 0, NULL, 0);
+    if (NT_SUCCESS(status)) status = open_iosb.Status;
+    if (!NT_SUCCESS(status) || handle == NULL) return STATUS_UNSUCCESSFUL;
+    void *file = NULL;
+    status = ObReferenceObjectByHandle(handle, FILE_READ_DATA, NULL, 0, &file, NULL);
+    if (!NT_SUCCESS(status) || file == NULL) goto close;
+    DEVICE_OBJECT *device = IoGetRelatedDeviceObject(file);
+    if (device == NULL || device->StackSize == 0 || device->StackSize > 32) {
+        status = STATUS_UNSUCCESSFUL;
+        goto dereference;
+    }
+    status = SectionQueryOnce(file, device, FileStandardInformation);
+    if (status == STATUS_SUCCESS) status = SectionQueryOnce(file, device, FileInternalInformation);
+    if (status == STATUS_SUCCESS) status = SectionReadOnce(file, device);
+dereference:
+    ObfDereferenceObject(file);
+close:
+    ZwClose(handle);
+    return status;
+}
+
 static void __stdcall ReadWorker(void *context)
 {
     (void)context;
@@ -416,6 +569,7 @@ dereference:
     ObfDereferenceObject(file);
 close:
     ZwClose(handle);
+    if (status == STATUS_SUCCESS) status = CheckSectionFile();
 fail:
     if (!NT_SUCCESS(status))
         DbgPrint("[read-forward-fail] status=0x%08x\n", (uint32_t)status);
