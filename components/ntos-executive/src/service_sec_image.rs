@@ -3211,12 +3211,12 @@ unsafe fn reset_service_hosted_loaded_images_work() -> &'static mut HostedLoaded
 }
 
 #[inline(never)]
-unsafe fn reset_service_generic_sections_work() -> &'static mut GenericSectionTable {
+unsafe fn reset_service_generic_sections_work() -> *mut GenericSectionTable {
     let slot = core::ptr::addr_of_mut!(SERVICE_GENERIC_SECTIONS_WORK);
     if !(*slot).reset() {
         panic!("generic section table allocation failed");
     }
-    &mut *slot
+    slot
 }
 
 pub(crate) fn service_generic_section_stats() -> GenericSectionTableStats {
@@ -3450,7 +3450,7 @@ pub(crate) use section_writeback::{
 
 pub(crate) unsafe fn service_generic_section_fault(
     nt_handler: &mut ExecNtHandler,
-    generic_sections: &mut GenericSectionTable,
+    generic_sections: *mut GenericSectionTable,
     pi: usize,
     page: u64,
     pml4: u64,
@@ -3463,12 +3463,18 @@ pub(crate) unsafe fn service_generic_section_fault(
     let lifetime = nt_memory_manager::MemoryLifetime::Process(process);
     hosted_thread_memory_access(pi as u64, page, 0x1000)?;
     let write_fault = fault_access == nt_address_space::FaultAccess::Write;
-    let Some((section_index, view)) = generic_sections.view_for_page(pi, page) else {
+    let Some((section_index, view)) = (&*generic_sections).view_for_page(pi, page) else {
         return Ok(false);
     };
-    let Some(section) = generic_sections.section(section_index) else {
+    if view.lifetime != lifetime {
+        return Err(nt_address_space::STATUS_NOT_COMMITTED);
+    }
+    let Some(section) = (&*generic_sections).section(section_index) else {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     };
+    let section_identity = (&*generic_sections)
+        .section_identity(section_index)
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
     let section_page_offset = view.section_offset + (page - view.base);
     let page_index = section_page_offset / 0x1000;
     let Some(view_info) = process_committed_mapping_basic_information(pi as u64, page) else {
@@ -3524,7 +3530,7 @@ pub(crate) unsafe fn service_generic_section_fault(
             let old_protection =
                 nt_address_space::mapped_view_fault_plan(view_info.protect, false).map_protection;
             generic_section_mark_dirty_if_backed(
-                generic_sections,
+                &mut *generic_sections,
                 section_index,
                 section,
                 page_index,
@@ -3546,10 +3552,16 @@ pub(crate) unsafe fn service_generic_section_fault(
     let frame = service_generic_section_frame(
         generic_sections,
         section_index,
+        section_identity,
         section,
         page_index,
         scratch_base,
     )?;
+    if (&*generic_sections).view_for_page(pi, page) != Some((section_index, view))
+        || process_committed_mapping_basic_information(pi as u64, page) != Some(view_info)
+    {
+        return Err(nt_address_space::STATUS_NOT_COMMITTED);
+    }
     if fault_plan.copy_on_write {
         let old_protection =
             nt_address_space::mapped_view_fault_plan(view_info.protect, false).map_protection;
@@ -3567,7 +3579,7 @@ pub(crate) unsafe fn service_generic_section_fault(
     }
     vm_ensure_private_pt(nt_handler, pi, page, pml4)?;
     if fault_plan.mark_dirty {
-        generic_section_mark_dirty_if_backed(generic_sections, section_index, section, page_index)?;
+        generic_section_mark_dirty_if_backed(&mut *generic_sections, section_index, section, page_index)?;
     }
     let (map_cap, copy_error) = copy_cap_r(frame);
     if copy_error != 0 {
@@ -8961,7 +8973,7 @@ pub(crate) unsafe fn service_sec_image(
         nt_base,
         nt_end,
         dll_pe_store: dll_pe_store as *mut DllPeStore,
-        generic_sections: generic_sections as *mut GenericSectionTable,
+        generic_sections,
         dll_arena_paging: dll_arena_paging as *mut DllArenaPagingState,
     };
     nt_handler.loop_ctx = Some(memory_context);

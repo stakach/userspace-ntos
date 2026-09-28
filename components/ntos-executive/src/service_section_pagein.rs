@@ -117,8 +117,9 @@ pub(crate) unsafe fn service_prepare_data_section_file(
 }
 
 pub(super) unsafe fn service_generic_section_frame(
-    generic_sections: &mut GenericSectionTable,
+    generic_sections: *mut GenericSectionTable,
     section_index: usize,
+    identity: nt_memory_manager::SectionIdentity,
     section: GenericSection,
     page_index: u64,
     scratch_base: u64,
@@ -127,10 +128,10 @@ pub(super) unsafe fn service_generic_section_frame(
         .checked_mul(DATA_PAGE_SIZE as u64)
         .filter(|offset| *offset < section.size)
         .ok_or(nt_memory_manager::STATUS_INVALID_VIEW_SIZE)?;
+    if (&*generic_sections).section_identity(section_index) != Some(identity) {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
     let route = if let Some(lease) = section.backing.routed_lease {
-        let identity = generic_sections
-            .section_identity(section_index)
-            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
         Some(
             crate::hosted_routed_section_capture::route(lease, identity)
                 .ok_or(nt_fs::STATUS_INVALID_HANDLE)?,
@@ -141,18 +142,41 @@ pub(super) unsafe fn service_generic_section_frame(
     let mut io = BackingIo { backing: section.backing, route };
     let file_size = if section.backing.kind != GENERIC_SECTION_BACKING_ANON {
         let info = io.query_file()?;
-        generic_sections.refresh_file_extent(section_index, info.end_of_file)?;
         Some(info.end_of_file)
     } else {
         None
     };
-    if let Some(frame) = generic_sections.page_frame(section_index, page_index) {
-        return Ok(frame);
+    {
+        let table = &mut *generic_sections;
+        if table.section_identity(section_index) != Some(identity)
+            || section.backing.routed_lease.is_some_and(|lease| {
+                crate::hosted_routed_section_capture::route(lease, identity) != route
+            })
+        {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
+        }
+        if let Some(file_size) = file_size {
+            table.refresh_file_extent(section_index, file_size)?;
+        }
+        if let Some(frame) = table.page_frame(section_index, page_index) {
+            return Ok(frame);
+        }
     }
-    // Finish backing I/O before acquiring a physical frame. Failed reads never enter the cache.
+    // Provider I/O runs without a live Section-table borrow. Its result is only a candidate until
+    // the exact Section incarnation and routed lease have been revalidated.
     let mut bytes = [0u8; DATA_PAGE_SIZE];
     if let Some(file_size) = file_size {
         read_data_section_page(page_index, section.size, file_size, &mut bytes, &mut io)?;
+    }
+    if (&*generic_sections).section_identity(section_index) != Some(identity)
+        || section.backing.routed_lease.is_some_and(|lease| {
+            crate::hosted_routed_section_capture::route(lease, identity) != route
+        })
+    {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
+    if let Some(frame) = (&*generic_sections).page_frame(section_index, page_index) {
+        return Ok(frame);
     }
     reserve_pagein_cleanup()?;
     let frame = vm_frame_acquire(scratch_base)?;
@@ -163,9 +187,23 @@ pub(super) unsafe fn service_generic_section_frame(
     }
     core::ptr::copy_nonoverlapping(bytes.as_ptr(), scratch as *mut u8, DATA_PAGE_SIZE);
     let unmap_status = page_unmap_r(frame);
-    if unmap_status != 0 || !generic_sections.set_page_frame(section_index, page_index, frame) {
+    if unmap_status != 0 {
         release_unpublished_section_frame(frame);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
-    Ok(frame)
+    match (&mut *generic_sections).publish_page_frame_exact(identity, page_index, frame) {
+        Ok(nt_memory_manager::SectionPagePublication::Inserted) => Ok(frame),
+        Ok(nt_memory_manager::SectionPagePublication::Existing(existing)) => {
+            release_unpublished_section_frame(frame);
+            Ok(existing)
+        }
+        Err(nt_memory_manager::SectionPagePublicationError::StaleSection) => {
+            release_unpublished_section_frame(frame);
+            Err(nt_fs::STATUS_INVALID_HANDLE)
+        }
+        Err(_) => {
+            release_unpublished_section_frame(frame);
+            Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
+        }
+    }
 }

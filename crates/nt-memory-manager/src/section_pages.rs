@@ -1,7 +1,46 @@
 //! Canonical page residency, shared dirty tickets, and alias planning.
 use super::*;
 
+/// The candidate frame is owned by the section only when publication inserts it. On `Existing`,
+/// the caller still owns the candidate and must release it through its checked retirement path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SectionPagePublication {
+    Inserted,
+    Existing(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SectionPagePublicationError {
+    StaleSection,
+    InvalidFrame,
+    Unavailable,
+}
+
 impl GenericSectionTable {
+    /// Revalidate the section incarnation after external page I/O, then publish at most one
+    /// canonical frame for the shared control-area page. This does not transfer the candidate
+    /// frame on failure or when another page-in populated the page first.
+    pub fn publish_page_frame_exact(
+        &mut self,
+        section: SectionIdentity,
+        page_index: u64,
+        frame: u64,
+    ) -> Result<SectionPagePublication, SectionPagePublicationError> {
+        if self.section_identity(section.index) != Some(section) {
+            return Err(SectionPagePublicationError::StaleSection);
+        }
+        if frame == 0 {
+            return Err(SectionPagePublicationError::InvalidFrame);
+        }
+        if let Some(existing) = self.page_frame(section.index, page_index) {
+            return Ok(SectionPagePublication::Existing(existing));
+        }
+        if !self.set_page_frame(section.index, page_index, frame) {
+            return Err(SectionPagePublicationError::Unavailable);
+        }
+        Ok(SectionPagePublication::Inserted)
+    }
+
     pub fn page_frame(&self, section_index: usize, page_index: u64) -> Option<u64> {
         let area = self.control_area(section_index)?.id;
         self.pages
