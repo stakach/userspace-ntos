@@ -44,6 +44,15 @@ impl ReservedGenericDataSection {
 }
 
 impl ExecNtHandler {
+    pub(crate) fn native_section_owner_pi(
+        &self,
+        caller: NativeHandleCaller,
+    ) -> Result<usize, u32> {
+        (0..MAX_PI)
+            .find(|&pi| self.pm_pid_for_pi(pi) == Some(caller.effective_process()))
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)
+    }
+
     /// Reserve a real section and an invisible native handle. The caller must publish only after
     /// output delivery, or abort to retire the section and its retained backing reference.
     pub(crate) unsafe fn reserve_generic_data_section(
