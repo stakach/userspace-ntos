@@ -84,6 +84,24 @@ fn short_or_failed_terminal_never_exposes_a_page() {
 }
 
 #[test]
+fn failed_terminal_output_copy_requires_ack_and_cannot_publish() {
+    let plan = plan_data_section_page_read(0, 0x1000, 0x1000).unwrap();
+    let mut reads = PendingSectionPageReads::<Box<u32>, u64>::new();
+    let id = reads.reserve(section(), lease(), 0, plan, Box::new(24)).unwrap();
+    assert!(reads.bind(id, 82));
+    assert!(reads.terminal(id, 82, 0, plan.length() as u64));
+    assert!(reads.append(id, 82, 0, &[0x5a; 32]));
+    assert!(!reads.fail_copy(id, 83, STATUS_IO_DEVICE_ERROR));
+    assert!(reads.fail_copy(id, 82, STATUS_IO_DEVICE_ERROR));
+    assert!(reads.ready_page(id, 82).is_none());
+    assert!(reads.take_acknowledged(id, 82).is_none());
+    assert!(reads.acknowledge_backend(id, 82));
+    let (owner, result) = reads.take_acknowledged(id, 82).unwrap();
+    assert_eq!(*owner, 24);
+    assert_eq!(result, Err(STATUS_IO_DEVICE_ERROR));
+}
+
+#[test]
 fn cancelled_and_reused_slots_reject_stale_ids_and_foreign_stores() {
     let plan = plan_data_section_page_read(0, 0x1000, 0x1000).unwrap();
     let mut first = PendingSectionPageReads::<Box<u32>, u64>::new();
@@ -145,4 +163,113 @@ fn invalid_geometry_and_generation_exhaustion_return_the_owner() {
             .map_err(|owner| *owner),
         Err(32),
     );
+}
+
+#[test]
+fn inline_completion_uses_reserved_page_and_zero_fills_eof_tail() {
+    let plan = plan_data_section_page_read(0, 0x1000, 0x180).unwrap();
+    let mut reads = PendingSectionPageReads::<Box<u32>, u64>::new();
+    let id = reads
+        .reserve(section(), lease(), 0, plan, Box::new(41))
+        .unwrap();
+    let (owner, result) = reads
+        .complete_inline(id, 0, plan.length() as u64, &[0x6b; 0x180])
+        .unwrap();
+    assert_eq!(*owner, 41);
+    let page = result.unwrap();
+    assert_eq!(&page[..0x180], &[0x6b; 0x180]);
+    assert!(page[0x180..].iter().all(|byte| *byte == 0));
+    assert!(reads.identity(id).is_none());
+}
+
+#[test]
+fn inline_short_read_is_terminal_failure_without_publication() {
+    let plan = plan_data_section_page_read(0, 0x1000, 0x1000).unwrap();
+    let mut reads = PendingSectionPageReads::<Box<u32>, u64>::new();
+    let id = reads
+        .reserve(section(), lease(), 0, plan, Box::new(42))
+        .unwrap();
+    let (owner, result) = reads
+        .complete_inline(id, 0, (plan.length() - 1) as u64, &[0x6b; DATA_PAGE_SIZE])
+        .unwrap();
+    assert_eq!(*owner, 42);
+    assert_eq!(result, Err(STATUS_IO_DEVICE_ERROR));
+    assert!(reads.identity(id).is_none());
+}
+
+#[test]
+fn acknowledged_read_cannot_publish_into_reused_section_or_view() {
+    let mut table = GenericSectionTable::new();
+    let mount = crate::SectionMountIds::new().allocate().unwrap();
+    let first = table
+        .create(
+            2,
+            0x40,
+            0x1000,
+            PAGE_READONLY,
+            SECTION_ATTR_SEC_COMMIT,
+            GenericSectionBacking::routed(
+                lease(),
+                crate::SectionFileIdentity { mount, file_id: 1 },
+                0x1000,
+            ),
+        )
+        .unwrap();
+    assert!(table.map_view(3, first, 0x10000, 0x1000, 0));
+    let old_section = table.section_identity(first).unwrap();
+    let old_view = table.view_for_page(3, 0x10000).unwrap();
+    let plan = plan_data_section_page_read(0, 0x1000, 0x1000).unwrap();
+    let mut reads = PendingSectionPageReads::<Box<u32>, u64>::new();
+    let id = reads
+        .reserve(old_section, lease(), 0, plan, Box::new(31))
+        .unwrap();
+    assert!(reads.bind(id, 77));
+    assert!(reads.terminal(id, 77, 0, 0x1000));
+    assert!(reads.append(id, 77, 0, &[0x5a; DATA_PAGE_SIZE]));
+    assert!(reads.acknowledge_backend(id, 77));
+
+    assert!(table.unmap_view(3, 0x10000).is_some());
+    assert!(table.release_handle(first));
+    struct Retire;
+    impl crate::SectionRetirementIo for Retire {
+        fn release_frame(&mut self, _: u64) -> Result<(), u32> {
+            Ok(())
+        }
+
+        fn release_backing(
+            &mut self,
+            _: SectionIdentity,
+            _: GenericSectionBacking,
+        ) -> Result<(), u32> {
+            Ok(())
+        }
+    }
+    table.drain_retired(&mut Retire).unwrap();
+    let replacement = table
+        .create(
+            2,
+            0x41,
+            0x1000,
+            PAGE_READONLY,
+            SECTION_ATTR_SEC_COMMIT,
+            GenericSectionBacking::routed(
+                RoutedSectionLease::new(8).unwrap(),
+                crate::SectionFileIdentity { mount, file_id: 2 },
+                0x1000,
+            ),
+        )
+        .unwrap();
+    assert_eq!(replacement, first);
+    assert!(table.map_view(3, replacement, 0x10000, 0x1000, 0));
+    assert_ne!(table.section_identity(replacement), Some(old_section));
+    assert_ne!(table.view_for_page(3, 0x10000), Some(old_view));
+
+    let (owner, page) = reads.take_acknowledged(id, 77).unwrap();
+    assert_eq!(*owner, 31);
+    assert_eq!(page.unwrap()[0], 0x5a);
+    assert_eq!(
+        table.publish_page_frame_exact(old_section, 0, 101),
+        Err(crate::SectionPagePublicationError::StaleSection)
+    );
+    assert_eq!(table.page_frame(replacement, 0), None);
 }

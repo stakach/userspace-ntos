@@ -3408,7 +3408,7 @@ fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
 }
 
 #[path = "service_section_pagein.rs"]
-mod section_pagein;
+pub(crate) mod section_pagein;
 use section_pagein::service_generic_section_frame;
 pub(crate) use section_pagein::service_prepare_data_section_file;
 
@@ -3448,6 +3448,13 @@ pub(crate) use section_writeback::{
     service_generic_section_writeback_unpublished_selftest,
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GenericSectionFaultResult {
+    Unmapped,
+    Mapped,
+    RoutedPageIn,
+}
+
 pub(crate) unsafe fn service_generic_section_fault(
     nt_handler: &mut ExecNtHandler,
     generic_sections: *mut GenericSectionTable,
@@ -3456,7 +3463,9 @@ pub(crate) unsafe fn service_generic_section_fault(
     pml4: u64,
     scratch_base: u64,
     fault_access: nt_address_space::FaultAccess,
-) -> Result<bool, u32> {
+    defer_routed: bool,
+    routed_metadata_validated: bool,
+) -> Result<GenericSectionFaultResult, u32> {
     let process = nt_handler
         .capture_process_identity(pi)
         .ok_or(nt_address_space::STATUS_ACCESS_VIOLATION)?;
@@ -3464,7 +3473,7 @@ pub(crate) unsafe fn service_generic_section_fault(
     hosted_thread_memory_access(pi as u64, page, 0x1000)?;
     let write_fault = fault_access == nt_address_space::FaultAccess::Write;
     let Some((section_index, view)) = (&*generic_sections).view_for_page(pi, page) else {
-        return Ok(false);
+        return Ok(GenericSectionFaultResult::Unmapped);
     };
     if view.lifetime != lifetime {
         return Err(nt_address_space::STATUS_NOT_COMMITTED);
@@ -3485,7 +3494,7 @@ pub(crate) unsafe fn service_generic_section_fault(
     }
     nt_address_space::mapped_view_fault_access_status(view_info.protect, fault_access)?;
     if nt_handler.restore_process_pagefile_page(pi, page, pml4, scratch_base)? {
-        return Ok(true);
+        return Ok(GenericSectionFaultResult::Mapped);
     }
     let resident = nt_memory_manager::admit_resident_reprotect(
         pi as u64,
@@ -3495,13 +3504,13 @@ pub(crate) unsafe fn service_generic_section_fault(
     )?;
     if resident.is_some() {
         if fault_access == nt_address_space::FaultAccess::Lock {
-            return Ok(true);
+            return Ok(GenericSectionFaultResult::Mapped);
         }
         let fault_plan = nt_address_space::mapped_view_fault_plan(view_info.protect, write_fault);
         if write_fault && resident.is_some_and(|record| record.owns_frame) {
             let protection = nt_address_space::private_backing_protection(view_info.protect);
             vm_reprotect_private_page(pi, process, page, protection, protection, pml4)?;
-            return Ok(true);
+            return Ok(GenericSectionFaultResult::Mapped);
         }
         if write_fault && fault_plan.copy_on_write {
             crate::win32k_glue::detach_attached_client_page_with_access(
@@ -3524,7 +3533,7 @@ pub(crate) unsafe fn service_generic_section_fault(
                 pml4,
                 scratch_base,
             )?;
-            return Ok(true);
+            return Ok(GenericSectionFaultResult::Mapped);
         }
         if write_fault && fault_plan.mark_dirty {
             let old_protection =
@@ -3543,12 +3552,15 @@ pub(crate) unsafe fn service_generic_section_fault(
                 view_info.protect,
                 pml4,
             )?;
-            return Ok(true);
+            return Ok(GenericSectionFaultResult::Mapped);
         }
         return Err(0xC000_0005); // STATUS_ACCESS_VIOLATION
     }
     nt_handler.ensure_process_working_set_admission(pi, page, scratch_base)?;
     let fault_plan = nt_address_space::mapped_view_fault_plan(view_info.protect, write_fault);
+    if defer_routed && section.backing.kind == nt_memory_manager::GENERIC_SECTION_BACKING_ROUTED {
+        return Ok(GenericSectionFaultResult::RoutedPageIn);
+    }
     let frame = service_generic_section_frame(
         generic_sections,
         section_index,
@@ -3556,6 +3568,7 @@ pub(crate) unsafe fn service_generic_section_fault(
         section,
         page_index,
         scratch_base,
+        routed_metadata_validated,
     )?;
     if (&*generic_sections).view_for_page(pi, page) != Some((section_index, view))
         || process_committed_mapping_basic_information(pi as u64, page) != Some(view_info)
@@ -3575,7 +3588,7 @@ pub(crate) unsafe fn service_generic_section_fault(
             pml4,
             scratch_base,
         )?;
-        return Ok(true);
+        return Ok(GenericSectionFaultResult::Mapped);
     }
     vm_ensure_private_pt(nt_handler, pi, page, pml4)?;
     if fault_plan.mark_dirty {
@@ -3597,7 +3610,7 @@ pub(crate) unsafe fn service_generic_section_fault(
     if map_error != 0 {
         let _ = cnode_delete_recycle_r(map_cap);
         if map_error == 8 && csrss_frame_get_exact(pi as u64, page).0 != 0 {
-            return Ok(true);
+            return Ok(GenericSectionFaultResult::Mapped);
         }
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -3623,7 +3636,7 @@ pub(crate) unsafe fn service_generic_section_fault(
         print_hex(frame as u32);
         print_str(b"\n");
     }
-    Ok(true)
+    Ok(GenericSectionFaultResult::Mapped)
 }
 
 fn sec_image_page_shareable(
@@ -8910,6 +8923,7 @@ pub(crate) unsafe fn service_sec_image(
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-waiting")
                 && crate::registry_mutation_work::next_deadline().is_none()
                 && crate::section_metadata_work::next_deadline().is_none()
+                && crate::section_pagein_work::next_deadline().is_none()
                 && crate::provider_section_broker::next_deadline().is_none()
             {
                 print_str(
@@ -9019,6 +9033,7 @@ pub(crate) unsafe fn service_sec_image(
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
             crate::section_metadata_work::redrive(&mut nt_handler, delay_queue);
+            crate::section_pagein_work::redrive(&mut nt_handler);
             crate::provider_section_broker::redrive(&mut nt_handler);
             crate::driver_launch::redrive_hosted_driver_io_create_file(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_path_forward(nt_handler as *mut _);
@@ -10781,8 +10796,10 @@ pub(crate) unsafe fn service_sec_image(
                 pml4,
                 scratch_base,
                 vm_fault_access_from_x86_error(m3),
+                true,
+                false,
             ) {
-                Ok(true) => {
+                Ok(GenericSectionFaultResult::Mapped) => {
                     note_boot_progress(BootProgress::PageMappingPublished);
                     procs[pi].faults = faults;
                     procs[pi].first = first;
@@ -10797,7 +10814,31 @@ pub(crate) unsafe fn service_sec_image(
                     m3 = nm3;
                     continue;
                 }
-                Ok(false) => {}
+                Ok(GenericSectionFaultResult::RoutedPageIn) => {
+                    match crate::section_pagein_work::submit(
+                        &mut nt_handler, pi, page, vm_fault_access_from_x86_error(m3),
+                    ) {
+                        Ok(()) => {
+                            crate::section_pagein_work::redrive(&mut nt_handler);
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                            badge = received.0;
+                            mi = received.1;
+                            m0 = received.2;
+                            m1 = received.3;
+                            m2 = received.4;
+                            m3 = received.5;
+                            continue;
+                        }
+                        Err(status) => {
+                            print_str(b"[section] deferred fault admission failed status=0x");
+                            print_hex(status);
+                            print_str(b"\n");
+                            park_and_log!(pi, b"section-pagein-admission", m0, addr);
+                        }
+                    }
+                }
+                Ok(GenericSectionFaultResult::Unmapped) => {}
                 Err(status) => {
                     print_str(b"[section] fault failed pi=");
                     print_u64(pi as u64);

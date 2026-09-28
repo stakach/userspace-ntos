@@ -127,6 +127,7 @@ pub(super) unsafe fn service_generic_section_frame(
     section: GenericSection,
     page_index: u64,
     scratch_base: u64,
+    routed_metadata_validated: bool,
 ) -> Result<u64, u32> {
     page_index
         .checked_mul(DATA_PAGE_SIZE as u64)
@@ -144,6 +145,13 @@ pub(super) unsafe fn service_generic_section_frame(
         None
     };
     let mut io = BackingIo { backing: section.backing, route };
+    if routed_metadata_validated {
+        if section.backing.kind != nt_memory_manager::GENERIC_SECTION_BACKING_ROUTED {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
+        }
+        return (&*generic_sections).page_frame(section_index, page_index)
+            .ok_or(nt_address_space::STATUS_NOT_COMMITTED);
+    }
     let file_size = if section.backing.kind != GENERIC_SECTION_BACKING_ANON {
         let info = io.query_file()?;
         Some(info.end_of_file)
@@ -181,6 +189,19 @@ pub(super) unsafe fn service_generic_section_frame(
     }
     if let Some(frame) = (&*generic_sections).page_frame(section_index, page_index) {
         return Ok(frame);
+    }
+    service_publish_section_frame_from_bytes(generic_sections, identity, page_index, &bytes, scratch_base)
+}
+
+pub(crate) unsafe fn service_publish_section_frame_from_bytes(
+    generic_sections: *mut GenericSectionTable,
+    identity: nt_memory_manager::SectionIdentity,
+    page_index: u64,
+    bytes: &[u8],
+    scratch_base: u64,
+) -> Result<u64, u32> {
+    if bytes.len() != DATA_PAGE_SIZE {
+        return Err(STATUS_IO_DEVICE_ERROR);
     }
     reserve_pagein_cleanup()?;
     let frame = vm_frame_acquire(scratch_base)?;

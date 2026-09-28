@@ -165,6 +165,30 @@ impl<R, K: Copy + Eq> PendingSectionPageReads<R, K> {
         Some(self.rows[id.slot].take()?.owner)
     }
 
+    /// Finish an inline provider read using the page reserved before dispatch.
+    pub fn complete_inline(
+        &mut self,
+        id: PendingSectionPageReadId,
+        status: u32,
+        information: u64,
+        output: &[u8],
+    ) -> Option<(R, Result<Vec<u8>, u32>)> {
+        if self.row(id)?.phase != Phase::Reserved {
+            return None;
+        }
+        let mut row = self.rows[id.slot].take()?;
+        let result = if information > usize::MAX as u64
+            || output.len() < row.plan.length()
+        {
+            Err(STATUS_IO_DEVICE_ERROR)
+        } else {
+            row.bytes[..row.plan.length()].copy_from_slice(&output[..row.plan.length()]);
+            let page: &mut [u8; DATA_PAGE_SIZE] = row.bytes.as_mut_slice().try_into().unwrap();
+            row.plan.complete(status, information as usize, page).map(|()| row.bytes)
+        };
+        Some((row.owner, result))
+    }
+
     /// A pending indication is not terminal; a short success is a terminal failure.
     pub fn terminal(
         &mut self,
@@ -221,6 +245,19 @@ impl<R, K: Copy + Eq> PendingSectionPageReads<R, K> {
         } else {
             row.phase = Phase::Copying(copied);
         }
+        true
+    }
+
+    /// A terminal completion with unreadable output cannot publish a page, but still needs its
+    /// exact backend acknowledgement before the owner may be released.
+    pub fn fail_copy(&mut self, id: PendingSectionPageReadId, key: K, status: u32) -> bool {
+        let Some(row) = self.row_mut(id) else {
+            return false;
+        };
+        if row.key != Some(key) || !matches!(row.phase, Phase::Copying(_)) || status == 0 {
+            return false;
+        }
+        row.phase = Phase::Failed(status);
         true
     }
 

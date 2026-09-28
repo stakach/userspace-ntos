@@ -17664,9 +17664,12 @@ impl ExecNtHandler {
                     } else {
                         plan.access
                     },
+                    false,
+                    false,
                 )? {
-                    true => Ok(()),
-                    false => Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES),
+                    crate::service_sec_image::GenericSectionFaultResult::Mapped => Ok(()),
+                    crate::service_sec_image::GenericSectionFaultResult::Unmapped => Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES),
+                    crate::service_sec_image::GenericSectionFaultResult::RoutedPageIn => Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES),
                 }
             }
             nt_address_space::VmResidencySource::Image => {
