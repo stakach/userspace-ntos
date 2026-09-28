@@ -11,6 +11,7 @@ pub use mount_binding::{SectionMountBindingError, SectionMountBindings};
 
 #[path = "section_pages.rs"]
 mod pages;
+pub use pages::{SectionPagePublication, SectionPagePublicationError};
 
 #[path = "section_file_io.rs"]
 mod file_io;
@@ -193,6 +194,7 @@ impl GenericSection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GenericSectionView {
     pub live: bool,
+    pub generation: u64,
     pub pi: usize,
     pub lifetime: MemoryLifetime,
     pub section_index: usize,
@@ -244,6 +246,7 @@ impl GenericSectionView {
     const fn empty() -> Self {
         Self {
             live: false,
+            generation: 0,
             pi: 0,
             lifetime: MemoryLifetime::UnpublishedImage(0),
             section_index: usize::MAX,
@@ -332,6 +335,7 @@ pub struct GenericSectionTable {
     pages: Vec<GenericSectionPage>,
     dirty_epoch: u64,
     section_generation: u64,
+    view_generation: u64,
     section_growths: u64,
     section_allocation_failures: u64,
     view_growths: u64,
@@ -352,6 +356,7 @@ impl GenericSectionTable {
             pages: Vec::new(),
             dirty_epoch: 0,
             section_generation: 0,
+            view_generation: 0,
             section_growths: 0,
             section_allocation_failures: 0,
             view_growths: 0,
@@ -726,8 +731,12 @@ impl GenericSectionTable {
         if !lifetime.is_valid() || self.section(section_index).is_none() || base == 0 || size == 0 {
             return false;
         }
+        let Some(generation) = self.view_generation.checked_add(1) else {
+            return false;
+        };
         let view = GenericSectionView {
             live: true,
+            generation,
             pi,
             lifetime,
             section_index,
@@ -735,12 +744,16 @@ impl GenericSectionTable {
             size,
             section_offset,
         };
-        if let Some(index) = self.views.iter().position(|entry| !entry.live) {
+        let published = if let Some(index) = self.views.iter().position(|entry| !entry.live) {
             self.views[index] = view;
             true
         } else {
             self.append_view(view)
+        };
+        if published {
+            self.view_generation = generation;
         }
+        published
     }
 
     #[cfg(test)]
@@ -934,6 +947,48 @@ mod tests {
 
     fn provider(domain: u64, generation: u64) -> ProviderVspaceIdentity {
         ProviderVspaceIdentity { domain, generation }
+    }
+
+    #[test]
+    fn process_view_generation_changes_on_exact_unmap_and_slot_reuse() {
+        let mut table = GenericSectionTable::new();
+        let section = create_section(&mut table, 2, 0x40);
+        let lifetime = MemoryLifetime::Process(crate::ProcessIdentity {
+            pid: 17,
+            generation: crate::ProcessGeneration::Hosted(3),
+        });
+        assert!(table.map_view_with_lifetime(2, lifetime, section, 0x10000, 0x2000, 0));
+        let first = table.first_view_for_process_exact(2, lifetime).unwrap();
+        assert_ne!(first.generation, 0);
+        assert_eq!(table.view_for_page(2, 0x11000).unwrap().1.generation, first.generation);
+        assert_eq!(table.unmap_view_exact(2, lifetime, 0x10000), Some(first));
+        assert!(table.map_view_with_lifetime(2, lifetime, section, 0x10000, 0x2000, 0));
+        let second = table.first_view_for_process_exact(2, lifetime).unwrap();
+        assert_eq!(table.stats().view_records, 1);
+        assert_eq!(second.generation, first.generation + 1);
+        assert_eq!(table.view_for_page(2, 0x11000).unwrap().1, second);
+    }
+
+    #[test]
+    fn process_view_generation_survives_table_reset_and_fails_closed_at_wrap() {
+        let mut table = GenericSectionTable::new();
+        let section = create_section(&mut table, 2, 0x40);
+        assert!(table.map_view(2, section, 0x10000, 0x1000, 0));
+        let first = table.first_view_for_process(2).unwrap();
+        assert!(table.unmap_view(2, 0x10000).is_some());
+        assert!(table.release_handle(section));
+        let retirement = table.next_retirement().unwrap();
+        assert!(table.complete_retirement(retirement));
+        assert!(table.reset());
+        let replacement = create_section(&mut table, 2, 0x40);
+        assert!(table.map_view(2, replacement, 0x10000, 0x1000, 0));
+        assert_eq!(table.first_view_for_process(2).unwrap().generation, first.generation + 1);
+
+        assert!(table.unmap_view(2, 0x10000).is_some());
+        table.view_generation = u64::MAX;
+        assert!(!table.map_view(2, replacement, 0x10000, 0x1000, 0));
+        assert_eq!(table.stats().live_views, 0);
+        assert_eq!(table.view_generation, u64::MAX);
     }
 
     #[test]
@@ -1215,5 +1270,66 @@ mod tests {
         assert!(!table.mark_page_dirty(section, 0));
         assert!(!table.set_page_frame(section, 0, 101));
         assert_eq!(table.page_frame(section, 0), Some(100));
+    }
+
+    #[test]
+    fn page_publication_reuses_an_existing_frame_without_adopting_candidate() {
+        let mut table = GenericSectionTable::new();
+        let index = create_section(&mut table, 2, 0x40);
+        let identity = table.section_identity(index).unwrap();
+        assert_eq!(
+            table.publish_page_frame_exact(identity, 0, 100),
+            Ok(SectionPagePublication::Inserted)
+        );
+        assert_eq!(
+            table.publish_page_frame_exact(identity, 0, 101),
+            Ok(SectionPagePublication::Existing(100))
+        );
+        assert_eq!(table.page_frame(index, 0), Some(100));
+        assert_eq!(table.stats().live_pages, 1);
+    }
+
+    #[test]
+    fn page_publication_rejects_a_reused_section_slot() {
+        let mut table = GenericSectionTable::new();
+        let index = create_section(&mut table, 2, 0x40);
+        let stale = table.section_identity(index).unwrap();
+        assert!(table.release_handle(index));
+        let retirement = table.next_retirement().unwrap();
+        assert_eq!(retirement.identity(), stale);
+        assert!(table.complete_retirement(retirement));
+        let replacement = create_section(&mut table, 2, 0x41);
+        assert_eq!(replacement, index);
+        let fresh = table.section_identity(replacement).unwrap();
+        assert_ne!(fresh, stale);
+        assert_eq!(
+            table.publish_page_frame_exact(stale, 0, 100),
+            Err(SectionPagePublicationError::StaleSection)
+        );
+        assert_eq!(table.page_frame(replacement, 0), None);
+        assert_eq!(
+            table.publish_page_frame_exact(fresh, 0, 101),
+            Ok(SectionPagePublication::Inserted)
+        );
+    }
+
+    #[test]
+    fn page_publication_follows_view_lifetime_after_handle_close() {
+        let mut table = GenericSectionTable::new();
+        let index = create_section(&mut table, 2, 0x40);
+        let identity = table.section_identity(index).unwrap();
+        let owner = provider(7, 11);
+        assert!(table.map_provider_view(owner, identity, 0x10000, 0x1000, 0));
+        assert!(table.release_handle(index));
+        assert_eq!(
+            table.publish_page_frame_exact(identity, 0, 100),
+            Ok(SectionPagePublication::Inserted)
+        );
+        assert!(table.unmap_provider_view(owner, 0x10000).is_some());
+        assert_eq!(
+            table.publish_page_frame_exact(identity, 1, 101),
+            Err(SectionPagePublicationError::StaleSection)
+        );
+        assert_eq!(table.page_frame(index, 1), None);
     }
 }

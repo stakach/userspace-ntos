@@ -17653,7 +17653,7 @@ impl ExecNtHandler {
             nt_address_space::VmResidencySource::Mapped => {
                 match service_generic_section_fault(
                     self,
-                    &mut *ctx.generic_sections,
+                    ctx.generic_sections,
                     target_pi,
                     plan.page,
                     target.pml4,
