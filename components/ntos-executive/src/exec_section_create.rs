@@ -71,7 +71,7 @@ impl ExecNtHandler {
         if self.pm_pid_for_pi(owner_pi) != Some(caller.effective_process()) {
             return Err(nt_fs::STATUS_INVALID_HANDLE);
         }
-        let generic_sections = &mut *self.loop_ctx.ok_or(0xC000_00A3u32)?.generic_sections;
+        let generic_sections = self.loop_ctx.ok_or(0xC000_00A3u32)?.generic_sections;
         let mut routed_lease = None;
         let (backing, backing_size) = if sec_file == 0 {
             if maxsize == 0 {
@@ -133,7 +133,7 @@ impl ExecNtHandler {
                 }
                 _ => return Err(STATUS_INVALID_FILE_FOR_SECTION),
             };
-            if let Err(status) = generic_sections.validate_file_creation(backing, maxsize) {
+            if let Err(status) = (&*generic_sections).validate_file_creation(backing, maxsize) {
                 if let Some(lease) = routed_lease {
                     crate::hosted_routed_section_capture::cancel_unbound(lease)
                         .expect("failed routed Section admission retains its File reference");
@@ -147,7 +147,7 @@ impl ExecNtHandler {
                 }
             }
         };
-        if let Err(status) = generic_sections.validate_backing_extent(backing) {
+        if let Err(status) = (&*generic_sections).validate_backing_extent(backing) {
             if let Some(lease) = routed_lease {
                 crate::hosted_routed_section_capture::cancel_unbound(lease)
                     .expect("failed routed Section extent retains its File reference");
@@ -172,6 +172,7 @@ impl ExecNtHandler {
                 return Err(status);
             }
         }
+        let generic_sections = &mut *generic_sections;
         let Some(index) = generic_sections.create(
             owner_pi,
             0,
