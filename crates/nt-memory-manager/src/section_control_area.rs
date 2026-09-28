@@ -28,6 +28,15 @@ pub struct SectionFileIdentity {
     pub file_id: u64,
 }
 
+impl SectionFileIdentity {
+    /// Decode the successful FILE_INTERNAL_INFORMATION result for this mounted volume.
+    pub fn from_file_internal(mount: SectionMountId, information: &[u8]) -> Option<Self> {
+        let bytes: [u8; 8] = information.try_into().ok()?;
+        let file_id = u64::from_le_bytes(bytes);
+        (file_id != 0).then_some(Self { mount, file_id })
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct ControlArea {
     pub id: u64,

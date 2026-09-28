@@ -87,6 +87,49 @@ fn mount_ids_are_unique_and_exhaustion_never_reuses_an_identity() {
 }
 
 #[test]
+fn routed_file_identity_uses_mount_and_file_internal_index() {
+    let mut mounts = SectionMountIds::new();
+    let first_mount = mounts.allocate().unwrap();
+    let second_mount = mounts.allocate().unwrap();
+    let internal = 0x1234_5678_9abc_def0u64.to_le_bytes();
+    let first = SectionFileIdentity::from_file_internal(first_mount, &internal).unwrap();
+    let reopened = SectionFileIdentity::from_file_internal(first_mount, &internal).unwrap();
+    let other_mount = SectionFileIdentity::from_file_internal(second_mount, &internal).unwrap();
+    assert_eq!(first, reopened);
+    assert_ne!(first, other_mount);
+    assert_eq!(first.file_id, 0x1234_5678_9abc_def0);
+    assert_eq!(SectionFileIdentity::from_file_internal(first_mount, &internal[..7]), None);
+    assert_eq!(SectionFileIdentity::from_file_internal(first_mount, &[0; 9]), None);
+    assert_eq!(SectionFileIdentity::from_file_internal(first_mount, &[0; 8]), None);
+
+    let mut table = GenericSectionTable::new();
+    let first_lease = RoutedSectionLease::new(11).unwrap();
+    let second_lease = RoutedSectionLease::new(12).unwrap();
+    let third_lease = RoutedSectionLease::new(13).unwrap();
+    let first_section = table
+        .create(
+            2, 0x40, 0x1000, crate::PAGE_READONLY, SECTION_ATTR_SEC_COMMIT,
+            GenericSectionBacking::routed(first_lease, first, 0x1000),
+        )
+        .unwrap();
+    let reopened_section = table
+        .create(
+            2, 0x44, 0x1000, crate::PAGE_READONLY, SECTION_ATTR_SEC_COMMIT,
+            GenericSectionBacking::routed(second_lease, reopened, 0x1000),
+        )
+        .unwrap();
+    let other_section = table
+        .create(
+            2, 0x48, 0x1000, crate::PAGE_READONLY, SECTION_ATTR_SEC_COMMIT,
+            GenericSectionBacking::routed(third_lease, other_mount, 0x1000),
+        )
+        .unwrap();
+    assert!(table.set_page_frame(first_section, 0, 100));
+    assert_eq!(table.page_frame(reopened_section, 0), Some(100));
+    assert_eq!(table.page_frame(other_section, 0), None);
+}
+
+#[test]
 fn independently_created_sections_share_canonical_frames_and_dirty_state() {
     let mut table = GenericSectionTable::new();
     let a = section(&mut table, 7, key(100), 0x2000, 0x2000);
