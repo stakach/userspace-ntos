@@ -395,7 +395,11 @@ impl crate::SectionRetirementIo for Io {
         self.events.push(Event::Frame(frame));
         Ok(())
     }
-    fn release_backing(&mut self, _: crate::GenericSectionBacking) -> Result<(), u32> {
+    fn release_backing(
+        &mut self,
+        _: crate::SectionIdentity,
+        _: crate::GenericSectionBacking,
+    ) -> Result<(), u32> {
         self.events.push(Event::Backing);
         Ok(())
     }

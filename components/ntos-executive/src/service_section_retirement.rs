@@ -32,7 +32,11 @@ impl SectionRetirementIo for RetirementIo {
         }
     }
 
-    fn release_backing(&mut self, backing: GenericSectionBacking) -> Result<(), u32> {
+    fn release_backing(
+        &mut self,
+        _: nt_memory_manager::SectionIdentity,
+        backing: GenericSectionBacking,
+    ) -> Result<(), u32> {
         if backing.kind == GENERIC_SECTION_BACKING_OVERLAY {
             unsafe { crate::writable_fs::release_io_reference(backing.overlay_file_id) }
         } else {

@@ -42,7 +42,11 @@ impl SectionRetirementIo for Release {
         self.frames.push(frame);
         Ok(())
     }
-    fn release_backing(&mut self, backing: GenericSectionBacking) -> Result<(), u32> {
+    fn release_backing(
+        &mut self,
+        _: SectionIdentity,
+        backing: GenericSectionBacking,
+    ) -> Result<(), u32> {
         self.files.push(backing.overlay_file_id);
         Ok(())
     }
@@ -456,7 +460,11 @@ impl SectionRetirementIo for FsRelease<'_> {
         self.frames.push(frame);
         Ok(())
     }
-    fn release_backing(&mut self, backing: GenericSectionBacking) -> Result<(), u32> {
+    fn release_backing(
+        &mut self,
+        _: SectionIdentity,
+        backing: GenericSectionBacking,
+    ) -> Result<(), u32> {
         self.fs.zw_release_io_reference(backing.overlay_file_id)
     }
 }
