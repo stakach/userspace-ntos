@@ -1874,9 +1874,6 @@ unsafe fn recorded_frame_copyout_impl(pi: u64, va: u64, src: &[u8], scratch_base
     let Some(chunks) = nt_address_space::page_chunks(va, src.len()) else {
         return false;
     };
-    let Ok(pi_index) = usize::try_from(pi) else {
-        return false;
-    };
     let mut copied = 0usize;
     for chunk in chunks {
         if !admitted && crate::service_sec_image::service_admit_section_alias(pi, chunk.page_base, true, None).is_err() {
@@ -2126,6 +2123,9 @@ pub(crate) unsafe fn client_write_process_mapped_for(
         return false;
     }
     let Some(chunks) = nt_address_space::page_chunks(va, src.len()) else {
+        return false;
+    };
+    let Ok(pi_index) = usize::try_from(pi) else {
         return false;
     };
     let mut copied = 0usize;

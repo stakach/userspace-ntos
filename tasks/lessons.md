@@ -287,3 +287,8 @@ diagnosis-free failure.
   different frame cap to replace a 4 KiB PTE, and rust-micro tests that behavior. When two services
   disagree about a shared frame after a map, audit the executive's VA allocation and frame ownership
   first; do not change the microkernel's map contract based on the collision symptom alone.
+
+## Revalidate after the last edit
+- A successful build only proves the exact source tree it compiled. Even a readability-only patch
+  can match a neighboring function and move a binding to the wrong scope. Inspect the final diff
+  and rerun the native compile after every post-build source edit, before pushing or merging.
