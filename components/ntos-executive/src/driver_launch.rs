@@ -43616,11 +43616,13 @@ pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
             standard.len() as u32,
             &mut standard,
         )?;
-        if !matches!(query, ExternalDispatchResult::Completed { status: nt_status::NtStatus::SUCCESS, information: 24, .. })
-            || u64::from_le_bytes(standard[8..16].try_into().unwrap()) < 4
-        {
+        let ExternalDispatchResult::Completed {
+            status: standard_status,
+            information: standard_information,
+            ..
+        } = query else {
             return Ok(false);
-        }
+        };
         let mut internal = [0u8; 8];
         let query = io.build_and_dispatch_external_to_device(
             client,
@@ -43637,10 +43639,30 @@ pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
             internal.len() as u32,
             &mut internal,
         )?;
-        if !matches!(query, ExternalDispatchResult::Completed { status: nt_status::NtStatus::SUCCESS, information: 8, .. })
-            || nt_memory_manager::SectionFileIdentity::from_file_internal(mount, &internal)
-                .is_none()
-        {
+        let ExternalDispatchResult::Completed {
+            status: internal_status,
+            information: internal_information,
+            ..
+        } = query else {
+            return Ok(false);
+        };
+        let metadata = nt_memory_manager::RoutedSectionMetadata::from_queries(
+            mount,
+            nt_memory_manager::CompletedFileQuery {
+                status: standard_status.raw() as u32,
+                information: standard_information,
+                output: &standard,
+            },
+            nt_memory_manager::CompletedFileQuery {
+                status: internal_status.raw() as u32,
+                information: internal_information,
+                output: &internal,
+            },
+        );
+        let Ok(metadata) = metadata else {
+            return Ok(false);
+        };
+        if metadata.end_of_file < 4 || metadata.prepare_readonly(0, 0x02, 0x8000_0000).is_err() {
             return Ok(false);
         }
         let mut signature = [0u8; 4];
