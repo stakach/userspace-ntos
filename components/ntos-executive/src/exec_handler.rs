@@ -20223,7 +20223,7 @@ impl ExecNtHandler {
         }
     }
 
-    fn release_handle_object(&mut self, object: nt_process::HandleObject) {
+    pub(crate) fn release_handle_object(&mut self, object: nt_process::HandleObject) {
         match object {
             nt_process::HandleObject::Event(id) => {
                 self.release_event_handle_reference(nt_kernel_exec::EventObjectId(id));

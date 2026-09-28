@@ -404,4 +404,40 @@ mod tests {
             29
         );
     }
+
+    #[test]
+    fn native_section_close_consumes_only_the_selected_table_reference() {
+        let (mut pm, user, kernel, _) = fixture();
+        let mut local = pm.reserve_native_section_handle(user, 0).unwrap();
+        let mut system = pm
+            .reserve_native_section_handle(kernel, OBJ_KERNEL_HANDLE)
+            .unwrap();
+        local.bind(&mut pm, 31, 0x4).unwrap();
+        system.bind(&mut pm, 37, 0x4).unwrap();
+        let local_value = local.publish(&mut pm).unwrap();
+        let system_value = system.publish(&mut pm).unwrap();
+        assert_eq!(local_value, system_value & !KERNEL_HANDLE_TAG);
+        assert_eq!(
+            pm.close_native_handle(kernel, system_value)
+                .unwrap()
+                .into_object(),
+            HandleObject::Section(37)
+        );
+        assert_eq!(
+            pm.lookup_native_section_handle(user, local_value)
+                .unwrap()
+                .section(),
+            31
+        );
+        assert_eq!(
+            pm.close_native_handle(user, local_value)
+                .unwrap()
+                .into_object(),
+            HandleObject::Section(31)
+        );
+        assert_eq!(
+            pm.lookup_native_section_handle(user, local_value),
+            Err(STATUS_INVALID_HANDLE)
+        );
+    }
 }
