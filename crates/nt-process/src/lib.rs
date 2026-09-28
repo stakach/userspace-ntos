@@ -24,6 +24,7 @@ pub mod job;
 pub mod job_abi;
 mod initial_system;
 pub mod native_handle;
+mod native_section_file_source;
 mod registry_key_handle;
 mod object_directory_handle;
 mod routed_file_handle;
@@ -31,6 +32,7 @@ pub mod process_object_retirement;
 pub mod thread_suspend;
 
 pub use initial_system::InitialSystemIdentity;
+pub use native_section_file_source::NativeSectionFileSource;
 pub use registry_key_handle::RegistryKeyHandlePublication;
 pub use object_directory_handle::ObjectDirectoryHandlePublication;
 pub use routed_file_handle::RoutedFileHandlePublication;

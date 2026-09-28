@@ -41350,6 +41350,7 @@ impl ExecNtHandler {
                 const SEC_IMAGE: u32 = 0x0100_0000;
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                 const STATUS_INVALID_FILE_FOR_SECTION: u32 = 0xC000_0020;
+                let previous_mode = ctx.previous_mode;
                 let ctx = self.loop_ctx.unwrap();
                 let reg = &mut *ctx.reg;
                 let out = args[0];
@@ -41457,15 +41458,19 @@ impl ExecNtHandler {
                     }
                     (GenericSectionBacking::anonymous(), maxsize)
                 } else {
-                    let Ok(file_handle) = nt_process::Handle::try_from(sec_file) else {
-                        return nt_fs::STATUS_INVALID_HANDLE;
+                    let caller = match self.native_handle_caller(previous_mode) {
+                        Ok(caller) => caller,
+                        Err(status) => return status,
                     };
-                    let Some(object) = self.pm.lookup_handle(caller_pid, file_handle) else {
+                    if caller.effective_process() != caller_pid {
                         return nt_fs::STATUS_INVALID_HANDLE;
+                    }
+                    let source = match self.pm.lookup_native_section_file_source(caller, sec_file) {
+                        Ok(source) => source,
+                        Err(status) => return status,
                     };
-                    let Some(access) = self.pm.handle_access(caller_pid, file_handle) else {
-                        return nt_fs::STATUS_INVALID_HANDLE;
-                    };
+                    let object = source.object();
+                    let access = source.granted_access();
                     if let Err(status) = nt_memory_manager::data_section::check_data_section_file_access(page_protection, access) {
                         return status;
                     }
