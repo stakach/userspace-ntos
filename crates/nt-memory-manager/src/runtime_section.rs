@@ -5,6 +5,10 @@ mod control_area;
 use control_area::ControlArea;
 pub use control_area::{SectionFileIdentity, SectionMountId, SectionMountIds};
 
+#[path = "section_mount_binding.rs"]
+mod mount_binding;
+pub use mount_binding::{SectionMountBindingError, SectionMountBindings};
+
 #[path = "section_pages.rs"]
 mod pages;
 

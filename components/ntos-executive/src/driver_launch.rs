@@ -43560,10 +43560,13 @@ pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
     let Some(device_name) = parse_nt_path(device_path) else {
         return false;
     };
-    let io = io_manager_mut();
-    let Some(device) = io.device_id_by_name(&device_name) else {
+    let Some(device) = io_manager_mut().device_id_by_name(&device_name) else {
         return false;
     };
+    let Some(mount) = crate::mounted_volume::mount_id_for_live_device(device.raw()) else {
+        return false;
+    };
+    let io = io_manager_mut();
     let client = ClientId(IO_MANAGER_COMPONENT_ID);
     let name = nt_types::UnicodeString::from_str("reactos\\Fonts\\arial.ttf");
     let Ok(file) = io.allocate_external_file(
@@ -43615,6 +43618,28 @@ pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
         )?;
         if !matches!(query, ExternalDispatchResult::Completed { status: nt_status::NtStatus::SUCCESS, information: 24, .. })
             || u64::from_le_bytes(standard[8..16].try_into().unwrap()) < 4
+        {
+            return Ok(false);
+        }
+        let mut internal = [0u8; 8];
+        let query = io.build_and_dispatch_external_to_device(
+            client,
+            device,
+            Some(file),
+            0,
+            0,
+            nt_io_abi::major::IRP_MJ_QUERY_INFORMATION,
+            IoParameters::QueryInformation(InformationParameters {
+                info_class: nt_fs::FILE_INTERNAL_INFORMATION,
+                length: internal.len() as u32,
+            }),
+            0,
+            internal.len() as u32,
+            &mut internal,
+        )?;
+        if !matches!(query, ExternalDispatchResult::Completed { status: nt_status::NtStatus::SUCCESS, information: 8, .. })
+            || nt_memory_manager::SectionFileIdentity::from_file_internal(mount, &internal)
+                .is_none()
         {
             return Ok(false);
         }
