@@ -71,7 +71,8 @@ pub use copy_context::{copy_bookkeeping, live_checkpoint_matches, CopyBookkeepin
 pub use runtime_section::{
     SectionFilePage, SectionFileReadIo, SectionFileResizeIo, SectionFileWriteIo,
     GenericSection, GenericSectionBacking, GenericSectionFlushPlan, GenericSectionTable,
-    GenericSectionTableStats, GenericSectionView, PendingSectionFrames, SectionRetirement, SectionRetirementIo,
+    GenericSectionTableStats, GenericSectionView, ProviderSectionView, ProviderVspaceIdentity,
+    PendingSectionFrames, SectionRetirement, SectionRetirementIo,
     SectionIdentity, SectionRetirementResource, RoutedSectionLease, GENERIC_SECTION_BACKING_ANON,
     SectionFileIdentity, SectionMountBindingError, SectionMountBindings, SectionMountId, SectionMountIds,
     GENERIC_SECTION_BACKING_DISK, GENERIC_SECTION_BACKING_NONE, GENERIC_SECTION_BACKING_OVERLAY,
