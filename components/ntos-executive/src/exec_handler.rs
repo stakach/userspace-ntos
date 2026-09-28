@@ -41180,6 +41180,7 @@ impl ExecNtHandler {
                 const SECTION_BASIC_INFORMATION_SIZE: usize = 24;
                 const SECTION_IMAGE_INFORMATION_SIZE: usize = 64;
                 const STATUS_SECTION_NOT_IMAGE: u32 = 0xC000_0049;
+                let previous_mode = ctx.previous_mode;
                 let ctx = self.loop_ctx.unwrap();
                 let reg = &*ctx.reg;
                 let sect = args[0];
@@ -41240,16 +41241,21 @@ impl ExecNtHandler {
                 };
 
                 if image_info.is_none() {
-                    if let Some(section_index) = self
-                        .pm_pid_for_pi(self.pi)
-                        .and_then(|pid| {
-                            match self.pm.lookup_handle(pid, sect as nt_process::Handle) {
-                                Some(nt_process::HandleObject::Section(id)) => Some(id as usize),
-                                _ => None,
-                            }
-                        })
-                        .or_else(|| (&*ctx.generic_sections).index_for_handle(self.pi, sect))
-                    {
+                    let native_section = self
+                        .native_handle_caller(previous_mode)
+                        .and_then(|caller| {
+                            self.pm
+                                .lookup_native_section_handle(caller, sect)
+                                .map(|section| (caller, section))
+                        });
+                    if let Ok((caller, section_handle)) = native_section {
+                        if let Err(status) = nt_memory_manager::section_view_access::check_section_query_access(
+                            section_handle.granted_access(),
+                            caller.mode(),
+                        ) {
+                            return status;
+                        }
+                        let section_index = section_handle.section() as usize;
                         let Some(section) = (&*ctx.generic_sections).section(section_index) else {
                             return nt_process::STATUS_INVALID_HANDLE;
                         };
@@ -41263,7 +41269,7 @@ impl ExecNtHandler {
                         basic_info[8..12].copy_from_slice(&SECTION_ATTR_SEC_FILE.to_le_bytes());
                         basic_info[16..24].copy_from_slice(&nls_size.to_le_bytes());
                     } else {
-                        return nt_process::STATUS_INVALID_HANDLE;
+                        return native_section.err().unwrap_or(nt_process::STATUS_INVALID_HANDLE);
                     }
                 }
 
@@ -41634,6 +41640,7 @@ impl ExecNtHandler {
             // identity across every mapped process view.
             NativeService::NtMapViewOfSection => unsafe {
                 const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_007B;
+                let previous_mode = ctx.previous_mode;
                 let ctx = self.loop_ctx.unwrap();
                 let reg = &mut *ctx.reg;
                 let dll_pes = ctx.dll_pes();
@@ -41835,18 +41842,40 @@ impl ExecNtHandler {
                         b"",
                     );
                     0
-                } else if let Some(section_index) = self
-                    .pm_pid_for_pi(self.pi)
-                    .and_then(
-                        |pid| match self.pm.lookup_handle(pid, sect as nt_process::Handle) {
-                            Some(nt_process::HandleObject::Section(id)) => Some(id as usize),
-                            _ => None,
-                        },
-                    )
-                    .or_else(|| (&*ctx.generic_sections).index_for_handle(self.pi, sect))
-                {
+                } else {
                     const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                     const PROCESS_VM_OPERATION: u32 = 0x0008;
+                    let caller = match self.native_handle_caller(previous_mode) {
+                        Ok(caller) => caller,
+                        Err(status) => return status,
+                    };
+                    let section_handle = match self.pm.lookup_native_section_handle(caller, sect) {
+                        Ok(section) => section,
+                        Err(status) => {
+                            loader_trace_record(
+                                self.pi, LoaderOp::MapViewOfSection, status, None, sect, 0, b"",
+                            );
+                            return status;
+                        }
+                    };
+                    let section_index = section_handle.section() as usize;
+                    let Some(section) = (&*ctx.generic_sections).section(section_index) else {
+                        return nt_process::STATUS_INVALID_HANDLE;
+                    };
+                    let win32_protect = nt_ulong_arg(args[9]);
+                    let view_protection = if win32_protect == 0 {
+                        section.protection
+                    } else {
+                        win32_protect
+                    };
+                    if let Err(status) = nt_memory_manager::section_view_access::check_section_view_access(
+                        section.protection,
+                        view_protection,
+                        section_handle.granted_access(),
+                        caller.mode(),
+                    ) {
+                        return status;
+                    }
                     let (_target_pid, target_pi) =
                         match self.resolve_process_for_access(args[1], PROCESS_VM_OPERATION) {
                             Ok(target) => target,
@@ -41879,7 +41908,6 @@ impl ExecNtHandler {
                         section_offset = u64::from_le_bytes(word);
                     }
                     let allocation_type = nt_ulong_arg(args[8]);
-                    let win32_protect = nt_ulong_arg(args[9]);
                     let (mapped_base, mapped_size) = match self.map_generic_section_view_internal(
                         section_index,
                         target_pi,
@@ -41925,22 +41953,6 @@ impl ExecNtHandler {
                         b"",
                     );
                     0
-                } else {
-                    print_str(b"[ntos-exec] NtMapViewOfSection unsupported pi=");
-                    print_u64(self.pi as u64);
-                    print_str(b" section=0x");
-                    print_hex(sect as u32);
-                    print_str(b"\n");
-                    loader_trace_record(
-                        self.pi,
-                        LoaderOp::MapViewOfSection,
-                        nt_process::STATUS_INVALID_HANDLE,
-                        None,
-                        sect,
-                        0,
-                        b"",
-                    );
-                    nt_process::STATUS_INVALID_HANDLE
                 }
             },
             // NtCreateProcess captured args: *ProcessHandle=args[0], access=args[1], *OA=args[2],
