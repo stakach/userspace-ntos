@@ -43553,8 +43553,7 @@ pub(crate) fn register_kernel_volume_device(
 
 pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
     use nt_io_manager::{
-        CreateOptions, CreateParameters, ExternalDispatchResult, InformationParameters,
-        IoParameters, ReadWriteParameters, ShareAccess,
+        CreateOptions, CreateParameters, ExternalDispatchResult, IoParameters, ShareAccess,
     };
 
     let Some(device_name) = parse_nt_path(device_path) else {
@@ -43566,10 +43565,9 @@ pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
     let Some(mount) = crate::mounted_volume::mount_id_for_live_device(device.raw()) else {
         return false;
     };
-    let io = io_manager_mut();
     let client = ClientId(IO_MANAGER_COMPONENT_ID);
     let name = nt_types::UnicodeString::from_str("reactos\\Fonts\\arial.ttf");
-    let Ok(file) = io.allocate_external_file(
+    let Ok(file) = io_manager_mut().allocate_external_file(
         client,
         device,
         AccessMask::GENERIC_READ,
@@ -43579,8 +43577,9 @@ pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
     ) else {
         return false;
     };
-    let result = (|| -> Result<bool, nt_status::NtStatus> {
-        let create = io.build_and_dispatch_external_to_device(
+    let mut release_queued = false;
+    let result = (|| -> Result<bool, u32> {
+        let create = io_manager_mut().build_and_dispatch_external_to_device(
             client,
             device,
             Some(file),
@@ -43596,116 +43595,42 @@ pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
             0,
             0,
             &mut [],
-        )?;
+        ).map_err(|status| status.raw() as u32)?;
         if !matches!(create, ExternalDispatchResult::Completed { status: nt_status::NtStatus::SUCCESS, file_context: Some(_), .. }) {
             return Ok(false);
         }
-        let mut metadata_work = nt_memory_manager::PendingSectionMetadataQueries::<(), u64>::new();
-        let Ok(metadata_id) = metadata_work.reserve(mount, ()) else {
-            return Ok(false);
-        };
-        let mut standard = [0u8; 24];
-        let query = io.build_and_dispatch_external_to_device(
-            client,
-            device,
-            Some(file),
-            0,
-            0,
-            nt_io_abi::major::IRP_MJ_QUERY_INFORMATION,
-            IoParameters::QueryInformation(InformationParameters {
-                info_class: nt_fs::FILE_STANDARD_INFORMATION,
-                length: standard.len() as u32,
-            }),
-            0,
-            standard.len() as u32,
-            &mut standard,
+        let capture = hosted_file_capture::capture(
+            file.raw(), device.raw(), AccessMask::GENERIC_READ.bits(),
         )?;
-        let ExternalDispatchResult::Completed {
-            status: standard_status,
-            information: standard_information,
-            ..
-        } = query else {
-            return Ok(false);
-        };
-        if !metadata_work.complete_inline(
-            metadata_id,
-            nt_memory_manager::CompletedFileQuery {
-                status: standard_status.raw() as u32,
-                information: standard_information,
-                output: &standard,
-            },
-        ) || metadata_work.next_query(metadata_id)
-            != Some(nt_memory_manager::pending_section_metadata::FILE_INTERNAL_INFORMATION_CLASS)
+        let metadata = crate::routed_section_io::query_metadata(file.raw(), device.raw(), mount)?;
+        if metadata.end_of_file < 4
+            || metadata.prepare_readonly(0, 0x02, AccessMask::GENERIC_READ.bits()).is_err()
         {
             return Ok(false);
         }
-        let mut internal = [0u8; 8];
-        let query = io.build_and_dispatch_external_to_device(
-            client,
-            device,
-            Some(file),
-            0,
-            0,
-            nt_io_abi::major::IRP_MJ_QUERY_INFORMATION,
-            IoParameters::QueryInformation(InformationParameters {
-                info_class: nt_fs::FILE_INTERNAL_INFORMATION,
-                length: internal.len() as u32,
-            }),
-            0,
-            internal.len() as u32,
-            &mut internal,
-        )?;
-        let ExternalDispatchResult::Completed {
-            status: internal_status,
-            information: internal_information,
-            ..
-        } = query else {
-            return Ok(false);
-        };
-        if !metadata_work.complete_inline(
-            metadata_id,
-            nt_memory_manager::CompletedFileQuery {
-                status: internal_status.raw() as u32,
-                information: internal_information,
-                output: &internal,
-            },
-        ) {
-            return Ok(false);
-        }
-        let Some(((), Ok(metadata))) = metadata_work.take_terminal(metadata_id) else {
-            return Ok(false);
-        };
-        if metadata.end_of_file < 4 || metadata.prepare_readonly(0, 0x02, 0x8000_0000).is_err() {
-            return Ok(false);
-        }
+        io_manager_mut().queue_external_file_release(client, file)
+            .map_err(|status| status.raw() as u32)?;
+        release_queued = true;
+        let current = crate::routed_section_io::query_standard(file.raw(), device.raw())?;
         let mut signature = [0u8; 4];
-        let read = io.build_and_dispatch_external_to_device(
-            client,
-            device,
-            Some(file),
-            0,
-            0,
-            nt_io_abi::major::IRP_MJ_READ,
-            IoParameters::Read(ReadWriteParameters {
-                length: signature.len() as u32,
-                key: 0,
-                offset: 0,
-            }),
-            0,
-            signature.len() as u32,
-            &mut signature,
-        )?;
-        Ok(matches!(read, ExternalDispatchResult::Completed { status: nt_status::NtStatus::SUCCESS, information: 4, .. })
+        let (status, information) = crate::routed_section_io::read(
+            file.raw(), device.raw(), 0, &mut signature,
+        );
+        drop(capture);
+        Ok(current.end_of_file == metadata.end_of_file
+            && !current.is_directory
+            && status == 0
+            && information == 4
             && signature == [0, 1, 0, 0])
     })();
-    let released = io.release_external_file(client, file).is_ok();
+    let released = release_queued || io_manager_mut().release_external_file(client, file).is_ok();
     for _ in 0..3 {
-        if io.file(file).is_none() {
+        if io_manager_mut().file(file).is_none() {
             break;
         }
-        io.pump();
+        io_manager_mut().pump();
     }
-    result.unwrap_or(false) && released && io.file(file).is_none()
+    result.unwrap_or(false) && released && io_manager_mut().file(file).is_none()
 }
 
 pub(crate) fn driver_id_by_name(path: &str) -> Option<u64> {

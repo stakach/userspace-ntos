@@ -73,6 +73,8 @@ mod fs_loader;
 mod mounted_volume;
 mod mounted_volume_backend;
 mod mounted_volume_ingress_probe;
+mod hosted_routed_section_capture;
+mod routed_section_io;
 pub(crate) use fs_loader::*;
 mod hosted_bootstrap;
 pub(crate) use hosted_bootstrap::*;

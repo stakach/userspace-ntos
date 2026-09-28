@@ -41447,6 +41447,7 @@ impl ExecNtHandler {
                     return nt_fs::STATUS_INVALID_HANDLE;
                 };
 
+                let mut routed_lease = None;
                 let (backing, backing_size) = if sec_file == 0 {
                     if maxsize == 0 {
                         return 0xc000_00f2; // STATUS_INVALID_PARAMETER_4
@@ -41468,7 +41469,7 @@ impl ExecNtHandler {
                     if let Err(status) = nt_memory_manager::data_section::check_data_section_file_access(page_protection, access) {
                         return status;
                     }
-                    let backing = match object {
+                    let (backing, routed_size) = match object {
                         nt_process::HandleObject::DiskFile { first_cluster, size, object_id } => {
                             let open = match self.readonly_file_opens.get(object_id) {
                                 Ok(open) => open,
@@ -41483,25 +41484,68 @@ impl ExecNtHandler {
                             let Some(identity) = exec_fs_file_identity(open.metadata.file_id) else {
                                 return nt_fs::STATUS_INVALID_HANDLE;
                             };
-                            GenericSectionBacking::disk(first_cluster, size, identity)
+                            (GenericSectionBacking::disk(first_cluster, size, identity), None)
                         }
                         nt_process::HandleObject::OverlayFile(file_id) => match crate::writable_fs::section_backing(file_id) {
-                            Ok(backing) => backing,
+                            Ok(backing) => (backing, None),
                             Err(status) => return status,
                         },
+                        nt_process::HandleObject::RoutedFile { file_id, device_id } => {
+                            let Some(mount) = crate::mounted_volume::mount_id_for_live_device(device_id) else {
+                                return STATUS_INVALID_FILE_FOR_SECTION;
+                            };
+                            let capture = match crate::driver_launch::hosted_file_capture::capture(
+                                file_id,
+                                device_id,
+                                access,
+                            ) {
+                                Ok(capture) => capture,
+                                Err(status) => return status,
+                            };
+                            let metadata = match crate::routed_section_io::query_metadata(file_id, device_id, mount) {
+                                Ok(metadata) => metadata,
+                                Err(status) => return status,
+                            };
+                            let extent = match metadata.prepare_readonly(maxsize, page_protection, access) {
+                                Ok(extent) => extent,
+                                Err(status) => return status,
+                            };
+                            let lease = match crate::hosted_routed_section_capture::reserve(capture) {
+                                Ok(lease) => lease,
+                                Err(_capture) => return nt_address_space::STATUS_INSUFFICIENT_RESOURCES,
+                            };
+                            routed_lease = Some(lease);
+                            (
+                                GenericSectionBacking::routed(lease, metadata.file, extent.file_size),
+                                Some(extent.section_size),
+                            )
+                        }
                         _ => return STATUS_INVALID_FILE_FOR_SECTION,
                     };
                     if let Err(status) = (&*ctx.generic_sections).validate_file_creation(backing, maxsize) {
+                        if let Some(lease) = routed_lease {
+                            crate::hosted_routed_section_capture::cancel_unbound(lease)
+                                .expect("failed routed section admission retains its file reference");
+                        }
                         return status;
                     }
-                    let (backing, size) = match service_prepare_data_section_file(backing, maxsize, page_protection, access) {
-                        Ok(result) => result,
-                        Err(status) => return status,
+                    let (backing, size) = match routed_size {
+                        Some(size) => (backing, size),
+                        None => match service_prepare_data_section_file(backing, maxsize, page_protection, access) {
+                            Ok(result) => result,
+                            Err(status) => return status,
+                        },
                     };
                     (backing, size)
                 };
                 let generic_sections = &mut *ctx.generic_sections;
-                if let Err(status) = generic_sections.validate_backing_extent(backing) { return status; }
+                if let Err(status) = generic_sections.validate_backing_extent(backing) {
+                    if let Some(lease) = routed_lease {
+                        crate::hosted_routed_section_capture::cancel_unbound(lease)
+                            .expect("failed routed section extent retains its file reference");
+                    }
+                    return status;
+                }
                 if backing.kind == GENERIC_SECTION_BACKING_OVERLAY {
                     if let Err(status) = crate::writable_fs::retain_io_reference(backing.overlay_file_id) {
                         return status;
@@ -41519,8 +41563,17 @@ impl ExecNtHandler {
                         crate::writable_fs::release_io_reference(backing.overlay_file_id)
                             .expect("failed section publication retains its acquired file reference");
                     }
+                    if let Some(lease) = routed_lease {
+                        crate::hosted_routed_section_capture::cancel_unbound(lease)
+                            .expect("failed routed section publication retains its file reference");
+                    }
                     return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
                 };
+                if let Some(lease) = routed_lease {
+                    let identity = generic_sections.section_identity(index)
+                        .expect("new routed section has an exact identity");
+                    assert!(crate::hosted_routed_section_capture::bind(lease, identity));
+                }
                 let h = match self.insert_process_handle(
                     caller_pid,
                     nt_process::HandleObject::Section(index as nt_process::SectionId),

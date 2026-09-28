@@ -34,12 +34,16 @@ impl SectionRetirementIo for RetirementIo {
 
     fn release_backing(
         &mut self,
-        _: nt_memory_manager::SectionIdentity,
+        identity: nt_memory_manager::SectionIdentity,
         backing: GenericSectionBacking,
     ) -> Result<(), u32> {
         match backing.kind {
             GENERIC_SECTION_BACKING_OVERLAY => unsafe {
                 crate::writable_fs::release_io_reference(backing.overlay_file_id)
+            },
+            nt_memory_manager::GENERIC_SECTION_BACKING_ROUTED => unsafe {
+                let lease = backing.routed_lease.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                crate::hosted_routed_section_capture::release(lease, identity)
             },
             nt_memory_manager::GENERIC_SECTION_BACKING_ANON | GENERIC_SECTION_BACKING_DISK => Ok(()),
             _ => Err(nt_fs::STATUS_INVALID_HANDLE),
