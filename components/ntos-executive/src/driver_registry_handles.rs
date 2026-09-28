@@ -202,7 +202,7 @@ pub(crate) unsafe fn abort_driver_registry_publication(
 fn target_snapshot(target: u32) -> Result<DriverRegistryHandleTarget, i32> {
     if let Some(system) = crate::registry_key_targets::system(target) {
         let mut physical_path = HostedAscii::empty();
-        if !physical_path.push_str(&system.physical_path) {
+        if !physical_path.push_utf8(&system.physical_path) {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
         Ok(DriverRegistryHandleTarget::System {
@@ -211,7 +211,7 @@ fn target_snapshot(target: u32) -> Result<DriverRegistryHandleTarget, i32> {
         })
     } else if let Some(runtime) = crate::registry_key_targets::runtime(target) {
         let mut path = HostedAscii::empty();
-        if !path.push_str(&runtime.path) {
+        if !path.push_utf8(&runtime.path) {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
         Ok(DriverRegistryHandleTarget::Generic {
@@ -223,7 +223,7 @@ fn target_snapshot(target: u32) -> Result<DriverRegistryHandleTarget, i32> {
             .registry_target_path(target)
             .ok_or(STATUS_INVALID_HANDLE)?;
         let mut path = HostedAscii::empty();
-        if !path.push_str(&full) {
+        if !path.push_utf8(&full) {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
         Ok(DriverRegistryHandleTarget::Hosted { key: target, path })
@@ -250,7 +250,7 @@ pub(crate) unsafe fn driver_registry_handle_slot(
 pub(crate) unsafe fn open_driver_registry_handle(
     dispatch: RegistryPublicationDispatch,
     caller: NativeHandleCaller,
-    path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
+    path: &str,
     root: Option<DriverRegistryHandleTarget>,
     attributes: u32,
     authorize: impl FnOnce(DriverRegistryHandleTarget) -> Result<u32, i32>,
@@ -262,9 +262,9 @@ pub(crate) unsafe fn open_driver_registry_handle(
     let mut publication = reserve_driver_registry_publication(dispatch, caller, attributes)?;
     let outcome = (|| {
         let key = if let Some(root) = root {
-            acquire_relative_target(root, path.as_str())?
+            acquire_relative_target(root, path)?
         } else if hosted_registry_path_is_system(path) {
-            let opened = crate::config_manager_open_system_hive_key(path.as_str())?;
+            let opened = crate::config_manager_open_system_hive_key(path)?;
             match crate::registry_key_targets::install_system(crate::CmSystemKeyTarget {
                 lease: opened.lease,
                 physical_path: opened.physical_path,
@@ -277,11 +277,11 @@ pub(crate) unsafe fn open_driver_registry_handle(
             }
         } else if let Ok(handler) = driver_registry_live_handler() {
             handler
-                .acquire_registry_target(path.as_str())
+                .acquire_registry_target(path)
                 .map_err(|status| status as i32)?
         } else {
-            let key = crate::config_manager_open_key_id(path.as_str())?;
-            crate::registry_key_targets::install_runtime(String::from(path.as_str()), key)
+            let key = crate::config_manager_open_key_id(path)?;
+            crate::registry_key_targets::install_runtime(String::from(path), key)
                 .map_err(|status| status as i32)?
         };
         publication.bind_reserved_target(key, 0)?;

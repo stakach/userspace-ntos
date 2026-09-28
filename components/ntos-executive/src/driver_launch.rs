@@ -5347,6 +5347,18 @@ impl<const N: usize> HostedAscii<N> {
         true
     }
 
+    pub(crate) fn push_utf8(&mut self, src: &str) -> bool {
+        let bytes = src.as_bytes();
+        if self.len.checked_add(bytes.len()).is_none_or(|len| len > N)
+            || bytes.contains(&0)
+        {
+            return false;
+        }
+        self.bytes[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        true
+    }
+
     fn push_ascii<const M: usize>(&mut self, src: &HostedAscii<M>) -> bool {
         if self.len + src.len > N {
             return false;
@@ -54375,7 +54387,7 @@ pub(crate) fn service_hosted_driver_registry(
             metadata.root_handle = Some(a1);
         }
         match service_hosted_driver_create_registry_path(
-            caller, name, a2 as u32, &metadata, subject.0.as_ref().unwrap(), None,
+            caller, name.as_str(), a2 as u32, &metadata, subject.0.as_ref().unwrap(), None,
         ) {
             DriverRegistryCreateResult::Ready(result) => ProviderRegistryResult::Ready(result),
             DriverRegistryCreateResult::Deferred(admission) =>
@@ -54782,7 +54794,7 @@ fn service_hosted_driver_registry_sync(
                     if a1 == 0 { return (STATUS_OBJECT_PATH_NOT_FOUND, 0, 0); }
                     metadata.root_handle = Some(a1);
                 }
-                service_hosted_driver_open_registry_path(caller, name, &metadata, subject.0.as_ref().unwrap())
+                service_hosted_driver_open_registry_path(caller, name.as_str(), &metadata, subject.0.as_ref().unwrap())
             }
             HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY => {
                 if !hosted_pdo_known_at(inst.exec_shared_va, a1) {
@@ -54799,7 +54811,7 @@ fn service_hosted_driver_registry_sync(
                 let Some(path) = hosted_driver_key_cm_path(&identity) else {
                     return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
                 };
-                service_hosted_driver_open_registry_path(caller, path, &metadata, subject.0.as_ref().unwrap())
+                service_hosted_driver_open_registry_path(caller, path.as_str(), &metadata, subject.0.as_ref().unwrap())
             }
             HOSTED_REGISTRY_OP_CLOSE => {
                 finish_driver_registry_close(ch, close_driver_registry_handle(caller, a1))
@@ -54886,7 +54898,7 @@ fn service_hosted_driver_registry_sync(
                 ) else {
                     return (STATUS_INVALID_PARAMETER, 0, 0);
                 };
-                let opened = match open_driver_registry_handle(dispatch, caller, key_path, None, 0,
+                let opened = match open_driver_registry_handle(dispatch, caller, key_path.as_str(), None, 0,
                     |target| authorize_driver_registry_open(subject.0.as_ref().unwrap(), &metadata, target)) {
                     Ok(opened) => opened,
                     Err(status) => return (status, 0, 0),

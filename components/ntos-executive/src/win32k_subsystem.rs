@@ -12353,14 +12353,6 @@ unsafe fn read_wide_cstr_ascii_lower(ptr: u64) -> Option<Vec<u8>> {
     None
 }
 
-unsafe fn object_attributes_name_ascii_lower(obj_attr: u64) -> Option<Vec<u8>> {
-    if obj_attr == 0 {
-        return None;
-    }
-    let ustr = read_unaligned((obj_attr + 0x10) as *const u64);
-    read_unicode_string_ascii_lower(ustr)
-}
-
 unsafe fn write_win32k_registry_ascii(len_off: u64, data_off: u64, value: &[u8]) -> bool {
     if value.len() > WIN32K_REGISTRY_PATH_MAX || value.iter().any(|byte| *byte == 0 || *byte > 0x7f)
     {
@@ -12656,7 +12648,7 @@ unsafe fn service_win32k_registry_create(
         || WIN32K_REGISTRY_KEY_OFF
             .checked_add(path_len as u64)
             .and_then(|offset| offset.checked_add(class_len as u64))
-            .is_none_or(|end| end > WIN32K_REGISTRY_BYTES as u64)
+            .is_none_or(|end| end > WIN32K_REGISTRY_DATA_OFF)
     {
         return Err(STATUS_INVALID_PARAMETER_I32);
     }
@@ -12680,11 +12672,10 @@ unsafe fn service_win32k_registry_create(
         metadata.root_handle = Some(root);
     }
     let name = core::str::from_utf8(&path).map_err(|_| STATUS_INVALID_PARAMETER_I32)?;
+    if name.contains('\0') { return Err(STATUS_INVALID_PARAMETER_I32); }
 
-    let mut path = crate::driver_launch::HostedAscii::empty();
-    if !path.push_str(name) { return Err(STATUS_INSUFFICIENT_RESOURCES_I32); }
     Ok(crate::driver_launch::service_hosted_driver_create_registry_path(
-        caller, path, create_options, metadata, subject, class.as_deref(),
+        caller, name, create_options, metadata, subject, class.as_deref(),
     ))
 }
 
@@ -12697,9 +12688,8 @@ unsafe fn service_win32k_registry_open(caller: nt_process::native_handle::Native
         metadata.root_handle = Some(root);
     }
     let name = core::str::from_utf8(path).map_err(|_| STATUS_INVALID_PARAMETER_I32)?;
-    let mut path = crate::driver_launch::HostedAscii::empty();
-    if !path.push_str(name) { return Err(STATUS_INSUFFICIENT_RESOURCES_I32); }
-    let (status, handle, _) = crate::driver_launch::service_hosted_driver_open_registry_path(caller, path, metadata, subject);
+    if name.contains('\0') { return Err(STATUS_INVALID_PARAMETER_I32); }
+    let (status, handle, _) = crate::driver_launch::service_hosted_driver_open_registry_path(caller, name, metadata, subject);
     if status == 0 { Ok(handle) } else { Err(status) }
 }
 
@@ -12846,8 +12836,13 @@ unsafe fn service_registry_request_sync(
     );
     match op {
         WIN32K_REGISTRY_OP_OPEN => {
+            if read_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_KEY_LEN) as *const u32)
+                as usize > WIN32K_REGISTRY_PATH_MAX
+            {
+                return (STATUS_INVALID_PARAMETER_I32, 0, 0);
+            }
             let Some(path) =
-                read_win32k_registry_ascii(WIN32K_REGISTRY_KEY_LEN, WIN32K_REGISTRY_KEY_OFF)
+                read_win32k_registry_bytes(WIN32K_REGISTRY_KEY_LEN, WIN32K_REGISTRY_KEY_OFF)
             else {
                 return (STATUS_INVALID_PARAMETER_I32, 0, 0);
             };
@@ -13010,11 +13005,16 @@ fn win32k_open_key(handle_out: *mut u64, desired_access: u64, obj_attr: u64, pre
     }
     unsafe {
         if let Err(status) = stage_win32k_registry_metadata(desired_access, obj_attr, previous_mode) { return status; }
-        let Some(path) = object_attributes_name_ascii_lower(obj_attr) else {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
+        let object_name = read_unaligned((obj_attr + 0x10) as *const u64);
+        let path = match read_unicode_string_utf8(object_name, false) {
+            Ok(path) if !path.is_empty() => path,
+            Ok(_) => return STATUS_OBJECT_NAME_NOT_FOUND,
+            Err(status) => return status,
         };
         let root_dir = read_unaligned((obj_attr + 0x8) as *const u64);
-        if !write_win32k_registry_ascii(WIN32K_REGISTRY_KEY_LEN, WIN32K_REGISTRY_KEY_OFF, &path) {
+        if path.len() > WIN32K_REGISTRY_PATH_MAX
+            || !write_win32k_registry_bytes(WIN32K_REGISTRY_KEY_LEN, WIN32K_REGISTRY_KEY_OFF, &path)
+        {
             return STATUS_INVALID_PARAMETER_I32;
         }
         let (status, hkey, _) = win32k_registry_broker_call(WIN32K_REGISTRY_OP_OPEN, root_dir);
