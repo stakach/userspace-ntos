@@ -7067,7 +7067,7 @@ pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SCHED_RUNTIME_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to independently timed wake paths;
 /// one of them owns the whole boot, so they are timed individually.
-pub(crate) const SUBDRAIN_N: usize = 19;
+pub(crate) const SUBDRAIN_N: usize = 20;
 pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
@@ -17223,6 +17223,7 @@ unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
         + subdrain!(16, driver_launch::hosted_file_retry_wake_due(now_100ns))
         + subdrain!(17, registry_mutation_work::wake_due(now_100ns))
         + subdrain!(18, section_metadata_work::wake_due(now_100ns))
+        + subdrain!(19, provider_section_broker::wake_due(now_100ns))
 }
 
 /// May reply to driver waiters and establish DPC lanes; never use from ACK-only paths.
