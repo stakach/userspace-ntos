@@ -31,8 +31,12 @@ impl DataSectionFileIo for BackingIo {
                 })
             }
             nt_memory_manager::GENERIC_SECTION_BACKING_ROUTED => {
-                let route = self.route.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-                crate::routed_section_io::query_standard(route.file_id, route.device_id)
+                self.route.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                Ok(DataSectionFileInfo {
+                    end_of_file: self.backing.file_extent,
+                    is_directory: false,
+                    read_only_volume: true,
+                })
             }
             _ => Err(0xc000_0024), // STATUS_OBJECT_TYPE_MISMATCH
         }
