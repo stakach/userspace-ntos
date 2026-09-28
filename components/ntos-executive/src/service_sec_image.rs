@@ -4541,6 +4541,61 @@ pub(crate) unsafe fn service_win32k_file_close_request(
     crate::hosted_routed_file_close_work::submit(channel, caller, handle)
 }
 
+pub(crate) unsafe fn service_win32k_section_close_request(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    handle: u64,
+    previous_mode: u64,
+    spare: [u64; 2],
+) -> i32 {
+    if previous_mode > 1 || spare != [0; 2] {
+        return nt_process::STATUS_INVALID_PARAMETER as i32;
+    }
+    let (_, _, caller) = match authenticate_win32k_service_request(
+        channel,
+        reply_cap,
+        badge,
+        mi,
+        (crate::win32k_subsystem::W32_SECTION_CLOSE_LABEL << 12) | 4,
+    ) {
+        Ok(owner) => owner,
+        Err(status) => return status as i32,
+    };
+    let handler = match registry_live_handler() {
+        Ok(handler) if handler.loop_ctx.is_some() => handler,
+        _ => return 0xC000_00A3u32 as i32, // STATUS_DEVICE_NOT_READY
+    };
+    let caller = if previous_mode != 0 {
+        if channel.logical_caller.is_none() {
+            return nt_process::STATUS_INVALID_PARAMETER as i32;
+        }
+        match handler.pm.capture_native_handle_caller(
+            caller.original_thread(),
+            nt_types::AccessMode::UserMode,
+        ) {
+            Ok(caller) => caller,
+            Err(status) => return status as i32,
+        }
+    } else {
+        caller
+    };
+    if let Err(status) = handler.pm.lookup_native_section_handle(caller, handle) {
+        return status as i32;
+    }
+    match handler.pm.close_native_handle(caller, handle) {
+        Ok(closed) => {
+            handler.release_handle_object(closed.into_object());
+            0
+        }
+        Err(nt_process::native_handle::NativeCloseError::Status(status)) => status as i32,
+        Err(nt_process::native_handle::NativeCloseError::BugCheck { code, parameters }) => {
+            crate::provider_bugcheck::report(code, parameters)
+        }
+    }
+}
+
 pub(crate) unsafe fn service_win32k_file_create_request(
     channel: &spawn_hosts::PumpChannel,
     reply_cap: u64,

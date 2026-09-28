@@ -1197,6 +1197,7 @@ pub const W32_FILE_READ_RELEASE_LABEL: u64 = 0x798;
 pub const W32_FILE_IOCTL_LABEL: u64 = 0x799;
 pub const W32_FILE_IOCTL_COMPLETION_LABEL: u64 = 0x79a;
 pub const W32_FILE_IOCTL_RELEASE_LABEL: u64 = 0x79b;
+pub const W32_SECTION_CLOSE_LABEL: u64 = 0x79c;
 pub const W32_FILE_OBJECT_REFERENCE_HANDLE: u64 = 1;
 pub const W32_FILE_OBJECT_REFERENCE_POINTER: u64 = 2;
 pub const W32_FILE_OBJECT_DEREFERENCE_POINTER: u64 = 3;
@@ -3968,6 +3969,10 @@ extern "win64" fn s_zw_close(handle: u64) -> i32 {
     if ObHandleTable::is_handle_namespace_value(handle) {
         return s_ob_close_handle(handle, 0);
     }
+    let section_status = unsafe { section_close(handle, false) };
+    if !matches!(section_status as u32, 0xC000_0008 | 0xC000_0024) {
+        return section_status;
+    }
     let file_status = unsafe { file_close::close(handle) };
     if !matches!(file_status as u32, 0xC000_0008 | 0xC000_0024) {
         return file_status;
@@ -3981,7 +3986,29 @@ extern "win64" fn s_zw_close(handle: u64) -> i32 {
 
 extern "win64" fn s_nt_close(handle: u64) -> i32 {
     let (status, mode, _) = unsafe { win32k_registry_broker_call(WIN32K_REGISTRY_OP_CLOSE | WIN32K_REGISTRY_USE_PREVIOUS_MODE, handle) };
-    if status as u32 == 0xc000_0024 { s_ob_close_handle(handle, mode) } else { status }
+    if status as u32 != 0xc000_0024 {
+        return status;
+    }
+    let section_status = unsafe { section_close(handle, mode != 0) };
+    if !matches!(section_status as u32, 0xC000_0008 | 0xC000_0024) {
+        return section_status;
+    }
+    s_ob_close_handle(handle, mode)
+}
+
+unsafe fn section_close(handle: u64, previous_mode: bool) -> i32 {
+    let (words, raw, _, _, _) = crate::driver_launch::call_on4_raw(
+        (W32_SECTION_CLOSE_LABEL << 12) | 4,
+        handle,
+        u64::from(previous_mode),
+        0,
+        0,
+    );
+    let canonical_status = raw == raw as u32 as u64 || raw == raw as u32 as i32 as i64 as u64;
+    if words != 1 || !canonical_status {
+        crate::provider_bugcheck::report(0xc4, [W32_SECTION_CLOSE_LABEL, handle, words, raw]);
+    }
+    raw as u32 as i32
 }
 
 unsafe fn retire_provider_local_event(
