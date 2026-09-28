@@ -34,7 +34,7 @@ pub mod thread_suspend;
 
 pub use initial_system::InitialSystemIdentity;
 pub use native_section_file_source::NativeSectionFileSource;
-pub use native_section_handle::NativeSectionHandle;
+pub use native_section_handle::{NativeSectionHandle, NativeSectionHandlePublication};
 pub use registry_key_handle::RegistryKeyHandlePublication;
 pub use object_directory_handle::ObjectDirectoryHandlePublication;
 pub use routed_file_handle::RoutedFileHandlePublication;
@@ -1117,6 +1117,8 @@ pub struct ProcessManager {
     directory_publication_identity: u64,
     /// Move-stable owner identity for staged routed File handle publication.
     routed_file_publication_identity: u64,
+    /// Move-stable owner identity for staged Section handle publication.
+    section_publication_identity: u64,
     processes: IdTable<NtProcess>,
     threads: IdTable<NtThread>,
     /// Withdrawn Ps objects remain owned until their exact cleanup ticket is finished.

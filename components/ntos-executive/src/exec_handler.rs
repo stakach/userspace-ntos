@@ -41450,9 +41450,32 @@ impl ExecNtHandler {
                 if !self.probe_user_output(out, core::mem::size_of::<u64>()) {
                     return STATUS_ACCESS_VIOLATION;
                 }
+                let attributes = if args[2] == 0 {
+                    0
+                } else {
+                    let Some(oa) = self.capture_object_attributes(args[2]) else {
+                        return STATUS_ACCESS_VIOLATION;
+                    };
+                    if oa.length as usize != core::mem::size_of::<nt_ntdll_layout::ObjectAttributes>()
+                        || oa.root_directory != 0
+                        || oa.object_name != 0
+                        || oa.security_descriptor != 0
+                        || oa.security_quality_of_service != 0
+                    {
+                        return nt_process::STATUS_INVALID_PARAMETER;
+                    }
+                    oa.attributes
+                };
                 let Some(caller_pid) = self.pm_pid_for_pi(self.pi) else {
                     return nt_fs::STATUS_INVALID_HANDLE;
                 };
+                let caller = match self.native_handle_caller(previous_mode) {
+                    Ok(caller) => caller,
+                    Err(status) => return status,
+                };
+                if caller.effective_process() != caller_pid {
+                    return nt_fs::STATUS_INVALID_HANDLE;
+                }
 
                 let mut routed_lease = None;
                 let (backing, backing_size) = if sec_file == 0 {
@@ -41464,13 +41487,6 @@ impl ExecNtHandler {
                     }
                     (GenericSectionBacking::anonymous(), maxsize)
                 } else {
-                    let caller = match self.native_handle_caller(previous_mode) {
-                        Ok(caller) => caller,
-                        Err(status) => return status,
-                    };
-                    if caller.effective_process() != caller_pid {
-                        return nt_fs::STATUS_INVALID_HANDLE;
-                    }
                     let source = match self.pm.lookup_native_section_file_source(caller, sec_file) {
                         Ok(source) => source,
                         Err(status) => return status,
@@ -41557,8 +41573,19 @@ impl ExecNtHandler {
                     }
                     return status;
                 }
+                let mut publication = match self.pm.reserve_native_section_handle(caller, attributes) {
+                    Ok(publication) => publication,
+                    Err(status) => {
+                        if let Some(lease) = routed_lease {
+                            crate::hosted_routed_section_capture::cancel_unbound(lease)
+                                .expect("failed Section handle reservation retains its file reference");
+                        }
+                        return status;
+                    }
+                };
                 if backing.kind == GENERIC_SECTION_BACKING_OVERLAY {
                     if let Err(status) = crate::writable_fs::retain_io_reference(backing.overlay_file_id) {
+                        publication.abort(&mut self.pm).expect("empty Section reservation aborts");
                         return status;
                     }
                 }
@@ -41578,6 +41605,7 @@ impl ExecNtHandler {
                         crate::hosted_routed_section_capture::cancel_unbound(lease)
                             .expect("failed routed section publication retains its file reference");
                     }
+                    publication.abort(&mut self.pm).expect("empty Section reservation aborts");
                     return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
                 };
                 if let Some(lease) = routed_lease {
@@ -41585,20 +41613,15 @@ impl ExecNtHandler {
                         .expect("new routed section has an exact identity");
                     assert!(crate::hosted_routed_section_capture::bind(lease, identity));
                 }
-                let h = match self.insert_process_handle(
-                    caller_pid,
-                    nt_process::HandleObject::Section(index as nt_process::SectionId),
-                    desired_access,
-                ) {
-                    Ok(handle) => handle as u64,
-                    Err(status) => {
-                        generic_sections.clear_section(index);
-                        return status;
-                    }
-                };
+                let h = publication.value();
+                if let Err(status) = publication.bind(&mut self.pm, index as nt_process::SectionId, desired_access) {
+                    generic_sections.clear_section(index);
+                    publication.abort(&mut self.pm).expect("failed Section binding leaves an empty reservation");
+                    return status;
+                }
                 if !generic_sections.bind_handle(index, h) {
                     generic_sections.clear_section(index);
-                    let _ = self.close_process_handle(caller_pid, h);
+                    publication.abort(&mut self.pm).expect("bound Section reservation aborts");
                     return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
                 }
                 if !self.user_memory_write(
@@ -41606,9 +41629,11 @@ impl ExecNtHandler {
                     out,
                     &h.to_le_bytes(),
                 ) {
-                    let _ = self.close_process_handle(caller_pid, h);
+                    publication.abort(&mut self.pm).expect("bound Section reservation aborts");
+                    generic_sections.clear_section(index);
                     return STATUS_ACCESS_VIOLATION;
                 }
+                publication.publish(&mut self.pm).expect("uncontended Section handle publication follows output copy");
                 print_str(b"[section] create generic pi=");
                 print_u64(self.pi as u64);
                 print_str(b" handle=0x");
