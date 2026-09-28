@@ -3,8 +3,8 @@
 use alloc::vec::Vec;
 
 use crate::{
-    FatShortName, FileMetadata, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_HANDLE,
-    STATUS_OBJECT_NAME_INVALID,
+    FatShortName, FileMetadata, STATUS_DATA_ERROR, STATUS_INSUFFICIENT_RESOURCES,
+    STATUS_INVALID_HANDLE, STATUS_OBJECT_NAME_INVALID,
 };
 
 /// Matches the executive's captured native File-name limit without folding or truncating UTF-16.
@@ -47,6 +47,25 @@ pub enum LayeredOpenSource {
     Overlay {
         file_id: u64,
     },
+}
+
+impl LayeredOpenSource {
+    /// Keep installed and overlay file indexes distinct within one mounted volume.
+    pub fn file_internal_index(self, metadata_file_id: u64) -> Result<u64, u32> {
+        const OVERLAY_BIT: u64 = 1 << 63;
+        if metadata_file_id & OVERLAY_BIT != 0 {
+            return Err(STATUS_DATA_ERROR);
+        }
+        match self {
+            Self::Installed { metadata, .. } if metadata.file_id == metadata_file_id => {
+                Ok(metadata_file_id)
+            }
+            Self::Overlay { file_id } if file_id == metadata_file_id && file_id != 0 => {
+                Ok(OVERLAY_BIT | file_id)
+            }
+            _ => Err(STATUS_DATA_ERROR),
+        }
+    }
 }
 
 /// A borrowed view of the CREATE-selected source and exact opened name.
@@ -302,6 +321,21 @@ mod tests {
             },
             alternate_name: FatShortName::EMPTY,
         }
+    }
+
+    #[test]
+    fn file_internal_indexes_separate_installed_and_overlay_sources() {
+        let installed = installed();
+        let overlay = LayeredOpenSource::Overlay { file_id: 137 };
+        assert_eq!(installed.file_internal_index(137), Ok(137));
+        assert_eq!(overlay.file_internal_index(137), Ok((1 << 63) | 137));
+        assert_eq!(installed.file_internal_index(138), Err(STATUS_DATA_ERROR));
+        assert_eq!(overlay.file_internal_index(138), Err(STATUS_DATA_ERROR));
+        assert_eq!(overlay.file_internal_index(1 << 63), Err(STATUS_DATA_ERROR));
+        assert_eq!(
+            LayeredOpenSource::Overlay { file_id: 0 }.file_internal_index(0),
+            Err(STATUS_DATA_ERROR)
+        );
     }
 
     #[test]

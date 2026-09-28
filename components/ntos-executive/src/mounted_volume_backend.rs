@@ -642,6 +642,10 @@ impl MountedVolumeBackend {
             }
         };
         let mut query = metadata.query_metadata();
+        query.file_id = record
+            .source
+            .file_internal_index(metadata.file_id)
+            .map_err(status)?;
         query.current_byte_offset = current_offset;
         query.access_flags = binding.granted_access;
         query.mode = mode;
