@@ -201,6 +201,35 @@ pub struct GenericSectionView {
     pub section_offset: u64,
 }
 
+/// Exact identity of an isolated provider address space. The caller must obtain and validate
+/// these values from its provider catalog, not from an IPC badge or a bare VSpace capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderVspaceIdentity {
+    pub domain: u64,
+    pub generation: u64,
+}
+
+impl ProviderVspaceIdentity {
+    pub const fn is_valid(self) -> bool {
+        self.domain != 0 && self.generation != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderSectionView {
+    pub owner: ProviderVspaceIdentity,
+    pub section: SectionIdentity,
+    pub base: u64,
+    pub size: u64,
+    pub section_offset: u64,
+}
+
+impl ProviderSectionView {
+    fn contains(self, page: u64) -> bool {
+        page >= self.base && self.base.checked_add(self.size).is_some_and(|end| page < end)
+    }
+}
+
 /// A page-aligned range within one data-file view, ready for backing-store writeback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GenericSectionFlushPlan {
@@ -284,6 +313,10 @@ pub struct GenericSectionTableStats {
     pub view_capacity: usize,
     pub view_growths: u64,
     pub view_allocation_failures: u64,
+    pub live_provider_views: usize,
+    pub provider_view_capacity: usize,
+    pub provider_view_growths: u64,
+    pub provider_view_allocation_failures: u64,
     pub live_pages: usize,
     pub page_records: usize,
     pub page_capacity: usize,
@@ -295,6 +328,7 @@ pub struct GenericSectionTable {
     sections: Vec<GenericSection>,
     control_areas: Vec<ControlArea>,
     views: Vec<GenericSectionView>,
+    provider_views: Vec<ProviderSectionView>,
     pages: Vec<GenericSectionPage>,
     dirty_epoch: u64,
     section_generation: u64,
@@ -302,6 +336,8 @@ pub struct GenericSectionTable {
     section_allocation_failures: u64,
     view_growths: u64,
     view_allocation_failures: u64,
+    provider_view_growths: u64,
+    provider_view_allocation_failures: u64,
     page_growths: u64,
     page_allocation_failures: u64,
 }
@@ -312,6 +348,7 @@ impl GenericSectionTable {
             sections: Vec::new(),
             control_areas: Vec::new(),
             views: Vec::new(),
+            provider_views: Vec::new(),
             pages: Vec::new(),
             dirty_epoch: 0,
             section_generation: 0,
@@ -319,6 +356,8 @@ impl GenericSectionTable {
             section_allocation_failures: 0,
             view_growths: 0,
             view_allocation_failures: 0,
+            provider_view_growths: 0,
+            provider_view_allocation_failures: 0,
             page_growths: 0,
             page_allocation_failures: 0,
         }
@@ -342,6 +381,7 @@ impl GenericSectionTable {
             .sections
             .iter()
             .any(|section| section.backing.is_live())
+            || !self.provider_views.is_empty()
             || self.pages.iter().any(|page| page.live)
         {
             return false;
@@ -349,11 +389,14 @@ impl GenericSectionTable {
         self.sections.clear();
         self.control_areas.clear();
         self.views.clear();
+        self.provider_views.clear();
         self.pages.clear();
         self.section_growths = 0;
         self.section_allocation_failures = 0;
         self.view_growths = 0;
         self.view_allocation_failures = 0;
+        self.provider_view_growths = 0;
+        self.provider_view_allocation_failures = 0;
         self.page_growths = 0;
         self.page_allocation_failures = 0;
         if self.sections.try_reserve(section_reserve).is_err() {
@@ -362,6 +405,10 @@ impl GenericSectionTable {
         }
         if self.views.try_reserve(view_reserve).is_err() {
             self.view_allocation_failures = 1;
+            return false;
+        }
+        if self.provider_views.try_reserve(view_reserve).is_err() {
+            self.provider_view_allocation_failures = 1;
             return false;
         }
         if self.pages.try_reserve(page_reserve).is_err() {
@@ -531,6 +578,7 @@ impl GenericSectionTable {
                 *view = GenericSectionView::empty();
             }
         }
+        self.provider_views.retain(|view| view.section.index != index);
         // Keep source frames and backing until the mechanism acknowledges their release.
     }
 
@@ -538,6 +586,7 @@ impl GenericSectionTable {
         self.views
             .iter()
             .any(|view| view.live && view.section_index == index)
+            || self.provider_views.iter().any(|view| view.section.index == index)
     }
 
     fn clear_section_if_unreferenced(&mut self, index: usize) {
@@ -581,6 +630,88 @@ impl GenericSectionTable {
             index,
             generation: section.generation,
         })
+    }
+
+    /// Publish a provider-owned view only after its VSpace reservation has succeeded. Views in
+    /// different provider address spaces may use the same VA; ranges in one space may not overlap.
+    pub fn map_provider_view(
+        &mut self,
+        owner: ProviderVspaceIdentity,
+        section: SectionIdentity,
+        base: u64,
+        size: u64,
+        section_offset: u64,
+    ) -> bool {
+        if !owner.is_valid() || base == 0 || size == 0 || (base | size | section_offset) & 0xfff != 0 {
+            return false;
+        }
+        let Some(end) = base.checked_add(size) else { return false };
+        let Some(section_end) = section_offset.checked_add(size) else { return false };
+        if self.section_identity(section.index) != Some(section)
+            || self.sections[section.index]
+                .size
+                .checked_add(0xfff)
+                .map(|size| size & !0xfff)
+                .is_none_or(|extent| extent < section_end)
+            || self.provider_views.iter().any(|view| {
+                view.owner.domain == owner.domain
+                    && (view.owner.generation != owner.generation
+                        || (base < view.base + view.size && view.base < end))
+            })
+        {
+            return false;
+        }
+        let old_capacity = self.provider_views.capacity();
+        if self.provider_views.try_reserve(1).is_err() {
+            self.provider_view_allocation_failures = self.provider_view_allocation_failures.saturating_add(1);
+            return false;
+        }
+        if self.provider_views.capacity() != old_capacity {
+            self.provider_view_growths = self.provider_view_growths.saturating_add(1);
+        }
+        self.provider_views.push(ProviderSectionView { owner, section, base, size, section_offset });
+        true
+    }
+
+    pub fn provider_view_for_page(
+        &self,
+        owner: ProviderVspaceIdentity,
+        page: u64,
+    ) -> Option<ProviderSectionView> {
+        if !owner.is_valid() { return None; }
+        self.provider_views.iter().copied().find(|view| {
+            view.owner == owner
+                && view.contains(page)
+                && self.section_identity(view.section.index) == Some(view.section)
+        })
+    }
+
+    /// Enumerate exact views while retiring one provider address-space generation.
+    pub fn first_provider_view(
+        &self,
+        owner: ProviderVspaceIdentity,
+    ) -> Option<ProviderSectionView> {
+        if !owner.is_valid() {
+            return None;
+        }
+        self.provider_views.iter().copied().find(|view| view.owner == owner)
+    }
+
+    /// An unmap must name the same provider incarnation and the exact view base.
+    pub fn unmap_provider_view(
+        &mut self,
+        owner: ProviderVspaceIdentity,
+        base: u64,
+    ) -> Option<ProviderSectionView> {
+        if !owner.is_valid() { return None; }
+        let index = self.provider_views.iter().position(|view| {
+            view.owner == owner
+                && view.base == base
+                && self.section_identity(view.section.index) == Some(view.section)
+        })?;
+        let view = self.provider_views.remove(index);
+        self.clear_section_if_unreferenced(view.section.index);
+        Some(view)
     }
 
     pub fn map_view_with_lifetime(
@@ -758,6 +889,10 @@ impl GenericSectionTable {
             view_capacity: self.views.capacity(),
             view_growths: self.view_growths,
             view_allocation_failures: self.view_allocation_failures,
+            live_provider_views: self.provider_views.len(),
+            provider_view_capacity: self.provider_views.capacity(),
+            provider_view_growths: self.provider_view_growths,
+            provider_view_allocation_failures: self.provider_view_allocation_failures,
             live_pages: self.pages.iter().filter(|page| page.live).count(),
             page_records: self.pages.len(),
             page_capacity: self.pages.capacity(),
@@ -795,6 +930,88 @@ mod tests {
                 GenericSectionBacking::anonymous(),
             )
             .unwrap()
+    }
+
+    fn provider(domain: u64, generation: u64) -> ProviderVspaceIdentity {
+        ProviderVspaceIdentity { domain, generation }
+    }
+
+    #[test]
+    fn provider_view_retains_section_backing_after_handle_close() {
+        let mut table = GenericSectionTable::new();
+        let index = create_section(&mut table, 2, 0x40);
+        let section = table.section_identity(index).unwrap();
+        let owner = provider(7, 11);
+        assert!(table.map_provider_view(owner, section, 0x10000, 0x2000, 0));
+        assert!(table.release_handle(index));
+        assert_eq!(table.provider_view_for_page(owner, 0x11000).unwrap().section, section);
+        assert!(table.section(index).is_some());
+        assert!(table.next_retirement().is_none());
+        assert_eq!(table.stats().live_provider_views, 1);
+
+        assert_eq!(table.unmap_provider_view(owner, 0x10000).unwrap().section, section);
+        assert!(table.section(index).is_none());
+        assert_eq!(table.next_retirement().unwrap().identity(), section);
+        assert_eq!(table.stats().live_provider_views, 0);
+    }
+
+    #[test]
+    fn provider_view_rejects_overlap_and_stale_generation() {
+        let mut table = GenericSectionTable::new();
+        let index = create_section(&mut table, 2, 0x40);
+        let section = table.section_identity(index).unwrap();
+        let first = provider(7, 11);
+        let next = provider(7, 12);
+        let other = provider(8, 1);
+        assert!(table.map_provider_view(first, section, 0x10000, 0x2000, 0));
+        assert!(!table.map_provider_view(first, section, 0x11000, 0x1000, 0));
+        assert!(table.map_provider_view(first, section, 0x12000, 0x1000, 0x2000));
+        assert!(table.map_provider_view(other, section, 0x10000, 0x1000, 0));
+        assert_eq!(table.first_provider_view(first).unwrap().base, 0x10000);
+        assert!(table.first_provider_view(next).is_none());
+        assert!(table.provider_view_for_page(next, 0x10000).is_none());
+        assert!(table.unmap_provider_view(next, 0x10000).is_none());
+        assert!(!table.map_provider_view(next, section, 0x20000, 0x1000, 0));
+        assert!(table.unmap_provider_view(first, 0x10000).is_some());
+        assert!(table.unmap_provider_view(first, 0x12000).is_some());
+        assert!(table.first_provider_view(first).is_none());
+        assert!(table.map_provider_view(next, section, 0x10000, 0x1000, 0));
+        assert!(table.provider_view_for_page(first, 0x10000).is_none());
+        assert!(table.unmap_provider_view(first, 0x10000).is_none());
+    }
+
+    #[test]
+    fn provider_view_validates_section_generation_and_range() {
+        let mut table = GenericSectionTable::new();
+        let index = create_section(&mut table, 2, 0x40);
+        let section = table.section_identity(index).unwrap();
+        let stale = SectionIdentity { index, generation: section.generation + 1 };
+        let owner = provider(7, 11);
+        assert!(!table.map_provider_view(owner, stale, 0x10000, 0x1000, 0));
+        assert!(!table.map_provider_view(provider(0, 11), section, 0x10000, 0x1000, 0));
+        assert!(!table.map_provider_view(owner, section, 0x10001, 0x1000, 0));
+        assert!(!table.map_provider_view(owner, section, 0x10000, 0x1000, 1));
+        assert!(!table.map_provider_view(owner, section, 0x10000, 0x2000, 0x3000));
+        assert!(!table.map_provider_view(owner, section, u64::MAX & !0xfff, 0x2000, 0));
+        assert!(table.map_provider_view(owner, section, 0x10000, 0x1000, 0x3000));
+    }
+
+    #[test]
+    fn provider_view_covers_last_partial_file_page() {
+        let mut table = GenericSectionTable::new();
+        let index = table.create(
+            2,
+            0x40,
+            0x1001,
+            crate::PAGE_READONLY,
+            SECTION_ATTR_SEC_COMMIT,
+            GenericSectionBacking::disk(1, 0x1001, file_identity(7)),
+        ).unwrap();
+        let section = table.section_identity(index).unwrap();
+        let owner = provider(7, 11);
+        assert!(table.map_provider_view(owner, section, 0x10000, 0x2000, 0));
+        assert_eq!(table.provider_view_for_page(owner, 0x11000).unwrap().section_offset, 0);
+        assert!(!table.map_provider_view(owner, section, 0x20000, 0x1000, 0x2000));
     }
 
     #[test]
