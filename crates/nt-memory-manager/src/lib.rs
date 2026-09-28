@@ -81,6 +81,8 @@ pub use runtime_section::{
 };
 pub mod writeback;
 pub use writeback::admit_section_alias_rearm;
+pub mod routed_section_metadata;
+pub use routed_section_metadata::{CompletedFileQuery, RoutedSectionMetadata};
 pub use working_set::{
     PagefilePage, PagefileProtectionPlan, PagefilePublishPlan, PagefileRetirement,
     PagefileRetirementIo, PagefileStore, PagefileStoreStats,
