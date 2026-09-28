@@ -98,6 +98,22 @@ pub fn three_stack_tail_addresses(sp: u64) -> Option<[u64; 3]> {
     ])
 }
 
+pub fn four_stack_tail_addresses(sp: u64) -> Option<[u64; 4]> {
+    let [first, second, third] = three_stack_tail_addresses(sp)?;
+    Some([first, second, third, sp.checked_add(0x40)?])
+}
+
+pub fn capture_stack_tail<const N: usize>(
+    addresses: [u64; N],
+    mut read: impl FnMut(u64) -> Option<u64>,
+) -> Option<[u64; N]> {
+    let mut tail = [0u64; N];
+    for (index, address) in addresses.into_iter().enumerate() {
+        tail[index] = read(address)?;
+    }
+    Some(tail)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +213,26 @@ mod tests {
         );
         assert_eq!(three_stack_tail_addresses(0), None);
         assert_eq!(three_stack_tail_addresses(u64::MAX - 0x30), None);
+        assert_eq!(
+            four_stack_tail_addresses(0x1000),
+            Some([0x1028, 0x1030, 0x1038, 0x1040])
+        );
+        assert_eq!(four_stack_tail_addresses(0), None);
+        assert_eq!(four_stack_tail_addresses(u64::MAX - 0x38), None);
+    }
+
+    #[test]
+    fn stack_tail_stops_at_first_unreadable_word() {
+        let addresses = three_stack_tail_addresses(0x1000).unwrap();
+        let mut reads = 0;
+        assert_eq!(
+            capture_stack_tail(addresses, |address| {
+                reads += 1;
+                (address != 0x1030).then_some(address)
+            }),
+            None
+        );
+        assert_eq!(reads, 2);
+        assert_eq!(capture_stack_tail(addresses, Some), Some(addresses));
     }
 }
