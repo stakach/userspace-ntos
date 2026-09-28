@@ -120,15 +120,46 @@ pub trait DataSectionReadIo {
     fn read(&mut self, offset: u64, output: &mut [u8]) -> (u32, usize);
 }
 
-/// Read the file prefix exactly; zero only the remainder of its final partial page. A whole page
-/// past current EOF is an error (for example after truncation), not an anonymous zero-page fallback.
-pub fn read_data_section_page(
+/// Immutable EOF-bounded work that can outlive a pending provider read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DataSectionPageRead {
+    offset: u64,
+    length: usize,
+}
+
+impl DataSectionPageRead {
+    pub const fn offset(self) -> u64 {
+        self.offset
+    }
+
+    pub const fn length(self) -> usize {
+        self.length
+    }
+
+    /// A failed or short provider completion must not publish this page as resident.
+    pub fn complete(
+        self,
+        status: u32,
+        read: usize,
+        output: &mut [u8; DATA_PAGE_SIZE],
+    ) -> Result<(), u32> {
+        if status != 0 {
+            return Err(status);
+        }
+        if read != self.length {
+            return Err(STATUS_IO_DEVICE_ERROR);
+        }
+        output[self.length..].fill(0);
+        Ok(())
+    }
+}
+
+/// A whole page past current EOF is an error, not an anonymous zero-page fallback.
+pub fn plan_data_section_page_read(
     page_index: u64,
     section_size: u64,
     file_size: u64,
-    output: &mut [u8; DATA_PAGE_SIZE],
-    io: &mut impl DataSectionReadIo,
-) -> Result<(), u32> {
+) -> Result<DataSectionPageRead, u32> {
     let offset = page_index
         .checked_mul(DATA_PAGE_SIZE as u64)
         .filter(|offset| *offset < section_size)
@@ -138,15 +169,21 @@ pub fn read_data_section_page(
         .filter(|length| *length != 0)
         .ok_or(STATUS_END_OF_FILE)?
         .min(DATA_PAGE_SIZE as u64) as usize;
+    Ok(DataSectionPageRead { offset, length })
+}
+
+/// Read the file prefix exactly; zero only the remainder of its final partial page.
+pub fn read_data_section_page(
+    page_index: u64,
+    section_size: u64,
+    file_size: u64,
+    output: &mut [u8; DATA_PAGE_SIZE],
+    io: &mut impl DataSectionReadIo,
+) -> Result<(), u32> {
+    let plan = plan_data_section_page_read(page_index, section_size, file_size)?;
     output.fill(0);
-    let (status, read) = io.read(offset, &mut output[..length]);
-    if status != 0 {
-        return Err(status);
-    }
-    if read != length {
-        return Err(STATUS_IO_DEVICE_ERROR);
-    }
-    Ok(())
+    let (status, read) = io.read(plan.offset, &mut output[..plan.length]);
+    plan.complete(status, read, output)
 }
 
 #[cfg(test)]
