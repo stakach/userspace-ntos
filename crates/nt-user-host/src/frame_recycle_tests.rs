@@ -246,7 +246,11 @@ impl SectionRetirementIo for SectionIo {
             .publish_reserved(frame, &mut self.pool)
             .map_err(|_| 3u32)
     }
-    fn release_backing(&mut self, _: GenericSectionBacking) -> Result<(), u32> {
+    fn release_backing(
+        &mut self,
+        _: nt_memory_manager::SectionIdentity,
+        _: GenericSectionBacking,
+    ) -> Result<(), u32> {
         panic!("frame only")
     }
 }

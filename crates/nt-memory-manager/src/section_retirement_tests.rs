@@ -12,6 +12,7 @@ fn file_identity(file_id: u64) -> SectionFileIdentity {
 struct Release {
     frames: Vec<u64>,
     files: Vec<u64>,
+    identities: Vec<SectionIdentity>,
     fail_frame: Option<u64>,
     fail_file: bool,
 }
@@ -24,11 +25,16 @@ impl SectionRetirementIo for Release {
         self.frames.push(frame);
         Ok(())
     }
-    fn release_backing(&mut self, backing: GenericSectionBacking) -> Result<(), u32> {
+    fn release_backing(
+        &mut self,
+        identity: SectionIdentity,
+        backing: GenericSectionBacking,
+    ) -> Result<(), u32> {
         if self.fail_file {
             return Err(0xc000_0008);
         }
         self.files.push(backing.overlay_file_id);
+        self.identities.push(identity);
         Ok(())
     }
 }
@@ -143,6 +149,7 @@ fn failed_frame_revoke_preserves_later_frames_and_file() {
 fn failed_backing_release_is_not_acknowledged_or_reused() {
     let mut table = GenericSectionTable::new();
     let first = section(&mut table);
+    let first_identity = table.section_identity(first).unwrap();
     table.release_handle(first);
     let mut io = Release {
         fail_file: true,
@@ -154,17 +161,66 @@ fn failed_backing_release_is_not_acknowledged_or_reused() {
     io.fail_file = false;
     table.drain_retired(&mut io).unwrap();
     assert_eq!(io.files, vec![7]);
+    assert_eq!(io.identities, vec![first_identity]);
     assert!(table.section(second).is_some());
+}
+
+#[test]
+fn shared_file_sections_release_distinct_incarnations() {
+    let mut table = GenericSectionTable::new();
+    let file = file_identity(41);
+    let first = table
+        .create(
+            2,
+            0x40,
+            0x1000,
+            crate::PAGE_READONLY,
+            SECTION_ATTR_SEC_COMMIT,
+            GenericSectionBacking::overlay(7, file, 0x1000),
+        )
+        .unwrap();
+    let second = table
+        .create(
+            2,
+            0x44,
+            0x1000,
+            crate::PAGE_READONLY,
+            SECTION_ATTR_SEC_COMMIT,
+            GenericSectionBacking::overlay(8, file, 0x1000),
+        )
+        .unwrap();
+    let first_identity = table.section_identity(first).unwrap();
+    let second_identity = table.section_identity(second).unwrap();
+    assert_ne!(first_identity, second_identity);
+    assert!(table.set_page_frame(first, 0, 100));
+    assert_eq!(table.page_frame(second, 0), Some(100));
+
+    assert!(table.release_handle(first));
+    let mut io = Release::default();
+    table.drain_retired(&mut io).unwrap();
+    assert!(io.frames.is_empty());
+    assert_eq!(io.files, vec![7]);
+    assert_eq!(io.identities, vec![first_identity]);
+    assert_eq!(table.page_frame(second, 0), Some(100));
+
+    assert!(table.release_handle(second));
+    table.drain_retired(&mut io).unwrap();
+    assert_eq!(io.frames, vec![100]);
+    assert_eq!(io.files, vec![7, 8]);
+    assert_eq!(io.identities, vec![first_identity, second_identity]);
 }
 
 #[test]
 fn stale_handoff_cannot_release_a_reused_section() {
     let mut table = GenericSectionTable::new();
     let first = section(&mut table);
+    let first_identity = table.section_identity(first).unwrap();
     table.release_handle(first);
     let ticket = table.next_retirement().unwrap();
+    assert_eq!(ticket.identity(), first_identity);
     assert!(table.complete_retirement(ticket));
     assert_eq!(section(&mut table), first);
+    assert_ne!(table.section_identity(first), Some(first_identity));
     table.release_handle(first);
     assert!(!table.complete_retirement(ticket));
     assert!(table.next_retirement().is_some());

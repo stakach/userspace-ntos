@@ -7,6 +7,14 @@ pub enum SectionRetirementResource {
     Backing(GenericSectionBacking),
 }
 
+/// Exact section incarnation. A file identity may be shared by several sections, but each
+/// section owns its own backing reference and must release it only once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SectionIdentity {
+    pub(super) index: usize,
+    pub(super) generation: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SectionRetirement {
     section_index: usize,
@@ -16,11 +24,24 @@ pub struct SectionRetirement {
     pub resource: SectionRetirementResource,
 }
 
+impl SectionRetirement {
+    pub const fn identity(self) -> SectionIdentity {
+        SectionIdentity {
+            index: self.section_index,
+            generation: self.generation,
+        }
+    }
+}
+
 pub trait SectionRetirementIo {
     /// Revoke all derived mappings and unmap the owner before recycling its physical frame.
     fn release_frame(&mut self, frame: u64) -> Result<(), u32>;
     /// Release the section's object reference, not an open handle reference.
-    fn release_backing(&mut self, backing: GenericSectionBacking) -> Result<(), u32>;
+    fn release_backing(
+        &mut self,
+        identity: SectionIdentity,
+        backing: GenericSectionBacking,
+    ) -> Result<(), u32>;
 }
 
 /// Frames whose page-in failed before publication still need checked physical release.
@@ -121,7 +142,9 @@ impl GenericSectionTable {
         while let Some(ticket) = self.next_retirement() {
             match ticket.resource {
                 SectionRetirementResource::Frame(frame) => io.release_frame(frame)?,
-                SectionRetirementResource::Backing(backing) => io.release_backing(backing)?,
+                SectionRetirementResource::Backing(backing) => {
+                    io.release_backing(ticket.identity(), backing)?
+                }
             }
             assert!(
                 self.complete_retirement(ticket),

@@ -15,7 +15,8 @@ pub use file_io::{SectionFilePage, SectionFileReadIo, SectionFileResizeIo, Secti
 #[path = "section_retirement.rs"]
 mod retirement;
 pub use retirement::{
-    PendingSectionFrames, SectionRetirement, SectionRetirementIo, SectionRetirementResource,
+    PendingSectionFrames, SectionIdentity, SectionRetirement, SectionRetirementIo,
+    SectionRetirementResource,
 };
 
 use crate::{MemoryLifetime, PAGE_NOACCESS, STATUS_INVALID_PARAMETER_2, STATUS_NOT_MAPPED_VIEW};
@@ -513,6 +514,13 @@ impl GenericSectionTable {
             .get(index)
             .copied()
             .filter(|section| section.live)
+    }
+
+    pub fn section_identity(&self, index: usize) -> Option<SectionIdentity> {
+        self.section(index).map(|section| SectionIdentity {
+            index,
+            generation: section.generation,
+        })
     }
 
     pub fn map_view_with_lifetime(

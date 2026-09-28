@@ -71,7 +71,7 @@ pub use runtime_section::{
     SectionFilePage, SectionFileReadIo, SectionFileResizeIo, SectionFileWriteIo,
     GenericSection, GenericSectionBacking, GenericSectionFlushPlan, GenericSectionTable,
     GenericSectionTableStats, GenericSectionView, PendingSectionFrames, SectionRetirement, SectionRetirementIo,
-    SectionRetirementResource, GENERIC_SECTION_BACKING_ANON,
+    SectionIdentity, SectionRetirementResource, GENERIC_SECTION_BACKING_ANON,
     SectionFileIdentity, SectionMountId, SectionMountIds,
     GENERIC_SECTION_BACKING_DISK, GENERIC_SECTION_BACKING_NONE, GENERIC_SECTION_BACKING_OVERLAY,
     SECTION_ATTR_SEC_BASED, SECTION_ATTR_SEC_COMMIT, SECTION_ATTR_SEC_FILE, SECTION_ATTR_SEC_IMAGE,
