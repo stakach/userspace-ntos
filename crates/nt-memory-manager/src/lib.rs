@@ -42,6 +42,7 @@ pub mod frame_acquisition;
 mod commit;
 mod copy_context;
 pub mod data_section;
+pub mod pending_section_pagein;
 pub mod image_section;
 pub mod owned_paging_structure;
 pub mod owned_object_page;
