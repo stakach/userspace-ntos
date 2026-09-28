@@ -347,7 +347,9 @@ impl Work {
     unsafe fn poll_provider(&mut self) {
         let Some(irp) = self.canonical_irp else { return; };
         let Some(completion) = completed_irp_exact(irp.raw()) else { return; };
+        assert_eq!(completion.client_id, IO_MANAGER_COMPONENT_ID);
         assert_eq!(completion.file_id, self.source.file_id().raw());
+        assert_eq!(completion.device_id, self.source.device_id().raw());
         assert_eq!(completion.requestor_tid, u64::from(self.caller.original_thread().thread_id()));
         assert_eq!(completion.major, major::IRP_MJ_READ);
         let protocol_error = completion.status == STATUS_PENDING as u32

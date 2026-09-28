@@ -434,7 +434,9 @@ impl Work {
         let Some(completion) = completed_irp_exact(irp.raw()) else {
             return;
         };
+        assert_eq!(completion.client_id, IO_MANAGER_COMPONENT_ID);
         assert_eq!(completion.file_id, self.source.file_id().raw());
+        assert_eq!(completion.device_id, self.source.device_id().raw());
         assert_eq!(
             completion.requestor_tid,
             u64::from(self.caller.original_thread().thread_id())
