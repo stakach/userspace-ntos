@@ -224,19 +224,24 @@ const _: () = assert!(
 /// leased while an outer dispatch is parked behind a user-mode callback.
 pub const WIN32K_ARG_VADDR: u64 = 0x0000_0100_071A_0000;
 pub const WIN32K_ARG_GENERAL_FRAMES: u64 = 4;
-pub const WIN32K_ARG_FRAMES: u64 = WIN32K_ARG_GENERAL_FRAMES + 1;
+pub const WIN32K_ARG_FRAMES: u64 = WIN32K_ARG_GENERAL_FRAMES + 2;
 pub const WIN32K_ARG_GENERAL_BYTES: u64 = WIN32K_ARG_GENERAL_FRAMES * 0x1000;
 pub const WIN32K_MESSAGE_STAGE_BASE: u64 = WIN32K_ARG_VADDR + WIN32K_ARG_GENERAL_BYTES;
 pub const WIN32K_MESSAGE_STAGE_SLOT_BYTES: u64 = 64;
 pub const WIN32K_MESSAGE_STAGE_SLOTS: u64 = 0x1000 / WIN32K_MESSAGE_STAGE_SLOT_BYTES;
 pub const WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET: u64 = 56;
+pub const WIN32K_PAINT_STAGE_BASE: u64 = WIN32K_MESSAGE_STAGE_BASE + 0x1000;
+pub const WIN32K_PAINT_STAGE_SLOT_BYTES: u64 = 128;
+pub const WIN32K_PAINT_STAGE_SLOTS: u64 = 0x1000 / WIN32K_PAINT_STAGE_SLOT_BYTES;
+pub const WIN32K_PAINT_STAGE_OUTPUT_LENGTH_OFFSET: u64 = 120;
 const _: () = assert!(
     WIN32K_PROVIDER_WAIT_VADDR + WIN32K_PROVIDER_WAIT_FRAMES * 0x1000 <= WIN32K_ARG_VADDR
 );
 const _: () = assert!(
     WIN32K_MESSAGE_STAGE_BASE + WIN32K_MESSAGE_STAGE_SLOTS * WIN32K_MESSAGE_STAGE_SLOT_BYTES
-        == WIN32K_ARG_VADDR + WIN32K_ARG_FRAMES * 0x1000
+        == WIN32K_PAINT_STAGE_BASE
 );
+const _: () = assert!(WIN32K_PAINT_STAGE_BASE + WIN32K_PAINT_STAGE_SLOTS * WIN32K_PAINT_STAGE_SLOT_BYTES == WIN32K_ARG_VADDR + WIN32K_ARG_FRAMES * 0x1000);
 const _: () = assert!(WIN32K_MESSAGE_STAGE_SLOTS <= u64::BITS as u64);
 const _: () = assert!(
     WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET
@@ -15941,6 +15946,20 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
             u64::MAX,
         );
     }
+    let paint_stage_valid = matches!(
+        ssn,
+        nt_user_callback::NTUSER_BEGIN_PAINT_SSN
+            | nt_user_callback::NTUSER_GET_UPDATE_RECT_SSN
+    )
+        && a1 >= WIN32K_PAINT_STAGE_BASE
+        && a1 < WIN32K_PAINT_STAGE_BASE + 0x1000
+        && (a1 - WIN32K_PAINT_STAGE_BASE) % WIN32K_PAINT_STAGE_SLOT_BYTES == 0;
+    if paint_stage_valid {
+        write_volatile(
+            (a1 + WIN32K_PAINT_STAGE_OUTPUT_LENGTH_OFFSET) as *mut u64,
+            u64::MAX,
+        );
+    }
     let process_id = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_PROCESS_ID) as *const u64);
     let client_pi = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64);
     let client_teb = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_TEB) as *const u64);
@@ -16054,6 +16073,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
             publish_thread_desktop_binding(t, hdesk, desk_body, pdeskinfo);
         }
     }
+    let paint_window_valid = paint_stage_valid && resolve_window_handle(a0) != 0;
     let result = if ssn == SSN_GDI_BATCH_FLUSH_CALLOUT {
         dispatch_gdi_batch_flush_callout(client_pi, client_teb)
     } else if ssn == SSN_WIN32_JOB_USER_HANDLE {
@@ -16107,6 +16127,18 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
             nt_user_callback::message_dispatch_output_length(ssn, result, staged_message);
         write_volatile(
             (a0 + WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET) as *mut u64,
+            u64::from(output_length),
+        );
+    }
+    if paint_stage_valid {
+        let output_length = nt_user_callback::paint_dispatch_output_length(
+            ssn,
+            result,
+            true,
+            paint_window_valid,
+        ).unwrap_or(0);
+        write_volatile(
+            (a1 + WIN32K_PAINT_STAGE_OUTPUT_LENGTH_OFFSET) as *mut u64,
             u64::from(output_length),
         );
     }

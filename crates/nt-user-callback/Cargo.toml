@@ -9,3 +9,4 @@ path = "src/lib.rs"
 
 [dependencies]
 nt-component-suspension.workspace = true
+nt-types.workspace = true
