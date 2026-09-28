@@ -25,6 +25,7 @@ pub const GENERIC_SECTION_BACKING_NONE: u8 = 0;
 pub const GENERIC_SECTION_BACKING_ANON: u8 = 1;
 pub const GENERIC_SECTION_BACKING_DISK: u8 = 2;
 pub const GENERIC_SECTION_BACKING_OVERLAY: u8 = 3;
+pub const GENERIC_SECTION_BACKING_ROUTED: u8 = 4;
 pub const SECTION_ATTR_SEC_BASED: u32 = 0x0020_0000;
 pub const SECTION_ATTR_SEC_FILE: u32 = 0x0080_0000;
 pub const SECTION_ATTR_SEC_IMAGE: u32 = 0x0100_0000;
@@ -35,12 +36,31 @@ const SECTION_INITIAL_RESERVE: usize = 16;
 const VIEW_INITIAL_RESERVE: usize = 32;
 const PAGE_INITIAL_RESERVE: usize = 128;
 
+/// Opaque ownership key for one routed FILE_OBJECT reference, not a file identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoutedSectionLease(u64);
+
+impl RoutedSectionLease {
+    pub const fn new(value: u64) -> Option<Self> {
+        if value == 0 {
+            None
+        } else {
+            Some(Self(value))
+        }
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GenericSectionBacking {
     pub kind: u8,
     pub first_cluster: u32,
     pub file_size: u32,
     pub overlay_file_id: u64,
+    pub routed_lease: Option<RoutedSectionLease>,
     pub file: Option<SectionFileIdentity>,
     pub file_extent: u64,
 }
@@ -52,6 +72,7 @@ impl GenericSectionBacking {
             first_cluster: 0,
             file_size: 0,
             overlay_file_id: 0,
+            routed_lease: None,
             file: None,
             file_extent: 0,
         }
@@ -63,6 +84,7 @@ impl GenericSectionBacking {
             first_cluster: 0,
             file_size: 0,
             overlay_file_id: 0,
+            routed_lease: None,
             file: None,
             file_extent: 0,
         }
@@ -74,6 +96,7 @@ impl GenericSectionBacking {
             first_cluster,
             file_size,
             overlay_file_id: 0,
+            routed_lease: None,
             file: Some(file),
             file_extent: file_size as u64,
         }
@@ -85,6 +108,23 @@ impl GenericSectionBacking {
             first_cluster: 0,
             file_size: 0,
             overlay_file_id: file_id,
+            routed_lease: None,
+            file: Some(file),
+            file_extent,
+        }
+    }
+
+    pub const fn routed(
+        lease: RoutedSectionLease,
+        file: SectionFileIdentity,
+        file_extent: u64,
+    ) -> Self {
+        Self {
+            kind: GENERIC_SECTION_BACKING_ROUTED,
+            first_cluster: 0,
+            file_size: 0,
+            overlay_file_id: 0,
+            routed_lease: Some(lease),
             file: Some(file),
             file_extent,
         }
@@ -130,7 +170,9 @@ impl GenericSection {
                 | SECTION_ATTR_SEC_RESERVE
                 | SECTION_ATTR_SEC_COMMIT);
         match self.backing.kind {
-            GENERIC_SECTION_BACKING_DISK | GENERIC_SECTION_BACKING_OVERLAY => {
+            GENERIC_SECTION_BACKING_DISK
+            | GENERIC_SECTION_BACKING_OVERLAY
+            | GENERIC_SECTION_BACKING_ROUTED => {
                 attributes |= SECTION_ATTR_SEC_FILE;
             }
             GENERIC_SECTION_BACKING_ANON => {
@@ -377,11 +419,25 @@ impl GenericSectionTable {
             return None;
         }
         match backing.kind {
-            GENERIC_SECTION_BACKING_ANON if backing.file.is_none() => {}
+            GENERIC_SECTION_BACKING_ANON
+                if backing.file.is_none() && backing.routed_lease.is_none() => {}
             GENERIC_SECTION_BACKING_DISK | GENERIC_SECTION_BACKING_OVERLAY
                 if backing.file.is_some()
+                    && backing.routed_lease.is_none()
                     && size <= backing.file_extent
                     && backing.file_extent <= crate::data_section::MAX_DATA_SECTION_SIZE => {}
+            GENERIC_SECTION_BACKING_ROUTED
+                if backing.file.is_some()
+                    && backing.routed_lease.is_some()
+                    && backing.overlay_file_id == 0
+                    && backing.first_cluster == 0
+                    && backing.file_size == 0
+                    && size <= backing.file_extent
+                    && backing.file_extent <= crate::data_section::MAX_DATA_SECTION_SIZE
+                    && !self.sections.iter().any(|section| {
+                        section.backing.kind == GENERIC_SECTION_BACKING_ROUTED
+                            && section.backing.routed_lease == backing.routed_lease
+                    }) => {}
             _ => return None,
         }
         if handle != 0 {

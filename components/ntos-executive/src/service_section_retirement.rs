@@ -37,10 +37,12 @@ impl SectionRetirementIo for RetirementIo {
         _: nt_memory_manager::SectionIdentity,
         backing: GenericSectionBacking,
     ) -> Result<(), u32> {
-        if backing.kind == GENERIC_SECTION_BACKING_OVERLAY {
-            unsafe { crate::writable_fs::release_io_reference(backing.overlay_file_id) }
-        } else {
-            Ok(()) // Anonymous and immutable boot-disk backing hold no FILE_OBJECT reference.
+        match backing.kind {
+            GENERIC_SECTION_BACKING_OVERLAY => unsafe {
+                crate::writable_fs::release_io_reference(backing.overlay_file_id)
+            },
+            nt_memory_manager::GENERIC_SECTION_BACKING_ANON | GENERIC_SECTION_BACKING_DISK => Ok(()),
+            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
         }
     }
 }

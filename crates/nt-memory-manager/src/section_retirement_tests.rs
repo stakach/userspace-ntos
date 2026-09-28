@@ -12,9 +12,17 @@ fn file_identity(file_id: u64) -> SectionFileIdentity {
 struct Release {
     frames: Vec<u64>,
     files: Vec<u64>,
+    routed_leases: Vec<RoutedSectionLease>,
     identities: Vec<SectionIdentity>,
+    events: Vec<ReleaseEvent>,
     fail_frame: Option<u64>,
     fail_file: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseEvent {
+    Frame(u64),
+    Backing(SectionIdentity),
 }
 
 impl SectionRetirementIo for Release {
@@ -23,6 +31,7 @@ impl SectionRetirementIo for Release {
             return Err(0xc000_009a);
         }
         self.frames.push(frame);
+        self.events.push(ReleaseEvent::Frame(frame));
         Ok(())
     }
     fn release_backing(
@@ -33,8 +42,13 @@ impl SectionRetirementIo for Release {
         if self.fail_file {
             return Err(0xc000_0008);
         }
-        self.files.push(backing.overlay_file_id);
+        if backing.kind == GENERIC_SECTION_BACKING_ROUTED {
+            self.routed_leases.push(backing.routed_lease.unwrap());
+        } else {
+            self.files.push(backing.overlay_file_id);
+        }
         self.identities.push(identity);
+        self.events.push(ReleaseEvent::Backing(identity));
         Ok(())
     }
 }
@@ -208,6 +222,111 @@ fn shared_file_sections_release_distinct_incarnations() {
     assert_eq!(io.frames, vec![100]);
     assert_eq!(io.files, vec![7, 8]);
     assert_eq!(io.identities, vec![first_identity, second_identity]);
+}
+
+#[test]
+fn routed_file_sections_keep_independent_leases_until_last_view() {
+    assert_eq!(RoutedSectionLease::new(0), None);
+    let first_lease = RoutedSectionLease::new(11).unwrap();
+    let second_lease = RoutedSectionLease::new(12).unwrap();
+    let mut table = GenericSectionTable::new();
+    let file = file_identity(41);
+    let first_backing = GenericSectionBacking::routed(first_lease, file, 0x1000);
+    let second_backing = GenericSectionBacking::routed(second_lease, file, 0x1000);
+    assert_eq!(
+        table.create(
+            2,
+            0x3c,
+            0x1000,
+            crate::PAGE_READONLY,
+            SECTION_ATTR_SEC_COMMIT,
+            GenericSectionBacking {
+                routed_lease: None,
+                ..first_backing
+            },
+        ),
+        None,
+    );
+    let first = table
+        .create(2, 0x40, 0x1000, crate::PAGE_READONLY, SECTION_ATTR_SEC_COMMIT, first_backing)
+        .unwrap();
+    let second = table
+        .create(2, 0x44, 0x1000, crate::PAGE_READONLY, SECTION_ATTR_SEC_COMMIT, second_backing)
+        .unwrap();
+    let first_identity = table.section_identity(first).unwrap();
+    let second_identity = table.section_identity(second).unwrap();
+    assert_ne!(first_identity, second_identity);
+    assert_ne!(table.section(first).unwrap().basic_attributes() & SECTION_ATTR_SEC_FILE, 0);
+    assert_eq!(
+        table.create(2, 0x48, 0x1000, crate::PAGE_READONLY, SECTION_ATTR_SEC_COMMIT, first_backing),
+        None,
+        "one retained lease cannot back two sections",
+    );
+    assert!(table.map_view(3, first, 0x10000, 0x1000, 0));
+    assert!(table.set_page_frame(first, 0, 100));
+    assert_eq!(table.page_frame(second, 0), Some(100));
+
+    assert!(table.release_handle(first));
+    let mut io = Release::default();
+    table.drain_retired(&mut io).unwrap();
+    assert!(io.events.is_empty(), "final view retains the section lease");
+    assert!(table.unmap_view(3, 0x10000).is_some());
+    assert_eq!(
+        table.create(2, 0x48, 0x1000, crate::PAGE_READONLY, SECTION_ATTR_SEC_COMMIT, first_backing),
+        None,
+        "pending retirement still owns the lease",
+    );
+    table.drain_retired(&mut io).unwrap();
+    assert_eq!(io.routed_leases, vec![first_lease]);
+    assert_eq!(io.events, vec![ReleaseEvent::Backing(first_identity)]);
+    assert_eq!(table.page_frame(second, 0), Some(100));
+
+    assert!(table.release_handle(second));
+    table.drain_retired(&mut io).unwrap();
+    assert_eq!(io.routed_leases, vec![first_lease, second_lease]);
+    assert_eq!(
+        io.events,
+        vec![
+            ReleaseEvent::Backing(first_identity),
+            ReleaseEvent::Frame(100),
+            ReleaseEvent::Backing(second_identity),
+        ],
+    );
+}
+
+#[test]
+fn failed_routed_lease_release_retains_exact_token_and_slot() {
+    let mut table = GenericSectionTable::new();
+    let lease = RoutedSectionLease::new(31).unwrap();
+    let backing = GenericSectionBacking::routed(lease, file_identity(51), 0x1000);
+    let section = table
+        .create(2, 0x40, 0x1000, crate::PAGE_READONLY, SECTION_ATTR_SEC_COMMIT, backing)
+        .unwrap();
+    let identity = table.section_identity(section).unwrap();
+    assert!(table.release_handle(section));
+    let ticket = table.next_retirement().unwrap();
+    let mut io = Release { fail_file: true, ..Release::default() };
+    assert_eq!(table.drain_retired(&mut io), Err(0xc000_0008));
+    assert_eq!(table.next_retirement(), Some(ticket));
+    assert_eq!(
+        table.create(2, 0x44, 0x1000, crate::PAGE_READONLY, SECTION_ATTR_SEC_COMMIT, backing),
+        None,
+    );
+    io.fail_file = false;
+    table.drain_retired(&mut io).unwrap();
+    assert_eq!(io.routed_leases, vec![lease]);
+    assert_eq!(io.identities, vec![identity]);
+    let replacement_backing = GenericSectionBacking::routed(
+        RoutedSectionLease::new(32).unwrap(),
+        backing.file.unwrap(),
+        0x1000,
+    );
+    let replacement = table
+        .create(2, 0x44, 0x1000, crate::PAGE_READONLY, SECTION_ATTR_SEC_COMMIT, replacement_backing)
+        .unwrap();
+    assert_eq!(replacement, section);
+    assert_ne!(table.section_identity(replacement), Some(identity));
+    assert!(!table.complete_retirement(ticket));
 }
 
 #[test]
