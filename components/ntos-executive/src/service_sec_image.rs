@@ -7137,6 +7137,7 @@ struct CapturedGetClassName {
 
 #[derive(Clone, Copy)]
 struct CapturedGetAtomName {
+    process: nt_memory_manager::ProcessIdentity,
     buffer_client: u64,
     desc_out: u64,
     buffer_out: u64,
@@ -7364,6 +7365,7 @@ unsafe fn copy_back_get_class_name(
 
 unsafe fn capture_get_atom_name_out(
     pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
     atom_name: u64,
     filled_pages: &[u64],
     nfilled: usize,
@@ -7373,13 +7375,8 @@ unsafe fn capture_get_atom_name_out(
         return None;
     }
     let mut raw = [0u8; 16];
-    if !img_spawn::client_copyin_mapped(
-        pi,
-        atom_name,
-        &mut raw,
-        filled_pages,
-        nfilled,
-        scratch_base,
+    if !copy_client_string_bytes(
+        pi, Some(process), atom_name, &mut raw, filled_pages, nfilled, scratch_base,
     ) {
         return None;
     }
@@ -7398,6 +7395,7 @@ unsafe fn capture_get_atom_name_out(
     raw[8..16].copy_from_slice(&buffer_out.to_le_bytes());
     core::ptr::copy_nonoverlapping(raw.as_ptr(), desc_out as *mut u8, raw.len());
     Some(CapturedGetAtomName {
+        process,
         buffer_client: buffer,
         desc_out,
         buffer_out,
@@ -7406,11 +7404,10 @@ unsafe fn capture_get_atom_name_out(
 }
 
 unsafe fn copy_back_get_atom_name(
+    handler: &mut ExecNtHandler,
     pi: u64,
     capture: CapturedGetAtomName,
     chars_returned: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
     let byte_len = chars_returned.saturating_mul(2).min(RC_ARG_BUF_CAP);
@@ -7418,12 +7415,12 @@ unsafe fn copy_back_get_atom_name(
         .min(capture.maximum as u64)
         .min(RC_ARG_BUF_CAP) as usize;
     let text = core::slice::from_raw_parts(capture.buffer_out as *const u8, copy_len);
-    img_spawn::client_write_mapped(
+    img_spawn::client_write_process_mapped_for(
+        handler,
         pi,
+        capture.process,
         capture.buffer_client,
         text,
-        filled_pages,
-        nfilled,
         scratch_base,
     )
 }
@@ -15628,13 +15625,12 @@ pub(crate) unsafe fn service_sec_image(
                 let userinit_gui_client = nt_handler.hosted_process_role(pi)
                     == Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap);
                 let get_atom_name_capture = if m0 == 0x10ad {
-                    let capture = capture_get_atom_name_out(
-                        pi as u64,
-                        a1,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    );
+                    let capture = nt_handler.capture_process_identity(pi).and_then(|process| {
+                        capture_get_atom_name_out(
+                            pi as u64, process, a1,
+                            filled_pages, faults as usize, scratch_base,
+                        )
+                    });
                     if let Some(capture) = capture {
                         d_a1 = capture.desc_out;
                         let n = GET_ATOM_NAME_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
@@ -17180,11 +17176,10 @@ pub(crate) unsafe fn service_sec_image(
                     if let Some(capture) = get_atom_name_capture {
                         if st != 0
                             && !copy_back_get_atom_name(
+                                nt_handler,
                                 pi as u64,
                                 capture,
                                 st,
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
                             )
                         {
