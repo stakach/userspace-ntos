@@ -61,6 +61,9 @@ mod directory_query;
 #[path = "exec_directory_object.rs"]
 pub(crate) mod directory_object;
 
+#[path = "exec_section_create.rs"]
+pub(crate) mod section_create;
+
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
 pub(crate) const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
@@ -41477,163 +41480,26 @@ impl ExecNtHandler {
                     return nt_fs::STATUS_INVALID_HANDLE;
                 }
 
-                let mut routed_lease = None;
-                let (backing, backing_size) = if sec_file == 0 {
-                    if maxsize == 0 {
-                        return 0xc000_00f2; // STATUS_INVALID_PARAMETER_4
-                    }
-                    if maxsize > i64::MAX as u64 {
-                        return nt_memory_manager::STATUS_SECTION_TOO_BIG;
-                    }
-                    (GenericSectionBacking::anonymous(), maxsize)
-                } else {
-                    let source = match self.pm.lookup_native_section_file_source(caller, sec_file) {
-                        Ok(source) => source,
-                        Err(status) => return status,
-                    };
-                    let object = source.object();
-                    let access = source.granted_access();
-                    if let Err(status) = nt_memory_manager::data_section::check_data_section_file_access(page_protection, access) {
-                        return status;
-                    }
-                    let (backing, routed_size) = match object {
-                        nt_process::HandleObject::DiskFile { first_cluster, size, object_id } => {
-                            let open = match self.readonly_file_opens.get(object_id) {
-                                Ok(open) => open,
-                                Err(status) => return status,
-                            };
-                            if open.first_cluster != first_cluster || open.size != size {
-                                return nt_fs::STATUS_INVALID_HANDLE;
-                            }
-                            if open.metadata.is_directory {
-                                return STATUS_INVALID_FILE_FOR_SECTION;
-                            }
-                            let Some(identity) = exec_fs_file_identity(open.metadata.file_id) else {
-                                return nt_fs::STATUS_INVALID_HANDLE;
-                            };
-                            (GenericSectionBacking::disk(first_cluster, size, identity), None)
-                        }
-                        nt_process::HandleObject::OverlayFile(file_id) => match crate::writable_fs::section_backing(file_id) {
-                            Ok(backing) => (backing, None),
-                            Err(status) => return status,
-                        },
-                        nt_process::HandleObject::RoutedFile { file_id, device_id } => {
-                            let Some(mount) = crate::mounted_volume::mount_id_for_live_device(device_id) else {
-                                return STATUS_INVALID_FILE_FOR_SECTION;
-                            };
-                            let capture = match crate::driver_launch::hosted_file_capture::capture(
-                                file_id,
-                                device_id,
-                                access,
-                            ) {
-                                Ok(capture) => capture,
-                                Err(status) => return status,
-                            };
-                            let metadata = match crate::routed_section_io::query_metadata(file_id, device_id, mount) {
-                                Ok(metadata) => metadata,
-                                Err(status) => return status,
-                            };
-                            let extent = match metadata.prepare_readonly(maxsize, page_protection, access) {
-                                Ok(extent) => extent,
-                                Err(status) => return status,
-                            };
-                            let lease = match crate::hosted_routed_section_capture::reserve(capture) {
-                                Ok(lease) => lease,
-                                Err(_capture) => return nt_address_space::STATUS_INSUFFICIENT_RESOURCES,
-                            };
-                            routed_lease = Some(lease);
-                            (
-                                GenericSectionBacking::routed(lease, metadata.file, extent.file_size),
-                                Some(extent.section_size),
-                            )
-                        }
-                        _ => return STATUS_INVALID_FILE_FOR_SECTION,
-                    };
-                    if let Err(status) = (&*ctx.generic_sections).validate_file_creation(backing, maxsize) {
-                        if let Some(lease) = routed_lease {
-                            crate::hosted_routed_section_capture::cancel_unbound(lease)
-                                .expect("failed routed section admission retains its file reference");
-                        }
-                        return status;
-                    }
-                    let (backing, size) = match routed_size {
-                        Some(size) => (backing, size),
-                        None => match service_prepare_data_section_file(backing, maxsize, page_protection, access) {
-                            Ok(result) => result,
-                            Err(status) => return status,
-                        },
-                    };
-                    (backing, size)
+                let owner_pi = self.pi;
+                let mut reserved = match self.reserve_generic_data_section(
+                    caller, owner_pi, desired_access, attributes, maxsize,
+                    page_protection, allocation_attrs, sec_file,
+                ) {
+                    Ok(reserved) => reserved,
+                    Err(status) => return status,
                 };
-                let generic_sections = &mut *ctx.generic_sections;
-                if let Err(status) = generic_sections.validate_backing_extent(backing) {
-                    if let Some(lease) = routed_lease {
-                        crate::hosted_routed_section_capture::cancel_unbound(lease)
-                            .expect("failed routed section extent retains its file reference");
-                    }
-                    return status;
-                }
-                let mut publication = match self.pm.reserve_native_section_handle(caller, attributes) {
-                    Ok(publication) => publication,
-                    Err(status) => {
-                        if let Some(lease) = routed_lease {
-                            crate::hosted_routed_section_capture::cancel_unbound(lease)
-                                .expect("failed Section handle reservation retains its file reference");
-                        }
-                        return status;
-                    }
-                };
-                if backing.kind == GENERIC_SECTION_BACKING_OVERLAY {
-                    if let Err(status) = crate::writable_fs::retain_io_reference(backing.overlay_file_id) {
-                        publication.abort(&mut self.pm).expect("empty Section reservation aborts");
-                        return status;
-                    }
-                }
-                let Some(index) = generic_sections.create(
-                    self.pi,
-                    0,
-                    backing_size,
-                    page_protection,
-                    allocation_attrs,
-                    backing,
-                ) else {
-                    if backing.kind == GENERIC_SECTION_BACKING_OVERLAY {
-                        crate::writable_fs::release_io_reference(backing.overlay_file_id)
-                            .expect("failed section publication retains its acquired file reference");
-                    }
-                    if let Some(lease) = routed_lease {
-                        crate::hosted_routed_section_capture::cancel_unbound(lease)
-                            .expect("failed routed section publication retains its file reference");
-                    }
-                    publication.abort(&mut self.pm).expect("empty Section reservation aborts");
-                    return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
-                };
-                if let Some(lease) = routed_lease {
-                    let identity = generic_sections.section_identity(index)
-                        .expect("new routed section has an exact identity");
-                    assert!(crate::hosted_routed_section_capture::bind(lease, identity));
-                }
-                let h = publication.value();
-                if let Err(status) = publication.bind(&mut self.pm, index as nt_process::SectionId, desired_access) {
-                    generic_sections.clear_section(index);
-                    publication.abort(&mut self.pm).expect("failed Section binding leaves an empty reservation");
-                    return status;
-                }
-                if !generic_sections.bind_handle(index, h) {
-                    generic_sections.clear_section(index);
-                    publication.abort(&mut self.pm).expect("bound Section reservation aborts");
-                    return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
-                }
+                let h = reserved.value();
+                let backing_size = reserved.size;
                 if !self.user_memory_write(
                     SyscallUserMemory::CurrentProcess,
                     out,
                     &h.to_le_bytes(),
                 ) {
-                    publication.abort(&mut self.pm).expect("bound Section reservation aborts");
-                    generic_sections.clear_section(index);
+                    reserved.abort(self);
                     return STATUS_ACCESS_VIOLATION;
                 }
-                publication.publish(&mut self.pm).expect("uncontended Section handle publication follows output copy");
+                reserved.publish(self)
+                    .expect("uncontended Section publication follows syscall output copy");
                 print_str(b"[section] create generic pi=");
                 print_u64(self.pi as u64);
                 print_str(b" handle=0x");
