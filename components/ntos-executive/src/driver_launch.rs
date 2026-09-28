@@ -38195,7 +38195,12 @@ pub(crate) unsafe fn copy_completed_irp(
 
 #[derive(Clone, Copy)]
 pub(crate) struct HostedCompletedIrp {
+    pub client_id: u64,
+    pub driver_id: u64,
     pub file_id: u64,
+    pub device_id: u64,
+    pub completion_driver_id: u64,
+    pub completion_device_id: u64,
     pub requestor_tid: u64,
     pub major: u8,
     pub status: u32,
@@ -38216,7 +38221,12 @@ pub(crate) unsafe fn completed_irp_exact(irp_id: u64) -> Option<HostedCompletedI
         io_manager_mut().completed_irp(IrpId(irp_id))?
     };
     Some(HostedCompletedIrp {
+        client_id: completion.client_id.0,
+        driver_id: completion.driver_id.raw(),
         file_id: completion.file_id?.raw(),
+        device_id: completion.device_id.raw(),
+        completion_driver_id: completion.completion_driver_id.raw(),
+        completion_device_id: completion.completion_device_id.raw(),
         requestor_tid: completion.requestor_tid,
         major: completion.major,
         status: completion.status.raw() as u32,

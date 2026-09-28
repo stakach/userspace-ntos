@@ -542,7 +542,9 @@ impl Work {
             let Some(completion) = completed_irp_exact(irp.raw()) else {
                 return false;
             };
-            if completion.file_id != self.file.file_id()
+            if completion.client_id != IO_MANAGER_COMPONENT_ID
+                || completion.file_id != self.file.file_id()
+                || completion.device_id != self.file.device_id()
                 || completion.requestor_tid != u64::from(self.caller.original_thread().thread_id())
                 || completion.major != self.operation.major()
             {
