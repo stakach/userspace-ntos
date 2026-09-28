@@ -25,6 +25,7 @@ typedef void *HANDLE;
 #define IRP_MJ_CLEANUP 0x12
 #define IRP_MJ_MAXIMUM_FUNCTION 0x1b
 #define FileStandardInformation 5
+#define FileInternalInformation 6
 #define SL_PENDING_RETURNED 0x01
 #define DO_DEVICE_INITIALIZING 0x80
 #define DO_BUFFERED_IO 0x04
@@ -234,6 +235,10 @@ struct MupProviderEvidence {
     uint32_t probe_read_bytes;
     uint32_t probe_flush_count;
     uint32_t probe_query_file_count;
+    uint32_t section_file_created;
+    uint32_t section_query_standard_count;
+    uint32_t section_query_internal_count;
+    uint32_t section_page_read_count;
     uint32_t query_count;
     uint32_t query_accepted;
     uint32_t query_rejected;
@@ -267,16 +272,29 @@ static const WCHAR ProbeRelativeName[] = {
     '\\', 'n', 't', 'o', 's', '-', 'p', 'r', 'o', 'b', 'e',
     '\\', 's', 'h', 'a', 'r', 'e'
 };
+static const WCHAR SectionRelativeName[] = {
+    '\\', 'n', 't', 'o', 's', '-', 'p', 'r', 'o', 'b', 'e',
+    '\\', 's', 'e', 'c', 't', 'i', 'o', 'n'
+};
 static const uint8_t ProbeWriteBytes[] = {'n', 't', 'o', 's', '-', 'w', 'r', 'i', 't', 'e'};
 static const uint8_t ProbeReadBytes[] = {'n', 't', 'o', 's', '-', 'r', 'e', 'a', 'd', '!'};
 static const FILE_STANDARD_INFORMATION ProbeStandardInfo = {
     0x1122334455667788ll, 0x0102030405060708ll, 0x13579bdfu, 1, 0, {0, 0}
 };
+static const FILE_STANDARD_INFORMATION SectionStandardInfo = {
+    4096, 4096, 1, 0, 0, {0, 0}
+};
+static const uint64_t SectionInternalIndex = 0x53656374696f6e31ull;
+static uint8_t SectionFileMarker;
 static IRP *PendingReadIrp;
 static IRP *PendingFlushIrp;
 static uint8_t PendingFlushEvent[0x20] __attribute__((aligned(8)));
 static IRP *PendingQueryFileIrp;
 static uint8_t PendingQueryFileEvent[0x20] __attribute__((aligned(8)));
+static IRP *PendingSectionQueryIrp;
+static uint8_t PendingSectionQueryEvent[0x20] __attribute__((aligned(8)));
+static IRP *PendingSectionReadIrp;
+static uint8_t PendingSectionReadEvent[0x20] __attribute__((aligned(8)));
 
 static int IsProbeFileName(const UNICODE_STRING *name)
 {
@@ -285,6 +303,17 @@ static int IsProbeFileName(const UNICODE_STRING *name)
         WCHAR c = name->Buffer[i];
         if (c >= 'A' && c <= 'Z') c = (WCHAR)(c + ('a' - 'A'));
         if (c != ProbeRelativeName[i]) return 0;
+    }
+    return 1;
+}
+
+static int IsSectionFileName(const UNICODE_STRING *name)
+{
+    if (name->Length != sizeof(SectionRelativeName) || name->Buffer == NULL) return 0;
+    for (uint32_t i = 0; i < sizeof(SectionRelativeName) / sizeof(WCHAR); i++) {
+        WCHAR c = name->Buffer[i];
+        if (c >= 'A' && c <= 'Z') c = (WCHAR)(c + ('a' - 'A'));
+        if (c != SectionRelativeName[i]) return 0;
     }
     return 1;
 }
@@ -307,6 +336,13 @@ static NTSTATUS __stdcall ProviderCreate(DEVICE_OBJECT *device, IRP *irp)
     }
     FILE_OBJECT *file = (FILE_OBJECT *)stack->FileObject;
     if (file->FileName.Length == 0) return Complete(irp, STATUS_SUCCESS, 1);
+    if (IsSectionFileName(&file->FileName)) {
+        file->FsContext = &SectionFileMarker;
+        MupProviderEvidence.section_file_created++;
+        DbgPrint("[mup-provider-section-create] count=%u\n",
+                 MupProviderEvidence.section_file_created);
+        return Complete(irp, STATUS_SUCCESS, 1);
+    }
     if (!IsProbeFileName(&file->FileName)) {
         return Complete(irp, STATUS_BAD_NETWORK_NAME, 0);
     }
@@ -384,6 +420,26 @@ static NTSTATUS __stdcall ProviderRead(DEVICE_OBJECT *device, IRP *irp)
 {
     (void)device;
     IO_STACK_LOCATION *stack = irp->CurrentStackLocation;
+    if (stack != NULL && stack->FileObject != NULL &&
+        ((FILE_OBJECT *)stack->FileObject)->FsContext == &SectionFileMarker) {
+        if (stack->Parameters.Read.Length != 4096 ||
+            stack->Parameters.Read.ByteOffset != 0 ||
+            irp->AssociatedSystemBuffer == NULL) {
+            return Complete(irp, STATUS_INVALID_PARAMETER, 0);
+        }
+        if (MupProviderEvidence.section_page_read_count != 0)
+            return Complete(irp, STATUS_INVALID_PARAMETER, 0);
+        IRP *empty = NULL;
+        stack->Control |= SL_PENDING_RETURNED;
+        if (!__atomic_compare_exchange_n(&PendingSectionReadIrp, &empty, irp, 0,
+                                         __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+            stack->Control &= (uint8_t)~SL_PENDING_RETURNED;
+            return Complete(irp, STATUS_DEVICE_BUSY, 0);
+        }
+        DbgPrint("[mup-provider-section-read-pending-dispatch] bytes=4096\n");
+        KeSetEvent(PendingSectionReadEvent, 0, 0);
+        return STATUS_PENDING;
+    }
     if (stack == NULL || stack->FileObject == NULL ||
         stack->Parameters.Read.Length != sizeof(ProbeReadBytes) ||
         (stack->Parameters.Read.ByteOffset != 0 &&
@@ -450,6 +506,41 @@ static NTSTATUS __stdcall ProviderQueryInformation(DEVICE_OBJECT *device, IRP *i
 {
     (void)device;
     IO_STACK_LOCATION *stack = irp->CurrentStackLocation;
+    if (stack != NULL && stack->FileObject != NULL &&
+        ((FILE_OBJECT *)stack->FileObject)->FsContext == &SectionFileMarker) {
+        if (irp->AssociatedSystemBuffer == NULL) return Complete(irp, STATUS_INVALID_PARAMETER, 0);
+        if (stack->Parameters.QueryFile.FileInformationClass == FileInternalInformation &&
+            stack->Parameters.QueryFile.Length == sizeof(SectionInternalIndex)) {
+            uint8_t *output = (uint8_t *)irp->AssociatedSystemBuffer;
+            const uint8_t *index = (const uint8_t *)&SectionInternalIndex;
+            for (uint32_t i = 0; i < sizeof(SectionInternalIndex); i++) output[i] = index[i];
+            MupProviderEvidence.section_query_internal_count++;
+            DbgPrint("[mup-provider-section-query-internal] bytes=8\n");
+            return Complete(irp, STATUS_SUCCESS, sizeof(SectionInternalIndex));
+        }
+        if (stack->Parameters.QueryFile.FileInformationClass != FileStandardInformation ||
+            stack->Parameters.QueryFile.Length != sizeof(SectionStandardInfo)) {
+            return Complete(irp, STATUS_INVALID_PARAMETER, 0);
+        }
+        uint32_t count = ++MupProviderEvidence.section_query_standard_count;
+        if (count != 1) {
+            uint8_t *output = (uint8_t *)irp->AssociatedSystemBuffer;
+            const uint8_t *expected = (const uint8_t *)&SectionStandardInfo;
+            for (uint32_t i = 0; i < sizeof(SectionStandardInfo); i++) output[i] = expected[i];
+            DbgPrint("[mup-provider-section-query] class=5 bytes=24 count=%u\n", count);
+            return Complete(irp, STATUS_SUCCESS, sizeof(SectionStandardInfo));
+        }
+        IRP *empty = NULL;
+        stack->Control |= SL_PENDING_RETURNED;
+        if (!__atomic_compare_exchange_n(&PendingSectionQueryIrp, &empty, irp, 0,
+                                         __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+            stack->Control &= (uint8_t)~SL_PENDING_RETURNED;
+            return Complete(irp, STATUS_DEVICE_BUSY, 0);
+        }
+        DbgPrint("[mup-provider-section-query-pending-dispatch] class=5 bytes=24\n");
+        KeSetEvent(PendingSectionQueryEvent, 0, 0);
+        return STATUS_PENDING;
+    }
     if (stack == NULL || stack->MajorFunction != IRP_MJ_QUERY_INFORMATION ||
         stack->FileObject == NULL ||
         (((FILE_OBJECT *)stack->FileObject)->FsContext != stack->FileObject &&
@@ -670,6 +761,26 @@ static void __stdcall RegistrationWorker(void *context)
                 Complete(pending, STATUS_SUCCESS, sizeof(ProbeStandardInfo));
             }
         }
+        if (NT_SUCCESS(KeWaitForSingleObject(PendingSectionQueryEvent, 0, 0, 0, NULL))) {
+            IRP *pending = __atomic_exchange_n(&PendingSectionQueryIrp, NULL, __ATOMIC_ACQ_REL);
+            if (pending != NULL) {
+                uint8_t *output = (uint8_t *)pending->AssociatedSystemBuffer;
+                const uint8_t *expected = (const uint8_t *)&SectionStandardInfo;
+                for (uint32_t i = 0; i < sizeof(SectionStandardInfo); i++) output[i] = expected[i];
+                DbgPrint("[mup-provider-section-query-pending-complete] class=5 bytes=24\n");
+                Complete(pending, STATUS_SUCCESS, sizeof(SectionStandardInfo));
+            }
+        }
+        if (NT_SUCCESS(KeWaitForSingleObject(PendingSectionReadEvent, 0, 0, 0, NULL))) {
+            IRP *pending = __atomic_exchange_n(&PendingSectionReadIrp, NULL, __ATOMIC_ACQ_REL);
+            if (pending != NULL) {
+                uint8_t *output = (uint8_t *)pending->AssociatedSystemBuffer;
+                for (uint32_t i = 0; i < 4096; i++) output[i] = (uint8_t)i;
+                MupProviderEvidence.section_page_read_count++;
+                DbgPrint("[mup-provider-section-read-pending-complete] bytes=4096\n");
+                Complete(pending, STATUS_SUCCESS, 4096);
+            }
+        }
         PsTerminateSystemThread(STATUS_SUCCESS);
         return;
     }
@@ -684,6 +795,8 @@ NTSTATUS __stdcall DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *registry_p
     (void)registry_path;
     KeInitializeEvent(PendingFlushEvent, 1, 0);
     KeInitializeEvent(PendingQueryFileEvent, 1, 0);
+    KeInitializeEvent(PendingSectionQueryEvent, 1, 0);
+    KeInitializeEvent(PendingSectionReadEvent, 1, 0);
     MupProviderEvidence.driver_entry++;
     DbgPrint("[mup-provider-stage] entry\n");
     UNICODE_STRING provider_name = {

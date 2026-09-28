@@ -60,8 +60,9 @@ impl LayeredOpenSource {
             Self::Installed { metadata, .. } if metadata.file_id == metadata_file_id => {
                 Ok(metadata_file_id)
             }
-            Self::Overlay { file_id } if file_id == metadata_file_id && file_id != 0 => {
-                Ok(OVERLAY_BIT | file_id)
+            Self::Overlay { .. } if metadata_file_id != 0 => {
+                // The retained overlay id is an open handle; metadata carries the stable node id.
+                Ok(OVERLAY_BIT | metadata_file_id)
             }
             _ => Err(STATUS_DATA_ERROR),
         }
@@ -330,12 +331,23 @@ mod tests {
         assert_eq!(installed.file_internal_index(137), Ok(137));
         assert_eq!(overlay.file_internal_index(137), Ok((1 << 63) | 137));
         assert_eq!(installed.file_internal_index(138), Err(STATUS_DATA_ERROR));
-        assert_eq!(overlay.file_internal_index(138), Err(STATUS_DATA_ERROR));
+        assert_eq!(overlay.file_internal_index(138), Ok((1 << 63) | 138));
         assert_eq!(overlay.file_internal_index(1 << 63), Err(STATUS_DATA_ERROR));
+        assert_eq!(overlay.file_internal_index(0), Err(STATUS_DATA_ERROR));
         assert_eq!(
             LayeredOpenSource::Overlay { file_id: 0 }.file_internal_index(0),
             Err(STATUS_DATA_ERROR)
         );
+    }
+
+    #[test]
+    fn overlay_file_index_uses_stable_node_identity_across_distinct_open_handles() {
+        let first = LayeredOpenSource::Overlay { file_id: 41 };
+        let second = LayeredOpenSource::Overlay { file_id: 42 };
+        let zero = LayeredOpenSource::Overlay { file_id: 0 };
+        assert_eq!(first.file_internal_index(137), Ok((1 << 63) | 137));
+        assert_eq!(second.file_internal_index(137), Ok((1 << 63) | 137));
+        assert_eq!(zero.file_internal_index(137), Ok((1 << 63) | 137));
     }
 
     #[test]
