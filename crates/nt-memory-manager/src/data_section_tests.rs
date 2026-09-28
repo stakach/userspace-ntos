@@ -314,6 +314,36 @@ fn only_eof_suffix_is_zero_filled() {
 }
 
 #[test]
+fn planned_page_read_can_complete_after_provider_delivery() {
+    let plan = plan_data_section_page_read(2, 0x2100, 0x2100).unwrap();
+    assert_eq!(plan.offset(), 0x2000);
+    assert_eq!(plan.length(), 0x100);
+    let mut output = [0xcc; DATA_PAGE_SIZE];
+    output[..plan.length()].fill(0xa5);
+    plan.complete(0, plan.length(), &mut output).unwrap();
+    assert_eq!(&output[..0x100], &[0xa5; 0x100]);
+    assert!(output[0x100..].iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn planned_page_read_refuses_failed_or_inexact_terminal_delivery() {
+    let plan = plan_data_section_page_read(0, 0x1000, 0x1000).unwrap();
+    for (status, read, expected) in [
+        (STATUS_END_OF_FILE, 0, STATUS_END_OF_FILE),
+        (0, DATA_PAGE_SIZE - 1, STATUS_IO_DEVICE_ERROR),
+        (0, DATA_PAGE_SIZE + 1, STATUS_IO_DEVICE_ERROR),
+    ] {
+        let mut output = [0xcc; DATA_PAGE_SIZE];
+        assert_eq!(plan.complete(status, read, &mut output), Err(expected));
+        assert_eq!(output, [0xcc; DATA_PAGE_SIZE]);
+    }
+    assert_eq!(
+        plan_data_section_page_read(1, 0x2000, 0x1000),
+        Err(STATUS_END_OF_FILE)
+    );
+}
+
+#[test]
 fn read_errors_and_short_or_oversized_success_never_form_a_valid_page() {
     for (status, short, expected) in [
         (0, -1, STATUS_IO_DEVICE_ERROR),
