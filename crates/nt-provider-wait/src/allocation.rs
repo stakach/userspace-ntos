@@ -371,6 +371,33 @@ impl ProviderAllocationCatalog {
         Ok(snapshot)
     }
 
+    /// Reserve a disjoint set of exact allocations without partially retiring the set.
+    pub fn begin_retirement_batch(
+        &mut self,
+        allocations: &[ProviderAllocationSnapshot],
+    ) -> Result<(), ProviderAllocationError> {
+        for (index, allocation) in allocations.iter().enumerate() {
+            if allocations[..index]
+                .iter()
+                .any(|previous| previous.identity == allocation.identity)
+            {
+                return Err(ProviderAllocationError::AddressInUse);
+            }
+            if self.snapshot_active(allocation.identity)? != *allocation
+                || self.validate_retirement(allocation.identity)? != *allocation
+            {
+                return Err(ProviderAllocationError::StaleIdentity);
+            }
+        }
+        for allocation in allocations {
+            let slot = self
+                .slot(allocation.identity)
+                .expect("validated retirement batch identity");
+            self.records[slot].retiring = true;
+        }
+        Ok(())
+    }
+
     /// Atomically exchange one exact lifetime pin for a retirement reservation.
     /// On failure the pin remains held, including when another pin prevents retirement.
     pub fn begin_retirement_from_pin(
@@ -644,6 +671,55 @@ mod tests {
             catalog.begin_retirement_from_pin(copy_pin),
             Err(ProviderAllocationError::StalePin)
         );
+        assert_eq!(catalog.snapshot_active(reused.identity), Ok(reused));
+    }
+
+    #[test]
+    fn batch_retirement_is_all_or_nothing_for_context_storage() {
+        let mut catalog = ProviderAllocationCatalog::new();
+        let thread = catalog.register(arena(1), 0x8000, 0x100).unwrap();
+        let teb = catalog.register(arena(1), 0x9000, 0x100).unwrap();
+        let (_, pin) = catalog.pin_containing(teb.base, 1).unwrap();
+        assert_eq!(
+            catalog.begin_retirement_batch(&[thread, teb]),
+            Err(ProviderAllocationError::Pinned)
+        );
+        assert_eq!(catalog.snapshot_active(thread.identity), Ok(thread));
+        assert_eq!(catalog.snapshot_active(teb.identity), Ok(teb));
+        catalog.release_pin(pin).unwrap();
+        assert_eq!(catalog.begin_retirement_batch(&[thread, teb]), Ok(()));
+        assert_eq!(
+            catalog.snapshot_active(thread.identity),
+            Err(ProviderAllocationError::Retiring)
+        );
+        assert_eq!(
+            catalog.snapshot_active(teb.identity),
+            Err(ProviderAllocationError::Retiring)
+        );
+        catalog.retire(thread.identity).unwrap();
+        catalog.retire(teb.identity).unwrap();
+    }
+
+    #[test]
+    fn batch_retirement_rejects_duplicate_and_stale_generations() {
+        let mut catalog = ProviderAllocationCatalog::new();
+        let first = catalog.register(arena(1), 0xa000, 0x100).unwrap();
+        let second = catalog.register(arena(1), 0xb000, 0x100).unwrap();
+        assert_eq!(
+            catalog.begin_retirement_batch(&[first, first]),
+            Err(ProviderAllocationError::AddressInUse)
+        );
+        assert_eq!(catalog.snapshot_active(first.identity), Ok(first));
+        catalog.retire(second.identity).unwrap();
+        let reused = catalog
+            .register(arena(1), second.base, second.capacity)
+            .unwrap();
+        assert_ne!(reused.identity, second.identity);
+        assert_eq!(
+            catalog.begin_retirement_batch(&[first, second]),
+            Err(ProviderAllocationError::StaleIdentity)
+        );
+        assert_eq!(catalog.snapshot_active(first.identity), Ok(first));
         assert_eq!(catalog.snapshot_active(reused.identity), Ok(reused));
     }
 
