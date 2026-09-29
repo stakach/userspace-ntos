@@ -239,6 +239,20 @@ impl ProviderAllocationCatalog {
         record.snapshot(slot)
     }
 
+    /// Match a native allocation header to the live, non-retiring catalog generation.
+    pub fn active_exact_capacity(
+        &self,
+        arena: ProviderArenaIdentity,
+        base: u64,
+        native_capacity: u64,
+    ) -> Result<ProviderAllocationSnapshot, ProviderAllocationError> {
+        let snapshot = self.exact(arena, base)?;
+        if snapshot.capacity != native_capacity {
+            return Err(ProviderAllocationError::StaleIdentity);
+        }
+        self.snapshot_active(snapshot.identity)
+    }
+
     pub fn containing(
         &self,
         address: u64,
@@ -357,6 +371,30 @@ impl ProviderAllocationCatalog {
         Ok(snapshot)
     }
 
+    /// Atomically exchange one exact lifetime pin for a retirement reservation.
+    /// On failure the pin remains held, including when another pin prevents retirement.
+    pub fn begin_retirement_from_pin(
+        &mut self,
+        pin: ProviderAllocationPin,
+    ) -> Result<ProviderAllocationSnapshot, ProviderAllocationError> {
+        if pin.catalog_id != self.catalog_id || self.catalog_id == 0 {
+            return Err(ProviderAllocationError::StalePin);
+        }
+        let index = self
+            .pins
+            .iter()
+            .position(|record| record.id == pin.id && record.identity == pin.identity)
+            .ok_or(ProviderAllocationError::StalePin)?;
+        let record = self.pins.swap_remove(index);
+        match self.begin_retirement(pin.identity) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                self.pins.push(record);
+                Err(error)
+            }
+        }
+    }
+
     pub fn validate_retirement(
         &self,
         identity: ProviderAllocationIdentity,
@@ -435,6 +473,36 @@ mod tests {
         );
         assert_eq!(catalog.snapshot(second.identity).unwrap(), second);
         assert_eq!(catalog.exact(arena(1), 0x1000).unwrap(), second);
+    }
+
+    #[test]
+    fn active_exact_capacity_rejects_reuse_retirement_and_header_mismatch() {
+        let mut catalog = ProviderAllocationCatalog::new();
+        let first = catalog.register(arena(1), 0x2000, 0x80).unwrap();
+        assert_eq!(
+            catalog.active_exact_capacity(arena(1), 0x2000, 0x80),
+            Ok(first)
+        );
+        assert_eq!(
+            catalog.active_exact_capacity(arena(1), 0x2000, 0x90),
+            Err(ProviderAllocationError::StaleIdentity)
+        );
+        catalog.retire(first.identity).unwrap();
+        let second = catalog.register(arena(1), 0x2000, 0x90).unwrap();
+        assert_ne!(first.identity, second.identity);
+        assert_eq!(
+            catalog.active_exact_capacity(arena(1), 0x2000, 0x80),
+            Err(ProviderAllocationError::StaleIdentity)
+        );
+        assert_eq!(
+            catalog.active_exact_capacity(arena(2), 0x2000, 0x90),
+            Err(ProviderAllocationError::NotFound)
+        );
+        catalog.begin_retirement(second.identity).unwrap();
+        assert_eq!(
+            catalog.active_exact_capacity(arena(1), 0x2000, 0x90),
+            Err(ProviderAllocationError::Retiring)
+        );
     }
 
     #[test]
@@ -543,6 +611,40 @@ mod tests {
             Err(ProviderAllocationError::StalePin)
         );
         catalog.retire(reused.identity).unwrap();
+    }
+
+    #[test]
+    fn pinned_reallocation_transfers_exact_ownership_to_retirement() {
+        let mut catalog = ProviderAllocationCatalog::new();
+        let allocation = catalog.register(arena(1), 0x7000, 0x100).unwrap();
+        let (_, copy_pin) = catalog.pin_containing(0x7000, 0x100).unwrap();
+        let (_, other_pin) = catalog.pin_containing(0x7010, 0x10).unwrap();
+        assert_eq!(
+            catalog.begin_retirement_from_pin(copy_pin),
+            Err(ProviderAllocationError::Pinned)
+        );
+        assert_eq!(
+            catalog.retire(allocation.identity),
+            Err(ProviderAllocationError::Pinned)
+        );
+        catalog.release_pin(other_pin).unwrap();
+        assert_eq!(catalog.begin_retirement_from_pin(copy_pin), Ok(allocation));
+        assert_eq!(
+            catalog.release_pin(copy_pin),
+            Err(ProviderAllocationError::StalePin)
+        );
+        assert_eq!(
+            catalog.pin_containing(0x7000, 1),
+            Err(ProviderAllocationError::Retiring)
+        );
+        catalog.retire(allocation.identity).unwrap();
+        let reused = catalog.register(arena(1), 0x7000, 0x100).unwrap();
+        assert_ne!(reused.identity, allocation.identity);
+        assert_eq!(
+            catalog.begin_retirement_from_pin(copy_pin),
+            Err(ProviderAllocationError::StalePin)
+        );
+        assert_eq!(catalog.snapshot_active(reused.identity), Ok(reused));
     }
 
     #[test]
