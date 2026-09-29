@@ -2311,6 +2311,7 @@ unsafe fn poll_hosted_completion(instance_index: usize) -> Option<nt_io_manager:
 const POOL_FREE_LIST_MAX: u64 = (FSD_POOL_FRAMES * 0x1000) / 16;
 const COMPONENT_POOL_LOCK_OFF: u64 = 0x10;
 const COMPONENT_DEVICE_REPLY_LOCK_OFF: u64 = 0x18;
+const COMPONENT_POOL_GENERATION_OFF: u64 = 0x20;
 /// Double `pool_free` calls the guard below rejected, and free-list cycles `pool_alloc` broke out of.
 /// Both are counter-backed so a regression is a gate failure rather than a silent 555-second hang.
 pub(crate) static FSD_POOL_DOUBLE_FREES: AtomicU64 = AtomicU64::new(0);
@@ -2341,6 +2342,15 @@ unsafe fn component_pool_lock() -> ComponentPoolLockGuard {
         crate::yield_now();
     }
     ComponentPoolLockGuard
+}
+
+/// Called with the shared pool lock held by either address-space view. A reused address must
+/// receive a new identity before it leaves the free list.
+unsafe fn next_component_pool_generation(pool_va: u64) -> Option<u64> {
+    let slot = (pool_va + COMPONENT_POOL_GENERATION_OFF) as *mut u64;
+    let next = read_volatile(slot).checked_add(1)?;
+    write_volatile(slot, next);
+    Some(next)
 }
 
 struct ComponentDeviceReplyLockGuard;
@@ -2395,8 +2405,12 @@ pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
         steps += 1;
         let cap = read_volatile((cur - 16) as *const u64);
         if cap >= size {
+            let Some(generation) = next_component_pool_generation(FSD_POOL_VADDR) else {
+                return 0;
+            };
             let next = read_volatile((cur - 8) as *const u64);
             write_volatile(prev, next);
+            write_volatile((cur - 8) as *mut u64, generation);
             return cur;
         }
         prev = (cur - 8) as *mut u64;
@@ -2418,9 +2432,12 @@ pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
         print_str(b"\n");
         return 0;
     }
+    let Some(generation) = next_component_pool_generation(FSD_POOL_VADDR) else {
+        return 0;
+    };
     write_volatile(ctr, (block + size) - FSD_POOL_VADDR);
     write_volatile((block - 16) as *mut u64, size); // capacity header
-    write_volatile((block - 8) as *mut u64, 0);
+    write_volatile((block - 8) as *mut u64, generation);
     block
 }
 
@@ -3540,7 +3557,9 @@ unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<
         let cap = read_volatile((cur_exec - 16) as *const u64);
         let next = read_volatile((cur_exec - 8) as *const u64);
         if cap >= size {
+            let generation = next_component_pool_generation(inst.exec_pool_va)?;
             write_volatile(prev_next_slot_exec as *mut u64, next);
+            write_volatile((cur_exec - 8) as *mut u64, generation);
             return Some(cur);
         }
         prev_next_slot_exec = cur_exec - 8;
@@ -3562,9 +3581,10 @@ unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<
     if block_exec < inst.exec_pool_va + 16 || block_exec >= exec_pool_end {
         return None;
     }
+    let generation = next_component_pool_generation(inst.exec_pool_va)?;
     write_volatile(ctr_exec as *mut u64, end - FSD_POOL_VADDR);
     write_volatile((block_exec - 16) as *mut u64, size);
-    write_volatile((block_exec - 8) as *mut u64, 0);
+    write_volatile((block_exec - 8) as *mut u64, generation);
     Some(block)
 }
 
@@ -36968,6 +36988,7 @@ unsafe fn load_driver_reserved(
         map_instance_exec_frame(instance, cap, win.pool_va + i * 0x1000, RW_NX)
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     }
+    zero(win.pool_va, POOL_DATA_OFF);
     // DATA + SHARED + ARG: caps + an aux PT in the executive VSpace.
     let data_base = alloc_driver_frame_run(instance, b"data", FSD_DATA_FRAMES)
         .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
