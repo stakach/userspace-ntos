@@ -78,6 +78,47 @@ pub fn copy_device_relations_x64(bytes: &[u8]) -> Result<Vec<u64>, DeviceRelatio
     Ok(objects)
 }
 
+/// Write a counted native x64 `DEVICE_RELATIONS` into caller-owned storage. The pointers must
+/// already be authenticated projections with a caller reference for each entry. Validation is
+/// complete before any byte is written, so failure leaves the destination unchanged.
+pub fn write_device_relations_x64(
+    bytes: &mut [u8],
+    objects: &[u64],
+) -> Result<usize, DeviceRelationsCopyError> {
+    let count = u32::try_from(objects.len()).map_err(|_| DeviceRelationsCopyError::SizeOverflow)?;
+    let object_bytes = objects
+        .len()
+        .checked_mul(core::mem::size_of::<u64>())
+        .ok_or(DeviceRelationsCopyError::SizeOverflow)?;
+    let required = DEVICE_RELATIONS_X64_HEADER_BYTES
+        .checked_add(object_bytes)
+        .ok_or(DeviceRelationsCopyError::SizeOverflow)?;
+    if bytes.len() < required {
+        return Err(if bytes.len() < DEVICE_RELATIONS_X64_HEADER_BYTES {
+            DeviceRelationsCopyError::TruncatedHeader
+        } else {
+            DeviceRelationsCopyError::TruncatedObjects
+        });
+    }
+    for (index, &object) in objects.iter().enumerate() {
+        if object == 0 {
+            return Err(DeviceRelationsCopyError::NullPdo);
+        }
+        if objects[..index].contains(&object) {
+            return Err(DeviceRelationsCopyError::DuplicatePdo);
+        }
+    }
+    bytes[..4].copy_from_slice(&count.to_le_bytes());
+    bytes[4..DEVICE_RELATIONS_X64_HEADER_BYTES].fill(0);
+    for (slot, &object) in bytes[DEVICE_RELATIONS_X64_HEADER_BYTES..required]
+        .chunks_exact_mut(8)
+        .zip(objects)
+    {
+        slot.copy_from_slice(&object.to_le_bytes());
+    }
+    Ok(required)
+}
+
 pub const MAX_BUS_QUERY_ID_CHARS: usize = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1078,6 +1119,45 @@ mod tests {
             copy_device_relations_x64(&native_relations(&[0x1000, 0x1000], 24)),
             Err(DeviceRelationsCopyError::DuplicatePdo)
         );
+    }
+
+    #[test]
+    fn native_device_relations_writer_round_trips_projected_pointers() {
+        let mut bytes = [0x55; 40];
+        let written = write_device_relations_x64(&mut bytes, &[0x1000, 0x2000]).unwrap();
+        assert_eq!(written, 24);
+        assert_eq!(&bytes[..8], &[2, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&bytes[written..], &[0x55; 16]);
+        assert_eq!(
+            copy_device_relations_x64(&bytes[..written]),
+            Ok(vec![0x1000, 0x2000])
+        );
+
+        let written = write_device_relations_x64(&mut bytes, &[]).unwrap();
+        assert_eq!(written, 8);
+        assert_eq!(copy_device_relations_x64(&bytes[..written]), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn native_device_relations_writer_rejects_before_modifying_destination() {
+        for (size, objects, error) in [
+            (7, &[0x1000][..], DeviceRelationsCopyError::TruncatedHeader),
+            (
+                15,
+                &[0x1000][..],
+                DeviceRelationsCopyError::TruncatedObjects,
+            ),
+            (24, &[0][..], DeviceRelationsCopyError::NullPdo),
+            (
+                24,
+                &[0x1000, 0x1000][..],
+                DeviceRelationsCopyError::DuplicatePdo,
+            ),
+        ] {
+            let mut bytes = vec![0xa5; size];
+            assert_eq!(write_device_relations_x64(&mut bytes, objects), Err(error));
+            assert!(bytes.iter().all(|&byte| byte == 0xa5));
+        }
     }
 
     #[test]
