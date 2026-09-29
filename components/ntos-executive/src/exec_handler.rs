@@ -29753,6 +29753,24 @@ impl ExecNtHandler {
         {
             return Err(STATUS_INVALID_VIEW_SIZE);
         }
+        let effective_view_size = if request.view_size == 0 {
+            section.size - section_offset
+        } else {
+            request.view_size
+        };
+        nt_io_manager::win32k_section_map_wire::validate_commit_size(
+            request.commit_size,
+            effective_view_size,
+            section.basic_attributes() & nt_memory_manager::SECTION_ATTR_SEC_RESERVE != 0,
+        )
+        .map_err(|error| match error {
+            nt_io_manager::win32k_section_map_wire::SectionMapCommitError::ExceedsView => {
+                nt_address_space::STATUS_INVALID_PARAMETER_5
+            }
+            nt_io_manager::win32k_section_map_wire::SectionMapCommitError::IncrementalCommitUnsupported => {
+                0xC000_00BB
+            }
+        })?;
         self.pending_section_view_rollbacks
             .try_reserve(1)
             .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;

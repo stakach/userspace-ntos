@@ -30,7 +30,6 @@ unsafe fn abort(token: u64, base: u64) {
     }
 }
 
-#[allow(dead_code)] // Kept behind the strict import gate until exact unmap is live.
 pub(super) extern "win64" fn map(
     section_handle: u64,
     process_handle: u64,

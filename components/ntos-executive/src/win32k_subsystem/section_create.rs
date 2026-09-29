@@ -30,7 +30,6 @@ unsafe fn abort(token: u64, handle: u64) {
     }
 }
 
-#[allow(dead_code)] // Kept behind the strict win32k import gate until Section mapping is live.
 pub(super) extern "win64" fn create(
     handle_out: *mut u64,
     desired_access: u32,
