@@ -74,6 +74,7 @@ mod fs_loader;
 mod mounted_volume;
 mod mounted_volume_backend;
 mod mounted_volume_ingress_probe;
+mod mounted_section_probe;
 mod hosted_routed_section_capture;
 mod routed_section_io;
 mod section_metadata_work;
@@ -30065,6 +30066,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // use the same retained scratch alias as later process demand fills, so its page tables must
     // exist before the first driver executes rather than only when SMSS starts.
     map_demand_scratch_pts(SMSS_SCRATCH_BASE);
+    let mounted_section_ok = mounted_volume_device_id
+        .is_some_and(|device| unsafe {
+            mounted_section_probe::probe_font_section_after_file_close(device, SMSS_SCRATCH_BASE)
+        });
+    check(
+        b"exec_mounted_volume_section_page_after_file_close",
+        mounted_section_ok,
+        &mut passed,
+    );
 
     // --- SERVICE 9: the GENERAL DYNAMIC driver-launch path. The SYSTEM hive is imported into
     // Config Manager metadata, ordered by ServiceGroupOrder, then narrowed by mechanism: FSD-class
