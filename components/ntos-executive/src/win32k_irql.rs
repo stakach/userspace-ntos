@@ -13,10 +13,13 @@ pub(super) extern "win64" fn get_current() -> u8 {
     unsafe {
         let activation = active_provider_stack_event_activation()
             .unwrap_or_else(|| protocol_fault(b"KeGetCurrentIrql"));
-        (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
-            .as_ref()
-            .and_then(|catalog| catalog.current_irql(activation).ok())
-            .unwrap_or_else(|| protocol_fault(b"KeGetCurrentIrql"))
+        let result = {
+            let _metadata = ProviderMetadataGuard::acquire();
+            (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
+                .as_ref()
+                .and_then(|catalog| catalog.current_irql(activation).ok())
+        };
+        result.unwrap_or_else(|| protocol_fault(b"KeGetCurrentIrql"))
     }
 }
 
@@ -29,10 +32,13 @@ pub(super) extern "win64" fn raise(new: u8) -> u8 {
     unsafe {
         let activation = active_provider_stack_event_activation()
             .unwrap_or_else(|| protocol_fault(b"KfRaiseIrql"));
-        (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
-            .as_mut()
-            .and_then(|catalog| catalog.raise_irql(activation, new).ok())
-            .unwrap_or_else(|| protocol_fault(b"KfRaiseIrql"))
+        let result = {
+            let _metadata = ProviderMetadataGuard::acquire();
+            (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
+                .as_mut()
+                .and_then(|catalog| catalog.raise_irql(activation, new).ok())
+        };
+        result.unwrap_or_else(|| protocol_fault(b"KfRaiseIrql"))
     }
 }
 
@@ -40,10 +46,13 @@ pub(super) extern "win64" fn lower(new: u8) {
     unsafe {
         let activation = active_provider_stack_event_activation()
             .unwrap_or_else(|| protocol_fault(b"KeLowerIrql"));
-        (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
-            .as_mut()
-            .and_then(|catalog| catalog.lower_irql(activation, new).ok())
-            .unwrap_or_else(|| protocol_fault(b"KeLowerIrql"));
+        let result = {
+            let _metadata = ProviderMetadataGuard::acquire();
+            (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
+                .as_mut()
+                .and_then(|catalog| catalog.lower_irql(activation, new).ok())
+        };
+        result.unwrap_or_else(|| protocol_fault(b"KeLowerIrql"));
     }
 }
 
@@ -55,6 +64,7 @@ pub(super) fn require_wait(timeout: nt_provider_wait::ProviderWaitTimeoutKind) {
     let allowed = unsafe {
         let activation = active_provider_stack_event_activation()
             .unwrap_or_else(|| protocol_fault(b"dispatcher wait"));
+        let _metadata = ProviderMetadataGuard::acquire();
         (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
             .as_ref()
             .and_then(|catalog| catalog.can_wait(activation, timeout).ok())
