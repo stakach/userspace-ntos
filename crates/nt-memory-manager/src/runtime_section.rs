@@ -219,6 +219,7 @@ impl ProviderVspaceIdentity {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProviderSectionView {
+    pub generation: u64,
     pub owner: ProviderVspaceIdentity,
     pub section: SectionIdentity,
     pub base: u64,
@@ -336,6 +337,7 @@ pub struct GenericSectionTable {
     dirty_epoch: u64,
     section_generation: u64,
     view_generation: u64,
+    provider_view_generation: u64,
     section_growths: u64,
     section_allocation_failures: u64,
     view_growths: u64,
@@ -357,6 +359,7 @@ impl GenericSectionTable {
             dirty_epoch: 0,
             section_generation: 0,
             view_generation: 0,
+            provider_view_generation: 0,
             section_growths: 0,
             section_allocation_failures: 0,
             view_growths: 0,
@@ -646,12 +649,12 @@ impl GenericSectionTable {
         base: u64,
         size: u64,
         section_offset: u64,
-    ) -> bool {
+    ) -> Option<ProviderSectionView> {
         if !owner.is_valid() || base == 0 || size == 0 || (base | size | section_offset) & 0xfff != 0 {
-            return false;
+            return None;
         }
-        let Some(end) = base.checked_add(size) else { return false };
-        let Some(section_end) = section_offset.checked_add(size) else { return false };
+        let Some(end) = base.checked_add(size) else { return None };
+        let Some(section_end) = section_offset.checked_add(size) else { return None };
         if self.section_identity(section.index) != Some(section)
             || self.sections[section.index]
                 .size
@@ -664,18 +667,21 @@ impl GenericSectionTable {
                         || (base < view.base + view.size && view.base < end))
             })
         {
-            return false;
+            return None;
         }
+        let generation = self.provider_view_generation.checked_add(1)?;
         let old_capacity = self.provider_views.capacity();
         if self.provider_views.try_reserve(1).is_err() {
             self.provider_view_allocation_failures = self.provider_view_allocation_failures.saturating_add(1);
-            return false;
+            return None;
         }
         if self.provider_views.capacity() != old_capacity {
             self.provider_view_growths = self.provider_view_growths.saturating_add(1);
         }
-        self.provider_views.push(ProviderSectionView { owner, section, base, size, section_offset });
-        true
+        let view = ProviderSectionView { generation, owner, section, base, size, section_offset };
+        self.provider_views.push(view);
+        self.provider_view_generation = generation;
+        Some(view)
     }
 
     pub fn provider_view_for_page(
@@ -702,17 +708,12 @@ impl GenericSectionTable {
         self.provider_views.iter().copied().find(|view| view.owner == owner)
     }
 
-    /// An unmap must name the same provider incarnation and the exact view base.
-    pub fn unmap_provider_view(
-        &mut self,
-        owner: ProviderVspaceIdentity,
-        base: u64,
-    ) -> Option<ProviderSectionView> {
-        if !owner.is_valid() { return None; }
-        let index = self.provider_views.iter().position(|view| {
-            view.owner == owner
-                && view.base == base
-                && self.section_identity(view.section.index) == Some(view.section)
+    /// An unmap must name the exact view incarnation, not just a reusable address.
+    pub fn unmap_provider_view_exact(&mut self, view: ProviderSectionView) -> Option<ProviderSectionView> {
+        if !view.owner.is_valid() || view.generation == 0 { return None; }
+        let index = self.provider_views.iter().position(|candidate| {
+            *candidate == view
+                && self.section_identity(candidate.section.index) == Some(candidate.section)
         })?;
         let view = self.provider_views.remove(index);
         self.clear_section_if_unreferenced(view.section.index);
@@ -997,17 +998,43 @@ mod tests {
         let index = create_section(&mut table, 2, 0x40);
         let section = table.section_identity(index).unwrap();
         let owner = provider(7, 11);
-        assert!(table.map_provider_view(owner, section, 0x10000, 0x2000, 0));
+        let view = table.map_provider_view(owner, section, 0x10000, 0x2000, 0).unwrap();
         assert!(table.release_handle(index));
         assert_eq!(table.provider_view_for_page(owner, 0x11000).unwrap().section, section);
         assert!(table.section(index).is_some());
         assert!(table.next_retirement().is_none());
         assert_eq!(table.stats().live_provider_views, 1);
 
-        assert_eq!(table.unmap_provider_view(owner, 0x10000).unwrap().section, section);
+        assert_eq!(table.unmap_provider_view_exact(view).unwrap().section, section);
         assert!(table.section(index).is_none());
         assert_eq!(table.next_retirement().unwrap().identity(), section);
         assert_eq!(table.stats().live_provider_views, 0);
+    }
+
+    #[test]
+    fn stale_provider_view_cannot_unmap_same_base_replacement() {
+        let mut table = GenericSectionTable::new();
+        let index = create_section(&mut table, 2, 0x40);
+        let section = table.section_identity(index).unwrap();
+        let owner = provider(7, 11);
+        let first = table.map_provider_view(owner, section, 0x10000, 0x1000, 0).unwrap();
+        assert_eq!(table.unmap_provider_view_exact(first), Some(first));
+        let replacement = table.map_provider_view(owner, section, 0x10000, 0x1000, 0).unwrap();
+        assert_ne!(first.generation, replacement.generation);
+        assert_eq!(table.unmap_provider_view_exact(first), None);
+        assert_eq!(table.provider_view_for_page(owner, 0x10000), Some(replacement));
+    }
+
+    #[test]
+    fn provider_view_generation_exhaustion_refuses_map() {
+        let mut table = GenericSectionTable::new();
+        let index = create_section(&mut table, 2, 0x40);
+        let section = table.section_identity(index).unwrap();
+        table.provider_view_generation = u64::MAX;
+
+        assert!(table.map_provider_view(provider(7, 11), section, 0x10000, 0x1000, 0).is_none());
+        assert_eq!(table.stats().live_provider_views, 0);
+        assert_eq!(table.provider_view_generation, u64::MAX);
     }
 
     #[test]
@@ -1018,21 +1045,21 @@ mod tests {
         let first = provider(7, 11);
         let next = provider(7, 12);
         let other = provider(8, 1);
-        assert!(table.map_provider_view(first, section, 0x10000, 0x2000, 0));
-        assert!(!table.map_provider_view(first, section, 0x11000, 0x1000, 0));
-        assert!(table.map_provider_view(first, section, 0x12000, 0x1000, 0x2000));
-        assert!(table.map_provider_view(other, section, 0x10000, 0x1000, 0));
+        let first_view = table.map_provider_view(first, section, 0x10000, 0x2000, 0).unwrap();
+        assert!(table.map_provider_view(first, section, 0x11000, 0x1000, 0).is_none());
+        let second_view = table.map_provider_view(first, section, 0x12000, 0x1000, 0x2000).unwrap();
+        assert!(table.map_provider_view(other, section, 0x10000, 0x1000, 0).is_some());
         assert_eq!(table.first_provider_view(first).unwrap().base, 0x10000);
         assert!(table.first_provider_view(next).is_none());
         assert!(table.provider_view_for_page(next, 0x10000).is_none());
-        assert!(table.unmap_provider_view(next, 0x10000).is_none());
-        assert!(!table.map_provider_view(next, section, 0x20000, 0x1000, 0));
-        assert!(table.unmap_provider_view(first, 0x10000).is_some());
-        assert!(table.unmap_provider_view(first, 0x12000).is_some());
+        assert!(table.unmap_provider_view_exact(ProviderSectionView { owner: next, ..first_view }).is_none());
+        assert!(table.map_provider_view(next, section, 0x20000, 0x1000, 0).is_none());
+        assert!(table.unmap_provider_view_exact(first_view).is_some());
+        assert!(table.unmap_provider_view_exact(second_view).is_some());
         assert!(table.first_provider_view(first).is_none());
-        assert!(table.map_provider_view(next, section, 0x10000, 0x1000, 0));
+        assert!(table.map_provider_view(next, section, 0x10000, 0x1000, 0).is_some());
         assert!(table.provider_view_for_page(first, 0x10000).is_none());
-        assert!(table.unmap_provider_view(first, 0x10000).is_none());
+        assert!(table.unmap_provider_view_exact(first_view).is_none());
     }
 
     #[test]
@@ -1042,13 +1069,13 @@ mod tests {
         let section = table.section_identity(index).unwrap();
         let stale = SectionIdentity { index, generation: section.generation + 1 };
         let owner = provider(7, 11);
-        assert!(!table.map_provider_view(owner, stale, 0x10000, 0x1000, 0));
-        assert!(!table.map_provider_view(provider(0, 11), section, 0x10000, 0x1000, 0));
-        assert!(!table.map_provider_view(owner, section, 0x10001, 0x1000, 0));
-        assert!(!table.map_provider_view(owner, section, 0x10000, 0x1000, 1));
-        assert!(!table.map_provider_view(owner, section, 0x10000, 0x2000, 0x3000));
-        assert!(!table.map_provider_view(owner, section, u64::MAX & !0xfff, 0x2000, 0));
-        assert!(table.map_provider_view(owner, section, 0x10000, 0x1000, 0x3000));
+        assert!(table.map_provider_view(owner, stale, 0x10000, 0x1000, 0).is_none());
+        assert!(table.map_provider_view(provider(0, 11), section, 0x10000, 0x1000, 0).is_none());
+        assert!(table.map_provider_view(owner, section, 0x10001, 0x1000, 0).is_none());
+        assert!(table.map_provider_view(owner, section, 0x10000, 0x1000, 1).is_none());
+        assert!(table.map_provider_view(owner, section, 0x10000, 0x2000, 0x3000).is_none());
+        assert!(table.map_provider_view(owner, section, u64::MAX & !0xfff, 0x2000, 0).is_none());
+        assert!(table.map_provider_view(owner, section, 0x10000, 0x1000, 0x3000).is_some());
     }
 
     #[test]
@@ -1064,9 +1091,9 @@ mod tests {
         ).unwrap();
         let section = table.section_identity(index).unwrap();
         let owner = provider(7, 11);
-        assert!(table.map_provider_view(owner, section, 0x10000, 0x2000, 0));
+        assert!(table.map_provider_view(owner, section, 0x10000, 0x2000, 0).is_some());
         assert_eq!(table.provider_view_for_page(owner, 0x11000).unwrap().section_offset, 0);
-        assert!(!table.map_provider_view(owner, section, 0x20000, 0x1000, 0x2000));
+        assert!(table.map_provider_view(owner, section, 0x20000, 0x1000, 0x2000).is_none());
     }
 
     #[test]
@@ -1319,13 +1346,13 @@ mod tests {
         let index = create_section(&mut table, 2, 0x40);
         let identity = table.section_identity(index).unwrap();
         let owner = provider(7, 11);
-        assert!(table.map_provider_view(owner, identity, 0x10000, 0x1000, 0));
+        let view = table.map_provider_view(owner, identity, 0x10000, 0x1000, 0).unwrap();
         assert!(table.release_handle(index));
         assert_eq!(
             table.publish_page_frame_exact(identity, 0, 100),
             Ok(SectionPagePublication::Inserted)
         );
-        assert!(table.unmap_provider_view(owner, 0x10000).is_some());
+        assert!(table.unmap_provider_view_exact(view).is_some());
         assert_eq!(
             table.publish_page_frame_exact(identity, 1, 101),
             Err(SectionPagePublicationError::StaleSection)
