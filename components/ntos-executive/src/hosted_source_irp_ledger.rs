@@ -3,7 +3,7 @@
 use super::*;
 use nt_io_manager::retained_query_path_forward::SourceIrpTicket;
 use nt_io_manager::source_irp_ledger::{
-    SourceIrpAllocation, SourceIrpLedger, SourceIrpLedgerError, SourceIrpRetirement,
+    SourceIrpAllocation, SourceIrpLedger, SourceIrpLedgerError, SourceIrpOwner, SourceIrpRetirement,
 };
 
 static LOCK: AtomicU64 = AtomicU64::new(0);
@@ -59,7 +59,7 @@ fn allocation(
         return None;
     }
     Some(SourceIrpAllocation {
-        instance: instance_index,
+        owner: SourceIrpOwner::HostedDriver(instance_index),
         domain: instance_domain_identity(inst)?,
         component_address,
         bytes,
@@ -107,7 +107,11 @@ pub(super) fn service(
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
             let _guard = lock();
-            let Some(owner) = ledger().allocation_for(instance_index, domain, component_address)
+            let Some(owner) = ledger().allocation_for(
+                SourceIrpOwner::HostedDriver(instance_index),
+                domain,
+                component_address,
+            )
             else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
@@ -121,7 +125,11 @@ pub(super) fn service(
             {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             }
-            match ledger().request_free(instance_index, domain, component_address) {
+            match ledger().request_free(
+                SourceIrpOwner::HostedDriver(instance_index),
+                domain,
+                component_address,
+            ) {
                 Ok(SourceIrpRetirement::Retired(ticket)) => {
                     (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get())
                 }
@@ -151,7 +159,11 @@ pub(super) fn pin(
     }
     let _guard = lock();
     let (ticket, owner) = ledger()
-        .pin(instance_index, domain, component_address)
+        .pin(
+            SourceIrpOwner::HostedDriver(instance_index),
+            domain,
+            component_address,
+        )
         .ok()?;
     if allocation(
         instance_index,
@@ -173,7 +185,7 @@ pub(super) fn matches(
     ticket: SourceIrpTicket,
 ) -> bool {
     let _guard = lock();
-    ledger().matches(instance_index, owner, ticket)
+    ledger().matches(SourceIrpOwner::HostedDriver(instance_index), owner, ticket)
 }
 
 pub(super) fn unpin(ticket: SourceIrpTicket) -> bool {
@@ -193,5 +205,5 @@ pub(super) fn deferred_free_requested(ticket: SourceIrpTicket) -> bool {
 
 pub(super) fn live_for_instance(instance_index: usize, domain: HostedDomainIdentity) -> usize {
     let _guard = lock();
-    ledger().live_for_instance(instance_index, domain)
+    ledger().live_for_owner(SourceIrpOwner::HostedDriver(instance_index), domain)
 }
