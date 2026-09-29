@@ -1255,6 +1255,7 @@ pub const W32_FILE_OBJECT_DEREFERENCE_POINTER: u64 = 3;
 pub const W32_FILE_OBJECT_RELATED_DEVICE: u64 = 4;
 pub const W32_FILE_OBJECT_WAIT_IDENTITY: u64 = 5;
 pub const W32_FILE_OBJECT_DEVICE_NAME: u64 = 6;
+pub const W32_FILE_OBJECT_RELEASE_WAIT: u64 = 7;
 /// Root-authenticated kernel activation handoff before entering provider code.
 pub const W32_KERNEL_ACTIVATION_LABEL: u64 = 0x78E;
 pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
@@ -5137,6 +5138,7 @@ enum ProviderWaitLease {
     Event(nt_provider_wait::ProviderLocalEventLease),
     Timer(nt_provider_wait::ProviderLocalTimerOperationLease),
     ProjectedEvent(nt_kernel_exec::ProviderEventProjectionWaitLease),
+    File(u64),
 }
 
 struct ProviderWaitAdmission {
@@ -5186,12 +5188,28 @@ impl ProviderWaitAdmission {
                             .release_wait(lease)
                             .is_ok()
                     }
+                    Some(ProviderWaitLease::File(_)) => continue,
                 };
                 if !released {
                     return false;
                 }
                 self.leases[index] = None;
             }
+        }
+        for index in 0..self.count {
+            let Some(ProviderWaitLease::File(token)) = self.leases[index] else {
+                continue;
+            };
+            let (status, _, _, _) = win32k_file_object_broker_call(
+                W32_FILE_OBJECT_RELEASE_WAIT,
+                token,
+                0,
+                0,
+            );
+            if status != 0 {
+                return false;
+            }
+            self.leases[index] = None;
         }
         !projected_released
             || event_reclaim_pending_marker().load(Ordering::Acquire) == 0
@@ -5281,29 +5299,27 @@ unsafe fn provider_wait_object_for_dispatcher(
     if !provider_pool_contains(object_body) {
         return None;
     }
-    let (status, file_id, generation, _) = win32k_file_object_broker_call(
+    let (status, file_id, generation, token) = win32k_file_object_broker_call(
         W32_FILE_OBJECT_WAIT_IDENTITY,
         object_body,
         0,
         0,
     );
-    if status != 0 || file_id == 0 || generation == 0 {
+    if status != 0 {
+        if token != 0 {
+            park();
+        }
         return None;
+    }
+    if file_id == 0 || generation == 0 || token == 0 {
+        park();
     }
     let canonical = nt_provider_wait::ProviderWaitObject::new(
         nt_provider_wait::ProviderWaitObjectType::File,
         file_id,
         generation,
     );
-    matches!(
-        canonical.typed(),
-        Some(
-            nt_provider_wait::ProviderWaitObjectType::Event
-                | nt_provider_wait::ProviderWaitObjectType::Timer
-                | nt_provider_wait::ProviderWaitObjectType::File
-        )
-    )
-    .then_some((canonical, None))
+    Some((canonical, Some(ProviderWaitLease::File(token))))
 }
 
 unsafe fn current_provider_wait_owner() -> Option<nt_provider_wait::ProviderWaitOwner> {

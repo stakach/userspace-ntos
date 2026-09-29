@@ -4,7 +4,8 @@ use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
 
 use nt_io_manager::{
-    consumer_file_projection::ConsumerFileProjection, DeviceId, FileId, HostedFileIdentity,
+    consumer_file_projection::ConsumerFileProjection, DeviceId, FileId, FileReference,
+    HostedFileIdentity, HostedFilePublicationLease, HostedFileWaitLeaseLedger,
     WDM_X64_FILE_OBJECT_EVENT_OFFSET, WDM_X64_FILE_OBJECT_EVENT_SIGNAL_STATE_OFFSET,
     WDM_X64_FILE_OBJECT_SIZE,
 };
@@ -35,6 +36,25 @@ struct Row {
 
 static mut ROWS: Vec<Row> = Vec::new();
 static mut NEXT_ID: u64 = 1;
+static mut WAIT_LEASES: HostedFileWaitLeaseLedger = HostedFileWaitLeaseLedger::new();
+static mut WAIT_RECEIPTS: Vec<WaitReceipt> = Vec::new();
+
+struct WaitReceipt {
+    token: u64,
+    row_id: u64,
+    identity: HostedFileIdentity,
+    releasing: bool,
+    publication: Option<HostedFilePublicationLease>,
+    reference: Option<FileReference>,
+}
+
+unsafe fn wait_leases() -> &'static mut HostedFileWaitLeaseLedger {
+    &mut *addr_of_mut!(WAIT_LEASES)
+}
+
+unsafe fn wait_receipts() -> &'static mut Vec<WaitReceipt> {
+    &mut *addr_of_mut!(WAIT_RECEIPTS)
+}
 
 unsafe fn rows() -> &'static mut Vec<Row> {
     &mut *addr_of_mut!(ROWS)
@@ -55,21 +75,95 @@ unsafe fn id_for_address(address: u64) -> Option<u64> {
 }
 
 pub(crate) unsafe fn quiescent() -> bool {
-    rows().is_empty()
+    rows().is_empty() && wait_receipts().is_empty()
 }
 
-/// The embedded notification Event is not an independently allocated Event object. A provider
-/// wait may name it only through an exact, referenced File projection.
-pub(crate) unsafe fn wait_identity_for_event(event: u64) -> Result<HostedFileIdentity, i32> {
+/// Admit an embedded FILE_OBJECT Event only while the exact projection is still referenced.
+/// The row pin is recorded before acquiring independently owned canonical receipts, so
+/// retirement cannot recycle its address during any external I/O-manager operation.
+pub(crate) unsafe fn acquire_wait_identity_for_event(
+    event: u64,
+) -> Result<(HostedFileIdentity, u64), i32> {
     let id = rows()
         .iter()
         .find(|row| {
-            row.address.checked_add(WDM_X64_FILE_OBJECT_EVENT_OFFSET as u64) == Some(event)
-                && row.address != 0
+            row.address != 0
+                && row.address.checked_add(WDM_X64_FILE_OBJECT_EVENT_OFFSET as u64) == Some(event)
         })
         .map(|row| row.id)
         .ok_or(STATUS_INVALID_HANDLE)?;
-    wait_identity_for_row(id)
+    let identity = wait_identity_for_row(id, false)?;
+    wait_receipts()
+        .try_reserve(1)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    let token = wait_leases().acquire(id, identity).map_err(|status| status.raw())?;
+    wait_receipts().push(WaitReceipt {
+        token,
+        row_id: id,
+        identity,
+        releasing: false,
+        publication: None,
+        reference: None,
+    });
+
+    let result = (|| -> Result<(), i32> {
+        let reference = io_manager_mut()
+            .retain_file_reference(identity.file_id())
+            .map_err(|status| status.raw())?;
+        wait_receipts()
+            .iter_mut()
+            .find(|receipt| receipt.token == token)
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .reference = Some(reference);
+        let publication = io_manager_mut()
+            .lease_hosted_file_identity(identity)
+            .map_err(|status| status.raw())?;
+        wait_receipts()
+            .iter_mut()
+            .find(|receipt| receipt.token == token)
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .publication = Some(publication);
+        Ok(())
+    })();
+    if let Err(status) = result {
+        if release_wait_identity(token).is_err() {
+            park();
+        }
+        return Err(status);
+    }
+    Ok((identity, token))
+}
+
+/// Retain the token and any unreleased receipts on uncertainty. Redrive may complete a
+/// partially released token without requiring LIFO pointer-reference behavior.
+pub(crate) unsafe fn release_wait_identity(token: u64) -> Result<(), i32> {
+    let index = wait_receipts()
+        .iter()
+        .position(|receipt| token != 0 && receipt.token == token)
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    let receipt = &mut wait_receipts()[index];
+    receipt.releasing = true;
+    if let Some(reference) = receipt.reference.as_mut() {
+        io_manager_mut()
+            .release_file_reference(reference)
+            .map_err(|status| status.raw())?;
+        receipt.reference = None;
+    }
+    if let Some(publication) = receipt.publication.as_mut() {
+        io_manager_mut()
+            .release_hosted_file_publication(publication)
+            .map_err(|status| status.raw())?;
+        receipt.publication = None;
+    }
+    wait_leases()
+        .release(receipt.token, receipt.row_id, receipt.identity)
+        .map_err(|status| status.raw())?;
+    let row_id = receipt.row_id;
+    wait_receipts().swap_remove(index);
+    if row(row_id).is_some_and(|owner| owner.phase == Phase::Retiring) {
+        let _ = retire(row_id);
+    }
+    Ok(())
 }
 
 pub(crate) unsafe fn wait_identity_for_canonical(
@@ -86,17 +180,18 @@ pub(crate) unsafe fn wait_identity_for_canonical(
         })
         .map(|row| row.id)
         .ok_or(STATUS_INVALID_HANDLE)?;
-    wait_identity_for_row(id)
+    wait_identity_for_row(id, true)
 }
 
-unsafe fn wait_identity_for_row(id: u64) -> Result<HostedFileIdentity, i32> {
+unsafe fn wait_identity_for_row(id: u64, allow_wait_lease: bool) -> Result<HostedFileIdentity, i32> {
     let row = row(id).ok_or(STATUS_INVALID_HANDLE)?;
     if row.phase == Phase::Building {
         return Err(STATUS_INVALID_HANDLE);
     }
     let identity = row.identity.ok_or(STATUS_INVALID_HANDLE)?;
     let projection = row.projection.as_ref().ok_or(STATUS_INVALID_HANDLE)?;
-    if projection.pointer_reference_count() == 0
+    if (projection.pointer_reference_count() == 0
+        && !(allow_wait_lease && wait_leases().has_lease(id, identity)))
         || io_manager_mut()
             .hosted_file_identity_at(identity.domain(), identity.file_id(), identity.address())
             .map_err(|status| status.raw())?
@@ -145,6 +240,9 @@ unsafe fn build(id: u64) -> Result<(), i32> {
 
 /// Retire exact receipts before returning the native allocation to the provider pool.
 unsafe fn retire(id: u64) -> Result<(), i32> {
+    if !wait_leases().can_retire(id) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
+    }
     let owner = row(id).ok_or(STATUS_INVALID_HANDLE)?;
     if owner.phase != Phase::Retiring {
         return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
@@ -300,6 +398,16 @@ pub(crate) unsafe fn handle_closed(
 }
 
 pub(crate) unsafe fn redrive() {
+    let mut cursor = 0;
+    while let Some(token) = wait_receipts()
+        .iter()
+        .filter(|receipt| receipt.releasing && receipt.token > cursor)
+        .map(|receipt| receipt.token)
+        .min()
+    {
+        cursor = token;
+        let _ = release_wait_identity(token);
+    }
     let mut cursor = 0;
     while let Some(id) = rows().iter().filter(|row| {
         row.phase == Phase::Retiring && row.id > cursor

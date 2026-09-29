@@ -166,7 +166,10 @@ pub use file_information::{
     FileInformationContract,
 };
 pub use hosted_domain::{HostedDomainIdentity, HostedDomainRecord, HostedProviderIdentity};
-pub use hosted_file::{HostedFileIdentity, HostedFilePublicationLease, HostedFileUnbindOutcome};
+pub use hosted_file::{
+    HostedFileIdentity, HostedFilePublicationLease, HostedFileUnbindOutcome,
+    HostedFileWaitLeaseLedger,
+};
 pub use irp::{
     request_input_fingerprint, BufferAccess, CancelState, CreateParameters,
     DeviceControlParameters, InformationParameters, IoBufferRef, IoParameters, IoStackLocation,
