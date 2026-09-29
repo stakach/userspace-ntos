@@ -40469,6 +40469,7 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
     let catalog_update = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
         .as_mut()
         .and_then(|query| query.acpi_pci_catalog_update.take());
+    let pci_catalog_published = catalog_update.is_some();
     if let Some(catalog_update) = catalog_update {
         crate::hosted_pci_topology::commit_hosted_acpi_pci_relation_sources(catalog_update)
             .expect("serialized ACPI PCI catalog preparation became stale before relation commit");
@@ -40480,6 +40481,7 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
         crate::hosted_pci_topology::note_hosted_pci_relation_completion(
             relation_owner,
             invalidation_completion,
+            pci_catalog_published,
         )
         .expect("published relation transaction lost its PCI topology dirty claim");
     *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = None;
@@ -40522,6 +40524,7 @@ unsafe fn complete_hosted_relation_probe_without_publication(
         crate::hosted_pci_topology::note_hosted_pci_relation_completion(
             relation_owner,
             invalidation_completion,
+            false,
         )
         .map_err(HostedRelationPublishError::Barrier)?;
     *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = None;
@@ -45981,15 +45984,20 @@ unsafe fn enqueue_hosted_device_relations(
     if relation_type == nt_pnp_abi::BUS_RELATIONS
         && enqueued.disposition == nt_pnp_manager::DeviceRelationInvalidationDisposition::Queued
     {
-        if let Err(status) =
-            crate::hosted_pci_topology::note_hosted_pci_relation_queued(relation_owner)
-        {
-            hosted_device_relation_invalidations_mut()
-                .discard_pending(enqueued.invalidation)
-                .expect("unclaimed relation request could not be rolled back");
-            return Err(status);
+        let pci_relevant = match crate::hosted_pci_topology::note_hosted_pci_relation_queued(
+            relation_owner,
+        ) {
+            Ok(relevant) => relevant,
+            Err(status) => {
+                hosted_device_relation_invalidations_mut()
+                    .discard_pending(enqueued.invalidation)
+                    .expect("unclaimed relation request could not be rolled back");
+                return Err(status);
+            }
+        };
+        if pci_relevant {
+            cancel_stale_hosted_acpi_pci_route_query()?;
         }
-        cancel_stale_hosted_acpi_pci_route_query()?;
     }
     Ok(enqueued)
 }

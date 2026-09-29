@@ -23,7 +23,6 @@ struct HostedPciTopologyAuthority {
 #[derive(Clone, Copy)]
 struct HostedPciDirtyRelation {
     endpoint: AcpiPciProviderEndpoint,
-    routing_fenced: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -74,10 +73,7 @@ impl HostedPciInterruptRouteClaim {
 static mut HOSTED_PCI_TOPOLOGY: Option<HostedPciTopologyAuthority> = None;
 
 fn routing_is_fenced(authority: &HostedPciTopologyAuthority) -> bool {
-    authority
-        .dirty_relations
-        .iter()
-        .any(|dirty| dirty.routing_fenced)
+    !authority.dirty_relations.is_empty()
 }
 
 fn routing_reconciliation_pending(authority: &HostedPciTopologyAuthority) -> bool {
@@ -86,9 +82,6 @@ fn routing_reconciliation_pending(authority: &HostedPciTopologyAuthority) -> boo
             && (authority.routes.inventory_generation() != Some(authority.inventory.generation())
                 || authority.routes.provider_scope_generation()
                     != Some(authority.scopes.generation())))
-        || (authority.scopes.sources().is_empty()
-            && authority.routes.inventory_generation().is_none()
-            && !authority.dirty_relations.is_empty())
 }
 
 fn inventory_status(error: PciInventoryError) -> nt_status::NtStatus {
@@ -301,12 +294,37 @@ pub(crate) unsafe fn hosted_acpi_pci_relation_has_sources(
         .is_some_and(|authority| authority.scopes.relation_has_sources(relation_owner))
 }
 
+unsafe fn register_hosted_pci_dirty_relation(
+    authority: &mut HostedPciTopologyAuthority,
+    relation_owner: AcpiPciProviderEndpoint,
+) -> Result<(), nt_status::NtStatus> {
+    authority
+        .dirty_relations
+        .try_reserve(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    crate::fence_pci_interrupt_claims(authority.routes.generation())?;
+    authority
+        .routes
+        .invalidate()
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    authority.interrupt_claims.clear();
+    authority.reconcile_ready = false;
+    authority.route_blocked = None;
+    authority.dirty_relations.push(HostedPciDirtyRelation {
+        endpoint: relation_owner,
+    });
+    Ok(())
+}
+
 pub(crate) unsafe fn note_hosted_pci_relation_queued(
     relation_owner: AcpiPciProviderEndpoint,
 ) -> Result<bool, nt_status::NtStatus> {
     let Some(authority) = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY)).as_mut() else {
         return Ok(false);
     };
+    if !authority.scopes.relation_has_sources(relation_owner) {
+        return Ok(false);
+    }
     if authority
         .dirty_relations
         .iter()
@@ -314,32 +332,31 @@ pub(crate) unsafe fn note_hosted_pci_relation_queued(
     {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    authority
+    register_hosted_pci_dirty_relation(authority, relation_owner)?;
+    Ok(true)
+}
+
+pub(crate) unsafe fn note_hosted_pci_relation_discovered(
+    relation_owner: AcpiPciProviderEndpoint,
+) -> Result<bool, nt_status::NtStatus> {
+    let Some(authority) = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY)).as_mut() else {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    };
+    if authority
         .dirty_relations
-        .try_reserve(1)
-        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    let relevant = authority.scopes.relation_has_sources(relation_owner);
-    if relevant {
-        crate::fence_pci_interrupt_claims(authority.routes.generation())?;
-        authority
-            .routes
-            .invalidate()
-            .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        authority.interrupt_claims.clear();
-        authority.reconcile_ready = false;
-        authority.route_blocked = None;
+        .iter()
+        .any(|dirty| dirty.endpoint == relation_owner)
+    {
+        return Ok(false);
     }
-    authority.dirty_relations.push(HostedPciDirtyRelation {
-        endpoint: relation_owner,
-        routing_fenced: relevant,
-    });
-    authority.reconcile_ready = false;
-    Ok(relevant)
+    register_hosted_pci_dirty_relation(authority, relation_owner)?;
+    Ok(true)
 }
 
 pub(crate) unsafe fn note_hosted_pci_relation_completion(
     relation_owner: AcpiPciProviderEndpoint,
     completion: nt_pnp_manager::DeviceRelationInvalidationCompletion,
+    pci_catalog_published: bool,
 ) -> Result<bool, nt_status::NtStatus> {
     let Some(authority) = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY)).as_mut() else {
         return Ok(false);
@@ -347,8 +364,14 @@ pub(crate) unsafe fn note_hosted_pci_relation_completion(
     let index = authority
         .dirty_relations
         .iter()
-        .position(|dirty| dirty.endpoint == relation_owner)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        .position(|dirty| dirty.endpoint == relation_owner);
+    let Some(index) = index else {
+        return if pci_catalog_published || authority.scopes.relation_has_sources(relation_owner) {
+            Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+        } else {
+            Ok(false)
+        };
+    };
     if matches!(
         completion,
         nt_pnp_manager::DeviceRelationInvalidationCompletion::Requeued(_)
@@ -356,10 +379,8 @@ pub(crate) unsafe fn note_hosted_pci_relation_completion(
         authority.reconcile_ready = false;
         return Ok(false);
     }
-    let completed = authority.dirty_relations.remove(index);
-    if completed.routing_fenced {
-        authority.route_blocked = None;
-    }
+    authority.dirty_relations.remove(index);
+    authority.route_blocked = None;
     refresh_hosted_pci_route_reconciliation(authority);
     Ok(authority.reconcile_ready)
 }
@@ -382,16 +403,14 @@ pub(crate) unsafe fn note_hosted_pci_relation_failure(
     if matches.next().is_some() {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    let failed = authority.dirty_relations.remove(index);
+    authority.dirty_relations.remove(index);
     authority.reconcile_ready = false;
-    if failed.routing_fenced {
-        authority.route_blocked = Some(HostedPciRouteBlock {
-            catalog_generation: authority.scopes.generation(),
-            inventory_generation: authority.inventory.generation(),
-            route_owner_generation: authority.routes.generation(),
-            status,
-        });
-    }
+    authority.route_blocked = Some(HostedPciRouteBlock {
+        catalog_generation: authority.scopes.generation(),
+        inventory_generation: authority.inventory.generation(),
+        route_owner_generation: authority.routes.generation(),
+        status,
+    });
     Ok(())
 }
 
