@@ -5067,12 +5067,9 @@ extern "win64" fn s_ke_wait_for_single_object(
     alertable: u8,
     timeout: u64,
 ) -> i32 {
-    let Some(object) = (unsafe { provider_wait_object_for_dispatcher(event) }) else {
-        return 0xC000_000Du32 as i32;
-    };
     unsafe {
         provider_wait_rendezvous(
-            core::slice::from_ref(&object),
+            core::slice::from_ref(&event),
             nt_provider_wait::ProviderWaitType::Any,
             wait_mode,
             alertable,
@@ -5114,52 +5111,147 @@ fn next_provider_wait_id() -> Option<u64> {
         .filter(|id| *id != 0)
 }
 
+#[derive(Clone, Copy)]
+enum ProviderWaitLocalLease {
+    Event(nt_provider_wait::ProviderLocalEventLease),
+    Timer(nt_provider_wait::ProviderLocalTimerOperationLease),
+}
+
+struct ProviderWaitAdmission {
+    objects: [nt_provider_wait::ProviderWaitObject; nt_provider_wait::PROVIDER_WAIT_MAX_OBJECTS],
+    leases: [Option<ProviderWaitLocalLease>; nt_provider_wait::PROVIDER_WAIT_MAX_OBJECTS],
+    count: usize,
+}
+
+impl ProviderWaitAdmission {
+    unsafe fn resolve(bodies: &[u64]) -> Option<Self> {
+        let mut admission = Self {
+            objects: [nt_provider_wait::ProviderWaitObject::EMPTY; nt_provider_wait::PROVIDER_WAIT_MAX_OBJECTS],
+            leases: [None; nt_provider_wait::PROVIDER_WAIT_MAX_OBJECTS],
+            count: 0,
+        };
+        if bodies.is_empty() || bodies.len() > nt_provider_wait::PROVIDER_WAIT_MAX_OBJECTS {
+            return None;
+        }
+        for &body in bodies {
+            let Some((object, lease)) = provider_wait_object_for_dispatcher(body) else {
+                if !admission.release() {
+                    park();
+                }
+                return None;
+            };
+            admission.objects[admission.count] = object;
+            admission.leases[admission.count] = lease;
+            admission.count += 1;
+        }
+        Some(admission)
+    }
+
+    unsafe fn release(&mut self) -> bool {
+        let _metadata = ProviderMetadataGuard::acquire();
+        for index in 0..self.count {
+            let released = match self.leases[index] {
+                None => true,
+                Some(ProviderWaitLocalLease::Event(lease)) => provider_local_events_mut()
+                    .is_some_and(|events| events.release_lease(lease).is_ok()),
+                Some(ProviderWaitLocalLease::Timer(lease)) => provider_local_timers_mut()
+                    .is_some_and(|timers| timers.release_operation(lease).is_ok()),
+            };
+            if !released {
+                return false;
+            }
+            self.leases[index] = None;
+        }
+        true
+    }
+}
+
+unsafe fn provider_wait_backing_active(
+    metadata: &mut ProviderMetadataGuard,
+    body: u64,
+    bytes: u64,
+    backing: nt_provider_wait::ProviderEventBacking,
+) -> bool {
+    if !matches!(backing, nt_provider_wait::ProviderEventBacking::Allocation { .. }) {
+        return true;
+    }
+    let Some(allocations) = provider_allocations_unlocked(metadata) else {
+        return false;
+    };
+    let Ok(allocation) = allocations.containing(body, bytes) else {
+        return false;
+    };
+    allocations.snapshot_active(allocation.identity).is_ok()
+        && nt_provider_wait::ProviderEventBacking::from_allocation(allocation) == backing
+}
+
 unsafe fn provider_wait_object_for_dispatcher(
     object_body: u64,
-) -> Option<nt_provider_wait::ProviderWaitObject> {
-    let event_canonical = || {
-        let _metadata = ProviderMetadataGuard::acquire();
-        provider_local_events()
-            .and_then(|events| events.resolve_body(object_body).ok())
-            .and_then(|snapshot| snapshot.canonical)
-    };
-    let timer_canonical = || {
-        let _metadata = ProviderMetadataGuard::acquire();
-        provider_local_timers()
-            .and_then(|timers| timers.resolve_body(object_body).ok())
-            .and_then(|snapshot| snapshot.canonical)
-    };
-    let canonical = if let Some(id) =
+) -> Option<(nt_provider_wait::ProviderWaitObject, Option<ProviderWaitLocalLease>)> {
+    if let Some(id) =
         (&*core::ptr::addr_of!(WIN32K_EVENT_PROJECTIONS)).identity(object_body)
     {
-        nt_provider_wait::ProviderWaitObject::new(
+        let canonical = nt_provider_wait::ProviderWaitObject::new(
             nt_provider_wait::ProviderWaitObjectType::Event,
             id.0.slot().checked_add(1)?,
             u64::from(id.0.generation().0),
-        )
-    } else if let Some(canonical) = event_canonical() {
-        canonical
-    } else if let Some(canonical) = timer_canonical() {
-        canonical
-    } else {
-        if !provider_pool_contains(object_body) {
-            return None;
-        }
-        let (status, file_id, generation, _) = win32k_file_object_broker_call(
-            W32_FILE_OBJECT_WAIT_IDENTITY,
-            object_body,
-            0,
-            0,
         );
-        if status != 0 || file_id == 0 || generation == 0 {
-            return None;
+        return Some((canonical, None));
+    }
+    {
+        let mut metadata = ProviderMetadataGuard::acquire();
+        if let Some(events) = provider_local_events_mut() {
+            if let Ok(snapshot) = events.snapshot_for_body(object_body) {
+                if snapshot.delete_pending
+                    || !provider_wait_backing_active(
+                        &mut metadata,
+                        object_body,
+                        nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64,
+                        snapshot.storage.backing,
+                    )
+                {
+                    return None;
+                }
+                let lease = events
+                    .acquire_lease(snapshot.id, nt_provider_wait::ProviderLocalEventLeaseKind::Wait)
+                    .ok()?;
+                return Some((lease.canonical, Some(ProviderWaitLocalLease::Event(lease))));
+            }
         }
-        nt_provider_wait::ProviderWaitObject::new(
-            nt_provider_wait::ProviderWaitObjectType::File,
-            file_id,
-            generation,
-        )
-    };
+        if let Some(timers) = provider_local_timers_mut() {
+            if let Ok(snapshot) = timers.snapshot_for_body(object_body) {
+                if snapshot.delete_pending
+                    || !provider_wait_backing_active(
+                        &mut metadata,
+                        object_body,
+                        0x40,
+                        snapshot.storage.backing,
+                    )
+                {
+                    return None;
+                }
+                let lease = timers.acquire_operation(snapshot.id).ok()?;
+                return Some((lease.canonical, Some(ProviderWaitLocalLease::Timer(lease))));
+            }
+        }
+    }
+    if !provider_pool_contains(object_body) {
+        return None;
+    }
+    let (status, file_id, generation, _) = win32k_file_object_broker_call(
+        W32_FILE_OBJECT_WAIT_IDENTITY,
+        object_body,
+        0,
+        0,
+    );
+    if status != 0 || file_id == 0 || generation == 0 {
+        return None;
+    }
+    let canonical = nt_provider_wait::ProviderWaitObject::new(
+        nt_provider_wait::ProviderWaitObjectType::File,
+        file_id,
+        generation,
+    );
     matches!(
         canonical.typed(),
         Some(
@@ -5168,7 +5260,7 @@ unsafe fn provider_wait_object_for_dispatcher(
                 | nt_provider_wait::ProviderWaitObjectType::File
         )
     )
-    .then_some(canonical)
+    .then_some((canonical, None))
 }
 
 unsafe fn current_provider_wait_owner() -> Option<nt_provider_wait::ProviderWaitOwner> {
@@ -5227,7 +5319,7 @@ unsafe fn provider_wait_timeout(
 }
 
 unsafe fn provider_wait_rendezvous(
-    objects: &[nt_provider_wait::ProviderWaitObject],
+    bodies: &[u64],
     wait_type: nt_provider_wait::ProviderWaitType,
     wait_mode: i8,
     alertable: u8,
@@ -5253,6 +5345,9 @@ unsafe fn provider_wait_rendezvous(
         1 => true,
         _ => return 0xC000_000Du32 as i32,
     };
+    let Some(mut admission) = ProviderWaitAdmission::resolve(bodies) else {
+        return 0xC000_000Du32 as i32;
+    };
     let page = WIN32K_PROVIDER_WAIT_VADDR as *mut nt_provider_wait::ProviderWaitSharedPage;
     let mut request = nt_provider_wait::ProviderWaitRequest::empty();
     if request
@@ -5266,16 +5361,24 @@ unsafe fn provider_wait_rendezvous(
                 timeout_kind,
                 timeout_100ns,
             },
-            objects,
+            &admission.objects[..admission.count],
     )
     .is_err()
     {
-        trace_provider_wait_component(b"invalid-request", wait_id, objects.len() as u64, timeout);
+        if !admission.release() {
+            park();
+        }
+        trace_provider_wait_component(b"invalid-request", wait_id, bodies.len() as u64, timeout);
         return 0xC000_000Du32 as i32;
     }
     let wait_context = match provider_wait_context::ProviderWaitContext::capture(&request) {
         Ok(context) => context,
-        Err(status) => return status as i32,
+        Err(status) => {
+            if !admission.release() {
+                park();
+            }
+            return status as i32;
+        }
     };
     write_volatile(core::ptr::addr_of_mut!((*page).request), request);
     write_volatile(
@@ -5287,23 +5390,28 @@ unsafe fn provider_wait_rendezvous(
         b"submit",
         wait_id,
         owner.dispatch_id,
-        objects.len() as u64,
+        bodies.len() as u64,
     );
     let mut outgoing = W32_PROVIDER_WAIT_LABEL << 12;
     loop {
         let (reply_info, tag, _, _, _) =
             crate::driver_launch::call_on4_raw(outgoing, 0, 0, 0, 0);
         if reply_info != 1 {
-            return 0xC000_000Du32 as i32;
+            trace_provider_wait_component(b"uncertain-reply", wait_id, reply_info, outgoing);
+            park();
         }
         match tag {
             W32_PROVIDER_WAIT_RESUME_LABEL => {
                 let result = read_volatile(core::ptr::addr_of!((*page).result));
                 let Some(status) = result.validate(wait_id) else {
-                    return 0xC000_0001u32 as i32;
+                    trace_provider_wait_component(b"invalid-result", wait_id, result.wait_id, tag);
+                    park();
                 };
                 if !wait_context.restore() {
-                    return 0xC000_000Du32 as i32;
+                    park();
+                }
+                if !admission.release() {
+                    park();
                 }
                 return status;
             }
@@ -5316,7 +5424,7 @@ unsafe fn provider_wait_rendezvous(
                     drv: 0,
                 });
                 if !wait_context.restore() {
-                    return 0xC000_000Du32 as i32;
+                    park();
                 }
                 write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut u64, info);
                 write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
@@ -5324,7 +5432,7 @@ unsafe fn provider_wait_rendezvous(
             }
             _ => {
                 trace_provider_wait_component(b"unexpected-tag", wait_id, tag, outgoing);
-                return 0xC000_0001u32 as i32;
+                park();
             }
         }
     }
@@ -5349,26 +5457,13 @@ extern "win64" fn s_ke_wait_for_multiple_objects(
         1 => nt_provider_wait::ProviderWaitType::Any,
         _ => return 0xC000_000Du32 as i32,
     };
-    let mut objects = [
-        nt_provider_wait::ProviderWaitObject::EMPTY;
-        nt_provider_wait::PROVIDER_WAIT_MAX_OBJECTS
-    ];
+    let mut bodies = [0u64; nt_provider_wait::PROVIDER_WAIT_MAX_OBJECTS];
     for index in 0..count as usize {
-        let event = unsafe { read_unaligned((object_array + index as u64 * 8) as *const u64) };
-        let Some(object) = (unsafe { provider_wait_object_for_dispatcher(event) }) else {
-            trace_provider_wait_component(
-                b"unresolved-object",
-                event,
-                index as u64,
-                count as u64,
-            );
-            return 0xC000_000Du32 as i32;
-        };
-        objects[index] = object;
+        bodies[index] = unsafe { read_unaligned((object_array + index as u64 * 8) as *const u64) };
     }
     unsafe {
         provider_wait_rendezvous(
-            &objects[..count as usize],
+            &bodies[..count as usize],
             wait_type,
             wait_mode,
             alertable,
