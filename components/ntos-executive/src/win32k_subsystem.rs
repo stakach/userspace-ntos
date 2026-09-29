@@ -1614,29 +1614,50 @@ pub(crate) unsafe fn provider_pool_packet_lease_live(lease: ProviderPoolPacketLe
         && matches!(shared_pool::allocation_capacity(&memory, offset), Ok(capacity) if capacity >= lease.length as u64)
 }
 
-unsafe fn provider_pool_validate_owned(objects: &[(u64, u64)]) -> bool {
-    let Some(_guard) = provider_pool_lock() else {
-        return false;
+struct ProviderPoolRetirement {
+    pointers: Vec<u64>,
+    shared_identities: Vec<shared_pool::AllocationIdentity>,
+    allocations: Vec<nt_provider_wait::ProviderAllocationSnapshot>,
+}
+
+unsafe fn reserve_provider_pool_owned(objects: &[(u64, u64)]) -> Option<ProviderPoolRetirement> {
+    let arena = fixed_provider_arena_identity(PROVIDER_ARENA_SHARED_POOL_ID)?;
+    let mut retirement = ProviderPoolRetirement {
+        pointers: Vec::new(),
+        shared_identities: Vec::new(),
+        allocations: Vec::new(),
     };
+    retirement.pointers.try_reserve(objects.len()).ok()?;
+    retirement.shared_identities.try_reserve(objects.len()).ok()?;
+    retirement.allocations.try_reserve(objects.len()).ok()?;
+    let (mut metadata, _pool) = provider_metadata_pool_lock()?;
     let memory = ProviderPoolMemory;
-    for (index, &(pointer, required)) in objects.iter().enumerate() {
-        if pointer == 0 || !provider_pool_contains(pointer) {
-            return false;
-        }
-        if objects[..index]
-            .iter()
-            .any(|&(previous, _)| previous == pointer)
+    let catalog = provider_allocations_unlocked(&mut metadata)?;
+    for &(pointer, required) in objects {
+        if pointer == 0
+            || !provider_pool_contains(pointer)
+            || retirement.pointers.contains(&pointer)
         {
-            return false;
+            return None;
         }
-        if !matches!(
-            shared_pool::allocation_capacity(&memory, pointer - WIN32K_POOL_VADDR),
-            Ok(capacity) if capacity >= required
-        ) {
-            return false;
+        let offset = pointer - WIN32K_POOL_VADDR;
+        let capacity = shared_pool::allocation_capacity(&memory, offset).ok()?;
+        let shared_identity = shared_pool::allocation_identity(&memory, offset).ok()?;
+        if capacity < required {
+            return None;
         }
+        let allocation = catalog.active_exact_capacity(arena, pointer, capacity).ok()?;
+        if !validate_provider_allocation_event_retirement(allocation)
+            || !validate_provider_allocation_timer_retirement(allocation)
+        {
+            return None;
+        }
+        retirement.pointers.push(pointer);
+        retirement.shared_identities.push(shared_identity);
+        retirement.allocations.push(allocation);
     }
-    true
+    catalog.begin_retirement_batch(&retirement.allocations).ok()?;
+    Some(retirement)
 }
 
 unsafe fn provider_pool_release_owned(objects: &[(u64, u64)]) -> bool {
@@ -1647,67 +1668,17 @@ unsafe fn provider_pool_release_owned_with_projection(
     objects: &[(u64, u64)],
     reclaim: Option<nt_kernel_exec::ProviderEventProjectionReclaim>,
 ) -> bool {
-    let Some(arena) = fixed_provider_arena_identity(PROVIDER_ARENA_SHARED_POOL_ID) else {
+    let Some(retirement) = reserve_provider_pool_owned(objects) else {
         return false;
     };
-    let mut shared_identities = Vec::new();
-    let mut tracked_allocations = Vec::new();
-    if shared_identities.try_reserve(objects.len()).is_err()
-        || tracked_allocations.try_reserve(objects.len()).is_err()
-    {
-        return false;
-    }
-    {
-        let Some((mut metadata, _pool)) = provider_metadata_pool_lock() else {
-            return false;
-        };
-        let memory = ProviderPoolMemory;
-        let Some(catalog) = provider_allocations_unlocked(&mut metadata) else {
-            return false;
-        };
-        for (index, &(pointer, required)) in objects.iter().enumerate() {
-            if pointer == 0
-                || !provider_pool_contains(pointer)
-                || objects[..index]
-                    .iter()
-                    .any(|&(previous, _)| previous == pointer)
-            {
-                return false;
-            }
-            let offset = pointer - WIN32K_POOL_VADDR;
-            let Ok(capacity) = shared_pool::allocation_capacity(&memory, offset) else {
-                return false;
-            };
-            let Ok(identity) = shared_pool::allocation_identity(&memory, offset) else {
-                return false;
-            };
-            if capacity < required {
-                return false;
-            }
-            let Ok(allocation) = catalog.exact(arena, pointer) else {
-                return false;
-            };
-            if allocation.capacity < required
-                || catalog.validate_retirement(allocation.identity) != Ok(allocation)
-            {
-                return false;
-            }
-            shared_identities.push(identity);
-            tracked_allocations.push(allocation);
-        }
-        if tracked_allocations.iter().copied().any(|allocation| {
-            !validate_provider_allocation_event_retirement(allocation)
-                || !validate_provider_allocation_timer_retirement(allocation)
-        }) {
-            return false;
-        }
-        for allocation in tracked_allocations.iter().copied() {
-            if catalog.begin_retirement(allocation.identity) != Ok(allocation) {
-                return false;
-            }
-        }
-    }
-    for allocation in tracked_allocations.iter().copied() {
+    release_reserved_provider_pool(retirement, reclaim)
+}
+
+unsafe fn release_reserved_provider_pool(
+    retirement: ProviderPoolRetirement,
+    reclaim: Option<nt_kernel_exec::ProviderEventProjectionReclaim>,
+) -> bool {
+    for allocation in retirement.allocations.iter().copied() {
         if !retire_provider_allocation_events(allocation) {
             print_str(b"[win32k-host] fatal provider-pool Event retirement commit failure\n");
             park();
@@ -1725,12 +1696,13 @@ unsafe fn provider_pool_release_owned_with_projection(
         let Some(catalog) = provider_allocations_unlocked(&mut metadata) else {
             break 'commit false;
         };
-        for (index, &(pointer, _)) in objects.iter().enumerate() {
+        for (index, &pointer) in retirement.pointers.iter().enumerate() {
             let offset = pointer - WIN32K_POOL_VADDR;
-            if shared_pool::allocation_identity(&memory, offset) != Ok(shared_identities[index])
+            if shared_pool::allocation_identity(&memory, offset)
+                != Ok(retirement.shared_identities[index])
                 || shared_pool::free(&mut memory, offset).is_err()
-                || catalog.retire(tracked_allocations[index].identity)
-                    != Ok(tracked_allocations[index])
+                || catalog.retire(retirement.allocations[index].identity)
+                    != Ok(retirement.allocations[index])
             {
                 break 'commit false;
             }
@@ -9755,9 +9727,14 @@ unsafe fn finalize_thread_ctx_record(index: usize) -> bool {
         owned[owned_len] = (record.ethread, WIN32K_ETHREAD_BYTES);
         owned_len += 1;
     }
-    if owned_len != 0 && !provider_pool_validate_owned(&owned[..owned_len]) {
-        return note_context_retirement_failure(b"thread-owned-storage", record.tid);
-    }
+    let retirement = if owned_len == 0 {
+        None
+    } else {
+        let Some(retirement) = reserve_provider_pool_owned(&owned[..owned_len]) else {
+            return note_context_retirement_failure(b"thread-owned-storage", record.tid);
+        };
+        Some(retirement)
+    };
 
     if read_volatile((WIN32K_KPCR_VA + 0x30) as *const u64) == record.callout_teb
         || read_volatile((WIN32K_KPCR_VA + 0x30) as *const u64) == record.teb
@@ -9780,8 +9757,10 @@ unsafe fn finalize_thread_ctx_record(index: usize) -> bool {
         write_volatile((shared + SH_CTX_W32THREAD) as *mut u64, 0);
     }
 
-    if owned_len != 0 && !provider_pool_release_owned(&owned[..owned_len]) {
-        return note_context_retirement_failure(b"thread-owned-storage-free", record.tid);
+    if let Some(retirement) = retirement {
+        if !release_reserved_provider_pool(retirement, None) {
+            return note_context_retirement_failure(b"thread-owned-storage-free", record.tid);
+        }
     }
     if owns_callout_teb {
         WIN32K_CONTEXT_CALLOUT_TEB_FREES.fetch_add(1, Ordering::Relaxed);
@@ -9849,9 +9828,14 @@ unsafe fn finalize_process_ctx_record(index: usize) -> bool {
         owned[owned_len] = (record.eprocess, WIN32K_EPROCESS_BYTES);
         owned_len += 1;
     }
-    if owned_len != 0 && !provider_pool_validate_owned(&owned[..owned_len]) {
-        return note_context_retirement_failure(b"process-owned-storage", record.pid);
-    }
+    let retirement = if owned_len == 0 {
+        None
+    } else {
+        let Some(retirement) = reserve_provider_pool_owned(&owned[..owned_len]) else {
+            return note_context_retirement_failure(b"process-owned-storage", record.pid);
+        };
+        Some(retirement)
+    };
 
     if read_volatile((WIN32K_KPCR_VA + 0x60) as *const u64) == record.eprocess {
         write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, 0);
@@ -9875,8 +9859,10 @@ unsafe fn finalize_process_ctx_record(index: usize) -> bool {
         write_volatile((shared + SH_CTX_W32THREAD) as *mut u64, 0);
     }
 
-    if owned_len != 0 && !provider_pool_release_owned(&owned[..owned_len]) {
-        return note_context_retirement_failure(b"process-owned-storage-free", record.pid);
+    if let Some(retirement) = retirement {
+        if !release_reserved_provider_pool(retirement, None) {
+            return note_context_retirement_failure(b"process-owned-storage-free", record.pid);
+        }
     }
     if owns_primary_token {
         WIN32K_CONTEXT_TOKEN_FREES.fetch_add(1, Ordering::Relaxed);
