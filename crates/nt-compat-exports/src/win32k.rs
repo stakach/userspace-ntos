@@ -53,7 +53,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ObFindHandleForObject", Partial, "object reference/handle/security ops routed to nt-object-manager"),
     e("ObGetObjectSecurity", Partial, "object reference/handle/security ops routed to nt-object-manager"),
     e("ObReleaseObjectSecurity", Partial, "object reference/handle/security ops routed to nt-object-manager"),
-    e("ObAssignSecurity", Partial, "object reference/handle/security ops routed to nt-object-manager"),
+    e("ObAssignSecurity", Partial, "authenticated Desktop descriptor assignment through nt-security and exact Object Manager body"),
     e("ObReferenceObjectByPointer", Partial, "type-checks and retains modeled USER, Ps, Event, LPC, Token, and video File/Device projections"),
     e("ObInsertObject", Partial, "object reference/handle/security ops routed to nt-object-manager"),
     e("ObReferenceObjectByHandle", Partial, "typed USER/Event/LPC/Token and pseudo-handle references with canonical owner retention"),

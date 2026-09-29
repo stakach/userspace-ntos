@@ -765,6 +765,7 @@ dependencies = [
  "nt-kernel-exec",
  "nt-memory-manager",
  "nt-ntdll-layout",
+ "nt-object-manager",
  "nt-pe-loader",
  "nt-process",
  "nt-provider-wait",

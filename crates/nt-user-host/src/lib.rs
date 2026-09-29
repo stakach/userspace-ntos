@@ -38,6 +38,7 @@ pub mod provider_local_event_request;
 pub mod component_pump;
 pub mod native_caller_subject;
 pub mod win32k_subject_lease;
+pub mod win32k_object_security;
 pub mod routed_section_owner;
 pub mod section_view_retirement;
 pub mod provider_section_unmap;

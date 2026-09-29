@@ -4669,9 +4669,17 @@ pub(crate) unsafe fn service_win32k_subject_request(
         Ok(owner) => owner,
         Err(status) => return (status as i32, 0, 0, 0),
     };
-    crate::provider_win32k_subject::dispatch(
-        route, dispatch, caller, op, first, second, third,
-    )
+    let caller = if channel.logical_caller.is_some() {
+        match with_provider_process_manager(|pm| {
+            pm.capture_native_handle_caller(caller.original_thread(), nt_types::AccessMode::UserMode)
+        }) {
+            Ok(caller) => caller,
+            Err(status) => return (status as i32, 0, 0, 0),
+        }
+    } else {
+        caller
+    };
+    crate::provider_win32k_subject::dispatch(route, dispatch, caller, op, first, second, third)
 }
 
 pub(crate) unsafe fn service_win32k_file_close_request(

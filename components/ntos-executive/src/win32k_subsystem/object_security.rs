@@ -1,13 +1,223 @@
 //! Referenced security descriptors for the provider's centralized USER object owner.
 
 use super::*;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_object_manager::object_security::{
     ObjectSecurityCache, ObjectSecurityCacheIo, ObjectSecurityCacheStats,
 };
+use nt_user_host::win32k_object_security::AssignmentPacket;
 
 static BUSY: AtomicBool = AtomicBool::new(false);
 static mut CACHE: ObjectSecurityCache = ObjectSecurityCache::new();
+static ASSIGNMENTS: AtomicU64 = AtomicU64::new(0);
+static ASSIGNMENT_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static PRIVILEGE_CHECKS: AtomicU64 = AtomicU64::new(0);
+static PRIVILEGE_DENIALS: AtomicU64 = AtomicU64::new(0);
+
+fn record_assignment_audit(audit: nt_security::SecurityAssignmentAudit) {
+    for decision in [audit.security, audit.restore].into_iter().flatten() {
+        PRIVILEGE_CHECKS.fetch_add(1, Ordering::Relaxed);
+        PRIVILEGE_DENIALS.fetch_add(
+            u64::from(decision == nt_security::SecurityAssignmentPrivilegeOutcome::Denied),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+pub(crate) fn print_assignment_stats() {
+    print_str(b"[user-object-security] assignments=");
+    print_u64(ASSIGNMENTS.load(Ordering::Relaxed));
+    print_str(b" successes=");
+    print_u64(ASSIGNMENT_SUCCESSES.load(Ordering::Relaxed));
+    print_str(b" privilege-checks=");
+    print_u64(PRIVILEGE_CHECKS.load(Ordering::Relaxed));
+    print_str(b" privilege-denials=");
+    print_u64(PRIVILEGE_DENIALS.load(Ordering::Relaxed));
+    print_str(b"\n");
+}
+
+struct AssignmentSubjectLease {
+    id: u64,
+    access_state: u64,
+}
+
+impl AssignmentSubjectLease {
+    unsafe fn begin(access_state: u64) -> Result<Self, i32> {
+        let (words, raw, id, spare, reserved) = crate::driver_launch::call_on4_raw(
+            (W32_SUBJECT_LABEL << 12) | 4,
+            3,
+            access_state,
+            0,
+            0,
+        );
+        if words != 4 || spare != 0 || reserved != 0 || (raw != 0 && id != 0)
+            || (raw != raw as u32 as u64 && raw != raw as u32 as i32 as i64 as u64)
+        {
+            crate::provider_bugcheck::report(0xc4, [W32_SUBJECT_LABEL, 3, words, raw]);
+        }
+        if raw != 0 {
+            return Err(raw as u32 as i32);
+        }
+        if id == 0 {
+            crate::provider_bugcheck::report(0xc4, [W32_SUBJECT_LABEL, 3, words, id]);
+        }
+        Ok(Self { id, access_state })
+    }
+}
+
+impl Drop for AssignmentSubjectLease {
+    fn drop(&mut self) {
+        let (words, raw, first, second, third) = unsafe {
+            crate::driver_launch::call_on4_raw(
+                (W32_SUBJECT_LABEL << 12) | 4,
+                5,
+                self.id,
+                self.access_state,
+                0,
+            )
+        };
+        if words != 4 || raw != 0 || first != 0 || second != 0 || third != 0 {
+            unsafe { crate::provider_bugcheck::report(0xc4, [W32_SUBJECT_LABEL, 5, words, raw]) };
+        }
+    }
+}
+
+unsafe fn assign_from_descriptors(
+    access_state: u64,
+    parent: Option<&[u8]>,
+    creator: Option<&[u8]>,
+    object: u64,
+    object_type: u64,
+) -> i32 {
+    let packet = AssignmentPacket {
+        object,
+        object_type,
+        access_state,
+        parent,
+        creator,
+    };
+    let len = match packet.encoded_len() {
+        Ok(len) => len,
+        Err(status) => return status as i32,
+    };
+    let lease = match AssignmentSubjectLease::begin(access_state) {
+        Ok(lease) => lease,
+        Err(status) => return status,
+    };
+    let buffer = provider_pool_alloc(len as u64, false);
+    if buffer == 0 {
+        return STATUS_INSUFFICIENT_RESOURCES_I32;
+    }
+    let output = core::slice::from_raw_parts_mut(buffer as *mut u8, len);
+    packet.encode(output).expect("validated assignment packet length");
+    let (words, raw, first, second, third) = crate::driver_launch::call_on4_raw(
+        (W32_SUBJECT_LABEL << 12) | 4,
+        4,
+        lease.id,
+        buffer,
+        len as u64,
+    );
+    if words != 4 || first != 0 || second != 0 || third != 0
+        || (raw != raw as u32 as u64 && raw != raw as u32 as i32 as i64 as u64)
+    {
+        crate::provider_bugcheck::report(0xc4, [W32_SUBJECT_LABEL, 4, words, raw]);
+    }
+    assert!(provider_pool_free(buffer), "assignment packet allocation lost its owner");
+    drop(lease);
+    raw as u32 as i32
+}
+
+pub(super) extern "win64" fn assign_export(
+    access_state: u64,
+    parent_descriptor: u64,
+    object: u64,
+    object_type: u64,
+) -> i32 {
+    if access_state == 0 {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    unsafe {
+        let creator_pointer = read_unaligned(
+            (access_state + core::mem::offset_of!(nt_kernel_abi::security_create_x64::AccessState, security_descriptor) as u64)
+                as *const u64,
+        );
+        let parent = if parent_descriptor != 0 {
+            match capture_user_object_security_descriptor(parent_descriptor) {
+                Ok(descriptor) => Some(descriptor),
+                Err(status) => return status,
+            }
+        } else {
+            None
+        };
+        let creator = if creator_pointer != 0 {
+            match capture_user_object_security_descriptor(creator_pointer) {
+                Ok(descriptor) => Some(descriptor),
+                Err(status) => return status,
+            }
+        } else {
+            None
+        };
+        assign_from_descriptors(
+            access_state,
+            parent.as_ref().map(CapturedUserObjectSecurityDescriptor::as_slice),
+            creator.as_ref().map(CapturedUserObjectSecurityDescriptor::as_slice),
+            object,
+            object_type,
+        )
+    }
+}
+
+pub(super) unsafe fn assign_opened_desktop(
+    parent: Option<&[u8]>,
+    creator: Option<&[u8]>,
+    object: u64,
+) -> i32 {
+    assign_from_descriptors(
+        0,
+        parent,
+        creator,
+        object,
+        nt_object_manager::object_type::desktop_object_type_addr(),
+    )
+}
+
+pub(crate) unsafe fn assign(
+    packet: AssignmentPacket<'_>,
+    subject: &nt_security::CapturedSubjectTokens<'_>,
+    mode: nt_types::AccessMode,
+) -> Result<(), u32> {
+    if packet.object_type != nt_object_manager::object_type::desktop_object_type_addr()
+        || (*core::ptr::addr_of!(OBJ_TABLE)).kind_by_body(packet.object)
+            != Some(ObKind::Desktop)
+    {
+        return Err(STATUS_INVALID_HANDLE_I32 as u32);
+    }
+    let object_type = packet.object_type as *const nt_object_manager::object_type::ObjectType;
+    if read_volatile(core::ptr::addr_of!((*object_type).type_info.methods[5])) != 0 {
+        return Err(STATUS_NOT_SUPPORTED_I32 as u32);
+    }
+    let native = &(*object_type).type_info.generic_mapping;
+    let mapping = nt_security::GenericMapping {
+        generic_read: read_volatile(core::ptr::addr_of!(native.generic_read)),
+        generic_write: read_volatile(core::ptr::addr_of!(native.generic_write)),
+        generic_execute: read_volatile(core::ptr::addr_of!(native.generic_execute)),
+        generic_all: read_volatile(core::ptr::addr_of!(native.generic_all)),
+    };
+    ASSIGNMENTS.fetch_add(1, Ordering::Relaxed);
+    let result = nt_user_host::win32k_object_security::assign_exact_desktop(
+        &mut *core::ptr::addr_of_mut!(OBJ_TABLE),
+        packet,
+        subject,
+        &mapping,
+        match mode {
+            nt_types::AccessMode::KernelMode => nt_security::ProcessorMode::KernelMode,
+            nt_types::AccessMode::UserMode => nt_security::ProcessorMode::UserMode,
+        },
+        record_assignment_audit,
+    );
+    ASSIGNMENT_SUCCESSES.fetch_add(u64::from(result.is_ok()), Ordering::Relaxed);
+    result
+}
 
 struct CacheGuard;
 
