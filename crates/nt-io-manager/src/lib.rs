@@ -247,8 +247,9 @@ pub use volume_information::{
     SetVolumeInformationParameters, VolumeInformationContract,
 };
 pub use wdm_x64::{
-    write_wdm_device_object, write_wdm_driver_object, write_wdm_file_object,
-    write_wdm_io_stack_location, write_wdm_irp, write_wdm_open_device_projection,
+    decode_wdm_kernel_built_io_stack, write_wdm_device_object, write_wdm_driver_object,
+    write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
+    write_wdm_open_device_projection,
     WdmDeviceObjectInit, WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
     WdmIoStackParameters, WdmIrpInit, WdmLayoutError, WdmOpenDeviceProjectionInit,
     WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE,

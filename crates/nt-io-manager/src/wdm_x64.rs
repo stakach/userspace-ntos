@@ -576,6 +576,57 @@ pub fn write_wdm_io_stack_location(
     Ok(())
 }
 
+/// Decode the next stack location of a kernel-built IRP before it enters the I/O manager.
+/// Device and File addresses are untrusted WDM projection values; the caller must authenticate
+/// them against its own projection ledger before dispatching the returned operation.
+pub fn decode_wdm_kernel_built_io_stack(
+    bytes: &[u8],
+) -> Result<WdmIoStackLocationInit, WdmLayoutError> {
+    require(bytes, WDM_X64_IO_STACK_LOCATION_SIZE)?;
+    let u32_at = |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    let u64_at = |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    let major = bytes[0];
+    let minor = bytes[1];
+    let parameters = match major {
+        nt_io_abi::major::IRP_MJ_PNP if minor == nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS => {
+            WdmIoStackParameters::PnpQueryDeviceRelations {
+                relation_type: u32_at(0x08),
+            }
+        }
+        nt_io_abi::major::IRP_MJ_READ if minor == 0 => WdmIoStackParameters::Read {
+            length: u32_at(0x08),
+            key: u32_at(0x10),
+            byte_offset: u64_at(0x18),
+        },
+        nt_io_abi::major::IRP_MJ_WRITE if minor == 0 => WdmIoStackParameters::Write {
+            length: u32_at(0x08),
+            key: u32_at(0x10),
+            byte_offset: u64_at(0x18),
+        },
+        nt_io_abi::major::IRP_MJ_DEVICE_CONTROL
+        | nt_io_abi::major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+            if minor == 0 =>
+        {
+            WdmIoStackParameters::DeviceControl {
+                output_buffer_length: u32_at(0x08),
+                input_buffer_length: u32_at(0x10),
+                io_control_code: u32_at(0x18),
+                type3_input_buffer: u64_at(0x20),
+            }
+        }
+        _ => return Err(WdmLayoutError::InvalidField),
+    };
+    Ok(WdmIoStackLocationInit {
+        major,
+        minor,
+        flags: bytes[2],
+        control: bytes[3],
+        device_object: u64_at(0x28),
+        file_object: u64_at(0x30),
+        parameters,
+    })
+}
+
 fn require(bytes: &[u8], len: usize) -> Result<(), WdmLayoutError> {
     if bytes.len() < len {
         Err(WdmLayoutError::BufferTooSmall)
