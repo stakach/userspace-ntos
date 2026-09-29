@@ -29703,6 +29703,71 @@ impl ExecNtHandler {
         Ok((connection_id, response.to_vec()))
     }
 
+    pub(crate) unsafe fn map_provider_section_view(
+        &mut self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        request: nt_io_manager::win32k_section_map_wire::SectionMapRequest,
+    ) -> Result<nt_memory_manager::GenericSectionView, u32> {
+        const PROCESS_VM_OPERATION: u32 = 0x0008;
+        const STATUS_INVALID_VIEW_SIZE: u32 = 0xC000_001F;
+        if request.process_handle != u64::MAX {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        let mut process = self.pm.reference_native_ps_handle(
+            caller,
+            request.process_handle,
+            Some(nt_process::native_handle::PsHandleType::Process),
+            PROCESS_VM_OPERATION,
+        )?;
+        let nt_process::HandleObject::Process(target_pid) = process.object() else {
+            unreachable!("typed Process reference");
+        };
+        let target_pi = self
+            .pi_for_pid(target_pid)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE);
+        process.release(&mut self.pm)?;
+        let target_pi = target_pi?;
+        let section_handle = self
+            .pm
+            .lookup_native_section_handle(caller, request.section_handle)?;
+        let section_index = section_handle.section() as usize;
+        let sections = self.loop_ctx.ok_or(0xC000_00A3u32)?.generic_sections;
+        let section = (&*sections)
+            .section(section_index)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let view_protection = if request.win32_protect == 0 {
+            section.protection
+        } else {
+            request.win32_protect
+        };
+        nt_memory_manager::section_view_access::check_section_view_access(
+            section.protection,
+            view_protection,
+            section_handle.granted_access(),
+            caller.mode(),
+        )?;
+        let section_offset = request.section_offset.unwrap_or(0);
+        if section_offset > section.size
+            || (request.view_size != 0
+                && request.view_size > section.size - section_offset)
+        {
+            return Err(STATUS_INVALID_VIEW_SIZE);
+        }
+        self.pending_section_view_rollbacks
+            .try_reserve(1)
+            .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
+        self.map_generic_section_view_internal(
+            section_index,
+            target_pi,
+            request.base_address,
+            request.view_size,
+            section_offset,
+            request.zero_bits,
+            request.allocation_type,
+            request.win32_protect,
+        )
+    }
+
     unsafe fn map_generic_section_view_internal(
         &mut self,
         section_index: usize,
@@ -30046,7 +30111,7 @@ impl ExecNtHandler {
         })
     }
 
-    unsafe fn rollback_or_defer_generic_section_view(
+    pub(crate) unsafe fn rollback_or_defer_generic_section_view(
         &mut self,
         view: nt_memory_manager::GenericSectionView,
     ) {

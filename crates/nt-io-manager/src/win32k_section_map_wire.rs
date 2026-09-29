@@ -19,6 +19,16 @@ pub struct SectionMapRequest {
     pub win32_protect: u32,
 }
 
+impl SectionMapRequest {
+    pub const fn is_supported_reactos_shape(self) -> bool {
+        self.process_handle == u64::MAX
+            && self.zero_bits == 0
+            && self.commit_size == 0
+            && self.inherit_disposition == 1
+            && self.allocation_type == 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SectionMapWireError {
     Length,
@@ -114,6 +124,27 @@ mod tests {
             allocation_type: 0,
             win32_protect: 4,
         }
+    }
+
+    #[test]
+    fn supported_reactos_shape_is_narrow_and_explicit() {
+        let mut input = request();
+        input.commit_size = 0;
+        assert!(input.is_supported_reactos_shape());
+        input.process_handle = 4;
+        assert!(!input.is_supported_reactos_shape());
+        input.process_handle = u64::MAX;
+        input.zero_bits = 1;
+        assert!(!input.is_supported_reactos_shape());
+        input.zero_bits = 0;
+        input.commit_size = 1;
+        assert!(!input.is_supported_reactos_shape());
+        input.commit_size = 0;
+        input.inherit_disposition = 2;
+        assert!(!input.is_supported_reactos_shape());
+        input.inherit_disposition = 1;
+        input.allocation_type = 1;
+        assert!(!input.is_supported_reactos_shape());
     }
 
     #[test]

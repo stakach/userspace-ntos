@@ -929,6 +929,7 @@ pub(crate) unsafe fn complete(
         (&mut *core::ptr::addr_of_mut!(NATIVE_PEERS))[index].bootstrap = false;
         crate::service_sec_image::retire_win32k_directory_route(route, dispatch);
         crate::service_sec_image::retire_win32k_section_create_route(route, dispatch);
+        crate::service_sec_image::retire_win32k_section_map_route(route, dispatch);
         crate::provider_win32k_subject::retire_completed(route, dispatch);
         crate::provider_registry_caller::retire_completed(route, dispatch);
         return Ok(());
@@ -940,6 +941,7 @@ pub(crate) unsafe fn complete(
         .map_err(|_| Error::Protocol)?;
     crate::service_sec_image::retire_win32k_directory_route(route, dispatch);
     crate::service_sec_image::retire_win32k_section_create_route(route, dispatch);
+    crate::service_sec_image::retire_win32k_section_map_route(route, dispatch);
     crate::provider_win32k_subject::retire_completed(route, dispatch);
     crate::provider_registry_caller::retire_completed(route, dispatch);
     Ok(())
@@ -989,6 +991,7 @@ pub(crate) unsafe fn complete_protocol(
         .map_err(|_| Error::Protocol)?;
     crate::service_sec_image::retire_win32k_directory_route(route, dispatch);
     crate::service_sec_image::retire_win32k_section_create_route(route, dispatch);
+    crate::service_sec_image::retire_win32k_section_map_route(route, dispatch);
     crate::provider_win32k_subject::retire_completed(route, dispatch);
     crate::provider_registry_caller::retire_completed(route, dispatch);
     Ok(())
