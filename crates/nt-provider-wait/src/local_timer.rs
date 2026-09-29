@@ -84,6 +84,14 @@ pub struct ProviderLocalTimerRetirement {
     pub canonical: ProviderWaitObject,
 }
 
+/// Exact ownership of one in-flight set, cancel, or read request to the Timer broker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderLocalTimerOperationLease {
+    pub id: ProviderLocalTimerId,
+    pub canonical: ProviderWaitObject,
+    serial: u64,
+}
+
 #[derive(Clone, Copy)]
 struct LocalTimerRecord {
     generation: u32,
@@ -130,6 +138,8 @@ impl LocalTimerRecord {
 pub struct ProviderLocalTimerCatalog {
     provider: ProviderDomainIdentity,
     records: Vec<LocalTimerRecord>,
+    operation_leases: Vec<ProviderLocalTimerOperationLease>,
+    next_lease_serial: u64,
 }
 
 impl ProviderLocalTimerCatalog {
@@ -140,7 +150,59 @@ impl ProviderLocalTimerCatalog {
         Ok(Self {
             provider,
             records: Vec::new(),
+            operation_leases: Vec::new(),
+            next_lease_serial: 1,
         })
+    }
+
+    fn has_operation_leases(&self, id: ProviderLocalTimerId) -> bool {
+        self.operation_leases.iter().any(|lease| lease.id == id)
+    }
+
+    /// Hold the exact local and canonical identity across a broker roundtrip. An uncertain broker
+    /// result must retain its lease until the operation's effect is resolved.
+    pub fn acquire_operation(
+        &mut self,
+        id: ProviderLocalTimerId,
+    ) -> Result<ProviderLocalTimerOperationLease, ProviderTimerError> {
+        let slot = self.slot(id)?;
+        let record = self.records[slot];
+        if record.delete_pending {
+            return Err(ProviderTimerError::DeletePending);
+        }
+        let canonical = record.canonical.ok_or(ProviderTimerError::NotPublished)?;
+        let next = self
+            .next_lease_serial
+            .checked_add(1)
+            .ok_or(ProviderTimerError::LeaseOverflow)?;
+        self.operation_leases
+            .try_reserve(1)
+            .map_err(|_| ProviderTimerError::NoCapacity)?;
+        let lease = ProviderLocalTimerOperationLease {
+            id,
+            canonical,
+            serial: self.next_lease_serial,
+        };
+        self.operation_leases.push(lease);
+        self.next_lease_serial = next;
+        Ok(lease)
+    }
+
+    pub fn release_operation(
+        &mut self,
+        lease: ProviderLocalTimerOperationLease,
+    ) -> Result<(), ProviderTimerError> {
+        let slot = self.slot(lease.id)?;
+        if self.records[slot].canonical != Some(lease.canonical) {
+            return Err(ProviderTimerError::WrongLease);
+        }
+        let index = self
+            .operation_leases
+            .iter()
+            .position(|active| *active == lease)
+            .ok_or(ProviderTimerError::WrongLease)?;
+        self.operation_leases.swap_remove(index);
+        Ok(())
     }
 
     fn initialize(
@@ -355,6 +417,12 @@ impl ProviderLocalTimerCatalog {
                 count += 1;
             }
         }
+        if self.operation_leases.iter().any(|lease| {
+            self.slot(lease.id)
+                .is_ok_and(|slot| self.records[slot].storage.backing == backing)
+        }) {
+            return Err(ProviderTimerError::ActiveLeases);
+        }
         Ok(count)
     }
 
@@ -391,7 +459,10 @@ impl ProviderLocalTimerCatalog {
         id: ProviderLocalTimerId,
     ) -> Result<(), ProviderTimerError> {
         let slot = self.slot(id)?;
-        if self.records[slot].canonical.is_some() || self.records[slot].delete_pending {
+        if self.records[slot].canonical.is_some()
+            || self.records[slot].delete_pending
+            || self.has_operation_leases(id)
+        {
             return Err(ProviderTimerError::AlreadyPublished);
         }
         self.records[slot].live = false;
@@ -406,6 +477,9 @@ impl ProviderLocalTimerCatalog {
         if self.records[slot].delete_pending {
             return Err(ProviderTimerError::DeletePending);
         }
+        if self.has_operation_leases(id) {
+            return Err(ProviderTimerError::ActiveLeases);
+        }
         let canonical = self.records[slot]
             .canonical
             .ok_or(ProviderTimerError::NotPublished)?;
@@ -418,10 +492,13 @@ impl ProviderLocalTimerCatalog {
         retirement: ProviderLocalTimerRetirement,
     ) -> Result<(), ProviderTimerError> {
         let slot = self.slot(retirement.id)?;
-        let record = &mut self.records[slot];
-        if !record.delete_pending || record.canonical != Some(retirement.canonical) {
+        if !self.records[slot].delete_pending
+            || self.records[slot].canonical != Some(retirement.canonical)
+            || self.has_operation_leases(retirement.id)
+        {
             return Err(ProviderTimerError::RetirementMismatch);
         }
+        let record = &mut self.records[slot];
         record.live = false;
         record.canonical = None;
         record.delete_pending = false;
@@ -1032,6 +1109,82 @@ mod tests {
             catalog.bind_canonical(first, canonical),
             Err(ProviderTimerError::StaleIdentity)
         );
+    }
+
+    #[test]
+    fn operation_leases_block_retirement_until_each_exact_lease_is_released() {
+        let mut catalog = ProviderLocalTimerCatalog::new(provider()).unwrap();
+        let first = catalog
+            .initialize_static(0x1000, 0x80, ProviderTimerKind::Notification)
+            .unwrap();
+        assert_eq!(
+            catalog.acquire_operation(first),
+            Err(ProviderTimerError::NotPublished)
+        );
+        let canonical = ProviderWaitObject::new(ProviderWaitObjectType::Timer, 1, 1);
+        catalog.bind_canonical(first, canonical).unwrap();
+        let first_lease = catalog.acquire_operation(first).unwrap();
+        let second_lease = catalog.acquire_operation(first).unwrap();
+        assert_ne!(first_lease, second_lease);
+        assert_eq!(first_lease.canonical, canonical);
+        assert_eq!(
+            catalog.begin_retire(first),
+            Err(ProviderTimerError::ActiveLeases)
+        );
+        catalog.release_operation(first_lease).unwrap();
+        assert_eq!(
+            catalog.release_operation(first_lease),
+            Err(ProviderTimerError::WrongLease)
+        );
+        assert_eq!(
+            catalog.begin_retire(first),
+            Err(ProviderTimerError::ActiveLeases)
+        );
+        catalog.release_operation(second_lease).unwrap();
+        let retirement = catalog.begin_retire(first).unwrap();
+        assert_eq!(
+            catalog.acquire_operation(first),
+            Err(ProviderTimerError::DeletePending)
+        );
+        catalog.ack_retirement(retirement).unwrap();
+
+        let second = catalog
+            .initialize_static(0x1000, 0x80, ProviderTimerKind::Synchronization)
+            .unwrap();
+        catalog.bind_canonical(second, canonical).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            catalog.release_operation(second_lease),
+            Err(ProviderTimerError::StaleIdentity)
+        );
+        assert_eq!(catalog.acquire_operation(second).unwrap().id, second);
+    }
+
+    #[test]
+    fn backing_retirement_rejects_an_in_flight_operation_without_partial_mutation() {
+        let mut catalog = ProviderLocalTimerCatalog::new(provider()).unwrap();
+        let first = catalog
+            .initialize_stack(0x1000, 1, 1, 1, 1, 0x10, ProviderTimerKind::Notification)
+            .unwrap();
+        let second = catalog
+            .initialize_stack(0x1040, 1, 1, 1, 1, 0x50, ProviderTimerKind::Synchronization)
+            .unwrap();
+        catalog
+            .bind_canonical(first, ProviderWaitObject::new(ProviderWaitObjectType::Timer, 1, 1))
+            .unwrap();
+        catalog
+            .bind_canonical(second, ProviderWaitObject::new(ProviderWaitObjectType::Timer, 2, 1))
+            .unwrap();
+        let backing = catalog.resolve_body(0x1000).unwrap().storage.backing;
+        let lease = catalog.acquire_operation(second).unwrap();
+        assert_eq!(
+            catalog.begin_retire_backing(backing),
+            Err(ProviderTimerError::ActiveLeases)
+        );
+        assert!(!catalog.resolve_body(0x1000).unwrap().delete_pending);
+        assert!(!catalog.resolve_body(0x1040).unwrap().delete_pending);
+        catalog.release_operation(lease).unwrap();
+        assert_eq!(catalog.begin_retire_backing(backing).unwrap().len(), 2);
     }
 
     #[test]
