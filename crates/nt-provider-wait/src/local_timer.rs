@@ -329,6 +329,63 @@ impl ProviderLocalTimerCatalog {
         Ok(record.snapshot(slot))
     }
 
+    pub fn backing_timer_count(&self, backing: ProviderEventBacking) -> usize {
+        self.records
+            .iter()
+            .filter(|record| record.live && record.storage.backing == backing)
+            .count()
+    }
+
+    pub fn validate_backing_retirement(
+        &self,
+        backing: ProviderEventBacking,
+    ) -> Result<usize, ProviderTimerError> {
+        if !backing.is_valid(self.provider) {
+            return Err(ProviderTimerError::InvalidStorage);
+        }
+        let mut count = 0;
+        for record in &self.records {
+            if record.live && record.storage.backing == backing {
+                if record.delete_pending {
+                    return Err(ProviderTimerError::DeletePending);
+                }
+                if record.canonical.is_none() {
+                    return Err(ProviderTimerError::NotPublished);
+                }
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    pub fn begin_retire_backing(
+        &mut self,
+        backing: ProviderEventBacking,
+    ) -> Result<Vec<ProviderLocalTimerRetirement>, ProviderTimerError> {
+        let count = self.validate_backing_retirement(backing)?;
+        if count == 0 {
+            return Err(ProviderTimerError::NotFound);
+        }
+        let mut retirements = Vec::new();
+        retirements
+            .try_reserve(count)
+            .map_err(|_| ProviderTimerError::NoCapacity)?;
+        for (slot, record) in self.records.iter().enumerate() {
+            if record.live && record.storage.backing == backing {
+                retirements.push(ProviderLocalTimerRetirement {
+                    id: ProviderLocalTimerId::new(slot, record.generation)?,
+                    canonical: record.canonical.ok_or(ProviderTimerError::NotPublished)?,
+                });
+            }
+        }
+        for record in &mut self.records {
+            if record.live && record.storage.backing == backing {
+                record.delete_pending = true;
+            }
+        }
+        Ok(retirements)
+    }
+
     pub fn rollback_unpublished(
         &mut self,
         id: ProviderLocalTimerId,
@@ -346,6 +403,9 @@ impl ProviderLocalTimerCatalog {
         id: ProviderLocalTimerId,
     ) -> Result<ProviderLocalTimerRetirement, ProviderTimerError> {
         let slot = self.slot(id)?;
+        if self.records[slot].delete_pending {
+            return Err(ProviderTimerError::DeletePending);
+        }
         let canonical = self.records[slot]
             .canonical
             .ok_or(ProviderTimerError::NotPublished)?;
@@ -863,6 +923,94 @@ mod tests {
     }
 
     #[test]
+    fn backing_retirement_is_atomic_and_generation_exact() {
+        let mut allocations = ProviderAllocationCatalog::new();
+        let arena = crate::ProviderArenaIdentity {
+            id: 1,
+            generation: 1,
+        };
+        let first_allocation = allocations.register(arena, 0xa000, 0x100).unwrap();
+        let other_allocation = allocations.register(arena, 0xb000, 0x100).unwrap();
+        let backing = ProviderEventBacking::from_allocation(first_allocation);
+        let other_backing = ProviderEventBacking::from_allocation(other_allocation);
+        let mut timers = ProviderLocalTimerCatalog::new(provider()).unwrap();
+        let first = timers
+            .initialize_in_allocation(
+                &allocations,
+                first_allocation.identity,
+                0xa000,
+                0x40,
+                ProviderTimerKind::Notification,
+            )
+            .unwrap();
+        let second = timers
+            .initialize_in_allocation(
+                &allocations,
+                first_allocation.identity,
+                0xa040,
+                0x40,
+                ProviderTimerKind::Synchronization,
+            )
+            .unwrap();
+        let other = timers
+            .initialize_in_allocation(
+                &allocations,
+                other_allocation.identity,
+                0xb000,
+                0x40,
+                ProviderTimerKind::Notification,
+            )
+            .unwrap();
+        let first_canonical = ProviderWaitObject::new(ProviderWaitObjectType::Timer, 1, 1);
+        let second_canonical = ProviderWaitObject::new(ProviderWaitObjectType::Timer, 2, 1);
+        let other_canonical = ProviderWaitObject::new(ProviderWaitObjectType::Timer, 3, 1);
+        timers.bind_canonical(first, first_canonical).unwrap();
+        timers.bind_canonical(other, other_canonical).unwrap();
+
+        assert_eq!(timers.backing_timer_count(backing), 2);
+        assert_eq!(
+            timers.begin_retire_backing(backing),
+            Err(ProviderTimerError::NotPublished)
+        );
+        assert_eq!(timers.resolve_body(0xa000).unwrap().id, first);
+
+        timers.bind_canonical(second, second_canonical).unwrap();
+        let retirements = timers.begin_retire_backing(backing).unwrap();
+        assert_eq!(retirements.len(), 2);
+        assert!(retirements.iter().any(|retirement| retirement.id == first));
+        assert!(retirements.iter().any(|retirement| retirement.id == second));
+        assert_eq!(
+            timers.begin_retire_backing(backing),
+            Err(ProviderTimerError::DeletePending)
+        );
+        assert_eq!(
+            timers.resolve_body(0xa000),
+            Err(ProviderTimerError::DeletePending)
+        );
+        assert_eq!(timers.resolve_body(0xb000).unwrap().id, other);
+        assert_eq!(timers.backing_timer_count(other_backing), 1);
+
+        for retirement in retirements {
+            timers.ack_retirement(retirement).unwrap();
+        }
+        assert_eq!(timers.backing_timer_count(backing), 0);
+        let reused = timers
+            .initialize_in_allocation(
+                &allocations,
+                first_allocation.identity,
+                0xa000,
+                0x40,
+                ProviderTimerKind::Notification,
+            )
+            .unwrap();
+        assert_ne!(reused, first);
+        assert_eq!(
+            timers.bind_canonical(first, first_canonical),
+            Err(ProviderTimerError::StaleIdentity)
+        );
+    }
+
+    #[test]
     fn local_retirement_is_generation_exact() {
         let mut catalog = ProviderLocalTimerCatalog::new(provider()).unwrap();
         let first = catalog
@@ -871,6 +1019,10 @@ mod tests {
         let canonical = ProviderWaitObject::new(ProviderWaitObjectType::Timer, 1, 1);
         catalog.bind_canonical(first, canonical).unwrap();
         let retirement = catalog.begin_retire(first).unwrap();
+        assert_eq!(
+            catalog.begin_retire(first),
+            Err(ProviderTimerError::DeletePending)
+        );
         catalog.ack_retirement(retirement).unwrap();
         let second = catalog
             .initialize_static(0x1000, 0x80, ProviderTimerKind::Synchronization)
