@@ -21,6 +21,34 @@ pub enum KernelIrpPlanError {
     InvalidStackSize,
     UnsupportedMajor,
     MissingStartingOffset,
+    InvalidIrpHeader,
+}
+
+/// Admit only a freshly allocated IRP packet with the cursor still above its
+/// stack. The provider may later mutate the next stack before `IofCallDriver`;
+/// this validation is for registration, not dispatch authorization.
+pub fn validate_new_kernel_irp_packet(
+    base: u64,
+    bytes: &[u8],
+    stack_count: u8,
+) -> Result<(), KernelIrpPlanError> {
+    if base == 0 || stack_count == 0 || stack_count == u8::MAX {
+        return Err(KernelIrpPlanError::InvalidStackSize);
+    }
+    let size = WDM_X64_IRP_SIZE + stack_count as usize * WDM_X64_IO_STACK_LOCATION_SIZE;
+    let end = base
+        .checked_add(size as u64)
+        .ok_or(KernelIrpPlanError::InvalidIrpHeader)?;
+    if bytes.len() != size
+        || u16::from_le_bytes(bytes[0..2].try_into().unwrap()) != 6
+        || u16::from_le_bytes(bytes[2..4].try_into().unwrap()) as usize != size
+        || bytes[0x42] != stack_count
+        || bytes[0x43] != stack_count + 1
+        || u64::from_le_bytes(bytes[0xb8..0xc0].try_into().unwrap()) != end
+    {
+        return Err(KernelIrpPlanError::InvalidIrpHeader);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -162,6 +162,27 @@ impl SourceIrpLedger {
             .map(|row| row.allocation)
     }
 
+    /// Check an exact allocation before its owner performs an irreversible native free.
+    /// The owner must serialize this check and the subsequent `retire` call.
+    pub fn retirement_ready(
+        &self,
+        ticket: SourceIrpTicket,
+        allocation: SourceIrpAllocation,
+    ) -> Result<(), SourceIrpLedgerError> {
+        let row = self
+            .rows
+            .iter()
+            .find(|row| row.ticket == ticket)
+            .ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        if row.allocation != allocation {
+            return Err(SourceIrpLedgerError::WrongIdentity);
+        }
+        if row.pins != 0 {
+            return Err(SourceIrpLedgerError::Pinned);
+        }
+        Ok(())
+    }
+
     pub fn unpin(&mut self, ticket: SourceIrpTicket) -> Result<(), SourceIrpLedgerError> {
         let row = self
             .rows
@@ -378,6 +399,39 @@ mod tests {
         let reused = ledger.register(win32k).unwrap();
         assert_ne!(reused, win32k_ticket);
         assert!(!ledger.matches(win32k.owner, win32k, win32k_ticket));
+    }
+
+    #[test]
+    fn native_free_preflight_requires_exact_live_unpinned_allocation() {
+        let mut ledger = SourceIrpLedger::new();
+        let owner = allocation(0x2000, 11);
+        let ticket = ledger.register(owner).unwrap();
+        assert_eq!(ledger.retirement_ready(ticket, owner), Ok(()));
+        assert_eq!(
+            ledger.retirement_ready(
+                ticket,
+                SourceIrpAllocation {
+                    bytes: owner.bytes + 1,
+                    ..owner
+                }
+            ),
+            Err(SourceIrpLedgerError::WrongIdentity),
+        );
+        ledger
+            .pin(owner.owner, owner.domain, owner.component_address)
+            .unwrap();
+        assert_eq!(
+            ledger.retirement_ready(ticket, owner),
+            Err(SourceIrpLedgerError::Pinned)
+        );
+        ledger.unpin(ticket).unwrap();
+        ledger
+            .retire(owner.owner, owner.domain, owner.component_address)
+            .unwrap();
+        assert_eq!(
+            ledger.retirement_ready(ticket, owner),
+            Err(SourceIrpLedgerError::WrongIdentity)
+        );
     }
 
     #[test]
