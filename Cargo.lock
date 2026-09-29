@@ -598,6 +598,7 @@ dependencies = [
  "nt-cm-resources",
  "nt-io-manager",
  "nt-pnp-abi",
+ "nt-status",
 ]
 
 [[package]]

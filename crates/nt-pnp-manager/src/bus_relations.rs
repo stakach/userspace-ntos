@@ -285,6 +285,20 @@ pub enum DeviceRelationInvalidationError {
     SequenceExhausted,
     InsufficientResources,
     StaleClaim,
+    StaleTicket,
+    NotTerminal,
+    SyncStatusRequired,
+    InvalidTerminalStatus,
+}
+
+/// A distinct synchronous PnP action. Its terminal result remains owned by the caller until taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncDeviceRelationTicket(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SyncDeviceRelationWaiter {
+    ticket: SyncDeviceRelationTicket,
+    status: Option<nt_status::NtStatus>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,6 +335,7 @@ struct DeviceRelationInvalidationRow {
 pub struct DeviceRelationInvalidationQueue {
     next_sequence: u64,
     rows: Vec<DeviceRelationInvalidationRow>,
+    sync_waiters: Vec<SyncDeviceRelationWaiter>,
 }
 
 impl DeviceRelationInvalidationQueue {
@@ -370,6 +385,13 @@ impl DeviceRelationInvalidationQueue {
             row.parent == parent
                 && row.pdo_device_id == pdo_device_id
                 && row.relation_type == relation_type
+                && !self.sync_waiters.iter().any(|waiter| {
+                    waiter.ticket.0
+                        == match row.state {
+                            DeviceRelationInvalidationState::Pending { sequence }
+                            | DeviceRelationInvalidationState::Claimed { sequence, .. } => sequence,
+                        }
+                })
         }) {
             return match self.rows[index].state {
                 DeviceRelationInvalidationState::Pending { sequence } => {
@@ -438,6 +460,79 @@ impl DeviceRelationInvalidationQueue {
         })
     }
 
+    /// A synchronous caller owns a separate device action even when another action for this PDO
+    /// is pending. Reserve its terminal-result slot before publishing the queue row.
+    pub fn enqueue_sync(
+        &mut self,
+        parent: crate::DevnodeIdentity,
+        relation_type: u32,
+    ) -> Result<
+        (SyncDeviceRelationTicket, DeviceRelationInvalidation),
+        DeviceRelationInvalidationError,
+    > {
+        let pdo_device_id = parent.pdo_object_id();
+        if parent.devnode_id() == 0 || parent.generation() == 0 || pdo_device_id == 0 {
+            return Err(DeviceRelationInvalidationError::InvalidPdo);
+        }
+        let sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(DeviceRelationInvalidationError::SequenceExhausted)?;
+        self.rows
+            .try_reserve(1)
+            .map_err(|_| DeviceRelationInvalidationError::InsufficientResources)?;
+        self.sync_waiters
+            .try_reserve(1)
+            .map_err(|_| DeviceRelationInvalidationError::InsufficientResources)?;
+        let invalidation = DeviceRelationInvalidation {
+            parent,
+            pdo_device_id,
+            relation_type,
+            sequence,
+        };
+        let ticket = SyncDeviceRelationTicket(sequence);
+        self.next_sequence = sequence;
+        self.rows.push(DeviceRelationInvalidationRow {
+            parent,
+            pdo_device_id,
+            relation_type,
+            state: DeviceRelationInvalidationState::Pending { sequence },
+        });
+        self.sync_waiters.push(SyncDeviceRelationWaiter {
+            ticket,
+            status: None,
+        });
+        Ok((ticket, invalidation))
+    }
+
+    /// `None` means the exact action remains pending; row removal alone is never success.
+    pub fn sync_status(
+        &self,
+        ticket: SyncDeviceRelationTicket,
+    ) -> Result<Option<nt_status::NtStatus>, DeviceRelationInvalidationError> {
+        self.sync_waiters
+            .iter()
+            .find(|waiter| waiter.ticket == ticket)
+            .map(|waiter| waiter.status)
+            .ok_or(DeviceRelationInvalidationError::StaleTicket)
+    }
+
+    pub fn take_sync_status(
+        &mut self,
+        ticket: SyncDeviceRelationTicket,
+    ) -> Result<nt_status::NtStatus, DeviceRelationInvalidationError> {
+        let index = self
+            .sync_waiters
+            .iter()
+            .position(|waiter| waiter.ticket == ticket)
+            .ok_or(DeviceRelationInvalidationError::StaleTicket)?;
+        let status = self.sync_waiters[index]
+            .status
+            .ok_or(DeviceRelationInvalidationError::NotTerminal)?;
+        self.sync_waiters.remove(index);
+        Ok(status)
+    }
+
     pub fn claim_front(&mut self) -> Option<DeviceRelationInvalidation> {
         let (index, sequence) = self
             .rows
@@ -483,6 +578,13 @@ impl DeviceRelationInvalidationQueue {
                     )
             })
             .ok_or(DeviceRelationInvalidationError::StaleClaim)?;
+        if self
+            .sync_waiters
+            .iter()
+            .any(|waiter| waiter.ticket.0 == invalidation.sequence && waiter.status.is_none())
+        {
+            return Err(DeviceRelationInvalidationError::SyncStatusRequired);
+        }
         self.rows.remove(index);
         Ok(())
     }
@@ -492,27 +594,56 @@ impl DeviceRelationInvalidationQueue {
         claim: DeviceRelationInvalidation,
     ) -> Result<DeviceRelationInvalidationCompletion, DeviceRelationInvalidationError> {
         let index = self.claimed_row_index(claim)?;
+        if self
+            .sync_waiters
+            .iter()
+            .any(|waiter| waiter.ticket.0 == claim.sequence && waiter.status.is_none())
+        {
+            return Err(DeviceRelationInvalidationError::SyncStatusRequired);
+        }
+        Ok(self.complete_claim(index))
+    }
+
+    /// Publish the driver's real terminal status for one exact synchronous action. No allocation
+    /// occurs after claim; a stale or uncertain completion cannot consume another caller's ticket.
+    pub fn complete_sync(
+        &mut self,
+        claim: DeviceRelationInvalidation,
+        status: nt_status::NtStatus,
+    ) -> Result<DeviceRelationInvalidationCompletion, DeviceRelationInvalidationError> {
+        if status == nt_status::NtStatus::PENDING {
+            return Err(DeviceRelationInvalidationError::InvalidTerminalStatus);
+        }
+        let index = self.claimed_row_index(claim)?;
+        let waiter = self
+            .sync_waiters
+            .iter_mut()
+            .find(|waiter| waiter.ticket.0 == claim.sequence && waiter.status.is_none())
+            .ok_or(DeviceRelationInvalidationError::StaleTicket)?;
+        waiter.status = Some(status);
+        Ok(self.complete_claim(index))
+    }
+
+    fn complete_claim(&mut self, index: usize) -> DeviceRelationInvalidationCompletion {
         match self.rows[index].state {
             DeviceRelationInvalidationState::Claimed {
                 requeue_sequence: Some(sequence),
                 ..
             } => {
                 self.rows[index].state = DeviceRelationInvalidationState::Pending { sequence };
-                Ok(DeviceRelationInvalidationCompletion::Requeued(
-                    DeviceRelationInvalidation {
-                        parent: self.rows[index].parent,
-                        pdo_device_id: self.rows[index].pdo_device_id,
-                        relation_type: self.rows[index].relation_type,
-                        sequence,
-                    },
-                ))
+                DeviceRelationInvalidationCompletion::Requeued(DeviceRelationInvalidation {
+                    parent: self.rows[index].parent,
+                    pdo_device_id: self.rows[index].pdo_device_id,
+                    relation_type: self.rows[index].relation_type,
+                    sequence,
+                })
             }
             DeviceRelationInvalidationState::Claimed {
                 requeue_sequence: None,
                 ..
             } => {
                 self.rows.remove(index);
-                Ok(DeviceRelationInvalidationCompletion::Drained)
+                DeviceRelationInvalidationCompletion::Drained
             }
             DeviceRelationInvalidationState::Pending { .. } => unreachable!(),
         }
@@ -1494,6 +1625,138 @@ mod tests {
             Ok(DeviceRelationInvalidationCompletion::Drained)
         );
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn synchronous_relation_actions_are_distinct_and_retain_terminal_status() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        let (first_ticket, first) = queue.enqueue_sync(parent(10), 0).unwrap();
+        let (second_ticket, second) = queue.enqueue_sync(parent(10), 0).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(queue.claim_front(), Some(first));
+        assert_eq!(queue.sync_status(first_ticket), Ok(None));
+        assert_eq!(
+            queue.complete(first),
+            Err(DeviceRelationInvalidationError::SyncStatusRequired)
+        );
+        assert_eq!(
+            queue.complete_sync(first, nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+            Ok(DeviceRelationInvalidationCompletion::Drained)
+        );
+        assert_eq!(
+            queue.sync_status(first_ticket),
+            Ok(Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST))
+        );
+        assert_eq!(queue.sync_status(second_ticket), Ok(None));
+        assert_eq!(queue.claim_front(), Some(second));
+        queue
+            .complete_sync(second, nt_status::NtStatus::SUCCESS)
+            .unwrap();
+        assert_eq!(
+            queue.take_sync_status(first_ticket),
+            Ok(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+        );
+        assert_eq!(
+            queue.take_sync_status(second_ticket),
+            Ok(nt_status::NtStatus::SUCCESS)
+        );
+        assert_eq!(
+            queue.sync_status(first_ticket),
+            Err(DeviceRelationInvalidationError::StaleTicket)
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn synchronous_relation_abort_retries_exact_action_without_absorbing_async_work() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        let (ticket, action) = queue.enqueue_sync(parent(10), 0).unwrap();
+        assert_eq!(queue.claim_front(), Some(action));
+        let async_later = queue.enqueue(parent(10), 0).unwrap().invalidation;
+        assert_ne!(async_later, action);
+        queue.abort(action).unwrap();
+        assert_eq!(queue.sync_status(ticket), Ok(None));
+        assert_eq!(queue.claim_front(), Some(action));
+        assert_eq!(
+            queue.complete_sync(action, nt_status::NtStatus::SUCCESS),
+            Ok(DeviceRelationInvalidationCompletion::Drained)
+        );
+        assert_eq!(
+            queue.take_sync_status(ticket),
+            Ok(nt_status::NtStatus::SUCCESS)
+        );
+        assert_eq!(queue.claim_front(), Some(async_later));
+        queue.complete(async_later).unwrap();
+    }
+
+    #[test]
+    fn synchronous_relation_claim_and_discard_require_exact_owner() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        let (ticket, action) = queue.enqueue_sync(parent(10), 0).unwrap();
+        assert_eq!(
+            queue.discard_pending(action),
+            Err(DeviceRelationInvalidationError::SyncStatusRequired)
+        );
+        assert_eq!(
+            queue.take_sync_status(ticket),
+            Err(DeviceRelationInvalidationError::NotTerminal)
+        );
+        let stale = DeviceRelationInvalidation {
+            sequence: action.sequence + 1,
+            ..action
+        };
+        assert_eq!(queue.claim_front(), Some(action));
+        assert_eq!(
+            queue.complete_sync(action, nt_status::NtStatus::PENDING),
+            Err(DeviceRelationInvalidationError::InvalidTerminalStatus)
+        );
+        assert_eq!(queue.sync_status(ticket), Ok(None));
+        assert_eq!(
+            queue.complete_sync(stale, nt_status::NtStatus::SUCCESS),
+            Err(DeviceRelationInvalidationError::StaleClaim)
+        );
+        queue
+            .complete_sync(action, nt_status::NtStatus::UNSUCCESSFUL)
+            .unwrap();
+        assert_eq!(
+            queue.complete_sync(action, nt_status::NtStatus::SUCCESS),
+            Err(DeviceRelationInvalidationError::StaleClaim)
+        );
+        assert_eq!(
+            queue.take_sync_status(ticket),
+            Ok(nt_status::NtStatus::UNSUCCESSFUL)
+        );
+    }
+
+    #[test]
+    fn synchronous_completion_does_not_complete_a_later_async_action() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        let (ticket, action) = queue.enqueue_sync(parent(10), 0).unwrap();
+        assert_eq!(queue.claim_front(), Some(action));
+        let later = queue.enqueue(parent(10), 0).unwrap().invalidation;
+        assert_eq!(
+            queue.complete_sync(action, nt_status::NtStatus::SUCCESS),
+            Ok(DeviceRelationInvalidationCompletion::Drained)
+        );
+        assert_eq!(
+            queue.take_sync_status(ticket),
+            Ok(nt_status::NtStatus::SUCCESS)
+        );
+        assert_eq!(queue.claim_front(), Some(later));
+        queue.complete(later).unwrap();
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn synchronous_sequence_exhaustion_does_not_publish_a_row_or_ticket() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        queue.next_sequence = u64::MAX;
+        assert_eq!(
+            queue.enqueue_sync(parent(10), 0),
+            Err(DeviceRelationInvalidationError::SequenceExhausted)
+        );
+        assert!(queue.is_empty());
+        assert!(queue.sync_waiters.is_empty());
     }
 
     #[test]
