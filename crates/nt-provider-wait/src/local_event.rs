@@ -111,6 +111,15 @@ pub enum ProviderLocalEventLeaseKind {
     Signal,
 }
 
+/// Exact ownership of one in-flight wait or signal against a published Event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderLocalEventLease {
+    pub id: ProviderLocalEventId,
+    pub canonical: ProviderWaitObject,
+    pub kind: ProviderLocalEventLeaseKind,
+    serial: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderLocalEventError {
     InvalidProvider,
@@ -128,6 +137,7 @@ pub enum ProviderLocalEventError {
     ActiveLeases,
     LeaseOverflow,
     LeaseUnderflow,
+    WrongLease,
     RetirementMismatch,
 }
 
@@ -209,6 +219,8 @@ impl ProviderLocalEventRecord {
 pub struct ProviderLocalEventCatalog {
     provider: ProviderDomainIdentity,
     records: Vec<ProviderLocalEventRecord>,
+    leases: Vec<ProviderLocalEventLease>,
+    next_lease_serial: u64,
 }
 
 impl ProviderLocalEventCatalog {
@@ -219,6 +231,8 @@ impl ProviderLocalEventCatalog {
         Ok(Self {
             provider,
             records: Vec::new(),
+            leases: Vec::new(),
+            next_lease_serial: 1,
         })
     }
 
@@ -504,38 +518,63 @@ impl ProviderLocalEventCatalog {
         &mut self,
         id: ProviderLocalEventId,
         kind: ProviderLocalEventLeaseKind,
-    ) -> Result<(), ProviderLocalEventError> {
+    ) -> Result<ProviderLocalEventLease, ProviderLocalEventError> {
         let slot = self.slot(id)?;
-        let record = &mut self.records[slot];
-        if record.canonical.is_none() {
-            return Err(ProviderLocalEventError::NotPublished);
-        }
+        let record = self.records[slot];
         if record.delete_pending {
             return Err(ProviderLocalEventError::DeletePending);
         }
-        let count = match kind {
-            ProviderLocalEventLeaseKind::Wait => &mut record.wait_leases,
-            ProviderLocalEventLeaseKind::Signal => &mut record.signal_leases,
-        };
-        *count = count
+        let canonical = record.canonical.ok_or(ProviderLocalEventError::NotPublished)?;
+        let next = self
+            .next_lease_serial
             .checked_add(1)
             .ok_or(ProviderLocalEventError::LeaseOverflow)?;
-        Ok(())
+        let count = match kind {
+            ProviderLocalEventLeaseKind::Wait => record.wait_leases,
+            ProviderLocalEventLeaseKind::Signal => record.signal_leases,
+        };
+        let updated_count = count
+            .checked_add(1)
+            .ok_or(ProviderLocalEventError::LeaseOverflow)?;
+        self.leases
+            .try_reserve(1)
+            .map_err(|_| ProviderLocalEventError::NoCapacity)?;
+        let lease = ProviderLocalEventLease {
+            id,
+            canonical,
+            kind,
+            serial: self.next_lease_serial,
+        };
+        self.leases.push(lease);
+        self.next_lease_serial = next;
+        *match kind {
+            ProviderLocalEventLeaseKind::Wait => &mut self.records[slot].wait_leases,
+            ProviderLocalEventLeaseKind::Signal => &mut self.records[slot].signal_leases,
+        } = updated_count;
+        Ok(lease)
     }
 
     pub fn release_lease(
         &mut self,
-        id: ProviderLocalEventId,
-        kind: ProviderLocalEventLeaseKind,
+        lease: ProviderLocalEventLease,
     ) -> Result<(), ProviderLocalEventError> {
-        let slot = self.slot(id)?;
-        let count = match kind {
+        let slot = self.slot(lease.id)?;
+        if self.records[slot].canonical != Some(lease.canonical) {
+            return Err(ProviderLocalEventError::WrongLease);
+        }
+        let index = self
+            .leases
+            .iter()
+            .position(|active| *active == lease)
+            .ok_or(ProviderLocalEventError::WrongLease)?;
+        let count = match lease.kind {
             ProviderLocalEventLeaseKind::Wait => &mut self.records[slot].wait_leases,
             ProviderLocalEventLeaseKind::Signal => &mut self.records[slot].signal_leases,
         };
         *count = count
             .checked_sub(1)
             .ok_or(ProviderLocalEventError::LeaseUnderflow)?;
+        self.leases.swap_remove(index);
         Ok(())
     }
 
@@ -703,30 +742,135 @@ mod tests {
             .initialize(0x2000, storage, ProviderEventKind::Synchronization, false)
             .unwrap();
         catalog.bind_canonical(id, canonical(6, 1)).unwrap();
-        catalog
+        let wait = catalog
             .acquire_lease(id, ProviderLocalEventLeaseKind::Wait)
             .unwrap();
-        catalog
+        let signal = catalog
             .acquire_lease(id, ProviderLocalEventLeaseKind::Signal)
             .unwrap();
         assert_eq!(
             catalog.begin_retire_backing(storage.backing),
             Err(ProviderLocalEventError::ActiveLeases)
         );
-        catalog
-            .release_lease(id, ProviderLocalEventLeaseKind::Wait)
-            .unwrap();
+        catalog.release_lease(wait).unwrap();
         assert_eq!(
             catalog.begin_retire_backing(storage.backing),
             Err(ProviderLocalEventError::ActiveLeases)
         );
-        catalog
-            .release_lease(id, ProviderLocalEventLeaseKind::Signal)
-            .unwrap();
+        catalog.release_lease(signal).unwrap();
         assert_eq!(
             catalog.begin_retire_backing(storage.backing).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn duplicate_release_cannot_consume_another_wait_lease() {
+        let mut catalog = ProviderLocalEventCatalog::new(provider()).unwrap();
+        let storage = allocation(40, 1, 0);
+        let id = catalog
+            .initialize(0xb000, storage, ProviderEventKind::Notification, false)
+            .unwrap();
+        catalog.bind_canonical(id, canonical(40, 1)).unwrap();
+        let first = catalog
+            .acquire_lease(id, ProviderLocalEventLeaseKind::Wait)
+            .unwrap();
+        let second = catalog
+            .acquire_lease(id, ProviderLocalEventLeaseKind::Wait)
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(catalog.snapshot(id).unwrap().wait_leases, 2);
+
+        catalog.release_lease(first).unwrap();
+        assert_eq!(
+            catalog.release_lease(first),
+            Err(ProviderLocalEventError::WrongLease)
+        );
+        assert_eq!(catalog.snapshot(id).unwrap().wait_leases, 1);
+        assert_eq!(
+            catalog.begin_retire_backing(storage.backing),
+            Err(ProviderLocalEventError::ActiveLeases)
+        );
+        catalog.release_lease(second).unwrap();
+        assert_eq!(catalog.snapshot(id).unwrap().wait_leases, 0);
+    }
+
+    #[test]
+    fn wrong_kind_and_canonical_cannot_release_mixed_leases() {
+        let mut catalog = ProviderLocalEventCatalog::new(provider()).unwrap();
+        let storage = allocation(41, 1, 0);
+        let id = catalog
+            .initialize(0xb100, storage, ProviderEventKind::Synchronization, false)
+            .unwrap();
+        catalog.bind_canonical(id, canonical(41, 1)).unwrap();
+        let wait = catalog
+            .acquire_lease(id, ProviderLocalEventLeaseKind::Wait)
+            .unwrap();
+        let signal = catalog
+            .acquire_lease(id, ProviderLocalEventLeaseKind::Signal)
+            .unwrap();
+        assert_eq!(wait.canonical, signal.canonical);
+        assert_eq!(
+            catalog.release_lease(ProviderLocalEventLease {
+                kind: ProviderLocalEventLeaseKind::Signal,
+                ..wait
+            }),
+            Err(ProviderLocalEventError::WrongLease)
+        );
+        assert_eq!(
+            catalog.release_lease(ProviderLocalEventLease {
+                canonical: canonical(41, 2),
+                ..signal
+            }),
+            Err(ProviderLocalEventError::WrongLease)
+        );
+        let snapshot = catalog.snapshot(id).unwrap();
+        assert_eq!((snapshot.wait_leases, snapshot.signal_leases), (1, 1));
+        assert_eq!(
+            catalog.begin_retire_backing(storage.backing),
+            Err(ProviderLocalEventError::ActiveLeases)
+        );
+        catalog.release_lease(wait).unwrap();
+        assert_eq!(
+            catalog.begin_retire_backing(storage.backing),
+            Err(ProviderLocalEventError::ActiveLeases)
+        );
+        catalog.release_lease(signal).unwrap();
+        assert_eq!(catalog.validate_backing_retirement(storage.backing), Ok(1));
+    }
+
+    #[test]
+    fn stale_lease_cannot_release_reused_event_slot() {
+        let mut catalog = ProviderLocalEventCatalog::new(provider()).unwrap();
+        let storage = allocation(42, 1, 0);
+        let first = catalog
+            .initialize(0xb200, storage, ProviderEventKind::Notification, false)
+            .unwrap();
+        catalog.bind_canonical(first, canonical(42, 1)).unwrap();
+        let stale = catalog
+            .acquire_lease(first, ProviderLocalEventLeaseKind::Signal)
+            .unwrap();
+        catalog.release_lease(stale).unwrap();
+        let retirement = catalog.begin_retire_event(first).unwrap();
+        catalog.ack_retirement(retirement).unwrap();
+        let second = catalog
+            .initialize(
+                0xb200,
+                allocation(42, 2, 0),
+                ProviderEventKind::Notification,
+                false,
+            )
+            .unwrap();
+        catalog.bind_canonical(second, canonical(42, 1)).unwrap();
+        let live = catalog
+            .acquire_lease(second, ProviderLocalEventLeaseKind::Signal)
+            .unwrap();
+        assert_eq!(
+            catalog.release_lease(stale),
+            Err(ProviderLocalEventError::StaleIdentity)
+        );
+        assert_eq!(catalog.snapshot(second).unwrap().signal_leases, 1);
+        catalog.release_lease(live).unwrap();
     }
 
     #[test]
@@ -752,7 +896,7 @@ mod tests {
             .unwrap();
         catalog.bind_canonical(first, canonical(7, 1)).unwrap();
         catalog.bind_canonical(second, canonical(8, 1)).unwrap();
-        catalog
+        let lease = catalog
             .acquire_lease(second, ProviderLocalEventLeaseKind::Wait)
             .unwrap();
         assert_eq!(
@@ -760,9 +904,7 @@ mod tests {
             Err(ProviderLocalEventError::ActiveLeases)
         );
         assert!(!catalog.snapshot(first).unwrap().delete_pending);
-        catalog
-            .release_lease(second, ProviderLocalEventLeaseKind::Wait)
-            .unwrap();
+        catalog.release_lease(lease).unwrap();
         let retirements = catalog.begin_retire_backing(first_storage.backing).unwrap();
         assert_eq!(retirements.len(), 2);
         assert!(catalog.snapshot(first).unwrap().delete_pending);

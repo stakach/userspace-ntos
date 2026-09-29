@@ -4534,8 +4534,8 @@ unsafe fn initialize_provider_local_event(
 
 unsafe fn provider_local_event_signal_lease_or_park(
     event: u64,
-) -> nt_provider_wait::ProviderLocalEventId {
-    let id = {
+) -> nt_provider_wait::ProviderLocalEventLease {
+    let lease = {
         let mut metadata = ProviderMetadataGuard::acquire();
         provider_local_events_mut().and_then(|events| {
             let snapshot = events.resolve_body(event).ok()?;
@@ -4556,12 +4556,11 @@ unsafe fn provider_local_event_signal_lease_or_park(
             }
             events
                 .acquire_lease(snapshot.id, nt_provider_wait::ProviderLocalEventLeaseKind::Signal)
-                .ok()?;
-            Some(snapshot.id)
+                .ok()
         })
     };
-    match id {
-        Some(id) => id,
+    match lease {
+        Some(lease) => lease,
         None => {
             print_str(b"[win32k-event] unowned local Event body=0x");
             print_hex((event >> 32) as u32);
@@ -4573,8 +4572,8 @@ unsafe fn provider_local_event_signal_lease_or_park(
 }
 
 unsafe fn provider_local_event_call(event: u64, op: u64) -> (u64, u64) {
-    let id = provider_local_event_signal_lease_or_park(event);
-    let (status, out1, out2, _) = win32k_event_broker_call(op, id.raw(), 0, 0);
+    let lease = provider_local_event_signal_lease_or_park(event);
+    let (status, out1, out2, _) = win32k_event_broker_call(op, lease.id.raw(), 0, 0);
     if status != 0 {
         print_str(b"[win32k-event] canonical local Event operation failed\n");
         park();
@@ -4590,7 +4589,7 @@ unsafe fn provider_local_event_call(event: u64, op: u64) -> (u64, u64) {
         mirror_projected_event_state(event, signaled);
         provider_local_events_mut()
             .expect("local Event catalog disappeared")
-            .release_lease(id, nt_provider_wait::ProviderLocalEventLeaseKind::Signal)
+            .release_lease(lease)
             .is_ok()
     };
     if !released {
