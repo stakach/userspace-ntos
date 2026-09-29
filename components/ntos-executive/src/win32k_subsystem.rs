@@ -688,6 +688,22 @@ unsafe fn retire_provider_allocation_events(
     retire_provider_local_events_for_backing(provider_allocation_event_backing(allocation))
 }
 
+unsafe fn validate_provider_allocation_timer_retirement(
+    allocation: nt_provider_wait::ProviderAllocationSnapshot,
+) -> bool {
+    provider_local_timers().is_some_and(|timers| {
+        timers
+            .validate_backing_retirement(provider_allocation_event_backing(allocation))
+            .is_ok()
+    })
+}
+
+unsafe fn retire_provider_allocation_timers(
+    allocation: nt_provider_wait::ProviderAllocationSnapshot,
+) -> bool {
+    retire_provider_local_timers_for_backing(provider_allocation_event_backing(allocation))
+}
+
 unsafe fn provider_heap_arena_identity(
     arena_base: u64,
 ) -> Option<nt_provider_wait::ProviderArenaIdentity> {
@@ -1617,13 +1633,20 @@ unsafe fn provider_pool_release_owned(objects: &[(u64, u64)]) -> bool {
     if tracked_allocations
         .iter()
         .copied()
-        .any(|allocation| !validate_provider_allocation_event_retirement(allocation))
+        .any(|allocation| {
+            !validate_provider_allocation_event_retirement(allocation)
+                || !validate_provider_allocation_timer_retirement(allocation)
+        })
     {
         return false;
     }
     for allocation in tracked_allocations.iter().copied() {
         if !retire_provider_allocation_events(allocation) {
             print_str(b"[win32k-host] fatal provider-pool Event retirement commit failure\n");
+            park();
+        }
+        if !retire_provider_allocation_timers(allocation) {
+            print_str(b"[win32k-host] fatal provider-pool Timer retirement commit failure\n");
             park();
         }
     }
@@ -1862,7 +1885,9 @@ unsafe fn reclaiming_pool_free(p: u64) -> bool {
     };
     if reclaiming_pool_capacity(p) != Some(allocation.capacity)
         || !validate_provider_allocation_event_retirement(allocation)
+        || !validate_provider_allocation_timer_retirement(allocation)
         || !retire_provider_allocation_events(allocation)
+        || !retire_provider_allocation_timers(allocation)
         || !reclaiming_pool_free_raw(p)
     {
         return false;
@@ -4153,6 +4178,9 @@ unsafe fn finish_provider_stack_event_activation(
     if !retire_provider_local_events_for_backing(activation.backing()) {
         return false;
     }
+    if !retire_provider_local_timers_for_backing(activation.backing()) {
+        return false;
+    }
     (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
         .as_mut()
         .is_some_and(|activations| activations.finish(activation).is_ok())
@@ -4478,6 +4506,12 @@ unsafe fn retire_existing_provider_local_timer(timer: u64) -> bool {
         Ok(retirement) => retirement,
         Err(_) => return false,
     };
+    retire_provider_local_timer(retirement)
+}
+
+unsafe fn retire_provider_local_timer(
+    retirement: nt_provider_wait::ProviderLocalTimerRetirement,
+) -> bool {
     let (status, object_id, object_generation, _) = win32k_event_broker_call(
         W32_TIMER_OP_RETIRE_LOCAL,
         retirement.id.raw(),
@@ -4498,9 +4532,39 @@ unsafe fn retire_existing_provider_local_timer(timer: u64) -> bool {
         object_id,
         object_generation,
     );
-    status == 0
-        && provider_local_timers_mut()
-            .is_some_and(|timers| timers.ack_retirement(retirement).is_ok())
+    if status != 0 {
+        return false;
+    }
+    if provider_local_timers_mut().is_none_or(|timers| timers.ack_retirement(retirement).is_err()) {
+        print_str(b"[win32k-timer] fatal local retirement commit mismatch\n");
+        park();
+    }
+    true
+}
+
+unsafe fn retire_provider_local_timers_for_backing(
+    backing: nt_provider_wait::ProviderEventBacking,
+) -> bool {
+    let count = provider_local_timers().map(|timers| timers.backing_timer_count(backing));
+    if count == Some(0) {
+        return true;
+    }
+    if count.is_none() {
+        return false;
+    }
+    let retirements = match provider_local_timers_mut()
+        .expect("local Timer catalog disappeared")
+        .begin_retire_backing(backing)
+    {
+        Ok(retirements) => retirements,
+        Err(_) => return false,
+    };
+    for retirement in retirements {
+        if !retire_provider_local_timer(retirement) {
+            return false;
+        }
+    }
+    true
 }
 
 unsafe fn initialize_provider_local_timer(
@@ -7324,7 +7388,9 @@ unsafe fn heap_free_in(arena_base: u64, arena_bytes: u64, p: u64) -> bool {
     };
     if heap_block_capacity_in(arena_base, arena_bytes, p) != Some(allocation.capacity)
         || !validate_provider_allocation_event_retirement(allocation)
+        || !validate_provider_allocation_timer_retirement(allocation)
         || !retire_provider_allocation_events(allocation)
+        || !retire_provider_allocation_timers(allocation)
     {
         return false;
     }
