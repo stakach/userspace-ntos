@@ -132,6 +132,8 @@ mod hosted_kernel_file_control;
 mod hosted_kernel_file_read_query;
 #[path = "hosted_kernel_win32k_async_read.rs"]
 mod hosted_kernel_win32k_async_read;
+#[path = "hosted_sync_relations.rs"]
+pub(crate) mod hosted_sync_relations;
 #[path = "hosted_kernel_win32k_buffered_ioctl.rs"]
 mod hosted_kernel_win32k_buffered_ioctl;
 #[path = "hosted_kernel_file_cancel.rs"]
@@ -40488,6 +40490,7 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
     let route_reconciliation_ready =
         crate::hosted_pci_topology::note_hosted_pci_relation_completion(
             relation_owner,
+            claim,
             invalidation_completion,
             pci_catalog_published,
         )
@@ -40529,6 +40532,7 @@ unsafe fn complete_hosted_relation_probe_without_publication(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         ));
     }
+    // ReactOS returns the completed enumeration action's status, not the leaf query status.
     let invalidation_completion = hosted_device_relation_invalidations_mut()
         .complete_terminal(claim, nt_status::NtStatus::SUCCESS)
         .map_err(|_| {
@@ -40538,6 +40542,7 @@ unsafe fn complete_hosted_relation_probe_without_publication(
     let route_reconciliation_ready =
         crate::hosted_pci_topology::note_hosted_pci_relation_completion(
             relation_owner,
+            claim,
             invalidation_completion,
             false,
         )
@@ -41908,12 +41913,13 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
 }
 
 unsafe fn retire_hosted_device_relation_barrier() -> usize {
-    let Some((claim, irp_id, status)) = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+    let Some((claim, relation_owner, irp_id, status)) = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
         .as_ref()
         .filter(|query| query.phase == HostedDeviceRelationQueryPhase::Barrier)
         .map(|query| {
             (
                 query.claim,
+                query.relation_owner,
                 query.irp_id,
                 query
                     .barrier_status
@@ -41951,13 +41957,13 @@ unsafe fn retire_hosted_device_relation_barrier() -> usize {
         .complete_terminal(claim, status)
         .expect("failed relation query lost its exact invalidation claim");
     remove_hosted_device_relation_owner(claim);
-    if matches!(
+    crate::hosted_pci_topology::note_hosted_pci_relation_failure(
+        relation_owner,
+        claim,
         invalidation_completion,
-        nt_pnp_manager::DeviceRelationInvalidationCompletion::Drained
-    ) {
-        crate::hosted_pci_topology::note_hosted_pci_relation_failure(claim.pdo_device_id, status)
-            .expect("failed relation query lost its PCI topology dirty owner");
-    }
+        status,
+    )
+    .expect("failed relation query lost its PCI topology dirty owner");
     *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = None;
     1
 }
@@ -42053,6 +42059,27 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         );
         return 1;
     };
+
+    let pci_admission = crate::hosted_pci_topology::note_hosted_pci_relation_claimed(
+        relation_owner,
+        claim,
+    );
+    let pci_admission = match pci_admission {
+        Ok(true) => cancel_stale_hosted_acpi_pci_route_query().map(|_| ()),
+        Ok(false) => Ok(()),
+        Err(status) => Err(status),
+    };
+    if let Err(status) = pci_admission {
+        io_manager_mut()
+            .discard_prepared_external_pnp(prepared)
+            .expect("undispatched hosted relation IRP could not be discarded");
+        retain_hosted_relation_query_barrier(
+            claim,
+            status,
+            HostedRelationBarrierOrigin::ClaimTarget,
+        );
+        return 1;
+    }
 
     *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = Some(HostedDeviceRelationQuery {
         claim,
@@ -42327,6 +42354,7 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
         .saturating_add(unsafe { drain_hosted_acpi_pci_route_query() })
         .saturating_add(unsafe { start_hosted_device_relation_query() })
         .saturating_add(unsafe { start_hosted_acpi_pci_route_query() })
+        .saturating_add(unsafe { hosted_sync_relations::drain() })
 }
 
 pub(crate) fn hosted_file_retry_deadline(now: u64) -> Option<u64> {
@@ -46071,6 +46099,7 @@ unsafe fn enqueue_hosted_device_relations(
     {
         let pci_relevant = match crate::hosted_pci_topology::note_hosted_pci_relation_queued(
             relation_owner,
+            enqueued.invalidation,
         ) {
             Ok(relevant) => relevant,
             Err(status) => {
@@ -46086,6 +46115,61 @@ unsafe fn enqueue_hosted_device_relations(
         }
     }
     Ok(enqueued)
+}
+
+unsafe fn enqueue_hosted_sync_device_relations(
+    relation_owner: nt_pnp::AcpiPciProviderEndpoint,
+    parent: nt_pnp_manager::DevnodeIdentity,
+) -> Result<nt_pnp_manager::SyncDeviceRelationTicket, nt_status::NtStatus> {
+    if parent.pdo_object_id() != relation_owner.device_id
+        || !hosted_pnp_manager_mut().devnode_identity_is_started(parent)
+        || hosted_pnp_manager_mut().devnode_identity_for_pdo(relation_owner.device_id)
+            != Some(parent)
+        || !hosted_device_relation_owner_is_current(relation_owner)
+        || hosted_device_relation_owners_mut().conflicting_projection(
+            parent,
+            nt_pnp_abi::BUS_RELATIONS,
+            relation_owner,
+        )
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    hosted_device_relation_owners_mut()
+        .reserve()
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let (ticket, invalidation) = hosted_device_relation_invalidations_mut()
+        .enqueue_sync(parent, nt_pnp_abi::BUS_RELATIONS)
+        .map_err(hosted_relation_invalidation_status)?;
+    hosted_device_relation_owners_mut().record(invalidation, relation_owner);
+    let pci_relevant = match crate::hosted_pci_topology::note_hosted_pci_relation_queued(
+        relation_owner,
+        invalidation,
+    ) {
+        Ok(relevant) => relevant,
+        Err(status) => {
+            hosted_device_relation_invalidations_mut()
+                .discard_pending_sync(ticket, invalidation)
+                .expect("unclaimed synchronous relation could not be rolled back");
+            remove_hosted_device_relation_owner(invalidation);
+            return Err(status);
+        }
+    };
+    if pci_relevant {
+        if let Err(status) = cancel_stale_hosted_acpi_pci_route_query() {
+            crate::hosted_pci_topology::note_hosted_pci_relation_admission_failed(
+                relation_owner,
+                invalidation,
+                status,
+            )
+            .expect("queued PCI relation lost its exact admission owner");
+            hosted_device_relation_invalidations_mut()
+                .discard_pending_sync(ticket, invalidation)
+                .expect("unclaimed synchronous relation could not be rolled back");
+            remove_hosted_device_relation_owner(invalidation);
+            return Err(status);
+        }
+    }
+    Ok(ticket)
 }
 
 unsafe fn hosted_relation_owner_for_device(

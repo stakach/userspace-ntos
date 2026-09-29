@@ -228,7 +228,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("IoGetDeviceProperty", StubSuccess, "returns benign device-property/stack-limit values for win32k init"),
     e("IoGetStackLimits", Implemented, "returns the exact active primary or repeated component-lane stack interval"),
     e("IoGetCurrentProcess", Partial, "returns the current EPROCESS via nt-process"),
-    e("IoSynchronousInvalidateDeviceRelations", TrapIfCalled, "device-stack I/O not reached on the win32k init path; traps if called"),
+    e("IoSynchronousInvalidateDeviceRelations", Partial, "authenticated PDO action retains the win32k Reply until exact PnP terminal completion"),
     e("IoOpenDeviceRegistryKey", Partial, "authenticated PDO Driver-key open with canonical CM property and pending kernel-handle publication; live win32k invocation awaits the remaining import gate"),
     e("IoGetRelatedDeviceObject", Partial, "resolves the canonical live attachment-stack top and returns it only through an exact win32k video Device projection"),
     e("IoGetDeviceObjectPointer", Partial, "opens the dynamically published video route, access-checks it through Object Manager, and returns retained WDM File/Device projections"),
