@@ -4575,24 +4575,26 @@ extern "win64" fn s_ke_initialize_event(event: u64, event_type: u64, initial_sta
 }
 
 unsafe fn retire_existing_provider_local_timer(timer: u64) -> bool {
-    let existing = match provider_local_timers()
-        .expect("local Timer catalog is not initialized")
-        .snapshot_for_body(timer)
-    {
-        Ok(existing) => existing,
-        Err(nt_provider_wait::ProviderTimerError::NotFound) => return true,
-        Err(_) => return false,
-    };
-    if existing.canonical.is_none() {
-        return provider_local_timers_mut()
-            .is_some_and(|timers| timers.rollback_unpublished(existing.id).is_ok());
-    }
-    let retirement = match provider_local_timers_mut()
-        .expect("local Timer catalog disappeared")
-        .begin_retire(existing.id)
-    {
-        Ok(retirement) => retirement,
-        Err(_) => return false,
+    let retirement = {
+        let _metadata = ProviderMetadataGuard::acquire();
+        let existing = match provider_local_timers()
+            .expect("local Timer catalog is not initialized")
+            .snapshot_for_body(timer)
+        {
+            Ok(existing) => existing,
+            Err(nt_provider_wait::ProviderTimerError::NotFound) => return true,
+            Err(_) => return false,
+        };
+        if existing.canonical.is_none() {
+            return false;
+        }
+        match provider_local_timers_mut()
+            .expect("local Timer catalog disappeared")
+            .begin_retire(existing.id)
+        {
+            Ok(retirement) => retirement,
+            Err(_) => return false,
+        }
     };
     retire_provider_local_timer(retirement)
 }
@@ -4623,7 +4625,12 @@ unsafe fn retire_provider_local_timer(
     if status != 0 {
         return false;
     }
-    if provider_local_timers_mut().is_none_or(|timers| timers.ack_retirement(retirement).is_err()) {
+    let acknowledged = {
+        let _metadata = ProviderMetadataGuard::acquire();
+        provider_local_timers_mut()
+            .is_some_and(|timers| timers.ack_retirement(retirement).is_ok())
+    };
+    if !acknowledged {
         print_str(b"[win32k-timer] fatal local retirement commit mismatch\n");
         park();
     }
@@ -4633,19 +4640,18 @@ unsafe fn retire_provider_local_timer(
 unsafe fn retire_provider_local_timers_for_backing(
     backing: nt_provider_wait::ProviderEventBacking,
 ) -> bool {
-    let count = provider_local_timers().map(|timers| timers.backing_timer_count(backing));
-    if count == Some(0) {
-        return true;
-    }
-    if count.is_none() {
-        return false;
-    }
-    let retirements = match provider_local_timers_mut()
-        .expect("local Timer catalog disappeared")
-        .begin_retire_backing(backing)
-    {
-        Ok(retirements) => retirements,
-        Err(_) => return false,
+    let retirements = {
+        let _metadata = ProviderMetadataGuard::acquire();
+        let Some(timers) = provider_local_timers_mut() else {
+            return false;
+        };
+        if timers.backing_timer_count(backing) == 0 {
+            return true;
+        }
+        match timers.begin_retire_backing(backing) {
+            Ok(retirements) => retirements,
+            Err(_) => return false,
+        }
     };
     for retirement in retirements {
         if !retire_provider_local_timer(retirement) {
@@ -4663,49 +4669,52 @@ unsafe fn initialize_provider_local_timer(
         return false;
     }
     const KTIMER_BYTES: u64 = 0x40;
-    let id = with_provider_allocations(|allocations| {
-        allocations
-            .containing(timer, KTIMER_BYTES)
-            .ok()
-            .and_then(|allocation| {
+    let id = {
+        let mut metadata = ProviderMetadataGuard::acquire();
+        provider_allocations_unlocked(&mut metadata)
+            .and_then(|allocations| {
+                allocations
+                    .containing(timer, KTIMER_BYTES)
+                    .ok()
+                    .and_then(|allocation| {
+                        provider_local_timers_mut()?
+                            .initialize_in_allocation(
+                                allocations,
+                                allocation.identity,
+                                timer,
+                                KTIMER_BYTES,
+                                kind,
+                            )
+                            .ok()
+                    })
+            })
+            .or_else(|| {
+                let (activation, offset) = (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
+                    .as_ref()?
+                    .classify_event_storage(current_stack_pointer(), timer, KTIMER_BYTES)
+                    .ok()?;
                 provider_local_timers_mut()?
-                    .initialize_in_allocation(
-                        allocations,
-                        allocation.identity,
+                    .initialize_stack(
                         timer,
-                        KTIMER_BYTES,
+                        activation.lane_id,
+                        u64::from(activation.lane.generation()),
+                        activation.dispatch_id,
+                        activation.generation,
+                        offset,
                         kind,
                     )
                     .ok()
             })
-    })
-    .flatten()
-    .or_else(|| {
-        let (activation, offset) = (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
-            .as_ref()?
-            .classify_event_storage(current_stack_pointer(), timer, KTIMER_BYTES)
-            .ok()?;
-        provider_local_timers_mut()?
-            .initialize_stack(
-                timer,
-                activation.lane_id,
-                u64::from(activation.lane.generation()),
-                activation.dispatch_id,
-                activation.generation,
-                offset,
-                kind,
-            )
-            .ok()
-    })
-    .or_else(|| {
-        let end = timer.checked_add(KTIMER_BYTES)?;
-        if timer >= WIN32K_CODE_VA && end <= WIN32K_CODE_VA + WIN32K_IMAGE_BYTES {
-            return provider_local_timers_mut()?
-                .initialize_static(timer, timer - WIN32K_CODE_VA, kind)
-                .ok();
-        }
-        None
-    });
+            .or_else(|| {
+                let end = timer.checked_add(KTIMER_BYTES)?;
+                if timer >= WIN32K_CODE_VA && end <= WIN32K_CODE_VA + WIN32K_IMAGE_BYTES {
+                    return provider_local_timers_mut()?
+                        .initialize_static(timer, timer - WIN32K_CODE_VA, kind)
+                        .ok();
+                }
+                None
+            })
+    };
     let Some(id) = id else {
         return false;
     };
@@ -4720,6 +4729,7 @@ unsafe fn initialize_provider_local_timer(
         0,
     );
     if status != 0 || object_id == 0 || object_generation == 0 || metadata != timer_type {
+        let _metadata = ProviderMetadataGuard::acquire();
         let _ = provider_local_timers_mut()
             .expect("local Timer catalog disappeared")
             .rollback_unpublished(id);
@@ -4730,11 +4740,23 @@ unsafe fn initialize_provider_local_timer(
         object_id,
         object_generation,
     );
-    if provider_local_timers_mut()
-        .expect("local Timer catalog disappeared")
-        .bind_canonical(id, canonical)
-        .is_err()
-    {
+    let published = {
+        let _metadata = ProviderMetadataGuard::acquire();
+        let bound = provider_local_timers_mut()
+            .expect("local Timer catalog disappeared")
+            .bind_canonical(id, canonical)
+            .is_ok();
+        if bound {
+            core::ptr::write_bytes(timer as *mut u8, 0, KTIMER_BYTES as usize);
+            write_unaligned(
+                timer as *mut u8,
+                if timer_type == 0 { 8u8 } else { 9u8 },
+            );
+            write_unaligned((timer + 2) as *mut u8, 0x0A);
+        }
+        bound
+    };
+    if !published {
         let (retire_status, retired_id, retired_generation, _) = win32k_event_broker_call(
             W32_TIMER_OP_RETIRE_LOCAL,
             id.raw(),
@@ -4752,17 +4774,12 @@ unsafe fn initialize_provider_local_timer(
                 canonical.object_generation,
             );
         }
+        let _metadata = ProviderMetadataGuard::acquire();
         let _ = provider_local_timers_mut()
             .expect("local Timer catalog disappeared")
             .rollback_unpublished(id);
         return false;
     }
-    core::ptr::write_bytes(timer as *mut u8, 0, KTIMER_BYTES as usize);
-    write_unaligned(
-        timer as *mut u8,
-        if timer_type == 0 { 8u8 } else { 9u8 },
-    );
-    write_unaligned((timer + 2) as *mut u8, 0x0A);
     true
 }
 
@@ -4785,15 +4802,49 @@ extern "win64" fn s_ke_initialize_timer(timer: u64) {
     s_ke_initialize_timer_ex(timer, 0);
 }
 
-unsafe fn provider_local_timer_snapshot_or_park(
+unsafe fn provider_local_timer_operation_or_park(
     timer: u64,
-) -> nt_provider_wait::ProviderLocalTimerSnapshot {
-    match provider_local_timers().and_then(|timers| timers.resolve_body(timer).ok()) {
-        Some(snapshot) => snapshot,
+) -> nt_provider_wait::ProviderLocalTimerOperationLease {
+    let lease = {
+        let mut metadata = ProviderMetadataGuard::acquire();
+        provider_local_timers_mut().and_then(|timers| {
+            let snapshot = timers.resolve_body(timer).ok()?;
+            if matches!(
+                snapshot.storage.backing,
+                nt_provider_wait::ProviderEventBacking::Allocation { .. }
+            ) {
+                let allocations = provider_allocations_unlocked(&mut metadata)?;
+                let allocation = allocations.containing(timer, 0x40).ok()?;
+                if allocations.snapshot_active(allocation.identity).is_err()
+                    || nt_provider_wait::ProviderEventBacking::from_allocation(allocation)
+                        != snapshot.storage.backing
+                {
+                    return None;
+                }
+            }
+            timers.acquire_operation(snapshot.id).ok()
+        })
+    };
+    match lease {
+        Some(lease) => lease,
         None => {
             print_str(b"[win32k-timer] unowned local Timer\n");
             park();
         }
+    }
+}
+
+unsafe fn release_provider_local_timer_operation(
+    lease: nt_provider_wait::ProviderLocalTimerOperationLease,
+) {
+    let released = {
+        let _metadata = ProviderMetadataGuard::acquire();
+        provider_local_timers_mut()
+            .is_some_and(|timers| timers.release_operation(lease).is_ok())
+    };
+    if !released {
+        print_str(b"[win32k-timer] fatal local Timer lease release mismatch\n");
+        park();
     }
 }
 
@@ -4802,11 +4853,11 @@ extern "win64" fn s_ke_set_timer(timer: u64, due_time: i64, dpc: u64) -> u8 {
         print_str(b"[win32k-timer] invalid Timer or unsupported Timer DPC\n");
         park();
     }
-    let snapshot = unsafe { provider_local_timer_snapshot_or_park(timer) };
+    let lease = unsafe { provider_local_timer_operation_or_park(timer) };
     let (status, active, _, _) = unsafe {
         win32k_event_broker_call(
             W32_TIMER_OP_SET_LOCAL,
-            snapshot.id.raw(),
+            lease.id.raw(),
             due_time as u64,
             0,
         )
@@ -4816,30 +4867,33 @@ extern "win64" fn s_ke_set_timer(timer: u64, due_time: i64, dpc: u64) -> u8 {
         park();
     }
     unsafe { write_unaligned((timer + 4) as *mut i32, 0) };
+    unsafe { release_provider_local_timer_operation(lease) };
     active as u8
 }
 
 extern "win64" fn s_ke_cancel_timer(timer: u64) -> u8 {
-    let snapshot = unsafe { provider_local_timer_snapshot_or_park(timer) };
+    let lease = unsafe { provider_local_timer_operation_or_park(timer) };
     let (status, active, _, _) = unsafe {
-        win32k_event_broker_call(W32_TIMER_OP_CANCEL_LOCAL, snapshot.id.raw(), 0, 0)
+        win32k_event_broker_call(W32_TIMER_OP_CANCEL_LOCAL, lease.id.raw(), 0, 0)
     };
     if status != 0 {
         print_str(b"[win32k-timer] KeCancelTimer broker failure\n");
         park();
     }
+    unsafe { release_provider_local_timer_operation(lease) };
     active as u8
 }
 
 extern "win64" fn s_ke_read_state_timer(timer: u64) -> i32 {
-    let snapshot = unsafe { provider_local_timer_snapshot_or_park(timer) };
+    let lease = unsafe { provider_local_timer_operation_or_park(timer) };
     let (status, signaled, _, _) = unsafe {
-        win32k_event_broker_call(W32_TIMER_OP_READ_LOCAL, snapshot.id.raw(), 0, 0)
+        win32k_event_broker_call(W32_TIMER_OP_READ_LOCAL, lease.id.raw(), 0, 0)
     };
     if status != 0 {
         print_str(b"[win32k-timer] KeReadStateTimer broker failure\n");
         park();
     }
+    unsafe { release_provider_local_timer_operation(lease) };
     signaled as i32
 }
 
@@ -5025,6 +5079,12 @@ fn next_provider_wait_id() -> Option<u64> {
 unsafe fn provider_wait_object_for_dispatcher(
     object_body: u64,
 ) -> Option<nt_provider_wait::ProviderWaitObject> {
+    let timer_canonical = || {
+        let _metadata = ProviderMetadataGuard::acquire();
+        provider_local_timers()
+            .and_then(|timers| timers.resolve_body(object_body).ok())
+            .and_then(|snapshot| snapshot.canonical)
+    };
     let canonical = if let Some(id) =
         (&*core::ptr::addr_of!(WIN32K_EVENT_PROJECTIONS)).identity(object_body)
     {
@@ -5038,10 +5098,7 @@ unsafe fn provider_wait_object_for_dispatcher(
         .and_then(|snapshot| snapshot.canonical)
     {
         canonical
-    } else if let Some(canonical) = provider_local_timers()
-        .and_then(|timers| timers.resolve_body(object_body).ok())
-        .and_then(|snapshot| snapshot.canonical)
-    {
+    } else if let Some(canonical) = timer_canonical() {
         canonical
     } else {
         if !provider_pool_contains(object_body) {
