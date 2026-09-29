@@ -8,6 +8,9 @@ use crate::{FileId, FileState, HostedDomainIdentity, IoManager};
 use alloc::vec::Vec;
 use nt_status::NtStatus;
 
+mod wait_lease;
+pub use wait_lease::HostedFileWaitLeaseLedger;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostedFileIdentity {
     manager: u64,

@@ -5004,7 +5004,7 @@ pub(crate) unsafe fn service_win32k_file_object_request(
         W32_FILE_OBJECT_DEREFERENCE_POINTER, W32_FILE_OBJECT_DEVICE_NAME,
         W32_FILE_OBJECT_LABEL, W32_FILE_OBJECT_REFERENCE_HANDLE,
         W32_FILE_OBJECT_REFERENCE_POINTER, W32_FILE_OBJECT_RELATED_DEVICE,
-        W32_FILE_OBJECT_WAIT_IDENTITY,
+        W32_FILE_OBJECT_RELEASE_WAIT, W32_FILE_OBJECT_WAIT_IDENTITY,
     };
     let caller = match authenticate_win32k_service_request(
         channel, reply_cap, badge, mi, (W32_FILE_OBJECT_LABEL << 12) | 4,
@@ -5045,8 +5045,15 @@ pub(crate) unsafe fn service_win32k_file_object_request(
             }
         }
         W32_FILE_OBJECT_WAIT_IDENTITY if access == 0 && mode == 0 => {
-            match crate::driver_launch::win32k_file_owners::wait_identity_for_event(object) {
-                Ok(identity) => (0, identity.file_id().raw(), identity.binding_generation(), 0),
+            match crate::driver_launch::win32k_file_owners::acquire_wait_identity_for_event(object) {
+                Ok((identity, token)) =>
+                    (0, identity.file_id().raw(), identity.binding_generation(), token),
+                Err(status) => (status, 0, 0, 0),
+            }
+        }
+        W32_FILE_OBJECT_RELEASE_WAIT if access == 0 && mode == 0 => {
+            match crate::driver_launch::win32k_file_owners::release_wait_identity(object) {
+                Ok(()) => (0, 0, 0, 0),
                 Err(status) => (status, 0, 0, 0),
             }
         }
