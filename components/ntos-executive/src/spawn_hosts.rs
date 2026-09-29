@@ -2395,7 +2395,16 @@ unsafe fn component_pump_loop(
         } else if label == crate::win32k_subsystem::W32_REGISTRY_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
-            match crate::win32k_subsystem::service_registry_request(ch, msg.m0, msg.m1, msg.m2, msg.m3) {
+            if msg.m0 == crate::win32k_subsystem::WIN32K_REGISTRY_OP_OPEN_DEVICE_KEY
+                && !shared_pump::authenticated_badge(ch, msg.badge)
+            {
+                pump_reply_recv4_into!(
+                    ch, *reply_cap, msg, 4,
+                    nt_process::STATUS_INVALID_HANDLE as u64, 0, 0, 0
+                );
+                continue;
+            }
+            match crate::win32k_subsystem::service_registry_request(ch, *reply_cap, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3) {
                 crate::registry_mutation_work::ProviderRegistryResult::Ready((status, out1, out2)) => {
                     pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u32 as u64, out1, out2, 0);
                 }
