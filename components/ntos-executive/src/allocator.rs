@@ -4,14 +4,16 @@
 //! **read-only** (shared image frames), so allocator metadata can't be ordinary
 //! mutable statics. The bump counter and free-list head live in the first bytes
 //! of the **RW heap region** the broker maps at [`HEAP_BASE`]; allocations start
-//! past them. Each component has its own heap frames at the same vaddr, and each
-//! is single-threaded, so no locks are needed. The retype-zeroed heap gives empty
-//! metadata. Spawned components must publish the number of mapped heap frames
+//! past them. Each component has its own heap frames at the same vaddr, while
+//! win32k lanes share one component heap and may allocate concurrently. The
+//! retype-zeroed heap gives empty metadata and a heap-resident allocator lock.
+//! Spawned components must publish the number of mapped heap frames
 //! before their first allocation; the initial executive retains the full arena.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::{align_of, size_of};
 use core::ptr::{copy_nonoverlapping, null_mut, read_volatile, write_volatile};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Base of the RW heap region the broker maps into each component. Sits just past the executive
 /// ELF + rust-micro's rootserver aux pages (guard + stack + IPC + BootInfo + extra-BootInfo), which
@@ -75,15 +77,52 @@ const OOM_SCOPE_LEN: usize = HEAP_BASE + 88;
 const TRANSIENT_CTR: usize = HEAP_BASE + 96; // bytes consumed downward from the mapped heap end
 const TRANSIENT_DEPTH: usize = HEAP_BASE + 104; // nested transient allocation scopes
 const TRANSIENT_HIGH_WATER: usize = HEAP_BASE + 112; // peak transient bytes consumed
+const ALLOC_LOCK: usize = HEAP_BASE + 120; // shared across lanes mapping the same heap frames
+const ALLOC_UNLOCKED: usize = 0;
+const ALLOC_HELD: usize = 1;
+const ALLOC_POISONED: usize = 2;
 const DATA: usize = HEAP_BASE + 128; // allocations start past allocator/local metadata
 const _: () = assert!(MAPPED_HEAP_BYTES + size_of::<usize>() <= OOM_REPORTED);
 const _: () = assert!(OOM_SCOPE_LEN + size_of::<usize>() <= TRANSIENT_CTR);
 const _: () = assert!(TRANSIENT_HIGH_WATER + size_of::<usize>() <= DATA);
+const _: () = assert!(ALLOC_LOCK + size_of::<usize>() <= DATA);
 const WORD: usize = size_of::<usize>();
 const ALLOC_GRANULE: usize = align_of::<usize>();
 const FREE_NODE_SIZE: usize = WORD * 2; // { size, next } stored inside the freed block
 
 struct Bump;
+
+struct HeapLockGuard;
+
+impl HeapLockGuard {
+    fn acquire() -> Self {
+        let lock = unsafe { &*(ALLOC_LOCK as *const AtomicUsize) };
+        loop {
+            match lock.compare_exchange_weak(
+                ALLOC_UNLOCKED,
+                ALLOC_HELD,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Self,
+                Err(ALLOC_POISONED) => crate::park(),
+                Err(_) => core::hint::spin_loop(),
+            }
+        }
+    }
+}
+
+impl Drop for HeapLockGuard {
+    fn drop(&mut self) {
+        let lock = unsafe { &*(ALLOC_LOCK as *const AtomicUsize) };
+        let _ = lock.compare_exchange(
+            ALLOC_HELD,
+            ALLOC_UNLOCKED,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+    }
+}
 
 pub const ALLOC_CTX_REGF_IMPORT: u32 = 1;
 pub const ALLOC_CTX_HIVE_ENCODE: u32 = 2;
@@ -104,7 +143,8 @@ pub struct AllocScope {
 ///
 /// The guard is deliberately not exposed as a mark/reset pair: nested scopes rewind in LIFO order,
 /// and values allocated while it is live must be dropped before the guard. Durable objects must not
-/// be created inside this scope.
+/// be created inside this scope. Scope routing is root-executive single-lane state; shared win32k
+/// lanes have no transient arena and must not use it as thread-local storage.
 pub struct TransientAllocScope {
     previous_mark: usize,
     previous_depth: usize,
@@ -436,6 +476,7 @@ fn allocator_corruption(
         debug_bytes(unsafe { core::slice::from_raw_parts(scope_ptr as *const u8, scope_len) });
     }
     crate::debug_put_char(b'\n');
+    unsafe { &*(ALLOC_LOCK as *const AtomicUsize) }.store(ALLOC_POISONED, Ordering::Release);
     panic!("allocator free-list corruption");
 }
 
@@ -624,6 +665,23 @@ unsafe fn grow_in_place_from_adjacent_free(start: usize, old_size: usize, new_si
 }
 
 impl Bump {
+    unsafe fn dealloc_unlocked(&self, ptr: *mut u8, layout: Layout) {
+        if ptr.is_null() || layout.size() == 0 {
+            return;
+        }
+        let start = ptr as usize;
+        if is_transient_pointer(start) {
+            return;
+        }
+        let Some(size) = block_size(layout.size()) else {
+            return;
+        };
+        unsafe {
+            insert_free_block(start, size);
+            release_top_free_blocks();
+        };
+    }
+
     unsafe fn alloc_durable(&self, layout: Layout) -> *mut u8 {
         let Some(size) = block_size(layout.size()) else {
             report_oom(
@@ -698,11 +756,12 @@ impl Bump {
     }
 }
 
-// SAFETY: single-threaded per component; allocator metadata lives in the component-local RW heap
-// and is accessed only by this allocator. Free blocks are returned to the list only through
-// `dealloc`/`realloc` for dead allocations, and alignment is applied to each returned pointer.
+// SAFETY: allocator metadata and its lock live in the same component-local RW heap frames. Lanes
+// sharing a heap serialize all free-list and bump mutations. Free blocks return through
+// `dealloc`/`realloc` only for dead allocations; each returned pointer retains its alignment.
 unsafe impl GlobalAlloc for Bump {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let _guard = HeapLockGuard::acquire();
         if transient_heap_size() != 0 && unsafe { read_word(TRANSIENT_DEPTH) } != 0 {
             unsafe { self.alloc_transient(layout) }
         } else {
@@ -711,31 +770,24 @@ unsafe impl GlobalAlloc for Bump {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if ptr.is_null() || layout.size() == 0 {
-            return;
-        }
-        let start = ptr as usize;
-        if is_transient_pointer(start) {
-            return;
-        }
-        let Some(size) = block_size(layout.size()) else {
-            return;
-        };
-        unsafe {
-            insert_free_block(start, size);
-            release_top_free_blocks();
-        };
+        let _guard = HeapLockGuard::acquire();
+        unsafe { self.dealloc_unlocked(ptr, layout) };
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
+        let _guard = HeapLockGuard::acquire();
         if ptr.is_null() {
             let Ok(layout) = Layout::from_size_align(new_size, old_layout.align()) else {
                 return null_mut();
             };
-            return unsafe { self.alloc(layout) };
+            return if transient_heap_size() != 0 && unsafe { read_word(TRANSIENT_DEPTH) } != 0 {
+                unsafe { self.alloc_transient(layout) }
+            } else {
+                unsafe { self.alloc_durable(layout) }
+            };
         }
         if new_size == 0 {
-            unsafe { self.dealloc(ptr, old_layout) };
+            unsafe { self.dealloc_unlocked(ptr, old_layout) };
             return null_mut();
         }
 
@@ -814,7 +866,7 @@ unsafe impl GlobalAlloc for Bump {
         let new_ptr = unsafe { self.alloc_durable(new_layout) };
         if !new_ptr.is_null() {
             unsafe { copy_nonoverlapping(ptr, new_ptr, old_size.min(new_size)) };
-            unsafe { self.dealloc(ptr, old_layout) };
+            unsafe { self.dealloc_unlocked(ptr, old_layout) };
         }
         new_ptr
     }
@@ -826,12 +878,14 @@ static ALLOC: Bump = Bump;
 /// Current durable bump offset. Dropped allocations are reused through the address-ordered free
 /// list; dispatch-local bulk scratch belongs in the independent transient lane.
 pub fn mark() -> usize {
+    let _guard = HeapLockGuard::acquire();
     unsafe { read_word(CTR) }
 }
 
 /// Bytes still available above the current bump mark.
 pub fn remaining() -> usize {
-    durable_heap_capacity().saturating_sub(mark())
+    let _guard = HeapLockGuard::acquire();
+    durable_heap_capacity().saturating_sub(unsafe { read_word(CTR) })
 }
 
 #[derive(Copy, Clone)]
@@ -852,9 +906,10 @@ pub struct HeapUsage {
 /// `bump` is an address-space watermark, not live allocation bytes. Dropped allocations below a
 /// later durable object remain reusable through the free list even when they cannot lower it.
 pub fn usage() -> HeapUsage {
+    let _lock = HeapLockGuard::acquire();
     unsafe { validate_free_list(b"usage", 0, 0) };
-    let bump = mark();
-    let top_reusable = remaining();
+    let bump = unsafe { read_word(CTR) };
+    let top_reusable = durable_heap_capacity().saturating_sub(bump);
     let mut free_bytes = 0usize;
     let mut largest_free = 0usize;
     let mut node = unsafe { read_word(FREE_HEAD) };
