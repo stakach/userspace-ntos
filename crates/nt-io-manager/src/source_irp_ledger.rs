@@ -1,4 +1,4 @@
-//! Generation-bearing ownership for native IRPs allocated inside hosted drivers.
+//! Generation-bearing ownership for native IRPs allocated inside hosted components.
 //!
 //! The component address is a lookup key within one physical hosted domain, never a transport
 //! identity. A forwarded IRP stays pinned until its source-domain completion has finished.
@@ -9,8 +9,14 @@ use crate::retained_query_path_forward::SourceIrpTicket;
 use crate::{HostedDomainId, HostedDomainIdentity};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceIrpOwner {
+    HostedDriver(usize),
+    Win32k,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourceIrpAllocation {
-    pub instance: usize,
+    pub owner: SourceIrpOwner,
     pub domain: HostedDomainIdentity,
     pub component_address: u64,
     pub bytes: u64,
@@ -80,7 +86,7 @@ impl SourceIrpLedger {
             return Err(SourceIrpLedgerError::InvalidAllocation);
         }
         if self.rows.iter().any(|row| {
-            row.allocation.instance == allocation.instance
+            row.allocation.owner == allocation.owner
                 && row.allocation.domain == allocation.domain
                 && row.allocation.component_address == allocation.component_address
         }) {
@@ -107,7 +113,7 @@ impl SourceIrpLedger {
 
     pub fn pin(
         &mut self,
-        instance: usize,
+        owner: SourceIrpOwner,
         domain: HostedDomainIdentity,
         component_address: u64,
     ) -> Result<(SourceIrpTicket, SourceIrpAllocation), SourceIrpLedgerError> {
@@ -115,7 +121,7 @@ impl SourceIrpLedger {
             .rows
             .iter_mut()
             .find(|row| {
-                row.allocation.instance == instance
+                row.allocation.owner == owner
                     && row.allocation.domain == domain
                     && row.allocation.component_address == component_address
             })
@@ -129,12 +135,12 @@ impl SourceIrpLedger {
 
     pub fn matches(
         &self,
-        instance: usize,
+        owner: SourceIrpOwner,
         allocation: SourceIrpAllocation,
         ticket: SourceIrpTicket,
     ) -> bool {
         self.rows.iter().any(|row| {
-            row.allocation.instance == instance
+            row.allocation.owner == owner
                 && row.allocation == allocation
                 && row.ticket == ticket
         })
@@ -142,14 +148,14 @@ impl SourceIrpLedger {
 
     pub fn allocation_for(
         &self,
-        instance: usize,
+        owner: SourceIrpOwner,
         domain: HostedDomainIdentity,
         component_address: u64,
     ) -> Option<SourceIrpAllocation> {
         self.rows
             .iter()
             .find(|row| {
-                row.allocation.instance == instance
+                row.allocation.owner == owner
                     && row.allocation.domain == domain
                     && row.allocation.component_address == component_address
             })
@@ -197,7 +203,7 @@ impl SourceIrpLedger {
     /// After exact terminal ACK and unpin, a second source-local free retires the allocation.
     pub fn request_free(
         &mut self,
-        instance: usize,
+        owner: SourceIrpOwner,
         domain: HostedDomainIdentity,
         component_address: u64,
     ) -> Result<SourceIrpRetirement, SourceIrpLedgerError> {
@@ -205,7 +211,7 @@ impl SourceIrpLedger {
             .rows
             .iter()
             .position(|row| {
-                row.allocation.instance == instance
+                row.allocation.owner == owner
                     && row.allocation.domain == domain
                     && row.allocation.component_address == component_address
             })
@@ -227,7 +233,7 @@ impl SourceIrpLedger {
 
     pub fn retire(
         &mut self,
-        instance: usize,
+        owner: SourceIrpOwner,
         domain: HostedDomainIdentity,
         component_address: u64,
     ) -> Result<SourceIrpTicket, SourceIrpLedgerError> {
@@ -235,7 +241,7 @@ impl SourceIrpLedger {
             .rows
             .iter()
             .position(|row| {
-                row.allocation.instance == instance
+                row.allocation.owner == owner
                     && row.allocation.domain == domain
                     && row.allocation.component_address == component_address
             })
@@ -246,10 +252,10 @@ impl SourceIrpLedger {
         Ok(self.rows.swap_remove(index).ticket)
     }
 
-    pub fn live_for_instance(&self, instance: usize, domain: HostedDomainIdentity) -> usize {
+    pub fn live_for_owner(&self, owner: SourceIrpOwner, domain: HostedDomainIdentity) -> usize {
         self.rows
             .iter()
-            .filter(|row| row.allocation.instance == instance && row.allocation.domain == domain)
+            .filter(|row| row.allocation.owner == owner && row.allocation.domain == domain)
             .count()
     }
 }
@@ -260,7 +266,7 @@ mod tests {
 
     fn allocation(address: u64, cookie: u64) -> SourceIrpAllocation {
         SourceIrpAllocation {
-            instance: 3,
+            owner: SourceIrpOwner::HostedDriver(3),
             domain: HostedDomainIdentity {
                 domain_id: HostedDomainId(7),
                 cookie,
@@ -277,13 +283,13 @@ mod tests {
         let first = allocation(0x2000, 11);
         let first_ticket = ledger.register(first).unwrap();
         assert_eq!(
-            ledger.retire(3, first.domain, first.component_address),
+            ledger.retire(first.owner, first.domain, first.component_address),
             Ok(first_ticket)
         );
         let second_ticket = ledger.register(first).unwrap();
         assert_ne!(first_ticket, second_ticket);
-        assert!(!ledger.matches(3, first, first_ticket));
-        assert!(ledger.matches(3, first, second_ticket));
+        assert!(!ledger.matches(first.owner, first, first_ticket));
+        assert!(ledger.matches(first.owner, first, second_ticket));
         assert_eq!(
             ledger.unpin(first_ticket),
             Err(SourceIrpLedgerError::WrongIdentity)
@@ -300,16 +306,16 @@ mod tests {
             Err(SourceIrpLedgerError::AlreadyLive)
         );
         assert_eq!(
-            ledger.pin(3, owner.domain, owner.component_address),
+            ledger.pin(owner.owner, owner.domain, owner.component_address),
             Ok((ticket, owner))
         );
         assert_eq!(
-            ledger.retire(3, owner.domain, owner.component_address),
+            ledger.retire(owner.owner, owner.domain, owner.component_address),
             Err(SourceIrpLedgerError::Pinned)
         );
         ledger.unpin(ticket).unwrap();
         assert_eq!(
-            ledger.retire(3, owner.domain, owner.component_address),
+            ledger.retire(owner.owner, owner.domain, owner.component_address),
             Ok(ticket)
         );
     }
@@ -321,18 +327,57 @@ mod tests {
         let stale_domain = allocation(0x2000, 12);
         let ticket = ledger.register(first).unwrap();
         assert_eq!(
-            ledger.pin(3, stale_domain.domain, first.component_address),
+            ledger.pin(first.owner, stale_domain.domain, first.component_address),
             Err(SourceIrpLedgerError::NotFound)
         );
         assert_eq!(
-            ledger.pin(4, first.domain, first.component_address),
+            ledger.pin(SourceIrpOwner::HostedDriver(4), first.domain, first.component_address),
             Err(SourceIrpLedgerError::NotFound)
         );
-        assert!(!ledger.matches(3, stale_domain, ticket));
+        assert!(!ledger.matches(first.owner, stale_domain, ticket));
         assert_eq!(
-            ledger.retire(3, stale_domain.domain, first.component_address),
+            ledger.retire(first.owner, stale_domain.domain, first.component_address),
             Err(SourceIrpLedgerError::NotFound)
         );
+    }
+
+    #[test]
+    fn owners_are_isolated_even_at_the_same_domain_and_address() {
+        let mut ledger = SourceIrpLedger::new();
+        let driver = allocation(0x2000, 11);
+        let win32k = SourceIrpAllocation {
+            owner: SourceIrpOwner::Win32k,
+            ..driver
+        };
+        let driver_ticket = ledger.register(driver).unwrap();
+        let win32k_ticket = ledger.register(win32k).unwrap();
+        assert_ne!(driver_ticket, win32k_ticket);
+        assert_eq!(ledger.live_for_owner(driver.owner, driver.domain), 1);
+        assert_eq!(ledger.live_for_owner(win32k.owner, win32k.domain), 1);
+        assert_eq!(
+            ledger.pin(driver.owner, driver.domain, driver.component_address),
+            Ok((driver_ticket, driver)),
+        );
+        assert_eq!(
+            ledger.pin(win32k.owner, win32k.domain, win32k.component_address),
+            Ok((win32k_ticket, win32k)),
+        );
+        assert!(!ledger.matches(driver.owner, win32k, win32k_ticket));
+        assert!(!ledger.matches(win32k.owner, driver, driver_ticket));
+        ledger.unpin(driver_ticket).unwrap();
+        assert_eq!(
+            ledger.retire(driver.owner, driver.domain, driver.component_address),
+            Ok(driver_ticket),
+        );
+        assert!(ledger.matches(win32k.owner, win32k, win32k_ticket));
+        ledger.unpin(win32k_ticket).unwrap();
+        assert_eq!(
+            ledger.retire(win32k.owner, win32k.domain, win32k.component_address),
+            Ok(win32k_ticket),
+        );
+        let reused = ledger.register(win32k).unwrap();
+        assert_ne!(reused, win32k_ticket);
+        assert!(!ledger.matches(win32k.owner, win32k, win32k_ticket));
     }
 
     #[test]
@@ -341,20 +386,20 @@ mod tests {
         let owner = allocation(0x2000, 11);
         let ticket = ledger.register(owner).unwrap();
         ledger
-            .pin(3, owner.domain, owner.component_address)
+            .pin(owner.owner, owner.domain, owner.component_address)
             .unwrap();
         assert_eq!(
-            ledger.request_free(3, owner.domain, owner.component_address),
+            ledger.request_free(owner.owner, owner.domain, owner.component_address),
             Err(SourceIrpLedgerError::Pinned),
         );
         ledger.arm_deferred_free(ticket).unwrap();
         assert_eq!(
-            ledger.request_free(3, owner.domain, owner.component_address),
+            ledger.request_free(owner.owner, owner.domain, owner.component_address),
             Ok(SourceIrpRetirement::Deferred(ticket)),
         );
         assert!(ledger.deferred_free_requested(ticket));
         assert_eq!(
-            ledger.request_free(3, owner.domain, owner.component_address),
+            ledger.request_free(owner.owner, owner.domain, owner.component_address),
             Err(SourceIrpLedgerError::AlreadyDeferred),
         );
         assert_eq!(
@@ -363,7 +408,7 @@ mod tests {
         );
         ledger.unpin(ticket).unwrap();
         assert_eq!(
-            ledger.request_free(3, owner.domain, owner.component_address),
+            ledger.request_free(owner.owner, owner.domain, owner.component_address),
             Ok(SourceIrpRetirement::Retired(ticket)),
         );
         assert!(!ledger.deferred_free_requested(ticket));
@@ -375,23 +420,23 @@ mod tests {
         let owner = allocation(0x2000, 11);
         let stale = ledger.register(owner).unwrap();
         ledger
-            .retire(3, owner.domain, owner.component_address)
+            .retire(owner.owner, owner.domain, owner.component_address)
             .unwrap();
         let live = ledger.register(owner).unwrap();
         ledger
-            .pin(3, owner.domain, owner.component_address)
+            .pin(owner.owner, owner.domain, owner.component_address)
             .unwrap();
         assert_eq!(
             ledger.arm_deferred_free(stale),
             Err(SourceIrpLedgerError::WrongIdentity)
         );
         assert_eq!(
-            ledger.request_free(3, owner.domain, owner.component_address),
+            ledger.request_free(owner.owner, owner.domain, owner.component_address),
             Err(SourceIrpLedgerError::Pinned)
         );
         ledger.arm_deferred_free(live).unwrap();
         assert_eq!(
-            ledger.request_free(3, owner.domain, owner.component_address),
+            ledger.request_free(owner.owner, owner.domain, owner.component_address),
             Ok(SourceIrpRetirement::Deferred(live))
         );
     }
