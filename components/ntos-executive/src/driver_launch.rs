@@ -5278,6 +5278,8 @@ const HOSTED_DEVICE_OP_CREATE_SYMBOLIC_LINK: u64 = 10;
 const HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK: u64 = 11;
 const HOSTED_DEVICE_OP_REGISTER_INTERFACE: u64 = 12;
 const HOSTED_DEVICE_OP_SET_INTERFACE_STATE: u64 = 13;
+const HOSTED_DEVICE_OP_REFERENCE_POINTER: u64 = 14;
+const HOSTED_DEVICE_OP_DEREFERENCE_POINTER: u64 = 15;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN: u64 = 0;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF: u64 = 2;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
@@ -14034,8 +14036,39 @@ unsafe fn consumer_file_object_in_local_pool(object: u64) -> bool {
         && !hosted_file_objects::fo_is_registered(object)
 }
 
+unsafe fn consumer_device_object_in_local_pool(object: u64) -> bool {
+    component_pool_allocation_capacity(object)
+        .is_some_and(|capacity| capacity >= WDM_X64_DEVICE_OBJECT_SIZE as u64)
+        && read_unaligned(object as *const i16) == WDM_X64_IO_TYPE_DEVICE
+}
+
+unsafe fn hosted_device_pointer_count_mutation(object: u64, op: u64) -> u64 {
+    let (words, status, count, reserved0, reserved1) =
+        call_on4_raw((FSD_SERVICE_DEVICE_LABEL << 12) | 4, op, object, 0, 0);
+    if words != 4 || reserved0 != 0 || reserved1 != 0 {
+        crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_DEVICE_LABEL, op, words, status]);
+    }
+    match nt_io_abi::device_pointer::DevicePointerReply::decode(status, count) {
+        Ok(reply) => reply.into_result().unwrap_or_else(|error| {
+            crate::provider_bugcheck::report(
+                0xc4,
+                [FSD_SERVICE_DEVICE_LABEL, op, object, error as u32 as u64],
+            )
+        }),
+        Err(_) => {
+            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_DEVICE_LABEL, op, status, count])
+        }
+    }
+}
+
 extern "win64" fn s_obf_reference_object(object: u64) -> u64 {
     unsafe {
+        if consumer_device_object_in_local_pool(object) {
+            return hosted_device_pointer_count_mutation(
+                object,
+                HOSTED_DEVICE_OP_REFERENCE_POINTER,
+            );
+        }
         if !consumer_file_object_in_local_pool(object) {
             return object;
         }
@@ -14050,6 +14083,12 @@ extern "win64" fn s_obf_reference_object(object: u64) -> u64 {
 
 extern "win64" fn s_obf_dereference_object(object: u64) -> u64 {
     unsafe {
+        if consumer_device_object_in_local_pool(object) {
+            return hosted_device_pointer_count_mutation(
+                object,
+                HOSTED_DEVICE_OP_DEREFERENCE_POINTER,
+            );
+        }
         if !consumer_file_object_in_local_pool(object) {
             return 0;
         }
@@ -49881,6 +49920,8 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK
             | HOSTED_DEVICE_OP_REGISTER_INTERFACE
             | HOSTED_DEVICE_OP_SET_INTERFACE_STATE
+            | HOSTED_DEVICE_OP_REFERENCE_POINTER
+            | HOSTED_DEVICE_OP_DEREFERENCE_POINTER
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
@@ -49895,6 +49936,38 @@ pub(crate) fn service_hosted_device(
         if let Err(status) = unsafe { hosted_add_device_rollback::admit_mutation(domain, ch, active_reply_cap, caller_badge) } {
             return (status.raw(), 0, 0, 0);
         }
+    }
+    if op == HOSTED_DEVICE_OP_REFERENCE_POINTER || op == HOSTED_DEVICE_OP_DEREFERENCE_POINTER {
+        if arg2 != 0 || arg3 != 0 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        let (_, inst, device_id) =
+            match authenticated_hosted_device(ch, pdo_object, active_reply_cap) {
+                Ok(identity) => identity,
+                Err(status) => return (status.raw(), 0, 0, 0),
+            };
+        let domain = HostedDomainIdentity {
+            domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
+            cookie: inst.hosted_domain_cookie,
+        };
+        let registration = match hosted_device_pointer_registration(domain, pdo_object, device_id) {
+            Ok(registration) => registration,
+            Err(status) => return (status.raw(), 0, 0, 0),
+        };
+        let result = if op == HOSTED_DEVICE_OP_REFERENCE_POINTER {
+            io_manager_mut().reference_hosted_device_pointer(registration)
+        } else {
+            io_manager_mut().dereference_hosted_device_pointer(registration)
+        };
+        return match result {
+            Ok(_) => (
+                STATUS_SUCCESS,
+                io_manager_mut().device_reference_count(device_id),
+                0,
+                0,
+            ),
+            Err(status) => (status.raw(), 0, 0, 0),
+        };
     }
     if op == HOSTED_DEVICE_OP_REGISTER_INTERFACE {
         let (_, inst, pdo_device_id) =
