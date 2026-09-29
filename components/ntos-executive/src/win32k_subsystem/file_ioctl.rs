@@ -268,15 +268,14 @@ unsafe fn copy_validated_input(
         }
     }
     if provider_pool_contains(address) {
-        let (_, pin) = provider_allocations_mut()
+        let (_, pin) = with_provider_allocations(|catalog| catalog.pin_containing(address, length))
             .ok_or(STATUS_NOT_SUPPORTED_I32)?
-            .pin_containing(address, length)
             .map_err(|_| STATUS_ACCESS_VIOLATION_I32)?;
         destination.copy_from_slice(core::slice::from_raw_parts(
             address as *const u8,
             length as usize,
         ));
-        if provider_allocations_mut().is_none_or(|catalog| catalog.release_pin(pin).is_err()) {
+        if with_provider_allocations(|catalog| catalog.release_pin(pin).is_ok()) != Some(true) {
             crate::provider_bugcheck::report(0xc4, [W32_FILE_IOCTL_LABEL, address, length, 8]);
         }
         return Ok(());
