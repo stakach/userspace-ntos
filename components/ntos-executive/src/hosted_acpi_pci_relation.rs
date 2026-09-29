@@ -743,15 +743,7 @@ unsafe fn complete_hosted_acpi_pci_scope_source(child_index: usize) -> bool {
 
 unsafe fn hosted_acpi_pci_relation_owner_endpoint() -> Option<nt_pnp::AcpiPciProviderEndpoint> {
     let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).as_ref()?;
-    let domain = query.relation_domain?;
-    let device_id = nt_io_manager::DeviceId(query.claim.pdo_device_id);
-    let pdo_object = io_manager_mut().hosted_device_address_by_identity(domain, device_id)?;
-    Some(nt_pnp::AcpiPciProviderEndpoint {
-        device_id: device_id.raw(),
-        hosted_domain_id: domain.domain_id.raw(),
-        hosted_domain_cookie: domain.cookie,
-        pdo_object,
-    })
+    hosted_device_relation_owner_is_current(query.relation_owner).then_some(query.relation_owner)
 }
 
 unsafe fn stage_hosted_acpi_pci_scope_sources() -> bool {
