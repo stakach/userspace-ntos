@@ -624,6 +624,27 @@ impl DeviceRelationInvalidationQueue {
         Ok(self.complete_claim(index))
     }
 
+    /// Finish one action without letting the native worker mistake a synchronous row for an
+    /// asynchronous invalidation. Only the exact sync ticket receives the terminal status.
+    pub fn complete_terminal(
+        &mut self,
+        claim: DeviceRelationInvalidation,
+        status: nt_status::NtStatus,
+    ) -> Result<DeviceRelationInvalidationCompletion, DeviceRelationInvalidationError> {
+        if status == nt_status::NtStatus::PENDING {
+            return Err(DeviceRelationInvalidationError::InvalidTerminalStatus);
+        }
+        if self
+            .sync_waiters
+            .iter()
+            .any(|waiter| waiter.ticket.0 == claim.sequence)
+        {
+            self.complete_sync(claim, status)
+        } else {
+            self.complete(claim)
+        }
+    }
+
     fn complete_claim(&mut self, index: usize) -> DeviceRelationInvalidationCompletion {
         match self.rows[index].state {
             DeviceRelationInvalidationState::Claimed {
@@ -1745,6 +1766,31 @@ mod tests {
         assert_eq!(queue.claim_front(), Some(later));
         queue.complete(later).unwrap();
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn terminal_completion_publishes_status_only_to_the_exact_sync_ticket() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        let (ticket, sync) = queue.enqueue_sync(parent(10), 0).unwrap();
+        let claim = queue.claim_front().unwrap();
+        assert_eq!(claim, sync);
+        let later = queue.enqueue(parent(10), 0).unwrap().invalidation;
+        assert_eq!(
+            queue.complete_terminal(claim, nt_status::NtStatus::PENDING),
+            Err(DeviceRelationInvalidationError::InvalidTerminalStatus)
+        );
+        assert_eq!(queue.sync_status(ticket), Ok(None));
+        assert_eq!(
+            queue.complete_terminal(claim, nt_status::NtStatus::UNSUCCESSFUL),
+            Ok(DeviceRelationInvalidationCompletion::Drained)
+        );
+        assert_eq!(queue.take_sync_status(ticket), Ok(nt_status::NtStatus::UNSUCCESSFUL));
+        let async_claim = queue.claim_front().unwrap();
+        assert_eq!(async_claim, later);
+        assert_eq!(
+            queue.complete_terminal(async_claim, nt_status::NtStatus::SUCCESS),
+            Ok(DeviceRelationInvalidationCompletion::Drained)
+        );
     }
 
     #[test]
