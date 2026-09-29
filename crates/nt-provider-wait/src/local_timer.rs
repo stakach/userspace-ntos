@@ -244,7 +244,7 @@ impl ProviderLocalTimerCatalog {
         kind: ProviderTimerKind,
     ) -> Result<ProviderLocalTimerId, ProviderTimerError> {
         let allocation = allocations
-            .snapshot(allocation_identity)
+            .snapshot_active(allocation_identity)
             .map_err(|_| ProviderTimerError::InvalidStorage)?;
         let offset = allocation
             .offset_of(body)
@@ -833,6 +833,33 @@ mod tests {
         assert_eq!(snapshot.id, id);
         assert_eq!(snapshot.canonical, Some(canonical));
         assert_ne!(snapshot.body, canonical.object_id);
+    }
+
+    #[test]
+    fn allocation_timer_initialization_refuses_retiring_storage() {
+        let mut allocations = ProviderAllocationCatalog::new();
+        let allocation = allocations
+            .register(
+                crate::ProviderArenaIdentity {
+                    id: 1,
+                    generation: 1,
+                },
+                0xa000,
+                0x100,
+            )
+            .unwrap();
+        allocations.begin_retirement(allocation.identity).unwrap();
+        let mut timers = ProviderLocalTimerCatalog::new(provider()).unwrap();
+        assert_eq!(
+            timers.initialize_in_allocation(
+                &allocations,
+                allocation.identity,
+                0xa020,
+                0x40,
+                ProviderTimerKind::Notification,
+            ),
+            Err(ProviderTimerError::InvalidStorage)
+        );
     }
 
     #[test]
