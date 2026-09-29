@@ -4590,6 +4590,35 @@ pub(crate) unsafe fn service_win32k_section_create_request(
     )
 }
 
+pub(crate) unsafe fn service_win32k_section_map_request(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    op: u64,
+    first: u64,
+    second: u64,
+    third: u64,
+) -> (i32, u64, u64, u64) {
+    let (route, dispatch, caller) = match authenticate_win32k_service_request(
+        channel,
+        reply_cap,
+        badge,
+        mi,
+        (crate::win32k_subsystem::W32_SECTION_MAP_LABEL << 12) | 4,
+    ) {
+        Ok(owner) => owner,
+        Err(status) => return (status as i32, 0, 0, 0),
+    };
+    let handler = match registry_live_handler() {
+        Ok(handler) if handler.loop_ctx.is_some() => handler,
+        _ => return (0xC000_00A3u32 as i32, 0, 0, 0),
+    };
+    crate::provider_section_map_broker::dispatch(
+        handler, route, dispatch, caller, op, first, second, third,
+    )
+}
+
 /// Capture and release a canonical subject for one exact win32k Object Manager parse job.
 pub(crate) unsafe fn service_win32k_subject_request(
     channel: &spawn_hosts::PumpChannel,
@@ -5056,6 +5085,16 @@ pub(crate) unsafe fn retire_win32k_section_create_route(
     let pointer = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if !pointer.is_null() {
         crate::provider_section_broker::retire_completed(&mut *pointer, route, dispatch);
+    }
+}
+
+pub(crate) unsafe fn retire_win32k_section_map_route(
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+) {
+    let pointer = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if !pointer.is_null() {
+        crate::provider_section_map_broker::retire_completed(&mut *pointer, route, dispatch);
     }
 }
 
