@@ -30347,6 +30347,99 @@ impl ExecNtHandler {
         Ok(())
     }
 
+    /// Unmap only the captured generic view in an already access-checked target process.
+    /// `false` leaves image-view lookup to the caller.
+    pub(crate) unsafe fn unmap_generic_section_view_for_target(
+        &mut self,
+        target_pid: nt_process::ProcessId,
+        target_pi: usize,
+        base: u64,
+    ) -> Result<bool, u32> {
+        let Some(ctx) = self.loop_ctx else {
+            return Ok(false);
+        };
+        let generic_sections = &mut *ctx.generic_sections;
+        let Some((_, view)) = generic_sections.view_for_page(target_pi, base) else {
+            return Ok(false);
+        };
+        let nt_memory_manager::MemoryLifetime::Process(process) = view.lifetime else {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        };
+        if self.pm_pid_for_pi(target_pi) != Some(target_pid)
+            || self.capture_process_identity(target_pi) != Some(process)
+        {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        hosted_thread_memory_access(target_pi as u64, view.base, view.size)?;
+
+        // Stage exact VAD and committed-range removal before writeback. Neither scratch table is
+        // held across provider I/O; the coordinator revalidates it before final publication.
+        nt_user_host::section_view_retirement::prepare_generic_section_view_retirement(
+            view,
+            generic_sections,
+            process_vm_region_map(target_pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?,
+            process_committed_mapping_table(target_pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?,
+            &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER),
+            &mut *core::ptr::addr_of_mut!(COMMITTED_MAP_AFTER),
+        )?;
+        hosted_thread_memory_access(target_pi as u64, view.base, view.size)?;
+        if self.secured_virtual_memory.conflicts_with_delete(
+            u64::from(target_pid),
+            view.base,
+            view.size,
+        ) {
+            return Err(nt_address_space::STATUS_INVALID_PAGE_PROTECTION);
+        }
+        let mapped_commit =
+            process_committed_allocation_commit_bytes(target_pi as u64, view.base).unwrap_or(0);
+        if mapped_commit != 0 {
+            if let Err(status) = self.ensure_process_commit_owner(target_pid, target_pi) {
+                self.drain_job_notifications();
+                return Err(status);
+            }
+        }
+        let writeback = service_generic_section_writeback_view(
+            generic_sections,
+            view,
+            ctx.scratch_base,
+            Some(ctx),
+        );
+        if writeback.bytes_written != 0 {
+            self.writable_fs_dirty = true;
+        }
+        if writeback.status != 0 {
+            return Err(writeback.status);
+        }
+        if self.capture_process_identity(target_pi) != Some(process) {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        nt_user_host::section_view_retirement::prepare_generic_section_view_retirement(
+            view,
+            generic_sections,
+            process_vm_region_map(target_pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?,
+            process_committed_mapping_table(target_pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?,
+            &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER),
+            &mut *core::ptr::addr_of_mut!(COMMITTED_MAP_AFTER),
+        )?;
+        hosted_thread_memory_access(target_pi as u64, view.base, view.size)?;
+        let _ = vm_page_lock_retire_range(target_pi as u64, view.base, view.size);
+        service_unmap_section_view_mappings(view, self)?;
+        if self.capture_process_identity(target_pi) != Some(process) {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        nt_user_host::section_view_retirement::commit_generic_section_view_retirement(
+            view,
+            generic_sections,
+            process_vm_region_map_mut(target_pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?,
+            process_committed_mapping_table_mut(target_pi)
+                .ok_or(nt_process::STATUS_INVALID_HANDLE)?,
+            &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER),
+            &mut *core::ptr::addr_of_mut!(COMMITTED_MAP_AFTER),
+        )?;
+        self.release_process_commit(target_pid, mapped_commit);
+        Ok(true)
+    }
+
     pub(crate) unsafe fn rollback_generic_section_view(
         &mut self,
         view: nt_memory_manager::GenericSectionView,
@@ -36549,91 +36642,10 @@ impl ExecNtHandler {
                         Ok(target) => target,
                         Err(status) => return status,
                     };
-                if let Some(ctx) = self.loop_ctx {
-                    let generic_sections = &mut *ctx.generic_sections;
-                    if let Some((_section_index, view)) =
-                        generic_sections.view_for_page(target_pi, base)
-                    {
-                        if let Err(status) = hosted_thread_memory_access(target_pi as u64, view.base, view.size) {
-                            return status;
-                        }
-                        // Resolve the VAD's effective range before writeback; do not retain static
-                        // scratch borrows across it. The plan is recomputed before publication.
-                        let preflight = {
-                            let Some(vm_map) = process_vm_region_map_mut(target_pi) else {
-                                return nt_process::STATUS_INVALID_HANDLE;
-                            };
-                            let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
-                            *after = *vm_map;
-                            match after.unmap_mapped(view.base) {
-                                Ok(plan) => plan,
-                                Err(status) => return status,
-                            }
-                        };
-                        if let Err(status) = hosted_thread_memory_access(target_pi as u64, preflight.base, preflight.size) {
-                            return status;
-                        }
-                        if self.secured_virtual_memory.conflicts_with_delete(
-                            u64::from(target_pid),
-                            view.base,
-                            view.size,
-                        ) {
-                            return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
-                        }
-                        let mapped_commit =
-                            process_committed_allocation_commit_bytes(target_pi as u64, view.base)
-                                .unwrap_or(0);
-                        if mapped_commit != 0 {
-                            if let Err(status) =
-                                self.ensure_process_commit_owner(target_pid, target_pi)
-                            {
-                                self.drain_job_notifications();
-                                return status;
-                            }
-                        }
-                        let writeback = service_generic_section_writeback_view(
-                            generic_sections,
-                            view,
-                            ctx.scratch_base,
-                            Some(ctx),
-                        );
-                        if writeback.bytes_written != 0 {
-                            self.writable_fs_dirty = true;
-                        }
-                        if writeback.status != 0 {
-                            return writeback.status;
-                        }
-                        let Some(vm_map) = process_vm_region_map_mut(target_pi) else {
-                            return nt_process::STATUS_INVALID_HANDLE;
-                        };
-                        let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
-                        let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
-                        *before = *vm_map;
-                        *after = *before;
-                        let plan = match after.unmap_mapped(view.base) {
-                            Ok(plan) => plan,
-                            Err(status) => return status,
-                        };
-                        if plan != preflight {
-                            return nt_address_space::STATUS_CONFLICTING_ADDRESSES;
-                        }
-                        if let Err(status) = hosted_thread_memory_access(target_pi as u64, plan.base, plan.size) {
-                            return status;
-                        }
-                        let _ = vm_page_lock_retire_range(target_pi as u64, plan.base, plan.size);
-                        if let Err(status) = service_unmap_section_view_mappings(view, self) {
-                            return status;
-                        }
-                        *vm_map = *after;
-                        let _ = process_committed_mapping_unregister_range(
-                            target_pi as u64,
-                            view.base,
-                            view.size,
-                        );
-                        let _ = generic_sections.unmap_view_identity(view);
-                        self.release_process_commit(target_pid, mapped_commit);
-                        return 0;
-                    }
+                match self.unmap_generic_section_view_for_target(target_pid, target_pi, base) {
+                    Ok(true) => return 0,
+                    Ok(false) => {}
+                    Err(status) => return status,
                 }
                 if let Some(ctx) = self.loop_ctx {
                     let reg = &mut *ctx.reg;
