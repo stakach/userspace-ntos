@@ -4760,6 +4760,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_str(b"\n");
     unsafe { cm_key_ownership::print_stats() };
     registry_security_audit::print_stats();
+    win32k_subsystem::print_object_security_assignment_stats();
     unsafe { cm_snapshot_ownership::print_stats() };
     let fb_readback = unsafe { explorer_framebuffer_final_readback() };
     let fb_span_x = fb_readback.span_x();

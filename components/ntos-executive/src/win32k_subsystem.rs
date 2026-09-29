@@ -3683,7 +3683,7 @@ use nt_object_manager::win32k_ob::{
 /// The single win32k object registry (single-threaded host; handle→(type, body) lives in the crate).
 static mut OBJ_TABLE: ObHandleTable = ObHandleTable::new();
 
-mod object_security;
+pub(crate) mod object_security;
 mod directory_object;
 mod file_close;
 mod file_open;
@@ -3697,6 +3697,7 @@ mod file_ioctl;
 pub(crate) mod file_ioctl_target;
 mod file_object_query;
 pub(crate) use object_security::census as object_security_census;
+pub(crate) use object_security::print_assignment_stats as print_object_security_assignment_stats;
 
 /// Duplicate a handle owned by win32k's USER object table. Native `NtDuplicateObject` calls this
 /// after the caller's EPROCESS table reports `STATUS_INVALID_HANDLE`, because desktop/window-
@@ -6147,17 +6148,21 @@ fn ob_open_object_by_name_existing(
     handle: *mut u64,
 ) -> i32 {
     unsafe {
-        let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
         match classify_type(obj_type) {
             Some(ObKind::Desktop) => {
                 let requested_root = object_attributes_root_directory(object_attributes);
-                let Some((root, winsta_body)) = effective_desktop_root(table, requested_root)
+                let Some((root, winsta_body)) = effective_desktop_root(
+                    &mut *core::ptr::addr_of_mut!(OBJ_TABLE),
+                    requested_root,
+                )
                 else {
                     return STATUS_OBJECT_NAME_NOT_FOUND;
                 };
                 let named_leaf = object_attributes_name_leaf_ascii(object_attributes);
                 if let Some((leaf, len)) = named_leaf {
-                    if let Some(existing) = table.desktop_handle_for_name(root, &leaf[..len]) {
+                    if let Some(existing) = (&*core::ptr::addr_of!(OBJ_TABLE))
+                        .desktop_handle_for_name(root, &leaf[..len])
+                    {
                         if !handle.is_null() {
                             write_unaligned(handle, existing);
                         }
@@ -6174,6 +6179,19 @@ fn ob_open_object_by_name_existing(
                     Ok(security) => security,
                     Err(status) => return status,
                 };
+                let parent_security = {
+                    let Some((ObKind::WindowStation, descriptor)) =
+                        (&*core::ptr::addr_of!(OBJ_TABLE)).security_descriptor_by_body(winsta_body)
+                    else {
+                        return STATUS_INVALID_HANDLE_I32;
+                    };
+                    descriptor.map(|bytes| {
+                        let mut captured = CapturedUserObjectSecurityDescriptor::empty();
+                        captured.bytes[..bytes.len()].copy_from_slice(bytes);
+                        captured.len = bytes.len();
+                        captured
+                    })
+                };
                 let body = alloc_desktop_body();
                 if body == 0 {
                     return STATUS_INSUFFICIENT_RESOURCES_I32;
@@ -6182,21 +6200,41 @@ fn ob_open_object_by_name_existing(
                     (body + DESKTOP_RPWINSTA_PARENT_OFF) as *mut u64,
                     winsta_body,
                 );
-                if !initialize_desktop_heap(table, body, winsta_body, object_attributes) {
+                if !initialize_desktop_heap(
+                    &mut *core::ptr::addr_of_mut!(OBJ_TABLE),
+                    body,
+                    winsta_body,
+                    object_attributes,
+                ) {
                     return STATUS_INSUFFICIENT_RESOURCES_I32;
                 }
-                let h = table.register_with_security(
-                    ObKind::Desktop,
-                    body,
+                if !(&mut *core::ptr::addr_of_mut!(OBJ_TABLE))
+                    .latch_pending_with_security(ObKind::Desktop, body, None)
+                {
+                    return STATUS_INSUFFICIENT_RESOURCES_I32;
+                }
+                let status = object_security::assign_opened_desktop(
+                    parent_security
+                        .as_ref()
+                        .map(CapturedUserObjectSecurityDescriptor::as_slice),
                     security
                         .as_ref()
                         .map(CapturedUserObjectSecurityDescriptor::as_slice),
+                    body,
                 );
-                if h == 0 {
-                    return STATUS_INSUFFICIENT_RESOURCES_I32;
+                if status != 0 {
+                    s_ob_dereference_object(body);
+                    return status;
                 }
+                let Some((h, _)) = (&mut *core::ptr::addr_of_mut!(OBJ_TABLE))
+                    .insert_pending_with_cache_policy(body)
+                else {
+                    s_ob_dereference_object(body);
+                    return STATUS_INSUFFICIENT_RESOURCES_I32;
+                };
                 if let Some((leaf, len)) = named_leaf {
-                    let _ = table.remember_desktop_name(root, &leaf[..len], h);
+                    let _ = (&mut *core::ptr::addr_of_mut!(OBJ_TABLE))
+                        .remember_desktop_name(root, &leaf[..len], h);
                 }
                 if !handle.is_null() {
                     write_unaligned(handle, h);
@@ -6207,6 +6245,7 @@ fn ob_open_object_by_name_existing(
                 0
             }
             Some(ObKind::WindowStation) => {
+                let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
                 let service = object_attributes_name_contains_ascii(object_attributes, b"service-");
                 if service {
                     let handle_for_service = service_window_station_handle_for_current_token();
@@ -14337,6 +14376,10 @@ fn register_trampolines() -> bool {
     reg.bind(
         "ObReleaseObjectSecurity",
         object_security::release as *const () as usize as u64,
+    );
+    reg.bind(
+        "ObAssignSecurity",
+        object_security::assign_export as *const () as usize as u64,
     );
     reg.bind("ObCloseHandle", s_ob_close_handle as usize as u64);
     reg.bind("ObReferenceObject", s_ob_reference_object as usize as u64);
