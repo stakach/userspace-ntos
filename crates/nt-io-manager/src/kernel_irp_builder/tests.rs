@@ -247,6 +247,20 @@ fn planned_irp_and_next_stack_roundtrip_without_clobbering_completion_targets() 
         decode_wdm_kernel_built_io_stack(&packet[plan.next_stack_offset..]).unwrap(),
         plan.stack
     );
+    assert_eq!(validate_new_kernel_irp_packet(irp_base, &packet, 2), Ok(()));
+    assert_eq!(
+        validate_new_kernel_irp_packet(irp_base, &packet, 1),
+        Err(KernelIrpPlanError::InvalidIrpHeader)
+    );
+    for offset in [0, 2, 0x42, 0x43, 0xb8] {
+        let mut corrupted = packet;
+        corrupted[offset] ^= 1;
+        assert_eq!(
+            validate_new_kernel_irp_packet(irp_base, &corrupted, 2),
+            Err(KernelIrpPlanError::InvalidIrpHeader),
+            "offset {offset:#x}"
+        );
+    }
     let mut short = [0xa5; WDM_X64_IRP_SIZE - 1];
     assert_eq!(
         write_wdm_irp_completion_targets(&mut short, 1, 2),

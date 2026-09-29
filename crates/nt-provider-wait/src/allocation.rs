@@ -71,6 +71,7 @@ pub enum ProviderAllocationError {
     ContainsLiveAllocations,
     Pinned,
     StalePin,
+    Retiring,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,6 +85,7 @@ struct ProviderAllocationRecord {
     arena: ProviderArenaIdentity,
     generation: u64,
     live: bool,
+    retiring: bool,
     base: u64,
     capacity: u64,
 }
@@ -96,6 +98,7 @@ impl ProviderAllocationRecord {
         },
         generation: 0,
         live: false,
+        retiring: false,
         base: 0,
         capacity: 0,
     };
@@ -161,7 +164,7 @@ impl ProviderAllocationCatalog {
             if !record.live || base >= record.end() || record.base >= end {
                 return false;
             }
-            if record.arena == arena {
+            if record.retiring || record.arena == arena {
                 return true;
             }
             let new_contains_existing = base < record.base && end >= record.end();
@@ -194,6 +197,7 @@ impl ProviderAllocationCatalog {
             arena,
             generation,
             live: true,
+            retiring: false,
             base,
             capacity,
         };
@@ -260,6 +264,9 @@ impl ProviderAllocationCatalog {
         required: u64,
     ) -> Result<(ProviderAllocationSnapshot, ProviderAllocationPin), ProviderAllocationError> {
         let snapshot = self.containing(address, required)?;
+        if self.records[self.slot(snapshot.identity)?].retiring {
+            return Err(ProviderAllocationError::Retiring);
+        }
         let id = self.next_pin_id;
         let next = id
             .checked_add(1)
@@ -319,6 +326,21 @@ impl ProviderAllocationCatalog {
         let snapshot = self.validate_retirement(identity)?;
         let slot = self.slot(identity)?;
         self.records[slot].live = false;
+        Ok(snapshot)
+    }
+
+    /// Reserve this exact allocation for a native teardown that may cross a
+    /// reentrant IPC boundary. A failed or uncertain teardown stays reserved.
+    pub fn begin_retirement(
+        &mut self,
+        identity: ProviderAllocationIdentity,
+    ) -> Result<ProviderAllocationSnapshot, ProviderAllocationError> {
+        let slot = self.slot(identity)?;
+        if self.records[slot].retiring {
+            return Err(ProviderAllocationError::Retiring);
+        }
+        let snapshot = self.validate_retirement(identity)?;
+        self.records[slot].retiring = true;
         Ok(snapshot)
     }
 
@@ -561,5 +583,42 @@ mod tests {
         );
         first.release_pin(first_pin).unwrap();
         second.release_pin(second_pin).unwrap();
+    }
+
+    #[test]
+    fn retirement_reservation_blocks_new_pins_and_nested_reuse_until_commit() {
+        let mut catalog = ProviderAllocationCatalog::new();
+        let allocation = catalog.register(arena(1), 0xa000, 0x1000).unwrap();
+        let (_, pin) = catalog.pin_containing(0xa100, 0x10).unwrap();
+        assert_eq!(
+            catalog.begin_retirement(allocation.identity),
+            Err(ProviderAllocationError::Pinned)
+        );
+        catalog.release_pin(pin).unwrap();
+        assert_eq!(
+            catalog.begin_retirement(allocation.identity),
+            Ok(allocation)
+        );
+        assert_eq!(
+            catalog.begin_retirement(allocation.identity),
+            Err(ProviderAllocationError::Retiring)
+        );
+        assert_eq!(
+            catalog.pin_containing(0xa100, 0x10),
+            Err(ProviderAllocationError::Retiring)
+        );
+        assert_eq!(
+            catalog.register(arena(2), 0xa200, 0x100),
+            Err(ProviderAllocationError::AddressInUse)
+        );
+        assert_eq!(
+            catalog.register(arena(1), 0xa000, 0x1000),
+            Err(ProviderAllocationError::AddressInUse)
+        );
+        assert_eq!(catalog.snapshot(allocation.identity), Ok(allocation));
+        catalog.retire(allocation.identity).unwrap();
+        let reused = catalog.register(arena(1), 0xa000, 0x1000).unwrap();
+        assert_ne!(reused.identity, allocation.identity);
+        assert_eq!(catalog.pin_containing(0xa100, 0x10).unwrap().0, reused);
     }
 }
