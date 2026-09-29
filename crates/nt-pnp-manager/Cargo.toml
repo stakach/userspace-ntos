@@ -11,6 +11,7 @@ authors.workspace = true
 nt-cm-resources = { workspace = true }
 nt-io-manager = { workspace = true }
 nt-pnp-abi = { workspace = true }
+nt-status = { workspace = true }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

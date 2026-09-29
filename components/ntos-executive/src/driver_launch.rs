@@ -45950,7 +45950,11 @@ fn hosted_relation_invalidation_status(
         }
         nt_pnp_manager::DeviceRelationInvalidationError::InvalidPdo
         | nt_pnp_manager::DeviceRelationInvalidationError::SequenceExhausted
-        | nt_pnp_manager::DeviceRelationInvalidationError::StaleClaim => {
+        | nt_pnp_manager::DeviceRelationInvalidationError::StaleClaim
+        | nt_pnp_manager::DeviceRelationInvalidationError::StaleTicket
+        | nt_pnp_manager::DeviceRelationInvalidationError::NotTerminal
+        | nt_pnp_manager::DeviceRelationInvalidationError::SyncStatusRequired
+        | nt_pnp_manager::DeviceRelationInvalidationError::InvalidTerminalStatus => {
             nt_status::NtStatus::INVALID_DEVICE_REQUEST
         }
     }
