@@ -49826,6 +49826,36 @@ unsafe fn config_device_property_snapshot(
     Ok(value)
 }
 
+pub(crate) unsafe fn win32k_pdo_driver_key_property_snapshot(
+    device: nt_io_manager::DeviceId,
+    expected: nt_pnp_manager::DevnodeIdentity,
+) -> Result<Vec<u8>, i32> {
+    let instance_path = {
+        let pnp = hosted_pnp_manager_mut();
+        if pnp.devnode_identity_for_pdo(device.raw()) != Some(expected) {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let source = pnp
+            .devnode_for_pdo(device.raw())
+            .and_then(|id| pnp.instance_id(id))
+            .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+        let mut path = String::new();
+        path.try_reserve_exact(source.len())
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        path.push_str(source);
+        path
+    };
+    let value = config_device_property_snapshot(
+        &instance_path,
+        nt_config_manager::device_property::DRIVER_KEY_NAME,
+    )
+    .map_err(|error| error.status)?;
+    if hosted_pnp_manager_mut().devnode_identity_for_pdo(device.raw()) != Some(expected) {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    Ok(value)
+}
+
 pub(crate) fn service_hosted_device(
     ch: &crate::spawn_hosts::PumpChannel,
     op: u64,

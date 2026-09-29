@@ -12221,7 +12221,10 @@ const WIN32K_REGISTRY_OP_CREATE_KEY: u64 = 11;
 const WIN32K_REGISTRY_OP_PUBLISH: u64 = 12;
 const WIN32K_REGISTRY_OP_ABORT: u64 = 13;
 const WIN32K_REGISTRY_OP_IS_KEY: u64 = 14;
+pub(crate) const WIN32K_REGISTRY_OP_OPEN_DEVICE_KEY: u64 = 15;
 const WIN32K_REGISTRY_USE_PREVIOUS_MODE: u64 = 1 << 63;
+#[path = "win32k_subsystem/device_registry.rs"]
+mod device_registry;
 #[path = "win32k_registry_deferred_value.rs"]
 mod win32k_registry_deferred_value;
 const REG_OPTION_VOLATILE: u32 = 0x0000_0001;
@@ -12736,12 +12739,19 @@ unsafe fn service_win32k_registry_query(
 /// executive-side component pump, which owns the Configuration Manager transport and handle table.
 pub(crate) unsafe fn service_registry_request(
     channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    mi: u64,
     op: u64,
     arg: u64,
     param1: u64,
     param2: u64,
 ) -> crate::registry_mutation_work::ProviderRegistryResult {
     use crate::registry_mutation_work::ProviderRegistryResult;
+    if op == WIN32K_REGISTRY_OP_OPEN_DEVICE_KEY {
+        return ProviderRegistryResult::Ready(device_registry::service(
+            channel, reply_cap, mi, arg, param1, param2,
+        ));
+    }
     if let Some(result) = win32k_registry_deferred_value::route(
         channel, op, arg, param1, param2,
     ) {
@@ -14596,6 +14606,10 @@ fn register_trampolines() -> bool {
     );
     reg.bind("ZwOpenFile", file_open::open as *const () as usize as u64);
     reg.bind("ZwCreateFile", file_open::create as *const () as usize as u64);
+    reg.bind(
+        "IoOpenDeviceRegistryKey",
+        device_registry::open_device_registry_key as *const () as usize as u64,
+    );
     reg.bind("ZwCreateSection", section_create::create as *const () as usize as u64);
     reg.bind("ZwMapViewOfSection", section_map::map as *const () as usize as u64);
     reg.bind("ZwUnmapViewOfSection", section_unmap::unmap as *const () as usize as u64);
