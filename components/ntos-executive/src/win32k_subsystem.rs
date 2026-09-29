@@ -152,6 +152,8 @@ const PROVIDER_ARENA_FTYP_POOL_ID: u64 = 3;
 const PROVIDER_ARENA_FIRST_HOSTED_HEAP_ID: u64 = 4;
 static PROVIDER_ARENA_NEXT_HOSTED_HEAP_ID: AtomicU64 =
     AtomicU64::new(PROVIDER_ARENA_FIRST_HOSTED_HEAP_ID);
+static PROVIDER_METADATA_BUSY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 static mut WIN32K_PROVIDER_ALLOCATIONS: Option<nt_provider_wait::ProviderAllocationCatalog> = None;
 static mut WIN32K_HOSTED_HEAP_ARENAS: Option<Vec<HostedHeapArena>> = None;
 static mut WIN32K_LOCAL_EVENTS: Option<nt_provider_wait::ProviderLocalEventCatalog> = None;
@@ -177,6 +179,26 @@ struct HostedHeapArena {
     bytes: u64,
     identity: nt_provider_wait::ProviderArenaIdentity,
     backing: nt_provider_wait::ProviderAllocationIdentity,
+}
+
+struct ProviderMetadataGuard;
+
+impl ProviderMetadataGuard {
+    fn acquire() -> Self {
+        while PROVIDER_METADATA_BUSY
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            crate::yield_now();
+        }
+        Self
+    }
+}
+
+impl Drop for ProviderMetadataGuard {
+    fn drop(&mut self) {
+        PROVIDER_METADATA_BUSY.store(false, Ordering::Release);
+    }
 }
 
 type ProviderStackEventActivation = nt_provider_wait::ProviderStackEventActivation;
@@ -508,8 +530,9 @@ fn fixed_provider_arena_identity(id: u64) -> Option<nt_provider_wait::ProviderAr
 }
 
 unsafe fn initialize_provider_allocation_tracking() -> bool {
+    let mut guard = ProviderMetadataGuard::acquire();
     if registered_provider_wait_domain().is_none()
-        || (&*core::ptr::addr_of!(WIN32K_PROVIDER_ALLOCATIONS)).is_some()
+        || provider_allocations_unlocked(&mut guard).is_some()
         || (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS)).is_some()
     {
         return false;
@@ -629,9 +652,17 @@ unsafe fn capture_kernel_provider_stack_activation() -> Option<ProviderStackEven
     Some(ProviderStackEventActivationGuard { activation })
 }
 
-unsafe fn provider_allocations_mut(
-) -> Option<&'static mut nt_provider_wait::ProviderAllocationCatalog> {
+unsafe fn provider_allocations_unlocked<'a>(
+    _guard: &'a mut ProviderMetadataGuard,
+) -> Option<&'a mut nt_provider_wait::ProviderAllocationCatalog> {
     (&mut *core::ptr::addr_of_mut!(WIN32K_PROVIDER_ALLOCATIONS)).as_mut()
+}
+
+unsafe fn with_provider_allocations<R>(
+    f: impl FnOnce(&mut nt_provider_wait::ProviderAllocationCatalog) -> R,
+) -> Option<R> {
+    let mut guard = ProviderMetadataGuard::acquire();
+    Some(f(provider_allocations_unlocked(&mut guard)?))
 }
 
 unsafe fn register_provider_allocation(
@@ -639,7 +670,7 @@ unsafe fn register_provider_allocation(
     base: u64,
     capacity: u64,
 ) -> Option<nt_provider_wait::ProviderAllocationSnapshot> {
-    provider_allocations_mut()?.register(arena, base, capacity).ok()
+    with_provider_allocations(|allocations| allocations.register(arena, base, capacity).ok())?
 }
 
 unsafe fn validate_provider_allocation_retirement(
@@ -647,23 +678,24 @@ unsafe fn validate_provider_allocation_retirement(
     base: u64,
     required: u64,
 ) -> Option<nt_provider_wait::ProviderAllocationSnapshot> {
-    let allocations = provider_allocations_mut()?;
-    let allocation = allocations.exact(arena, base).ok()?;
-    if allocation.capacity < required
-        || allocations
-            .validate_retirement(allocation.identity)
-            .is_err()
-    {
-        return None;
-    }
-    Some(allocation)
+    with_provider_allocations(|allocations| {
+        let allocation = allocations.exact(arena, base).ok()?;
+        if allocation.capacity < required
+            || allocations
+                .validate_retirement(allocation.identity)
+                .is_err()
+        {
+            return None;
+        }
+        Some(allocation)
+    })?
 }
 
 unsafe fn retire_provider_allocation(
     allocation: nt_provider_wait::ProviderAllocationSnapshot,
 ) -> bool {
-    provider_allocations_mut()
-        .is_some_and(|allocations| allocations.retire(allocation.identity).is_ok())
+    with_provider_allocations(|allocations| allocations.retire(allocation.identity).is_ok())
+        .unwrap_or(false)
 }
 
 unsafe fn provider_allocation_event_backing(
@@ -710,6 +742,7 @@ unsafe fn provider_heap_arena_identity(
     if arena_base == WIN32K_HEAP_VADDR {
         return root_heap_arena_identity();
     }
+    let _guard = ProviderMetadataGuard::acquire();
     (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS))
         .as_ref()?
         .iter()
@@ -735,7 +768,8 @@ unsafe fn register_hosted_heap_arena(base: u64, bytes: u64) -> bool {
     let Some(root) = root_heap_arena_identity() else {
         return false;
     };
-    let Some(allocations) = provider_allocations_mut() else {
+    let mut guard = ProviderMetadataGuard::acquire();
+    let Some(allocations) = provider_allocations_unlocked(&mut guard) else {
         return false;
     };
     let Ok(backing) = allocations.exact(root, base) else {
@@ -768,6 +802,7 @@ unsafe fn register_hosted_heap_arena(base: u64, bytes: u64) -> bool {
 unsafe fn hosted_heap_arena_backed_by(
     backing: nt_provider_wait::ProviderAllocationIdentity,
 ) -> Option<nt_provider_wait::ProviderArenaIdentity> {
+    let _guard = ProviderMetadataGuard::acquire();
     (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS))
         .as_ref()?
         .iter()
@@ -779,6 +814,7 @@ unsafe fn retire_hosted_heap_arena(
     identity: nt_provider_wait::ProviderArenaIdentity,
     backing: nt_provider_wait::ProviderAllocationIdentity,
 ) -> bool {
+    let _guard = ProviderMetadataGuard::acquire();
     let Some(arenas) = (&mut *core::ptr::addr_of_mut!(WIN32K_HOSTED_HEAP_ARENAS)).as_mut() else {
         return false;
     };
@@ -4250,9 +4286,7 @@ unsafe fn initialize_provider_local_event(
             nt_provider_wait::ProviderEventKind::Synchronization
         )));
         print_str(b" allocation-catalog=");
-        print_u64(u64::from(
-            (&*core::ptr::addr_of!(WIN32K_PROVIDER_ALLOCATIONS)).is_some(),
-        ));
+        print_u64(u64::from(with_provider_allocations(|_| ()).is_some()));
         print_str(b" local-catalog=");
         print_u64(u64::from(
             (&*core::ptr::addr_of!(WIN32K_LOCAL_EVENTS)).is_some(),
@@ -4263,11 +4297,9 @@ unsafe fn initialize_provider_local_event(
         return false;
     }
     let event_bytes = nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64;
-    let id = if let Some(allocations) =
-        (&*core::ptr::addr_of!(WIN32K_PROVIDER_ALLOCATIONS)).as_ref()
-    {
+    let allocation_admission = with_provider_allocations(|allocations| {
         match allocations.containing(event, event_bytes) {
-            Ok(allocation) => match provider_local_events_mut().and_then(|events| {
+            Ok(allocation) => Ok((allocation, provider_local_events_mut().and_then(|events| {
                 events
                     .initialize_in_allocation(
                         allocations,
@@ -4278,35 +4310,38 @@ unsafe fn initialize_provider_local_event(
                         initial_state,
                     )
                     .ok()
-            }) {
-                Some(id) => Some(id),
-                None => {
-                    print_str(b"[win32k-event] allocation-backed local identity rejected body=0x");
-                    print_hex((event >> 32) as u32);
-                    print_hex(event as u32);
-                    print_str(b" allocation=0x");
-                    print_hex(allocation.identity.allocation_id as u32);
-                    print_str(b"\n");
-                    None
-                }
-            },
-            Err(error) => {
-                if provider_pool_contains(event) {
-                    print_str(b"[win32k-event] provider-pool allocation lookup rejected reason=");
-                    print_u64(error as u64);
-                    print_str(b" body=0x");
-                    print_hex((event >> 32) as u32);
-                    print_hex(event as u32);
-                    print_str(b" native-cap=0x");
-                    print_hex(provider_pool_allocation_capacity(event).unwrap_or(0) as u32);
-                    print_str(b"\n");
-                }
-                None
-            }
+            }))),
+            Err(error) => Err(error),
         }
-    } else {
-        print_str(b"[win32k-event] provider allocation catalog missing during initialization\n");
-        None
+    });
+    let id = match allocation_admission {
+        Some(Ok((_, Some(id)))) => Some(id),
+        Some(Ok((allocation, None))) => {
+            print_str(b"[win32k-event] allocation-backed local identity rejected body=0x");
+            print_hex((event >> 32) as u32);
+            print_hex(event as u32);
+            print_str(b" allocation=0x");
+            print_hex(allocation.identity.allocation_id as u32);
+            print_str(b"\n");
+            None
+        }
+        Some(Err(error)) => {
+            if provider_pool_contains(event) {
+                print_str(b"[win32k-event] provider-pool allocation lookup rejected reason=");
+                print_u64(error as u64);
+                print_str(b" body=0x");
+                print_hex((event >> 32) as u32);
+                print_hex(event as u32);
+                print_str(b" native-cap=0x");
+                print_hex(provider_pool_allocation_capacity(event).unwrap_or(0) as u32);
+                print_str(b"\n");
+            }
+            None
+        }
+        None => {
+            print_str(b"[win32k-event] provider allocation catalog missing during initialization\n");
+            None
+        }
     }
     .or_else(|| {
         let (activation, offset) =
@@ -4575,9 +4610,7 @@ unsafe fn initialize_provider_local_timer(
         return false;
     }
     const KTIMER_BYTES: u64 = 0x40;
-    let id = if let Some(allocations) =
-        (&*core::ptr::addr_of!(WIN32K_PROVIDER_ALLOCATIONS)).as_ref()
-    {
+    let id = with_provider_allocations(|allocations| {
         allocations
             .containing(timer, KTIMER_BYTES)
             .ok()
@@ -4592,9 +4625,8 @@ unsafe fn initialize_provider_local_timer(
                     )
                     .ok()
             })
-    } else {
-        None
-    }
+    })
+    .flatten()
     .or_else(|| {
         let (activation, offset) = (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
             .as_ref()?
@@ -7279,8 +7311,8 @@ unsafe fn heap_alloc_in(
     let Some(capacity) = heap_block_capacity_in(arena_base, arena_bytes, payload) else {
         return 0;
     };
-    let registered = provider_allocations_mut()
-        .and_then(|allocations| allocations.register(arena, payload, capacity).ok())
+    let registered = with_provider_allocations(|allocations| allocations.register(arena, payload, capacity).ok())
+        .flatten()
         .is_some();
     if registered {
         payload

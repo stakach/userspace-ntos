@@ -64,9 +64,8 @@ pub(super) unsafe fn pin_output(
         }
     }
     if provider_pool_contains(address) {
-        let pin = provider_allocations_mut()
+        let pin = with_provider_allocations(|catalog| catalog.pin_containing(address, length))
             .ok_or(STATUS_NOT_SUPPORTED_I32)?
-            .pin_containing(address, length)
             .map(|(_, pin)| pin)
             .map_err(|_| STATUS_ACCESS_VIOLATION_I32)?;
         if capture_root_output(address, length).is_some() {
@@ -96,7 +95,7 @@ pub(super) unsafe fn release_output(pin: PinnedIoctlOutput) {
                 .is_some_and(|catalog| catalog.release_pin(pin).is_ok())
         }
         PinnedIoctlOutput::Pool(pin) => {
-            provider_allocations_mut().is_some_and(|catalog| catalog.release_pin(pin).is_ok())
+            with_provider_allocations(|catalog| catalog.release_pin(pin).is_ok()) == Some(true)
         }
     };
     if !released {
