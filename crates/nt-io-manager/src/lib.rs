@@ -59,6 +59,7 @@ pub mod hosted_pool_range;
 pub mod hosted_kernel_read_delivery;
 pub mod inline_file_retirement;
 mod irp;
+pub mod kernel_irp_builder;
 pub mod io_create_file;
 pub mod io_create_file_capture;
 pub mod io_create_file_reply;
@@ -249,6 +250,7 @@ pub use volume_information::{
 pub use wdm_x64::{
     decode_wdm_kernel_built_io_stack, write_wdm_device_object, write_wdm_driver_object,
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
+    write_wdm_irp_completion_targets,
     write_wdm_open_device_projection,
     WdmDeviceObjectInit, WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
     WdmIoStackParameters, WdmIrpInit, WdmLayoutError, WdmOpenDeviceProjectionInit,

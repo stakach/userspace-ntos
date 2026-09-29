@@ -424,6 +424,19 @@ pub fn write_wdm_irp(bytes: &mut [u8], init: WdmIrpInit) -> Result<(), WdmLayout
     Ok(())
 }
 
+/// Set the caller-owned completion destinations on an allocated IRP. A NULL
+/// destination is valid; completion must then skip that publication or signal.
+pub fn write_wdm_irp_completion_targets(
+    bytes: &mut [u8],
+    user_iosb: u64,
+    user_event: u64,
+) -> Result<(), WdmLayoutError> {
+    require(bytes, WDM_X64_IRP_SIZE)?;
+    put_u64(bytes, 0x48, user_iosb);
+    put_u64(bytes, 0x50, user_event);
+    Ok(())
+}
+
 pub fn write_wdm_io_stack_location(
     bytes: &mut [u8],
     init: WdmIoStackLocationInit,
