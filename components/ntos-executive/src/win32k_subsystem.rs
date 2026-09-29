@@ -665,14 +665,6 @@ unsafe fn with_provider_allocations<R>(
     Some(f(provider_allocations_unlocked(&mut guard)?))
 }
 
-unsafe fn register_provider_allocation(
-    arena: nt_provider_wait::ProviderArenaIdentity,
-    base: u64,
-    capacity: u64,
-) -> Option<nt_provider_wait::ProviderAllocationSnapshot> {
-    with_provider_allocations(|allocations| allocations.register(arena, base, capacity).ok())?
-}
-
 unsafe fn validate_provider_allocation_retirement(
     arena: nt_provider_wait::ProviderArenaIdentity,
     base: u64,
@@ -681,6 +673,7 @@ unsafe fn validate_provider_allocation_retirement(
     with_provider_allocations(|allocations| {
         let allocation = allocations.exact(arena, base).ok()?;
         if allocation.capacity < required
+            || allocations.snapshot_active(allocation.identity).is_err()
             || allocations
                 .validate_retirement(allocation.identity)
                 .is_err()
@@ -691,11 +684,24 @@ unsafe fn validate_provider_allocation_retirement(
     })?
 }
 
-unsafe fn retire_provider_allocation(
-    allocation: nt_provider_wait::ProviderAllocationSnapshot,
-) -> bool {
-    with_provider_allocations(|allocations| allocations.retire(allocation.identity).is_ok())
-        .unwrap_or(false)
+unsafe fn begin_provider_allocation_retirement_locked(
+    metadata: &mut ProviderMetadataGuard,
+    arena: nt_provider_wait::ProviderArenaIdentity,
+    base: u64,
+    required: u64,
+    native_capacity: Option<u64>,
+) -> Option<nt_provider_wait::ProviderAllocationSnapshot> {
+    let catalog = provider_allocations_unlocked(metadata)?;
+    let allocation = catalog.exact(arena, base).ok()?;
+    if allocation.capacity < required
+        || native_capacity != Some(allocation.capacity)
+        || catalog.validate_retirement(allocation.identity) != Ok(allocation)
+        || !validate_provider_allocation_event_retirement(allocation)
+        || !validate_provider_allocation_timer_retirement(allocation)
+    {
+        return None;
+    }
+    (catalog.begin_retirement(allocation.identity) == Ok(allocation)).then_some(allocation)
 }
 
 unsafe fn provider_allocation_event_backing(
@@ -739,10 +745,17 @@ unsafe fn retire_provider_allocation_timers(
 unsafe fn provider_heap_arena_identity(
     arena_base: u64,
 ) -> Option<nt_provider_wait::ProviderArenaIdentity> {
+    let guard = ProviderMetadataGuard::acquire();
+    provider_heap_arena_identity_unlocked(&guard, arena_base)
+}
+
+unsafe fn provider_heap_arena_identity_unlocked(
+    _guard: &ProviderMetadataGuard,
+    arena_base: u64,
+) -> Option<nt_provider_wait::ProviderArenaIdentity> {
     if arena_base == WIN32K_HEAP_VADDR {
         return root_heap_arena_identity();
     }
-    let _guard = ProviderMetadataGuard::acquire();
     (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS))
         .as_ref()?
         .iter()
@@ -764,18 +777,21 @@ fn mint_hosted_heap_arena_identity() -> Option<nt_provider_wait::ProviderArenaId
     }
 }
 
-unsafe fn register_hosted_heap_arena(base: u64, bytes: u64) -> bool {
+unsafe fn register_hosted_heap_arena_unlocked(
+    guard: &mut ProviderMetadataGuard,
+    base: u64,
+    bytes: u64,
+) -> bool {
     let Some(root) = root_heap_arena_identity() else {
         return false;
     };
-    let mut guard = ProviderMetadataGuard::acquire();
-    let Some(allocations) = provider_allocations_unlocked(&mut guard) else {
+    let Some(allocations) = provider_allocations_unlocked(guard) else {
         return false;
     };
     let Ok(backing) = allocations.exact(root, base) else {
         return false;
     };
-    if backing.capacity < bytes {
+    if backing.capacity < bytes || allocations.snapshot_active(backing.identity).is_err() {
         return false;
     }
     let Some(arenas) = (&mut *core::ptr::addr_of_mut!(WIN32K_HOSTED_HEAP_ARENAS)).as_mut() else {
@@ -796,35 +812,6 @@ unsafe fn register_hosted_heap_arena(base: u64, bytes: u64) -> bool {
         identity,
         backing: backing.identity,
     });
-    true
-}
-
-unsafe fn hosted_heap_arena_backed_by(
-    backing: nt_provider_wait::ProviderAllocationIdentity,
-) -> Option<nt_provider_wait::ProviderArenaIdentity> {
-    let _guard = ProviderMetadataGuard::acquire();
-    (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS))
-        .as_ref()?
-        .iter()
-        .find(|arena| arena.backing == backing)
-        .map(|arena| arena.identity)
-}
-
-unsafe fn retire_hosted_heap_arena(
-    identity: nt_provider_wait::ProviderArenaIdentity,
-    backing: nt_provider_wait::ProviderAllocationIdentity,
-) -> bool {
-    let _guard = ProviderMetadataGuard::acquire();
-    let Some(arenas) = (&mut *core::ptr::addr_of_mut!(WIN32K_HOSTED_HEAP_ARENAS)).as_mut() else {
-        return false;
-    };
-    let Some(index) = arenas
-        .iter()
-        .position(|arena| arena.identity == identity && arena.backing == backing)
-    else {
-        return false;
-    };
-    arenas.swap_remove(index);
     true
 }
 
@@ -1436,6 +1423,24 @@ unsafe fn provider_pool_lock() -> Option<ProviderPoolLockGuard> {
     Some(ProviderPoolLockGuard)
 }
 
+unsafe fn provider_metadata_pool_lock() -> Option<(ProviderMetadataGuard, ProviderPoolLockGuard)> {
+    if !provider_pool_ready() {
+        return None;
+    }
+    let lock = &*((WIN32K_POOL_VADDR + shared_pool::LOCK_OFFSET) as *const AtomicU64);
+    loop {
+        let metadata = ProviderMetadataGuard::acquire();
+        if lock
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some((metadata, ProviderPoolLockGuard));
+        }
+        drop(metadata);
+        crate::yield_now();
+    }
+}
+
 /// Initialize the already mapped provider arena exactly once, before the component is spawned.
 pub unsafe fn initialize_provider_pool() -> bool {
     let magic = &*((WIN32K_POOL_VADDR + shared_pool::MAGIC_OFFSET) as *const AtomicU64);
@@ -1463,40 +1468,57 @@ unsafe fn provider_pool_alloc(size: u64, zero: bool) -> u64 {
     let Some(arena) = fixed_provider_arena_identity(PROVIDER_ARENA_SHARED_POOL_ID) else {
         return 0;
     };
-    let allocation = {
-        let Some(_guard) = provider_pool_lock() else {
-            print_str(b"[win32k-host] provider pool is not initialized\n");
-            crate::WIN32K_POOL_EXHAUSTIONS.fetch_add(1, Ordering::Relaxed);
-            return 0;
-        };
+    enum Failure {
+        NotReady,
+        Native(u64),
+        Catalog,
+        Rollback,
+    }
+    let outcome = if let Some((mut metadata, _pool)) = provider_metadata_pool_lock() {
         let mut memory = ProviderPoolMemory;
         match shared_pool::allocate(&mut memory, size, zero) {
-            Ok(allocation) => allocation,
-            Err(error) => {
-                crate::WIN32K_POOL_EXHAUSTIONS.fetch_add(1, Ordering::Relaxed);
-                print_str(b"[win32k-host] provider pool allocation failed reason=");
-                print_u64(error as u64);
-                print_str(b" size=0x");
-                print_hex(size as u32);
-                print_str(b"\n");
-                return 0;
+            Err(error) => Err(Failure::Native(error as u64)),
+            Ok(allocation) => {
+                let payload = WIN32K_POOL_VADDR + allocation.payload_offset;
+                if provider_allocations_unlocked(&mut metadata)
+                    .is_some_and(|catalog| catalog.register(arena, payload, allocation.capacity).is_ok())
+                {
+                    Ok(payload)
+                } else if shared_pool::allocation_identity(&memory, allocation.payload_offset)
+                    == Ok(allocation.identity)
+                    && shared_pool::free(&mut memory, allocation.payload_offset).is_ok()
+                {
+                    Err(Failure::Catalog)
+                } else {
+                    Err(Failure::Rollback)
+                }
             }
         }
+    } else {
+        Err(Failure::NotReady)
     };
-    let payload = WIN32K_POOL_VADDR + allocation.payload_offset;
-    if register_provider_allocation(arena, payload, allocation.capacity).is_some() {
-        return payload;
-    }
-    if let Some(_guard) = provider_pool_lock() {
-        let mut memory = ProviderPoolMemory;
-        if shared_pool::allocation_identity(&memory, allocation.payload_offset)
-            == Ok(allocation.identity)
-        {
-            let _ = shared_pool::free(&mut memory, allocation.payload_offset);
+    match outcome {
+        Ok(payload) => payload,
+        Err(failure) => {
+            crate::WIN32K_POOL_EXHAUSTIONS.fetch_add(1, Ordering::Relaxed);
+            match failure {
+                Failure::NotReady => print_str(b"[win32k-host] provider pool is not initialized\n"),
+                Failure::Native(reason) => {
+                    print_str(b"[win32k-host] provider pool allocation failed reason=");
+                    print_u64(reason);
+                    print_str(b" size=0x");
+                    print_hex(size as u32);
+                    print_str(b"\n");
+                }
+                Failure::Catalog => {}
+                Failure::Rollback => {
+                    print_str(b"[win32k-host] fatal provider pool allocation rollback failure\n");
+                    park();
+                }
+            }
+            0
         }
     }
-    crate::WIN32K_POOL_EXHAUSTIONS.fetch_add(1, Ordering::Relaxed);
-    0
 }
 
 fn provider_pool_contains(p: u64) -> bool {
@@ -1632,10 +1654,13 @@ unsafe fn provider_pool_release_owned(objects: &[(u64, u64)]) -> bool {
         return false;
     }
     {
-        let Some(_guard) = provider_pool_lock() else {
+        let Some((mut metadata, _pool)) = provider_metadata_pool_lock() else {
             return false;
         };
         let memory = ProviderPoolMemory;
+        let Some(catalog) = provider_allocations_unlocked(&mut metadata) else {
+            return false;
+        };
         for (index, &(pointer, required)) in objects.iter().enumerate() {
             if pointer == 0
                 || !provider_pool_contains(pointer)
@@ -1655,26 +1680,28 @@ unsafe fn provider_pool_release_owned(objects: &[(u64, u64)]) -> bool {
             if capacity < required {
                 return false;
             }
+            let Ok(allocation) = catalog.exact(arena, pointer) else {
+                return false;
+            };
+            if allocation.capacity < required
+                || catalog.validate_retirement(allocation.identity) != Ok(allocation)
+            {
+                return false;
+            }
             shared_identities.push(identity);
+            tracked_allocations.push(allocation);
         }
-    }
-    for &(pointer, required) in objects {
-        let Some(allocation) =
-            validate_provider_allocation_retirement(arena, pointer, required)
-        else {
-            return false;
-        };
-        tracked_allocations.push(allocation);
-    }
-    if tracked_allocations
-        .iter()
-        .copied()
-        .any(|allocation| {
+        if tracked_allocations.iter().copied().any(|allocation| {
             !validate_provider_allocation_event_retirement(allocation)
                 || !validate_provider_allocation_timer_retirement(allocation)
-        })
-    {
-        return false;
+        }) {
+            return false;
+        }
+        for allocation in tracked_allocations.iter().copied() {
+            if catalog.begin_retirement(allocation.identity) != Ok(allocation) {
+                return false;
+            }
+        }
     }
     for allocation in tracked_allocations.iter().copied() {
         if !retire_provider_allocation_events(allocation) {
@@ -1686,27 +1713,29 @@ unsafe fn provider_pool_release_owned(objects: &[(u64, u64)]) -> bool {
             park();
         }
     }
-    {
-        let Some(_guard) = provider_pool_lock() else {
-            print_str(b"[win32k-host] fatal provider-pool lock loss during release commit\n");
-            park();
+    let committed = 'commit: {
+        let Some((mut metadata, _pool)) = provider_metadata_pool_lock() else {
+            break 'commit false;
         };
         let mut memory = ProviderPoolMemory;
+        let Some(catalog) = provider_allocations_unlocked(&mut metadata) else {
+            break 'commit false;
+        };
         for (index, &(pointer, _)) in objects.iter().enumerate() {
             let offset = pointer - WIN32K_POOL_VADDR;
             if shared_pool::allocation_identity(&memory, offset) != Ok(shared_identities[index])
                 || shared_pool::free(&mut memory, offset).is_err()
+                || catalog.retire(tracked_allocations[index].identity)
+                    != Ok(tracked_allocations[index])
             {
-                print_str(b"[win32k-host] fatal provider-pool allocator release commit failure\n");
-                park();
+                break 'commit false;
             }
         }
-    }
-    for allocation in tracked_allocations {
-        if !retire_provider_allocation(allocation) {
-            print_str(b"[win32k-host] fatal provider-pool catalog release commit failure\n");
-            park();
-        }
+        true
+    };
+    if !committed {
+        print_str(b"[win32k-host] fatal provider-pool release commit failure\n");
+        park();
     }
     true
 }
@@ -1826,17 +1855,26 @@ unsafe fn reclaiming_pool_alloc(size: u64) -> u64 {
     let Some(arena) = fixed_provider_arena_identity(PROVIDER_ARENA_FTYP_POOL_ID) else {
         return 0;
     };
+    let mut metadata = ProviderMetadataGuard::acquire();
     let payload = reclaiming_pool_alloc_raw(size);
     if payload == 0 {
         return 0;
     }
     let Some(capacity) = reclaiming_pool_capacity(payload) else {
-        return 0;
+        drop(metadata);
+        print_str(b"[win32k-host] fatal FTYP allocation header mismatch\n");
+        park();
     };
-    if register_provider_allocation(arena, payload, capacity).is_some() {
+    if provider_allocations_unlocked(&mut metadata)
+        .is_some_and(|allocations| allocations.register(arena, payload, capacity).is_ok())
+    {
         payload
     } else {
-        let _ = reclaiming_pool_free_raw(payload);
+        if !reclaiming_pool_free_raw(payload) {
+            drop(metadata);
+            print_str(b"[win32k-host] fatal FTYP allocation rollback failure\n");
+            park();
+        }
         0
     }
 }
@@ -1916,19 +1954,34 @@ unsafe fn reclaiming_pool_free(p: u64) -> bool {
     let Some(arena) = fixed_provider_arena_identity(PROVIDER_ARENA_FTYP_POOL_ID) else {
         return false;
     };
-    let Some(allocation) = validate_provider_allocation_retirement(arena, p, 1) else {
+    let allocation = {
+        let mut metadata = ProviderMetadataGuard::acquire();
+        begin_provider_allocation_retirement_locked(
+            &mut metadata,
+            arena,
+            p,
+            1,
+            reclaiming_pool_capacity(p),
+        )
+    };
+    let Some(allocation) = allocation else {
         return false;
     };
-    if reclaiming_pool_capacity(p) != Some(allocation.capacity)
-        || !validate_provider_allocation_event_retirement(allocation)
-        || !validate_provider_allocation_timer_retirement(allocation)
-        || !retire_provider_allocation_events(allocation)
+    if !retire_provider_allocation_events(allocation)
         || !retire_provider_allocation_timers(allocation)
+    {
+        return false;
+    }
+    let mut metadata = ProviderMetadataGuard::acquire();
+    if reclaiming_pool_capacity(p) != Some(allocation.capacity)
+        || provider_allocations_unlocked(&mut metadata)
+            .is_none_or(|catalog| catalog.snapshot(allocation.identity) != Ok(allocation))
         || !reclaiming_pool_free_raw(p)
     {
         return false;
     }
-    retire_provider_allocation(allocation)
+    provider_allocations_unlocked(&mut metadata)
+        .is_some_and(|catalog| catalog.retire(allocation.identity) == Ok(allocation))
 }
 
 /// User-mode VM arena for `ZwAllocateVirtualMemory(NtCurrentProcess(), ...)`. win32k's GDI attribute
@@ -7225,7 +7278,6 @@ unsafe fn heap_alloc_in_raw(
     arena_bytes: u64,
     size: u64,
     zero: bool,
-    label: &[u8],
 ) -> u64 {
     if size == 0 {
         return 0;
@@ -7275,13 +7327,6 @@ unsafe fn heap_alloc_in_raw(
     let hdr = align16(arena_base + cur);
     let cap = arena_base + arena_bytes;
     if hdr + HEAP_HDR_SIZE + want > cap {
-        print_str(b"[win32k-host] ");
-        print_str(label);
-        print_str(b" EXHAUSTED size=0x");
-        print_hex(size as u32);
-        print_str(b" used=0x");
-        print_hex(cur as u32);
-        print_str(b"\n");
         return 0;
     }
     write_volatile(ctr, (hdr + HEAP_HDR_SIZE + want) - arena_base);
@@ -7301,23 +7346,40 @@ unsafe fn heap_alloc_in(
     zero: bool,
     label: &[u8],
 ) -> u64 {
-    let Some(arena) = provider_heap_arena_identity(arena_base) else {
+    let mut metadata = ProviderMetadataGuard::acquire();
+    let Some(arena) = provider_heap_arena_identity_unlocked(&metadata, arena_base) else {
         return 0;
     };
-    let payload = heap_alloc_in_raw(arena_base, arena_bytes, size, zero, label);
+    let payload = heap_alloc_in_raw(arena_base, arena_bytes, size, zero);
     if payload == 0 {
+        let used = read_volatile(arena_base as *const u64);
+        drop(metadata);
+        if size != 0 {
+            print_str(b"[win32k-host] ");
+            print_str(label);
+            print_str(b" EXHAUSTED size=0x");
+            print_hex(size as u32);
+            print_str(b" used=0x");
+            print_hex(used as u32);
+            print_str(b"\n");
+        }
         return 0;
     }
     let Some(capacity) = heap_block_capacity_in(arena_base, arena_bytes, payload) else {
-        return 0;
+        drop(metadata);
+        print_str(b"[win32k-host] fatal heap allocation header mismatch\n");
+        park();
     };
-    let registered = with_provider_allocations(|allocations| allocations.register(arena, payload, capacity).ok())
-        .flatten()
-        .is_some();
+    let registered = provider_allocations_unlocked(&mut metadata)
+        .is_some_and(|allocations| allocations.register(arena, payload, capacity).is_ok());
     if registered {
         payload
     } else {
-        let _ = heap_free_in_raw(arena_base, arena_bytes, payload);
+        if !heap_free_in_raw(arena_base, arena_bytes, payload) {
+            drop(metadata);
+            print_str(b"[win32k-host] fatal heap allocation rollback failure\n");
+            park();
+        }
         0
     }
 }
@@ -7412,28 +7474,46 @@ unsafe fn heap_free_in_raw(arena_base: u64, arena_bytes: u64, p: u64) -> bool {
 }
 
 unsafe fn heap_free_in(arena_base: u64, arena_bytes: u64, p: u64) -> bool {
-    let Some(arena) = provider_heap_arena_identity(arena_base) else {
+    let allocation = {
+        let mut metadata = ProviderMetadataGuard::acquire();
+        let Some(arena) = provider_heap_arena_identity_unlocked(&metadata, arena_base) else {
+            return false;
+        };
+        begin_provider_allocation_retirement_locked(
+            &mut metadata,
+            arena,
+            p,
+            1,
+            heap_block_capacity_in(arena_base, arena_bytes, p),
+        )
+    };
+    let Some(allocation) = allocation else {
         return false;
     };
-    let Some(allocation) = validate_provider_allocation_retirement(arena, p, 1) else {
-        return false;
-    };
-    if heap_block_capacity_in(arena_base, arena_bytes, p) != Some(allocation.capacity)
-        || !validate_provider_allocation_event_retirement(allocation)
-        || !validate_provider_allocation_timer_retirement(allocation)
-        || !retire_provider_allocation_events(allocation)
+    if !retire_provider_allocation_events(allocation)
         || !retire_provider_allocation_timers(allocation)
     {
         return false;
     }
-    let nested_arena = hosted_heap_arena_backed_by(allocation.identity);
-    if !heap_free_in_raw(arena_base, arena_bytes, p) {
+    let mut metadata = ProviderMetadataGuard::acquire();
+    if heap_block_capacity_in(arena_base, arena_bytes, p) != Some(allocation.capacity)
+        || provider_allocations_unlocked(&mut metadata)
+            .is_none_or(|catalog| catalog.snapshot(allocation.identity) != Ok(allocation))
+        || !heap_free_in_raw(arena_base, arena_bytes, p)
+    {
         return false;
     }
-    if !retire_provider_allocation(allocation) {
+    if provider_allocations_unlocked(&mut metadata)
+        .is_none_or(|catalog| catalog.retire(allocation.identity) != Ok(allocation))
+    {
         return false;
     }
-    nested_arena.is_none_or(|identity| retire_hosted_heap_arena(identity, allocation.identity))
+    if let Some(arenas) = (&mut *core::ptr::addr_of_mut!(WIN32K_HOSTED_HEAP_ARENAS)).as_mut() {
+        if let Some(index) = arenas.iter().position(|arena| arena.backing == allocation.identity) {
+            arenas.swap_remove(index);
+        }
+    }
+    true
 }
 
 unsafe fn heap_realloc_in(
@@ -7524,12 +7604,13 @@ unsafe fn hosted_heap_init(base: u64, reserve_size: u64) -> u64 {
     let arena_bytes = WIN32K_HEAP_FRAMES * 0x1000;
     let arena_end = WIN32K_HEAP_VADDR + arena_bytes;
     let reserve_size = (reserve_size + 0xFFF) & !0xFFF;
+    let mut metadata = ProviderMetadataGuard::acquire();
     if base < arena_start
         || reserve_size < POOL_DATA_OFF + HEAP_HDR_SIZE
         || base.checked_add(reserve_size).is_none_or(|end| end > arena_end)
         || heap_block_capacity_in(WIN32K_HEAP_VADDR, arena_bytes, base)
             .is_none_or(|capacity| capacity < reserve_size)
-        || !register_hosted_heap_arena(base, reserve_size)
+        || !register_hosted_heap_arena_unlocked(&mut metadata, base, reserve_size)
     {
         return 0;
     }
@@ -7573,6 +7654,7 @@ unsafe fn shared_hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
 /// module; callers that only consume already-published scalar mapping facts use
 /// [`shared_hosted_heap_bounds`] instead.
 unsafe fn hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
+    let _metadata = ProviderMetadataGuard::acquire();
     let bounds = shared_hosted_heap_bounds(heap)?;
     let arenas = (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS)).as_ref()?;
     arenas
