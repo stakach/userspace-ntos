@@ -120,7 +120,7 @@ pub(crate) unsafe fn service_prepare_data_section_file(
     })
 }
 
-pub(super) unsafe fn service_generic_section_frame(
+pub(crate) unsafe fn service_generic_section_frame(
     generic_sections: *mut GenericSectionTable,
     section_index: usize,
     identity: nt_memory_manager::SectionIdentity,

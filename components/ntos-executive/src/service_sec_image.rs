@@ -3452,7 +3452,7 @@ fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
 
 #[path = "service_section_pagein.rs"]
 pub(crate) mod section_pagein;
-use section_pagein::service_generic_section_frame;
+pub(crate) use section_pagein::service_generic_section_frame;
 pub(crate) use section_pagein::service_prepare_data_section_file;
 
 fn generic_section_writes_back(section: GenericSection) -> bool {
