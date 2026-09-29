@@ -1293,16 +1293,19 @@ static mut WIN32K_LPC_PORT_REFERENCES: nt_object_manager::win32k_ob::ExternalObj
     nt_object_manager::win32k_ob::ExternalObjectReferenceTable::new();
 
 fn provider_event_projection_contains(body: u64) -> bool {
+    let _metadata = ProviderMetadataGuard::acquire();
     unsafe { (&*core::ptr::addr_of!(WIN32K_EVENT_PROJECTIONS)).contains(body) }
 }
 
 unsafe fn provider_event_projection_reserve() -> bool {
+    let _metadata = ProviderMetadataGuard::acquire();
     (&mut *core::ptr::addr_of_mut!(WIN32K_EVENT_PROJECTIONS))
         .reserve_one()
         .is_ok()
 }
 
 unsafe fn provider_event_projection_register_reserved(body: u64, raw_id: u64) -> bool {
+    let _metadata = ProviderMetadataGuard::acquire();
     (&mut *core::ptr::addr_of_mut!(WIN32K_EVENT_PROJECTIONS))
         .register_reserved(
             body,
@@ -1311,10 +1314,13 @@ unsafe fn provider_event_projection_register_reserved(body: u64, raw_id: u64) ->
         .is_ok()
 }
 
-unsafe fn provider_event_projection_remove(body: u64) -> bool {
+unsafe fn provider_event_projection_begin_reclaim(
+    body: u64,
+    raw_id: u64,
+) -> Result<nt_kernel_exec::ProviderEventProjectionReclaim, nt_kernel_exec::ProviderEventProjectionError> {
+    let _metadata = ProviderMetadataGuard::acquire();
     (&mut *core::ptr::addr_of_mut!(WIN32K_EVENT_PROJECTIONS))
-        .remove(body)
-        .is_ok()
+        .begin_reclaim(body, nt_kernel_exec::EventObjectId(nt_types::ObjectId(raw_id)))
 }
 
 const VIDEO_IOCTL_HDEV: u64 = 0x00;
@@ -1644,6 +1650,13 @@ unsafe fn provider_pool_validate_owned(objects: &[(u64, u64)]) -> bool {
 }
 
 unsafe fn provider_pool_release_owned(objects: &[(u64, u64)]) -> bool {
+    provider_pool_release_owned_with_projection(objects, None)
+}
+
+unsafe fn provider_pool_release_owned_with_projection(
+    objects: &[(u64, u64)],
+    reclaim: Option<nt_kernel_exec::ProviderEventProjectionReclaim>,
+) -> bool {
     let Some(arena) = fixed_provider_arena_identity(PROVIDER_ARENA_SHARED_POOL_ID) else {
         return false;
     };
@@ -1728,6 +1741,14 @@ unsafe fn provider_pool_release_owned(objects: &[(u64, u64)]) -> bool {
                 || shared_pool::free(&mut memory, offset).is_err()
                 || catalog.retire(tracked_allocations[index].identity)
                     != Ok(tracked_allocations[index])
+            {
+                break 'commit false;
+            }
+        }
+        if let Some(reclaim) = reclaim {
+            if (&mut *core::ptr::addr_of_mut!(WIN32K_EVENT_PROJECTIONS))
+                .remove_reclaimed(reclaim)
+                .is_err()
             {
                 break 'commit false;
             }
@@ -5112,14 +5133,15 @@ fn next_provider_wait_id() -> Option<u64> {
 }
 
 #[derive(Clone, Copy)]
-enum ProviderWaitLocalLease {
+enum ProviderWaitLease {
     Event(nt_provider_wait::ProviderLocalEventLease),
     Timer(nt_provider_wait::ProviderLocalTimerOperationLease),
+    ProjectedEvent(nt_kernel_exec::ProviderEventProjectionWaitLease),
 }
 
 struct ProviderWaitAdmission {
     objects: [nt_provider_wait::ProviderWaitObject; nt_provider_wait::PROVIDER_WAIT_MAX_OBJECTS],
-    leases: [Option<ProviderWaitLocalLease>; nt_provider_wait::PROVIDER_WAIT_MAX_OBJECTS],
+    leases: [Option<ProviderWaitLease>; nt_provider_wait::PROVIDER_WAIT_MAX_OBJECTS],
     count: usize,
 }
 
@@ -5148,21 +5170,32 @@ impl ProviderWaitAdmission {
     }
 
     unsafe fn release(&mut self) -> bool {
-        let _metadata = ProviderMetadataGuard::acquire();
-        for index in 0..self.count {
-            let released = match self.leases[index] {
-                None => true,
-                Some(ProviderWaitLocalLease::Event(lease)) => provider_local_events_mut()
-                    .is_some_and(|events| events.release_lease(lease).is_ok()),
-                Some(ProviderWaitLocalLease::Timer(lease)) => provider_local_timers_mut()
-                    .is_some_and(|timers| timers.release_operation(lease).is_ok()),
-            };
-            if !released {
-                return false;
+        let mut projected_released = false;
+        {
+            let _metadata = ProviderMetadataGuard::acquire();
+            for index in 0..self.count {
+                let released = match self.leases[index] {
+                    None => true,
+                    Some(ProviderWaitLease::Event(lease)) => provider_local_events_mut()
+                        .is_some_and(|events| events.release_lease(lease).is_ok()),
+                    Some(ProviderWaitLease::Timer(lease)) => provider_local_timers_mut()
+                        .is_some_and(|timers| timers.release_operation(lease).is_ok()),
+                    Some(ProviderWaitLease::ProjectedEvent(lease)) => {
+                        projected_released = true;
+                        (&mut *core::ptr::addr_of_mut!(WIN32K_EVENT_PROJECTIONS))
+                            .release_wait(lease)
+                            .is_ok()
+                    }
+                };
+                if !released {
+                    return false;
+                }
+                self.leases[index] = None;
             }
-            self.leases[index] = None;
         }
-        true
+        !projected_released
+            || event_reclaim_pending_marker().load(Ordering::Acquire) == 0
+            || drain_retired_event_provider_bodies()
     }
 }
 
@@ -5187,16 +5220,26 @@ unsafe fn provider_wait_backing_active(
 
 unsafe fn provider_wait_object_for_dispatcher(
     object_body: u64,
-) -> Option<(nt_provider_wait::ProviderWaitObject, Option<ProviderWaitLocalLease>)> {
-    if let Some(id) =
-        (&*core::ptr::addr_of!(WIN32K_EVENT_PROJECTIONS)).identity(object_body)
+) -> Option<(nt_provider_wait::ProviderWaitObject, Option<ProviderWaitLease>)> {
     {
-        let canonical = nt_provider_wait::ProviderWaitObject::new(
-            nt_provider_wait::ProviderWaitObjectType::Event,
-            id.0.slot().checked_add(1)?,
-            u64::from(id.0.generation().0),
-        );
-        return Some((canonical, None));
+        let _metadata = ProviderMetadataGuard::acquire();
+        match (&mut *core::ptr::addr_of_mut!(WIN32K_EVENT_PROJECTIONS))
+            .acquire_wait(object_body)
+        {
+            Ok(Some((id, lease))) => {
+                let Some(slot) = id.0.slot().checked_add(1) else {
+                    park();
+                };
+                let canonical = nt_provider_wait::ProviderWaitObject::new(
+                    nt_provider_wait::ProviderWaitObjectType::Event,
+                    slot,
+                    u64::from(id.0.generation().0),
+                );
+                return Some((canonical, Some(ProviderWaitLease::ProjectedEvent(lease))));
+            }
+            Ok(None) => {}
+            Err(_) => return None,
+        }
     }
     {
         let mut metadata = ProviderMetadataGuard::acquire();
@@ -5215,7 +5258,7 @@ unsafe fn provider_wait_object_for_dispatcher(
                 let lease = events
                     .acquire_lease(snapshot.id, nt_provider_wait::ProviderLocalEventLeaseKind::Wait)
                     .ok()?;
-                return Some((lease.canonical, Some(ProviderWaitLocalLease::Event(lease))));
+                return Some((lease.canonical, Some(ProviderWaitLease::Event(lease))));
             }
         }
         if let Some(timers) = provider_local_timers_mut() {
@@ -5231,7 +5274,7 @@ unsafe fn provider_wait_object_for_dispatcher(
                     return None;
                 }
                 let lease = timers.acquire_operation(snapshot.id).ok()?;
-                return Some((lease.canonical, Some(ProviderWaitLocalLease::Timer(lease))));
+                return Some((lease.canonical, Some(ProviderWaitLease::Timer(lease))));
             }
         }
     }
@@ -12947,15 +12990,64 @@ unsafe fn win32k_event_broker_call(
 
 static WIN32K_EVENT_RECLAIM_ACK_ID: AtomicU64 = AtomicU64::new(0);
 static WIN32K_EVENT_RECLAIM_ACK_BODY: AtomicU64 = AtomicU64::new(0);
+static WIN32K_EVENT_RECLAIM_EPOCH: AtomicU64 = AtomicU64::new(0);
+static WIN32K_EVENT_RECLAIM_REDRIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static WIN32K_EVENT_RECLAIM_DRAIN_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+unsafe fn event_reclaim_pending_marker() -> &'static AtomicU64 {
+    &*((WIN32K_SHARED_VADDR + SH_EVENT_RECLAIM_PENDING) as *const AtomicU64)
+}
+
+struct EventReclaimDrainGuard;
+
+impl EventReclaimDrainGuard {
+    fn try_acquire() -> Option<Self> {
+        WIN32K_EVENT_RECLAIM_DRAIN_ACTIVE
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for EventReclaimDrainGuard {
+    fn drop(&mut self) {
+        WIN32K_EVENT_RECLAIM_DRAIN_ACTIVE.store(false, Ordering::Release);
+    }
+}
 
 pub(crate) unsafe fn mark_event_provider_reclaim_pending() {
-    write_volatile(
-        (WIN32K_SHARED_VADDR + SH_EVENT_RECLAIM_PENDING) as *mut u64,
-        1,
-    );
+    if WIN32K_EVENT_RECLAIM_EPOCH
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| epoch.checked_add(1))
+        .is_err()
+    {
+        park();
+    }
+    event_reclaim_pending_marker().store(1, Ordering::Release);
 }
 
 unsafe fn drain_retired_event_provider_bodies() -> bool {
+    loop {
+        let Some(drain) = EventReclaimDrainGuard::try_acquire() else {
+            WIN32K_EVENT_RECLAIM_REDRIVE.store(true, Ordering::Release);
+            if WIN32K_EVENT_RECLAIM_DRAIN_ACTIVE.load(Ordering::Acquire) {
+                return true;
+            }
+            continue;
+        };
+        let result = drain_retired_event_provider_bodies_owned();
+        drop(drain);
+        if !result {
+            return false;
+        }
+        if !WIN32K_EVENT_RECLAIM_REDRIVE.swap(false, Ordering::AcqRel) {
+            return true;
+        }
+    }
+}
+
+unsafe fn drain_retired_event_provider_bodies_owned() -> bool {
     loop {
         let pending_id = WIN32K_EVENT_RECLAIM_ACK_ID.load(Ordering::Acquire);
         let pending_body = WIN32K_EVENT_RECLAIM_ACK_BODY.load(Ordering::Acquire);
@@ -12976,30 +13068,38 @@ unsafe fn drain_retired_event_provider_bodies() -> bool {
             WIN32K_EVENT_RECLAIM_ACK_ID.store(0, Ordering::Release);
             continue;
         }
+        let epoch = WIN32K_EVENT_RECLAIM_EPOCH.load(Ordering::Acquire);
         let (status, id, body, _) =
             win32k_event_broker_call(W32_EVENT_OP_DRAIN_RECLAIM, 0, 0, 0);
         if status != 0 {
             return false;
         }
         if id == 0 && body == 0 {
-            write_volatile(
-                (WIN32K_SHARED_VADDR + SH_EVENT_RECLAIM_PENDING) as *mut u64,
-                0,
-            );
+            if WIN32K_EVENT_RECLAIM_EPOCH.load(Ordering::Acquire) != epoch {
+                continue;
+            }
+            event_reclaim_pending_marker().store(0, Ordering::Release);
+            if WIN32K_EVENT_RECLAIM_EPOCH.load(Ordering::Acquire) != epoch {
+                event_reclaim_pending_marker().store(1, Ordering::Release);
+                continue;
+            }
             return true;
         }
-        if id == 0
-            || body == 0
-            || !provider_event_projection_contains(body)
-            || !provider_pool_release_owned(&[(
-                body,
-                nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64,
-            )])
-        {
+        if id == 0 || body == 0 {
             return false;
         }
-        if !provider_event_projection_remove(body) {
-            return false;
+        let reclaim = match provider_event_projection_begin_reclaim(body, id) {
+            Ok(reclaim) => reclaim,
+            Err(nt_kernel_exec::ProviderEventProjectionError::ActiveLeases) => return true,
+            Err(_) => return false,
+        };
+        if !provider_pool_release_owned_with_projection(&[(
+            body,
+            nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64,
+        )], Some(reclaim))
+        {
+            print_str(b"[win32k-event] fatal projected Event reclaim failure\n");
+            park();
         }
         WIN32K_EVENT_RECLAIM_ACK_ID.store(id, Ordering::Release);
         WIN32K_EVENT_RECLAIM_ACK_BODY.store(body, Ordering::Release);
@@ -16376,7 +16476,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         let status = 0xC000_009Au32;
         return (status as i32, status as u64);
     };
-    if read_volatile((WIN32K_SHARED_VADDR + SH_EVENT_RECLAIM_PENDING) as *const u64) != 0
+    if event_reclaim_pending_marker().load(Ordering::Acquire) != 0
         && !drain_retired_event_provider_bodies()
     {
         let status = 0xC000_0001u32;
