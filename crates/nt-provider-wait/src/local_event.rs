@@ -357,7 +357,7 @@ impl ProviderLocalEventCatalog {
         initial_state: bool,
     ) -> Result<ProviderLocalEventId, ProviderLocalEventError> {
         let allocation = allocations
-            .snapshot(allocation_identity)
+            .snapshot_active(allocation_identity)
             .map_err(|_| ProviderLocalEventError::InvalidStorage)?;
         let offset = allocation
             .offset_of(body)
@@ -937,5 +937,33 @@ mod tests {
                 false,
             )
             .is_ok());
+    }
+
+    #[test]
+    fn allocation_event_initialization_refuses_retiring_storage() {
+        let mut allocations = ProviderAllocationCatalog::new();
+        let allocation = allocations
+            .register(
+                crate::ProviderArenaIdentity {
+                    id: 1,
+                    generation: 1,
+                },
+                0xa000,
+                0x100,
+            )
+            .unwrap();
+        allocations.begin_retirement(allocation.identity).unwrap();
+        let mut events = ProviderLocalEventCatalog::new(provider()).unwrap();
+        assert_eq!(
+            events.initialize_in_allocation(
+                &allocations,
+                allocation.identity,
+                0xa020,
+                0x18,
+                ProviderEventKind::Notification,
+                false,
+            ),
+            Err(ProviderLocalEventError::InvalidStorage)
+        );
     }
 }

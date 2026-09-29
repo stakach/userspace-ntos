@@ -212,6 +212,19 @@ impl ProviderAllocationCatalog {
         self.records[slot].snapshot(slot)
     }
 
+    /// New objects may only be initialized in allocations that have not
+    /// entered native retirement. `snapshot` remains available for teardown.
+    pub fn snapshot_active(
+        &self,
+        identity: ProviderAllocationIdentity,
+    ) -> Result<ProviderAllocationSnapshot, ProviderAllocationError> {
+        let slot = self.slot(identity)?;
+        if self.records[slot].retiring {
+            return Err(ProviderAllocationError::Retiring);
+        }
+        self.records[slot].snapshot(slot)
+    }
+
     pub fn exact(
         &self,
         arena: ProviderArenaIdentity,
@@ -255,6 +268,9 @@ impl ProviderAllocationCatalog {
         if end > record.end() {
             return Err(ProviderAllocationError::InvalidRange);
         }
+        if record.retiring {
+            return Err(ProviderAllocationError::Retiring);
+        }
         record.snapshot(slot)
     }
 
@@ -264,9 +280,6 @@ impl ProviderAllocationCatalog {
         required: u64,
     ) -> Result<(ProviderAllocationSnapshot, ProviderAllocationPin), ProviderAllocationError> {
         let snapshot = self.containing(address, required)?;
-        if self.records[self.slot(snapshot.identity)?].retiring {
-            return Err(ProviderAllocationError::Retiring);
-        }
         let id = self.next_pin_id;
         let next = id
             .checked_add(1)
@@ -605,6 +618,14 @@ mod tests {
         );
         assert_eq!(
             catalog.pin_containing(0xa100, 0x10),
+            Err(ProviderAllocationError::Retiring)
+        );
+        assert_eq!(
+            catalog.containing(0xa100, 0x10),
+            Err(ProviderAllocationError::Retiring)
+        );
+        assert_eq!(
+            catalog.snapshot_active(allocation.identity),
             Err(ProviderAllocationError::Retiring)
         );
         assert_eq!(
