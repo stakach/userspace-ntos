@@ -779,14 +779,10 @@ impl GenericSectionTable {
         )
     }
 
-    pub fn unmap_view_exact(
-        &mut self,
-        pi: usize,
-        lifetime: MemoryLifetime,
-        base: u64,
-    ) -> Option<GenericSectionView> {
+    /// Remove only the captured incarnation of a process view, not a later view at its address.
+    pub fn unmap_view_identity(&mut self, expected: GenericSectionView) -> Option<GenericSectionView> {
         for view in &mut self.views {
-            if view.live && view.pi == pi && view.lifetime == lifetime && view.base == base {
+            if view.live && *view == expected {
                 let removed = *view;
                 *view = GenericSectionView::empty();
                 self.clear_section_if_unreferenced(removed.section_index);
@@ -962,12 +958,30 @@ mod tests {
         let first = table.first_view_for_process_exact(2, lifetime).unwrap();
         assert_ne!(first.generation, 0);
         assert_eq!(table.view_for_page(2, 0x11000).unwrap().1.generation, first.generation);
-        assert_eq!(table.unmap_view_exact(2, lifetime, 0x10000), Some(first));
+        assert_eq!(table.unmap_view_identity(first), Some(first));
         assert!(table.map_view_with_lifetime(2, lifetime, section, 0x10000, 0x2000, 0));
         let second = table.first_view_for_process_exact(2, lifetime).unwrap();
         assert_eq!(table.stats().view_records, 1);
         assert_eq!(second.generation, first.generation + 1);
         assert_eq!(table.view_for_page(2, 0x11000).unwrap().1, second);
+    }
+
+    #[test]
+    fn stale_process_view_cannot_unmap_same_base_replacement() {
+        let mut table = GenericSectionTable::new();
+        let section = create_section(&mut table, 2, 0x40);
+        let lifetime = MemoryLifetime::Process(crate::ProcessIdentity {
+            pid: 17,
+            generation: crate::ProcessGeneration::Hosted(3),
+        });
+        assert!(table.map_view_with_lifetime(2, lifetime, section, 0x10000, 0x1000, 0));
+        let first = table.first_view_for_process_exact(2, lifetime).unwrap();
+        assert_eq!(table.unmap_view_identity(first), Some(first));
+        assert!(table.map_view_with_lifetime(2, lifetime, section, 0x10000, 0x1000, 0));
+        let replacement = table.first_view_for_process_exact(2, lifetime).unwrap();
+        assert_ne!(first.generation, replacement.generation);
+        assert_eq!(table.unmap_view_identity(first), None);
+        assert_eq!(table.view_for_page(2, 0x10000).unwrap().1, replacement);
     }
 
     #[test]

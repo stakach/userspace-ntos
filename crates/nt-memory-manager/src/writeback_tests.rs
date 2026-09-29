@@ -103,9 +103,10 @@ fn stale_alias_rearm_has_no_write_effect_and_preserves_dirty_retry() {
     assert!(stale.aliases.is_empty());
     assert_eq!(table.prepare_writeback(plan).unwrap().len(), 1);
 
-    assert!(table
-        .unmap_view_exact(8, MemoryLifetime::Process(old), 0x20000)
-        .is_some());
+    let old_view = table
+        .first_view_for_process_exact(8, MemoryLifetime::Process(old))
+        .unwrap();
+    assert!(table.unmap_view_identity(old_view).is_some());
     assert!(table.map_view_with_lifetime(
         8,
         MemoryLifetime::Process(new),
@@ -215,8 +216,11 @@ fn writeback_alias_retains_original_process_generation_after_slot_reuse() {
         table.first_view_for_process_exact(8, original).unwrap().lifetime,
         original
     );
-    assert!(table.unmap_view_exact(8, replacement, 0x20000).is_none());
-    assert!(table.unmap_view_exact(8, original, 0x20000).is_some());
+    let original_view = table.first_view_for_process_exact(8, original).unwrap();
+    assert!(table
+        .unmap_view_identity(GenericSectionView { lifetime: replacement, ..original_view })
+        .is_none());
+    assert!(table.unmap_view_identity(original_view).is_some());
     assert!(!table
         .writeback_aliases(ticket)
         .unwrap()
