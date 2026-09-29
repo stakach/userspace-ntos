@@ -14596,6 +14596,9 @@ fn register_trampolines() -> bool {
     );
     reg.bind("ZwOpenFile", file_open::open as *const () as usize as u64);
     reg.bind("ZwCreateFile", file_open::create as *const () as usize as u64);
+    reg.bind("ZwCreateSection", section_create::create as *const () as usize as u64);
+    reg.bind("ZwMapViewOfSection", section_map::map as *const () as usize as u64);
+    reg.bind("ZwUnmapViewOfSection", section_unmap::unmap as *const () as usize as u64);
     reg.bind("ZwQueryInformationFile", file_query::query_information as *const () as usize as u64);
     reg.bind("ZwQueryDirectoryFile", file_query::query_directory as *const () as usize as u64);
     reg.bind("ZwCancelIoFile", file_cancel::cancel_io_file as *const () as usize as u64);

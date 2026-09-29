@@ -16,7 +16,6 @@ unsafe fn call(op: u64, first: u64, second: u64) -> (i32, u64) {
     (raw as u32 as i32, token)
 }
 
-#[allow(dead_code)] // Bound with the complete Section import lifecycle.
 pub(super) extern "win64" fn unmap(process_handle: u64, base_address: u64) -> i32 {
     unsafe {
         let (status, token) = call(UNMAP, process_handle, base_address);

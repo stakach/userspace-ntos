@@ -58,7 +58,7 @@ unsafe fn decode_request(packet: u64, length: u64) -> Result<SectionMapRequest, 
     let (_, bytes) =
         crate::win32k_subsystem::capture_provider_pool_packet(packet, wire::PACKET_BYTES)?;
     let request = wire::decode(&bytes).map_err(|_| STATUS_INVALID_PARAMETER)?;
-    if !request.is_supported_reactos_shape() {
+    if !request.is_supported_provider_shape() {
         return Err(STATUS_NOT_SUPPORTED);
     }
     Ok(request)

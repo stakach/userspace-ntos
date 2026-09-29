@@ -20,13 +20,32 @@ pub struct SectionMapRequest {
 }
 
 impl SectionMapRequest {
-    pub const fn is_supported_reactos_shape(self) -> bool {
+    pub const fn is_supported_provider_shape(self) -> bool {
         self.process_handle == u64::MAX
             && self.zero_bits == 0
-            && self.commit_size == 0
             && self.inherit_disposition == 1
             && self.allocation_type == 0
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SectionMapCommitError {
+    ExceedsView,
+    IncrementalCommitUnsupported,
+}
+
+pub const fn validate_commit_size(
+    commit_size: u64,
+    effective_view_size: u64,
+    section_is_reserved: bool,
+) -> Result<(), SectionMapCommitError> {
+    if commit_size > effective_view_size {
+        return Err(SectionMapCommitError::ExceedsView);
+    }
+    if commit_size != 0 && section_is_reserved {
+        return Err(SectionMapCommitError::IncrementalCommitUnsupported);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,24 +146,34 @@ mod tests {
     }
 
     #[test]
-    fn supported_reactos_shape_is_narrow_and_explicit() {
+    fn supported_provider_shape_is_narrow_and_explicit() {
         let mut input = request();
-        input.commit_size = 0;
-        assert!(input.is_supported_reactos_shape());
+        assert!(input.is_supported_provider_shape());
         input.process_handle = 4;
-        assert!(!input.is_supported_reactos_shape());
+        assert!(!input.is_supported_provider_shape());
         input.process_handle = u64::MAX;
         input.zero_bits = 1;
-        assert!(!input.is_supported_reactos_shape());
+        assert!(!input.is_supported_provider_shape());
         input.zero_bits = 0;
-        input.commit_size = 1;
-        assert!(!input.is_supported_reactos_shape());
-        input.commit_size = 0;
         input.inherit_disposition = 2;
-        assert!(!input.is_supported_reactos_shape());
+        assert!(!input.is_supported_provider_shape());
         input.inherit_disposition = 1;
         input.allocation_type = 1;
-        assert!(!input.is_supported_reactos_shape());
+        assert!(!input.is_supported_provider_shape());
+    }
+
+    #[test]
+    fn commit_size_never_exceeds_view_or_commits_reserved_section_implicitly() {
+        assert_eq!(validate_commit_size(0, 0x4000, true), Ok(()));
+        assert_eq!(validate_commit_size(0x4000, 0x4000, false), Ok(()));
+        assert_eq!(
+            validate_commit_size(0x5000, 0x4000, false),
+            Err(SectionMapCommitError::ExceedsView)
+        );
+        assert_eq!(
+            validate_commit_size(0x1000, 0x4000, true),
+            Err(SectionMapCommitError::IncrementalCommitUnsupported)
+        );
     }
 
     #[test]
