@@ -12222,9 +12222,12 @@ const WIN32K_REGISTRY_OP_PUBLISH: u64 = 12;
 const WIN32K_REGISTRY_OP_ABORT: u64 = 13;
 const WIN32K_REGISTRY_OP_IS_KEY: u64 = 14;
 pub(crate) const WIN32K_REGISTRY_OP_OPEN_DEVICE_KEY: u64 = 15;
+pub(crate) const WIN32K_REGISTRY_OP_SYNC_INVALIDATE_RELATIONS: u64 = 16;
 const WIN32K_REGISTRY_USE_PREVIOUS_MODE: u64 = 1 << 63;
 #[path = "win32k_subsystem/device_registry.rs"]
 mod device_registry;
+#[path = "win32k_subsystem/device_relations.rs"]
+mod device_relations;
 #[path = "win32k_registry_deferred_value.rs"]
 mod win32k_registry_deferred_value;
 const REG_OPTION_VOLATILE: u32 = 0x0000_0001;
@@ -12751,6 +12754,14 @@ pub(crate) unsafe fn service_registry_request(
         return ProviderRegistryResult::Ready(device_registry::service(
             channel, reply_cap, mi, arg, param1, param2,
         ));
+    }
+    if op == WIN32K_REGISTRY_OP_SYNC_INVALIDATE_RELATIONS {
+        return match crate::driver_launch::hosted_sync_relations::submit(
+            channel, reply_cap, mi, arg, param1, param2,
+        ) {
+            Some(status) => ProviderRegistryResult::Ready((status, 0, 0)),
+            None => ProviderRegistryResult::Deferred,
+        };
     }
     if let Some(result) = win32k_registry_deferred_value::route(
         channel, op, arg, param1, param2,
@@ -14609,6 +14620,10 @@ fn register_trampolines() -> bool {
     reg.bind(
         "IoOpenDeviceRegistryKey",
         device_registry::open_device_registry_key as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoSynchronousInvalidateDeviceRelations",
+        device_relations::synchronous_invalidate as *const () as usize as u64,
     );
     reg.bind("ZwCreateSection", section_create::create as *const () as usize as u64);
     reg.bind("ZwMapViewOfSection", section_map::map as *const () as usize as u64);

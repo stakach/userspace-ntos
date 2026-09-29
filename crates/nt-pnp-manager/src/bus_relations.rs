@@ -589,6 +589,37 @@ impl DeviceRelationInvalidationQueue {
         Ok(())
     }
 
+    /// Roll back a synchronous action only before any worker claims it. The ticket and queue row
+    /// must match the same exact generation; a claimed or terminal action cannot be discarded.
+    pub fn discard_pending_sync(
+        &mut self,
+        ticket: SyncDeviceRelationTicket,
+        invalidation: DeviceRelationInvalidation,
+    ) -> Result<(), DeviceRelationInvalidationError> {
+        if ticket.0 != invalidation.sequence {
+            return Err(DeviceRelationInvalidationError::StaleTicket);
+        }
+        let waiter_index = self
+            .sync_waiters
+            .iter()
+            .position(|waiter| waiter.ticket == ticket && waiter.status.is_none())
+            .ok_or(DeviceRelationInvalidationError::StaleTicket)?;
+        let row_index = self
+            .rows
+            .iter()
+            .position(|row| {
+                row.parent == invalidation.parent
+                    && row.pdo_device_id == invalidation.pdo_device_id
+                    && row.relation_type == invalidation.relation_type
+                    && matches!(row.state, DeviceRelationInvalidationState::Pending { sequence }
+                        if sequence == invalidation.sequence)
+            })
+            .ok_or(DeviceRelationInvalidationError::StaleClaim)?;
+        self.rows.remove(row_index);
+        self.sync_waiters.remove(waiter_index);
+        Ok(())
+    }
+
     pub fn complete(
         &mut self,
         claim: DeviceRelationInvalidation,
@@ -1766,6 +1797,27 @@ mod tests {
         assert_eq!(queue.claim_front(), Some(later));
         queue.complete(later).unwrap();
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn synchronous_admission_rollback_requires_unclaimed_exact_ticket() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        let (ticket, action) = queue.enqueue_sync(parent(10), 0).unwrap();
+        let (other_ticket, other) = queue.enqueue_sync(parent(20), 0).unwrap();
+        assert_eq!(
+            queue.discard_pending_sync(ticket, other),
+            Err(DeviceRelationInvalidationError::StaleTicket)
+        );
+        assert_eq!(queue.discard_pending_sync(ticket, action), Ok(()));
+        assert!(!queue.contains(action));
+        assert_eq!(queue.sync_status(ticket), Err(DeviceRelationInvalidationError::StaleTicket));
+        let claimed = queue.claim_front().unwrap();
+        assert_eq!(claimed, other);
+        assert_eq!(
+            queue.discard_pending_sync(other_ticket, other),
+            Err(DeviceRelationInvalidationError::StaleClaim)
+        );
+        assert_eq!(queue.sync_status(other_ticket), Ok(None));
     }
 
     #[test]

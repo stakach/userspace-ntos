@@ -2395,7 +2395,11 @@ unsafe fn component_pump_loop(
         } else if label == crate::win32k_subsystem::W32_REGISTRY_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
-            if msg.m0 == crate::win32k_subsystem::WIN32K_REGISTRY_OP_OPEN_DEVICE_KEY
+            if matches!(
+                msg.m0,
+                crate::win32k_subsystem::WIN32K_REGISTRY_OP_OPEN_DEVICE_KEY
+                    | crate::win32k_subsystem::WIN32K_REGISTRY_OP_SYNC_INVALIDATE_RELATIONS
+            )
                 && !shared_pump::authenticated_badge(ch, msg.badge)
             {
                 pump_reply_recv4_into!(

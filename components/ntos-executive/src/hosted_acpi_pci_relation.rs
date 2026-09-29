@@ -872,7 +872,10 @@ unsafe fn stage_hosted_acpi_pci_scope_sources() -> bool {
     query.acpi_pci_scope_sources = sources;
     query.acpi_pci_link_candidates = link_candidates;
     if source_count != 0 {
-        match crate::hosted_pci_topology::note_hosted_pci_relation_discovered(relation_owner) {
+        match crate::hosted_pci_topology::note_hosted_pci_relation_discovered(
+            relation_owner,
+            query.claim,
+        ) {
             Ok(true) => {
                 if let Err(status) = cancel_stale_hosted_acpi_pci_route_query() {
                     query.phase = HostedDeviceRelationQueryPhase::Barrier;
