@@ -118,6 +118,28 @@ pub enum ProviderEventProjectionError {
     InvalidBody,
     MissingBody,
     OutOfMemory,
+    StaleProjection,
+    StaleLease,
+    ActiveLeases,
+    ReclaimPending,
+    SequenceExhausted,
+}
+
+/// One exact wait reference to a projected Event. A provider address alone cannot release it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderEventProjectionWaitLease {
+    body: u64,
+    id: EventObjectId,
+    generation: u64,
+    serial: u64,
+}
+
+/// Permission to remove the same row after reclaim has excluded new wait admissions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderEventProjectionReclaim {
+    body: u64,
+    id: EventObjectId,
+    generation: u64,
 }
 
 /// Exact membership for Event bodies projected into a hosted kernel provider.
@@ -125,21 +147,36 @@ pub enum ProviderEventProjectionError {
 /// Embedded provider `KEVENT`s never enter this catalog. Import shims can therefore distinguish
 /// local dispatcher storage from an executive-owned projection without interpreting a failed
 /// broker call as a type test.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ProviderEventProjectionCatalog {
     projections: Vec<ProviderEventProjection>,
+    wait_leases: Vec<ProviderEventProjectionWaitLease>,
+    next_generation: u64,
+    next_serial: u64,
+}
+
+impl Default for ProviderEventProjectionCatalog {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProviderEventProjection {
     body: u64,
     id: EventObjectId,
+    generation: u64,
+    wait_leases: usize,
+    reclaim_pending: bool,
 }
 
 impl ProviderEventProjectionCatalog {
     pub const fn new() -> Self {
         Self {
             projections: Vec::new(),
+            wait_leases: Vec::new(),
+            next_generation: 1,
+            next_serial: 1,
         }
     }
 
@@ -162,8 +199,10 @@ impl ProviderEventProjectionCatalog {
             .iter()
             .find(|projection| projection.body == body || projection.id == id)
         {
-            return if existing.body == body && existing.id == id {
+            return if existing.body == body && existing.id == id && !existing.reclaim_pending {
                 Ok(false)
+            } else if existing.body == body && existing.id == id {
+                Err(ProviderEventProjectionError::ReclaimPending)
             } else {
                 Err(ProviderEventProjectionError::InvalidBody)
             };
@@ -171,8 +210,120 @@ impl ProviderEventProjectionCatalog {
         if self.projections.len() == self.projections.capacity() {
             return Err(ProviderEventProjectionError::OutOfMemory);
         }
-        self.projections.push(ProviderEventProjection { body, id });
+        let generation = self.next_generation;
+        self.next_generation = generation
+            .checked_add(1)
+            .ok_or(ProviderEventProjectionError::SequenceExhausted)?;
+        self.projections.push(ProviderEventProjection {
+            body,
+            id,
+            generation,
+            wait_leases: 0,
+            reclaim_pending: false,
+        });
         Ok(true)
+    }
+
+    /// Atomically resolve a live projection and retain its exact row for one provider wait.
+    pub fn acquire_wait(
+        &mut self,
+        body: u64,
+    ) -> Result<Option<(EventObjectId, ProviderEventProjectionWaitLease)>, ProviderEventProjectionError>
+    {
+        let Some(index) = self.projections.iter().position(|row| body != 0 && row.body == body)
+        else {
+            return Ok(None);
+        };
+        if self.projections[index].reclaim_pending {
+            return Err(ProviderEventProjectionError::ReclaimPending);
+        }
+        self.wait_leases
+            .try_reserve(1)
+            .map_err(|_| ProviderEventProjectionError::OutOfMemory)?;
+        let serial = self.next_serial;
+        let next_serial = serial
+            .checked_add(1)
+            .ok_or(ProviderEventProjectionError::SequenceExhausted)?;
+        let row = &mut self.projections[index];
+        row.wait_leases = row
+            .wait_leases
+            .checked_add(1)
+            .ok_or(ProviderEventProjectionError::SequenceExhausted)?;
+        self.next_serial = next_serial;
+        let lease = ProviderEventProjectionWaitLease {
+            body: row.body,
+            id: row.id,
+            generation: row.generation,
+            serial,
+        };
+        self.wait_leases.push(lease);
+        Ok(Some((row.id, lease)))
+    }
+
+    pub fn release_wait(
+        &mut self,
+        lease: ProviderEventProjectionWaitLease,
+    ) -> Result<(), ProviderEventProjectionError> {
+        let Some(lease_index) = self.wait_leases.iter().position(|held| *held == lease) else {
+            return Err(ProviderEventProjectionError::StaleLease);
+        };
+        let Some(row) = self.projections.iter_mut().find(|row| {
+            row.body == lease.body && row.id == lease.id && row.generation == lease.generation
+        }) else {
+            return Err(ProviderEventProjectionError::StaleLease);
+        };
+        if row.wait_leases == 0 {
+            return Err(ProviderEventProjectionError::StaleLease);
+        }
+        row.wait_leases -= 1;
+        self.wait_leases.swap_remove(lease_index);
+        Ok(())
+    }
+
+    /// Begin reclaim only for the expected canonical Event and only after all waits drain.
+    pub fn begin_reclaim(
+        &mut self,
+        body: u64,
+        id: EventObjectId,
+    ) -> Result<ProviderEventProjectionReclaim, ProviderEventProjectionError> {
+        let Some(row) = self.projections.iter_mut().find(|row| body != 0 && row.body == body)
+        else {
+            return Err(ProviderEventProjectionError::MissingBody);
+        };
+        if row.id != id || id.is_null() {
+            return Err(ProviderEventProjectionError::StaleProjection);
+        }
+        if row.reclaim_pending {
+            return Err(ProviderEventProjectionError::ReclaimPending);
+        }
+        if row.wait_leases != 0 {
+            return Err(ProviderEventProjectionError::ActiveLeases);
+        }
+        row.reclaim_pending = true;
+        Ok(ProviderEventProjectionReclaim {
+            body,
+            id,
+            generation: row.generation,
+        })
+    }
+
+    pub fn remove_reclaimed(
+        &mut self,
+        reclaim: ProviderEventProjectionReclaim,
+    ) -> Result<(), ProviderEventProjectionError> {
+        let Some(index) = self.projections.iter().position(|row| row.body == reclaim.body)
+        else {
+            return Err(ProviderEventProjectionError::MissingBody);
+        };
+        let row = self.projections[index];
+        if row.id != reclaim.id || row.generation != reclaim.generation || !row.reclaim_pending {
+            return Err(ProviderEventProjectionError::StaleProjection);
+        }
+        if row.wait_leases != 0 {
+            return Err(ProviderEventProjectionError::ActiveLeases);
+        }
+        self.projections.swap_remove(index);
+        Ok(())
     }
 
     pub fn contains(&self, body: u64) -> bool {
@@ -194,6 +345,12 @@ impl ProviderEventProjectionCatalog {
         else {
             return Err(ProviderEventProjectionError::MissingBody);
         };
+        if self.projections[index].wait_leases != 0 {
+            return Err(ProviderEventProjectionError::ActiveLeases);
+        }
+        if self.projections[index].reclaim_pending {
+            return Err(ProviderEventProjectionError::ReclaimPending);
+        }
         self.projections.swap_remove(index);
         Ok(())
     }
@@ -1692,6 +1849,87 @@ mod tests {
             catalog.remove(0x1000),
             Err(ProviderEventProjectionError::MissingBody)
         );
+    }
+
+    #[test]
+    fn provider_projection_wait_lease_is_exact_and_single_use() {
+        let mut catalog = ProviderEventProjectionCatalog::new();
+        let id = EventObjectId(ObjectId::new(Generation(1), 1));
+        catalog.reserve_one().unwrap();
+        catalog.register_reserved(0x1000, id).unwrap();
+        let (resolved, first) = catalog.acquire_wait(0x1000).unwrap().unwrap();
+        let (_, second) = catalog.acquire_wait(0x1000).unwrap().unwrap();
+        assert_eq!(resolved, id);
+        assert_ne!(first, second);
+        assert_eq!(catalog.acquire_wait(0x2000), Ok(None));
+        assert_eq!(
+            catalog.begin_reclaim(0x1000, id),
+            Err(ProviderEventProjectionError::ActiveLeases)
+        );
+        assert_eq!(
+            catalog.remove(0x1000),
+            Err(ProviderEventProjectionError::ActiveLeases)
+        );
+        let mut mismatch = first;
+        mismatch.id = EventObjectId(ObjectId::new(Generation(1), 2));
+        assert_eq!(
+            catalog.release_wait(mismatch),
+            Err(ProviderEventProjectionError::StaleLease)
+        );
+        catalog.release_wait(first).unwrap();
+        assert_eq!(
+            catalog.release_wait(first),
+            Err(ProviderEventProjectionError::StaleLease)
+        );
+        assert_eq!(
+            catalog.begin_reclaim(0x1000, id),
+            Err(ProviderEventProjectionError::ActiveLeases)
+        );
+        catalog.release_wait(second).unwrap();
+        let reclaim = catalog.begin_reclaim(0x1000, id).unwrap();
+        assert_eq!(
+            catalog.acquire_wait(0x1000),
+            Err(ProviderEventProjectionError::ReclaimPending)
+        );
+        assert_eq!(
+            catalog.register_reserved(0x1000, id),
+            Err(ProviderEventProjectionError::ReclaimPending)
+        );
+        catalog.remove_reclaimed(reclaim).unwrap();
+        assert_eq!(catalog.len(), 0);
+    }
+
+    #[test]
+    fn provider_projection_reclaim_rejects_mismatch_and_aba() {
+        let mut catalog = ProviderEventProjectionCatalog::new();
+        let first = EventObjectId(ObjectId::new(Generation(1), 1));
+        let second = EventObjectId(ObjectId::new(Generation(2), 1));
+        catalog.reserve_one().unwrap();
+        catalog.register_reserved(0x1000, first).unwrap();
+        assert_eq!(
+            catalog.begin_reclaim(0x1000, second),
+            Err(ProviderEventProjectionError::StaleProjection)
+        );
+        let old = catalog.begin_reclaim(0x1000, first).unwrap();
+        assert_eq!(
+            catalog.begin_reclaim(0x1000, first),
+            Err(ProviderEventProjectionError::ReclaimPending)
+        );
+        catalog.remove_reclaimed(old).unwrap();
+        catalog.register_reserved(0x1000, second).unwrap();
+        assert_eq!(
+            catalog.remove_reclaimed(old),
+            Err(ProviderEventProjectionError::StaleProjection)
+        );
+        assert_eq!(catalog.identity(0x1000), Some(second));
+        let new = catalog.begin_reclaim(0x1000, second).unwrap();
+        catalog.remove_reclaimed(new).unwrap();
+        catalog.register_reserved(0x1000, first).unwrap();
+        assert_eq!(
+            catalog.remove_reclaimed(old),
+            Err(ProviderEventProjectionError::StaleProjection)
+        );
+        assert_eq!(catalog.identity(0x1000), Some(first));
     }
 
     #[test]

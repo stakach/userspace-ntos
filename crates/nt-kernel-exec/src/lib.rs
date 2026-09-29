@@ -81,7 +81,8 @@ pub use event_wait::{
 pub use event_object::{
     EventLeaseId, EventLeaseKind, EventObjectError, EventObjectId, EventObjectOwner,
     EventObjectRegistry, EventObjectSnapshot, PendingEventSignal, ProviderEventProjectionCatalog,
-    ProviderEventProjectionError, RetiredEventObject,
+    ProviderEventProjectionError, ProviderEventProjectionReclaim, ProviderEventProjectionWaitLease,
+    RetiredEventObject,
     SignalQueueResult,
 };
 pub use hosted_dpc::{
