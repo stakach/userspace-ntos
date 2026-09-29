@@ -38434,6 +38434,8 @@ unsafe fn retain_hosted_relation_query_barrier(
 ) {
     *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = Some(HostedDeviceRelationQuery {
         claim,
+        relation_owner: hosted_device_relation_owner(claim)
+            .expect("claimed relation action lost its exact owner"),
         irp_id: IrpId(0),
         origin_driver_id: DriverId(0),
         completion_driver_id: DriverId(0),
@@ -40367,6 +40369,11 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
         ))?;
     let bus_object_id = query.claim.pdo_device_id;
     let claim = query.claim;
+    if !hosted_device_relation_owner_is_current(query.relation_owner) {
+        return Err(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
     let relation_owner = hosted_acpi_pci_relation_owner_endpoint().ok_or(
         HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
     )?;
@@ -40477,6 +40484,7 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
     let invalidation_completion = hosted_device_relation_invalidations_mut()
         .complete(claim)
         .expect("published relation transaction lost its exact invalidation claim");
+    remove_hosted_device_relation_owner(claim);
     let route_reconciliation_ready =
         crate::hosted_pci_topology::note_hosted_pci_relation_completion(
             relation_owner,
@@ -40513,13 +40521,20 @@ unsafe fn complete_hosted_relation_probe_without_publication(
         ));
     }
     let claim = query.claim;
-    let relation_owner = hosted_relation_owner_for_device(claim.pdo_device_id)
-        .map_err(HostedRelationPublishError::Barrier)?;
+    let relation_owner = query.relation_owner;
+    if !hosted_pnp_manager_mut().devnode_identity_is_started(claim.parent)
+        || !hosted_device_relation_owner_is_current(relation_owner)
+    {
+        return Err(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
     let invalidation_completion = hosted_device_relation_invalidations_mut()
         .complete(claim)
         .map_err(|_| {
             HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
         })?;
+    remove_hosted_device_relation_owner(claim);
     let route_reconciliation_ready =
         crate::hosted_pci_topology::note_hosted_pci_relation_completion(
             relation_owner,
@@ -41935,6 +41950,7 @@ unsafe fn retire_hosted_device_relation_barrier() -> usize {
     let invalidation_completion = hosted_device_relation_invalidations_mut()
         .complete(claim)
         .expect("failed relation query lost its exact invalidation claim");
+    remove_hosted_device_relation_owner(claim);
     if matches!(
         invalidation_completion,
         nt_pnp_manager::DeviceRelationInvalidationCompletion::Drained
@@ -41965,6 +41981,8 @@ unsafe fn start_hosted_device_relation_query() -> usize {
     let Some(claim) = hosted_device_relation_invalidations_mut().claim_front() else {
         return 0;
     };
+    let relation_owner = hosted_device_relation_owner(claim)
+        .expect("claimed relation action lost its exact owner");
     let pdo_device_id = nt_io_manager::DeviceId(claim.pdo_device_id);
     let pdo_driver_id = io_manager_mut()
         .device(pdo_device_id)
@@ -41978,6 +41996,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
     }
     if !hosted_pnp_manager_mut().devnode_identity_is_started(claim.parent)
         || io_manager_mut().device(pdo_device_id).is_none()
+        || !hosted_device_relation_owner_is_current(relation_owner)
     {
         retain_hosted_relation_query_barrier(
             claim,
@@ -42037,6 +42056,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
 
     *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = Some(HostedDeviceRelationQuery {
         claim,
+        relation_owner,
         irp_id,
         origin_driver_id,
         completion_driver_id,
@@ -44719,6 +44739,9 @@ static mut HOSTED_PNP_MANAGER: Option<nt_pnp_manager::PnpManager> = None;
 static mut HOSTED_DEVICE_RELATION_INVALIDATIONS: Option<
     nt_pnp_manager::DeviceRelationInvalidationQueue,
 > = None;
+static mut HOSTED_DEVICE_RELATION_OWNERS: Option<
+    nt_pnp_manager::RelationOwnerLedger<nt_pnp::AcpiPciProviderEndpoint>,
+> = None;
 static mut HOSTED_BUS_RELATIONS: Option<nt_pnp_manager::BusRelationTable> = None;
 static mut HOSTED_DEVICE_RELATION_QUERY: Option<HostedDeviceRelationQuery> = None;
 static mut HOSTED_DEVICE_RELATION_FAILURES: Option<Vec<HostedDeviceRelationFailure>> = None;
@@ -45194,6 +45217,7 @@ enum HostedRelationQueryOperation {
 
 struct HostedDeviceRelationQuery {
     claim: nt_pnp_manager::DeviceRelationInvalidation,
+    relation_owner: nt_pnp::AcpiPciProviderEndpoint,
     irp_id: IrpId,
     origin_driver_id: DriverId,
     completion_driver_id: DriverId,
@@ -45924,6 +45948,44 @@ unsafe fn hosted_device_relation_invalidations_mut(
     slot.as_mut().unwrap()
 }
 
+unsafe fn hosted_device_relation_owners_mut(
+) -> &'static mut nt_pnp_manager::RelationOwnerLedger<nt_pnp::AcpiPciProviderEndpoint> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_OWNERS);
+    if slot.is_none() {
+        *slot = Some(nt_pnp_manager::RelationOwnerLedger::default());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_device_relation_owner(
+    invalidation: nt_pnp_manager::DeviceRelationInvalidation,
+) -> Option<nt_pnp::AcpiPciProviderEndpoint> {
+    hosted_device_relation_owners_mut().owner(invalidation)
+}
+
+unsafe fn remove_hosted_device_relation_owner(
+    invalidation: nt_pnp_manager::DeviceRelationInvalidation,
+) {
+    hosted_device_relation_owners_mut()
+        .remove(invalidation)
+        .expect("terminal relation action lost its exact owner");
+}
+
+unsafe fn hosted_device_relation_owner_is_current(
+    endpoint: nt_pnp::AcpiPciProviderEndpoint,
+) -> bool {
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId(endpoint.hosted_domain_id),
+        cookie: endpoint.hosted_domain_cookie,
+    };
+    io_manager_mut().hosted_domain_identity(domain.domain_id) == Some(domain)
+        && io_manager_mut().hosted_device_by_identity(domain, endpoint.pdo_object)
+            == Some(nt_io_manager::DeviceId(endpoint.device_id))
+        && io_manager_mut()
+            .device(nt_io_manager::DeviceId(endpoint.device_id))
+            .is_some_and(|device| !device.delete_pending)
+}
+
 unsafe fn hosted_device_relation_failures_mut() -> &'static mut Vec<HostedDeviceRelationFailure> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_FAILURES);
     if slot.is_none() {
@@ -45978,9 +46040,32 @@ unsafe fn enqueue_hosted_device_relations(
         .devnode_identity_for_pdo(relation_owner.device_id)
         .filter(|identity| hosted_pnp_manager_mut().devnode_identity_is_started(*identity))
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if !hosted_device_relation_owner_is_current(relation_owner)
+        || hosted_device_relation_owners_mut().conflicting_projection(
+            parent,
+            relation_type,
+            relation_owner,
+        )
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    hosted_device_relation_owners_mut()
+        .reserve()
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let enqueued = hosted_device_relation_invalidations_mut()
         .enqueue(parent, relation_type)
         .map_err(hosted_relation_invalidation_status)?;
+    match enqueued.disposition {
+        nt_pnp_manager::DeviceRelationInvalidationDisposition::Coalesced => {
+            if hosted_device_relation_owner(enqueued.invalidation) != Some(relation_owner) {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+        }
+        nt_pnp_manager::DeviceRelationInvalidationDisposition::Queued
+        | nt_pnp_manager::DeviceRelationInvalidationDisposition::Requeued => {
+            hosted_device_relation_owners_mut().record(enqueued.invalidation, relation_owner);
+        }
+    }
     if relation_type == nt_pnp_abi::BUS_RELATIONS
         && enqueued.disposition == nt_pnp_manager::DeviceRelationInvalidationDisposition::Queued
     {
@@ -45992,6 +46077,7 @@ unsafe fn enqueue_hosted_device_relations(
                 hosted_device_relation_invalidations_mut()
                     .discard_pending(enqueued.invalidation)
                     .expect("unclaimed relation request could not be rolled back");
+                remove_hosted_device_relation_owner(enqueued.invalidation);
                 return Err(status);
             }
         };
