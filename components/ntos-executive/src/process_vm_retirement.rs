@@ -115,7 +115,7 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
                     return false;
                 }
                 sections
-                    .unmap_view_exact(pi, view.lifetime, view.base)
+                    .unmap_view_identity(view)
                     .expect("checked mapping teardown retains its exact section view");
             }
             if sections.first_view_for_process(pi).is_some() {

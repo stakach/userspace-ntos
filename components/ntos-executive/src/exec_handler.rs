@@ -29824,7 +29824,14 @@ impl ExecNtHandler {
             target_pi as u64,
             nt_address_space::VmCommittedRange::mapped(plan.base, plan.size, view_protection),
         ) {
-            let _ = generic_sections.unmap_view_exact(target_pi, target_lifetime, plan.base);
+            if let Some((_, view)) = generic_sections.view_for_page(target_pi, plan.base) {
+                if view.pi == target_pi
+                    && view.base == plan.base
+                    && view.lifetime == target_lifetime
+                {
+                    let _ = generic_sections.unmap_view_identity(view);
+                }
+            }
             *vm_map = *before;
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
@@ -30244,7 +30251,7 @@ impl ExecNtHandler {
         }
         *vm_map = *after;
         let _ = process_committed_mapping_unregister_range(pi as u64, view.base, view.size);
-        let _ = generic_sections.unmap_view_exact(pi, view.lifetime, view.base);
+        let _ = generic_sections.unmap_view_identity(view);
         if let Some(pid) = target_pid {
             self.release_process_commit(pid, mapped_commit);
         }
@@ -36475,7 +36482,7 @@ impl ExecNtHandler {
                             view.base,
                             view.size,
                         );
-                        let _ = generic_sections.unmap_view_exact(target_pi, view.lifetime, view.base);
+                        let _ = generic_sections.unmap_view_identity(view);
                         self.release_process_commit(target_pid, mapped_commit);
                         return 0;
                     }
