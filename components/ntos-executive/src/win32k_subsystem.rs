@@ -666,25 +666,6 @@ unsafe fn with_provider_allocations<R>(
     Some(f(provider_allocations_unlocked(&mut guard)?))
 }
 
-unsafe fn validate_provider_allocation_retirement(
-    arena: nt_provider_wait::ProviderArenaIdentity,
-    base: u64,
-    required: u64,
-) -> Option<nt_provider_wait::ProviderAllocationSnapshot> {
-    with_provider_allocations(|allocations| {
-        let allocation = allocations.exact(arena, base).ok()?;
-        if allocation.capacity < required
-            || allocations.snapshot_active(allocation.identity).is_err()
-            || allocations
-                .validate_retirement(allocation.identity)
-                .is_err()
-        {
-            return None;
-        }
-        Some(allocation)
-    })?
-}
-
 unsafe fn begin_provider_allocation_retirement_locked(
     metadata: &mut ProviderMetadataGuard,
     arena: nt_provider_wait::ProviderArenaIdentity,
@@ -709,6 +690,14 @@ unsafe fn provider_allocation_event_backing(
     allocation: nt_provider_wait::ProviderAllocationSnapshot,
 ) -> nt_provider_wait::ProviderEventBacking {
     nt_provider_wait::ProviderEventBacking::from_allocation(allocation)
+}
+
+unsafe fn provider_allocation_has_local_wait_objects(
+    allocation: nt_provider_wait::ProviderAllocationSnapshot,
+) -> bool {
+    let backing = provider_allocation_event_backing(allocation);
+    provider_local_events().is_none_or(|events| events.backing_event_count(backing) != 0)
+        || provider_local_timers().is_none_or(|timers| timers.backing_timer_count(backing) != 0)
 }
 
 unsafe fn validate_provider_allocation_event_retirement(
@@ -7742,6 +7731,15 @@ unsafe fn heap_free_in(arena_base: u64, arena_bytes: u64, p: u64) -> bool {
     let Some(allocation) = allocation else {
         return false;
     };
+    heap_free_in_reserved(arena_base, arena_bytes, p, allocation)
+}
+
+unsafe fn heap_free_in_reserved(
+    arena_base: u64,
+    arena_bytes: u64,
+    p: u64,
+    allocation: nt_provider_wait::ProviderAllocationSnapshot,
+) -> bool {
     if !retire_provider_allocation_events(allocation)
         || !retire_provider_allocation_timers(allocation)
     {
@@ -7768,6 +7766,13 @@ unsafe fn heap_free_in(arena_base: u64, arena_bytes: u64, p: u64) -> bool {
     true
 }
 
+unsafe fn release_provider_allocation_pin_or_park(pin: nt_provider_wait::ProviderAllocationPin) {
+    if with_provider_allocations(|catalog| catalog.release_pin(pin).is_ok()) != Some(true) {
+        print_str(b"[win32k-host] fatal provider allocation pin release failure\n");
+        park();
+    }
+}
+
 unsafe fn heap_realloc_in(
     arena_base: u64,
     arena_bytes: u64,
@@ -7792,30 +7797,43 @@ unsafe fn heap_realloc_in(
         }
         return 0;
     }
-    let Some(old_cap) = heap_block_capacity_in(arena_base, arena_bytes, p) else {
+    let Some(want) = size.checked_add(15).map(|size| size & !15) else {
         return 0;
     };
-    let want = align16(size);
+    let (allocation, pin) = {
+        let mut metadata = ProviderMetadataGuard::acquire();
+        let Some(arena) = provider_heap_arena_identity_unlocked(&metadata, arena_base) else {
+            return 0;
+        };
+        let Some(old_cap) = heap_block_capacity_in(arena_base, arena_bytes, p) else {
+            return 0;
+        };
+        let Some(catalog) = provider_allocations_unlocked(&mut metadata) else {
+            return 0;
+        };
+        let Ok(allocation) = catalog.active_exact_capacity(arena, p, old_cap) else {
+            return 0;
+        };
+        let Ok((pinned, pin)) = catalog.pin_containing(p, old_cap) else {
+            return 0;
+        };
+        if pinned != allocation
+            || (want > old_cap && provider_allocation_has_local_wait_objects(allocation))
+        {
+            if catalog.release_pin(pin).is_err() {
+                park();
+            }
+            return 0;
+        }
+        (allocation, pin)
+    };
+    let old_cap = allocation.capacity;
     if want <= old_cap {
+        release_provider_allocation_pin_or_park(pin);
         return p;
     }
     if flags & HEAP_REALLOC_IN_PLACE_ONLY != 0 {
-        return 0;
-    }
-    let Some(arena) = provider_heap_arena_identity(arena_base) else {
-        return 0;
-    };
-    let Some(allocation) = validate_provider_allocation_retirement(arena, p, old_cap)
-    else {
-        return 0;
-    };
-    let has_events = {
-        let _metadata = ProviderMetadataGuard::acquire();
-        provider_local_events().is_none_or(|events| {
-            events.backing_event_count(provider_allocation_event_backing(allocation)) != 0
-        })
-    };
-    if has_events {
+        release_provider_allocation_pin_or_park(pin);
         return 0;
     }
     let newp = heap_alloc_in(
@@ -7826,6 +7844,7 @@ unsafe fn heap_realloc_in(
         label,
     );
     if newp == 0 {
+        release_provider_allocation_pin_or_park(pin);
         return 0;
     }
     core::ptr::copy_nonoverlapping(
@@ -7833,12 +7852,30 @@ unsafe fn heap_realloc_in(
         newp as *mut u8,
         core::cmp::min(old_cap, size) as usize,
     );
-    if heap_free_in(arena_base, arena_bytes, p) {
-        newp
-    } else {
-        let _ = heap_free_in(arena_base, arena_bytes, newp);
-        0
+    // The pin prevents free/reuse during copy; exchange it for a retirement reservation
+    // before dropping the metadata lock, so no other lane can claim the old generation.
+    let reserved = {
+        let mut metadata = ProviderMetadataGuard::acquire();
+        heap_block_capacity_in(arena_base, arena_bytes, p) == Some(old_cap)
+            && !provider_allocation_has_local_wait_objects(allocation)
+            && provider_allocations_unlocked(&mut metadata).is_some_and(|catalog| {
+                catalog.snapshot_active(allocation.identity) == Ok(allocation)
+                    && catalog.begin_retirement_from_pin(pin) == Ok(allocation)
+            })
+    };
+    if !reserved {
+        release_provider_allocation_pin_or_park(pin);
+        if !heap_free_in(arena_base, arena_bytes, newp) {
+            print_str(b"[win32k-host] fatal heap realloc rollback failure\n");
+            park();
+        }
+        return 0;
     }
+    if !heap_free_in_reserved(arena_base, arena_bytes, p, allocation) {
+        print_str(b"[win32k-host] fatal heap realloc retirement failure\n");
+        park();
+    }
+    newp
 }
 
 unsafe fn heap_alloc(size: u64, zero: bool) -> u64 {
@@ -7910,7 +7947,14 @@ unsafe fn shared_hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
 /// module; callers that only consume already-published scalar mapping facts use
 /// [`shared_hosted_heap_bounds`] instead.
 unsafe fn hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
-    let _metadata = ProviderMetadataGuard::acquire();
+    let metadata = ProviderMetadataGuard::acquire();
+    hosted_heap_bounds_unlocked(&metadata, heap)
+}
+
+unsafe fn hosted_heap_bounds_unlocked(
+    _metadata: &ProviderMetadataGuard,
+    heap: u64,
+) -> Option<(u64, u64)> {
     let bounds = shared_hosted_heap_bounds(heap)?;
     let arenas = (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS)).as_ref()?;
     arenas
@@ -8445,10 +8489,23 @@ extern "win64" fn s_rtl_free_heap(heap: u64, _flags: u64, base: u64) -> u64 {
 /// `SIZE_T RtlSizeHeap(HeapHandle, Flags, Base)`.
 extern "win64" fn s_rtl_size_heap(heap: u64, _flags: u64, base: u64) -> u64 {
     unsafe {
-        let Some((arena_base, arena_bytes)) = hosted_heap_bounds(heap) else {
+        let mut metadata = ProviderMetadataGuard::acquire();
+        let Some((arena_base, arena_bytes)) = hosted_heap_bounds_unlocked(&metadata, heap) else {
             return u64::MAX;
         };
-        heap_block_capacity_in(arena_base, arena_bytes, base).unwrap_or(u64::MAX)
+        let Some(arena) = provider_heap_arena_identity_unlocked(&metadata, arena_base) else {
+            return u64::MAX;
+        };
+        let Some(capacity) = heap_block_capacity_in(arena_base, arena_bytes, base) else {
+            return u64::MAX;
+        };
+        if provider_allocations_unlocked(&mut metadata)
+            .is_some_and(|catalog| catalog.active_exact_capacity(arena, base, capacity).is_ok())
+        {
+            capacity
+        } else {
+            u64::MAX
+        }
     }
 }
 /// `PVOID RtlReAllocateHeap(HeapHandle, Flags, Base, Size)`.
