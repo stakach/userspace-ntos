@@ -36,6 +36,7 @@ mod provider_registry_caller;
 mod provider_directory_broker;
 mod provider_section_broker;
 mod provider_section_map_broker;
+mod provider_section_unmap_broker;
 mod provider_win32k_subject;
 mod cm_snapshot_ownership;
 mod io_server;

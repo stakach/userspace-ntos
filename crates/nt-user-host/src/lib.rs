@@ -40,6 +40,7 @@ pub mod native_caller_subject;
 pub mod win32k_subject_lease;
 pub mod routed_section_owner;
 pub mod section_view_retirement;
+pub mod provider_section_unmap;
 pub mod provider_logical_caller;
 pub mod provider_irp_requestor;
 pub mod provider_subject;

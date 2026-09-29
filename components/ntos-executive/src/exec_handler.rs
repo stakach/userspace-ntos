@@ -30354,6 +30354,7 @@ impl ExecNtHandler {
         target_pid: nt_process::ProcessId,
         target_pi: usize,
         base: u64,
+        expected: Option<nt_memory_manager::GenericSectionView>,
     ) -> Result<bool, u32> {
         let Some(ctx) = self.loop_ctx else {
             return Ok(false);
@@ -30362,6 +30363,9 @@ impl ExecNtHandler {
         let Some((_, view)) = generic_sections.view_for_page(target_pi, base) else {
             return Ok(false);
         };
+        if expected.is_some_and(|expected| expected != view) {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
         let nt_memory_manager::MemoryLifetime::Process(process) = view.lifetime else {
             return Err(nt_process::STATUS_INVALID_HANDLE);
         };
@@ -30438,6 +30442,46 @@ impl ExecNtHandler {
         )?;
         self.release_process_commit(target_pid, mapped_commit);
         Ok(true)
+    }
+
+    pub(crate) unsafe fn capture_provider_section_unmap_view(
+        &mut self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        process_handle: u64,
+        base: u64,
+    ) -> Result<(nt_process::ProcessId, usize, nt_memory_manager::GenericSectionView), u32> {
+        const PROCESS_VM_OPERATION: u32 = 0x0008;
+        const STATUS_NOT_MAPPED_VIEW: u32 = 0xC000_0019;
+        if process_handle != u64::MAX {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        if base > 0x0000_07ff_fffe_ffff {
+            return Err(STATUS_NOT_MAPPED_VIEW);
+        }
+        let mut process = self.pm.reference_native_ps_handle(
+            caller,
+            process_handle,
+            Some(nt_process::native_handle::PsHandleType::Process),
+            PROCESS_VM_OPERATION,
+        )?;
+        let nt_process::HandleObject::Process(target_pid) = process.object() else {
+            unreachable!("typed Process reference");
+        };
+        let target_pi = self.pi_for_pid(target_pid).ok_or(nt_process::STATUS_INVALID_HANDLE);
+        process.release(&mut self.pm)?;
+        let target_pi = target_pi?;
+        let sections = self.loop_ctx.ok_or(0xC000_00A3u32)?.generic_sections;
+        let view = (&*sections)
+            .view_for_page(target_pi, base)
+            .map(|(_, view)| view)
+            .ok_or(STATUS_NOT_MAPPED_VIEW)?;
+        let nt_memory_manager::MemoryLifetime::Process(identity) = view.lifetime else {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        };
+        if self.capture_process_identity(target_pi) != Some(identity) {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        Ok((target_pid, target_pi, view))
     }
 
     pub(crate) unsafe fn rollback_generic_section_view(
@@ -36642,7 +36686,7 @@ impl ExecNtHandler {
                         Ok(target) => target,
                         Err(status) => return status,
                     };
-                match self.unmap_generic_section_view_for_target(target_pid, target_pi, base) {
+                match self.unmap_generic_section_view_for_target(target_pid, target_pi, base, None) {
                     Ok(true) => return 0,
                     Ok(false) => {}
                     Err(status) => return status,
