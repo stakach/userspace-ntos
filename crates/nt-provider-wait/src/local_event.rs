@@ -466,6 +466,9 @@ impl ProviderLocalEventCatalog {
         let mut count = 0usize;
         for record in &self.records {
             if record.live && record.storage.backing == backing {
+                if record.delete_pending {
+                    return Err(ProviderLocalEventError::DeletePending);
+                }
                 if record.has_leases() {
                     return Err(ProviderLocalEventError::ActiveLeases);
                 }
@@ -543,6 +546,9 @@ impl ProviderLocalEventCatalog {
     ) -> Result<ProviderLocalEventRetirement, ProviderLocalEventError> {
         let slot = self.slot(id)?;
         let record = self.records[slot];
+        if record.delete_pending {
+            return Err(ProviderLocalEventError::DeletePending);
+        }
         if record.has_leases() {
             return Err(ProviderLocalEventError::ActiveLeases);
         }
@@ -761,6 +767,14 @@ mod tests {
         assert_eq!(retirements.len(), 2);
         assert!(catalog.snapshot(first).unwrap().delete_pending);
         assert!(catalog.snapshot(second).unwrap().delete_pending);
+        assert_eq!(
+            catalog.begin_retire_backing(first_storage.backing),
+            Err(ProviderLocalEventError::DeletePending)
+        );
+        assert_eq!(
+            catalog.begin_retire_event(first),
+            Err(ProviderLocalEventError::DeletePending)
+        );
     }
 
     #[test]
