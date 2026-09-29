@@ -301,13 +301,45 @@ pub const fn message_dispatch_output_length_matches_result(
     output_length == expected
 }
 
-/// Paint output belongs to a completed call that resolved its HWND. The returned HDC or BOOL is
-/// not a write witness: BeginPaint can copy with a NULL HDC, and GetUpdateRect can copy FALSE.
+/// Match a completed write probe to the base of one leased paint output slot.
+pub const fn paint_probe_output_bytes(
+    address: u64,
+    length: u64,
+    alignment: u64,
+    stage_base: u64,
+    slot_bytes: u64,
+    slot_count: u64,
+) -> Option<u32> {
+    let Some(total_bytes) = slot_bytes.checked_mul(slot_count) else {
+        return None;
+    };
+    let Some(stage_end) = stage_base.checked_add(total_bytes) else {
+        return None;
+    };
+    if alignment != 1
+        || slot_bytes == 0
+        || address < stage_base
+        || address >= stage_end
+        || (address - stage_base) % slot_bytes != 0
+    {
+        return None;
+    }
+    match length {
+        16 if length <= slot_bytes => Some(GET_UPDATE_RECT_OUTPUT_BYTES),
+        72 if length <= slot_bytes => Some(BEGIN_PAINT_OUTPUT_BYTES),
+        _ => None,
+    }
+}
+
+/// Paint output belongs to a completed call whose exact output range was probed. The returned
+/// HDC or BOOL is not a copy-path witness: BeginPaint can copy with a NULL HDC, and GetUpdateRect
+/// can copy FALSE. A valid window without a matching probe is an invalid publication.
 pub const fn paint_dispatch_output_length(
     ssn: u64,
     _raw_result: u64,
     completed: bool,
     window_valid: bool,
+    probed_bytes: u64,
 ) -> Option<u32> {
     let bytes = match ssn {
         NTUSER_BEGIN_PAINT_SSN => BEGIN_PAINT_OUTPUT_BYTES,
@@ -317,7 +349,17 @@ pub const fn paint_dispatch_output_length(
     if !completed {
         return None;
     }
-    Some(if window_valid { bytes } else { 0 })
+    if window_valid {
+        if probed_bytes == bytes as u64 {
+            Some(bytes)
+        } else {
+            None
+        }
+    } else if probed_bytes == 0 {
+        Some(0)
+    } else {
+        None
+    }
 }
 
 /// `w32ksvc64.h`: `SVC_(UserPostMessage, 4)` — the REAL keyboard/message post path. Used both for
@@ -3993,23 +4035,75 @@ mod message_result_tests {
     }
 
     #[test]
-    fn paint_publication_tracks_completion_and_window_not_return_value() {
+    fn paint_publication_requires_exact_completed_probe_not_return_value() {
         assert_eq!(
-            paint_dispatch_output_length(NTUSER_GET_UPDATE_RECT_SSN, 1, true, false),
+            paint_dispatch_output_length(NTUSER_GET_UPDATE_RECT_SSN, 1, true, false, 0),
             Some(0),
         );
         assert_eq!(
-            paint_dispatch_output_length(NTUSER_GET_UPDATE_RECT_SSN, 0, true, true),
+            paint_dispatch_output_length(
+                NTUSER_GET_UPDATE_RECT_SSN,
+                0,
+                true,
+                true,
+                u64::from(GET_UPDATE_RECT_OUTPUT_BYTES),
+            ),
             Some(GET_UPDATE_RECT_OUTPUT_BYTES),
         );
         assert_eq!(
-            paint_dispatch_output_length(NTUSER_BEGIN_PAINT_SSN, 0, true, true),
+            paint_dispatch_output_length(
+                NTUSER_BEGIN_PAINT_SSN,
+                0,
+                true,
+                true,
+                u64::from(BEGIN_PAINT_OUTPUT_BYTES),
+            ),
             Some(BEGIN_PAINT_OUTPUT_BYTES),
         );
         assert_eq!(
-            paint_dispatch_output_length(NTUSER_BEGIN_PAINT_SSN, 1, false, true),
+            paint_dispatch_output_length(NTUSER_BEGIN_PAINT_SSN, 1, false, true, 72),
             None,
         );
-        assert_eq!(paint_dispatch_output_length(0x1035, 1, true, true), None);
+        assert_eq!(paint_dispatch_output_length(0x1035, 1, true, true, 72), None);
+        assert_eq!(
+            paint_dispatch_output_length(NTUSER_BEGIN_PAINT_SSN, 1, true, true, 0),
+            None,
+        );
+        assert_eq!(
+            paint_dispatch_output_length(NTUSER_GET_UPDATE_RECT_SSN, 1, true, true, 72),
+            None,
+        );
+        assert_eq!(
+            paint_dispatch_output_length(NTUSER_BEGIN_PAINT_SSN, 1, true, false, 72),
+            None,
+        );
+    }
+
+    #[test]
+    fn paint_probe_accepts_only_exact_slot_base_range_and_alignment() {
+        const BASE: u64 = 0x1000;
+        const SLOT: u64 = 128;
+        const COUNT: u64 = 32;
+        assert_eq!(
+            paint_probe_output_bytes(BASE, 72, 1, BASE, SLOT, COUNT),
+            Some(BEGIN_PAINT_OUTPUT_BYTES),
+        );
+        assert_eq!(
+            paint_probe_output_bytes(BASE + SLOT, 16, 1, BASE, SLOT, COUNT),
+            Some(GET_UPDATE_RECT_OUTPUT_BYTES),
+        );
+        for (address, length, alignment) in [
+            (BASE - SLOT, 72, 1),
+            (BASE + 1, 72, 1),
+            (BASE, 71, 1),
+            (BASE, 72, 8),
+            (BASE + SLOT * COUNT, 16, 1),
+        ] {
+            assert_eq!(
+                paint_probe_output_bytes(address, length, alignment, BASE, SLOT, COUNT),
+                None,
+            );
+        }
+        assert_eq!(paint_probe_output_bytes(BASE, 72, 1, u64::MAX, SLOT, COUNT), None);
     }
 }

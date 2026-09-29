@@ -233,7 +233,10 @@ pub const WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET: u64 = 56;
 pub const WIN32K_PAINT_STAGE_BASE: u64 = WIN32K_MESSAGE_STAGE_BASE + 0x1000;
 pub const WIN32K_PAINT_STAGE_SLOT_BYTES: u64 = 128;
 pub const WIN32K_PAINT_STAGE_SLOTS: u64 = 0x1000 / WIN32K_PAINT_STAGE_SLOT_BYTES;
+pub const WIN32K_PAINT_STAGE_PROBE_BYTES_OFFSET: u64 = 112;
 pub const WIN32K_PAINT_STAGE_OUTPUT_LENGTH_OFFSET: u64 = 120;
+const _: () = assert!(WIN32K_PAINT_STAGE_PROBE_BYTES_OFFSET >= nt_user_callback::BEGIN_PAINT_OUTPUT_BYTES as u64);
+const _: () = assert!(WIN32K_PAINT_STAGE_PROBE_BYTES_OFFSET + 8 == WIN32K_PAINT_STAGE_OUTPUT_LENGTH_OFFSET);
 const _: () = assert!(
     WIN32K_PROVIDER_WAIT_VADDR + WIN32K_PROVIDER_WAIT_FRAMES * 0x1000 <= WIN32K_ARG_VADDR
 );
@@ -2037,6 +2040,23 @@ extern "win64" fn s_probe_for_write(address: u64, length: u64, alignment: u64) {
         current = (current & !0xfff) + 0x1000;
         if current == end {
             break;
+        }
+    }
+    if let Some(bytes) = nt_user_callback::paint_probe_output_bytes(
+        address,
+        length,
+        alignment,
+        WIN32K_PAINT_STAGE_BASE,
+        WIN32K_PAINT_STAGE_SLOT_BYTES,
+        WIN32K_PAINT_STAGE_SLOTS,
+    ) {
+        // The marker is slot-local, so a nested dispatch cannot attribute its probe to a parked
+        // outer paint call. The source copy follows this successful probe in _MmCopyToCaller.
+        unsafe {
+            write_volatile(
+                (address + WIN32K_PAINT_STAGE_PROBE_BYTES_OFFSET) as *mut u64,
+                u64::from(bytes),
+            );
         }
     }
 }
@@ -15956,6 +15976,10 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         && (a1 - WIN32K_PAINT_STAGE_BASE) % WIN32K_PAINT_STAGE_SLOT_BYTES == 0;
     if paint_stage_valid {
         write_volatile(
+            (a1 + WIN32K_PAINT_STAGE_PROBE_BYTES_OFFSET) as *mut u64,
+            0,
+        );
+        write_volatile(
             (a1 + WIN32K_PAINT_STAGE_OUTPUT_LENGTH_OFFSET) as *mut u64,
             u64::MAX,
         );
@@ -16131,15 +16155,19 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         );
     }
     if paint_stage_valid {
+        let probed_bytes = read_volatile(
+            (a1 + WIN32K_PAINT_STAGE_PROBE_BYTES_OFFSET) as *const u64,
+        );
         let output_length = nt_user_callback::paint_dispatch_output_length(
             ssn,
             result,
             true,
             paint_window_valid,
-        ).unwrap_or(0);
+            probed_bytes,
+        ).map(u64::from).unwrap_or(u64::MAX);
         write_volatile(
             (a1 + WIN32K_PAINT_STAGE_OUTPUT_LENGTH_OFFSET) as *mut u64,
-            u64::from(output_length),
+            output_length,
         );
     }
     (result as u32 as i32, result)
