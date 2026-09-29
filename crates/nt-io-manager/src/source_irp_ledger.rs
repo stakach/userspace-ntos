@@ -140,9 +140,7 @@ impl SourceIrpLedger {
         ticket: SourceIrpTicket,
     ) -> bool {
         self.rows.iter().any(|row| {
-            row.allocation.owner == owner
-                && row.allocation == allocation
-                && row.ticket == ticket
+            row.allocation.owner == owner && row.allocation == allocation && row.ticket == ticket
         })
     }
 
@@ -252,25 +250,23 @@ impl SourceIrpLedger {
         ))
     }
 
+    /// Remove the exact allocation after its owner has completed native teardown.
+    /// The caller must serialize `retirement_ready`, teardown, and this operation.
     pub fn retire(
         &mut self,
-        owner: SourceIrpOwner,
-        domain: HostedDomainIdentity,
-        component_address: u64,
-    ) -> Result<SourceIrpTicket, SourceIrpLedgerError> {
+        ticket: SourceIrpTicket,
+        allocation: SourceIrpAllocation,
+    ) -> Result<(), SourceIrpLedgerError> {
         let index = self
             .rows
             .iter()
-            .position(|row| {
-                row.allocation.owner == owner
-                    && row.allocation.domain == domain
-                    && row.allocation.component_address == component_address
-            })
-            .ok_or(SourceIrpLedgerError::NotFound)?;
+            .position(|row| row.ticket == ticket && row.allocation == allocation)
+            .ok_or(SourceIrpLedgerError::WrongIdentity)?;
         if self.rows[index].pins != 0 {
             return Err(SourceIrpLedgerError::Pinned);
         }
-        Ok(self.rows.swap_remove(index).ticket)
+        self.rows.swap_remove(index);
+        Ok(())
     }
 
     pub fn live_for_owner(&self, owner: SourceIrpOwner, domain: HostedDomainIdentity) -> usize {
@@ -303,14 +299,16 @@ mod tests {
         let mut ledger = SourceIrpLedger::new();
         let first = allocation(0x2000, 11);
         let first_ticket = ledger.register(first).unwrap();
-        assert_eq!(
-            ledger.retire(first.owner, first.domain, first.component_address),
-            Ok(first_ticket)
-        );
+        assert_eq!(ledger.retire(first_ticket, first), Ok(()));
         let second_ticket = ledger.register(first).unwrap();
         assert_ne!(first_ticket, second_ticket);
+        assert_eq!(
+            ledger.retire(first_ticket, first),
+            Err(SourceIrpLedgerError::WrongIdentity)
+        );
         assert!(!ledger.matches(first.owner, first, first_ticket));
         assert!(ledger.matches(first.owner, first, second_ticket));
+        assert_eq!(ledger.live_for_owner(first.owner, first.domain), 1);
         assert_eq!(
             ledger.unpin(first_ticket),
             Err(SourceIrpLedgerError::WrongIdentity)
@@ -331,14 +329,11 @@ mod tests {
             Ok((ticket, owner))
         );
         assert_eq!(
-            ledger.retire(owner.owner, owner.domain, owner.component_address),
+            ledger.retire(ticket, owner),
             Err(SourceIrpLedgerError::Pinned)
         );
         ledger.unpin(ticket).unwrap();
-        assert_eq!(
-            ledger.retire(owner.owner, owner.domain, owner.component_address),
-            Ok(ticket)
-        );
+        assert_eq!(ledger.retire(ticket, owner), Ok(()));
     }
 
     #[test]
@@ -352,13 +347,17 @@ mod tests {
             Err(SourceIrpLedgerError::NotFound)
         );
         assert_eq!(
-            ledger.pin(SourceIrpOwner::HostedDriver(4), first.domain, first.component_address),
+            ledger.pin(
+                SourceIrpOwner::HostedDriver(4),
+                first.domain,
+                first.component_address
+            ),
             Err(SourceIrpLedgerError::NotFound)
         );
         assert!(!ledger.matches(first.owner, stale_domain, ticket));
         assert_eq!(
-            ledger.retire(first.owner, stale_domain.domain, first.component_address),
-            Err(SourceIrpLedgerError::NotFound)
+            ledger.retire(ticket, stale_domain),
+            Err(SourceIrpLedgerError::WrongIdentity)
         );
     }
 
@@ -372,6 +371,10 @@ mod tests {
         };
         let driver_ticket = ledger.register(driver).unwrap();
         let win32k_ticket = ledger.register(win32k).unwrap();
+        assert_eq!(
+            ledger.retire(driver_ticket, win32k),
+            Err(SourceIrpLedgerError::WrongIdentity)
+        );
         assert_ne!(driver_ticket, win32k_ticket);
         assert_eq!(ledger.live_for_owner(driver.owner, driver.domain), 1);
         assert_eq!(ledger.live_for_owner(win32k.owner, win32k.domain), 1);
@@ -386,16 +389,10 @@ mod tests {
         assert!(!ledger.matches(driver.owner, win32k, win32k_ticket));
         assert!(!ledger.matches(win32k.owner, driver, driver_ticket));
         ledger.unpin(driver_ticket).unwrap();
-        assert_eq!(
-            ledger.retire(driver.owner, driver.domain, driver.component_address),
-            Ok(driver_ticket),
-        );
+        assert_eq!(ledger.retire(driver_ticket, driver), Ok(()),);
         assert!(ledger.matches(win32k.owner, win32k, win32k_ticket));
         ledger.unpin(win32k_ticket).unwrap();
-        assert_eq!(
-            ledger.retire(win32k.owner, win32k.domain, win32k.component_address),
-            Ok(win32k_ticket),
-        );
+        assert_eq!(ledger.retire(win32k_ticket, win32k), Ok(()),);
         let reused = ledger.register(win32k).unwrap();
         assert_ne!(reused, win32k_ticket);
         assert!(!ledger.matches(win32k.owner, win32k, win32k_ticket));
@@ -425,9 +422,7 @@ mod tests {
             Err(SourceIrpLedgerError::Pinned)
         );
         ledger.unpin(ticket).unwrap();
-        ledger
-            .retire(owner.owner, owner.domain, owner.component_address)
-            .unwrap();
+        ledger.retire(ticket, owner).unwrap();
         assert_eq!(
             ledger.retirement_ready(ticket, owner),
             Err(SourceIrpLedgerError::WrongIdentity)
@@ -473,9 +468,7 @@ mod tests {
         let mut ledger = SourceIrpLedger::new();
         let owner = allocation(0x2000, 11);
         let stale = ledger.register(owner).unwrap();
-        ledger
-            .retire(owner.owner, owner.domain, owner.component_address)
-            .unwrap();
+        ledger.retire(stale, owner).unwrap();
         let live = ledger.register(owner).unwrap();
         ledger
             .pin(owner.owner, owner.domain, owner.component_address)
