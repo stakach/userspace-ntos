@@ -40482,7 +40482,7 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             .expect("serialized ACPI PCI catalog preparation became stale before relation commit");
     }
     let invalidation_completion = hosted_device_relation_invalidations_mut()
-        .complete(claim)
+        .complete_terminal(claim, nt_status::NtStatus::SUCCESS)
         .expect("published relation transaction lost its exact invalidation claim");
     remove_hosted_device_relation_owner(claim);
     let route_reconciliation_ready =
@@ -40530,7 +40530,7 @@ unsafe fn complete_hosted_relation_probe_without_publication(
         ));
     }
     let invalidation_completion = hosted_device_relation_invalidations_mut()
-        .complete(claim)
+        .complete_terminal(claim, nt_status::NtStatus::SUCCESS)
         .map_err(|_| {
             HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
         })?;
@@ -41948,7 +41948,7 @@ unsafe fn retire_hosted_device_relation_barrier() -> usize {
         });
     }
     let invalidation_completion = hosted_device_relation_invalidations_mut()
-        .complete(claim)
+        .complete_terminal(claim, status)
         .expect("failed relation query lost its exact invalidation claim");
     remove_hosted_device_relation_owner(claim);
     if matches!(
