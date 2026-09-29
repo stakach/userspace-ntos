@@ -7209,19 +7209,28 @@ unsafe fn release_hosted_registry_identity(identity_id: HostedRegistryIdentityId
 /// `NTSTATUS IoOpenDeviceRegistryKey(PDEVICE_OBJECT, ULONG, ACCESS_MASK, PHANDLE)`.
 extern "win64" fn s_io_open_device_registry_key(
     pdo: u64,
-    _dev_inst_key_type: u32,
+    dev_inst_key_type: u32,
     desired_access: u32,
     handle_out: u64,
 ) -> i32 {
     if handle_out == 0 {
         return STATUS_INVALID_PARAMETER;
     }
+    let key_type = match nt_io_manager::device_registry::DeviceRegistryKeyType::from_flags(
+        dev_inst_key_type,
+    ) {
+        Ok(key_type) => key_type,
+        Err(status) => return status as i32,
+    };
+    if key_type != nt_io_manager::device_registry::DeviceRegistryKeyType::Driver {
+        return STATUS_NOT_SUPPORTED;
+    }
     unsafe {
         if let Err(status) = stage_registry_open_metadata(desired_access, nt_process::native_handle::OBJ_KERNEL_HANDLE | 0x40, 0) {
             return status;
         }
         let (status, handle, _) =
-            hosted_registry_broker_call(HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY, pdo, 0, 0);
+            hosted_registry_broker_call(HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY, pdo, dev_inst_key_type as u64, 0);
         write_unaligned(
             handle_out as *mut u64,
             if status == STATUS_SUCCESS { handle } else { 0 },
@@ -54742,6 +54751,17 @@ fn service_hosted_driver_registry_sync(
     let arg = inst.exec_arg_va;
     if arg == 0 {
         return (STATUS_INVALID_PARAMETER, 0, 0);
+    }
+    if op == HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY {
+        let flags = match u32::try_from(a2) {
+            Ok(flags) => flags,
+            Err(_) => return (STATUS_INVALID_PARAMETER, 0, 0),
+        };
+        match nt_io_manager::device_registry::DeviceRegistryKeyType::from_flags(flags) {
+            Ok(nt_io_manager::device_registry::DeviceRegistryKeyType::Driver) => (),
+            Ok(_) => return (STATUS_NOT_SUPPORTED, 0, 0),
+            Err(status) => return (status as i32, 0, 0),
+        }
     }
     unsafe {
         let caller = match crate::provider_registry_caller::resolve(ch) {
