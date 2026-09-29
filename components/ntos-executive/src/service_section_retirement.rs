@@ -84,6 +84,23 @@ pub(crate) unsafe fn service_unmap_section_view_mappings(
         .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
     let mut page = view.base;
     while page < end {
+        handler.service_unmap_section_view_page_mapping(view, process, &access, page)?;
+        page = page
+            .checked_add(0x1000)
+            .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
+    }
+    Ok(())
+}
+
+impl ExecNtHandler {
+    /// The caller retains the exact section view while this page's physical aliases retire.
+    pub(crate) unsafe fn service_unmap_section_view_page_mapping(
+        &self,
+        view: GenericSectionView,
+        process: nt_user_host::process_identity::ProcessIdentity,
+        access: &retirement_memory_access::Access<'_>,
+        page: u64,
+    ) -> Result<(), u32> {
         access.check(view.pi as u64, page)?;
         if !view.permits_retirement_page(
             process,
@@ -99,13 +116,10 @@ pub(crate) unsafe fn service_unmap_section_view_mappings(
         crate::win32k_glue::detach_attached_client_page_with_access(
             view.pi as u64,
             page,
-            &access,
+            access,
         )?;
-        client_frame_cleanup::release_with_access(view.pi as u64, page, &access)?;
-        pagefile_retirement::discard_with_access(view.pi as u64, page, &access)?;
-        page = page
-            .checked_add(0x1000)
-            .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
+        client_frame_cleanup::release_with_access(view.pi as u64, page, access)?;
+        pagefile_retirement::discard_with_access(view.pi as u64, page, access)?;
+        Ok(())
     }
-    Ok(())
 }

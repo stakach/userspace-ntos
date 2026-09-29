@@ -4076,6 +4076,7 @@ impl ExecNtHandler {
         write_field!(lpc_endpoint_progress, false);
         write_field!(lpc_reply_published, false);
         write_field!(lpc_connection_views, alloc::vec::Vec::with_capacity(32));
+        write_field!(pending_section_view_rollbacks, alloc::vec::Vec::with_capacity(8));
         write_field!(lpc_connections, alloc::vec::Vec::with_capacity(16));
         write_field!(pm, pm);
         write_field!(
@@ -29712,7 +29713,7 @@ impl ExecNtHandler {
         zero_bits: u64,
         allocation_type: u32,
         win32_protect: u32,
-    ) -> Result<(u64, u64), u32> {
+    ) -> Result<nt_memory_manager::GenericSectionView, u32> {
         const STATUS_INVALID_VIEW_SIZE: u32 = 0xC000_001F;
         const HIGHEST_VAD_ADDRESS: u64 = 0x0000_07ff_fffd_ffff;
         let ctx = self.loop_ctx.ok_or(STATUS_UNSUCCESSFUL)?;
@@ -29838,7 +29839,10 @@ impl ExecNtHandler {
         *vm_map = *after;
         self.commit_process_commit_charge(prepared_commit);
         crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
-        Ok((plan.base, plan.size))
+        Ok(generic_sections
+            .view_for_page(target_pi, plan.base)
+            .expect("just-published generic section view remains live")
+            .1)
     }
 
     unsafe fn lpc_user_memory_read(
@@ -29982,6 +29986,7 @@ impl ExecNtHandler {
             .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
         self.lpc_connection_views.push(PendingLpcConnectionViews {
             connection_id,
+            aborting: false,
             connector_pi,
             connector_memory,
             connector_view,
@@ -29998,7 +30003,10 @@ impl ExecNtHandler {
         owner_pi: usize,
         peer_pi: usize,
     ) -> Result<MappedLpcPortView, u32> {
-        let (peer_base, peer_size) = self.map_generic_section_view_internal(
+        self.pending_section_view_rollbacks
+            .try_reserve(2)
+            .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
+        let peer_view = self.map_generic_section_view_internal(
             captured.section_index,
             peer_pi,
             0,
@@ -30008,7 +30016,7 @@ impl ExecNtHandler {
             0,
             nt_address_space::PAGE_READWRITE,
         )?;
-        let (owner_base, owner_size) = match self.map_generic_section_view_internal(
+        let owner_view = match self.map_generic_section_view_internal(
             captured.section_index,
             owner_pi,
             0,
@@ -30020,27 +30028,50 @@ impl ExecNtHandler {
         ) {
             Ok(view) => view,
             Err(status) => {
-                self.rollback_generic_section_view(peer_pi, peer_base);
+                self.rollback_or_defer_generic_section_view(peer_view);
                 return Err(status);
             }
         };
-        if owner_size != peer_size {
-            self.rollback_generic_section_view(owner_pi, owner_base);
-            self.rollback_generic_section_view(peer_pi, peer_base);
+        if owner_view.size != peer_view.size {
+            self.rollback_or_defer_generic_section_view(owner_view);
+            self.rollback_or_defer_generic_section_view(peer_view);
             return Err(STATUS_INVALID_PARAMETER);
         }
         Ok(MappedLpcPortView {
-            owner_pi,
-            owner_base,
-            peer_pi,
-            peer_base,
-            view_size: owner_size,
+            owner_view: Some(owner_view),
+            peer_view: Some(peer_view),
+            owner_base: owner_view.base,
+            peer_base: peer_view.base,
+            view_size: owner_view.size,
         })
     }
 
-    unsafe fn rollback_lpc_port_view(&mut self, mapped: MappedLpcPortView) {
-        self.rollback_generic_section_view(mapped.owner_pi, mapped.owner_base);
-        self.rollback_generic_section_view(mapped.peer_pi, mapped.peer_base);
+    unsafe fn rollback_or_defer_generic_section_view(
+        &mut self,
+        view: nt_memory_manager::GenericSectionView,
+    ) {
+        if self.rollback_generic_section_view(view).is_err() {
+            // Capacity was reserved before the map, so failed cleanup never needs allocation.
+            self.pending_section_view_rollbacks.push(view);
+        }
+    }
+
+    unsafe fn rollback_lpc_port_view(&mut self, mapped: &mut MappedLpcPortView) -> Result<(), u32> {
+        let mut failed = None;
+        if let Some(view) = mapped.owner_view {
+            match self.rollback_generic_section_view(view) {
+                Ok(()) => mapped.owner_view = None,
+                Err(status) => failed = Some(status),
+            }
+        }
+        if let Some(view) = mapped.peer_view {
+            match self.rollback_generic_section_view(view) {
+                Ok(()) => mapped.peer_view = None,
+                Err(status) if failed.is_none() => failed = Some(status),
+                Err(_) => {}
+            }
+        }
+        failed.map_or(Ok(()), Err)
     }
 
     pub(crate) unsafe fn abort_lpc_connection_views(&mut self, connection_id: u64) {
@@ -30051,12 +30082,44 @@ impl ExecNtHandler {
         else {
             return;
         };
-        let pending = self.lpc_connection_views.swap_remove(index);
-        if let Some(mapped) = pending.connector_mapping {
-            self.rollback_lpc_port_view(mapped);
+        self.lpc_connection_views[index].aborting = true;
+        if let Some(mut mapped) = self.lpc_connection_views[index].connector_mapping {
+            let _ = self.rollback_lpc_port_view(&mut mapped);
+            self.lpc_connection_views[index].connector_mapping =
+                (mapped.owner_view.is_some() || mapped.peer_view.is_some()).then_some(mapped);
         }
-        if let Some(mapped) = pending.acceptor_mapping {
-            self.rollback_lpc_port_view(mapped);
+        if let Some(mut mapped) = self.lpc_connection_views[index].acceptor_mapping {
+            let _ = self.rollback_lpc_port_view(&mut mapped);
+            self.lpc_connection_views[index].acceptor_mapping =
+                (mapped.owner_view.is_some() || mapped.peer_view.is_some()).then_some(mapped);
+        }
+        if self.lpc_connection_views[index].connector_mapping.is_none()
+            && self.lpc_connection_views[index].acceptor_mapping.is_none()
+        {
+            self.lpc_connection_views.swap_remove(index);
+        }
+    }
+
+    unsafe fn retry_pending_section_view_rollbacks(&mut self) {
+        let mut index = 0;
+        while index < self.pending_section_view_rollbacks.len() {
+            let view = self.pending_section_view_rollbacks[index];
+            if self.rollback_generic_section_view(view).is_ok() {
+                self.pending_section_view_rollbacks.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        let mut index = 0;
+        while index < self.lpc_connection_views.len() {
+            if self.lpc_connection_views[index].aborting {
+                let connection_id = self.lpc_connection_views[index].connection_id;
+                self.abort_lpc_connection_views(connection_id);
+                if self.lpc_connection_views.get(index).is_none_or(|pending| pending.connection_id != connection_id) {
+                    continue;
+                }
+            }
+            index += 1;
         }
     }
 
@@ -30074,7 +30137,7 @@ impl ExecNtHandler {
             .position(|pending| pending.connection_id == connection_id)
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
         let mut pending = self.lpc_connection_views[index];
-        if pending.connector_mapping.is_some() || pending.acceptor_mapping.is_some() {
+        if pending.aborting || pending.connector_mapping.is_some() || pending.acceptor_mapping.is_some() {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let server_view =
@@ -30084,25 +30147,29 @@ impl ExecNtHandler {
 
         if let Some(connector_view) = pending.connector_view {
             match self.map_lpc_port_view(connector_view, pending.connector_pi, acceptor_pi) {
-                Ok(mapped) => pending.connector_mapping = Some(mapped),
+                Ok(mapped) => {
+                    pending.connector_mapping = Some(mapped);
+                    self.lpc_connection_views[index] = pending;
+                }
                 Err(status) => return Err(status),
             }
         }
         if let Some(server_view) = server_view {
             match self.map_lpc_port_view(server_view, acceptor_pi, pending.connector_pi) {
-                Ok(mapped) => pending.acceptor_mapping = Some(mapped),
+                Ok(mapped) => {
+                    pending.acceptor_mapping = Some(mapped);
+                    self.lpc_connection_views[index] = pending;
+                }
                 Err(status) => {
-                    if let Some(mapped) = pending.connector_mapping {
-                        self.rollback_lpc_port_view(mapped);
-                    }
+                    self.abort_lpc_connection_views(connection_id);
                     return Err(status);
                 }
             }
         }
 
         let results = nt_lpc_abi::connection_view_results(
-            pending.connector_mapping.map(MappedLpcPortView::abi),
-            pending.acceptor_mapping.map(MappedLpcPortView::abi),
+            pending.connector_mapping.and_then(MappedLpcPortView::abi),
+            pending.acceptor_mapping.and_then(MappedLpcPortView::abi),
         );
         let mut outputs_ok = true;
         if let Some(mut server_view) = server_view {
@@ -30134,12 +30201,7 @@ impl ExecNtHandler {
             );
         }
         if !outputs_ok {
-            if let Some(mapped) = pending.acceptor_mapping {
-                self.rollback_lpc_port_view(mapped);
-            }
-            if let Some(mapped) = pending.connector_mapping {
-                self.rollback_lpc_port_view(mapped);
-            }
+            self.abort_lpc_connection_views(connection_id);
             return Err(STATUS_ACCESS_VIOLATION);
         }
 
@@ -30170,9 +30232,12 @@ impl ExecNtHandler {
             return Ok(());
         };
         let pending = self.lpc_connection_views[index];
+        if pending.aborting {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
         let results = nt_lpc_abi::connection_view_results(
-            pending.connector_mapping.map(MappedLpcPortView::abi),
-            pending.acceptor_mapping.map(MappedLpcPortView::abi),
+            pending.connector_mapping.and_then(MappedLpcPortView::abi),
+            pending.acceptor_mapping.and_then(MappedLpcPortView::abi),
         );
         let mut outputs_ok = true;
         if let Some(mut connector_view) = pending.connector_view {
@@ -30217,44 +30282,61 @@ impl ExecNtHandler {
         Ok(())
     }
 
-    pub(crate) unsafe fn rollback_generic_section_view(&mut self, pi: usize, base: u64) {
-        let Some(ctx) = self.loop_ctx else {
-            return;
+    pub(crate) unsafe fn rollback_generic_section_view(
+        &mut self,
+        view: nt_memory_manager::GenericSectionView,
+    ) -> Result<(), u32> {
+        let nt_memory_manager::MemoryLifetime::Process(process) = view.lifetime else {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
         };
-        let generic_sections = &mut *ctx.generic_sections;
-        let Some((_section_index, view)) = generic_sections.view_for_page(pi, base) else {
-            return;
-        };
-        if hosted_thread_memory_access(pi as u64, view.base, view.size).is_err() {
-            return;
+        if self.capture_process_identity(view.pi) != Some(process) {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
         }
-        let Some(vm_map) = process_vm_region_map_mut(pi) else {
-            return;
-        };
-        let mapped_commit =
-            process_committed_allocation_commit_bytes(pi as u64, view.base).unwrap_or(0);
-        let target_pid = self.pm_pid_for_pi(pi);
+        hosted_thread_memory_retirement_access(view.pi as u64, view.base, view.size)?;
+        let target_pid = self
+            .pm_pid_for_pi(view.pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let mapped_commit = process_committed_allocation_commit_bytes(view.pi as u64, view.base)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         if mapped_commit != 0 {
-            let pid = target_pid.expect("a charged mapped view has a live EPROCESS");
-            self.ensure_process_commit_owner(pid, pi)
-                .expect("a charged mapped view has a live MM commit owner");
+            self.ensure_process_commit_owner(target_pid, view.pi)?;
         }
-        let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
-        let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
-        *before = *vm_map;
-        *after = *before;
-        if after.unmap_mapped(view.base).is_err() {
-            return;
+        let ctx = self.loop_ctx.ok_or(STATUS_UNSUCCESSFUL)?;
+        let vad_scratch = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
+        let committed_scratch = &mut *core::ptr::addr_of_mut!(COMMITTED_MAP_AFTER);
+        nt_user_host::section_view_retirement::prepare_generic_section_view_retirement(
+            view,
+            &*ctx.generic_sections,
+            process_vm_region_map(view.pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?,
+            process_committed_mapping_table(view.pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?,
+            vad_scratch,
+            committed_scratch,
+        )?;
+        let access = retirement_memory_access::Access::Process {
+            process,
+            handler: self,
+        };
+        let end = view.base.checked_add(view.size)
+            .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
+        let mut page = view.base;
+        while page < end {
+            self.service_unmap_section_view_page_mapping(view, process, &access, page)?;
+            page = page.checked_add(0x1000)
+                .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
         }
-        if service_unmap_section_view_mappings(view, self).is_err() {
-            return;
+        if self.capture_process_identity(view.pi) != Some(process) {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
         }
-        *vm_map = *after;
-        let _ = process_committed_mapping_unregister_range(pi as u64, view.base, view.size);
-        let _ = generic_sections.unmap_view_identity(view);
-        if let Some(pid) = target_pid {
-            self.release_process_commit(pid, mapped_commit);
-        }
+        nt_user_host::section_view_retirement::commit_generic_section_view_retirement(
+            view,
+            &mut *ctx.generic_sections,
+            process_vm_region_map_mut(view.pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?,
+            process_committed_mapping_table_mut(view.pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?,
+            vad_scratch,
+            committed_scratch,
+        )?;
+        self.release_process_commit(target_pid, mapped_commit);
+        Ok(())
     }
 
     unsafe fn validate_secure_lpc_connect(
@@ -31073,6 +31155,7 @@ impl NativeSyscallHandler for ExecNtHandler {
     ) -> u32 {
         let service_name = ctx.service.name();
         let _alloc_scope = crate::allocator::enter_scope(service_name.as_bytes());
+        unsafe { self.retry_pending_section_view_rollbacks() };
         let status = self.handle_service(ctx, args, out);
         self.sync_debug_object_signals();
         status
@@ -41826,7 +41909,10 @@ impl ExecNtHandler {
                         section_offset = u64::from_le_bytes(word);
                     }
                     let allocation_type = nt_ulong_arg(args[8]);
-                    let (mapped_base, mapped_size) = match self.map_generic_section_view_internal(
+                    if self.pending_section_view_rollbacks.try_reserve(1).is_err() {
+                        return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                    let mapped = match self.map_generic_section_view_internal(
                         section_index,
                         target_pi,
                         base_in,
@@ -41839,10 +41925,12 @@ impl ExecNtHandler {
                         Ok(mapped) => mapped,
                         Err(status) => return status,
                     };
+                    let mapped_base = mapped.base;
+                    let mapped_size = mapped.size;
                     if !self.xas_write_u64(base_ptr, mapped_base)
                         || !self.xas_write_u64(view_size_ptr, mapped_size)
                     {
-                        self.rollback_generic_section_view(target_pi, mapped_base);
+                        self.rollback_or_defer_generic_section_view(mapped);
                         return STATUS_ACCESS_VIOLATION;
                     }
                     print_str(b"[section] map generic owner-pi=");

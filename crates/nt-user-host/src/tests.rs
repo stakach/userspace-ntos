@@ -8,6 +8,9 @@ use nt_syscall::{
     STATUS_SUCCESS,
 };
 
+#[path = "generic_section_view_retirement_tests.rs"]
+mod generic_section_view_retirement_tests;
+
 fn build_services() -> KernelServices {
     let mut cm = ConfigManager::new();
     cm.register_service("Svc", "svc.sys", None, None, 3, 1);
