@@ -620,6 +620,7 @@ fn current_stack_pointer() -> u64 {
 }
 
 unsafe fn active_provider_stack_event_activation() -> Option<ProviderStackEventActivation> {
+    let _metadata = ProviderMetadataGuard::acquire();
     let activations = (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS)).as_ref()?;
     let (binding, _) = activations.resolve(current_stack_pointer(), 1).ok()?;
     activations.active(binding.handle).ok()
@@ -628,6 +629,7 @@ unsafe fn active_provider_stack_event_activation() -> Option<ProviderStackEventA
 unsafe fn begin_provider_stack_event_activation(
     dispatch_id: u64,
 ) -> Option<ProviderStackEventActivationGuard> {
+    let _metadata = ProviderMetadataGuard::acquire();
     let activation = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
         .as_mut()?
         .begin_for_stack_pointer(current_stack_pointer(), dispatch_id)
@@ -646,6 +648,7 @@ unsafe fn capture_kernel_provider_stack_activation() -> Option<ProviderStackEven
     }
     let page = WIN32K_PROVIDER_WAIT_VADDR as *const nt_provider_wait::ProviderWaitSharedPage;
     let descriptor = read_volatile(core::ptr::addr_of!((*page).kernel_activation));
+    let _metadata = ProviderMetadataGuard::acquire();
     let activation = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
         .as_mut()?
         .begin_kernel_for_stack_pointer(current_stack_pointer(), provider, descriptor)
@@ -4245,10 +4248,15 @@ unsafe fn retire_provider_local_events_for_backing(
 unsafe fn finish_provider_stack_event_activation(
     activation: ProviderStackEventActivation,
 ) -> bool {
-    if !(&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
-        .as_ref()
-        .is_some_and(|activations| activations.current_irql(activation) == Ok(nt_kernel_exec::PASSIVE_LEVEL))
-    {
+    let passive = {
+        let _metadata = ProviderMetadataGuard::acquire();
+        (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
+            .as_ref()
+            .is_some_and(|activations| {
+                activations.current_irql(activation) == Ok(nt_kernel_exec::PASSIVE_LEVEL)
+            })
+    };
+    if !passive {
         return false;
     }
     file_read::release_completed_for_activation(activation);
@@ -4260,6 +4268,7 @@ unsafe fn finish_provider_stack_event_activation(
     if !retire_provider_local_timers_for_backing(activation.backing()) {
         return false;
     }
+    let _metadata = ProviderMetadataGuard::acquire();
     (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
         .as_mut()
         .is_some_and(|activations| activations.finish(activation).is_ok())
@@ -5285,8 +5294,14 @@ unsafe fn provider_wait_object_for_dispatcher(
 
 unsafe fn current_provider_wait_owner() -> Option<nt_provider_wait::ProviderWaitOwner> {
     let activation = active_provider_stack_event_activation()?;
-    let activations = (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS)).as_ref()?;
-    if let Some(owner) = activations.owner(activation).ok()? {
+    let owner = {
+        let _metadata = ProviderMetadataGuard::acquire();
+        (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
+            .as_ref()?
+            .owner(activation)
+            .ok()?
+    };
+    if let Some(owner) = owner {
         return Some(owner);
     }
     let provider = registered_provider_wait_domain()?;
@@ -16183,20 +16198,23 @@ pub unsafe extern "C" fn win32k_dispatch_lane_entry(lane_ordinal: u64) -> ! {
         print_str(b"[win32k-host] ERROR: secondary lane stack range overflow\n");
         park();
     };
-    let publications = &mut *core::ptr::addr_of_mut!(WIN32K_SECONDARY_STACK_PUBLICATIONS);
-    let binding = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
-        .as_mut()
-        .and_then(|activations| {
-            publications[worker_index as usize]
-                .register(
-                    activations,
-                    WIN32K_PRIMARY_STACK_LANE_ID + lane_ordinal,
-                    stack_base,
-                    WIN32K_LANE_STACK_FRAMES * 0x1000,
-                )
-                .ok()?;
-            publications[worker_index as usize].binding(activations).ok()
-        });
+    let binding = {
+        let _metadata = ProviderMetadataGuard::acquire();
+        let publications = &mut *core::ptr::addr_of_mut!(WIN32K_SECONDARY_STACK_PUBLICATIONS);
+        (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
+            .as_mut()
+            .and_then(|activations| {
+                publications[worker_index as usize]
+                    .register(
+                        activations,
+                        WIN32K_PRIMARY_STACK_LANE_ID + lane_ordinal,
+                        stack_base,
+                        WIN32K_LANE_STACK_FRAMES * 0x1000,
+                    )
+                    .ok()?;
+                publications[worker_index as usize].binding(activations).ok()
+            })
+    };
     let Some(binding) = binding else {
         print_str(b"[win32k-host] ERROR: secondary stack lane registration failed\n");
         park();
