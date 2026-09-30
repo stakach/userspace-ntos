@@ -6,7 +6,7 @@
 use alloc::vec::Vec;
 use core::num::NonZeroU64;
 use nt_kernel_exec::provider_pool::AllocationIdentity;
-use nt_provider_wait::{ProviderAllocationSnapshot, ProviderDomainIdentity};
+use nt_provider_wait::{ProviderAllocationPin, ProviderAllocationSnapshot, ProviderDomainIdentity};
 
 use crate::{WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IRP_SIZE};
 
@@ -14,6 +14,7 @@ use crate::{WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IRP_SIZE};
 pub struct ProviderSourceIrpAllocation {
     pub provider: ProviderDomainIdentity,
     pub catalog: ProviderAllocationSnapshot,
+    pub catalog_pin: ProviderAllocationPin,
     pub pool_base: u64,
     pub native: AllocationIdentity,
     pub native_capacity: u64,
@@ -34,6 +35,7 @@ impl ProviderSourceIrpAllocation {
         };
         self.provider.is_valid()
             && self.catalog.identity.is_valid()
+            && self.catalog_pin.identity() == self.catalog.identity
             && self.catalog.identity.arena.generation == self.provider.generation
             && self.pool_base != 0
             && self.catalog.base != 0
@@ -244,28 +246,33 @@ mod tests {
     use super::*;
     use nt_kernel_exec::provider_pool::AllocationIdentity;
     use nt_provider_wait::{
-        ProviderAllocationIdentity, ProviderAllocationSnapshot, ProviderArenaIdentity,
+        ProviderAllocationCatalog, ProviderAllocationError, ProviderArenaIdentity,
         ProviderDomainIdentity,
     };
 
-    fn allocation(pool_generation: u64, catalog_generation: u64) -> ProviderSourceIrpAllocation {
-        ProviderSourceIrpAllocation {
+    fn allocation(
+        pool_generation: u64,
+        catalog_generation: u64,
+    ) -> (ProviderAllocationCatalog, ProviderSourceIrpAllocation) {
+        let mut catalog = ProviderAllocationCatalog::new();
+        let arena = ProviderArenaIdentity {
+            id: 3,
+            generation: 7,
+        };
+        for _ in 1..catalog_generation {
+            let prior = catalog.register(arena, 0x1000_2000, 0x200).unwrap();
+            catalog.retire(prior.identity).unwrap();
+        }
+        let snapshot = catalog.register(arena, 0x1000_2000, 0x200).unwrap();
+        let (pinned, pin) = catalog.pin_containing(snapshot.base, 0x1b0).unwrap();
+        assert_eq!(pinned, snapshot);
+        let allocation = ProviderSourceIrpAllocation {
             provider: ProviderDomainIdentity {
                 domain: 4,
                 generation: 7,
             },
-            catalog: ProviderAllocationSnapshot {
-                identity: ProviderAllocationIdentity {
-                    arena: ProviderArenaIdentity {
-                        id: 3,
-                        generation: 7,
-                    },
-                    allocation_id: 9,
-                    generation: catalog_generation,
-                },
-                base: 0x1000_2000,
-                capacity: 0x200,
-            },
+            catalog: snapshot,
+            catalog_pin: pin,
             pool_base: 0x1000_0000,
             native: AllocationIdentity {
                 allocation_id: 0x2000,
@@ -274,22 +281,27 @@ mod tests {
             native_capacity: 0x200,
             bytes: (WDM_X64_IRP_SIZE + 2 * WDM_X64_IO_STACK_LOCATION_SIZE) as u64,
             stack_count: 2,
-        }
+        };
+        (catalog, allocation)
     }
 
     #[test]
     fn exact_retry_recovers_ticket_but_reused_native_generation_cannot() {
         let mut ledger = ProviderSourceIrpLedger::new();
-        let first = allocation(11, 5);
+        let (mut first_catalog, first) = allocation(11, 5);
         let ticket = ledger.register(first).unwrap();
         assert_eq!(ledger.register(first), Ok(ticket));
-        let reused = allocation(12, 6);
+        let (_reused_catalog, reused) = allocation(12, 6);
         assert_eq!(
             ledger.register(reused),
             Err(ProviderSourceIrpError::AddressInUse)
         );
         assert!(!ledger.matches(ticket, reused));
         ledger.begin_free(ticket, first).unwrap();
+        assert_eq!(
+            first_catalog.begin_retirement(first.catalog.identity),
+            Err(ProviderAllocationError::Pinned)
+        );
         assert_eq!(
             ledger.allocation_at(first.pool_base, first.catalog.base),
             Some((ticket, first))
@@ -302,6 +314,10 @@ mod tests {
             ledger.register(reused),
             Err(ProviderSourceIrpError::AddressInUse)
         );
+        first_catalog
+            .begin_retirement_from_pin(first.catalog_pin)
+            .unwrap();
+        first_catalog.retire(first.catalog.identity).unwrap();
         ledger.finish_free(ticket, first).unwrap();
         let next = ledger.register(reused).unwrap();
         assert_ne!(next, ticket);
@@ -314,7 +330,7 @@ mod tests {
     #[test]
     fn pinned_irp_cannot_begin_free_and_uncertain_free_stays_reserved() {
         let mut ledger = ProviderSourceIrpLedger::new();
-        let owner = allocation(11, 5);
+        let (mut catalog, owner) = allocation(11, 5);
         let ticket = ledger.register(owner).unwrap();
         ledger.pin(ticket, owner).unwrap();
         assert_eq!(
@@ -332,13 +348,17 @@ mod tests {
             Err(ProviderSourceIrpError::Retiring)
         );
         assert!(ledger.matches(ticket, owner));
+        catalog
+            .begin_retirement_from_pin(owner.catalog_pin)
+            .unwrap();
+        catalog.retire(owner.catalog.identity).unwrap();
         ledger.finish_free(ticket, owner).unwrap();
     }
 
     #[test]
     fn invalid_or_mixed_provider_identity_is_not_admitted() {
         let mut ledger = ProviderSourceIrpLedger::new();
-        let valid = allocation(11, 5);
+        let (_catalog, valid) = allocation(11, 5);
         let bad_pool = ProviderSourceIrpAllocation {
             native: AllocationIdentity {
                 allocation_id: 0x3000,
@@ -378,6 +398,15 @@ mod tests {
         };
         assert_eq!(
             ledger.register(wrong_capacity),
+            Err(ProviderSourceIrpError::InvalidAllocation)
+        );
+        let (_other_catalog, other) = allocation(12, 6);
+        let wrong_pin = ProviderSourceIrpAllocation {
+            catalog_pin: other.catalog_pin,
+            ..valid
+        };
+        assert_eq!(
+            ledger.register(wrong_pin),
             Err(ProviderSourceIrpError::InvalidAllocation)
         );
     }
