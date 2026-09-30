@@ -628,13 +628,56 @@ unsafe fn active_provider_stack_event_activation() -> Option<ProviderStackEventA
 
 unsafe fn begin_provider_stack_event_activation(
     dispatch_id: u64,
+    owner: Option<nt_provider_wait::ProviderWaitOwner>,
 ) -> Option<ProviderStackEventActivationGuard> {
     let _metadata = ProviderMetadataGuard::acquire();
-    let activation = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
-        .as_mut()?
-        .begin_for_stack_pointer(current_stack_pointer(), dispatch_id)
-        .ok()?;
+    let activations = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS)).as_mut()?;
+    let activation = if let Some(owner) = owner {
+        activations.begin_hosted_for_stack_pointer(current_stack_pointer(), owner)
+    } else {
+        activations.begin_for_stack_pointer(current_stack_pointer(), dispatch_id)
+    }
+    .ok()?;
     Some(ProviderStackEventActivationGuard { activation })
+}
+
+unsafe fn hosted_wait_owner_at_dispatch(
+    header: nt_user_callback::CallbackHeader,
+) -> Result<Option<nt_provider_wait::ProviderWaitOwner>, ()> {
+    let sh = WIN32K_SHARED_VADDR;
+    let client_pi = read_volatile((sh + SH_REQ_CLIENT_PI) as *const u64);
+    let client_tid = read_volatile((sh + SH_REQ_THREAD_ID) as *const u64);
+    let generation = read_volatile((sh + SH_REQ_GENERATION) as *const u64);
+    if header.magic != nt_user_callback::CALLBACK_MAGIC
+        || header.version != nt_user_callback::CALLBACK_VERSION
+        || header.kind != nt_user_callback::CALLBACK_KIND_USER_MODE
+        || u64::from(header.client_pi) != client_pi
+        || header.client_tid != client_tid
+    {
+        return Err(());
+    }
+    if generation == 0 && client_tid == 0 && header.client_badge == 0 {
+        return Ok(None);
+    }
+    let provider = registered_provider_wait_domain().ok_or(())?;
+    let owner = nt_provider_wait::ProviderWaitOwner {
+        provider_domain: provider.domain,
+        provider_generation: provider.generation,
+        dispatch_id: header.dispatch_id,
+        caller: nt_provider_wait::SuspensionCaller::Hosted(
+            nt_provider_wait::SuspensionHostedClient {
+                client_pi: header.client_pi,
+                client_generation: generation,
+                client_tid,
+                client_badge: header.client_badge,
+            },
+        ),
+    };
+    if owner.is_valid() {
+        Ok(Some(owner))
+    } else {
+        Err(())
+    }
 }
 
 unsafe fn capture_kernel_provider_stack_activation() -> Option<ProviderStackEventActivationGuard> {
@@ -5294,46 +5337,11 @@ unsafe fn provider_wait_object_for_dispatcher(
 
 unsafe fn current_provider_wait_owner() -> Option<nt_provider_wait::ProviderWaitOwner> {
     let activation = active_provider_stack_event_activation()?;
-    let owner = {
-        let _metadata = ProviderMetadataGuard::acquire();
-        (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
-            .as_ref()?
-            .owner(activation)
-            .ok()?
-    };
-    if let Some(owner) = owner {
-        return Some(owner);
-    }
-    let provider = registered_provider_wait_domain()?;
-    let callback_frame =
-        (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *const nt_user_callback::CallbackFrame;
-    let header = read_volatile(core::ptr::addr_of!((*callback_frame).header));
-    if header.dispatch_id != activation.dispatch_id {
-        return None;
-    }
-    let client_generation = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_GENERATION) as *const u64);
-    let owner = nt_provider_wait::ProviderWaitOwner {
-        provider_domain: provider.domain,
-        provider_generation: provider.generation,
-        caller: nt_component_suspension::SuspensionCaller::Hosted(
-            nt_component_suspension::SuspensionHostedClient {
-                client_pi: header.client_pi,
-                client_generation,
-                client_tid: header.client_tid,
-                client_badge: header.client_badge,
-            },
-        ),
-        dispatch_id: header.dispatch_id,
-    };
-    if !owner.is_valid() {
-        trace_provider_wait_component(
-            b"invalid-owner",
-            (u64::from(header.client_pi) << 32) | client_generation,
-            header.client_tid,
-            header.dispatch_id,
-        );
-    }
-    owner.is_valid().then_some(owner)
+    let _metadata = ProviderMetadataGuard::acquire();
+    (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
+        .as_ref()?
+        .owner(activation)
+        .ok()?
 }
 
 unsafe fn provider_wait_timeout(
@@ -16548,8 +16556,24 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     object_security::retry_retirements();
     let callback_frame =
         (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *const nt_user_callback::CallbackFrame;
-    let dispatch_id = read_volatile(core::ptr::addr_of!((*callback_frame).header.dispatch_id));
-    let Some(_stack_event_activation) = begin_provider_stack_event_activation(dispatch_id) else {
+    let header = read_volatile(core::ptr::addr_of!((*callback_frame).header));
+    let request_kind = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_KIND) as *const u64);
+    let owner = if request_kind == WIN32K_REQUEST_SSDT {
+        match hosted_wait_owner_at_dispatch(header) {
+            Ok(owner) => owner,
+            Err(()) => {
+                return (
+                    STATUS_INVALID_PARAMETER_I32,
+                    STATUS_INVALID_PARAMETER_I32 as u32 as u64,
+                )
+            }
+        }
+    } else {
+        None
+    };
+    let Some(_stack_event_activation) =
+        begin_provider_stack_event_activation(header.dispatch_id, owner)
+    else {
         let status = 0xC000_009Au32;
         return (status as i32, status as u64);
     };
@@ -16564,7 +16588,6 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let a1 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A1) as *const u64);
     let a2 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A2) as *const u64);
     let a3 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A3) as *const u64);
-    let request_kind = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_KIND) as *const u64);
     if request_kind == WIN32K_REQUEST_PS_PROVIDER {
         let result = dispatch_ps_provider_command(a0, a1, a2);
         return (result as u32 as i32, result);

@@ -9,7 +9,7 @@ pub(crate) struct StackCatalogIdentity(u64);
 
 use crate::{
     KernelProviderActivationDescriptor, KernelProviderActivationError, ProviderDomainIdentity,
-    ProviderEventBacking, ProviderWaitOwner, ProviderWaitTimeoutKind,
+    ProviderEventBacking, ProviderWaitOwner, ProviderWaitTimeoutKind, SuspensionCaller,
 };
 use nt_kernel_exec::{IrqlState, PASSIVE_LEVEL};
 
@@ -410,6 +410,20 @@ impl ProviderStackActivationCatalog {
         self.begin(binding.handle, dispatch_id)
     }
 
+    /// Bind the hosted caller while its dispatch frame is admitted. A resumed lane must not
+    /// reconstruct this authority from a shared request page that another lane can overwrite.
+    pub fn begin_hosted_for_stack_pointer(
+        &mut self,
+        stack_pointer: u64,
+        owner: ProviderWaitOwner,
+    ) -> Result<ProviderStackEventActivation, ProviderStackActivationError> {
+        if !owner.is_valid() || !matches!(owner.caller, SuspensionCaller::Hosted(_)) {
+            return Err(ProviderStackActivationError::InvalidDispatch);
+        }
+        let (binding, _) = self.resolve(stack_pointer, 1)?;
+        self.begin_with_owner(binding.handle, owner.dispatch_id, Some(owner))
+    }
+
     pub fn begin(
         &mut self,
         handle: ProviderStackLaneHandle,
@@ -493,7 +507,11 @@ impl ProviderStackActivationCatalog {
             irql: IrqlState::new(),
             owner,
         });
-        if let Some(owner) = owner {
+        if let Some(owner @ ProviderWaitOwner {
+            caller: SuspensionCaller::Kernel { .. },
+            ..
+        }) = owner
+        {
             lane.last_kernel_owner = Some(owner);
         }
         Ok(activation)
