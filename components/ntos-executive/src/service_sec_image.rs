@@ -2610,36 +2610,6 @@ unsafe fn process_completed_user_callback_outer_dispatch(
             return false;
         }
     }
-    let completion_process_role = nt_handler.hosted_process_role(completion_pi);
-    if completion_process_role.is_some_and(nt_exe_image::HostedProcessRole::uses_win32_client_gdi) {
-        let is_wl_worker = matches!(
-            completion_badge,
-            WINLOGON_WORKER_BADGE | WINLOGON_WORKER2_BADGE | WINLOGON_WORKER3_BADGE
-        );
-        if let Some((teb_alias, client_deskinfo, pti, delta, client_pcti, old_pti)) =
-            refresh_hosted_gui_thread_client_info(
-                nt_handler,
-                completion_pi,
-                completion_badge,
-                completion_tid,
-                tp_worker_identity_from_badge(completion_badge),
-                is_wl_worker,
-                completion_pml4,
-            )
-        {
-            log_refreshed_gui_thread_client_info(
-                completion_process_role == Some(nt_exe_image::HostedProcessRole::InteractiveLogon),
-                completion_pi,
-                completion_tid,
-                teb_alias,
-                client_deskinfo,
-                pti,
-                delta,
-                client_pcti,
-                old_pti,
-            );
-        }
-    }
     if completion_pi == 2 {
         observe_winlogon_completed_dispatch(
             dispatch,
@@ -4943,6 +4913,87 @@ pub(crate) unsafe fn service_win32k_file_ioctl_release(
     crate::driver_launch::service_win32k_file_ioctl_release(channel, token, handle)
 }
 
+pub(crate) unsafe fn service_win32k_source_ioctl_request(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    packet: u64,
+    length: u64,
+    provider_stack_pointer: u64,
+    reserved2: u64,
+) -> Option<i32> {
+    if provider_stack_pointer == 0 || reserved2 != 0 {
+        return Some(nt_process::STATUS_INVALID_PARAMETER as i32);
+    }
+    if let Err(status) = authenticate_win32k_service_request(
+        channel,
+        reply_cap,
+        badge,
+        mi,
+        (crate::win32k_subsystem::W32_SOURCE_IOCTL_LABEL << 12) | 4,
+    ) {
+        return Some(status as i32);
+    }
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if handler.is_null() {
+        return Some(0xC000_00A3u32 as i32);
+    }
+    crate::driver_launch::service_win32k_source_ioctl(
+        channel, reply_cap, packet, length, provider_stack_pointer, handler,
+    )
+}
+
+pub(crate) unsafe fn service_win32k_source_ioctl_completion(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    token: u64,
+    source: u64,
+    reserved1: u64,
+    reserved2: u64,
+) -> Option<i32> {
+    if reserved1 != 0 || reserved2 != 0 {
+        return Some(nt_process::STATUS_INVALID_PARAMETER as i32);
+    }
+    if let Err(status) = authenticate_win32k_service_request(
+        channel,
+        reply_cap,
+        badge,
+        mi,
+        (crate::win32k_subsystem::W32_SOURCE_IOCTL_COMPLETION_LABEL << 12) | 4,
+    ) {
+        return Some(status as i32);
+    }
+    crate::driver_launch::service_win32k_source_ioctl_completion(channel, token, source)
+}
+
+pub(crate) unsafe fn service_win32k_source_ioctl_release(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    token: u64,
+    source: u64,
+    reserved1: u64,
+    reserved2: u64,
+) -> i32 {
+    if reserved1 != 0 || reserved2 != 0 {
+        return nt_process::STATUS_INVALID_PARAMETER as i32;
+    }
+    if let Err(status) = authenticate_win32k_service_request(
+        channel,
+        reply_cap,
+        badge,
+        mi,
+        (crate::win32k_subsystem::W32_SOURCE_IOCTL_RELEASE_LABEL << 12) | 4,
+    ) {
+        return status as i32;
+    }
+    crate::driver_launch::service_win32k_source_ioctl_release(channel, token, source)
+}
+
 pub(crate) unsafe fn service_win32k_file_query_delivered(
     channel: &spawn_hosts::PumpChannel,
     reply_cap: u64,
@@ -6555,34 +6606,145 @@ unsafe fn spawn_requested_hosted_exe(
     Ok(process_handle)
 }
 
-/// Populate one GUI thread's client-side win32 state from the desktop facts published by the live
-/// win32k dispatch thread. `Win32ThreadInfo` is an opaque server THREADINFO identity; the inline
-/// CLIENTINFO stores the client mapping of DESKTOPINFO and the USER-heap pointer delta.
-unsafe fn seed_gui_thread_client_info(
-    nt_handler: &mut ExecNtHandler,
-    pi: usize,
-    teb_alias: u64,
-    pml4: u64,
-    pti: u64,
-) -> Option<(u64, u64, u64, u64, u64)> {
-    let mapped_delta = win32k_glue::map_win32k_user_heap_into_client(nt_handler, pml4, pi)?;
-    let (client_deskinfo, pti, desktop_delta, client_pcti) =
-        win32k_subsystem::desktop_client_info_for_w32thread(pti)?;
-    if desktop_delta != mapped_delta {
-        return None;
-    }
-    let old_pti = core::ptr::read_volatile((teb_alias + 0x78) as *const u64);
-    core::ptr::write_volatile((teb_alias + 0x78) as *mut u64, pti);
-    core::ptr::write_volatile((teb_alias + 0x820) as *mut u64, client_deskinfo);
-    core::ptr::write_volatile((teb_alias + 0x828) as *mut u64, desktop_delta);
-    core::ptr::write_volatile((teb_alias + 0x860) as *mut u64, client_pcti);
-    if let Some((_kl, hkl, codepage)) =
-        win32k_subsystem::keyboard_layout_client_info_for_w32thread(pti)
+/// Copyout is synchronous with the originating physical win32k lane. Its pool allocation and
+/// desktop objects remain owned by that parked provider until the reply is acknowledged.
+pub(crate) unsafe fn service_win32k_gui_client_info(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    packet_address: u64,
+    packet_bytes: u64,
+    reserved0: u64,
+    reserved1: u64,
+) -> i32 {
+    use nt_user_host::gui_client_info_snapshot::{
+        DesktopClientMapping, GuiClientInfoOwner, GuiClientInfoSnapshot, KeyboardLayoutClientInfo,
+    };
+    let invalid = nt_process::STATUS_INVALID_PARAMETER as i32;
+    if reserved0 != 0
+        || reserved1 != 0
+        || packet_bytes != core::mem::size_of::<win32k_subsystem::Win32kGuiClientInfoPacket>() as u64
     {
-        core::ptr::write_volatile((teb_alias + 0x890) as *mut u64, hkl);
-        core::ptr::write_volatile((teb_alias + 0x898) as *mut u16, codepage);
+        return invalid;
     }
-    Some((client_deskinfo, pti, desktop_delta, client_pcti, old_pti))
+    let (route, dispatch, caller) = match authenticate_win32k_service_request(
+        channel,
+        reply_cap,
+        badge,
+        mi,
+        (win32k_subsystem::W32_GUI_CLIENT_INFO_LABEL << 12) | 4,
+    ) {
+        Ok(identity) => identity,
+        Err(status) => return status as i32,
+    };
+    let Some(logical) = channel.logical_caller else { return invalid };
+    let Some(wait_owner) = win32k_glue::current_provider_poll_owner(channel) else {
+        return invalid;
+    };
+    let Some(provider) = crate::current_win32k_provider_domain() else {
+        return invalid;
+    };
+    if wait_owner.provider_domain != provider.domain
+        || wait_owner.provider_generation != provider.generation
+        || logical.thread() != caller.original_thread()
+        || !validate_provider_logical_caller(logical)
+    {
+        return invalid;
+    }
+    let (_, bytes) = match win32k_subsystem::capture_provider_pool_packet(
+        packet_address,
+        packet_bytes as usize,
+    ) {
+        Ok(captured) => captured,
+        Err(status) => return status as i32,
+    };
+    let packet = core::ptr::read_unaligned(
+        bytes.as_ptr() as *const win32k_subsystem::Win32kGuiClientInfoPacket,
+    );
+    let pi = logical.pi();
+    let Some(pml4) = (SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler)
+        .as_mut()
+        .and_then(|handler| handler.hosted_process_vspace(pi))
+    else { return invalid };
+    let handler = &mut *(SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler);
+    let Some(process) = handler.capture_process_identity(pi) else { return invalid };
+    let thread = caller.original_thread();
+    if packet.magic != win32k_subsystem::W32_GUI_CLIENT_INFO_PACKET_MAGIC
+        || packet.dispatch_id != wait_owner.dispatch_id
+        || packet.client_pi != pi as u64
+        || packet.process_id != u64::from(process.pid)
+        || packet.process_generation != channel.client_generation
+        || packet.thread_id != u64::from(thread.thread_id())
+        || logical.process() != process
+        || handler.pm.thread_lifetime(thread.thread_id()) != Some(thread)
+        || handler.pm.thread_win32(thread.thread_id()) != Some(packet.thread_info)
+        || packet.keyboard_present > 1
+        || (packet.keyboard_present == 0 && (packet.keyboard_hkl != 0 || packet.keyboard_codepage != 0))
+    {
+        return invalid;
+    }
+    let admitted = GuiClientInfoOwner {
+        process,
+        thread,
+        provider,
+        dispatch: (route, dispatch, wait_owner.dispatch_id),
+    };
+    let claimed = GuiClientInfoOwner {
+        process: nt_user_host::process_identity::ProcessIdentity {
+            pid: packet.process_id as u32,
+            generation: nt_user_host::process_identity::ProcessGeneration::Hosted(packet.process_generation),
+        },
+        ..admitted
+    };
+    let keyboard = if packet.keyboard_present != 0 {
+        let Ok(codepage) = u16::try_from(packet.keyboard_codepage) else { return invalid };
+        Some(KeyboardLayoutClientInfo { hkl: packet.keyboard_hkl, codepage })
+    } else {
+        None
+    };
+    let mapping = DesktopClientMapping {
+        server_base: packet.server_base,
+        client_base: packet.client_base,
+        bytes: packet.mapping_bytes,
+        server_deskinfo: packet.server_deskinfo,
+        server_client_thread_info: packet.server_client_thread_info,
+        mapped_delta: packet.mapped_delta,
+    };
+    let Ok(snapshot) = GuiClientInfoSnapshot::capture(
+        claimed, admitted, packet.thread_info, mapping, keyboard,
+    ) else { return invalid };
+    let client_badge = logical.badge();
+    let is_wl_worker = matches!(client_badge, WINLOGON_WORKER_BADGE | WINLOGON_WORKER2_BADGE | WINLOGON_WORKER3_BADGE);
+    let Some(teb_alias) = hosted_gui_thread_teb_alias_for(
+        handler, pi, client_badge, packet.thread_id,
+        tp_worker_identity_from_badge(client_badge), is_wl_worker,
+    ) else { return invalid };
+    let Some(mapped_delta) = win32k_glue::map_win32k_user_heap_into_client(handler, pml4, pi)
+    else { return nt_process::STATUS_INSUFFICIENT_RESOURCES as i32 };
+    if mapped_delta != packet.mapped_delta
+        || crate::current_win32k_provider_domain() != Some(provider)
+        || win32k_glue::current_provider_poll_owner(channel) != Some(wait_owner)
+        || handler.pm.thread_lifetime(thread.thread_id()) != Some(thread)
+    {
+        return invalid;
+    }
+    let Ok(values) = snapshot.values_for(admitted) else { return invalid };
+    let old_pti = core::ptr::read_volatile((teb_alias + 0x78) as *const u64);
+    core::ptr::write_volatile((teb_alias + 0x78) as *mut u64, values.win32_thread_info);
+    core::ptr::write_volatile((teb_alias + 0x820) as *mut u64, values.client_deskinfo);
+    core::ptr::write_volatile((teb_alias + 0x828) as *mut u64, values.desktop_delta);
+    core::ptr::write_volatile((teb_alias + 0x860) as *mut u64, values.client_thread_info);
+    if let Some(keyboard) = values.keyboard_layout {
+        core::ptr::write_volatile((teb_alias + 0x890) as *mut u64, keyboard.hkl);
+        core::ptr::write_volatile((teb_alias + 0x898) as *mut u16, keyboard.codepage);
+    }
+    log_refreshed_gui_thread_client_info(
+        handler.hosted_process_role(pi) == Some(nt_exe_image::HostedProcessRole::InteractiveLogon),
+        pi, packet.thread_id, teb_alias, values.client_deskinfo, values.win32_thread_info,
+        values.desktop_delta, values.client_thread_info, old_pti,
+    );
+    0
 }
 
 fn winlogon_thread_teb_alias_for(
@@ -6638,38 +6800,6 @@ fn hosted_gui_thread_teb_alias_for(
     }
     let teb_alias = hosted_env_scratch_base_for_pi(pi);
     (teb_alias != 0).then_some(teb_alias)
-}
-
-unsafe fn hosted_gui_thread_w32thread(nt_handler: &ExecNtHandler, current_tid: u64) -> Option<u64> {
-    if current_tid == 0 || current_tid > nt_process::ThreadId::MAX as u64 {
-        return None;
-    }
-    nt_handler
-        .pm
-        .thread_win32(current_tid as nt_process::ThreadId)
-}
-
-unsafe fn refresh_hosted_gui_thread_client_info(
-    nt_handler: &mut ExecNtHandler,
-    pi: usize,
-    badge: u64,
-    current_tid: u64,
-    tp_worker_identity: Option<(usize, usize)>,
-    is_wl_worker: bool,
-    pml4: u64,
-) -> Option<(u64, u64, u64, u64, u64, u64)> {
-    let teb_alias = hosted_gui_thread_teb_alias_for(
-        nt_handler,
-        pi,
-        badge,
-        current_tid,
-        tp_worker_identity,
-        is_wl_worker,
-    )?;
-    let pti = hosted_gui_thread_w32thread(nt_handler, current_tid)?;
-    let (client_deskinfo, pti, delta, client_pcti, old_pti) =
-        seed_gui_thread_client_info(nt_handler, pi, teb_alias, pml4, pti)?;
-    Some((teb_alias, client_deskinfo, pti, delta, client_pcti, old_pti))
 }
 
 fn log_refreshed_gui_thread_client_info(
@@ -10465,56 +10595,6 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex((ret >> 32) as u32);
                     print_hex(ret as u32);
                     print_str(b"\n");
-                }
-                // user32 GetThreadDesktopWnd (RVA 0x50009) dereferences
-                // `GetThreadDesktopInfo()->spwnd`. IntSetThreadDesktop can clear the client fields
-                // while the hosted per-thread desktop-heap view is being established. Repair the
-                // exact fault in the TEB that owns it (main or one of winlogon's worker TEBs), then
-                // retry the instruction. This must precede the generic worker-wall park below.
-                if pi == 2 && m0 == 0x801a_0009 && addr == 0x10 {
-                    let tcb = event_runtime.tcb;
-                    let repair_tid = event_runtime.tid;
-                    if let Some((_teb_alias, client_deskinfo, pti, _, _, _old_pti)) =
-                        refresh_hosted_gui_thread_client_info(
-                            &mut nt_handler,
-                            pi,
-                            badge,
-                            repair_tid,
-                            tp_worker_identity,
-                            is_wl_worker,
-                            pml4,
-                        )
-                    {
-                        // The faulting instruction already has RAX=NULL. Re-run the helper call at
-                        // 0x801a0004 so it reloads the repaired TEB fields before dereferencing.
-                        if tcb != 0 && win32k_glue::rewind_fault_ip(tcb, 0x801a_0004) {
-                            print_str(b"[wl-deskinfo-fixup] badge=");
-                            print_u64(badge);
-                            print_str(b" real pti=0x");
-                            print_hex((pti >> 32) as u32);
-                            print_hex(pti as u32);
-                            print_str(b" pDeskInfo=0x");
-                            print_hex((client_deskinfo >> 32) as u32);
-                            print_hex(client_deskinfo as u32);
-                            print_str(b" -> rewind helper call; RESUME\n");
-                            procs[pi].faults = faults;
-                            procs[pi].first = first;
-                            procs[pi].ntfaults = ntfaults;
-                            pfilled[pi] = *filled_pages;
-                            let _ = finalize_service_loop_state(&mut nt_handler);
-                            let (nb, nmi, nm0, nm1, nm2, nm3) =
-                                component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
-                            trace_stack_growth_reply(pi, badge, nb, nmi, nm0, nm1, nm2, nm3);
-                            badge = nb;
-                            mi = nmi;
-                            m0 = nm0;
-                            m1 = nm1;
-                            m2 = nm2;
-                            m3 = nm3;
-                            continue;
-                        }
-                    }
-                    print_str(b"[wl-deskinfo-fixup] real client state unavailable; PARK worker\n");
                 }
                 if is_tp_worker {
                     assert!(drop_current_hosted_reply(), "terminal worker fault must retire its Call");
@@ -17555,44 +17635,6 @@ pub(crate) unsafe fn service_sec_image(
                     });
                     print_hex(st as u32);
                     print_str(b"\n");
-                }
-                // ★ DESKTOP-HEAP CLIENT-WINDOW MAPPING. Once win32k has created the caller's
-                // W32THREAD and bound it to a desktop, seed that exact GUI thread's
-                // TEB.Win32ClientInfo so user32's
-                // client-side ValidateHwnd/DesktopPtrToUser/IntCallMessageProc resolve real heap-
-                // resident PWNDs in the process' RO-mapped heap view without a syscall:
-                //   - Win32ThreadInfo (TEB+0x78) = pti (server VA), matching Wnd->head.pti.
-                //   - CLIENTINFO.pDeskInfo (TEB+0x820) = DESKTOPINFO translated through its owning
-                //     arena's client mapping.
-                //   - CLIENTINFO.ulClientDelta (TEB+0x828) = ReactOS' desktop-heap server->client
-                //     delta from PROCESSINFO.HeapMappings.
-                //   - CLIENTINFO.pClientThreadInfo (TEB+0x860) = pcti translated through that same
-                //     desktop-heap mapping.
-                // This used to be winlogon-only for the SAS path; explorer's real shell/ATL path uses
-                // the same ReactOS client-side `IsWindow` and subclass validation, so every hosted
-                // GUI main thread must be restated after win32k can clear the fields.
-                if let Some((teb_alias, client_deskinfo, pti, delta, client_pcti, old_pti)) =
-                    refresh_hosted_gui_thread_client_info(
-                        &mut nt_handler,
-                        pi,
-                        badge,
-                        current_tid,
-                        tp_worker_identity,
-                        is_wl_worker,
-                        pml4,
-                    )
-                {
-                    log_refreshed_gui_thread_client_info(
-                        winlogon_gui_client,
-                        pi,
-                        current_tid,
-                        teb_alias,
-                        client_deskinfo,
-                        pti,
-                        delta,
-                        client_pcti,
-                        old_pti,
-                    );
                 }
                 // ★ CLIENT-GDI HANDLE-TABLE ALIAS. GUI clients whose PEB+0xf8 was seeded before
                 // gdi32's GdiProcessSetup must have the live win32k USER heap prefix and user-attribute
