@@ -180,7 +180,8 @@ impl TargetRelationDelivery {
         Ok(())
     }
 
-    /// Called only after strict acknowledgement of this exact canonical PnP IRP.
+    /// Called only after exact canonical retirement: strict ACK for a pending completion, or
+    /// I/O-manager retirement accompanying the minted synchronous return receipt.
     pub fn canonical_acknowledged(&mut self, irp: IrpId) -> Result<(), TargetRelationError> {
         if self.phase != TargetRelationPhase::IosbPublished {
             return Err(TargetRelationError::WrongPhase);
