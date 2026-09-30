@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttachError<E> {
     WrongThread,
+    StaleTarget,
     InvalidNesting,
     InvalidSavedState,
     Exhausted,
@@ -68,13 +69,41 @@ impl<P: Clone + Eq> ProcessAttachState<P> {
         &self.original
     }
 
+    pub fn active_depth(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Process teardown must retain every identity still reachable through an
+    /// active APC state, including the original process.
+    pub fn references_process(&self, process: &P) -> bool {
+        &self.original == process
+            || &self.current == process
+            || self.frames.iter().any(|frame| &frame.previous == process)
+    }
+
+    /// A thread cannot retire while an attach frame still owns a process.
+    /// On failure ownership of all retained identities stays with the caller.
+    pub fn retire(self, thread: u64) -> Result<P, (AttachError<()>, Self)> {
+        if self.thread != thread {
+            return Err((AttachError::WrongThread, self));
+        }
+        if !self.frames.is_empty() {
+            return Err((AttachError::InvalidNesting, self));
+        }
+        Ok(self.original)
+    }
+
     pub fn attach<E>(
         &mut self,
         thread: u64,
         target: P,
+        admit: impl FnOnce(&P) -> bool,
         transition: impl FnOnce(&P, &P) -> Result<(), E>,
     ) -> Result<(), AttachError<E>> {
         self.check_thread(thread)?;
+        if !admit(&target) {
+            return Err(AttachError::StaleTarget);
+        }
         if self.current == target {
             return Ok(());
         }
@@ -106,9 +135,13 @@ impl<P: Clone + Eq> ProcessAttachState<P> {
         &mut self,
         thread: u64,
         target: P,
+        admit: impl FnOnce(&P) -> bool,
         transition: impl FnOnce(&P, &P) -> Result<(), E>,
     ) -> Result<SavedAttachState, AttachError<E>> {
         self.check_thread(thread)?;
+        if !admit(&target) {
+            return Err(AttachError::StaleTarget);
+        }
         let sequence = self.push(target, AttachKind::Stack, transition)?;
         Ok(SavedAttachState { thread, sequence })
     }
@@ -187,20 +220,20 @@ mod tests {
     fn plain_attach_is_single_level_and_same_target_is_noop() {
         let mut state = ProcessAttachState::new(7, (1, 10));
         state
-            .attach(7, (1, 10), |_, _| -> Result<(), ()> {
+            .attach(7, (1, 10), |_| true, |_, _| -> Result<(), ()> {
                 panic!("same target")
             })
             .unwrap();
         assert!(!state.is_attached());
         state
-            .attach(7, (2, 20), |from, to| {
+            .attach(7, (2, 20), |_| true, |from, to| {
                 assert_eq!((*from, *to), ((1, 10), (2, 20)));
                 Ok::<_, ()>(())
             })
             .unwrap();
         assert!(state.is_attached());
         assert_eq!(
-            state.attach(7, (3, 30), |_, _| Ok::<_, ()>(())),
+            state.attach(7, (3, 30), |_| true, |_, _| Ok::<_, ()>(())),
             Err(AttachError::InvalidNesting)
         );
         state
@@ -216,7 +249,7 @@ mod tests {
     fn stack_attach_nests_and_same_target_has_no_alias_transition() {
         let mut state = ProcessAttachState::new(7, 1);
         let original = state
-            .stack_attach(7, 1, |_, _| -> Result<(), ()> {
+            .stack_attach(7, 1, |_| true, |_, _| -> Result<(), ()> {
                 panic!("same original process")
             })
             .unwrap();
@@ -231,11 +264,11 @@ mod tests {
                 panic!("same original process")
             })
             .unwrap();
-        let first = state.stack_attach(7, 2, |_, _| Ok::<_, ()>(())).unwrap();
+        let first = state.stack_attach(7, 2, |_| true, |_, _| Ok::<_, ()>(())).unwrap();
         let same = state
-            .stack_attach(7, 2, |_, _| -> Result<(), ()> { panic!("same target") })
+            .stack_attach(7, 2, |_| true, |_, _| -> Result<(), ()> { panic!("same target") })
             .unwrap();
-        let nested = state.stack_attach(7, 3, |_, _| Ok::<_, ()>(())).unwrap();
+        let nested = state.stack_attach(7, 3, |_| true, |_, _| Ok::<_, ()>(())).unwrap();
         assert_eq!(*state.current(), 3);
         assert_eq!(
             state.unstack_detach(7, first, |_, _| Ok::<_, ()>(())),
@@ -263,15 +296,15 @@ mod tests {
     fn wrong_thread_stale_saved_state_and_failed_transition_do_not_mutate() {
         let mut state = ProcessAttachState::new(7, 1);
         assert_eq!(
-            state.stack_attach(8, 2, |_, _| Ok::<_, ()>(())),
+            state.stack_attach(8, 2, |_| true, |_, _| Ok::<_, ()>(())),
             Err(AttachError::WrongThread)
         );
         assert_eq!(
-            state.stack_attach(7, 2, |_, _| Err::<(), _>(5)),
+            state.stack_attach(7, 2, |_| true, |_, _| Err::<(), _>(5)),
             Err(AttachError::Transition(5))
         );
         assert!(!state.is_attached());
-        let saved = state.stack_attach(7, 2, |_, _| Ok::<_, ()>(())).unwrap();
+        let saved = state.stack_attach(7, 2, |_| true, |_, _| Ok::<_, ()>(())).unwrap();
         assert_eq!(
             state.unstack_detach(8, saved, |_, _| Ok::<_, ()>(())),
             Err(AttachError::WrongThread)
@@ -294,12 +327,63 @@ mod tests {
     fn process_generation_is_part_of_attachment_identity() {
         let mut state = ProcessAttachState::new(7, (1, 10));
         let saved = state
-            .stack_attach(7, (1, 11), |_, _| Ok::<_, ()>(()))
+            .stack_attach(7, (1, 11), |_| true, |_, _| Ok::<_, ()>(()))
             .unwrap();
         assert!(state.is_attached());
         assert_eq!(*state.current(), (1, 11));
         state
             .unstack_detach(7, saved, |_, _| Ok::<_, ()>(()))
             .unwrap();
+    }
+
+    #[test]
+    fn stale_target_is_refused_before_same_process_shortcut_or_transition() {
+        let mut state = ProcessAttachState::new(7, (1, 10));
+        assert_eq!(
+            state.attach(7, (1, 10), |_| false, |_, _| -> Result<(), ()> {
+                panic!("stale same-process attach transitioned")
+            }),
+            Err(AttachError::StaleTarget)
+        );
+        assert_eq!(
+            state.stack_attach(7, (2, 20), |_| false, |_, _| -> Result<(), ()> {
+                panic!("stale process transitioned")
+            }),
+            Err(AttachError::StaleTarget)
+        );
+        assert_eq!(state.active_depth(), 0);
+        assert_eq!(*state.current(), (1, 10));
+    }
+
+    #[test]
+    fn thread_and_process_teardown_retains_every_active_identity() {
+        let mut state = ProcessAttachState::new(7, (1, 10));
+        let first = state
+            .stack_attach(7, (2, 20), |_| true, |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        let second = state
+            .stack_attach(7, (3, 30), |_| true, |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(state.active_depth(), 2);
+        for identity in [(1, 10), (2, 20), (3, 30)] {
+            assert!(state.references_process(&identity));
+        }
+        assert!(!state.references_process(&(2, 21)));
+        let state = match state.retire(7) {
+            Err((AttachError::InvalidNesting, state)) => state,
+            _ => panic!("active attach retired"),
+        };
+        let mut state = match state.retire(8) {
+            Err((AttachError::WrongThread, state)) => state,
+            _ => panic!("different thread retired"),
+        };
+        state.unstack_detach(7, second, |_, _| Ok::<_, ()>(())).unwrap();
+        assert!(!state.references_process(&(3, 30)));
+        state.unstack_detach(7, first, |_, _| Ok::<_, ()>(())).unwrap();
+        assert_eq!(state.active_depth(), 0);
+        match state.retire(7) {
+            Ok(original) => assert_eq!(original, (1, 10)),
+            Err(_) => panic!("detached thread failed to retire"),
+        }
     }
 }
