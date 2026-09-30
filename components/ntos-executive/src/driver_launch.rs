@@ -43201,6 +43201,9 @@ impl DriverDispatchBackend for HostedDriverBackend {
         ctx: DispatchContext<'_>,
         irp: &IrpProjection,
     ) -> Result<DispatchOutcome, nt_status::NtStatus> {
+        if irp.requestor_tid != 0 {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
         let (input_len, output_len) = projection_buffer_extents(irp, ctx.system_buffer.len());
         let separate_output = projection_uses_separate_output(irp) && output_len != 0;
         let output_offset = if separate_output { input_len } else { 0 };
@@ -43211,7 +43214,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
         let input = Vec::from(&ctx.system_buffer[..input_len]);
         let result = hosted_file_dispatch::execute(
             self.instance,
-            None,
+            Some(unsafe { crate::initial_system_driver_caller() }),
             irp,
             &input,
             &mut ctx.system_buffer[output_offset..output_end],

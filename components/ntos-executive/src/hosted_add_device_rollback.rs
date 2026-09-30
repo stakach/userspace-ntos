@@ -1,5 +1,6 @@
 //! Retained ownership of an unpublished AddDevice attempt and its producer projections.
 use super::*;
+use crate::spawn_hosts::shared_ingress::owner::runtime;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Phase {
@@ -217,12 +218,16 @@ pub(super) unsafe fn admit_mutation(
         return Ok(());
     };
     let exact = row.channel.is_some_and(|channel| {
-        badge == 0
+        runtime::channel_route(ch)
+                .ok()
+                .flatten()
+                .is_some_and(|route| route.badge() == badge)
+            && super::instance_for_pump_channel(ch, reply_cap)
+                .is_some_and(|(index, _)| index == row.instance)
             && channel.tcb == ch.tcb
             && channel.fault_ep == ch.fault_ep
             && channel.pml4 == ch.pml4
             && channel.exec_shared_va == ch.shared_va
-            && channel.reply_cap == reply_cap
     });
     if row.phase != Phase::Dispatching || !exact {
         return Err(nt_status::NtStatus::DEVICE_BUSY);

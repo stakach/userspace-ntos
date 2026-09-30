@@ -9832,7 +9832,6 @@ const REG_MULTI_SZ: u32 = 7;
 
 const ENTRY_SIZE: usize = 0x38;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
-const OBJ_KERNEL_HANDLE: u32 = 0x200;
 
 /// The RTL_QUERY_REGISTRY_TABLE entry, read field-by-field from the caller's array.
 #[derive(Clone, Copy)]
@@ -10397,7 +10396,7 @@ unsafe fn rtl_get_registry_handle(
         );
         core::ptr::write(
             oa.as_mut_ptr().add(0x18) as *mut u32,
-            OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+            OBJ_CASE_INSENSITIVE,
         );
     }
     let status = if create {
