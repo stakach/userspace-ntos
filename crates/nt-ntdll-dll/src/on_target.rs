@@ -5786,9 +5786,9 @@ pub unsafe fn rtl_create_user_thread(
     }
     // Build the CONTEXT record on the current stack (zeroed, then Rip/Rcx/Rsp set). It must live long
     // enough for the executive's stack-mirror read during the syscall — a stack local of this fn.
-    let mut context = [0u8; nt_thread_start::AMD64_CONTEXT_SIZE];
+    let mut context = nt_thread_start::AlignedAmd64Context::zeroed();
     let initialized = nt_thread_start::initialize_amd64_user_context(
-        &mut context,
+        context.as_bytes_mut(),
         start_address,
         parameter,
         initial_teb[2],

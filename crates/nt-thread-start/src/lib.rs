@@ -2,6 +2,8 @@
 
 pub mod stack_vad;
 pub mod amd64_context;
+mod aligned_context;
+pub use aligned_context::AlignedAmd64Context;
 
 pub const CONTEXT_RCX_OFFSET: u64 = 0x80;
 pub const CONTEXT_RDX_OFFSET: u64 = 0x88;

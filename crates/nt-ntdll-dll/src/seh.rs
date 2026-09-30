@@ -55,22 +55,7 @@ const CONTEXT_FULL: u32 = 0x0010_000b;
 
 /// Stack storage for an AMD64 `CONTEXT`. `RtlCaptureContext` uses aligned XMM stores, matching the
 /// platform ABI's 16-byte alignment requirement for this structure.
-#[repr(C, align(16))]
-pub(crate) struct AlignedContext([u8; CONTEXT_SIZE]);
-
-impl AlignedContext {
-    pub(crate) const fn zeroed() -> Self {
-        Self([0; CONTEXT_SIZE])
-    }
-
-    pub(crate) fn as_ptr(&self) -> *const u8 {
-        self.0.as_ptr()
-    }
-
-    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.0.as_mut_ptr()
-    }
-}
+pub(crate) use nt_thread_start::AlignedAmd64Context as AlignedContext;
 
 #[repr(C)]
 struct RawExceptionRecord {
