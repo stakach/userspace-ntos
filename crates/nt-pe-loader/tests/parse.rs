@@ -125,6 +125,143 @@ fn immutable_support_fixture() -> Vec<u8> {
     bytes
 }
 
+fn fill_image_page(pe: &PeFile<'_>, page_rva: u32, file_size: u64) -> [u8; 0x1000] {
+    let plan = pe.image_page_fill_plan(page_rva, file_size).unwrap();
+    let mut page = [0u8; 0x1000];
+    for span in plan.spans() {
+        let from = span.file_offset as usize;
+        let to = span.page_offset as usize;
+        let len = span.length as usize;
+        page[to..to + len].copy_from_slice(&pe.bytes()[from..from + len]);
+    }
+    page
+}
+
+#[test]
+fn image_page_fill_matches_eager_headers_sections_and_zero_pages() {
+    let bytes = build_pe(
+        BASE,
+        0x1000,
+        0x5000,
+        &[
+            text_section(0x1000, vec![0x90; 0x1100]),
+            Sec {
+                name: *b".bss\0\0\0\0",
+                va: 0x3000,
+                chars: 0xc000_0080,
+                data: Vec::new(),
+            },
+        ],
+        &[],
+    );
+    let pe = PeFile::parse(&bytes).unwrap();
+    let eager = pe.map(BASE).unwrap();
+    for rva in [0, 0x1000, 0x2000, 0x3000, 0x4000] {
+        let page = fill_image_page(&pe, rva, bytes.len() as u64);
+        assert_eq!(
+            &page[..],
+            &eager.bytes[rva as usize..rva as usize + 0x1000]
+        );
+    }
+    assert_eq!(
+        pe.image_page_fill_plan(0x1000, bytes.len() as u64)
+            .unwrap()
+            .protection(),
+        ImageProtection::ExecuteWriteCopy
+    );
+    assert!(pe
+        .image_page_fill_plan(0x3000, bytes.len() as u64)
+        .unwrap()
+        .protection()
+        .copy_on_write());
+    assert!(pe
+        .image_page_fill_plan(0x4000, bytes.len() as u64)
+        .unwrap()
+        .spans()
+        .is_empty());
+}
+
+#[test]
+fn image_page_fill_uses_headers_only_and_checks_backing_extent() {
+    let bytes = build_pe(
+        BASE,
+        0x1000,
+        0x3000,
+        &[text_section(0x1000, vec![0xcc; 0x300])],
+        &[],
+    );
+    let headers = PeFile::parse(&bytes[..0x200]).unwrap();
+    let plan = headers
+        .image_page_fill_plan(0x1000, bytes.len() as u64)
+        .unwrap();
+    assert_eq!(plan.spans().len(), 1);
+    assert_eq!(plan.spans()[0].file_offset, 0x200);
+    assert_eq!(plan.spans()[0].length, 0x400);
+    assert_eq!(
+        headers.image_page_fill_plan(0x1000, 0x200),
+        Err(PeError::SectionOutOfBounds)
+    );
+    assert_eq!(
+        headers.image_page_fill_plan(1, bytes.len() as u64),
+        Err(PeError::BadRva(1))
+    );
+    assert_eq!(
+        headers.image_page_fill_plan(0x3000, bytes.len() as u64),
+        Err(PeError::BadRva(0x3000))
+    );
+}
+
+#[test]
+fn image_page_fill_rejects_subpage_section_protection() {
+    let bytes = build_pe(
+        BASE,
+        0x1100,
+        0x3000,
+        &[text_section(0x1100, vec![0xcc; 0x100])],
+        &[],
+    );
+    let pe = PeFile::parse(&bytes).unwrap();
+    assert_eq!(
+        pe.image_page_fill_plan(0x1000, bytes.len() as u64),
+        Err(PeError::UnsupportedImageAlignment(0x1100))
+    );
+}
+
+#[test]
+fn image_page_fill_rejects_header_table_outside_declared_headers() {
+    let mut bytes = build_pe(BASE, 0x1000, 0x3000, &[text_section(0x1000, vec![0xcc])], &[]);
+    put_u32(&mut bytes, OPT_OFF + 60, 0x100);
+    let pe = PeFile::parse(&bytes).unwrap();
+    assert_eq!(
+        pe.image_page_fill_plan(0, bytes.len() as u64),
+        Err(PeError::SectionOutOfBounds)
+    );
+}
+
+#[test]
+fn image_page_fill_rejects_overlapping_section_rights() {
+    let bytes = build_pe(
+        BASE,
+        0x1000,
+        0x3000,
+        &[
+            text_section(0x1000, vec![0xcc; 0x200]),
+            Sec {
+                name: *b".data\0\0\0",
+                va: 0x1000,
+                chars: 0xc000_0040,
+                data: vec![0x55; 0x200],
+            },
+        ],
+        &[],
+    );
+    let pe = PeFile::parse(&bytes).unwrap();
+    assert_eq!(
+        pe.image_page_fill_plan(0x1000, bytes.len() as u64),
+        Err(PeError::AmbiguousImagePage(0x1000))
+    );
+}
+
 fn immutable_result(bytes: &[u8]) -> Result<(), ImmutableSupportImageError> {
     immutable_support_image::validate(&PeFile::parse(bytes).unwrap())
 }
