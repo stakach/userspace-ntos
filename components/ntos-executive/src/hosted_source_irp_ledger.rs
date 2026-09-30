@@ -47,15 +47,22 @@ fn allocation(
     if bytes != expected || expected > u16::MAX as u64 {
         return None;
     }
+    let _pool_guard = unsafe { hosted_instance_pool_lock(inst.exec_pool_va)? };
+    if unsafe { hosted_instance_pool_allocation_is_free_unlocked(inst, component_address) }
+        != Some(false)
+    {
+        return None;
+    }
     let exec_address =
-        unsafe { hosted_instance_pool_allocation_exec_if_live(inst, component_address, bytes)? };
+        unsafe { hosted_pool_allocation_exec_va(inst.exec_pool_va, component_address, bytes)? };
+    let pool_generation = unsafe { read_volatile((exec_address - 8) as *const u64) };
     let valid_header = unsafe {
         read_unaligned(exec_address as *const u16) == WDM_X64_IO_TYPE_IRP
             && read_unaligned((exec_address + 2) as *const u16) as u64 == bytes
             && read_unaligned((exec_address + WDM_X64_IRP_STACK_COUNT_OFFSET) as *const u8)
                 == stack_count
     };
-    if !valid_header {
+    if !valid_header || pool_generation == 0 {
         return None;
     }
     Some(SourceIrpAllocation {
@@ -64,6 +71,7 @@ fn allocation(
         component_address,
         bytes,
         stack_count,
+        pool_generation,
     })
 }
 
@@ -87,12 +95,12 @@ pub(super) fn service(
             let Some(stack_count) = u8::try_from(stack_count).ok() else {
                 return (STATUS_INVALID_PARAMETER, 0, 0);
             };
+            let _guard = lock();
             let Some(allocation) =
                 allocation(instance_index, inst, component_address, bytes, stack_count)
             else {
                 return (STATUS_INVALID_PARAMETER, 0, 0);
             };
-            let _guard = lock();
             match ledger().register(allocation) {
                 Ok(ticket) => (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get()),
                 Err(SourceIrpLedgerError::AlreadyLive) => {
@@ -111,8 +119,7 @@ pub(super) fn service(
                 SourceIrpOwner::HostedDriver(instance_index),
                 domain,
                 component_address,
-            )
-            else {
+            ) else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
             if allocation(

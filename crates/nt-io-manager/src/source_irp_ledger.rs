@@ -21,6 +21,7 @@ pub struct SourceIrpAllocation {
     pub component_address: u64,
     pub bytes: u64,
     pub stack_count: u8,
+    pub pool_generation: u64,
 }
 
 impl SourceIrpAllocation {
@@ -30,6 +31,7 @@ impl SourceIrpAllocation {
             && self.component_address != 0
             && self.bytes != 0
             && self.stack_count != 0
+            && self.pool_generation != 0
     }
 }
 
@@ -85,12 +87,16 @@ impl SourceIrpLedger {
         if !allocation.valid() {
             return Err(SourceIrpLedgerError::InvalidAllocation);
         }
-        if self.rows.iter().any(|row| {
+        if let Some(row) = self.rows.iter().find(|row| {
             row.allocation.owner == allocation.owner
                 && row.allocation.domain == allocation.domain
                 && row.allocation.component_address == allocation.component_address
         }) {
-            return Err(SourceIrpLedgerError::AlreadyLive);
+            return if row.allocation == allocation && !row.free_requested {
+                Ok(row.ticket)
+            } else {
+                Err(SourceIrpLedgerError::AlreadyLive)
+            };
         }
         self.rows
             .try_reserve(1)
@@ -291,6 +297,7 @@ mod tests {
             component_address: address,
             bytes: 0x128,
             stack_count: 2,
+            pool_generation: 1,
         }
     }
 
@@ -316,14 +323,11 @@ mod tests {
     }
 
     #[test]
-    fn pinned_irp_cannot_be_freed_or_registered_twice() {
+    fn pinned_irp_cannot_be_freed_and_exact_retry_recovers_its_ticket() {
         let mut ledger = SourceIrpLedger::new();
         let owner = allocation(0x2000, 11);
         let ticket = ledger.register(owner).unwrap();
-        assert_eq!(
-            ledger.register(owner),
-            Err(SourceIrpLedgerError::AlreadyLive)
-        );
+        assert_eq!(ledger.register(owner), Ok(ticket));
         assert_eq!(
             ledger.pin(owner.owner, owner.domain, owner.component_address),
             Ok((ticket, owner))
@@ -334,6 +338,47 @@ mod tests {
         );
         ledger.unpin(ticket).unwrap();
         assert_eq!(ledger.retire(ticket, owner), Ok(()));
+    }
+
+    #[test]
+    fn reused_pool_generation_cannot_impersonate_a_live_source_irp() {
+        let mut ledger = SourceIrpLedger::new();
+        let first = allocation(0x2000, 11);
+        let ticket = ledger.register(first).unwrap();
+        let reused = SourceIrpAllocation {
+            pool_generation: first.pool_generation + 1,
+            ..first
+        };
+        assert_eq!(
+            ledger.register(reused),
+            Err(SourceIrpLedgerError::AlreadyLive)
+        );
+        assert!(!ledger.matches(reused.owner, reused, ticket));
+        assert_eq!(
+            ledger.retirement_ready(ticket, reused),
+            Err(SourceIrpLedgerError::WrongIdentity)
+        );
+        ledger.retire(ticket, first).unwrap();
+        let next = ledger.register(reused).unwrap();
+        assert_ne!(next, ticket);
+        assert_eq!(ledger.register(reused), Ok(next));
+        assert_eq!(
+            ledger.retire(ticket, reused),
+            Err(SourceIrpLedgerError::WrongIdentity)
+        );
+    }
+
+    #[test]
+    fn zero_native_pool_generation_is_not_an_allocation_identity() {
+        let mut ledger = SourceIrpLedger::new();
+        let invalid = SourceIrpAllocation {
+            pool_generation: 0,
+            ..allocation(0x2000, 11)
+        };
+        assert_eq!(
+            ledger.register(invalid),
+            Err(SourceIrpLedgerError::InvalidAllocation)
+        );
     }
 
     #[test]
