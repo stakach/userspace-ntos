@@ -36,6 +36,8 @@ mod irql;
 mod provider_wait_context;
 #[path = "win32k_source_irp.rs"]
 mod source_irp;
+#[path = "win32k_subsystem/provider_input.rs"]
+mod provider_input;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 use nt_compat_exports::{
     ssdt::{
