@@ -209,15 +209,17 @@ pub fn plan_synchronous_fsd_request(
                 plan.system_buffer_input_len = length;
             }
         } else if device_flags & DO_DIRECT_IO != 0 {
-            plan.mdl = Some(MdlPlan {
-                buffer,
-                length,
-                access: if major == major::IRP_MJ_READ {
-                    MdlAccess::Write
-                } else {
-                    MdlAccess::Read
-                },
-            });
+            if length != 0 {
+                plan.mdl = Some(MdlPlan {
+                    buffer,
+                    length,
+                    access: if major == major::IRP_MJ_READ {
+                        MdlAccess::Write
+                    } else {
+                        MdlAccess::Read
+                    },
+                });
+            }
         } else {
             plan.user_buffer = buffer;
         }
@@ -270,13 +272,13 @@ pub fn plan_device_io_control_request(
             }
         }
         ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT => {
-            if input_buffer != 0 {
+            if input_len != 0 {
                 plan.system_buffer_len = input_len;
                 plan.system_buffer_input = input_buffer;
                 plan.system_buffer_input_len = input_len;
                 plan.irp_flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER;
             }
-            if output_buffer != 0 {
+            if output_len != 0 {
                 plan.mdl = Some(MdlPlan {
                     buffer: output_buffer,
                     length: output_len,

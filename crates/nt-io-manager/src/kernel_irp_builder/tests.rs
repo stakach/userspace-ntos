@@ -179,6 +179,21 @@ fn fsd_read_write_buffer_modes_match_reactos() {
 }
 
 #[test]
+fn zero_length_direct_fsd_does_not_describe_an_unlocked_mdl() {
+    let plan = plan_synchronous_fsd_request(
+        major::IRP_MJ_READ,
+        1,
+        DO_DIRECT_IO,
+        0x1000,
+        0x2000,
+        0,
+        Some(0),
+    )
+    .unwrap();
+    assert_eq!(plan.mdl, None);
+}
+
+#[test]
 fn fsd_control_majors_ignore_buffer_and_offset() {
     for major in [
         major::IRP_MJ_PNP,
