@@ -50,6 +50,8 @@ pub(crate) unsafe fn submit(
         Err(status) => return Some(status),
     };
     match relation_type {
+        // IoSynchronousInvalidateDeviceRelations(TargetDeviceRelation) requests no bus
+        // re-enumeration. The actual TargetDeviceRelation query is a separate PnP IRP.
         nt_pnp_abi::TARGET_DEVICE_RELATION => return Some(nt_status::NtStatus::SUCCESS.raw()),
         nt_pnp_abi::POWER_RELATIONS => return Some(nt_status::NtStatus::NOT_IMPLEMENTED.raw()),
         nt_pnp_abi::BUS_RELATIONS => {}

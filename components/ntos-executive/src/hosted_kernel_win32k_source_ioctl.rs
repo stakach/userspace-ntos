@@ -9,14 +9,14 @@ use nt_kernel_exec::{EventLeaseId, EventLeaseKind, EventObjectId, EventSignalMod
 type Route = nt_component_suspension::peer_registry::PeerRoute;
 type Identity = (Route, u64, u64);
 
-enum Target {
+pub(super) enum Target {
     None,
     Stack { va: u64, alias: u64, len: u64 },
     Stable(crate::win32k_subsystem::file_ioctl_target::RootIoctlOutputTarget),
 }
 
 impl Target {
-    unsafe fn capture(route: Route, va: u64, len: u64) -> Option<Self> {
+    pub(super) unsafe fn capture(route: Route, va: u64, len: u64) -> Option<Self> {
         if len == 0 {
             return Some(Self::None);
         }
@@ -27,7 +27,7 @@ impl Target {
             .map(Self::Stable)
     }
 
-    unsafe fn address_if_live(&self, route: Route) -> Option<u64> {
+    pub(super) unsafe fn address_if_live(&self, route: Route) -> Option<u64> {
         match self {
             Self::None => Some(0),
             Self::Stack { va, alias, len } => {
@@ -40,11 +40,11 @@ impl Target {
     }
 }
 
-struct CanonicalEvent {
-    id: EventObjectId,
+pub(super) struct CanonicalEvent {
+    pub(super) id: EventObjectId,
     lease: EventLeaseId,
-    local: u64,
-    provider: nt_provider_wait::ProviderDomainIdentity,
+    pub(super) local: u64,
+    pub(super) provider: nt_provider_wait::ProviderDomainIdentity,
 }
 
 struct Work {
@@ -53,6 +53,8 @@ struct Work {
     reply: u64,
     token: u64,
     source_address: u64,
+    source_ticket: u64,
+    source_generation: u64,
     source: crate::win32k_subsystem::SourceBufferedDispatchLease,
     target: HostedForwardTarget,
     event: Option<CanonicalEvent>,
@@ -96,6 +98,32 @@ static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static NEXT_WAIT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
+pub(super) unsafe fn reserve_external_source_token() -> Option<u64> {
+    (&mut *core::ptr::addr_of_mut!(ACTIVE)).try_reserve(1).ok()?;
+    (&mut *core::ptr::addr_of_mut!(COMPLETED)).try_reserve(1).ok()?;
+    NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .ok().filter(|token| *token != 0)
+}
+
+pub(super) unsafe fn register_external_source(route: Route, source: u64, token: u64) {
+    (&mut *core::ptr::addr_of_mut!(ACTIVE)).push((route, source, token));
+}
+
+pub(super) unsafe fn complete_external_source(route: Route, source: u64, token: u64) {
+    let identity = (route, source, token);
+    let index = (&*core::ptr::addr_of!(ACTIVE)).iter().position(|row| *row == identity)
+        .expect("active external source identity");
+    (&mut *core::ptr::addr_of_mut!(ACTIVE)).swap_remove(index);
+    (&mut *core::ptr::addr_of_mut!(COMPLETED)).push(identity);
+}
+
+pub(super) unsafe fn cancel_external_source(route: Route, source: u64, token: u64) {
+    let identity = (route, source, token);
+    let index = (&*core::ptr::addr_of!(ACTIVE)).iter().position(|row| *row == identity)
+        .expect("cancelled external source identity");
+    (&mut *core::ptr::addr_of_mut!(ACTIVE)).swap_remove(index);
+}
+
 fn wire_status(error: wire::WireError) -> i32 {
     match error {
         wire::WireError::BufferTooSmall | wire::WireError::LengthMismatch =>
@@ -104,7 +132,7 @@ fn wire_status(error: wire::WireError) -> i32 {
     }
 }
 
-unsafe fn release_event(handler: *mut ExecNtHandler, event: CanonicalEvent) {
+pub(super) unsafe fn release_event(handler: *mut ExecNtHandler, event: CanonicalEvent) {
     if let Some(retired) = (*handler)
         .event_objects
         .release_wait(event.lease, EventLeaseKind::Operation)
@@ -114,7 +142,7 @@ unsafe fn release_event(handler: *mut ExecNtHandler, event: CanonicalEvent) {
     }
 }
 
-unsafe fn capture_event(
+pub(super) unsafe fn capture_event(
     handler: *mut ExecNtHandler,
     expected: Option<wire::EventIdentity>,
 ) -> Result<Option<CanonicalEvent>, i32> {
@@ -208,7 +236,7 @@ pub(crate) unsafe fn completion_for_token(
     None
 }
 
-unsafe fn redrive_completion_waits() {
+pub(super) unsafe fn redrive_completion_waits() {
     let mut index = 0;
     while index < (&*core::ptr::addr_of!(COMPLETION_WAITS)).len() {
         let wait = &mut (&mut *core::ptr::addr_of_mut!(COMPLETION_WAITS))[index];
@@ -326,10 +354,7 @@ pub(crate) unsafe fn submit(
         Ok(request) => request,
         Err(error) => return Some(wire_status(error)),
     };
-    if (&*core::ptr::addr_of!(ACTIVE))
-        .iter()
-        .any(|(_, source, _)| *source == request.source_irp_va)
-    {
+    if super::hosted_kernel_win32k_source_admission::contains(request.source_irp_va) {
         return Some(STATUS_INVALID_PARAMETER);
     }
     let access = match crate::win32k_device_consumer::authenticate(
@@ -364,6 +389,7 @@ pub(crate) unsafe fn submit(
         request.source_irp_va,
         request.device_object_va,
         provider_stack_pointer,
+        Some(route),
     ) {
         Ok(source) => source,
         Err(status) => {
@@ -378,7 +404,9 @@ pub(crate) unsafe fn submit(
         && source.source_native_generation() == request.native_allocation_generation
         && source.device == request.device_object_va
         && source.code == request.code
+        && source.method == nt_io_abi::ioctl::method(request.code)
         && source.input.as_slice() == request.input
+        && source.output_initial.as_slice() == request.output_initial
         && source.output_capacity == request.output_capacity
         && source.event == request.event
         && source.event.is_some() == source.event_body().is_some();
@@ -391,7 +419,11 @@ pub(crate) unsafe fn submit(
         target.release(io_manager_mut()).expect("mismatched source IOCTL target");
         return Some(STATUS_INVALID_PARAMETER);
     }
-    let output_target = Target::capture(route, source.output_va, u64::from(source.output_capacity));
+    let output_target = if source.method == nt_io_abi::ioctl::METHOD_IN_DIRECT {
+        Some(Target::None)
+    } else {
+        Target::capture(route, source.output_va, u64::from(source.output_capacity))
+    };
     let iosb_target = Target::capture(route, source.iosb_va, 16);
     let (Some(output_target), Some(iosb_target)) = (output_target, iosb_target) else {
         if !crate::win32k_subsystem::abort_source_buffered_ioctl_dispatch(&mut source) {
@@ -421,6 +453,9 @@ pub(crate) unsafe fn submit(
         return Some(STATUS_INSUFFICIENT_RESOURCES);
     }
     output.resize(request.output_capacity as usize, 0);
+    if !source.output_initial.is_empty() {
+        output.copy_from_slice(&source.output_initial);
+    }
     let token = match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
         Ok(token) if token != 0 => token,
         _ => {
@@ -433,8 +468,21 @@ pub(crate) unsafe fn submit(
         }
     };
     let source_address = source.source_address();
+    let source_ticket = source.source_ticket_serial();
+    let source_generation = source.source_native_generation();
+    if !super::hosted_kernel_win32k_source_admission::register(
+        route, source_address, source_ticket, source_generation,
+    ) {
+        if !crate::win32k_subsystem::abort_source_buffered_ioctl_dispatch(&mut source) {
+            crate::provider_bugcheck::report(0xc4, [source_address, token, 0, 57]);
+        }
+        if let Some(event) = event.take() { release_event(handler, event); }
+        target.release(io_manager_mut()).expect("unentered source IOCTL target");
+        return Some(STATUS_INSUFFICIENT_RESOURCES);
+    }
     let work = Work {
-        route, dispatch, reply, token, source_address, source, target, event,
+        route, dispatch, reply, token, source_address, source_ticket, source_generation,
+        source, target, event,
         packet_lease, packet, output, output_target, iosb_target,
         irp: None, entered: false, packet_prepared: false,
         reply_entered: false, reply_acked: false,
@@ -452,6 +500,9 @@ pub(crate) unsafe fn submit(
         rows.len() - 1
     };
     if runtime::park_retained_service(route, token).is_err() {
+        super::hosted_kernel_win32k_source_admission::retire(
+            route, source_address, source_ticket, source_generation,
+        );
         let mut work = (&mut *core::ptr::addr_of_mut!(WORK))[index]
             .take()
             .expect("unparked source IOCTL");
@@ -503,6 +554,9 @@ impl Work {
             .position(|row| *row == identity)
             .expect("cancelled source IOCTL identity");
         (&mut *core::ptr::addr_of_mut!(ACTIVE)).swap_remove(index);
+        super::hosted_kernel_win32k_source_admission::retire(
+            self.route, self.source_address, self.source_ticket, self.source_generation,
+        );
         true
     }
 
@@ -515,14 +569,9 @@ impl Work {
                 wire::publish_pending(&mut self.packet, self.token)
             } else {
                 let (_, information) = self.terminal.expect("inline source IOCTL terminal");
-                let output_len = if nt_io_completion::file_io_status_copies_output(status) {
-                    nt_io_manager::completion_output_transfer_len(
-                        information,
-                        self.output.len() as u64,
-                    ) as usize
-                } else {
-                    0
-                };
+                let output_len = wire::completion_output_len(
+                    self.source.code, status, information, self.source.output_capacity,
+                );
                 wire::publish_inline_terminal(
                     &mut self.packet,
                     self.token,
@@ -556,11 +605,9 @@ impl Work {
             return true;
         }
         let (status, information) = self.terminal.expect("source IOCTL terminal");
-        let length = if nt_io_completion::file_io_status_copies_output(status) {
-            nt_io_manager::completion_output_transfer_len(information, self.output.len() as u64) as usize
-        } else {
-            0
-        };
+        let length = wire::completion_output_len(
+            self.source.code, status, information, self.source.output_capacity,
+        );
         if let Some(irp) = self.irp {
             if length != 0 {
                 match copy_completed_irp_output_exact(irp.raw(), 0, &mut self.output[..length]) {
@@ -575,9 +622,9 @@ impl Work {
 
     unsafe fn output_slice(&self) -> &[u8] {
         let (status, information) = self.terminal.expect("source IOCTL terminal");
-        let length = if nt_io_completion::file_io_status_copies_output(status) {
-            nt_io_manager::completion_output_transfer_len(information, self.output.len() as u64) as usize
-        } else { 0 };
+        let length = wire::completion_output_len(
+            self.source.code, status, information, self.source.output_capacity,
+        );
         &self.output[..length]
     }
 
@@ -652,6 +699,9 @@ impl Work {
             .expect("active source IOCTL identity");
         (&mut *core::ptr::addr_of_mut!(ACTIVE)).swap_remove(index);
         (&mut *core::ptr::addr_of_mut!(COMPLETED)).push(identity);
+        super::hosted_kernel_win32k_source_admission::retire(
+            self.route, self.source_address, self.source_ticket, self.source_generation,
+        );
         true
     }
 

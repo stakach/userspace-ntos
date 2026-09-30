@@ -18,6 +18,8 @@ struct Work {
     reply: u64,
     token: u64,
     source_address: u64,
+    source_ticket: u64,
+    source_generation: u64,
     source: crate::win32k_subsystem::SourcePnpDispatchLease,
     target: HostedForwardTarget,
     event: Option<CanonicalEvent>,
@@ -102,7 +104,7 @@ pub(crate) unsafe fn submit(
         Ok(request) => request,
         Err(_) => return Some(STATUS_INVALID_PARAMETER),
     };
-    if (&*core::ptr::addr_of!(ACTIVE)).iter().any(|(_, source, _)| *source == request.source_irp_va) {
+    if super::hosted_kernel_win32k_source_admission::contains(request.source_irp_va) {
         return Some(STATUS_INVALID_PARAMETER);
     }
     let access = match crate::win32k_device_consumer::authenticate(
@@ -189,8 +191,21 @@ pub(crate) unsafe fn submit(
         }
     };
     let source_address = source.source_address();
+    let source_ticket = source.source_ticket_serial();
+    let source_generation = source.source_native_generation();
+    if !super::hosted_kernel_win32k_source_admission::register(
+        route, source_address, source_ticket, source_generation,
+    ) {
+        if !crate::win32k_subsystem::abort_source_target_relation_dispatch(&mut source) {
+            crate::provider_bugcheck::report(0xc4, [source_address, token, 0, 58]);
+        }
+        if let Some(event) = event.take() { release_event(handler, event); }
+        target.release(io_manager_mut()).expect("unentered PnP target");
+        return Some(STATUS_INSUFFICIENT_RESOURCES);
+    }
     let work = Work {
-        route, dispatch, reply, token, source_address, source, target, event, iosb_target,
+        route, dispatch, reply, token, source_address, source_ticket, source_generation,
+        source, target, event, iosb_target,
         packet_lease, packet, canonical_irp: None, receipt: None, pending: false, entered: false,
         terminal: None, relation: None, relation_allocation: None, source_allocation: None,
         source_pdo: None, allocations: ProviderAllocationCatalog::new(),
@@ -208,6 +223,9 @@ pub(crate) unsafe fn submit(
         rows.len() - 1
     };
     if runtime::park_retained_service(route, token).is_err() {
+        super::hosted_kernel_win32k_source_admission::retire(
+            route, source_address, source_ticket, source_generation,
+        );
         let mut work = (&mut *core::ptr::addr_of_mut!(WORK))[index].take().unwrap();
         if !crate::win32k_subsystem::abort_source_target_relation_dispatch(&mut work.source) {
             crate::provider_bugcheck::report(0xc4, [source_address, token, 0, 44]);
@@ -410,6 +428,9 @@ impl Work {
         let index = (&*core::ptr::addr_of!(ACTIVE)).iter().position(|row| *row == identity)
             .expect("cancelled PnP identity");
         (&mut *core::ptr::addr_of_mut!(ACTIVE)).swap_remove(index);
+        super::hosted_kernel_win32k_source_admission::retire(
+            self.route, self.source_address, self.source_ticket, self.source_generation,
+        );
         true
     }
 
@@ -612,6 +633,9 @@ impl Work {
             .expect("active PnP identity");
         (&mut *core::ptr::addr_of_mut!(ACTIVE)).swap_remove(index);
         (&mut *core::ptr::addr_of_mut!(COMPLETED)).push(identity);
+        super::hosted_kernel_win32k_source_admission::retire(
+            self.route, self.source_address, self.source_ticket, self.source_generation,
+        );
         true
     }
 
