@@ -13,6 +13,7 @@
 extern crate alloc;
 
 mod completion;
+pub mod apc_state;
 pub mod cr8_getter_patch;
 mod cyclic_ids;
 pub mod dbg;
