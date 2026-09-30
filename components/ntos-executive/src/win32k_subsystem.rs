@@ -15097,6 +15097,7 @@ fn register_trampolines() -> bool {
     reg.bind("ExRaiseAccessViolation", seh.access_violation_va);
     reg.bind("ExRaiseStatus", seh.raise_va);
     reg.bind("RtlUnwindEx", seh.unwind_entry_va);
+    reg.bind("RtlUnwind", seh.legacy_unwind_va);
     reg.bind(
         "RtlAreAllAccessesGranted",
         s_rtl_are_all_accesses_granted as usize as u64,

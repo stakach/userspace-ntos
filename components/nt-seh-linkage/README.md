@@ -19,6 +19,8 @@ void SehRaiseStatus(uint32_t status); /* traps without a dispatcher */
 void SehRaiseAccessViolation(void); /* raises STATUS_ACCESS_VIOLATION, nonreturning */
 void SehUnwindEx(void *target_frame, void *target_ip, void *exception_record,
                  void *return_value, void *context_record, void *history_table);
+void SehUnwind(void *target_frame, void *target_ip, void *exception_record,
+               void *return_value); /* RtlUnwind-compatible entry */
 void SehResumeContext(void *validated_raw_context); /* nonreturning */
 ```
 
@@ -36,6 +38,8 @@ first argument; `CLANG` and `RUST_LLD` select the cross compiler and linker.
 The executive build stages the verified DLL in the OS image and maps it RX/RO_NX into each hosted
 driver domain. `SehUnwindEx` captures a full caller context on its own stack, copies it to the
 caller's aligned `ContextRecord`, and passes a fixed sidecar to its nonreturning dispatch slot.
+`SehUnwind` supplies its own aligned stack-local `CONTEXT` and null history table to that same
+entry, matching the four-argument NT `RtlUnwind` contract.
 The sidecar contains the six original Win64 arguments, captured context VA and entry RSP. The
 native dispatcher must authenticate that stack frame, the captured context and all target values
 before any unwind or restore.

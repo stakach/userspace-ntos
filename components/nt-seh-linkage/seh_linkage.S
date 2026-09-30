@@ -15,6 +15,8 @@
  * void SehRaiseAccessViolation(void);  // does not return
  * void SehUnwindEx(void *target_frame, void *target_ip, void *exception_record,
  *                  void *return_value, void *context_record, void *history_table);
+ * void SehUnwind(void *target_frame, void *target_ip, void *exception_record,
+ *                void *return_value);
  * void SehResumeContext(void *validated_raw_context);  // does not return
  * uint64_t SehForeignCall2(uint64_t (*target)(uint64_t, uint64_t),
  *                          uint64_t arg1, uint64_t arg2);
@@ -427,6 +429,24 @@ SehRaiseAccessViolation:
     .seh_endprologue
     movl $0xc0000005, %ecx
     jmp SehRaiseStatus
+    .seh_endproc
+
+    /* ReactOS RtlUnwind passes a private CONTEXT and null history table to
+       RtlUnwindEx. The private CONTEXT remains live until that call restores
+       the target frame; both frames have genuine Win64 unwind metadata. */
+    .globl SehUnwind
+    .seh_proc SehUnwind
+SehUnwind:
+    subq $0x508, %rsp
+    .seh_stackalloc 0x508
+    .seh_endprologue
+    /* [rsp,rsp+0x20) is shadow space, followed by arguments five and six.
+       The 16-byte-aligned 0x4d0-byte CONTEXT occupies [rsp+0x30,rsp+0x500). */
+    leaq 0x30(%rsp), %rax
+    movq %rax, 0x20(%rsp)
+    movq $0, 0x28(%rsp)
+    callq SehUnwindEx
+    ud2
     .seh_endproc
 
     .section .rdata,"dr"
