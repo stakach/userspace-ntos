@@ -16,6 +16,7 @@ int32_t SehCallFilter(int32_t (*filter)(void *, void *), void *exception_pointer
 void SehCallFinally(void (*finally)(unsigned char, void *), void *establisher_frame,
                     void *dispatcher_context);
 void SehRaiseStatus(uint32_t status); /* traps without a dispatcher */
+void SehRaiseAccessViolation(void); /* raises STATUS_ACCESS_VIOLATION, nonreturning */
 void SehUnwindEx(void *target_frame, void *target_ip, void *exception_record,
                  void *return_value, void *context_record, void *history_table);
 void SehResumeContext(void *validated_raw_context); /* nonreturning */

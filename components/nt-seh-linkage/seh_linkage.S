@@ -12,6 +12,7 @@
  * int32_t SehExecuteHandlerForUnwind(void *exception_record, void *establisher_frame,
  *                                    void *context_record, void *dispatcher_context);
  * void SehRaiseStatus(uint32_t status);
+ * void SehRaiseAccessViolation(void);  // does not return
  * void SehUnwindEx(void *target_frame, void *target_ip, void *exception_record,
  *                  void *return_value, void *context_record, void *history_table);
  * void SehResumeContext(void *validated_raw_context);  // does not return
@@ -416,6 +417,16 @@ SehCallFinally:
     nop
     addq $40, %rsp
     retq
+    .seh_endproc
+
+    /* Preserve the caller's return address and stack while entering the
+       authenticated status-raise frame with STATUS_ACCESS_VIOLATION. */
+    .globl SehRaiseAccessViolation
+    .seh_proc SehRaiseAccessViolation
+SehRaiseAccessViolation:
+    .seh_endprologue
+    movl $0xc0000005, %ecx
+    jmp SehRaiseStatus
     .seh_endproc
 
     .section .rdata,"dr"
