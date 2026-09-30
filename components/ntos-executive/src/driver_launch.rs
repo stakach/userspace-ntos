@@ -33493,6 +33493,9 @@ pub unsafe extern "C" fn fsd_component_entry(heap_frames: u64) -> ! {
             mj: WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET as u64,
             mj_table_off: SH_MJ_TABLE, // 0x18 — the FSD records its MajorFunction[] base here
             pool: pool_alloc,
+            foreign_call2_va: read_volatile(
+                (FSD_SHARED_VADDR + SH_SEH_FOREIGN_CALL2_VA) as *const u64,
+            ),
             support_entry_rva_off: SH_SUPPORT_ENTRY_RVA,
             support_count_off: SH_SUPPORT_ENTRY_COUNT,
             support_records_off: SH_SUPPORT_RECORDS,

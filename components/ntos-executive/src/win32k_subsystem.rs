@@ -182,6 +182,9 @@ pub const WIN32K_AUX_PT_VADDR: u64 = 0x0000_0100_0700_0000;
 /// 9 frames.
 pub const WIN32K_DATA_VADDR: u64 = 0x0000_0100_0710_0000;
 pub const WIN32K_DATA_FRAMES: u64 = 9;
+pub const WIN32K_SEH_FOREIGN_CALL2_VA: u64 = WIN32K_DATA_VADDR + 0x6000;
+pub const WIN32K_SEH_FOREIGN_CALL16_VA: u64 = WIN32K_SEH_FOREIGN_CALL2_VA + 8;
+const _: () = assert!(WIN32K_SEH_FOREIGN_CALL16_VA + 8 <= WIN32K_DATA_VADDR + WIN32K_DATA_FRAMES * 0x1000);
 /// Per-dispatch primary-token user SID bytes. The shared dispatch page carries a pointer to this
 /// data-region buffer so the callback frame can remain at its fixed `0x200` offset.
 pub const WIN32K_TOKEN_USER_SID_VADDR: u64 = WIN32K_DATA_VADDR + 0x5000;
@@ -309,9 +312,7 @@ pub const WIN32K_SHARED_VADDR: u64 = 0x0000_0100_0718_0000;
 
 unsafe fn call_win32k_pe(target: u64, args: &[u64]) -> u64 {
     assert!(target != 0 && args.len() <= 16, "invalid win32k PE callback");
-    let boundary = read_volatile(
-        (WIN32K_SHARED_VADDR + crate::driver_launch::SH_SEH_FOREIGN_CALL16_VA) as *const u64,
-    );
+    let boundary = read_volatile(WIN32K_SEH_FOREIGN_CALL16_VA as *const u64);
     assert_ne!(boundary, 0, "win32k PE callback lacks its admitted boundary");
     let call: unsafe extern "win64" fn(u64, *const u64, u64) -> u64 =
         core::mem::transmute(boundary as *const ());
@@ -16300,15 +16301,33 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) ->
         WIN32K_SE_SID_POOL_VA,
     );
 
-    // Patch the IAT in place: walk the import descriptors (data dir 1) in the mapped image.
+    // Bind only native imports here. Static driver dependencies are loaded into this VSpace and
+    // resolved from their own PE export tables before win32k calls through those IAT slots.
     let imp_rva = read_unaligned((opt + 112 + 8) as *const u32) as u64;
     if imp_rva != 0 {
-        let mut desc = code_va + imp_rva;
-        loop {
+        let imp_size = read_unaligned((opt + 112 + 8 + 4) as *const u32) as u64;
+        if !image_rva_span_ok(imp_rva, imp_size, WIN32K_IMAGE_BYTES) {
+            return None;
+        }
+        let mut desc_rva = imp_rva;
+        while desc_rva + 20 <= imp_rva + imp_size {
+            let desc = code_va + desc_rva;
             let ilt = read_unaligned(desc as *const u32) as u64; // OriginalFirstThunk
             let iat = read_unaligned((desc + 16) as *const u32) as u64; // FirstThunk
             if ilt == 0 && iat == 0 {
                 break;
+            }
+            let dll_rva = read_unaligned((desc + 12) as *const u32) as u64;
+            let Some(dll_len) = image_c_string_len(code_va, dll_rva, WIN32K_IMAGE_BYTES, 31)
+            else {
+                return None;
+            };
+            if !image_c_string_is_safe(code_va, dll_rva, dll_len) {
+                return None;
+            }
+            if !image_c_string_is_native_import(code_va, dll_rva, dll_len) {
+                desc_rva += 20;
+                continue;
             }
             let names = code_va + if ilt != 0 { ilt } else { iat };
             let slots = code_va + iat;
@@ -16343,7 +16362,7 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) ->
                 }
                 k += 1;
             }
-            desc += 20;
+            desc_rva += 20;
         }
     }
 
@@ -16440,6 +16459,7 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
             mj: 0x100,
             mj_table_off: u64::MAX,
             pool: pool_alloc_export,
+            foreign_call2_va: read_volatile(WIN32K_SEH_FOREIGN_CALL2_VA as *const u64),
             support_entry_rva_off: u64::MAX,
             support_count_off: u64::MAX,
             support_records_off: u64::MAX,
@@ -18025,9 +18045,7 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     if nargs > 16 {
         return STATUS_INVALID_SYSTEM_SERVICE;
     }
-    let boundary = read_volatile(
-        (sh + crate::driver_launch::SH_SEH_FOREIGN_CALL16_VA) as *const u64,
-    );
+    let boundary = read_volatile(WIN32K_SEH_FOREIGN_CALL16_VA as *const u64);
     if boundary == 0 {
         return STATUS_INVALID_SYSTEM_SERVICE;
     }
@@ -18894,10 +18912,9 @@ pub unsafe fn win32k_static_import_dependency(index: usize, out: &mut [u8]) -> O
     None
 }
 
-/// Re-patch win32k's OWN IAT for a loaded static import DLL. Runs in the EXECUTIVE while win32k's
-/// frames are still mapped writable at [`WIN32K_CODE_VA`]. `load_into` initially resolved non-native
-/// imports to visible benign stubs because the dependency image was not loaded yet; this points the
-/// import slots at real exports from the loaded dependency. Returns the number of slots patched.
+/// Patch win32k's OWN IAT for a loaded static import DLL. Runs in the EXECUTIVE while win32k's
+/// frames are still mapped writable at [`WIN32K_CODE_VA`]. `load_into` leaves non-native IAT slots
+/// untouched until the dependency image is available. Returns the number of slots patched.
 pub unsafe fn patch_win32k_static_import(dll_name: &[u8], dll_base: u64) -> u32 {
     if !import_dll_name_is_safe(dll_name) || dll_base == 0 {
         return 0;
@@ -18937,37 +18954,46 @@ pub unsafe fn patch_win32k_static_import(dll_name: &[u8], dll_base: u64) -> u32 
             if !image_rva_span_ok(thunk_rva, 8, WIN32K_IMAGE_BYTES)
                 || !image_rva_span_ok(iat, 8, WIN32K_IMAGE_BYTES)
             {
-                return patched;
+                return 0;
             }
             let names = code_va + thunk_rva;
             let slots = code_va + iat;
             let mut k = 0u64;
+            let mut terminated = false;
             let thunk_cap =
                 ((WIN32K_IMAGE_BYTES - thunk_rva) / 8).min((WIN32K_IMAGE_BYTES - iat) / 8);
             while k < thunk_cap {
                 let thunk = read_unaligned((names + k * 8) as *const u64);
                 if thunk == 0 {
+                    terminated = true;
                     break;
                 }
                 if thunk & 0x8000_0000_0000_0000 == 0 {
                     let name_rva = thunk & 0x7FFF_FFFF;
                     if !image_rva_span_ok(name_rva, 2, WIN32K_IMAGE_BYTES) {
-                        return patched;
+                        return 0;
                     }
                     let name_ptr = code_va + name_rva + 2;
                     let Some(cstr_len) =
                         image_c_string_len(code_va, name_rva + 2, WIN32K_IMAGE_BYTES, 63)
                     else {
-                        return patched;
+                        return 0;
                     };
                     let import_name = core::slice::from_raw_parts(name_ptr as *const u8, cstr_len);
                     let addr = pe_export_lookup(dll_base, import_name);
-                    if addr != 0 {
-                        write_unaligned((slots + k * 8) as *mut u64, addr);
-                        patched += 1;
+                    if addr == 0 {
+                        log_unresolved_win32k_import(import_name);
+                        return 0;
                     }
+                    write_unaligned((slots + k * 8) as *mut u64, addr);
+                    patched += 1;
+                } else {
+                    return 0;
                 }
                 k += 1;
+            }
+            if !terminated {
+                return 0;
             }
             break;
         }

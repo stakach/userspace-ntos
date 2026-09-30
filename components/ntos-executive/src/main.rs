@@ -31188,6 +31188,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 entry_rva as u64,
             );
             core::ptr::write_volatile(
+                win32k_subsystem::WIN32K_SEH_FOREIGN_CALL2_VA as *mut u64,
+                seh_image.linkage().foreign_call2_va,
+            );
+            core::ptr::write_volatile(
+                win32k_subsystem::WIN32K_SEH_FOREIGN_CALL16_VA as *mut u64,
+                seh_image.linkage().foreign_call16_va,
+            );
+            core::ptr::write_volatile(
                 (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_VERDICT) as *mut u32,
                 0,
             );
@@ -31475,6 +31483,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 win32k_image_size,
             )
             .expect("win32k exception image catalog rejected");
+            win32k_glue::load_win32k_static_import_drivers(primary_component.pml4);
+            let (dependencies, loaded, _patches, failures) =
+                win32k_glue::win32k_static_import_loader_proofs();
+            if loaded != dependencies || failures != 0 {
+                panic!("win32k static import dependency load failed");
+            }
             let host_pml4 = primary_component.pml4;
             let primary_cnode = primary_component.cnode;
             let primary_sched_context = primary_component.sched_context;

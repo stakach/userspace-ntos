@@ -4575,6 +4575,8 @@ pub(crate) struct DriverObjectSpec {
     /// bump allocator over `WIN32K_POOL_VADDR`). `component_main` builds the DRIVER_OBJECT / ext /
     /// RegistryPath from THIS pool — win32k's DriverEntry + `SH_POOL_USED` readback need its own pool.
     pub pool: unsafe fn(u64) -> u64,
+    /// Admitted PE boundary used for DriverEntry and support-image calls in this component.
+    pub foreign_call2_va: u64,
     /// Optional shared-frame offset containing a support image `DriverEntry` RVA relative to
     /// `code_va`. `u64::MAX` disables support-driver initialization for hosted kinds that do not use
     /// dependency images.
@@ -4674,9 +4676,7 @@ unsafe fn component_run_support_entries(
         component_write_support_aggregate(shared_va, spec, 0, 0);
         return 0;
     }
-    let foreign_call2 = core::ptr::read_volatile(
-        (shared_va + crate::driver_launch::SH_SEH_FOREIGN_CALL2_VA) as *const u64,
-    );
+    let foreign_call2 = spec.foreign_call2_va;
     if foreign_call2 == 0 {
         component_write_support_aggregate(shared_va, spec, STATUS_INVALID_PARAMETER_I32, 0);
         return STATUS_INVALID_PARAMETER_I32;
@@ -4781,9 +4781,7 @@ pub(crate) unsafe fn component_main(
             crate::driver_launch::V_ENTERED,
         );
         let entry = code_va + entry_rva as u64;
-        let foreign_call2 = core::ptr::read_volatile(
-            (shared_va + crate::driver_launch::SH_SEH_FOREIGN_CALL2_VA) as *const u64,
-        );
+        let foreign_call2 = spec.foreign_call2_va;
         if foreign_call2 == 0 {
             status = STATUS_INVALID_PARAMETER_I32;
         } else {
