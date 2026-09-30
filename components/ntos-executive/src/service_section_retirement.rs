@@ -28,7 +28,9 @@ impl SectionRetirementIo for RetirementIo {
             if cnode_revoke_r(frame) != 0 || page_unmap_r(frame) != 0 {
                 return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
             }
-            frame_recycle::publish(frame)
+            frame_recycle::publish(frame)?;
+            crate::note_boot_progress(crate::BootProgress::PageMappingPublished);
+            Ok(())
         }
     }
 

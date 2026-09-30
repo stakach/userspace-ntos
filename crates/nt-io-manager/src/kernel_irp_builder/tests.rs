@@ -321,6 +321,18 @@ fn ioctl_null_and_zero_buffers_follow_builder_contract() {
             .unwrap();
     assert_eq!(direct.system_buffer_len, 0);
     assert_eq!(direct.mdl, None);
+    assert_eq!(direct.irp_flags, 0);
+    let zero_length = plan_device_io_control_request(
+        code | ioctl::METHOD_OUT_DIRECT, false, 1, 7, 0x1000, 0, 0x2000, 0,
+    ).unwrap();
+    assert_eq!(zero_length.system_buffer_len, 0);
+    assert_eq!(zero_length.system_buffer_input, 0x1000);
+    assert_eq!(zero_length.irp_flags, IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER);
+    assert_eq!(zero_length.mdl, Some(MdlPlan {
+        buffer: 0x2000,
+        length: 0,
+        access: MdlAccess::Write,
+    }));
 }
 
 #[test]

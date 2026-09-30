@@ -139,17 +139,24 @@ impl GenericSectionTable {
     /// Resource release is ordered: all frames before their file-object reference. Failure leaves
     /// the failed resource and every later resource owned, without replaying completed releases.
     pub fn drain_retired(&mut self, io: &mut impl SectionRetirementIo) -> Result<(), u32> {
-        while let Some(ticket) = self.next_retirement() {
-            match ticket.resource {
-                SectionRetirementResource::Frame(frame) => io.release_frame(frame)?,
-                SectionRetirementResource::Backing(backing) => {
-                    io.release_backing(ticket.identity(), backing)?
+        for section_index in 0..self.sections.len() {
+            let section = self.sections[section_index];
+            if section.live || !section.backing.is_live() {
+                continue;
+            }
+            if !self.control_area_live(section.control_area) {
+                for page_index in 0..self.pages.len() {
+                    let page = self.pages[page_index];
+                    if page.live && page.control_area == section.control_area {
+                        io.release_frame(page.frame)?;
+                        self.pages[page_index] = GenericSectionPage::empty();
+                    }
                 }
             }
-            assert!(
-                self.complete_retirement(ticket),
-                "serialized section retirement retains its generation"
-            );
+            let identity = SectionIdentity { index: section_index, generation: section.generation };
+            io.release_backing(identity, section.backing)?;
+            self.sections[section_index] = GenericSection::empty();
+            self.retire_control_area_if_unreferenced(section.control_area);
         }
         Ok(())
     }

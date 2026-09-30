@@ -272,13 +272,13 @@ pub fn plan_device_io_control_request(
             }
         }
         ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT => {
-            if input_len != 0 {
+            if input_buffer != 0 {
                 plan.system_buffer_len = input_len;
                 plan.system_buffer_input = input_buffer;
                 plan.system_buffer_input_len = input_len;
                 plan.irp_flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER;
             }
-            if output_len != 0 {
+            if output_buffer != 0 {
                 plan.mdl = Some(MdlPlan {
                     buffer: output_buffer,
                     length: output_len,
