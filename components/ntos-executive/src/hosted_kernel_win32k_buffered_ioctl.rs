@@ -356,7 +356,7 @@ impl Work {
                 return false;
             }
             self.cancel_ack_claimed = true;
-            if acknowledge_completed_irp(irp.raw()).is_err() {
+            if acknowledge_completed_irp_strict(irp.raw()).is_err() {
                 return false;
             }
             self.irp = None;
@@ -672,7 +672,7 @@ impl Work {
             .expect("win32k IOCTL IRP ACK claim");
         self.ack_claimed = true;
         if let Some(irp) = self.irp {
-            if acknowledge_completed_irp(irp.raw()).is_err() {
+            if acknowledge_completed_irp_strict(irp.raw()).is_err() {
                 return false;
             }
             self.irp = None;

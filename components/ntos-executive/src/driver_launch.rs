@@ -38373,6 +38373,24 @@ pub(crate) unsafe fn acknowledge_completed_irp(irp_id: u64) -> Result<(), u32> {
     }.map_err(|status| status.raw() as u32)
 }
 
+/// Completion owners that cannot reclaim after an uncertain backend ACK use
+/// the strict canonical operation. Detached File IRPs already enforce this in
+/// their retained owner before returning success.
+pub(crate) unsafe fn acknowledge_completed_irp_strict(irp_id: u64) -> Result<(), u32> {
+    if irp_id == 0 {
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    pump_io_manager();
+    if hosted_file_owners::contains(IrpId(irp_id)) {
+        hosted_file_owners::acknowledge(IrpId(irp_id))
+    } else {
+        io_manager_mut()
+            .acknowledge_completed_irp_strict(IrpId(irp_id))
+            .map(|_| ())
+    }
+    .map_err(|status| status.raw() as u32)
+}
+
 pub(crate) unsafe fn cancel_irp_if_pending(irp_id: u64) -> Result<bool, u32> {
     if irp_id == 0 {
         return Err(STATUS_INVALID_PARAMETER as u32);
