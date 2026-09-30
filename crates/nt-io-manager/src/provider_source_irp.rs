@@ -181,12 +181,12 @@ impl ProviderSourceIrpLedger {
         Ok(())
     }
 
-    pub fn unpin(&mut self, ticket: ProviderSourceIrpTicket) -> Result<(), ProviderSourceIrpError> {
-        let row = self
-            .rows
-            .iter_mut()
-            .find(|row| row.ticket == ticket)
-            .ok_or(ProviderSourceIrpError::WrongIdentity)?;
+    pub fn unpin(
+        &mut self,
+        ticket: ProviderSourceIrpTicket,
+        allocation: ProviderSourceIrpAllocation,
+    ) -> Result<(), ProviderSourceIrpError> {
+        let row = self.exact_mut(ticket, allocation)?;
         if row.pins == 0 {
             return Err(ProviderSourceIrpError::WrongIdentity);
         }
@@ -356,7 +356,7 @@ mod tests {
             ledger.begin_free(ticket, owner),
             Err(ProviderSourceIrpError::Pinned)
         );
-        ledger.unpin(ticket).unwrap();
+        ledger.unpin(ticket, owner).unwrap();
         assert_eq!(ledger.preflight_free(ticket, owner), Ok(()));
         ledger.begin_free(ticket, owner).unwrap();
         assert_eq!(
@@ -377,6 +377,31 @@ mod tests {
             .unwrap();
         catalog.retire(owner.catalog.identity).unwrap();
         ledger.finish_free(ticket, owner).unwrap();
+    }
+
+    #[test]
+    fn dispatch_lease_release_requires_exact_allocation_identity() {
+        let mut ledger = ProviderSourceIrpLedger::new();
+        let (_catalog, allocation) = allocation(11, 5);
+        let ticket = ledger.register(allocation).unwrap();
+        ledger.pin(ticket, allocation).unwrap();
+        let changed_generation = ProviderSourceIrpAllocation {
+            native: AllocationIdentity {
+                allocation_generation: 12,
+                ..allocation.native
+            },
+            ..allocation
+        };
+        assert_eq!(
+            ledger.unpin(ticket, changed_generation),
+            Err(ProviderSourceIrpError::WrongIdentity)
+        );
+        assert_eq!(
+            ledger.preflight_free(ticket, allocation),
+            Err(ProviderSourceIrpError::Pinned)
+        );
+        ledger.unpin(ticket, allocation).unwrap();
+        assert_eq!(ledger.preflight_free(ticket, allocation), Ok(()));
     }
 
     #[test]

@@ -154,6 +154,64 @@ pub(super) unsafe fn is_source_irp(address: u64) -> bool {
     ledger().is_some_and(|ledger| ledger.allocation_at(WIN32K_POOL_VADDR, address).is_some())
 }
 
+#[must_use]
+pub(super) struct SourceIrpDispatchLease {
+    pub ticket: ProviderSourceIrpTicket,
+    pub allocation: ProviderSourceIrpAllocation,
+}
+
+/// Retain the source across a reentrant or pending canonical device dispatch.
+/// The provider catalog and native pool identities must still describe this packet.
+pub(super) unsafe fn retain_dispatch(address: u64) -> Option<SourceIrpDispatchLease> {
+    if !provider_pool_contains(address) {
+        return None;
+    }
+    let (mut metadata, _pool) = provider_metadata_pool_lock()?;
+    let (ticket, allocation) = ledger()?.allocation_at(WIN32K_POOL_VADDR, address)?;
+    if registered_provider_wait_domain() != Some(allocation.provider)
+        || provider_allocations_unlocked(&mut metadata)?
+            .snapshot_active(allocation.catalog.identity)
+            .ok()?
+            != allocation.catalog
+    {
+        return None;
+    }
+    let memory = ProviderPoolMemory;
+    let offset = address - WIN32K_POOL_VADDR;
+    if shared_pool::allocation_identity(&memory, offset) != Ok(allocation.native)
+        || shared_pool::allocation_capacity(&memory, offset) != Ok(allocation.native_capacity)
+    {
+        return None;
+    }
+    ledger()?.pin(ticket, allocation).ok()?;
+    Some(SourceIrpDispatchLease { ticket, allocation })
+}
+
+/// Release only the exact source captured at dispatch admission. A stale lease
+/// remains pinned rather than authorizing retirement of a reused address.
+pub(super) unsafe fn release_dispatch(lease: SourceIrpDispatchLease) -> bool {
+    let address = lease.allocation.catalog.base;
+    if !provider_pool_contains(address) {
+        return false;
+    }
+    let Some((mut metadata, _pool)) = provider_metadata_pool_lock() else {
+        return false;
+    };
+    let offset = address - WIN32K_POOL_VADDR;
+    let memory = ProviderPoolMemory;
+    if registered_provider_wait_domain() != Some(lease.allocation.provider)
+        || provider_allocations_unlocked(&mut metadata).is_none_or(|catalog| {
+            catalog.snapshot_active(lease.allocation.catalog.identity)
+                != Ok(lease.allocation.catalog)
+        })
+        || shared_pool::allocation_identity(&memory, offset) != Ok(lease.allocation.native)
+        || shared_pool::allocation_capacity(&memory, offset) != Ok(lease.allocation.native_capacity)
+    {
+        return false;
+    }
+    ledger().is_some_and(|ledger| ledger.unpin(lease.ticket, lease.allocation).is_ok())
+}
+
 /// A failed commit remains reserved. Callers must never retry the free by address.
 pub(super) unsafe fn retire(address: u64, ticket: ProviderSourceIrpTicket) -> bool {
     let Some((mut metadata, _pool)) = provider_metadata_pool_lock() else {
