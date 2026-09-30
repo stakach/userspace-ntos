@@ -224,9 +224,9 @@ impl SourceIrpLedger {
             .any(|row| row.ticket == ticket && row.free_requested)
     }
 
-    /// The first free inside Mup's completion callback is retained while the forward owns a pin.
-    /// After exact terminal ACK and unpin, a second source-local free retires the allocation.
-    pub fn request_free(
+    /// A free inside a pinned completion is deferred; an unpinned free remains live until the
+    /// caller completes physical teardown and calls `retire` under the same ownership lock.
+    pub fn prepare_free(
         &mut self,
         owner: SourceIrpOwner,
         domain: HostedDomainIdentity,
@@ -251,9 +251,7 @@ impl SourceIrpLedger {
             self.rows[index].free_requested = true;
             return Ok(SourceIrpRetirement::Deferred(self.rows[index].ticket));
         }
-        Ok(SourceIrpRetirement::Retired(
-            self.rows.swap_remove(index).ticket,
-        ))
+        Ok(SourceIrpRetirement::Retired(self.rows[index].ticket))
     }
 
     /// Remove the exact allocation after its owner has completed native teardown.
@@ -475,6 +473,21 @@ mod tests {
     }
 
     #[test]
+    fn prepared_free_retains_identity_until_physical_teardown_completes() {
+        let mut ledger = SourceIrpLedger::new();
+        let owner = allocation(0x2000, 11);
+        let ticket = ledger.register(owner).unwrap();
+        assert_eq!(
+            ledger.prepare_free(owner.owner, owner.domain, owner.component_address),
+            Ok(SourceIrpRetirement::Retired(ticket))
+        );
+        assert!(ledger.matches(owner.owner, owner, ticket));
+        assert_eq!(ledger.register(owner), Ok(ticket));
+        ledger.retire(ticket, owner).unwrap();
+        assert!(!ledger.matches(owner.owner, owner, ticket));
+    }
+
+    #[test]
     fn only_explicitly_armed_forward_can_defer_source_callback_free() {
         let mut ledger = SourceIrpLedger::new();
         let owner = allocation(0x2000, 11);
@@ -483,17 +496,17 @@ mod tests {
             .pin(owner.owner, owner.domain, owner.component_address)
             .unwrap();
         assert_eq!(
-            ledger.request_free(owner.owner, owner.domain, owner.component_address),
+            ledger.prepare_free(owner.owner, owner.domain, owner.component_address),
             Err(SourceIrpLedgerError::Pinned),
         );
         ledger.arm_deferred_free(ticket).unwrap();
         assert_eq!(
-            ledger.request_free(owner.owner, owner.domain, owner.component_address),
+            ledger.prepare_free(owner.owner, owner.domain, owner.component_address),
             Ok(SourceIrpRetirement::Deferred(ticket)),
         );
         assert!(ledger.deferred_free_requested(ticket));
         assert_eq!(
-            ledger.request_free(owner.owner, owner.domain, owner.component_address),
+            ledger.prepare_free(owner.owner, owner.domain, owner.component_address),
             Err(SourceIrpLedgerError::AlreadyDeferred),
         );
         assert_eq!(
@@ -502,9 +515,11 @@ mod tests {
         );
         ledger.unpin(ticket).unwrap();
         assert_eq!(
-            ledger.request_free(owner.owner, owner.domain, owner.component_address),
+            ledger.prepare_free(owner.owner, owner.domain, owner.component_address),
             Ok(SourceIrpRetirement::Retired(ticket)),
         );
+        assert!(ledger.matches(owner.owner, owner, ticket));
+        ledger.retire(ticket, owner).unwrap();
         assert!(!ledger.deferred_free_requested(ticket));
     }
 
@@ -523,12 +538,12 @@ mod tests {
             Err(SourceIrpLedgerError::WrongIdentity)
         );
         assert_eq!(
-            ledger.request_free(owner.owner, owner.domain, owner.component_address),
+            ledger.prepare_free(owner.owner, owner.domain, owner.component_address),
             Err(SourceIrpLedgerError::Pinned)
         );
         ledger.arm_deferred_free(live).unwrap();
         assert_eq!(
-            ledger.request_free(owner.owner, owner.domain, owner.component_address),
+            ledger.prepare_free(owner.owner, owner.domain, owner.component_address),
             Ok(SourceIrpRetirement::Deferred(live))
         );
     }

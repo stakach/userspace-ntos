@@ -6342,10 +6342,20 @@ extern "win64" fn s_ex_alloc_pool(_pool: u64, size: u64) -> u64 {
 }
 /// `void ExFreePoolWithTag(PVOID, ULONG)` / `void ExFreePool(PVOID)`.
 extern "win64" fn s_ex_free_pool_tag(p: u64, _tag: u64) {
-    unsafe { pool_free(p) }
+    s_ex_free_pool(p)
 }
 extern "win64" fn s_ex_free_pool(p: u64) {
-    unsafe { pool_free(p) }
+    if p == 0 {
+        return;
+    }
+    let (label, status, _, _, _) = unsafe {
+        call_on4((FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4, 3, p, 0, 0)
+    };
+    if label != 0 || (status as u32 as i32 != STATUS_SUCCESS && status as u32 != STATUS_PENDING) {
+        unsafe {
+            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 3, p, status]);
+        }
+    }
 }
 
 /// `void RtlInitUnicodeString(PUNICODE_STRING Dest, PCWSTR Source)`.
@@ -7886,18 +7896,26 @@ extern "win64" fn s_io_allocate_irp(stack_size: u8, _charge_quota: u8) -> u64 {
             (irp + 0xb8) as *mut u64,
             stack_base + stack_count * WDM_X64_IO_STACK_LOCATION_SIZE as u64,
         );
-        let (_, status, ticket, generation, _) = call_on4(
+        let (label, status, ticket, generation, _) = call_on4(
             (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
             1,
             irp,
             total,
             stack_count,
         );
-        if status as u32 as i32 != STATUS_SUCCESS || ticket == 0 || generation == 0 {
-            pool_free(irp);
-            return 0;
+        if label == 0 && status as u32 as i32 == STATUS_SUCCESS && ticket != 0 && generation != 0 {
+            return irp;
         }
-        irp
+        if label == 0
+            && (status as u32 as i32 == STATUS_INVALID_PARAMETER
+                || status as u32 as i32 == STATUS_INSUFFICIENT_RESOURCES)
+        {
+            pool_free(irp);
+        } else {
+            // An ambiguous reply may follow a committed registration. Keep its storage live.
+            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 1, irp, status]);
+        }
+        0
     }
 }
 
@@ -7907,22 +7925,21 @@ extern "win64" fn s_io_free_irp(irp: u64) {
         return;
     }
     unsafe {
-        let (_, status, _, _, _) = call_on4(
+        let (label, status, _, _, _) = call_on4(
             (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
             2,
             irp,
             0,
             0,
         );
-        if status as u32 == STATUS_PENDING {
+        if label == 0 && status as u32 == STATUS_PENDING {
             // An explicitly armed cross-domain forward still owns this source allocation.
             // Its caller frees it after the local completion callback and exact terminal ACK.
             return;
         }
-        if status as u32 as i32 != STATUS_SUCCESS {
+        if label != 0 || status as u32 as i32 != STATUS_SUCCESS {
             crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 2, irp, status]);
         }
-        pool_free(irp);
     }
 }
 

@@ -39,6 +39,17 @@ fn allocation(
     bytes: u64,
     stack_count: u8,
 ) -> Option<SourceIrpAllocation> {
+    let _pool_guard = unsafe { hosted_instance_pool_lock(inst.exec_pool_va)? };
+    allocation_unlocked(instance_index, inst, component_address, bytes, stack_count)
+}
+
+fn allocation_unlocked(
+    instance_index: usize,
+    inst: DriverInstance,
+    component_address: u64,
+    bytes: u64,
+    stack_count: u8,
+) -> Option<SourceIrpAllocation> {
     if !(1..=32).contains(&stack_count) {
         return None;
     }
@@ -47,7 +58,6 @@ fn allocation(
     if bytes != expected || expected > u16::MAX as u64 {
         return None;
     }
-    let _pool_guard = unsafe { hosted_instance_pool_lock(inst.exec_pool_va)? };
     if unsafe { hosted_instance_pool_allocation_is_free_unlocked(inst, component_address) }
         != Some(false)
     {
@@ -110,19 +120,33 @@ pub(super) fn service(
                 Err(_) => (STATUS_INVALID_PARAMETER, 0, 0),
             }
         }
-        2 if bytes == 0 && stack_count == 0 => {
+        2 | 3 if bytes == 0 && stack_count == 0 => {
             let Some(domain) = instance_domain_identity(inst) else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
             let _guard = lock();
-            let Some(owner) = ledger().allocation_for(
+            let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) })
+            else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            let owner = ledger().allocation_for(
                 SourceIrpOwner::HostedDriver(instance_index),
                 domain,
                 component_address,
-            ) else {
-                return (STATUS_INVALID_HANDLE, 0, 0);
+            );
+            let Some(owner) = owner else {
+                return if op == 3
+                    && unsafe {
+                        hosted_instance_pool_allocation_is_free_unlocked(inst, component_address)
+                    } == Some(false)
+                    && unsafe { hosted_instance_pool_free_unlocked(inst, component_address) }
+                {
+                    (STATUS_SUCCESS, 0, 0)
+                } else {
+                    (STATUS_INVALID_HANDLE, 0, 0)
+                };
             };
-            if allocation(
+            if allocation_unlocked(
                 instance_index,
                 inst,
                 component_address,
@@ -132,12 +156,28 @@ pub(super) fn service(
             {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             }
-            match ledger().request_free(
+            match ledger().prepare_free(
                 SourceIrpOwner::HostedDriver(instance_index),
                 domain,
                 component_address,
             ) {
                 Ok(SourceIrpRetirement::Retired(ticket)) => {
+                    if !unsafe { hosted_instance_pool_free_unlocked(inst, component_address) } {
+                        return (STATUS_INVALID_HANDLE, 0, 0);
+                    }
+                    if ledger().retire(ticket, owner).is_err() {
+                        unsafe {
+                            crate::provider_bugcheck::report(
+                                0xc4,
+                                [
+                                    FSD_SERVICE_SOURCE_IRP_LABEL,
+                                    op,
+                                    component_address,
+                                    ticket.id.get(),
+                                ],
+                            );
+                        }
+                    }
                     (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get())
                 }
                 Ok(SourceIrpRetirement::Deferred(ticket)) => (
