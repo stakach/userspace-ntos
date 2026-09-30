@@ -15426,6 +15426,10 @@ fn register_trampolines() -> bool {
         crate::driver_launch::win32k_device_properties::io_get_device_property as *const () as u64,
     );
     reg.bind(
+        "IoBuildDeviceIoControlRequest",
+        source_irp::build_device_io_control_request as *const () as u64,
+    );
+    reg.bind(
         "KeUserModeCallback",
         s_ke_user_mode_callback_rendezvous as usize as u64,
     );
