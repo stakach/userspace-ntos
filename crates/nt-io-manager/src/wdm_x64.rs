@@ -424,6 +424,22 @@ pub fn write_wdm_irp(bytes: &mut [u8], init: WdmIrpInit) -> Result<(), WdmLayout
     Ok(())
 }
 
+/// Complete IoInitializeIrp's self-linked ThreadListEntry once the packet has
+/// its final address. The requestor-thread queue is a separate ownership step.
+pub fn initialize_wdm_irp_thread_list(
+    bytes: &mut [u8],
+    irp_address: u64,
+) -> Result<(), WdmLayoutError> {
+    require(bytes, WDM_X64_IRP_SIZE)?;
+    let entry = irp_address
+        .checked_add(0x20)
+        .filter(|_| irp_address != 0)
+        .ok_or(WdmLayoutError::InvalidField)?;
+    put_u64(bytes, 0x20, entry);
+    put_u64(bytes, 0x28, entry);
+    Ok(())
+}
+
 /// Set the caller-owned completion destinations on an allocated IRP. A NULL
 /// destination is valid; completion must then skip that publication or signal.
 pub fn write_wdm_irp_completion_targets(

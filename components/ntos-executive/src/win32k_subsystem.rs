@@ -34,6 +34,8 @@ use alloc::vec::Vec;
 mod irql;
 #[path = "win32k_provider_wait_context.rs"]
 mod provider_wait_context;
+#[path = "win32k_source_irp.rs"]
+mod source_irp;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 use nt_compat_exports::{
     ssdt::{
@@ -155,6 +157,7 @@ static PROVIDER_ARENA_NEXT_HOSTED_HEAP_ID: AtomicU64 =
 static PROVIDER_METADATA_BUSY: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 static mut WIN32K_PROVIDER_ALLOCATIONS: Option<nt_provider_wait::ProviderAllocationCatalog> = None;
+static mut WIN32K_SOURCE_IRPS: Option<nt_io_manager::provider_source_irp::ProviderSourceIrpLedger> = None;
 static mut WIN32K_HOSTED_HEAP_ARENAS: Option<Vec<HostedHeapArena>> = None;
 static mut WIN32K_LOCAL_EVENTS: Option<nt_provider_wait::ProviderLocalEventCatalog> = None;
 static mut WIN32K_LOCAL_TIMERS: Option<nt_provider_wait::ProviderLocalTimerCatalog> = None;
@@ -533,12 +536,15 @@ unsafe fn initialize_provider_allocation_tracking() -> bool {
     let mut guard = ProviderMetadataGuard::acquire();
     if registered_provider_wait_domain().is_none()
         || provider_allocations_unlocked(&mut guard).is_some()
+        || (&*core::ptr::addr_of!(WIN32K_SOURCE_IRPS)).is_some()
         || (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS)).is_some()
     {
         return false;
     }
     *core::ptr::addr_of_mut!(WIN32K_PROVIDER_ALLOCATIONS) =
         Some(nt_provider_wait::ProviderAllocationCatalog::new());
+    *core::ptr::addr_of_mut!(WIN32K_SOURCE_IRPS) =
+        Some(nt_io_manager::provider_source_irp::ProviderSourceIrpLedger::new());
     *core::ptr::addr_of_mut!(WIN32K_HOSTED_HEAP_ARENAS) = Some(Vec::new());
     PROVIDER_ARENA_NEXT_HOSTED_HEAP_ID
         .store(PROVIDER_ARENA_FIRST_HOSTED_HEAP_ID, Ordering::Relaxed);
@@ -8883,6 +8889,10 @@ extern "win64" fn s_vdbg_print_ex_with_prefix(
 extern "win64" fn s_ex_free_pool_with_tag(p: u64, _tag: u64) {
     unsafe {
         let in_provider_pool = provider_pool_contains(p);
+        if in_provider_pool && source_irp::is_source_irp(p) {
+            print_str(b"[win32k-host] source IRP requires exact retirement, not ExFreePool\n");
+            park();
+        }
         let in_ftyp_pool = p >= WIN32K_FTYP_VADDR + POOL_DATA_OFF + FTYP_HDR_SIZE
             && p < WIN32K_FTYP_VADDR + WIN32K_FTYP_FRAMES * 0x1000;
         let freed = if in_provider_pool {
