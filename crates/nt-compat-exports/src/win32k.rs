@@ -232,9 +232,9 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("IoOpenDeviceRegistryKey", Partial, "authenticated PDO Driver-key open with canonical CM property and pending kernel-handle publication; live win32k invocation awaits the remaining import gate"),
     e("IoGetRelatedDeviceObject", Partial, "resolves the canonical live attachment-stack top and returns it only through an exact win32k video Device projection"),
     e("IoGetDeviceObjectPointer", Partial, "opens the dynamically published video route, access-checks it through Object Manager, and returns retained WDM File/Device projections"),
-    e("IofCallDriver", TrapIfCalled, "device-stack I/O not reached on the win32k init path; traps if called"),
-    e("IoBuildDeviceIoControlRequest", Partial, "bounded METHOD_BUFFERED requests allocate a win32k-owned source IRP; dispatch and completion remain gated"),
-    e("IoBuildSynchronousFsdRequest", TrapIfCalled, "device-stack I/O not reached on the win32k init path; traps if called"),
+    e("IofCallDriver", Partial, "exact win32k source IOCTL, PnP TargetDeviceRelation, and FSD read/write dispatch through retained root transactions; unsupported majors fail explicitly"),
+    e("IoBuildDeviceIoControlRequest", Partial, "win32k-owned source IRPs with exact lifetime for all four IOCTL transfer methods"),
+    e("IoBuildSynchronousFsdRequest", Partial, "win32k-owned synchronous FSD source IRPs for planner-supported majors; live dispatch covers PnP TargetDeviceRelation and read/write"),
     // --- Se ---
     e("SeQueryAuthenticationIdToken", Partial, "subject-context/privilege checks routed to nt-security"),
     e("SeExports", Partial, "data export: the SE_EXPORTS well-known-SID/privilege table"),
