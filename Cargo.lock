@@ -598,9 +598,12 @@ name = "nt-pnp-manager"
 version = "0.1.0"
 dependencies = [
  "nt-cm-resources",
+ "nt-io-abi",
  "nt-io-manager",
  "nt-pnp-abi",
+ "nt-provider-wait",
  "nt-status",
+ "nt-types",
 ]
 
 [[package]]

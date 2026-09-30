@@ -535,6 +535,8 @@ pub struct IrpRecord {
     pub origin_device_id: DeviceId,
     pub origin_major: u8,
     pub origin_minor: u8,
+    /// Immutable relation type for an externally owned QUERY_DEVICE_RELATIONS IRP.
+    pub(crate) origin_pnp_relation_type: Option<u32>,
     /// Original CREATE File-body provenance, committed only by canonical IRP admission.
     pub(crate) create_case_sensitive: bool,
     /// Original canonical File options, independent of a filter's current CREATE stack.
@@ -579,6 +581,7 @@ impl IrpRecord {
             origin_device_id: device_id,
             origin_major: major,
             origin_minor: 0,
+            origin_pnp_relation_type: None,
             create_case_sensitive: false,
             file_create_options: 0,
             device_control_method: None,

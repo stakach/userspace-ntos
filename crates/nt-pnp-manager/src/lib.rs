@@ -13,10 +13,12 @@ extern crate alloc;
 mod bus_properties;
 mod bus_relations;
 mod relation_owners;
+mod target_device_relation;
 
 pub use bus_properties::*;
 pub use bus_relations::*;
 pub use relation_owners::*;
+pub use target_device_relation::*;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
