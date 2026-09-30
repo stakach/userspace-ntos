@@ -753,6 +753,76 @@ pub(super) unsafe fn retire(address: u64, ticket: ProviderSourceIrpTicket) -> bo
     true
 }
 
+/// Reject an unentered builder-owned source without leaking its child buffers.
+/// Reserve the exact source first so another dispatch cannot pin it while the
+/// auxiliary allocations are released under their own metadata locks.
+pub(super) unsafe fn retire_unentered(
+    address: u64,
+    ticket: ProviderSourceIrpTicket,
+    native_generation: u64,
+) -> bool {
+    let allocation = {
+        let Some((mut metadata, _pool)) = provider_metadata_pool_lock() else {
+            return false;
+        };
+        let Some(ledger) = ledger() else { return false };
+        let Some((found, allocation)) = ledger.allocation_at(WIN32K_POOL_VADDR, address) else {
+            return false;
+        };
+        if found != ticket
+            || allocation.native.allocation_generation != native_generation
+            || !source_irp_aux::contains_exact_unlocked(ticket, allocation)
+            || ledger.preflight_free(ticket, allocation).is_err()
+        {
+            return false;
+        }
+        let memory = ProviderPoolMemory;
+        let offset = address - WIN32K_POOL_VADDR;
+        if registered_provider_wait_domain() != Some(allocation.provider)
+            || shared_pool::allocation_identity(&memory, offset) != Ok(allocation.native)
+            || shared_pool::allocation_capacity(&memory, offset) != Ok(allocation.native_capacity)
+        {
+            return false;
+        }
+        let Some(catalog) = provider_allocations_unlocked(&mut metadata) else {
+            return false;
+        };
+        if catalog.snapshot_active(allocation.catalog.identity) != Ok(allocation.catalog)
+            || catalog.begin_retirement_from_pin(allocation.catalog_pin) != Ok(allocation.catalog)
+        {
+            return false;
+        }
+        if ledger.begin_free(ticket, allocation).is_err() {
+            crate::provider_bugcheck::report(0xc4, [0x57495250, address, 0, 40]);
+        }
+        allocation
+    };
+
+    if !source_irp_aux::retire_exact(ticket, allocation) {
+        crate::provider_bugcheck::report(0xc4, [0x57495250, address, 0, 41]);
+    }
+    let Some((mut metadata, _pool)) = provider_metadata_pool_lock() else {
+        crate::provider_bugcheck::report(0xc4, [0x57495250, address, 0, 42]);
+    };
+    let mut memory = ProviderPoolMemory;
+    let offset = address - WIN32K_POOL_VADDR;
+    let Some(catalog) = provider_allocations_unlocked(&mut metadata) else {
+        crate::provider_bugcheck::report(0xc4, [0x57495250, address, 0, 43]);
+    };
+    let Some(ledger) = ledger() else {
+        crate::provider_bugcheck::report(0xc4, [0x57495250, address, 0, 44]);
+    };
+    if shared_pool::allocation_identity(&memory, offset) != Ok(allocation.native)
+        || shared_pool::allocation_capacity(&memory, offset) != Ok(allocation.native_capacity)
+        || shared_pool::free(&mut memory, offset).is_err()
+        || catalog.retire(allocation.catalog.identity) != Ok(allocation.catalog)
+        || ledger.finish_free(ticket, allocation).is_err()
+    {
+        crate::provider_bugcheck::report(0xc4, [0x57495250, address, 0, 45]);
+    }
+    true
+}
+
 pub(super) struct PinnedSystemBuffer {
     address: u64,
     snapshot: ProviderAllocationSnapshot,
@@ -1464,286 +1534,13 @@ pub(crate) unsafe fn release_buffered_admission(
     finish_buffered_dispatch(lease, false)
 }
 
-#[must_use = "retain the PnP source through terminal acknowledgement"]
-pub(crate) struct SourcePnpDispatchLease {
-    source: Option<SourceIrpDispatchLease>,
-    pub device: u64,
-    pub iosb_va: u64,
-    pub event: Option<EventIdentity>,
-    event_va: u64,
-    image_map_owner: u64,
-    auxiliary: source_irp_aux::AuxiliarySnapshot,
-    iosb_pin: file_ioctl_target::PinnedIoctlOutput,
-    event_lease: Option<nt_provider_wait::ProviderLocalEventLease>,
-}
+#[path = "win32k_source_irp_pnp.rs"]
+mod pnp;
+pub(crate) use pnp::{
+    SourcePnpDispatchLease, abort_pnp_dispatch, admit_pnp_target_relation,
+    release_pnp_dispatch,
+};
 
-impl SourcePnpDispatchLease {
-    pub(crate) fn source_address(&self) -> u64 {
-        self.source.as_ref().unwrap().allocation.catalog.base
-    }
-
-    pub(crate) fn source_ticket_serial(&self) -> u64 {
-        self.source.as_ref().unwrap().ticket.serial.get()
-    }
-
-    pub(crate) fn source_native_generation(&self) -> u64 {
-        self.source.as_ref().unwrap().allocation.native.allocation_generation
-    }
-
-    pub(crate) fn event_body(&self) -> Option<u64> {
-        self.event_lease.map(|_| self.event_va)
-    }
-
-    pub(crate) unsafe fn validate(&self) -> bool {
-        let Some(source) = self.source.as_ref() else { return false };
-        if !dispatch_lease_live(source)
-            || source_irp_aux::snapshot_exact(source.ticket, source.allocation)
-                .is_none_or(|snapshot| !snapshot.same_identity(&self.auxiliary))
-            || !target_live(&self.iosb_pin, self.image_map_owner, self.iosb_va, 16)
-        {
-            return false;
-        }
-        if let Some(event) = self.event_lease {
-            let _metadata = ProviderMetadataGuard::acquire();
-            provider_local_events().is_some_and(|events| {
-                events.snapshot(event.id).is_ok_and(|snapshot| {
-                    snapshot.body == self.event_va && snapshot.canonical == Some(event.canonical)
-                })
-            })
-        } else {
-            true
-        }
-    }
-
-    /// Root has already validated the projected relation allocation, PDO reference,
-    /// canonical terminal, and the physical alias of this IOSB target.
-    pub(crate) unsafe fn publish_terminal(
-        &self,
-        status: u32,
-        information: u64,
-        iosb_address: u64,
-    ) -> bool {
-        if status == wire::STATUS_PENDING
-            || (status & 0x8000_0000 == 0 && information == 0)
-            || (status & 0x8000_0000 != 0 && information != 0)
-            || !self.validate()
-            || iosb_address == 0
-            || iosb_address.checked_add(16).is_none()
-        {
-            return false;
-        }
-        write_unaligned(iosb_address as *mut u32, status);
-        write_unaligned((iosb_address + 8) as *mut u64, information);
-        true
-    }
-
-    pub(crate) unsafe fn mirror_event_signaled(&self) -> bool {
-        if !self.validate() {
-            return false;
-        }
-        if self.event_lease.is_some() {
-            let _metadata = ProviderMetadataGuard::acquire();
-            mirror_projected_event_state(self.event_va, true);
-        }
-        true
-    }
-}
-
-pub(crate) unsafe fn admit_pnp_target_relation(
-    address: u64,
-    device: u64,
-    stack_pointer: u64,
-) -> Result<SourcePnpDispatchLease, i32> {
-    use nt_io_abi::major;
-    let mut source = Some(retain_dispatch(address).ok_or(STATUS_INVALID_PARAMETER_I32)?);
-    let result = (|| {
-        let source_ref = source.as_ref().unwrap();
-        let auxiliary = source_irp_aux::snapshot_exact(source_ref.ticket, source_ref.allocation)
-            .ok_or(STATUS_INVALID_PARAMETER_I32)?;
-        if auxiliary.system_buffer.is_some()
-            || auxiliary.mdl.is_some()
-            || auxiliary.input_target.is_some()
-            || auxiliary.output_target.is_some()
-        {
-            return Err(STATUS_INVALID_PARAMETER_I32);
-        }
-        let stack_address = address + source_ref.cursor.next_stack_offset as u64;
-        let stack = nt_io_manager::decode_wdm_kernel_built_io_stack(
-            core::slice::from_raw_parts(stack_address as *const u8, WDM_X64_IO_STACK_LOCATION_SIZE),
-        )
-        .map_err(|_| STATUS_INVALID_PARAMETER_I32)?;
-        if stack.major != major::IRP_MJ_PNP
-            || stack.minor != nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS
-            || stack.device_object != device
-            || stack.file_object != 0
-            || !matches!(
-                stack.parameters,
-                nt_io_manager::WdmIoStackParameters::PnpQueryDeviceRelations {
-                    relation_type: nt_pnp_abi::TARGET_DEVICE_RELATION
-                }
-            )
-            || read_volatile((address + 0x08) as *const u64) != 0
-            || read_volatile((address + 0x10) as *const u32) != 0
-            || read_volatile((address + 0x18) as *const u64) != 0
-            || read_volatile((address + 0x70) as *const u64) != 0
-        {
-            return Err(STATUS_INVALID_PARAMETER_I32);
-        }
-        let iosb_va = read_volatile((address + 0x48) as *const u64);
-        let event_va = read_volatile((address + 0x50) as *const u64);
-        let activation = {
-            let _metadata = ProviderMetadataGuard::acquire();
-            (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
-                .as_ref()
-                .and_then(|catalog| {
-                    let (binding, _) = catalog.resolve(stack_pointer, 1).ok()?;
-                    catalog.active(binding.handle).ok()
-                })
-        }
-        .ok_or(STATUS_NOT_SUPPORTED_I32)?;
-        let iosb_pin = file_ioctl_target::pin_output(activation, iosb_va, 16)?;
-        let event_lease = if event_va == 0 {
-            None
-        } else if let Some(event) = try_signal_event_lease(event_va) {
-            Some(event)
-        } else {
-            file_ioctl_target::release_output(iosb_pin);
-            return Err(STATUS_INVALID_PARAMETER_I32);
-        };
-        let event = event_lease.map(|lease| EventIdentity {
-            local_id: lease.id.raw(),
-            object_slot_plus_one: lease.canonical.object_id,
-            object_generation: lease.canonical.object_generation,
-        });
-        Ok(SourcePnpDispatchLease {
-            source: source.take(),
-            device,
-            iosb_va,
-            event,
-            event_va,
-            image_map_owner: WIN32K_ROOT_IMAGE_MAP_OWNER.load(Ordering::Acquire),
-            auxiliary,
-            iosb_pin,
-            event_lease,
-        })
-    })();
-    if result.is_err() && !release_dispatch(source.take().unwrap()) {
-        crate::provider_bugcheck::report(0xc4, [0x57495250, address, 0, 34]);
-    }
-    result
-}
-
-unsafe fn finish_pnp_dispatch(lease: &mut SourcePnpDispatchLease, retire_source: bool) -> bool {
-    if !lease.validate() {
-        return false;
-    }
-    if let Some(event) = lease.event_lease.take() {
-        let _metadata = ProviderMetadataGuard::acquire();
-        if provider_local_events_mut().is_none_or(|events| events.release_lease(event).is_err()) {
-            crate::provider_bugcheck::report(0xc4, [0x57495250, lease.event_va, 0, 35]);
-        }
-    }
-    file_ioctl_target::release_output(core::mem::replace(
-        &mut lease.iosb_pin,
-        file_ioctl_target::PinnedIoctlOutput::None,
-    ));
-    let source = lease.source.take().unwrap();
-    let address = source.allocation.catalog.base;
-    let ticket = source.ticket;
-    let allocation = source.allocation;
-    if !release_dispatch(source)
-        || (retire_source
-            && (!source_irp_aux::retire_exact(ticket, allocation) || !retire(address, ticket)))
-    {
-        crate::provider_bugcheck::report(0xc4, [0x57495250, address, 0, 36]);
-    }
-    true
-}
-
-pub(crate) unsafe fn release_pnp_dispatch(lease: &mut SourcePnpDispatchLease) -> bool {
-    finish_pnp_dispatch(lease, true)
-}
-
-pub(crate) unsafe fn abort_pnp_dispatch(lease: &mut SourcePnpDispatchLease) -> bool {
-    finish_pnp_dispatch(lease, false)
-}
-
-#[must_use = "transfer the relation to the caller or abort its exact allocation"]
-pub(crate) struct SourceRelationAllocationLease {
-    buffer: Option<PinnedSystemBuffer>,
-}
-
-impl SourceRelationAllocationLease {
-    pub(crate) fn address(&self) -> u64 {
-        self.buffer.as_ref().unwrap().address
-    }
-
-    pub(crate) fn catalog_snapshot(&self) -> ProviderAllocationSnapshot {
-        self.buffer.as_ref().unwrap().snapshot
-    }
-
-    pub(crate) fn native_identity(&self) -> shared_pool::AllocationIdentity {
-        self.buffer.as_ref().unwrap().native
-    }
-
-    pub(crate) unsafe fn validate(&self) -> bool {
-        self.buffer.as_ref().is_some_and(|buffer| system_buffer_live(buffer))
-    }
-
-    pub(crate) unsafe fn with_bytes<R>(
-        &self,
-        f: impl FnOnce(&mut [u8]) -> R,
-    ) -> Option<R> {
-        if !self.validate() {
-            return None;
-        }
-        Some(f(core::slice::from_raw_parts_mut(
-            self.address() as *mut u8,
-            nt_pnp_manager::TARGET_DEVICE_RELATIONS_X64_BYTES,
-        )))
-    }
-
-    /// The destination allocation and its eventual PDO reference become caller-owned.
-    pub(crate) unsafe fn transfer_to_caller(&mut self) -> bool {
-        let Some(buffer) = self.buffer.as_ref() else { return false };
-        if !system_buffer_live(buffer) {
-            return false;
-        }
-        let address = buffer.address;
-        let buffer = self.buffer.take().unwrap();
-        if !release_system_buffer(buffer) {
-            crate::provider_bugcheck::report(0xc4, [0x57495250, address, 0, 37]);
-        }
-        true
-    }
-
-    pub(crate) unsafe fn abort(&mut self) -> bool {
-        let Some(buffer) = self.buffer.as_ref() else { return false };
-        if !system_buffer_live(buffer) {
-            return false;
-        }
-        let address = buffer.address;
-        let buffer = self.buffer.take().unwrap();
-        if !release_system_buffer(buffer) || !provider_pool_free(address) {
-            crate::provider_bugcheck::report(0xc4, [0x57495250, address, 0, 38]);
-        }
-        true
-    }
-}
-
-pub(crate) unsafe fn allocate_target_relation() -> Option<SourceRelationAllocationLease> {
-    let address = pool_alloc(nt_pnp_manager::TARGET_DEVICE_RELATIONS_X64_BYTES as u64);
-    if address == 0 {
-        return None;
-    }
-    let Some(buffer) = pin_system_buffer(
-        address,
-        nt_pnp_manager::TARGET_DEVICE_RELATIONS_X64_BYTES as u64,
-    ) else {
-        if !provider_pool_free(address) {
-            crate::provider_bugcheck::report(0xc4, [0x57495250, address, 0, 39]);
-        }
-        return None;
-    };
-    Some(SourceRelationAllocationLease { buffer: Some(buffer) })
-}
+#[path = "win32k_source_irp_relation.rs"]
+mod relation;
+pub(crate) use relation::{SourceRelationAllocationLease, allocate_target_relation};
