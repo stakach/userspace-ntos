@@ -216,7 +216,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("RtlNumberOfSetBits", Partial, "RTL_BITMAP ops over the caller's buffer"),
     e("RtlTestBit", Partial, "RTL_BITMAP ops over the caller's buffer"),
     e("RtlTimeToTimeFields", Implemented, "host-tested NT epoch/calendar conversion in nt-kernel-exec"),
-    e("RtlUnwindEx", TrapIfCalled, "structured-exception unwind not modelled on the host; traps if reached"),
+    e("RtlUnwindEx", Implemented, "native SEH unwind through the admitted support image"),
     e("RtlUpcaseUnicodeChar", Implemented, "validated l_intl three-level signed-delta uppercase mapping"),
     e("RtlAnsiCharToUnicodeChar", Implemented, "single-character CP1252 decode with native source-pointer advance"),
     e("RtlImageDirectoryEntryToData", Partial, "checked mapped-image directory resolution over registered extents; raw-file views require explicit extent publication"),

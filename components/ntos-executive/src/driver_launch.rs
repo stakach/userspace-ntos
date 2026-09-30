@@ -33200,6 +33200,7 @@ struct HostedProviderImportResolver<'a> {
     thunks: Option<&'a mut HostedExecutableThunkWriter>,
     seh_raise_va: Option<u64>,
     seh_unwind_va: Option<u64>,
+    seh_legacy_unwind_va: Option<u64>,
 }
 
 impl DriverImportResolver for HostedProviderImportResolver<'_> {
@@ -33213,6 +33214,9 @@ impl DriverImportResolver for HostedProviderImportResolver<'_> {
         }
         if hosted_kernel_provider_dll(request.dll) && request.name == "RtlUnwindEx" {
             return Some(DriverImportResolution::DirectVa(self.seh_unwind_va?));
+        }
+        if hosted_kernel_provider_dll(request.dll) && request.name == "RtlUnwind" {
+            return Some(DriverImportResolution::DirectVa(self.seh_legacy_unwind_va?));
         }
         if hosted_dependency_provider_dll(request.dll) {
             unsafe {
@@ -36710,6 +36714,7 @@ unsafe fn load_hosted_dependency_images(
             thunks: executable_thunks.as_deref_mut(),
             seh_raise_va: None,
             seh_unwind_va: None,
+            seh_legacy_unwind_va: None,
         };
         let (dep_entry_rva, dep_image_len) = load_pe_into(
             planned.src_va,
@@ -37119,6 +37124,7 @@ unsafe fn load_driver_reserved(
         thunks: executable_thunk_writer.as_mut(),
         seh_raise_va: Some(seh_linkage.raise_va),
         seh_unwind_va: Some(seh_linkage.unwind_entry_va),
+        seh_legacy_unwind_va: Some(seh_linkage.legacy_unwind_va),
     };
     let (entry_rva, image_len) = load_pe_into(
         src_va,
