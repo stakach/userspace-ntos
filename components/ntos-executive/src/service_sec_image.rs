@@ -4372,87 +4372,53 @@ pub(crate) unsafe fn service_win32k_event_request(
                 .map(|signaled| (0, u64::from(signaled), 0, 0))
                 .unwrap_or_else(|status| (status as i32, 0, 0, 0))
         }
-        crate::win32k_subsystem::W32_TIMER_OP_PUBLISH_LOCAL => {
+        crate::win32k_subsystem::W32_TIMER_OP_PUBLISH_LOCAL
+        | crate::win32k_subsystem::W32_TIMER_OP_RETIRE_LOCAL
+        | crate::win32k_subsystem::W32_TIMER_OP_ACK_LOCAL_RETIREMENT
+        | crate::win32k_subsystem::W32_TIMER_OP_SET_LOCAL
+        | crate::win32k_subsystem::W32_TIMER_OP_CANCEL_LOCAL
+        | crate::win32k_subsystem::W32_TIMER_OP_READ_LOCAL => {
             let Some(provider) = crate::current_win32k_provider_domain() else {
                 return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
             };
-            handler
-                .provider_publish_local_timer(provider, arg1, arg2 as u32)
-                .map(|object| (0, object.object_id, object.object_generation, arg2))
-                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
-        }
-        crate::win32k_subsystem::W32_TIMER_OP_RETIRE_LOCAL => {
-            let Some(provider) = crate::current_win32k_provider_domain() else {
-                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
-            };
-            handler
-                .provider_retire_local_timer(provider, arg1)
-                .map(|retirement| match retirement {
-                    Some(retirement) => {
-                        let object = retirement.id.wait_object();
-                        (0, object.object_id, object.object_generation, 0)
-                    }
-                    None => (0x0000_0103, 0, 0, 0),
-                })
-                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
-        }
-        crate::win32k_subsystem::W32_TIMER_OP_ACK_LOCAL_RETIREMENT => {
-            let Some(provider) = crate::current_win32k_provider_domain() else {
-                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
-            };
-            let object = nt_provider_wait::ProviderWaitObject::new(
-                nt_provider_wait::ProviderWaitObjectType::Timer,
-                arg2,
-                arg3,
-            );
-            let Some(id) = nt_provider_wait::ProviderTimerId::from_wait_object(object) else {
-                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
-            };
-            handler
-                .provider_ack_local_timer_retirement(
-                    provider,
-                    nt_provider_wait::ProviderTimerRetirement {
-                        id,
-                        local_identity: arg1,
-                    },
-                )
-                .map(|()| (0, 0, 0, 0))
-                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
-        }
-        crate::win32k_subsystem::W32_TIMER_OP_SET_LOCAL => {
-            let Some(provider) = crate::current_win32k_provider_domain() else {
-                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
-            };
-            handler
-                .provider_set_local_timer(provider, arg1, arg2 as i64, arg3 as u32)
-                .map(|active| {
-                    let _ = rearm_registered_delay_timer();
-                    (0, u64::from(active), 0, 0)
-                })
-                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
-        }
-        crate::win32k_subsystem::W32_TIMER_OP_CANCEL_LOCAL => {
-            let Some(provider) = crate::current_win32k_provider_domain() else {
-                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
-            };
-            handler
-                .provider_cancel_local_timer(provider, arg1)
-                .map(|active| {
-                    let _ = rearm_registered_delay_timer();
-                    (0, u64::from(active), 0, 0)
-                })
-                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
-        }
-        crate::win32k_subsystem::W32_TIMER_OP_READ_LOCAL => {
-            let Some(provider) = crate::current_win32k_provider_domain() else {
-                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
-            };
-            handler
-                .provider_read_local_timer(provider, arg1)
-                .map(|signaled| (0, u64::from(signaled), 0, 0))
-                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+            service_win32k_provider_timer_request(provider, op, arg1, arg2, arg3)
         }
         _ => (STATUS_INVALID_PARAMETER, 0, 0, 0),
+    }
+}
+
+pub(crate) unsafe fn service_win32k_provider_timer_request(
+    provider: nt_provider_wait::ProviderDomainIdentity,
+    op: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> (i32, u64, u64, u64) {
+    let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    let result = if let Some(handler) = handler_ptr.as_mut() {
+        crate::provider_local_timer_request::dispatch(
+            &mut handler.provider_timers, provider, op, arg1, arg2, arg3,
+        )
+    } else {
+        match dispatcher_bootstrap::with_local_timers(|timers| {
+            crate::provider_local_timer_request::dispatch(timers, provider, op, arg1, arg2, arg3)
+        }) {
+            Ok(result) => result,
+            Err(status) => Err(status),
+        }
+    };
+    match result {
+        Ok(response) => {
+            if matches!(
+                op,
+                crate::win32k_subsystem::W32_TIMER_OP_SET_LOCAL
+                    | crate::win32k_subsystem::W32_TIMER_OP_CANCEL_LOCAL
+            ) {
+                let _ = rearm_registered_delay_timer();
+            }
+            response
+        }
+        Err(status) => (status as i32, 0, 0, 0),
     }
 }
 
@@ -6839,21 +6805,37 @@ pub(crate) unsafe fn service_win32k_gui_client_info(
         claimed, admitted, packet.thread_info, mapping, keyboard,
     ) else { return invalid };
     let client_badge = logical.badge();
-    let is_wl_worker = matches!(client_badge, WINLOGON_WORKER_BADGE | WINLOGON_WORKER2_BADGE | WINLOGON_WORKER3_BADGE);
     let Some(teb_alias) = hosted_gui_thread_teb_alias_for(
         handler, pi, client_badge, packet.thread_id,
-        tp_worker_identity_from_badge(client_badge), is_wl_worker,
+        tp_worker_identity_from_badge(client_badge),
     ) else { return invalid };
     let Some(mapped_delta) = win32k_glue::map_win32k_user_heap_into_client(handler, pml4, pi)
     else { return nt_process::STATUS_INSUFFICIENT_RESOURCES as i32 };
+    let current_process = handler.capture_process_identity(pi);
+    let current_thread = handler.pm.thread_lifetime(thread.thread_id());
+    let current_provider = crate::current_win32k_provider_domain();
+    let current_teb_alias = hosted_gui_thread_teb_alias_for(
+        handler, pi, client_badge, packet.thread_id,
+        tp_worker_identity_from_badge(client_badge),
+    );
     if mapped_delta != packet.mapped_delta
-        || crate::current_win32k_provider_domain() != Some(provider)
+        || current_provider != Some(provider)
         || win32k_glue::current_provider_poll_owner(channel) != Some(wait_owner)
-        || handler.pm.thread_lifetime(thread.thread_id()) != Some(thread)
+        || current_thread != Some(thread)
+        || current_process != Some(process)
+        || handler.hosted_process_generation(pi) != Some(channel.client_generation)
+        || handler.pm.thread_win32(thread.thread_id()) != Some(packet.thread_info)
+        || current_teb_alias != Some(teb_alias)
     {
         return invalid;
     }
-    let Ok(values) = snapshot.values_for(admitted) else { return invalid };
+    let current = GuiClientInfoOwner {
+        process: current_process.expect("revalidated GUI process disappeared"),
+        thread: current_thread.expect("revalidated GUI thread disappeared"),
+        provider: current_provider.expect("revalidated GUI provider disappeared"),
+        dispatch: (route, dispatch, wait_owner.dispatch_id),
+    };
+    let Ok(values) = snapshot.values_for(current) else { return invalid };
     let old_pti = core::ptr::read_volatile((teb_alias + 0x78) as *const u64);
     core::ptr::write_volatile((teb_alias + 0x78) as *mut u64, values.win32_thread_info);
     core::ptr::write_volatile((teb_alias + 0x820) as *mut u64, values.client_deskinfo);
@@ -6871,39 +6853,13 @@ pub(crate) unsafe fn service_win32k_gui_client_info(
     0
 }
 
-fn winlogon_thread_teb_alias_for(
-    badge: u64,
-    tp_worker_identity: Option<(usize, usize)>,
-    is_wl_worker: bool,
-) -> Option<u64> {
-    if let Some((2, tp_slot)) = tp_worker_identity {
-        return Some(tp_worker_teb_mirror_va(2, tp_slot));
-    }
-    if is_wl_worker {
-        return Some(match badge {
-            WINLOGON_WORKER2_BADGE => {
-                WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000
-            }
-            WINLOGON_WORKER3_BADGE => {
-                WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000
-            }
-            _ => WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000,
-        });
-    }
-    Some(WINLOGON_MAIN_TEB_MIRROR_VA)
-}
-
 fn hosted_gui_thread_teb_alias_for(
     nt_handler: &ExecNtHandler,
     pi: usize,
     badge: u64,
     current_tid: u64,
     tp_worker_identity: Option<(usize, usize)>,
-    is_wl_worker: bool,
 ) -> Option<u64> {
-    if pi == 2 {
-        return winlogon_thread_teb_alias_for(badge, tp_worker_identity, is_wl_worker);
-    }
     if let Some((tp_pi, tp_slot)) = tp_worker_identity {
         if tp_pi != pi || current_tid == 0 {
             return None;
@@ -6912,6 +6868,31 @@ fn hosted_gui_thread_teb_alias_for(
             .hosted_thread_tid_for_role(pi, HostedThreadRole::TpWorker { slot: tp_slot })
             == Some(current_tid))
         .then_some(tp_worker_teb_mirror_va(pi, tp_slot));
+    }
+    if pi == 2 {
+        let (role, teb_alias) = match badge {
+            WINLOGON_WORKER_BADGE => (
+                HostedThreadRole::WinlogonListener,
+                WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000,
+            ),
+            WINLOGON_WORKER2_BADGE => (
+                HostedThreadRole::WinlogonWorker { slot: 1 },
+                WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000,
+            ),
+            WINLOGON_WORKER3_BADGE => (
+                HostedThreadRole::WinlogonWorker { slot: 2 },
+                WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000,
+            ),
+            _ => {
+                return (current_tid != 0
+                    && nt_handler.pm_main_tid_for_pi(pi).map(u64::from) == Some(current_tid)
+                    && badge == hosted_top_badge_for_pi(nt_handler, pi))
+                    .then_some(WINLOGON_MAIN_TEB_MIRROR_VA);
+            }
+        };
+        return (current_tid != 0
+            && nt_handler.hosted_thread_tid_for_role(pi, role) == Some(current_tid))
+            .then_some(teb_alias);
     }
     let Some(main_tid) = nt_handler.pm_main_tid_for_pi(pi) else {
         return None;
@@ -16815,7 +16796,6 @@ pub(crate) unsafe fn service_sec_image(
                         badge,
                         current_tid,
                         tp_worker_identity,
-                        is_wl_worker,
                     )
                     .unwrap_or(0);
                     crate::ke_gdi_flush_user_batch(client, gdi_teb_alias);
@@ -21862,10 +21842,23 @@ pub(crate) unsafe fn service_sec_image(
                             break;
                         }
                     }
+                    // The root Reply slot is empty after the shared-ingress Call parks. This
+                    // private endpoint needs its own pool-owned Reply for the live wait proof.
+                    let private_reply = if debugger_runtime_registered
+                        && REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+                    {
+                        wait_reply_pool_find_free().map(|(index, cap)| {
+                            wait_reply_pool_mark_used(index);
+                            REPLY_MAIN_SLOT.store(cap, Ordering::Relaxed);
+                            cap
+                        })
+                    } else {
+                        None
+                    };
                     // The private endpoint has exactly one registered sender. A mismatched fault
                     // fails this proof; no shared-endpoint caller is discarded or rebound.
-                    let (w_badge, w_mi, w_m0, _, w_ip, _) = if debugger_runtime_registered {
-                        recv_full_r12(debugger_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed))
+                    let (w_badge, w_mi, w_m0, _, w_ip, _) = if let Some(reply) = private_reply {
+                        recv_full_r12(debugger_ep, reply)
                     } else {
                         (0, 0, 0, 0, 0, 0)
                     };
@@ -21944,6 +21937,13 @@ pub(crate) unsafe fn service_sec_image(
                         wait_cancel_thread(&mut nt_handler, u64::from(debugger_wait_tid.unwrap()));
                     } else if debugger_runtime_registered && w_mi >> 12 != 0 {
                         assert!(drop_current_hosted_reply(), "debugger proof failed to retire its received fault");
+                    }
+                    if private_reply.is_some() {
+                        let replacement = REPLY_MAIN_SLOT.swap(0, Ordering::Relaxed);
+                        let index = wait_reply_pool_find_cap(replacement)
+                            .expect("debugger proof lost its private Reply replacement");
+                        assert!(wait_reply_pool_ref()[index].used);
+                        wait_reply_pool_mark_free(index);
                     }
                     (
                         nt_handler.current_tid,

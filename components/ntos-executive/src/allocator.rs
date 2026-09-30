@@ -51,7 +51,10 @@ pub const HEAP_BASE: usize = 0x0000_0100_2000_0000;
 /// to 14.24 MiB and left only 861 KiB contiguous, causing Explorer process-parameter construction
 /// to fail. The extra 8 MiB is mapped from root Untyped at runtime and does not enlarge the loaded
 /// executable or initrd. Isolated-service heap profiles remain independently bounded.
-pub const HEAP_FRAMES: u64 = 6144;
+/// ★ RAISED 6144 -> 8192 (24 MiB -> 32 MiB) after the newer ReactOS image and real win32k static
+/// dependency loading left 790 KiB durable headroom before the 2.39 MiB object-wait table reserve.
+/// The 4 MiB transient partition remains separate; this adds runtime root Untyped frames only.
+pub const HEAP_FRAMES: u64 = 8192;
 /// Default heap frames mapped into an isolated component. Services that own larger durable state
 /// declare a larger profile at spawn time instead of charging every component for that capacity.
 pub const DEFAULT_SERVICE_HEAP_FRAMES: u64 = 128;

@@ -310,17 +310,28 @@ pub(super) unsafe fn service_event(
                 (win32k_subsystem::W32_EVENT_LABEL << 12) | 4,
             )
         })?;
+        let owner = caller.owner();
+        let provider = nt_provider_wait::ProviderDomainIdentity {
+            domain: owner.provider_domain,
+            generation: owner.provider_generation,
+        };
+        if matches!(
+            op,
+            win32k_subsystem::W32_TIMER_OP_PUBLISH_LOCAL
+                | win32k_subsystem::W32_TIMER_OP_RETIRE_LOCAL
+                | win32k_subsystem::W32_TIMER_OP_ACK_LOCAL_RETIREMENT
+                | win32k_subsystem::W32_TIMER_OP_SET_LOCAL
+                | win32k_subsystem::W32_TIMER_OP_CANCEL_LOCAL
+                | win32k_subsystem::W32_TIMER_OP_READ_LOCAL
+        ) {
+            return Ok(crate::service_sec_image::service_win32k_provider_timer_request(
+                provider, op, arg1, arg2, arg3,
+            ));
+        }
         let request = nt_user_host::provider_local_event_request::LocalEventRequest::decode(
             op, arg1, arg2, arg3,
         )?;
-        let owner = caller.owner();
-        event::dispatch(
-            nt_provider_wait::ProviderDomainIdentity {
-                domain: owner.provider_domain,
-                generation: owner.provider_generation,
-            },
-            request,
-        )
+        event::dispatch(provider, request)
     })();
     result.unwrap_or_else(|status| (status as i32, 0, 0, 0))
 }

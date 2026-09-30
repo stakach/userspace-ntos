@@ -96,6 +96,7 @@ mod ps_bootstrap;
 mod dispatcher_bootstrap;
 mod timer_deadline;
 mod provider_local_event;
+mod provider_local_timer_request;
 mod provider_dispatcher_backend;
 mod provider_file_wait;
 mod ps_object_retirement;

@@ -367,7 +367,6 @@ static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NAMED_EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
-static PROVIDER_TIMER_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EVENT_DELETE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_POST_LSA_REGISTRY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static TP_WORKER_PREFERRED_BUSY_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -1653,37 +1652,6 @@ fn trace_named_event_object(
     print_str(b"\n");
 }
 
-fn trace_provider_timer(
-    op: &[u8],
-    provider: nt_provider_wait::ProviderDomainIdentity,
-    local_identity: u64,
-    object: Option<nt_provider_wait::ProviderWaitObject>,
-    detail: u64,
-) {
-    let n = PROVIDER_TIMER_TRACE_N.fetch_add(1, Ordering::Relaxed);
-    if n >= 64 {
-        return;
-    }
-    print_str(b"[provider-timer] #");
-    print_u64(n + 1);
-    print_str(b" op=");
-    print_str(op);
-    print_str(b" provider=");
-    print_u64(provider.domain);
-    print_str(b"/");
-    print_u64(provider.generation);
-    print_str(b" local=0x");
-    print_hex_u64(local_identity);
-    if let Some(object) = object {
-        print_str(b" canonical=");
-        print_u64(object.object_id);
-        print_str(b"/");
-        print_u64(object.object_generation);
-    }
-    print_str(b" detail=");
-    print_u64(detail);
-    print_str(b"\n");
-}
 
 fn trace_winlogon_post_lsa_registry(
     handler: &ExecNtHandler,
@@ -24300,160 +24268,6 @@ impl ExecNtHandler {
             return Err(STATUS_INVALID_PARAMETER);
         }
         self.provider_local_events().ack(provider, local_identity, id)
-    }
-
-    pub(crate) fn provider_publish_local_timer(
-        &mut self,
-        provider: nt_provider_wait::ProviderDomainIdentity,
-        local_identity: u64,
-        timer_type: u32,
-    ) -> Result<nt_provider_wait::ProviderWaitObject, u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if !crate::win32k_provider_domain_is_current(provider) || timer_type > 1 {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        if self.provider_timers.is_none() {
-            self.provider_timers = Some(
-                nt_provider_wait::ProviderTimerTable::new(provider)
-                    .map_err(|_| STATUS_INVALID_PARAMETER)?,
-            );
-        }
-        let timers = self
-            .provider_timers
-            .as_mut()
-            .filter(|timers| timers.provider() == provider)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        let kind = if timer_type == 0 {
-            nt_provider_wait::ProviderTimerKind::Notification
-        } else {
-            nt_provider_wait::ProviderTimerKind::Synchronization
-        };
-        match timers.publish(local_identity, kind) {
-            Ok(id) => {
-                let object = id.wait_object();
-                trace_provider_timer(b"publish", provider, local_identity, Some(object), 0);
-                Ok(object)
-            }
-            Err(error) => {
-                trace_provider_timer(
-                    b"publish-fail",
-                    provider,
-                    local_identity,
-                    None,
-                    error as u64,
-                );
-                Err(STATUS_INVALID_PARAMETER)
-            }
-        }
-    }
-
-    pub(crate) fn provider_set_local_timer(
-        &mut self,
-        provider: nt_provider_wait::ProviderDomainIdentity,
-        local_identity: u64,
-        due_time_100ns: i64,
-        period_ms: u32,
-    ) -> Result<bool, u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if !crate::win32k_provider_domain_is_current(provider) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let timers = self.provider_timers
-            .as_mut()
-            .filter(|timers| timers.provider() == provider)
-            .ok_or_else(|| {
-                trace_provider_timer(b"set-no-table", provider, local_identity, None, 0);
-                STATUS_INVALID_PARAMETER
-            })?;
-        match timers.set_local(
-            local_identity,
-            due_time_100ns,
-            period_ms,
-            crate::nt_time_snapshot(),
-        ) {
-            Ok(active) => {
-                trace_provider_timer(b"set", provider, local_identity, None, u64::from(active));
-                Ok(active)
-            }
-            Err(error) => {
-                trace_provider_timer(b"set-fail", provider, local_identity, None, error as u64);
-                Err(STATUS_INVALID_PARAMETER)
-            }
-        }
-    }
-
-    pub(crate) fn provider_cancel_local_timer(
-        &mut self,
-        provider: nt_provider_wait::ProviderDomainIdentity,
-        local_identity: u64,
-    ) -> Result<bool, u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if !crate::win32k_provider_domain_is_current(provider) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        self.provider_timers
-            .as_mut()
-            .filter(|timers| timers.provider() == provider)
-            .ok_or(STATUS_INVALID_PARAMETER)?
-            .cancel_local(local_identity)
-            .map_err(|_| STATUS_INVALID_PARAMETER)
-    }
-
-    pub(crate) fn provider_read_local_timer(
-        &self,
-        provider: nt_provider_wait::ProviderDomainIdentity,
-        local_identity: u64,
-    ) -> Result<bool, u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if !crate::win32k_provider_domain_is_current(provider) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let id = self
-            .provider_timers
-            .as_ref()
-            .filter(|timers| timers.provider() == provider)
-            .ok_or(STATUS_INVALID_PARAMETER)?
-            .id_for_local(local_identity)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        self.provider_timers
-            .as_ref()
-            .expect("provider Timer table disappeared during an immutable query")
-            .read_state(id)
-            .map_err(|_| STATUS_INVALID_PARAMETER)
-    }
-
-    pub(crate) fn provider_retire_local_timer(
-        &mut self,
-        provider: nt_provider_wait::ProviderDomainIdentity,
-        local_identity: u64,
-    ) -> Result<Option<nt_provider_wait::ProviderTimerRetirement>, u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if !crate::win32k_provider_domain_is_current(provider) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        self.provider_timers
-            .as_mut()
-            .filter(|timers| timers.provider() == provider)
-            .ok_or(STATUS_INVALID_PARAMETER)?
-            .request_retire_local(local_identity)
-            .map_err(|_| STATUS_INVALID_PARAMETER)
-    }
-
-    pub(crate) fn provider_ack_local_timer_retirement(
-        &mut self,
-        provider: nt_provider_wait::ProviderDomainIdentity,
-        retirement: nt_provider_wait::ProviderTimerRetirement,
-    ) -> Result<(), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if !crate::win32k_provider_domain_is_current(provider) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        self.provider_timers
-            .as_mut()
-            .filter(|timers| timers.provider() == provider)
-            .ok_or(STATUS_INVALID_PARAMETER)?
-            .ack_retirement(retirement)
-            .map_err(|_| STATUS_INVALID_PARAMETER)
     }
 
     fn provider_event_identity(

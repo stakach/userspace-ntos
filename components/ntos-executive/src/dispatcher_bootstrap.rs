@@ -244,3 +244,11 @@ pub(crate) unsafe fn with_local_events<R>(
         })
         .map_err(|_| 0xC000_00A3u32)?
 }
+
+pub(crate) unsafe fn with_local_timers<R>(
+    operation: impl FnOnce(&mut Option<nt_provider_wait::ProviderTimerTable>) -> R,
+) -> Result<R, u32> {
+    (&mut *core::ptr::addr_of_mut!(BOOTSTRAP))
+        .with_mut(|seed| operation(&mut seed.dispatcher.provider_timers))
+        .map_err(|_| 0xC000_00A3u32)
+}
