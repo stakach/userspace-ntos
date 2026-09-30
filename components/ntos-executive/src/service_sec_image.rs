@@ -5149,6 +5149,7 @@ pub(crate) unsafe fn service_win32k_file_object_request(
         W32_FILE_OBJECT_LABEL, W32_FILE_OBJECT_REFERENCE_HANDLE,
         W32_FILE_OBJECT_REFERENCE_POINTER, W32_FILE_OBJECT_RELATED_DEVICE,
         W32_FILE_OBJECT_RELEASE_WAIT, W32_FILE_OBJECT_WAIT_IDENTITY,
+        W32_FILE_OBJECT_OPEN_DEVICE,
     };
     let caller = match authenticate_win32k_service_request(
         channel, reply_cap, badge, mi, (W32_FILE_OBJECT_LABEL << 12) | 4,
@@ -5171,18 +5172,36 @@ pub(crate) unsafe fn service_win32k_file_object_request(
             (status, pointer, granted as u64, attributes as u64)
         }
         W32_FILE_OBJECT_REFERENCE_POINTER if access == 0 && mode == 0 => {
+            if crate::video_device::video_file_projection_contains(object) {
+                return match crate::video_device::reference_video_file_pointer(object) {
+                    Ok(count) => (0, count, 0, 0),
+                    Err(status) => (status, 0, 0, 0),
+                };
+            }
             match crate::driver_launch::win32k_file_owners::reference_pointer(object) {
                 Ok(count) => (0, count, 0, 0),
                 Err(status) => (status, 0, 0, 0),
             }
         }
         W32_FILE_OBJECT_DEREFERENCE_POINTER if access == 0 && mode == 0 => {
+            if crate::video_device::video_file_projection_contains(object) {
+                return match crate::video_device::release_video_file_projection(object) {
+                    Ok(count) => (0, count, 0, 0),
+                    Err(status) => (status, 0, 0, 0),
+                };
+            }
             match crate::driver_launch::win32k_file_owners::dereference_pointer(object) {
                 Ok(count) => (0, count, 0, 0),
                 Err(status) => (status, 0, 0, 0),
             }
         }
         W32_FILE_OBJECT_RELATED_DEVICE if access == 0 && mode == 0 => {
+            if crate::video_device::video_file_projection_contains(object) {
+                return match crate::video_device::video_related_device_object(object) {
+                    Ok(device) => (0, device, 0, 0),
+                    Err(status) => (status.raw(), 0, 0, 0),
+                };
+            }
             match crate::driver_launch::win32k_file_owners::related_device_address(object) {
                 Ok(device) => (0, device, 0, 0),
                 Err(status) => (status, 0, 0, 0),
@@ -5198,6 +5217,30 @@ pub(crate) unsafe fn service_win32k_file_object_request(
         W32_FILE_OBJECT_RELEASE_WAIT if access == 0 && mode == 0 => {
             match crate::driver_launch::win32k_file_owners::release_wait_identity(object) {
                 Ok(()) => (0, 0, 0, 0),
+                Err(status) => (status, 0, 0, 0),
+            }
+        }
+        W32_FILE_OBJECT_OPEN_DEVICE => {
+            let Ok(length) = usize::try_from(mode) else {
+                return (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0);
+            };
+            if access > u32::MAX as u64 || length == 0 || length & 1 != 0 {
+                return (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0);
+            }
+            let (_lease, packet) =
+                match crate::win32k_subsystem::capture_provider_pool_packet(object, length) {
+                    Ok(packet) => packet,
+                    Err(status) => return (status as i32, 0, 0, 0),
+                };
+            let mut name = Vec::new();
+            if name.try_reserve_exact(length / 2).is_err() {
+                return (nt_process::STATUS_INSUFFICIENT_RESOURCES as i32, 0, 0, 0);
+            }
+            for unit in packet.chunks_exact(2) {
+                name.push(u16::from_le_bytes([unit[0], unit[1]]));
+            }
+            match crate::video_device::video_get_device_object_pointer(&name, access as u32) {
+                Ok((file, device)) => (0, file, device, 0),
                 Err(status) => (status, 0, 0, 0),
             }
         }

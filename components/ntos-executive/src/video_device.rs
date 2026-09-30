@@ -21,7 +21,6 @@ use nt_video_miniport::{
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_NO_MEMORY: i32 = 0xC000_0017u32 as i32;
-const STATUS_ACCESS_VIOLATION: i32 = 0xC000_0005u32 as i32;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const REG_SZ: u32 = 1;
 const REG_DWORD: u32 = 4;
@@ -580,8 +579,8 @@ unsafe fn teardown_video_io_route() -> bool {
     true
 }
 
-unsafe fn wstr_eq_ascii(buf: u64, len_bytes: usize, pat: &[u8]) -> bool {
-    if buf == 0 || len_bytes / 2 != pat.len() {
+fn wstr_eq_ascii(name: &[u16], pat: &[u8]) -> bool {
+    if name.len() != pat.len() {
         return false;
     }
     let low = |c: u16| -> u16 {
@@ -591,9 +590,9 @@ unsafe fn wstr_eq_ascii(buf: u64, len_bytes: usize, pat: &[u8]) -> bool {
             c
         }
     };
-    for k in 0..pat.len() {
-        let c = low(read_unaligned((buf + (k * 2) as u64) as *const u16));
-        if c != low(pat[k] as u16) {
+    for (c, expected) in name.iter().zip(pat) {
+        let c = low(*c);
+        if c != low(*expected as u16) {
             return false;
         }
     }
@@ -650,45 +649,30 @@ unsafe fn publish_video_device_map(metadata: VideoRegistrationMetadata) -> bool 
         .is_ok()
 }
 
+/// Resolve and retain the video File entirely in the executive's owning VSpace.
 pub(crate) unsafe fn video_get_device_object_pointer(
-    name: u64,
-    desired_access: u64,
-    fileobj_out: *mut u64,
-    devobj_out: *mut u64,
-) -> i32 {
-    if fileobj_out.is_null() || devobj_out.is_null() {
-        return STATUS_ACCESS_VIOLATION;
-    }
-    write_unaligned(fileobj_out, 0);
-    write_unaligned(devobj_out, 0);
-    if desired_access > u32::MAX as u64 {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if !projected_video_route_ready() || name == 0 {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
+    name: &[u16],
+    desired_access: u32,
+) -> Result<(u64, u64), i32> {
+    if !projected_video_route_ready() || name.is_empty() {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     }
     let state = video_state_snapshot();
     let Some(metadata) = state.metadata else {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     };
-    let len = read_unaligned(name as *const u16) as usize;
-    let buf = read_unaligned((name + 8) as *const u64);
-    if !wstr_eq_ascii(buf, len, metadata.device_path()) {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
+    if !wstr_eq_ascii(name, metadata.device_path()) {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     }
     let objects = state.objects;
     if !objects.ready() {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     }
-    if let Err(status) = retain_video_file_projection(
+    retain_video_file_projection(
         state.route.file_projection,
-        nt_types::AccessMask::from_bits_retain(desired_access as u32),
-    ) {
-        return status;
-    }
-    write_unaligned(fileobj_out, state.route.file_projection);
-    write_unaligned(devobj_out, objects.device);
-    0
+        nt_types::AccessMask::from_bits_retain(desired_access),
+    )?;
+    Ok((state.route.file_projection, objects.device))
 }
 
 /// Resolve the current attachment top through the File's exact consumer projection.

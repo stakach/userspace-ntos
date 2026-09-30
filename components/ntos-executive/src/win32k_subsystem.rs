@@ -1422,6 +1422,7 @@ pub const W32_FILE_OBJECT_RELATED_DEVICE: u64 = 4;
 pub const W32_FILE_OBJECT_WAIT_IDENTITY: u64 = 5;
 pub const W32_FILE_OBJECT_DEVICE_NAME: u64 = 6;
 pub const W32_FILE_OBJECT_RELEASE_WAIT: u64 = 7;
+pub const W32_FILE_OBJECT_OPEN_DEVICE: u64 = 8;
 /// Root-authenticated kernel activation handoff before entering provider code.
 pub const W32_KERNEL_ACTIVATION_LABEL: u64 = 0x78E;
 pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
@@ -4073,10 +4074,7 @@ extern "win64" fn s_ob_reference_object_by_pointer(
         s_ob_reference_object(object);
         return 0;
     }
-    if unsafe {
-        token_context_index(object).is_some()
-            || crate::video_device::video_file_projection_contains(object)
-    } {
+    if unsafe { token_context_index(object).is_some() } || provider_pool_contains(object) {
         if object_type != 0 {
             return STATUS_OBJECT_TYPE_MISMATCH;
         }
@@ -4115,10 +4113,6 @@ extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
         return unsafe { retain_primary_token_pointer(index) }
             .unwrap_or_else(|status| reject_ps_broker("token pointer retain", status))
             as u64;
-    }
-    if unsafe { crate::video_device::video_file_projection_contains(object) } {
-        return unsafe { crate::video_device::reference_video_file_pointer(object) }
-        .unwrap_or_else(|status| panic!("video projection retain failed: {status:#010x}"));
     }
     if provider_pool_contains(object) {
         let (file_status, file_count, _, _) = unsafe {
@@ -4198,10 +4192,6 @@ extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
         return unsafe { release_primary_token_pointer(index) }
             .unwrap_or_else(|status| reject_ps_broker("token pointer release", status))
             as u64;
-    }
-    if unsafe { crate::video_device::video_file_projection_contains(object) } {
-        return unsafe { crate::video_device::release_video_file_projection(object) }
-            .unwrap_or_else(|status| panic!("video projection release failed: {status:#010x}"));
     }
     if provider_pool_contains(object) {
         let (file_status, file_count, _, _) = unsafe {
@@ -14499,24 +14489,46 @@ extern "win64" fn s_io_get_device_object_pointer(
     devobj_out: *mut u64,
 ) -> i32 {
     unsafe {
-        crate::video_device::video_get_device_object_pointer(
-            name,
+        if fileobj_out.is_null() || devobj_out.is_null() || name == 0 {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+        core::ptr::write_unaligned(fileobj_out, 0);
+        core::ptr::write_unaligned(devobj_out, 0);
+        if access > u32::MAX as u64 {
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+        let length = core::ptr::read_unaligned(name as *const u16) as usize;
+        let maximum = core::ptr::read_unaligned((name + 2) as *const u16) as usize;
+        let buffer = core::ptr::read_unaligned((name + 8) as *const u64);
+        if length == 0 {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        if length > maximum || length & 1 != 0 || buffer == 0 {
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+        let packet = pool_alloc(length as u64);
+        if packet == 0 {
+            return STATUS_INSUFFICIENT_RESOURCES_I32;
+        }
+        core::ptr::copy_nonoverlapping(buffer as *const u8, packet as *mut u8, length);
+        let (status, file, device, _) = win32k_file_object_broker_call(
+            W32_FILE_OBJECT_OPEN_DEVICE,
+            packet,
             access,
-            fileobj_out,
-            devobj_out,
-        )
+            length as u64,
+        );
+        assert!(provider_pool_free(packet), "device-name packet retirement failed");
+        if status == 0 {
+            core::ptr::write_unaligned(fileobj_out, file);
+            core::ptr::write_unaligned(devobj_out, device);
+        }
+        status
     }
 }
 
 /// `PDEVICE_OBJECT IoGetRelatedDeviceObject(PFILE_OBJECT)`.
 extern "win64" fn s_io_get_related_device_object(file_object: u64) -> u64 {
     unsafe {
-        if crate::video_device::video_file_projection_contains(file_object) {
-            return crate::video_device::video_related_device_object(file_object)
-                .unwrap_or_else(|status| {
-                    panic!("IoGetRelatedDeviceObject rejected video File: {:#010x}", status.raw())
-                });
-        }
         let (status, device, _, _) = win32k_file_object_broker_call(
             W32_FILE_OBJECT_RELATED_DEVICE,
             file_object,
