@@ -71,6 +71,7 @@ pub(super) unsafe fn before_post_action(
         // The source remains in the handler until publication succeeds. Continuing synchronous
         // calls attach their reply in this same commit, never exposing an unarmed delivery row.
         let identity = reservation.identity();
+        let local_terminal = pending.local_terminal_result().is_some();
         pending_file_io_transfer(
             pending,
             wait_for_completion,
@@ -82,6 +83,9 @@ pub(super) unsafe fn before_post_action(
         );
         nt_handler.pending_file_io_transfer = None;
         nt_handler.pending_file_io_reservation = None;
+        if local_terminal {
+            FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+        }
         if let Some(identity) = nt_handler.current_synchronous_file.take() {
             inline_file_retirement::transfer_to_pending(identity);
         }
