@@ -534,6 +534,28 @@ pub(super) unsafe fn abort_unpublished(
     Ok(())
 }
 
+pub(super) unsafe fn abort_prepared_thread(
+    pm: &ProcessManager,
+    lifetime: ThreadLifetime,
+    scratch_base: u64,
+) -> Result<(), u32> {
+    let body = {
+        let _borrow = Borrow::acquire()?;
+        let arena = (&*core::ptr::addr_of!(ARENA)).as_ref().ok_or(INVALID)?;
+        arena.validate(pm)?;
+        arena.existing(BodyId::Thread(lifetime.thread_id())).and_then(|index| {
+            let row = &arena.rows[index];
+            (row.phase == BodyPhase::Prepared
+                && row.current_thread_lifetime == Some(lifetime))
+                .then_some(row.page.descriptor().address)
+        })
+    };
+    if let Some(body) = body {
+        abort_unpublished(pm, body, scratch_base)?;
+    }
+    Ok(())
+}
+
 /// Publish only already initialized storage. PM preflights both pointers and the exact thread
 /// activation before either becomes visible. No syscall/allocation/reentry separates its commit
 /// from these sticky ownership phases; withdrawal can never make the rows abortable again.
@@ -618,9 +640,14 @@ pub(super) unsafe fn commit_thread_activation(
     };
     let row = &mut arena.rows[index];
     let body = row.page.descriptor().address;
-    if row.phase != BodyPhase::Published
+    if !matches!(row.phase, BodyPhase::Prepared | BodyPhase::Published)
+        || !row.page.is_initialized()
         || row.current_thread_lifetime != Some(plan.expected_lifetime())
-        || pm.thread_kernel_object(plan.thread_id()) != Some(body)
+        || pm.thread_kernel_object(plan.thread_id()) != match row.phase {
+            BodyPhase::Prepared => None,
+            BodyPhase::Published => Some(body),
+            BodyPhase::Retiring { .. } => return Err(INVALID),
+        }
         || row
             .page
             .live_alias(MappingTarget::Executive(arena.root))
@@ -639,11 +666,18 @@ pub(super) unsafe fn commit_thread_activation(
     fields.system_thread = pm.thread(plan.thread_id()).ok_or(INVALID)?.is_system_thread;
     let bytes = core::slice::from_raw_parts_mut(body as *mut u8, abi::ETHREAD_BODY_BYTES);
     abi::validate_thread_activation(bytes, fields).map_err(|_| INVALID)?;
-    pm.commit_thread_activation_with_handle(plan, handle)?;
+    match row.phase {
+        BodyPhase::Prepared => {
+            pm.commit_thread_activation_with_handle_and_object(plan, handle, body)?;
+        }
+        BodyPhase::Published => pm.commit_thread_activation_with_handle(plan, handle)?,
+        BodyPhase::Retiring { .. } => unreachable!(),
+    }
     // Both owners remain exclusively borrowed. No allocation, syscall or provider byte write can
     // invalidate the preflight between PM generation publication and these bounded field writes.
     abi::refresh_thread_activation(bytes, fields).expect("exclusive prevalidated ETHREAD refresh");
     row.current_thread_lifetime = pm.thread_lifetime(plan.thread_id());
+    row.phase = BodyPhase::Published;
     Ok(())
 }
 

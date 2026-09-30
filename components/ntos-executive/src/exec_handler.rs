@@ -14278,9 +14278,30 @@ impl ExecNtHandler {
         assert!(self.thread_runtime.validate_spawn(&prepared, &spawn),
             "first run requires the exact completed construction and protected reservation");
         let tcb = spawn.tcb();
-        let activation = crate::ps_object_backing::commit_thread_activation(
-            &mut self.pm, publication.activation, publication.handle,
-        );
+        let scratch = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+        let old_lifetime = publication.activation.expected_lifetime();
+        let prepared_body = if self.pm.thread_kernel_object(tid).is_none() {
+            crate::ps_object_backing::prepare_thread(&self.pm, old_lifetime, scratch).map(Some)
+        } else {
+            Ok(None)
+        };
+        let activation = match prepared_body {
+            Ok(body) => {
+                let result = crate::ps_object_backing::commit_thread_activation(
+                    &mut self.pm, publication.activation, publication.handle,
+                );
+                if result.is_err() && body.is_some() {
+                    crate::ps_object_backing::abort_prepared_thread(&self.pm, old_lifetime, scratch)
+                        .expect("failed activation retains its unpublished ETHREAD owner");
+                }
+                result
+            }
+            Err(status) => {
+                crate::ps_object_backing::abort_prepared_thread(&self.pm, old_lifetime, scratch)
+                    .expect("failed construction retains its unpublished ETHREAD owner");
+                Err(status)
+            }
+        };
         let failure = match activation {
             Err(status) => Some(status),
             Ok(()) => {

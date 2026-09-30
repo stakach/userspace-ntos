@@ -3302,6 +3302,24 @@ impl ProcessManager {
         self.commit_thread_activation_inner(plan, Some(reservation))
     }
 
+    /// First activation of an already initialized canonical ETHREAD body. The body slot is
+    /// preflighted before changing the generation, then published without a fallible step.
+    pub fn commit_thread_activation_with_handle_and_object(
+        &mut self,
+        plan: ThreadActivationPlan,
+        reservation: HandleReservation,
+        ethread: u64,
+    ) -> Result<(), u32> {
+        if !self.can_publish_thread_kernel_object(plan.tid, ethread)
+            || self.thread_kernel_object(plan.tid).is_some()
+        {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        self.commit_thread_activation_inner(plan, Some(reservation))?;
+        self.threads.get_mut(&plan.tid).unwrap().kernel_thread_object = Some(ethread);
+        Ok(())
+    }
+
     fn commit_thread_activation_inner(
         &mut self,
         plan: ThreadActivationPlan,
