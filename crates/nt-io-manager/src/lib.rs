@@ -82,6 +82,8 @@ pub mod win32k_section_create_wire;
 pub mod win32k_section_map_wire;
 pub mod win32k_buffered_ioctl_wire;
 pub mod win32k_source_irp_ioctl_wire;
+pub mod win32k_source_pnp_wire;
+pub mod win32k_source_fsd_wire;
 pub mod file_directory_query_wire;
 mod lock_control;
 mod set_information_completion;
