@@ -148,6 +148,9 @@ const WIN32K_ETHREAD_BYTES: u64 = nt_kernel_abi::ps_reactos_x64::ETHREAD_BODY_BY
 /// desktop heaps then allocate inside their own section views, using the same block allocator.
 pub const WIN32K_HEAP_VADDR: u64 = 0x0000_0100_0740_0000;
 pub const WIN32K_HEAP_FRAMES: u64 = 4096;
+// Shared with the executive. Unlike the allocator's mutable bump cursor, this
+// committed high-water is monotonic and may be read outside provider context.
+const WIN32K_HEAP_PUBLISHED_HIGH_WATER_OFF: u64 = 0x10;
 const PROVIDER_ARENA_ROOT_HEAP_ID: u64 = 1;
 const PROVIDER_ARENA_SHARED_POOL_ID: u64 = 2;
 const PROVIDER_ARENA_FTYP_POOL_ID: u64 = 3;
@@ -369,6 +372,7 @@ pub const UC_SI_PDISPINFO: u64 = 0x20; // SHAREDINFO.pDispInfo
 pub const UC_SI_DELTA: u64 = 0x28; // SHAREDINFO.ulSharedDelta
 
 const POOL_DATA_OFF: u64 = 0x1000;
+const _: () = assert!(WIN32K_HEAP_PUBLISHED_HIGH_WATER_OFF + 8 <= POOL_DATA_OFF);
 
 // shared-page offsets
 pub const SH_ENTRY_RVA: u64 = 0x00; // in:  DriverEntry RVA (u64)
@@ -7578,6 +7582,10 @@ unsafe fn heap_alloc_in_raw(
     if zero {
         core::ptr::write_bytes(payload as *mut u8, 0, size as usize);
     }
+    if arena_base == WIN32K_HEAP_VADDR {
+        (&*((arena_base + WIN32K_HEAP_PUBLISHED_HIGH_WATER_OFF) as *const AtomicU64))
+            .fetch_max((hdr + HEAP_HDR_SIZE + want) - arena_base, Ordering::Release);
+    }
     payload
 }
 
@@ -7969,7 +7977,9 @@ pub(crate) fn win32k_user_heap_delta() -> u64 {
 }
 
 pub(crate) unsafe fn win32k_user_heap_committed_frames() -> u64 {
-    let used = read_volatile(WIN32K_HEAP_VADDR as *const u64).max(POOL_DATA_OFF);
+    let used = (&*((WIN32K_HEAP_VADDR + WIN32K_HEAP_PUBLISHED_HIGH_WATER_OFF) as *const AtomicU64))
+        .load(Ordering::Acquire)
+        .max(POOL_DATA_OFF);
     ((used + 0xfff) / 0x1000).clamp(1, WIN32K_HEAP_FRAMES)
 }
 
