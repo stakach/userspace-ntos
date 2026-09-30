@@ -55,6 +55,8 @@ pub(crate) use service_sec_image::*;
 mod loader_trace_diag;
 pub(crate) use loader_trace_diag::*;
 mod exec_handler;
+mod native_image_sections;
+mod hosted_routed_image_capture;
 mod thread_context;
 mod thread_suspend;
 mod object_wait;
@@ -22662,6 +22664,7 @@ const OBJ_KIND_LPC_PORT: u8 = 5;
 const OBJ_KIND_TIMER: u8 = 6;
 const OBJ_KIND_IO_COMPLETION: u8 = 7;
 const OBJ_KIND_JOB: u8 = 8;
+const OBJ_KIND_SECTION: u8 = 9;
 const OBJ_KIND_DELETED: u8 = 0xff;
 const OBJ_NAME_CAP: usize = 128;
 const OBJ_PARENT_ROOT: usize = usize::MAX;
@@ -23310,6 +23313,8 @@ struct ExecNtHandler {
     /// The minimal object-manager namespace (index 0 = root `\`). Entries are inline and the owned
     /// vector grows beyond its boot reserve when required.
     obj_ns: alloc::vec::Vec<ObjEntry>,
+    /// Native image Section identities and their exact file-backed lifetime.
+    image_sections: native_image_sections::NativeImageStore,
     /// Dispatcher state for every `obj_ns` event, keyed by the stable namespace index. The store
     /// owns manual/auto-reset and signal state; `obj_ns` owns names and identity.
     events: nt_kernel_exec::EventStore,

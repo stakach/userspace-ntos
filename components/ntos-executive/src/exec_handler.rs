@@ -64,6 +64,9 @@ pub(crate) mod directory_object;
 #[path = "exec_section_create.rs"]
 pub(crate) mod section_create;
 
+#[path = "exec_image_section_create.rs"]
+pub(crate) mod image_section_create;
+
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
 pub(crate) const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
@@ -3936,6 +3939,7 @@ impl ExecNtHandler {
             nt_address_space::SecuredVirtualMemoryTable::new()
         );
         write_field!(obj_ns, obj_ns);
+        write_field!(image_sections, native_image_sections::NativeImageStore::new());
         write_field!(events, events);
         write_field!(event_objects, event_objects);
         write_field!(provider_timers, provider_timers);
@@ -20285,11 +20289,20 @@ impl ExecNtHandler {
                     .handle_object_count(nt_process::HandleObject::Section(section))
                     == 0
                 {
-                    if let Some(loop_ctx) = self.loop_ctx {
-                        unsafe {
-                            let _ =
-                                (&mut *loop_ctx.generic_sections).release_handle(section as usize);
+                    if let Some(image) = native_image_sections::NativeImageSectionId::from_section_id(section) {
+                        self.image_sections.close_handle_group(image)
+                            .expect("final native image Section handle releases its group");
+                        if let Some(index) = self.obj_ns.iter().position(|entry| {
+                            entry.kind == OBJ_KIND_SECTION
+                                && entry.payload == u64::from(section)
+                                && !entry.permanent
+                        }) {
+                            self.obj_ns[index].unlink();
+                            self.image_sections.withdraw_permanent(image)
+                                .expect("unlinked image Section releases its name reference");
                         }
+                    } else if let Some(loop_ctx) = self.loop_ctx {
+                        unsafe { let _ = (&mut *loop_ctx.generic_sections).release_handle(section as usize); }
                     }
                 }
             }
@@ -38916,6 +38929,63 @@ impl ExecNtHandler {
             // Provide the US-ASCII NLS code-page section \Nls\NlsSectionCP20127 (csrss's Win32 stack
             // maps it during a DllMain); everything else → NOT_FOUND. Records nls_section_handle.
             NativeService::NtOpenSection => unsafe {
+                if !self.probe_user_output(args[0], core::mem::size_of::<u64>()) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let captured = match self.capture_named_object_attributes(args[2]) {
+                    Ok(captured) => captured,
+                    Err(status) => return status,
+                };
+                let Some(path) = captured.path() else {
+                    return STATUS_OBJECT_NAME_INVALID;
+                };
+                let (root_index, path) = match self.event_root_and_path(captured.root, path) {
+                    Ok(resolved) => resolved,
+                    Err(status) => return status,
+                };
+                if let Some(index) = self.obj_resolve(path, root_index) {
+                    if self.obj_ns[index].kind != OBJ_KIND_SECTION {
+                        return STATUS_OBJECT_TYPE_MISMATCH;
+                    }
+                    let section_id = self.obj_ns[index].payload as nt_process::SectionId;
+                    let Some(image) = native_image_sections::NativeImageSectionId::from_section_id(section_id) else {
+                        return STATUS_INVALID_HANDLE;
+                    };
+                    let caller = match self.native_handle_caller(ctx.previous_mode) {
+                        Ok(caller) => caller,
+                        Err(status) => return status,
+                    };
+                    let had_handle = self.pm.handle_object_count(nt_process::HandleObject::Section(section_id)) != 0;
+                    if let Err(error) = self.image_sections.ensure_handle_group(image) {
+                        return image_section_create::map_image_error(error);
+                    }
+                    let mut publication = match self.pm.reserve_native_section_handle(caller, captured.attributes & (nt_process::native_handle::OBJ_KERNEL_HANDLE | 0x2)) {
+                        Ok(publication) => publication,
+                        Err(status) => {
+                            if !had_handle {
+                                self.image_sections.close_handle_group(image).expect("unopened image group rollback");
+                            }
+                            return status;
+                        }
+                    };
+                    if let Err(status) = publication.bind(&mut self.pm, section_id, nt_ulong_arg(args[1])) {
+                        publication.abort(&mut self.pm).expect("failed image open reservation");
+                        if !had_handle {
+                            self.image_sections.close_handle_group(image).expect("failed image open group rollback");
+                        }
+                        return status;
+                    }
+                    let handle = publication.value();
+                    if !self.user_memory_write(SyscallUserMemory::CurrentProcess, args[0], &handle.to_le_bytes()) {
+                        publication.abort(&mut self.pm).expect("image open copyout rollback");
+                        if !had_handle {
+                            self.image_sections.close_handle_group(image).expect("image open copyout group rollback");
+                        }
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    publication.publish(&mut self.pm).expect("image Section open publication");
+                    return 0;
+                }
                 let ctx = self.loop_ctx.unwrap();
                 let name16 = smss_read_objattr_name(args[2]); // R8 = *ObjectAttributes
                 print_str(b"[ntos-exec] NtOpenSection name=\"");
@@ -41289,7 +41359,40 @@ impl ExecNtHandler {
                 }
 
                 let mut basic_info = [0u8; SECTION_BASIC_INFORMATION_SIZE];
-                let image_info: Option<([u8; 64], &[u8])> = if let Some(i) =
+                let native_image = self
+                    .native_handle_caller(previous_mode)
+                    .ok()
+                    .and_then(|caller| self.pm.lookup_native_section_handle(caller, sect).ok().map(|handle| (caller, handle)))
+                    .and_then(|(caller, handle)| native_image_sections::NativeImageSectionId::from_section_id(handle.section()).map(|id| (caller, handle, id)));
+                let image_info: Option<([u8; 64], &[u8])> = if let Some((caller, section_handle, id)) = native_image {
+                    if let Err(status) = nt_memory_manager::section_view_access::check_section_query_access(
+                        section_handle.granted_access(), caller.mode(),
+                    ) {
+                        return status;
+                    }
+                    let Some(source) = self.image_sections.source(id) else {
+                        return nt_process::STATUS_INVALID_HANDLE;
+                    };
+                    let pe = match nt_pe_loader::PeFile::parse(&source.pe_header) {
+                        Ok(pe) => pe,
+                        Err(_) => return 0xC000_007B,
+                    };
+                    let headers = pe.headers();
+                    let mut info = [0u8; SECTION_IMAGE_INFORMATION_SIZE];
+                    info[0..8].copy_from_slice(&headers.image_base.saturating_add(u64::from(headers.entry_point_rva)).to_le_bytes());
+                    info[0x10..0x18].copy_from_slice(&headers.size_of_stack_reserve.to_le_bytes());
+                    info[0x18..0x20].copy_from_slice(&headers.size_of_stack_commit.to_le_bytes());
+                    info[0x20..0x24].copy_from_slice(&(u32::from(headers.subsystem)).to_le_bytes());
+                    info[0x24..0x26].copy_from_slice(&headers.minor_subsystem_version.to_le_bytes());
+                    info[0x26..0x28].copy_from_slice(&headers.major_subsystem_version.to_le_bytes());
+                    info[0x2c..0x2e].copy_from_slice(&headers.characteristics.to_le_bytes());
+                    info[0x30..0x32].copy_from_slice(&headers.machine.to_le_bytes());
+                    info[0x32] = 1;
+                    info[0x38..0x3c].copy_from_slice(&headers.size_of_image.to_le_bytes());
+                    basic_info[8..12].copy_from_slice(&(SECTION_ATTR_SEC_IMAGE | SECTION_ATTR_SEC_FILE).to_le_bytes());
+                    basic_info[16..24].copy_from_slice(&u64::from(headers.size_of_image).to_le_bytes());
+                    Some((info, b"native image"))
+                } else if let Some(i) =
                     reg.index_for_section(self.pi, sect)
                 {
                     reg.image_info(i).map(|b| {
@@ -41461,6 +41564,51 @@ impl ExecNtHandler {
                 let registry_slot = reg.index_for_file(self.pi, sec_file);
 
                 if allocation_attrs & SEC_IMAGE != 0 {
+                    let caller = match self.native_handle_caller(previous_mode) {
+                        Ok(caller) => caller,
+                        Err(status) => return status,
+                    };
+                    if let Ok(source) = self.pm.lookup_native_section_file_source(caller, sec_file) {
+                        if matches!(source.object(), nt_process::HandleObject::RoutedFile { .. }) {
+                            let mut image_object_attributes = 0;
+                            let named = if args[2] == 0 {
+                                None
+                            } else {
+                                let captured = match self.capture_named_object_attributes(args[2]) {
+                                    Ok(captured) => captured,
+                                    Err(status) => return status,
+                                };
+                                image_object_attributes = captured.attributes;
+                                if let Some(path) = captured.path() {
+                                    let (root_index, path) = match self.event_root_and_path(captured.root, path) {
+                                        Ok(resolved) => resolved,
+                                        Err(status) => return status,
+                                    };
+                                    let root_identity = self.obj_ns[root_index].identity;
+                                    let mut owned_path = Vec::new();
+                                    if owned_path.try_reserve_exact(path.len()).is_err() {
+                                        return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
+                                    }
+                                    owned_path.extend_from_slice(path);
+                                    Some(section_metadata_work::ImageObjectName {
+                                        root_index,
+                                        root_identity,
+                                        path: owned_path,
+                                    })
+                                } else {
+                                    None
+                                }
+                            };
+                            return match crate::section_metadata_work::submit_hosted(
+                                self, caller, source, out, desired_access,
+                                image_object_attributes,
+                                maxsize, page_protection, allocation_attrs, sec_file, named,
+                            ) {
+                                Ok(()) => 0x0000_0103,
+                                Err(status) => status,
+                            };
+                        }
+                    }
                     let exe_known = (&*ctx.exe_images)
                         .index_for_file(self.pi, sec_file)
                         .is_some();
@@ -41570,7 +41718,7 @@ impl ExecNtHandler {
                     if matches!(source.object(), nt_process::HandleObject::RoutedFile { .. }) {
                         return match crate::section_metadata_work::submit_hosted(
                             self, caller, source, out, desired_access, attributes, maxsize,
-                            page_protection, allocation_attrs, sec_file,
+                            page_protection, allocation_attrs, sec_file, None,
                         ) {
                             Ok(()) => 0x0000_0103,
                             Err(status) => status,

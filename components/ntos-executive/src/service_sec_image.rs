@@ -25427,11 +25427,19 @@ unsafe fn file_cleanup_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let mut completed = 0u64;
     while let Some((slot, file_id)) = nt_handler.file_completion.active_cleanup_from(cursor) {
         cursor = slot + 1;
-        if driver_launch::hosted_file_exists(file_id) {
+        let cleanup_complete = driver_launch::io_manager_mut()
+            .file(nt_io_manager::FileId(file_id))
+            .is_none_or(|file| {
+                matches!(
+                    file.state,
+                    nt_io_manager::FileState::CleanupComplete
+                        | nt_io_manager::FileState::ClosePending
+                        | nt_io_manager::FileState::Closed
+                )
+            });
+        if !cleanup_complete {
             driver_launch::release_hosted_file(file_id)
                 .expect("active File cleanup lost its canonical manager owner");
-        }
-        if driver_launch::hosted_file_exists(file_id) {
             continue;
         }
         let continuation =
