@@ -44,6 +44,8 @@ pub fn validate_new_kernel_irp_packet(
         || u16::from_le_bytes(bytes[2..4].try_into().unwrap()) as usize != size
         || bytes[0x42] != stack_count
         || bytes[0x43] != stack_count + 1
+        || u64::from_le_bytes(bytes[0x20..0x28].try_into().unwrap()) != base + 0x20
+        || u64::from_le_bytes(bytes[0x28..0x30].try_into().unwrap()) != base + 0x20
         || u64::from_le_bytes(bytes[0xb8..0xc0].try_into().unwrap()) != end
     {
         return Err(KernelIrpPlanError::InvalidIrpHeader);

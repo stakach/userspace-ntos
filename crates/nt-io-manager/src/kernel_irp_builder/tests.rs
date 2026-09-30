@@ -1,8 +1,40 @@
 use super::*;
 use crate::{
-    decode_wdm_kernel_built_io_stack, write_wdm_io_stack_location, write_wdm_irp,
-    write_wdm_irp_completion_targets, WdmIrpInit, WdmLayoutError,
+    decode_wdm_kernel_built_io_stack, initialize_wdm_irp_thread_list, write_wdm_io_stack_location,
+    write_wdm_irp, write_wdm_irp_completion_targets, WdmIrpInit, WdmLayoutError,
 };
+
+#[test]
+fn new_kernel_irp_thread_list_is_self_linked_at_final_address() {
+    let base = 0x1000_2000u64;
+    let mut packet = [0u8; WDM_X64_IRP_SIZE + WDM_X64_IO_STACK_LOCATION_SIZE];
+    let packet_size = packet.len() as u16;
+    write_wdm_irp(
+        &mut packet,
+        WdmIrpInit {
+            packet_size,
+            stack_count: 1,
+            current_location: 2,
+            current_stack_location: base + packet_size as u64,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    initialize_wdm_irp_thread_list(&mut packet, base).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(packet[0x20..0x28].try_into().unwrap()),
+        base + 0x20
+    );
+    assert_eq!(
+        u64::from_le_bytes(packet[0x28..0x30].try_into().unwrap()),
+        base + 0x20
+    );
+    validate_new_kernel_irp_packet(base, &packet, 1).unwrap();
+    assert_eq!(
+        initialize_wdm_irp_thread_list(&mut packet, u64::MAX),
+        Err(WdmLayoutError::InvalidField)
+    );
+}
 
 #[test]
 fn fsd_read_write_buffer_modes_match_reactos() {
@@ -232,6 +264,7 @@ fn planned_irp_and_next_stack_roundtrip_without_clobbering_completion_targets() 
         },
     )
     .unwrap();
+    initialize_wdm_irp_thread_list(&mut packet, irp_base).unwrap();
     write_wdm_irp_completion_targets(&mut packet[..WDM_X64_IRP_SIZE], 0xb000, 0xc000).unwrap();
     write_wdm_io_stack_location(&mut packet[plan.next_stack_offset..], plan.stack).unwrap();
     let u64_at = |offset: usize| u64::from_le_bytes(packet[offset..offset + 8].try_into().unwrap());
@@ -252,7 +285,7 @@ fn planned_irp_and_next_stack_roundtrip_without_clobbering_completion_targets() 
         validate_new_kernel_irp_packet(irp_base, &packet, 1),
         Err(KernelIrpPlanError::InvalidIrpHeader)
     );
-    for offset in [0, 2, 0x42, 0x43, 0xb8] {
+    for offset in [0, 2, 0x20, 0x28, 0x42, 0x43, 0xb8] {
         let mut corrupted = packet;
         corrupted[offset] ^= 1;
         assert_eq!(
