@@ -43,20 +43,6 @@ impl Drop for IoctlsGuard {
     }
 }
 
-unsafe fn stack_catalog_mut(
-) -> Option<&'static mut nt_provider_wait::ProviderStackActivationCatalog> {
-    (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS)).as_mut()
-}
-
-unsafe fn release_stack_pin(pin: ProviderStackLanePin) {
-    if stack_catalog_mut().is_none_or(|catalog| catalog.release_pin(pin).is_err()) {
-        crate::provider_bugcheck::report(
-            0xc4,
-            [W32_FILE_IOCTL_LABEL, pin.range().0, pin.range().1, 1],
-        );
-    }
-}
-
 unsafe fn reserve_ioctl(
     handle: u64,
     activation: ProviderStackEventActivation,
@@ -74,7 +60,7 @@ unsafe fn reserve_ioctl(
     let next = local_id
         .checked_add(1)
         .ok_or(STATUS_INSUFFICIENT_RESOURCES_I32)?;
-    let (_, iosb_pin) = stack_catalog_mut()
+    let (_, iosb_pin) = provider_input::stack_catalog_mut()
         .ok_or(STATUS_NOT_SUPPORTED_I32)?
         .pin_active_range(activation, iosb, 16)
         .map_err(|_| STATUS_ACCESS_VIOLATION_I32)?;
@@ -85,7 +71,7 @@ unsafe fn reserve_ioctl(
     ) {
         Ok(pin) => pin,
         Err(status) => {
-            release_stack_pin(iosb_pin);
+            provider_input::release_stack_pin(iosb_pin, W32_FILE_IOCTL_LABEL);
             return Err(status);
         }
     };
@@ -116,7 +102,7 @@ unsafe fn retire_ioctl(local_id: u64) {
         file_ioctl_target::release_output(pin);
     }
     if let Some(pin) = ioctl.iosb_pin {
-        release_stack_pin(pin);
+        provider_input::release_stack_pin(pin, W32_FILE_IOCTL_LABEL);
     }
 }
 
@@ -137,7 +123,7 @@ unsafe fn release_pins(local_id: u64) {
         crate::provider_bugcheck::report(0xc4, [W32_FILE_IOCTL_LABEL, local_id, 0, 5])
     });
     file_ioctl_target::release_output(output_pin);
-    release_stack_pin(iosb_pin);
+    provider_input::release_stack_pin(iosb_pin, W32_FILE_IOCTL_LABEL);
 }
 
 unsafe fn retain_token(local_id: u64, token: u64) {
@@ -238,70 +224,6 @@ pub(super) unsafe fn release_completed_for_activation(activation: ProviderStackE
     release_completed(activation, None);
 }
 
-unsafe fn copy_validated_input(
-    activation: ProviderStackEventActivation,
-    address: u64,
-    length: u32,
-    destination: &mut [u8],
-) -> Result<(), i32> {
-    if length == 0 {
-        return Ok(());
-    }
-    let length = length as u64;
-    let end = address
-        .checked_add(length)
-        .ok_or(STATUS_ACCESS_VIOLATION_I32)?;
-    if address == 0 || destination.len() != length as usize {
-        return Err(STATUS_ACCESS_VIOLATION_I32);
-    }
-    if let Some(catalog) = stack_catalog_mut() {
-        if catalog.resolve(address, length).is_ok() {
-            let (_, pin) = catalog
-                .pin_active_range(activation, address, length)
-                .map_err(|_| STATUS_ACCESS_VIOLATION_I32)?;
-            destination.copy_from_slice(core::slice::from_raw_parts(
-                address as *const u8,
-                length as usize,
-            ));
-            release_stack_pin(pin);
-            return Ok(());
-        }
-    }
-    if provider_pool_contains(address) {
-        let (_, pin) = with_provider_allocations(|catalog| catalog.pin_containing(address, length))
-            .ok_or(STATUS_NOT_SUPPORTED_I32)?
-            .map_err(|_| STATUS_ACCESS_VIOLATION_I32)?;
-        destination.copy_from_slice(core::slice::from_raw_parts(
-            address as *const u8,
-            length as usize,
-        ));
-        if with_provider_allocations(|catalog| catalog.release_pin(pin).is_ok()) != Some(true) {
-            crate::provider_bugcheck::report(0xc4, [W32_FILE_IOCTL_LABEL, address, length, 8]);
-        }
-        return Ok(());
-    }
-    if address >= WIN32K_CODE_VA
-        && end <= WIN32K_CODE_VA + WIN32K_IMAGE_BYTES
-        && WIN32K_ROOT_IMAGE_MAP_OWNER.load(Ordering::Acquire) != 0
-        && registered_provider_wait_domain().is_some()
-    {
-        let first = ((address - WIN32K_CODE_VA) / 0x1000) as usize;
-        let last = ((end - 1 - WIN32K_CODE_VA) / 0x1000) as usize;
-        if !code_rights()[first..=last]
-            .iter()
-            .all(|&rights| rights == RW_NX || rights == 2)
-        {
-            return Err(STATUS_ACCESS_VIOLATION_I32);
-        }
-        destination.copy_from_slice(core::slice::from_raw_parts(
-            address as *const u8,
-            length as usize,
-        ));
-        return Ok(());
-    }
-    Err(STATUS_ACCESS_VIOLATION_I32)
-}
-
 pub(super) extern "win64" fn device_io_control_file(
     handle: u64,
     event: u64,
@@ -343,8 +265,13 @@ pub(super) extern "win64" fn device_io_control_file(
             return STATUS_INSUFFICIENT_RESOURCES_I32;
         }
         input_copy.resize(input_length as usize, 0);
-        if let Err(status) = copy_validated_input(activation, input, input_length, &mut input_copy)
-        {
+        if let Err(status) = provider_input::copy_validated_input(
+            activation,
+            input,
+            input_length,
+            &mut input_copy,
+            W32_FILE_IOCTL_LABEL,
+        ) {
             retire_ioctl(local_id);
             return status;
         }

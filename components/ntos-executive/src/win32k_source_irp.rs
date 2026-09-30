@@ -194,6 +194,27 @@ pub(super) extern "win64" fn build_device_io_control_request(
         ) else {
             return 0;
         };
+        let mut input_copy = Vec::new();
+        if plan.system_buffer_input_len != 0 {
+            let Some(activation) = active_provider_stack_event_activation() else {
+                return 0;
+            };
+            if input_copy.try_reserve_exact(input_length as usize).is_err() {
+                return 0;
+            }
+            input_copy.resize(input_length as usize, 0);
+            if provider_input::copy_validated_input(
+                activation,
+                input,
+                input_length,
+                &mut input_copy,
+                0x57495250,
+            )
+            .is_err()
+            {
+                return 0;
+            }
+        }
         let Some((irp, ticket)) = allocate(stack_count) else {
             return 0;
         };
@@ -210,9 +231,9 @@ pub(super) extern "win64" fn build_device_io_control_request(
         }
         if plan.system_buffer_input_len != 0 {
             core::ptr::copy_nonoverlapping(
-                input as *const u8,
+                input_copy.as_ptr(),
                 system_buffer as *mut u8,
-                input_length as usize,
+                input_copy.len(),
             );
         }
         let stack = irp + plan.next_stack_offset as u64;
