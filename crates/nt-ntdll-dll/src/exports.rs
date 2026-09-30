@@ -5200,6 +5200,24 @@ pub unsafe extern "system" fn ldr_query_image_file_execution_options_ex(
 }
 
 #[cfg(target_arch = "x86_64")]
+unsafe fn report_image_verify_failure(stage: u8, status: NtStatus) {
+    let mut message = [0u8; 64];
+    let mut length = 0usize;
+    for &byte in b"[ntdll-image-verify] stage=" {
+        message[length] = byte;
+        length += 1;
+    }
+    message[length] = b'0' + stage;
+    length += 1;
+    for &byte in b" status=0x" {
+        message[length] = byte;
+        length += 1;
+    }
+    length = crate::write_u64_hex(&mut message, length, status as u64);
+    unsafe { crate::dbg_print_bytes(message.as_ptr(), length) };
+}
+
+#[cfg(target_arch = "x86_64")]
 unsafe fn verify_image_file_handle(
     image_file_handle: *mut c_void,
     import_callback: *mut c_void,
@@ -5213,42 +5231,97 @@ unsafe fn verify_image_file_handle(
     if raw_handle == 0 {
         return STATUS_INVALID_HANDLE;
     }
-    let image = match unsafe {
-        read_file_handle_bounded(
+    let mut section = 0u64;
+    let status = unsafe {
+        nt_ntdll::trap_stubs::nt_create_section(
+            &mut section as *mut u64 as u64,
+            0x8, // SECTION_MAP_EXECUTE
+            0,
+            0,
+            0x10, // PAGE_EXECUTE
+            0x0800_0000, // SEC_COMMIT, raw file layout
             raw_handle as u64,
-            nt_ntdll::rtl::image_verify::MAX_IMAGE_FILE_BYTES,
-            STATUS_FILE_TOO_LARGE,
-        )
-    } {
-        Ok(image) => image,
-        Err(status) => return status,
+        ) as NtStatus
     };
-    let verified = match nt_ntdll::rtl::image_verify::verify_image(
-        &image,
-        tagged_handle & 1 != 0,
-        !import_callback.is_null(),
-    ) {
-        Ok(verified) => verified,
-        Err(_) => return STATUS_IMAGE_CHECKSUM_MISMATCH,
-    };
-
-    if !image_characteristics.is_null() {
-        unsafe { core::ptr::write_unaligned(image_characteristics, verified.characteristics) };
+    if (status as i32) < 0 {
+        unsafe { report_image_verify_failure(1, status) };
+        return status;
     }
-    if !import_callback.is_null() {
-        let callback =
-            unsafe { core::mem::transmute::<*mut c_void, ImportCallback>(import_callback) };
-        for name in verified.import_names {
-            // The checked PE parser guarantees that the borrowed name is followed by a NUL byte.
-            unsafe { callback(import_callback_parameter, name.as_ptr()) };
+    let mut base = 0u64;
+    let mut view_size = 0u64;
+    let status = unsafe {
+        nt_ntdll::trap_stubs::nt_map_view_of_section(
+            section,
+            u64::MAX, // NtCurrentProcess()
+            &mut base as *mut u64 as u64,
+            0,
+            0,
+            0,
+            &mut view_size as *mut u64 as u64,
+            1, // ViewShare
+            0,
+            0x10, // PAGE_EXECUTE
+        ) as NtStatus
+    };
+    if (status as i32) < 0 {
+        unsafe { report_image_verify_failure(2, status) };
+        let _ = unsafe { boot_nt_close(section) };
+        return status;
+    }
+    let result = (|| -> Result<NtStatus, NtStatus> {
+        let mut iosb = [0u64; 2];
+        let mut info = [0u8; 24]; // FILE_STANDARD_INFORMATION
+        let status = unsafe {
+            nt_ntdll::trap_stubs::nt_query_information_file(
+                raw_handle as u64,
+                &mut iosb as *mut [u64; 2] as u64,
+                info.as_mut_ptr() as u64,
+                info.len() as u64,
+                5, // FileStandardInformation
+            ) as NtStatus
+        };
+        if (status as i32) < 0 {
+            unsafe { report_image_verify_failure(3, status) };
+            return Err(status);
         }
-    }
-    STATUS_SUCCESS
+        let file_size = u64::from_le_bytes(info[8..16].try_into().unwrap());
+        if file_size == 0 || file_size > nt_ntdll::rtl::image_verify::MAX_IMAGE_FILE_BYTES as u64 {
+            return Err(STATUS_FILE_TOO_LARGE);
+        }
+        if base == 0 || file_size > view_size {
+            unsafe { report_image_verify_failure(4, STATUS_INVALID_IMAGE_FORMAT) };
+            return Err(STATUS_INVALID_IMAGE_FORMAT);
+        }
+        let image = unsafe { core::slice::from_raw_parts(base as *const u8, file_size as usize) };
+        let verified = nt_ntdll::rtl::image_verify::verify_image(
+            image,
+            tagged_handle & 1 != 0,
+            !import_callback.is_null(),
+        )
+        .map_err(|_| {
+            unsafe { report_image_verify_failure(5, STATUS_IMAGE_CHECKSUM_MISMATCH) };
+            STATUS_IMAGE_CHECKSUM_MISMATCH
+        })?;
+        if !image_characteristics.is_null() {
+            unsafe { core::ptr::write_unaligned(image_characteristics, verified.characteristics) };
+        }
+        if !import_callback.is_null() {
+            let callback =
+                unsafe { core::mem::transmute::<*mut c_void, ImportCallback>(import_callback) };
+            for name in verified.import_names {
+                unsafe { callback(import_callback_parameter, name.as_ptr()) };
+            }
+        }
+        Ok(STATUS_SUCCESS)
+    })();
+    let _ = unsafe { nt_ntdll::trap_stubs::nt_unmap_view_of_section(u64::MAX, base) };
+    let _ = unsafe { boot_nt_close(section) };
+    result.unwrap_or_else(|status| status)
 }
 
-/// Verify the PE image read from `ImageFileHandle`, report its characteristics, and enumerate its
-/// imported module names. A low-bit-tagged KnownDLL handle skips only the checksum comparison; the
-/// real executive handle used for I/O has that policy bit removed.
+/// Verify an executable file through a file-backed section, report its characteristics, and
+/// enumerate imported modules. A low-bit-tagged KnownDLL handle skips only the checksum comparison;
+/// the executive handle used for section creation has that policy bit removed.
 ///
 /// # Safety
 /// `import_callback` has the `LDR_IMPORT_MODULE_CALLBACK` ABI and `image_characteristics`, when

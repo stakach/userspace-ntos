@@ -144,6 +144,9 @@ pub(crate) unsafe fn service_generic_section_frame(
     } else {
         None
     };
+    if let Some(frame) = (&*generic_sections).page_frame(section_index, page_index) {
+        return Ok(frame);
+    }
     let mut io = BackingIo { backing: section.backing, route };
     if routed_metadata_validated {
         if section.backing.kind != nt_memory_manager::GENERIC_SECTION_BACKING_ROUTED {

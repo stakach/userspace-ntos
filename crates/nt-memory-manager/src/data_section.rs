@@ -127,6 +127,54 @@ pub struct DataSectionPageRead {
     length: usize,
 }
 
+/// A bounded sequential read that stages complete pages before any frame is published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DataSectionReadWindow {
+    offset: u64,
+    length: usize,
+    pages: usize,
+}
+
+impl DataSectionReadWindow {
+    pub const fn offset(self) -> u64 { self.offset }
+    pub const fn length(self) -> usize { self.length }
+    pub const fn pages(self) -> usize { self.pages }
+    pub const fn capacity(self) -> usize { self.pages * DATA_PAGE_SIZE }
+
+    pub fn complete(self, status: u32, read: usize, output: &mut [u8]) -> Result<(), u32> {
+        if status != 0 { return Err(status); }
+        if read != self.length || output.len() != self.capacity() {
+            return Err(STATUS_IO_DEVICE_ERROR);
+        }
+        output[self.length..].fill(0);
+        Ok(())
+    }
+
+    pub const fn from_page(plan: DataSectionPageRead) -> Self {
+        Self { offset: plan.offset, length: plan.length, pages: 1 }
+    }
+}
+
+pub fn plan_data_section_read_window(
+    page_index: u64,
+    section_size: u64,
+    file_size: u64,
+    max_pages: usize,
+) -> Result<DataSectionReadWindow, u32> {
+    let first = plan_data_section_page_read(page_index, section_size, file_size)?;
+    if max_pages == 0 || max_pages > 8 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let section_pages = section_size.div_ceil(DATA_PAGE_SIZE as u64);
+    let file_pages = file_size.div_ceil(DATA_PAGE_SIZE as u64);
+    let pages = (section_pages - page_index)
+        .min(file_pages - page_index)
+        .min(max_pages as u64) as usize;
+    let length = (file_size - first.offset())
+        .min((pages * DATA_PAGE_SIZE) as u64) as usize;
+    Ok(DataSectionReadWindow { offset: first.offset(), length, pages })
+}
+
 impl DataSectionPageRead {
     pub const fn offset(self) -> u64 {
         self.offset

@@ -1,4 +1,5 @@
 use super::*;
+use alloc::vec;
 use alloc::vec::Vec;
 
 struct FileIo {
@@ -341,6 +342,24 @@ fn planned_page_read_refuses_failed_or_inexact_terminal_delivery() {
         plan_data_section_page_read(1, 0x2000, 0x1000),
         Err(STATUS_END_OF_FILE)
     );
+}
+
+#[test]
+fn sequential_window_is_bounded_by_section_and_eof() {
+    let plan = plan_data_section_read_window(1, 0x7200, 0x5180, 8).unwrap();
+    assert_eq!((plan.offset(), plan.length(), plan.pages()), (0x1000, 0x4180, 5));
+    assert_eq!(plan.capacity(), 0x5000);
+    let mut bytes = vec![0x5a; plan.capacity()];
+    assert_eq!(plan.complete(0, plan.length() - 1, &mut bytes), Err(STATUS_IO_DEVICE_ERROR));
+    assert!(bytes.iter().all(|byte| *byte == 0x5a));
+    plan.complete(0, plan.length(), &mut bytes).unwrap();
+    assert!(bytes[..plan.length()].iter().all(|byte| *byte == 0x5a));
+    assert!(bytes[plan.length()..].iter().all(|byte| *byte == 0));
+
+    let plan = plan_data_section_read_window(1, 0x2100, 0x8000, 8).unwrap();
+    assert_eq!((plan.offset(), plan.length(), plan.pages()), (0x1000, 0x2000, 2));
+    assert_eq!(plan_data_section_read_window(0, 0x1000, 0x1000, 0), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(plan_data_section_read_window(0, 0x1000, 0x1000, 9), Err(STATUS_INVALID_PARAMETER));
 }
 
 #[test]

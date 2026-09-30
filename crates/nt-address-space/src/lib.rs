@@ -594,7 +594,11 @@ fn mapped_protection_allows_fault_access(protection: u32, access: FaultAccess) -
         return false;
     }
     match access {
-        FaultAccess::Read | FaultAccess::Lock => readable(protection),
+        // x64 PTEs cannot represent execute-only user pages: a mapped PAGE_EXECUTE
+        // view is readable by the processor even though it grants no file read access.
+        FaultAccess::Read | FaultAccess::Lock => {
+            readable(protection) || base_protection(protection) == PAGE_EXECUTE
+        }
         FaultAccess::Write => matches!(
             base_protection(protection),
             PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY

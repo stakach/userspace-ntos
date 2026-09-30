@@ -8536,6 +8536,20 @@ impl ExecNtHandler {
         self.pm.publish_initial_thread_runtime(
             lifetime, mapped.entry, teb, mapped.create_time_100ns,
         )?;
+        let scratch = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+        let process_body = unsafe {
+            crate::ps_object_backing::prepare_process(&self.pm, process.pid, scratch)?
+        };
+        if let Err(status) = unsafe {
+            crate::ps_object_backing::prepare_thread(&self.pm, lifetime, scratch)
+        } {
+            unsafe {
+                crate::ps_object_backing::abort_unpublished(&self.pm, process_body, scratch)
+                    .expect("unpublished process body remains privately owned");
+            }
+            return Err(status);
+        }
+        unsafe { crate::ps_object_backing::publish_prepared_pair(&mut self.pm, lifetime)?; }
         self.thread_runtime.set_user_stack(
             u64::from(tid), HOSTED_MAIN_STACK_ALLOCATION_BASE, STACK_BASE + STACK_FRAMES * 0x1000,
         ).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;

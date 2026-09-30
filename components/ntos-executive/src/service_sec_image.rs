@@ -3571,7 +3571,10 @@ pub(crate) unsafe fn service_generic_section_fault(
     }
     nt_handler.ensure_process_working_set_admission(pi, page, scratch_base)?;
     let fault_plan = nt_address_space::mapped_view_fault_plan(view_info.protect, write_fault);
-    if defer_routed && section.backing.kind == nt_memory_manager::GENERIC_SECTION_BACKING_ROUTED {
+    if defer_routed
+        && section.backing.kind == nt_memory_manager::GENERIC_SECTION_BACKING_ROUTED
+        && (&*generic_sections).page_frame(section_index, page_index).is_none()
+    {
         return Ok(GenericSectionFaultResult::RoutedPageIn);
     }
     let frame = service_generic_section_frame(
@@ -6652,11 +6655,13 @@ unsafe fn spawn_requested_hosted_exe(
     procs[pi].pid = child_pid as u64;
     procs[pi].pml4 = child_spawn.pml4;
     nt_handler.publish_hosted_process_vspace(pi, child_spawn.vspace_caps)?;
+    if !nt_handler.pm.set_peb_base(child_pid, SMSS_PEB_VA) {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
     nt_handler.register_main_thread_spawn(pi, child_spawn)?;
     procs[pi].img_end = PE_LOAD_BASE + image_extent(spec.pe);
     procs[pi].scratch_base = spec.runtime.scratch_base;
     map_demand_scratch_pts(spec.runtime.scratch_base);
-    let _ = nt_handler.pm.set_peb_base(child_pid, SMSS_PEB_VA);
 
     let process_handle = match nt_handler.insert_process_handle(
         creator_pid,

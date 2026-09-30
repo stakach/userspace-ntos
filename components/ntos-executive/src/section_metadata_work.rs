@@ -104,8 +104,7 @@ pub(crate) unsafe fn submit_hosted(
         source.granted_access(),
     )?;
     let mount = mounted_volume::mount_id_for_live_device(device_id).ok_or(0xc000_0020u32)?;
-    let capture =
-        driver_launch::hosted_file_capture::capture(file_id, device_id, source.granted_access())?;
+    let capture = driver_launch::hosted_file_capture::capture_native_section_source(source)?;
     let origin_driver = driver_launch::io_manager_mut()
         .device(DeviceId(device_id))
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
