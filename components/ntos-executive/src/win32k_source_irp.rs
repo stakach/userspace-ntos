@@ -2,7 +2,10 @@
 //! the executive cannot infer them from the shared pool header.
 
 use super::*;
-use nt_io_manager::kernel_irp_builder::validate_new_kernel_irp_packet;
+use nt_io_manager::kernel_irp_builder::{
+    validate_kernel_irp_dispatch_cursor, validate_new_kernel_irp_packet, KernelIrpDispatchCursor,
+    KernelIrpDispatchHeader,
+};
 use nt_io_manager::provider_source_irp::{
     ProviderSourceIrpAllocation, ProviderSourceIrpLedger, ProviderSourceIrpTicket,
 };
@@ -158,6 +161,7 @@ pub(super) unsafe fn is_source_irp(address: u64) -> bool {
 pub(super) struct SourceIrpDispatchLease {
     pub ticket: ProviderSourceIrpTicket,
     pub allocation: ProviderSourceIrpAllocation,
+    pub cursor: KernelIrpDispatchCursor,
 }
 
 /// Retain the source across a reentrant or pending canonical device dispatch.
@@ -183,8 +187,26 @@ pub(super) unsafe fn retain_dispatch(address: u64) -> Option<SourceIrpDispatchLe
     {
         return None;
     }
+    let header = KernelIrpDispatchHeader {
+        irp_type: read_volatile(address as *const u16),
+        packet_size: read_volatile((address + 2) as *const u16),
+        stack_count: read_volatile((address + 0x42) as *const u8),
+        current_location: read_volatile((address + 0x43) as *const u8),
+        current_stack_location: read_volatile((address + 0xb8) as *const u64),
+    };
+    let cursor = validate_kernel_irp_dispatch_cursor(
+        address,
+        allocation.bytes,
+        allocation.stack_count,
+        header,
+    )
+    .ok()?;
     ledger()?.pin(ticket, allocation).ok()?;
-    Some(SourceIrpDispatchLease { ticket, allocation })
+    Some(SourceIrpDispatchLease {
+        ticket,
+        allocation,
+        cursor,
+    })
 }
 
 /// Release only the exact source captured at dispatch admission. A stale lease
