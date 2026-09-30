@@ -38308,18 +38308,35 @@ pub(crate) struct HostedCompletedIrp {
     pub file_context: Option<u64>,
 }
 
-/// Resolve immutable terminal metadata for one exact canonical IRP. Generic executive delivery
-/// validates all of these identities before publishing its first user-visible surface.
-pub(crate) unsafe fn completed_irp_exact(irp_id: u64) -> Option<HostedCompletedIrp> {
+#[derive(Clone, Copy)]
+pub(crate) struct HostedCompletedDeviceControlIrp {
+    pub client_id: u64,
+    pub driver_id: u64,
+    pub device_id: u64,
+    pub completion_driver_id: u64,
+    pub completion_device_id: u64,
+    pub requestor_tid: u64,
+    pub major: u8,
+    pub status: u32,
+    pub information: u64,
+}
+
+unsafe fn completed_irp_snapshot_exact(irp_id: u64) -> Option<nt_io_manager::CompletedIrp> {
     if irp_id == 0 {
         return None;
     }
     pump_io_manager();
-    let completion = if hosted_file_owners::contains(IrpId(irp_id)) {
-        hosted_file_owners::completion(IrpId(irp_id)).ok()?
+    if hosted_file_owners::contains(IrpId(irp_id)) {
+        hosted_file_owners::completion(IrpId(irp_id)).ok()
     } else {
-        io_manager_mut().completed_irp(IrpId(irp_id))?
-    };
+        io_manager_mut().completed_irp(IrpId(irp_id))
+    }
+}
+
+/// Resolve immutable terminal metadata for one exact canonical IRP. Generic executive delivery
+/// validates all of these identities before publishing its first user-visible surface.
+pub(crate) unsafe fn completed_irp_exact(irp_id: u64) -> Option<HostedCompletedIrp> {
+    let completion = completed_irp_snapshot_exact(irp_id)?;
     Some(HostedCompletedIrp {
         client_id: completion.client_id.0,
         driver_id: completion.driver_id.raw(),
@@ -38332,6 +38349,34 @@ pub(crate) unsafe fn completed_irp_exact(irp_id: u64) -> Option<HostedCompletedI
         status: completion.status.raw() as u32,
         information: completion.information,
         file_context: completion.file_context,
+    })
+}
+
+/// Observe an exact terminal File-less control without consuming the canonical IRP.
+/// File-bound work must continue through `completed_irp_exact` and its File lease.
+pub(crate) unsafe fn completed_device_control_irp_exact(
+    irp_id: u64,
+) -> Option<HostedCompletedDeviceControlIrp> {
+    let completion = completed_irp_snapshot_exact(irp_id)?;
+    if completion.file_id.is_some()
+        || !matches!(
+            completion.major,
+            nt_io_abi::major::IRP_MJ_DEVICE_CONTROL
+                | nt_io_abi::major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+        )
+    {
+        return None;
+    }
+    Some(HostedCompletedDeviceControlIrp {
+        client_id: completion.client_id.0,
+        driver_id: completion.driver_id.raw(),
+        device_id: completion.device_id.raw(),
+        completion_driver_id: completion.completion_driver_id.raw(),
+        completion_device_id: completion.completion_device_id.raw(),
+        requestor_tid: completion.requestor_tid,
+        major: completion.major,
+        status: completion.status.raw() as u32,
+        information: completion.information,
     })
 }
 
