@@ -7,12 +7,38 @@ use nt_io_manager::win32k_source_irp_ioctl_wire::{
 };
 
 struct PendingSourceIoctl {
+    kind: SourceRequestKind,
     activation: ProviderStackEventActivation,
     source_irp: u64,
     token: u64,
     packet: u64,
     packet_length: usize,
     packet_pin: source_irp::PinnedSystemBuffer,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum SourceRequestKind {
+    Ioctl,
+    Pnp,
+    Fsd,
+}
+
+impl SourceRequestKind {
+    fn completion_label(self) -> u64 {
+        match self {
+            Self::Ioctl => W32_SOURCE_IOCTL_COMPLETION_LABEL,
+            Self::Pnp => W32_SOURCE_PNP_COMPLETION_LABEL,
+            Self::Fsd => W32_SOURCE_FSD_COMPLETION_LABEL,
+        }
+    }
+
+    fn release_label(self) -> u64 {
+        match self {
+            Self::Ioctl => W32_SOURCE_IOCTL_RELEASE_LABEL,
+            Self::Pnp => W32_SOURCE_PNP_RELEASE_LABEL,
+            Self::Fsd => W32_SOURCE_FSD_RELEASE_LABEL,
+        }
+    }
 }
 
 const MAX_PENDING_SOURCE_IOCTL: usize = 64;
@@ -41,7 +67,8 @@ impl Drop for SourceIoctlGuard {
     }
 }
 
-unsafe fn reserve_packet(
+pub(super) unsafe fn reserve_packet(
+    kind: SourceRequestKind,
     activation: ProviderStackEventActivation,
     source_irp: u64,
     packet: u64,
@@ -54,6 +81,7 @@ unsafe fn reserve_packet(
         return Err(packet_pin);
     };
     rows[index] = Some(PendingSourceIoctl {
+        kind,
         activation,
         source_irp,
         token: 0,
@@ -64,7 +92,7 @@ unsafe fn reserve_packet(
     Ok(index)
 }
 
-unsafe fn packet_live(index: usize, packet: u64, length: usize) -> bool {
+pub(super) unsafe fn packet_live(index: usize, packet: u64, length: usize) -> bool {
     let _guard = SourceIoctlGuard::acquire();
     (&*core::ptr::addr_of!(PENDING_SOURCE_IOCTL))[index]
         .as_ref()
@@ -75,7 +103,7 @@ unsafe fn packet_live(index: usize, packet: u64, length: usize) -> bool {
         })
 }
 
-unsafe fn retire_packet(index: usize) {
+pub(super) unsafe fn retire_packet(index: usize) {
     let row = {
         let _guard = SourceIoctlGuard::acquire();
         (&mut *core::ptr::addr_of_mut!(PENDING_SOURCE_IOCTL))[index].take()
@@ -88,7 +116,7 @@ unsafe fn retire_packet(index: usize) {
     }
 }
 
-unsafe fn retain_token(index: usize, token: u64) {
+pub(super) unsafe fn retain_token(index: usize, token: u64) {
     let _guard = SourceIoctlGuard::acquire();
     let row = (&mut *core::ptr::addr_of_mut!(PENDING_SOURCE_IOCTL))[index]
         .as_mut()
@@ -101,7 +129,7 @@ unsafe fn retain_token(index: usize, token: u64) {
     row.token = token;
 }
 
-fn valid_status_word(words: u64, raw: u64) -> bool {
+pub(super) fn valid_status_word(words: u64, raw: u64) -> bool {
     words == 1 && (raw == raw as u32 as u64 || raw == raw as u32 as i32 as i64 as u64)
 }
 
@@ -122,11 +150,21 @@ pub(super) unsafe fn release_completed_for_activation(activation: ProviderStackE
     }
 }
 
-unsafe fn complete_and_release(index: usize, token: u64, source_irp: u64) {
+pub(super) unsafe fn complete_and_release(index: usize, token: u64, source_irp: u64) {
+    let kind = {
+        let _guard = SourceIoctlGuard::acquire();
+        (&*core::ptr::addr_of!(PENDING_SOURCE_IOCTL))[index]
+            .as_ref()
+            .filter(|row| row.token == token && row.source_irp == source_irp)
+            .map(|row| row.kind)
+    }
+    .unwrap_or_else(|| crate::provider_bugcheck::report(0xc4, [W32_SOURCE_IOCTL_LABEL, token, 0, 40]));
+    let completion_label = kind.completion_label();
+    let release_label = kind.release_label();
     // Completion is a retained root wait. It replies only after terminal
     // publication, canonical Event signal, strict IRP ACK, and source retirement.
     let (words, raw, _, _, _) = crate::driver_launch::call_on4_raw(
-        (W32_SOURCE_IOCTL_COMPLETION_LABEL << 12) | 4,
+        (completion_label << 12) | 4,
         token,
         source_irp,
         0,
@@ -135,11 +173,11 @@ unsafe fn complete_and_release(index: usize, token: u64, source_irp: u64) {
     if !valid_status_word(words, raw) || raw as u32 != nt_process::STATUS_SUCCESS {
         crate::provider_bugcheck::report(
             0xc4,
-            [W32_SOURCE_IOCTL_COMPLETION_LABEL, token, words, raw],
+            [completion_label, token, words, raw],
         );
     }
     let (words, raw, _, _, _) = crate::driver_launch::call_on4_raw(
-        (W32_SOURCE_IOCTL_RELEASE_LABEL << 12) | 4,
+        (release_label << 12) | 4,
         token,
         source_irp,
         0,
@@ -148,7 +186,7 @@ unsafe fn complete_and_release(index: usize, token: u64, source_irp: u64) {
     if !valid_status_word(words, raw) || raw as u32 != nt_process::STATUS_SUCCESS {
         crate::provider_bugcheck::report(
             0xc4,
-            [W32_SOURCE_IOCTL_RELEASE_LABEL, token, words, raw],
+            [release_label, token, words, raw],
         );
     }
     retire_packet(index);
@@ -161,15 +199,15 @@ pub(super) extern "win64" fn iof_call_driver(device: u64, irp: u64) -> i32 {
             return STATUS_NOT_SUPPORTED_I32;
         };
         let stack_pointer = current_stack_pointer();
-        let mut admission = match source_irp::admit_buffered_dispatch(irp, device, stack_pointer) {
+        let mut admission = match source_irp::admit_buffered_dispatch(irp, device, stack_pointer, None) {
             Ok(lease) => lease,
             Err(status) => return status,
         };
         let input_length = admission.input.len() as u32;
-        let total = match wire::packet_len(input_length, admission.output_capacity) {
+        let total = match wire::packet_len(admission.code, input_length, admission.output_capacity) {
             Ok(total) if (total as u64) < WIN32K_POOL_FRAMES * 0x1000 => total,
             _ => {
-                if !source_irp::release_buffered_admission(&mut admission) {
+                if !source_irp::release_buffered_dispatch(&mut admission) {
                     crate::provider_bugcheck::report(0xc4, [W32_SOURCE_IOCTL_LABEL, irp, 0, 5]);
                 }
                 return STATUS_INVALID_PARAMETER_I32;
@@ -177,7 +215,7 @@ pub(super) extern "win64" fn iof_call_driver(device: u64, irp: u64) -> i32 {
         };
         let packet = pool_alloc(total as u64);
         if packet == 0 {
-            if !source_irp::release_buffered_admission(&mut admission) {
+            if !source_irp::release_buffered_dispatch(&mut admission) {
                 crate::provider_bugcheck::report(0xc4, [W32_SOURCE_IOCTL_LABEL, irp, 0, 6]);
             }
             return STATUS_INSUFFICIENT_RESOURCES_I32;
@@ -186,7 +224,7 @@ pub(super) extern "win64" fn iof_call_driver(device: u64, irp: u64) -> i32 {
             if !provider_pool_free(packet) {
                 crate::provider_bugcheck::report(0xc4, [W32_SOURCE_IOCTL_LABEL, packet, 0, 7]);
             }
-            if !source_irp::release_buffered_admission(&mut admission) {
+            if !source_irp::release_buffered_dispatch(&mut admission) {
                 crate::provider_bugcheck::report(0xc4, [W32_SOURCE_IOCTL_LABEL, irp, 0, 8]);
             }
             return STATUS_INSUFFICIENT_RESOURCES_I32;
@@ -211,6 +249,7 @@ pub(super) extern "win64" fn iof_call_driver(device: u64, irp: u64) -> i32 {
                 device_object_va: device,
                 code: admission.code,
                 input: &admission.input,
+                output_initial: &admission.output_initial,
                 output_capacity: admission.output_capacity,
                 event: admission.event,
             },
@@ -220,18 +259,18 @@ pub(super) extern "win64" fn iof_call_driver(device: u64, irp: u64) -> i32 {
             if !source_irp::release_system_buffer(packet_pin) || !provider_pool_free(packet) {
                 crate::provider_bugcheck::report(0xc4, [W32_SOURCE_IOCTL_LABEL, packet, 0, 10]);
             }
-            if !source_irp::release_buffered_admission(&mut admission) {
+            if !source_irp::release_buffered_dispatch(&mut admission) {
                 crate::provider_bugcheck::report(0xc4, [W32_SOURCE_IOCTL_LABEL, irp, 0, 11]);
             }
             return STATUS_INVALID_PARAMETER_I32;
         }
-        let index = match reserve_packet(activation, irp, packet, total, packet_pin) {
+        let index = match reserve_packet(SourceRequestKind::Ioctl, activation, irp, packet, total, packet_pin) {
             Ok(index) => index,
             Err(packet_pin) => {
             if !source_irp::release_system_buffer(packet_pin) || !provider_pool_free(packet) {
                 crate::provider_bugcheck::report(0xc4, [W32_SOURCE_IOCTL_LABEL, packet, 0, 12]);
             }
-            if !source_irp::release_buffered_admission(&mut admission) {
+            if !source_irp::release_buffered_dispatch(&mut admission) {
                 crate::provider_bugcheck::report(0xc4, [W32_SOURCE_IOCTL_LABEL, irp, 0, 13]);
             }
             return STATUS_INSUFFICIENT_RESOURCES_I32;
@@ -267,7 +306,7 @@ pub(super) extern "win64" fn iof_call_driver(device: u64, irp: u64) -> i32 {
                         .is_ok() =>
             {
                 retire_packet(index);
-                let mut source = source_irp::admit_buffered_dispatch(irp, device, stack_pointer)
+                let mut source = source_irp::admit_buffered_dispatch(irp, device, stack_pointer, None)
                     .unwrap_or_else(|_| {
                         crate::provider_bugcheck::report(
                             0xc4,

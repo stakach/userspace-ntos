@@ -12,6 +12,23 @@ pub(super) struct SourceIrpAuxiliary {
     pub output_target: Option<(u64, u64, file_ioctl_target::PinnedIoctlOutput)>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct AuxiliarySnapshot {
+    pub system_buffer: Option<(u64, shared_pool::AllocationIdentity)>,
+    pub mdl: Option<(u64, shared_pool::AllocationIdentity)>,
+    pub input_target: Option<(u64, u64)>,
+    pub output_target: Option<(u64, u64)>,
+}
+
+impl AuxiliarySnapshot {
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.system_buffer == other.system_buffer
+            && self.mdl == other.mdl
+            && self.input_target == other.input_target
+            && self.output_target == other.output_target
+    }
+}
+
 static mut SOURCE_AUXILIARIES: Vec<SourceIrpAuxiliary> = Vec::new();
 
 pub(super) unsafe fn register(auxiliary: SourceIrpAuxiliary) -> Result<(), SourceIrpAuxiliary> {
@@ -44,6 +61,28 @@ pub(super) unsafe fn contains_exact_unlocked(
     (&*core::ptr::addr_of!(SOURCE_AUXILIARIES))
         .iter()
         .any(|row| row.ticket == ticket && row.source == source)
+}
+
+pub(super) unsafe fn snapshot_exact(
+    ticket: ProviderSourceIrpTicket,
+    source: ProviderSourceIrpAllocation,
+) -> Option<AuxiliarySnapshot> {
+    let _metadata = ProviderMetadataGuard::acquire();
+    let row = (&*core::ptr::addr_of!(SOURCE_AUXILIARIES))
+        .iter()
+        .find(|row| row.ticket == ticket && row.source == source)?;
+    Some(AuxiliarySnapshot {
+        system_buffer: row
+            .system_buffer
+            .as_ref()
+            .map(|buffer| (buffer.address(), buffer.native_identity())),
+        mdl: row
+            .mdl
+            .as_ref()
+            .map(|buffer| (buffer.address(), buffer.native_identity())),
+        input_target: row.input_target.as_ref().map(|(address, length, _)| (*address, *length)),
+        output_target: row.output_target.as_ref().map(|(address, length, _)| (*address, *length)),
+    })
 }
 
 unsafe fn take_exact(
