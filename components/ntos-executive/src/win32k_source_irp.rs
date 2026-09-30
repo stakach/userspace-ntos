@@ -163,7 +163,14 @@ pub(super) unsafe fn retire(address: u64, ticket: ProviderSourceIrpTicket) -> bo
     let Some((found, allocation)) = ledger.allocation_at(WIN32K_POOL_VADDR, address) else {
         return false;
     };
-    if found != ticket || ledger.begin_free(ticket, allocation).is_err() {
+    if found != ticket || ledger.preflight_free(ticket, allocation).is_err() {
+        return false;
+    }
+    let mut memory = ProviderPoolMemory;
+    let offset = address - WIN32K_POOL_VADDR;
+    if shared_pool::allocation_identity(&memory, offset) != Ok(allocation.native)
+        || shared_pool::allocation_capacity(&memory, offset) != Ok(allocation.native_capacity)
+    {
         return false;
     }
     let Some(catalog) = provider_allocations_unlocked(&mut metadata) else {
@@ -172,10 +179,7 @@ pub(super) unsafe fn retire(address: u64, ticket: ProviderSourceIrpTicket) -> bo
     if catalog.begin_retirement_from_pin(allocation.catalog_pin) != Ok(allocation.catalog) {
         return false;
     }
-    let mut memory = ProviderPoolMemory;
-    let offset = address - WIN32K_POOL_VADDR;
-    if shared_pool::allocation_identity(&memory, offset) != Ok(allocation.native)
-        || shared_pool::allocation_capacity(&memory, offset) != Ok(allocation.native_capacity)
+    if ledger.begin_free(ticket, allocation).is_err()
         || shared_pool::free(&mut memory, offset).is_err()
         || catalog.retire(allocation.catalog.identity) != Ok(allocation.catalog)
         || ledger.finish_free(ticket, allocation).is_err()

@@ -194,19 +194,34 @@ impl ProviderSourceIrpLedger {
         Ok(())
     }
 
-    /// Reserve before native free. An uncertain effect leaves this row reserved, never replayable.
-    pub fn begin_free(
-        &mut self,
+    /// Check source-IRP ownership without consuming its retirement opportunity.
+    pub fn preflight_free(
+        &self,
         ticket: ProviderSourceIrpTicket,
         allocation: ProviderSourceIrpAllocation,
     ) -> Result<(), ProviderSourceIrpError> {
-        let row = self.exact_mut(ticket, allocation)?;
+        let row = self
+            .rows
+            .iter()
+            .find(|row| row.ticket == ticket && row.allocation == allocation)
+            .ok_or(ProviderSourceIrpError::WrongIdentity)?;
         if row.retiring {
             return Err(ProviderSourceIrpError::Retiring);
         }
         if row.pins != 0 {
             return Err(ProviderSourceIrpError::Pinned);
         }
+        Ok(())
+    }
+
+    /// Reserve after all fallible no-effect preflights. An uncertain native effect stays reserved.
+    pub fn begin_free(
+        &mut self,
+        ticket: ProviderSourceIrpTicket,
+        allocation: ProviderSourceIrpAllocation,
+    ) -> Result<(), ProviderSourceIrpError> {
+        self.preflight_free(ticket, allocation)?;
+        let row = self.exact_mut(ticket, allocation)?;
         row.retiring = true;
         Ok(())
     }
@@ -334,11 +349,20 @@ mod tests {
         let ticket = ledger.register(owner).unwrap();
         ledger.pin(ticket, owner).unwrap();
         assert_eq!(
+            ledger.preflight_free(ticket, owner),
+            Err(ProviderSourceIrpError::Pinned)
+        );
+        assert_eq!(
             ledger.begin_free(ticket, owner),
             Err(ProviderSourceIrpError::Pinned)
         );
         ledger.unpin(ticket).unwrap();
+        assert_eq!(ledger.preflight_free(ticket, owner), Ok(()));
         ledger.begin_free(ticket, owner).unwrap();
+        assert_eq!(
+            ledger.preflight_free(ticket, owner),
+            Err(ProviderSourceIrpError::Retiring)
+        );
         assert_eq!(
             ledger.pin(ticket, owner),
             Err(ProviderSourceIrpError::Retiring)
@@ -351,6 +375,30 @@ mod tests {
         catalog
             .begin_retirement_from_pin(owner.catalog_pin)
             .unwrap();
+        catalog.retire(owner.catalog.identity).unwrap();
+        ledger.finish_free(ticket, owner).unwrap();
+    }
+
+    #[test]
+    fn another_catalog_pin_does_not_strand_source_irp_retirement() {
+        let mut ledger = ProviderSourceIrpLedger::new();
+        let (mut catalog, owner) = allocation(11, 5);
+        let ticket = ledger.register(owner).unwrap();
+        let (_, other_pin) = catalog
+            .pin_containing(owner.catalog.base, owner.bytes)
+            .unwrap();
+        assert_eq!(ledger.preflight_free(ticket, owner), Ok(()));
+        assert_eq!(
+            catalog.begin_retirement_from_pin(owner.catalog_pin),
+            Err(ProviderAllocationError::Pinned)
+        );
+        assert_eq!(ledger.preflight_free(ticket, owner), Ok(()));
+        catalog.release_pin(other_pin).unwrap();
+        assert_eq!(
+            catalog.begin_retirement_from_pin(owner.catalog_pin),
+            Ok(owner.catalog)
+        );
+        ledger.begin_free(ticket, owner).unwrap();
         catalog.retire(owner.catalog.identity).unwrap();
         ledger.finish_free(ticket, owner).unwrap();
     }
