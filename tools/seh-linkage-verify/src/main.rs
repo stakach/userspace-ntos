@@ -10,7 +10,7 @@ use nt_unwind::{
 };
 use sha2::{Digest, Sha256};
 
-const EXPORTS: [&str; 13] = [
+const EXPORTS: [&str; 14] = [
     "SehCallFilter",
     "SehCallFinally",
     "SehExecuteHandlerForException",
@@ -24,10 +24,12 @@ const EXPORTS: [&str; 13] = [
     "SehForeignCall16",
     "SehFaultEntry",
     "SehFaultDispatch",
+    "SehRaiseAccessViolation",
 ];
 const RAISE_PROLOGUE: [u8; 8] = [0x9c, 0x48, 0x81, 0xec, 0xf0, 0x04, 0x00, 0x00];
 const RAISE_UNWIND_CODES: [u8; 6] = [8, 1, 0x9e, 0, 1, 2];
 const RAISE_FUNCTION_LEN: u32 = 0x12a;
+const ACCESS_VIOLATION_FUNCTION_LEN: u32 = 10;
 const RESUME_PROLOGUE: [u8; 4] = [0x48, 0x83, 0xec, 0x08];
 const RESUME_UNWIND_CODES: [u8; 2] = [4, 2];
 const RESUME_TRANSFER: [u8; 11] = [
@@ -330,6 +332,62 @@ fn verify_raise_entry(
         "{} RVA=0x{:x} unwind=0x{:x} flags={}",
         export.name, export.rva, function.unwind_info, header.flags
     );
+    Ok(())
+}
+
+fn verify_access_violation_entry(
+    pe: &PeFile<'_>,
+    mapped: &nt_pe_loader::MappedImage,
+    image: &BorrowedExceptionImage<'_>,
+    export: &ExportedSymbol,
+    raise_rva: u32,
+) -> Result<(), String> {
+    let pc = mapped
+        .load_base
+        .checked_add(u64::from(export.rva))
+        .ok_or("access-violation entry VA overflow")?;
+    let function = match image.lookup_exception_function(pc) {
+        Ok(ExceptionFunction::Function { image_base, function })
+            if image_base == mapped.load_base && function.begin == export.rva => function,
+        other => return Err(format!("access-violation entry lacks exact runtime function: {other:?}")),
+    };
+    let header: [u8; 4] = mapped
+        .bytes
+        .get(function.unwind_info as usize..function.unwind_info as usize + 4)
+        .ok_or("access-violation unwind header outside image")?
+        .try_into()
+        .map_err(|_| "access-violation unwind header malformed")?;
+    let code = mapped
+        .bytes
+        .get(function.begin as usize..function.end as usize)
+        .ok_or("access-violation body outside image")?;
+    let branch_delta = code
+        .get(6..10)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .map(i32::from_le_bytes)
+        .ok_or("access-violation branch is missing")?;
+    let target = i64::from(function.end) + i64::from(branch_delta);
+    if function.end - function.begin != ACCESS_VIOLATION_FUNCTION_LEN
+        || header != [1, 0, 0, 0]
+        || code.get(..6) != Some(&[0xb9, 5, 0, 0, 0xc0, 0xe9][..])
+        || target != i64::from(raise_rva)
+        || !pe.sections().iter().any(|section| {
+            section.name_str() == ".text"
+                && section_contains(section, export.rva, code.len())
+                && section.is_readable()
+                && section.is_executable()
+                && !section.is_writable()
+        })
+        || !pe.sections().iter().any(|section| {
+            section_contains(section, function.unwind_info, 4)
+                && section.is_readable()
+                && !section.is_writable()
+                && !section.is_executable()
+        })
+    {
+        return Err("access-violation entry code or unwind metadata invalid".into());
+    }
+    println!("{} RVA=0x{:x} unwind=0x{:x}", export.name, export.rva, function.unwind_info);
     Ok(())
 }
 
@@ -697,6 +755,11 @@ fn verify(path: &str) -> Result<(), String> {
     if !exact_exports(&exports) {
         return Err(format!("unexpected exports: {exports:?}"));
     }
+    let raise_rva = exports
+        .iter()
+        .find(|export| export.name == "SehRaiseStatus")
+        .ok_or("missing raise export")?
+        .rva;
     let mapped = pe
         .map(pe.image_base())
         .map_err(|error| format!("map: {error:?}"))?;
@@ -714,6 +777,10 @@ fn verify(path: &str) -> Result<(), String> {
         }
         if export.name == "SehRaiseStatus" {
             verify_raise_entry(&pe, &mapped, &image, &export)?;
+            continue;
+        }
+        if export.name == "SehRaiseAccessViolation" {
+            verify_access_violation_entry(&pe, &mapped, &image, &export, raise_rva)?;
             continue;
         }
         if export.name == "SehUnwindEx" {

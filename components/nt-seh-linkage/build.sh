@@ -19,7 +19,8 @@ mkdir -p "$OUT"
     /export:SehCallFilter /export:SehCallFinally /export:SehForeignCall2 \
     /export:SehForeignCall16 \
     /export:SehExecuteHandlerForException /export:SehExecuteHandlerForUnwind \
-    /export:SehRaiseStatus /export:SehUnwindEx /export:SehResumeContext \
+    /export:SehRaiseStatus /export:SehRaiseAccessViolation \
+    /export:SehUnwindEx /export:SehResumeContext \
     /export:SehFaultEntry /export:SehRaiseDispatch,DATA \
     /export:SehUnwindDispatch,DATA /export:SehFaultDispatch,DATA \
     "/out:$OUT/nt-seh-linkage.dll" "$OUT/seh_linkage.obj"

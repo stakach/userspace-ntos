@@ -117,6 +117,84 @@ pub(crate) fn validate_transfer(len: usize) -> Result<(), NtStatus> {
 }
 
 impl<P: ObjectManagerPort> IoManager<P> {
+    /// Dispatch a kernel-built, File-less READ to exactly `device_id`.
+    ///
+    /// The caller owns `output` until terminal delivery. A pending result keeps the
+    /// canonical IRP alive; consume its output with `copy_completed_irp_output`
+    /// before `acknowledge_completed_irp_strict`.
+    pub fn read_exact_device(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<crate::ExternalDispatchResult, NtStatus> {
+        validate_transfer(output.len())?;
+        let flags = self.device(device_id).ok_or(NtStatus::INVALID_PARAMETER)?.flags;
+        let mut empty = [];
+        let params = IoParameters::Read(ReadWriteParameters {
+            length: output.len() as u32,
+            key: 0,
+            offset,
+        });
+        if flags.contains(crate::DeviceFlags::BUFFERED_IO) {
+            self.build_and_dispatch_external_to_exact_device_with_transfer_buffers(
+                client, device_id, None, major::IRP_MJ_READ, params, 0,
+                output.len() as u32, output, None, None, None,
+            )
+        } else if flags.contains(crate::DeviceFlags::DIRECT_IO) {
+            self.build_and_dispatch_external_to_exact_device_with_transfer_buffers(
+                client, device_id, None, major::IRP_MJ_READ, params, 0,
+                output.len() as u32, &mut empty, Some(output), None, None,
+            )
+        } else {
+            self.build_and_dispatch_external_to_exact_device_with_transfer_buffers(
+                client, device_id, None, major::IRP_MJ_READ, params, 0,
+                output.len() as u32, &mut empty, None, None, Some(output),
+            )
+        }
+    }
+
+    /// Dispatch a kernel-built, File-less WRITE to exactly `device_id`.
+    /// `input` is copied into request-owned transfer storage before driver entry.
+    pub fn write_exact_device(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        offset: u64,
+        input: &[u8],
+    ) -> Result<crate::ExternalDispatchResult, NtStatus> {
+        validate_transfer(input.len())?;
+        let flags = self.device(device_id).ok_or(NtStatus::INVALID_PARAMETER)?.flags;
+        let params = IoParameters::Write(ReadWriteParameters {
+            length: input.len() as u32,
+            key: 0,
+            offset,
+        });
+        let mut transfer = Vec::new();
+        transfer
+            .try_reserve_exact(input.len())
+            .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        transfer.extend_from_slice(input);
+        let mut empty = [];
+        if flags.contains(crate::DeviceFlags::BUFFERED_IO) {
+            self.build_and_dispatch_external_to_exact_device_with_transfer_buffers(
+                client, device_id, None, major::IRP_MJ_WRITE, params,
+                input.len() as u32, 0, &mut transfer, None, None, None,
+            )
+        } else if flags.contains(crate::DeviceFlags::DIRECT_IO) {
+            self.build_and_dispatch_external_to_exact_device_with_transfer_buffers(
+                client, device_id, None, major::IRP_MJ_WRITE, params,
+                input.len() as u32, 0, &mut empty, Some(&mut transfer), None, None,
+            )
+        } else {
+            self.build_and_dispatch_external_to_exact_device_with_transfer_buffers(
+                client, device_id, None, major::IRP_MJ_WRITE, params,
+                input.len() as u32, 0, &mut empty, None, None, Some(&mut transfer),
+            )
+        }
+    }
+
     /// Read from an open file into `out`, returning the byte count (spec §17.3).
     pub fn read(
         &mut self,

@@ -36,6 +36,31 @@ mod irql;
 mod provider_wait_context;
 #[path = "win32k_source_irp.rs"]
 mod source_irp;
+#[path = "win32k_source_irp_aux.rs"]
+mod source_irp_aux;
+#[path = "win32k_source_irp_call.rs"]
+mod source_irp_call;
+pub(crate) use source_irp::SourceBufferedDispatchLease;
+
+pub(crate) unsafe fn admit_source_buffered_ioctl_dispatch(
+    irp: u64,
+    device: u64,
+    stack_pointer: u64,
+) -> Result<SourceBufferedDispatchLease, i32> {
+    source_irp::admit_buffered_dispatch(irp, device, stack_pointer)
+}
+
+pub(crate) unsafe fn release_source_buffered_ioctl_dispatch(
+    lease: &mut SourceBufferedDispatchLease,
+) -> bool {
+    source_irp::release_buffered_dispatch(lease)
+}
+
+pub(crate) unsafe fn abort_source_buffered_ioctl_dispatch(
+    lease: &mut SourceBufferedDispatchLease,
+) -> bool {
+    source_irp::release_buffered_admission(lease)
+}
 #[path = "win32k_subsystem/provider_input.rs"]
 mod provider_input;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
@@ -1292,6 +1317,34 @@ pub const W32_FILE_READ_RELEASE_LABEL: u64 = 0x798;
 pub const W32_FILE_IOCTL_LABEL: u64 = 0x799;
 pub const W32_FILE_IOCTL_COMPLETION_LABEL: u64 = 0x79a;
 pub const W32_FILE_IOCTL_RELEASE_LABEL: u64 = 0x79b;
+pub const W32_SOURCE_IOCTL_LABEL: u64 = 0x7a0;
+pub const W32_SOURCE_IOCTL_COMPLETION_LABEL: u64 = 0x7a1;
+pub const W32_SOURCE_IOCTL_RELEASE_LABEL: u64 = 0x7a2;
+pub const W32_GUI_CLIENT_INFO_LABEL: u64 = 0x7a3;
+pub const W32_GUI_CLIENT_INFO_PACKET_MAGIC: u64 = 0x5743_494e_464f_3031;
+
+/// One synchronous provider-owned copyout. All members are scalar claims; the executive checks
+/// them against the retained physical dispatch and canonical Ps identities before TEB writes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Win32kGuiClientInfoPacket {
+    pub magic: u64,
+    pub dispatch_id: u64,
+    pub client_pi: u64,
+    pub process_id: u64,
+    pub process_generation: u64,
+    pub thread_id: u64,
+    pub thread_info: u64,
+    pub server_base: u64,
+    pub client_base: u64,
+    pub mapping_bytes: u64,
+    pub server_deskinfo: u64,
+    pub server_client_thread_info: u64,
+    pub mapped_delta: u64,
+    pub keyboard_present: u64,
+    pub keyboard_hkl: u64,
+    pub keyboard_codepage: u64,
+}
 pub const W32_SECTION_CLOSE_LABEL: u64 = 0x79c;
 pub const W32_SECTION_CREATE_LABEL: u64 = 0x79d;
 pub const W32_SECTION_MAP_LABEL: u64 = 0x79e;
@@ -4316,6 +4369,7 @@ unsafe fn finish_provider_stack_event_activation(
     }
     file_read::release_completed_for_activation(activation);
     file_ioctl::release_completed_for_activation(activation);
+    source_irp_call::release_completed_for_activation(activation);
     // Event retirement may broker IPC. Keep no catalog borrow across reentrant execution.
     if !retire_provider_local_events_for_backing(activation.backing()) {
         return false;
@@ -8201,7 +8255,9 @@ unsafe fn prepared_process_desktop_mapping(
     false
 }
 
-pub(crate) unsafe fn desktop_client_info_for_w32thread(pti: u64) -> Option<(u64, u64, u64, u64)> {
+unsafe fn desktop_client_mapping_for_w32thread(
+    pti: u64,
+) -> Option<nt_user_host::gui_client_info_snapshot::DesktopClientMapping> {
     if pti == 0 {
         return None;
     }
@@ -8252,7 +8308,14 @@ pub(crate) unsafe fn desktop_client_info_for_w32thread(pti: u64) -> Option<(u64,
     {
         return None;
     }
-    Some((client_deskinfo, pti, delta, client_pcti))
+    Some(nt_user_host::gui_client_info_snapshot::DesktopClientMapping {
+        server_base: kernel_base,
+        client_base: user_base,
+        bytes: limit,
+        server_deskinfo,
+        server_client_thread_info: pcti,
+        mapped_delta: delta,
+    })
 }
 
 unsafe fn default_keyboard_layout_from_ring() -> u64 {
@@ -8363,6 +8426,92 @@ pub(crate) unsafe fn keyboard_layout_client_info_for_w32thread(
     pti: u64,
 ) -> Option<(u64, u64, u16)> {
     bind_default_keyboard_layout_to_thread(pti)
+}
+
+unsafe fn publish_gui_client_info_for_dispatch(
+    pti: u64,
+    dispatch_id: u64,
+    client_pi: u64,
+    process_id: u64,
+    process_generation: u64,
+    thread_id: u64,
+) {
+    // Keep the exact provider allocation generations and parent DESKTOP alive while the
+    // component is parked in the root copyout call. No metadata lock crosses IPC.
+    let thread_pin = with_provider_allocations(|catalog| catalog.pin_containing(pti, THREADINFO_PCLIENTINFO_OFF + 8))
+        .and_then(Result::ok)
+        .map(|(_, pin)| pin)
+        .unwrap_or_else(|| crate::provider_bugcheck::report(0xc4, [W32_GUI_CLIENT_INFO_LABEL, pti, 0, 0]));
+    let desk_body = read_volatile((pti + THREADINFO_RPDESK_OFF) as *const u64);
+    if desk_body == 0 {
+        release_provider_allocation_pin_or_park(thread_pin);
+        return;
+    }
+    let desktop_type = nt_object_manager::object_type::desktop_object_type_addr();
+    if s_ob_reference_object_by_pointer(desk_body, 0, desktop_type, 0) != 0 {
+        crate::provider_bugcheck::report(0xc4, [W32_GUI_CLIENT_INFO_LABEL, desk_body, 1, 0]);
+    }
+    let Some(mapping) = desktop_client_mapping_for_w32thread(pti) else {
+        crate::provider_bugcheck::report(0xc4, [W32_GUI_CLIENT_INFO_LABEL, desk_body, 2, 0]);
+    };
+    if read_volatile((pti + THREADINFO_RPDESK_OFF) as *const u64) != desk_body {
+        crate::provider_bugcheck::report(0xc4, [W32_GUI_CLIENT_INFO_LABEL, desk_body, 3, 0]);
+    }
+    let deskinfo_pin = with_provider_allocations(|catalog| catalog.pin_containing(mapping.server_deskinfo, DESKTOPINFO_MIN_ALLOC))
+        .and_then(Result::ok)
+        .map(|(_, pin)| pin)
+        .unwrap_or_else(|| crate::provider_bugcheck::report(0xc4, [W32_GUI_CLIENT_INFO_LABEL, mapping.server_deskinfo, 4, 0]));
+    let pcti_pin = with_provider_allocations(|catalog| catalog.pin_containing(mapping.server_client_thread_info, CLIENTTHREADINFO_SIZE))
+        .and_then(Result::ok)
+        .map(|(_, pin)| pin)
+        .unwrap_or_else(|| crate::provider_bugcheck::report(0xc4, [W32_GUI_CLIENT_INFO_LABEL, mapping.server_client_thread_info, 5, 0]));
+    let keyboard = keyboard_layout_client_info_for_w32thread(pti);
+    let packet = Win32kGuiClientInfoPacket {
+        magic: W32_GUI_CLIENT_INFO_PACKET_MAGIC,
+        dispatch_id,
+        client_pi,
+        process_id,
+        process_generation,
+        thread_id,
+        thread_info: pti,
+        server_base: mapping.server_base,
+        client_base: mapping.client_base,
+        mapping_bytes: mapping.bytes,
+        server_deskinfo: mapping.server_deskinfo,
+        server_client_thread_info: mapping.server_client_thread_info,
+        mapped_delta: mapping.mapped_delta,
+        keyboard_present: u64::from(keyboard.is_some()),
+        keyboard_hkl: keyboard.map_or(0, |(_, hkl, _)| hkl),
+        keyboard_codepage: keyboard.map_or(0, |(_, _, codepage)| u64::from(codepage)),
+    };
+    let bytes = core::mem::size_of::<Win32kGuiClientInfoPacket>() as u64;
+    let address = provider_pool_alloc(bytes, false);
+    if address == 0 {
+        crate::provider_bugcheck::report(0xc4, [W32_GUI_CLIENT_INFO_LABEL, pti, bytes, 0]);
+    }
+    let packet_pin = with_provider_allocations(|catalog| catalog.pin_containing(address, bytes))
+        .and_then(Result::ok)
+        .map(|(_, pin)| pin)
+        .unwrap_or_else(|| crate::provider_bugcheck::report(0xc4, [W32_GUI_CLIENT_INFO_LABEL, address, 6, 0]));
+    write_volatile(address as *mut Win32kGuiClientInfoPacket, packet);
+    let (words, raw, m1, m2, m3) = crate::driver_launch::call_on4_raw(
+        (W32_GUI_CLIENT_INFO_LABEL << 12) | 4,
+        address,
+        bytes,
+        0,
+        0,
+    );
+    if words != 1 || raw != 0 || m1 != 0 || m2 != 0 || m3 != 0 {
+        crate::provider_bugcheck::report(0xc4, [W32_GUI_CLIENT_INFO_LABEL, address, words, raw]);
+    }
+    release_provider_allocation_pin_or_park(packet_pin);
+    if !provider_pool_free(address) {
+        crate::provider_bugcheck::report(0xc4, [W32_GUI_CLIENT_INFO_LABEL, address, bytes, 1]);
+    }
+    release_provider_allocation_pin_or_park(pcti_pin);
+    release_provider_allocation_pin_or_park(deskinfo_pin);
+    s_ob_dereference_object(desk_body);
+    release_provider_allocation_pin_or_park(thread_pin);
 }
 
 /// A GENERAL_LOOKASIDE's default Allocate `PVOID(POOL_TYPE, SIZE_T, ULONG Tag)` — bump the heap
@@ -16826,7 +16975,11 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     // Desktop-heap mutation belongs to the win32k provider. Prepare the selected thread's client
     // mapping while the provider-private allocation and Event catalogs are addressable; the
     // executive consumes only the resulting scalar pointers after this dispatch completes.
-    let _ = prepare_thread_desktop_client_info(t);
+    if owner.is_some() && prepare_thread_desktop_client_info(t).is_some() {
+        publish_gui_client_info_for_dispatch(
+            t, header.dispatch_id, client_pi, process_id, generation, thread_id,
+        );
+    }
     if output_stage_valid {
         let staged_message = read_volatile((a0 + 8) as *const u32);
         let output_length =

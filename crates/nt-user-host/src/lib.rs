@@ -31,6 +31,7 @@ pub mod provider_finalization;
 pub mod provider_file_close;
 pub mod native_call_owner;
 pub mod gui_exit;
+pub mod gui_client_info_snapshot;
 pub mod provider_kernel_activation;
 pub mod provider_kernel_pump;
 pub mod provider_kernel_wait;
