@@ -6513,7 +6513,11 @@ mod tests {
             io.irp(irp_id).unwrap().request_input_fingerprint(),
             Some(request_input_fingerprint(request))
         );
-        assert_eq!(io.completed_irp(irp_id).unwrap().information, 0);
+        let completion = io.completed_irp(irp_id).unwrap();
+        assert_eq!(completion.information, 0);
+        assert_eq!(completion.file_id, None);
+        assert_eq!(completion.device_id, device);
+        assert_eq!(completion.major, major::IRP_MJ_DEVICE_CONTROL);
         let mut copied = [0u8; 8];
         assert_eq!(
             io.copy_completed_buffered_device_control_payload(irp_id, 0, &mut copied),
@@ -6523,6 +6527,7 @@ mod tests {
         assert_eq!(io.copy_completed_irp_output(irp_id, 0, &mut copied), Ok(0));
         io.acknowledge_completed_irp_strict(irp_id).unwrap();
         assert_eq!(state.borrow().acknowledgements, 1);
+        assert!(io.completed_irp(irp_id).is_none());
     }
 
     #[test]
