@@ -24,6 +24,83 @@ fn descriptor(index: u32, epoch: u64) -> KernelProviderActivationDescriptor {
     KernelProviderActivationDescriptor::new(owner(index, epoch)).unwrap()
 }
 
+fn hosted_owner(pi: u32, epoch: u64) -> ProviderWaitOwner {
+    ProviderWaitOwner {
+        provider_domain: PROVIDER.domain,
+        provider_generation: PROVIDER.generation,
+        dispatch_id: epoch,
+        caller: SuspensionCaller::Hosted(SuspensionHostedClient {
+            client_pi: pi,
+            client_generation: 5,
+            client_tid: 11 + u64::from(pi),
+            client_badge: 30 + u64::from(pi),
+        }),
+    }
+}
+
+#[test]
+fn hosted_wait_owner_survives_interleaved_dispatch_on_another_lane() {
+    let (mut catalog, first_lane) = fixture();
+    let second_lane = catalog.register_lane(2, 0x3000, 0x1000).unwrap();
+    let first_owner = hosted_owner(2, 40);
+    let first = catalog
+        .begin_hosted_for_stack_pointer(0x1800, first_owner)
+        .unwrap();
+    let second_owner = hosted_owner(3, 41);
+    let second = catalog
+        .begin_hosted_for_stack_pointer(0x3800, second_owner)
+        .unwrap();
+
+    assert_eq!(catalog.owner(first), Ok(Some(first_owner)));
+    assert_eq!(catalog.owner(second), Ok(Some(second_owner)));
+    catalog.finish(second).unwrap();
+    assert_eq!(catalog.active(first_lane), Ok(first));
+    assert_eq!(catalog.owner(first), Ok(Some(first_owner)));
+    catalog.finish(first).unwrap();
+    let kernel = catalog
+        .begin_kernel_for_stack_pointer(0x1800, PROVIDER, descriptor(50, 42))
+        .unwrap();
+    assert_eq!(catalog.owner(kernel), Ok(Some(owner(50, 42))));
+    catalog.finish(kernel).unwrap();
+    catalog.unregister_lane(second_lane).unwrap();
+}
+
+#[test]
+fn hosted_activation_rejects_invalid_or_kernel_owner_without_publication() {
+    let (mut catalog, lane) = fixture();
+    let valid = hosted_owner(2, 40);
+    let mut invalid = valid;
+    invalid.dispatch_id = 0;
+    assert_eq!(
+        catalog.begin_hosted_for_stack_pointer(0x1800, invalid),
+        Err(ProviderStackActivationError::InvalidDispatch)
+    );
+    invalid = valid;
+    invalid.caller = SuspensionCaller::Hosted(SuspensionHostedClient {
+        client_badge: 0,
+        ..valid.hosted_client().unwrap()
+    });
+    assert_eq!(
+        catalog.begin_hosted_for_stack_pointer(0x1800, invalid),
+        Err(ProviderStackActivationError::InvalidDispatch)
+    );
+    invalid = valid;
+    invalid.caller = SuspensionCaller::Kernel {
+        lane: LaneHandle {
+            index: 1,
+            generation: 1,
+        },
+    };
+    assert_eq!(
+        catalog.begin_hosted_for_stack_pointer(0x1800, invalid),
+        Err(ProviderStackActivationError::InvalidDispatch)
+    );
+    assert_eq!(
+        catalog.active(lane),
+        Err(ProviderStackActivationError::NoActiveActivation)
+    );
+}
+
 fn fixture() -> (ProviderStackActivationCatalog, ProviderStackLaneHandle) {
     let mut catalog = ProviderStackActivationCatalog::new(3, 4).unwrap();
     let lane = catalog.register_lane(1, 0x1000, 0x1000).unwrap();
