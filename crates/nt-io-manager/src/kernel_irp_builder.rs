@@ -24,6 +24,59 @@ pub enum KernelIrpPlanError {
     InvalidIrpHeader,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelIrpDispatchHeader {
+    pub irp_type: u16,
+    pub packet_size: u16,
+    pub stack_count: u8,
+    pub current_location: u8,
+    pub current_stack_location: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelIrpDispatchCursor {
+    pub current_location: u8,
+    pub next_stack_offset: usize,
+}
+
+/// Validate the cursor before IofCallDriver consumes the next stack. Unlike
+/// fresh-allocation validation, a forwarded IRP may already be inside its stack.
+pub fn validate_kernel_irp_dispatch_cursor(
+    base: u64,
+    allocation_bytes: u64,
+    expected_stack_count: u8,
+    header: KernelIrpDispatchHeader,
+) -> Result<KernelIrpDispatchCursor, KernelIrpPlanError> {
+    if base == 0 || expected_stack_count == 0 || expected_stack_count == u8::MAX {
+        return Err(KernelIrpPlanError::InvalidStackSize);
+    }
+    let packet_size =
+        WDM_X64_IRP_SIZE + expected_stack_count as usize * WDM_X64_IO_STACK_LOCATION_SIZE;
+    let current = header.current_location;
+    if header.irp_type != 6
+        || header.packet_size as usize != packet_size
+        || allocation_bytes != packet_size as u64
+        || header.stack_count != expected_stack_count
+        || current < 2
+        || current > expected_stack_count + 1
+    {
+        return Err(KernelIrpPlanError::InvalidIrpHeader);
+    }
+    let next_stack_offset =
+        WDM_X64_IRP_SIZE + (current as usize - 2) * WDM_X64_IO_STACK_LOCATION_SIZE;
+    let cursor = base
+        .checked_add(next_stack_offset as u64)
+        .and_then(|next| next.checked_add(WDM_X64_IO_STACK_LOCATION_SIZE as u64))
+        .ok_or(KernelIrpPlanError::InvalidIrpHeader)?;
+    if header.current_stack_location != cursor {
+        return Err(KernelIrpPlanError::InvalidIrpHeader);
+    }
+    Ok(KernelIrpDispatchCursor {
+        current_location: current,
+        next_stack_offset,
+    })
+}
+
 /// Admit only a freshly allocated IRP packet with the cursor still above its
 /// stack. The provider may later mutate the next stack before `IofCallDriver`;
 /// this validation is for registration, not dispatch authorization.

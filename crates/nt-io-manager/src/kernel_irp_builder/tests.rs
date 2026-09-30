@@ -5,6 +5,80 @@ use crate::{
 };
 
 #[test]
+fn dispatch_cursor_stays_inside_the_exact_source_irp_stack() {
+    let base = 0x1000_2000;
+    let count = 2;
+    let bytes = (WDM_X64_IRP_SIZE + count as usize * WDM_X64_IO_STACK_LOCATION_SIZE) as u64;
+    let header = KernelIrpDispatchHeader {
+        irp_type: 6,
+        packet_size: bytes as u16,
+        stack_count: count,
+        current_location: 3,
+        current_stack_location: base + bytes,
+    };
+    assert_eq!(
+        validate_kernel_irp_dispatch_cursor(base, bytes, count, header),
+        Ok(KernelIrpDispatchCursor {
+            current_location: 3,
+            next_stack_offset: WDM_X64_IRP_SIZE + WDM_X64_IO_STACK_LOCATION_SIZE,
+        })
+    );
+    let forwarded = KernelIrpDispatchHeader {
+        current_location: 2,
+        current_stack_location: base
+            + WDM_X64_IRP_SIZE as u64
+            + WDM_X64_IO_STACK_LOCATION_SIZE as u64,
+        ..header
+    };
+    assert_eq!(
+        validate_kernel_irp_dispatch_cursor(base, bytes, count, forwarded),
+        Ok(KernelIrpDispatchCursor {
+            current_location: 2,
+            next_stack_offset: WDM_X64_IRP_SIZE,
+        })
+    );
+    for invalid in [
+        KernelIrpDispatchHeader {
+            current_location: 1,
+            ..forwarded
+        },
+        KernelIrpDispatchHeader {
+            current_stack_location: base + bytes,
+            ..forwarded
+        },
+        KernelIrpDispatchHeader {
+            stack_count: 1,
+            ..header
+        },
+        KernelIrpDispatchHeader {
+            packet_size: 0,
+            ..header
+        },
+        KernelIrpDispatchHeader {
+            irp_type: 0,
+            ..header
+        },
+        KernelIrpDispatchHeader {
+            current_location: 4,
+            ..header
+        },
+    ] {
+        assert_eq!(
+            validate_kernel_irp_dispatch_cursor(base, bytes, count, invalid),
+            Err(KernelIrpPlanError::InvalidIrpHeader)
+        );
+    }
+    assert_eq!(
+        validate_kernel_irp_dispatch_cursor(base, bytes - 1, count, header),
+        Err(KernelIrpPlanError::InvalidIrpHeader)
+    );
+    assert_eq!(
+        validate_kernel_irp_dispatch_cursor(u64::MAX - 8, bytes, count, header),
+        Err(KernelIrpPlanError::InvalidIrpHeader)
+    );
+}
+
+#[test]
 fn new_kernel_irp_thread_list_is_self_linked_at_final_address() {
     let base = 0x1000_2000u64;
     let mut packet = [0u8; WDM_X64_IRP_SIZE + WDM_X64_IO_STACK_LOCATION_SIZE];
