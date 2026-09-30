@@ -715,7 +715,7 @@ pub(super) unsafe fn dispatch_lease_live(source: &SourceIrpDispatchLease) -> boo
 }
 
 /// A failed commit remains reserved. Callers must never retry the free by address.
-pub(super) unsafe fn retire(address: u64, ticket: ProviderSourceIrpTicket) -> bool {
+unsafe fn retire(address: u64, ticket: ProviderSourceIrpTicket) -> bool {
     let Some((mut metadata, _pool)) = provider_metadata_pool_lock() else {
         return false;
     };
