@@ -200,6 +200,29 @@ pub(crate) unsafe fn win32k_physical_lane_for_channel(
         })
 }
 
+pub(crate) unsafe fn win32k_physical_stack_route_for_channel(
+    tcb: u64,
+    endpoint: u64,
+    reply_object: u64,
+) -> Option<(
+    nt_component_suspension::peer_registry::PeerRoute,
+    nt_component_suspension::LaneDispatchIdentity,
+    u64,
+    u64,
+)> {
+    let handle = win32k_physical_lane_for_channel(tcb, endpoint, reply_object)?;
+    let lane = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
+        .as_ref()?
+        .iter()
+        .find(|lane| lane.handle == Some(handle) && lane.tcb == tcb)?;
+    let route = lane.route?;
+    let dispatch = crate::spawn_hosts::shared_ingress::owner::runtime::dispatch(route).ok()?;
+    let length = lane.stack_frames.checked_mul(0x1000)?;
+    let last = lane.stack_base.checked_add(length)?.checked_sub(8)?;
+    win32k_stack_alias_for_route(route, last, 8)?;
+    Some((route, dispatch, lane.stack_base, length))
+}
+
 /// Execution quiescence only; callers must separately retire published pointers and mappings.
 pub(crate) unsafe fn win32k_physical_lanes_quiescent() -> bool {
     (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
@@ -1316,8 +1339,13 @@ fn authenticated_client_window_owner(
 }
 
 unsafe fn select_win32k_client_window(client: Win32kClientContext) -> bool {
-    authenticated_client_window_owner(client)
-        .is_some_and(|owner| unsafe { w32_client_attach(owner) })
+    let Some(owner) = authenticated_client_window_owner(client) else {
+        return false;
+    };
+    match client.logical_caller {
+        Some(caller) => process_attach_root::select_effective_client(caller, owner),
+        None => w32_client_attach(owner),
+    }
 }
 
 fn win32k_dispatch_client_identity(
@@ -5603,6 +5631,11 @@ pub(crate) unsafe fn ensure_w32_client_paging(page: u64, w_pml4: u64) -> bool {
 #[path = "win32k_attach.rs"]
 mod client_attach;
 pub(crate) use client_attach::*;
+#[path = "win32k_process_attach_root.rs"]
+mod process_attach_root;
+pub(crate) use process_attach_root::service_process_attach;
+pub(crate) use process_attach_root::retire_thread_attach;
+pub(crate) use process_attach_root::retire_kernel_attach;
 
 
 /// Load ONE driver PE (raw at `src_va` in the executive) into `dst_va` in BOTH the executive (RW,
@@ -5806,7 +5839,7 @@ pub(crate) unsafe fn load_one_driver(
         release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
         return None;
     };
-    let Some(mut rights) = driver_load_scratch_records(frame_count, RW_NX, b"rights") else {
+    let Some(mut rights) = driver_load_scratch_records(frame_count, RO_NX, b"rights") else {
         release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
         return None;
     };
@@ -5884,6 +5917,21 @@ pub(crate) unsafe fn load_one_driver(
             return load_one_driver_fail(b"host-frame-map", va, map_error);
         }
         host_map_caps[i as usize] = cap;
+    }
+    if crate::win32k_seh_image::register_dynamic_image(
+        host_pml4,
+        dst_va,
+        res.2,
+        rights.as_slice(),
+    )
+    .is_none()
+    {
+        release_driver_load_map_caps(host_map_caps.as_mut_slice(), frames);
+        release_driver_load_page_table_if_new(host_pml4, dst_va, wpt, wpt_new);
+        release_driver_load_map_caps(exec_map_caps.as_mut_slice(), frames);
+        release_driver_load_frame_run(base, frames);
+        release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
+        return load_one_driver_fail(b"exception-catalog", dst_va, 0);
     }
     Some(res)
 }

@@ -40,14 +40,68 @@ mod source_irp;
 mod source_irp_aux;
 #[path = "win32k_source_irp_call.rs"]
 mod source_irp_call;
+#[path = "win32k_source_pnp_call.rs"]
+mod source_pnp_call;
+#[path = "win32k_source_fsd.rs"]
+mod source_fsd;
+#[path = "win32k_source_fsd_call.rs"]
+mod source_fsd_call;
+#[path = "win32k_source_call_router.rs"]
+mod source_call_router;
+#[path = "win32k_process_attach.rs"]
+mod process_attach;
 pub(crate) use source_irp::SourceBufferedDispatchLease;
+pub(crate) use source_irp::{SourcePnpDispatchLease, SourceRelationAllocationLease};
+pub(crate) use source_fsd::SourceFsdDispatchLease;
+
+pub(crate) unsafe fn admit_source_fsd_dispatch(
+    irp: u64,
+    device: u64,
+    stack_pointer: u64,
+    route: Option<nt_component_suspension::peer_registry::PeerRoute>,
+) -> Result<SourceFsdDispatchLease, i32> {
+    source_fsd::admit(irp, device, stack_pointer, route)
+}
+
+pub(crate) unsafe fn release_source_fsd_dispatch(lease: &mut SourceFsdDispatchLease) -> bool {
+    source_fsd::release(lease)
+}
+
+pub(crate) unsafe fn abort_source_fsd_dispatch(lease: &mut SourceFsdDispatchLease) -> bool {
+    source_fsd::abort(lease)
+}
+
+pub(crate) unsafe fn admit_source_target_relation_dispatch(
+    irp: u64,
+    device: u64,
+    stack_pointer: u64,
+) -> Result<SourcePnpDispatchLease, i32> {
+    source_irp::admit_pnp_target_relation(irp, device, stack_pointer)
+}
+
+pub(crate) unsafe fn release_source_target_relation_dispatch(
+    lease: &mut SourcePnpDispatchLease,
+) -> bool {
+    source_irp::release_pnp_dispatch(lease)
+}
+
+pub(crate) unsafe fn abort_source_target_relation_dispatch(
+    lease: &mut SourcePnpDispatchLease,
+) -> bool {
+    source_irp::abort_pnp_dispatch(lease)
+}
+
+pub(crate) unsafe fn allocate_source_target_relation() -> Option<SourceRelationAllocationLease> {
+    source_irp::allocate_target_relation()
+}
 
 pub(crate) unsafe fn admit_source_buffered_ioctl_dispatch(
     irp: u64,
     device: u64,
     stack_pointer: u64,
+    route: Option<nt_component_suspension::peer_registry::PeerRoute>,
 ) -> Result<SourceBufferedDispatchLease, i32> {
-    source_irp::admit_buffered_dispatch(irp, device, stack_pointer)
+    source_irp::admit_buffered_dispatch(irp, device, stack_pointer, route)
 }
 
 pub(crate) unsafe fn release_source_buffered_ioctl_dispatch(
@@ -1321,6 +1375,17 @@ pub const W32_SOURCE_IOCTL_LABEL: u64 = 0x7a0;
 pub const W32_SOURCE_IOCTL_COMPLETION_LABEL: u64 = 0x7a1;
 pub const W32_SOURCE_IOCTL_RELEASE_LABEL: u64 = 0x7a2;
 pub const W32_GUI_CLIENT_INFO_LABEL: u64 = 0x7a3;
+pub const W32_PROCESS_ATTACH_LABEL: u64 = 0x7a4;
+pub const W32_SOURCE_PNP_LABEL: u64 = 0x7a5;
+pub const W32_SOURCE_PNP_COMPLETION_LABEL: u64 = 0x7a6;
+pub const W32_SOURCE_PNP_RELEASE_LABEL: u64 = 0x7a7;
+pub const W32_SOURCE_FSD_LABEL: u64 = 0x7a8;
+pub const W32_SOURCE_FSD_COMPLETION_LABEL: u64 = 0x7a9;
+pub const W32_SOURCE_FSD_RELEASE_LABEL: u64 = 0x7aa;
+pub const W32_ATTACH_PLAIN: u64 = 1;
+pub const W32_ATTACH_DETACH: u64 = 2;
+pub const W32_ATTACH_STACK: u64 = 3;
+pub const W32_ATTACH_UNSTACK: u64 = 4;
 pub const W32_GUI_CLIENT_INFO_PACKET_MAGIC: u64 = 0x5743_494e_464f_3031;
 
 /// One synchronous provider-owned copyout. All members are scalar claims; the executive checks
@@ -10284,20 +10349,21 @@ unsafe fn current_ethread() -> u64 {
 }
 
 unsafe fn current_w32process() -> u64 {
-    let Some(index) = current_process_context_index() else {
+    let eprocess = current_eprocess();
+    if eprocess == 0 {
         return 0;
-    };
-    let eprocess = process_ctx_eprocess(index);
-    if eprocess != 0 {
-        let field = read_volatile((eprocess + EPROCESS_WIN32PROCESS_OFF) as *const u64);
+    }
+    let field = read_volatile((eprocess + EPROCESS_WIN32PROCESS_OFF) as *const u64);
+    if let Some(index) = process_context_index_for_eprocess(eprocess) {
         if field != 0 {
             if process_ctx_w32process(index) == 0 {
                 set_process_ctx_w32process(index, field);
             }
             return field;
         }
+        return process_ctx_w32process(index);
     }
-    process_ctx_w32process(index)
+    field
 }
 
 unsafe fn current_w32thread() -> u64 {
@@ -11346,9 +11412,15 @@ unsafe fn restore_current_context_for_user_callback_resume_inner(
     WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
     prepare_ethread_for_win32k_callout(thread_index, teb);
     write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, teb);
-    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, eprocess);
+    write_volatile(
+        (WIN32K_KPCR_VA + 0x60) as *mut u64,
+        process_attach::selected_process(ethread, eprocess),
+    );
     write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, ethread);
-    write_volatile(SLOT_W32PROCESS as *mut u64, w32process);
+    write_volatile(
+        SLOT_W32PROCESS as *mut u64,
+        process_attach::selected_win32process(ethread, eprocess, w32process),
+    );
     write_volatile(SLOT_W32THREAD as *mut u64, w32thread);
     write_volatile((ethread + KTHREAD_WIN32THREAD_OFF) as *mut u64, w32thread);
     write_volatile(w32thread as *mut u64, ethread);
@@ -11562,11 +11634,18 @@ unsafe fn select_win32k_client_context(
     WIN32K_CURRENT_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
     WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
     WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
-    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, eprocess);
+    write_volatile(
+        (WIN32K_KPCR_VA + 0x60) as *mut u64,
+        process_attach::selected_process(ethread, eprocess),
+    );
     write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, ethread);
     write_volatile(
         SLOT_W32PROCESS as *mut u64,
-        process_ctx_w32process(process_index),
+        process_attach::selected_win32process(
+            ethread,
+            eprocess,
+            process_ctx_w32process(process_index),
+        ),
     );
     write_volatile(
         SLOT_W32THREAD as *mut u64,
@@ -14979,10 +15058,13 @@ extern "win64" fn removed_s_ke_user_mode_callback_synthetic_baseline(
 static mut WIN32K_EXPORTS: DriverExportRegistry = DriverExportRegistry::new();
 static mut WIN32K_EXPORTS_READY: bool = false;
 
-/// Bind the complete win32k kernel/HAL import surface into [`WIN32K_EXPORTS`]. Idempotent (`bind`
-/// updates in place), so it is safe to call from any loader (win32k / dxg / driver) regardless of
-/// order. Readiness is published only after every declared import has a nonzero binding.
+/// Bind the complete win32k kernel/HAL import surface into [`WIN32K_EXPORTS`] after the admitted
+/// SEH support image has published its native entry points. `bind` is idempotent for later GDI
+/// loaders; readiness is published only after every declared import has a nonzero binding.
 fn register_trampolines() -> bool {
+    let Some(seh) = crate::win32k_seh_image::admitted_imports() else {
+        return false;
+    };
     // SAFETY: single-threaded executive; the registry is only ever touched here + in export_addr.
     let reg = unsafe { &mut *core::ptr::addr_of_mut!(WIN32K_EXPORTS) };
     if !reg.reserve_initial(DRIVER_EXPORT_INITIAL_RESERVE) {
@@ -15011,6 +15093,9 @@ fn register_trampolines() -> bool {
     reg.bind("ProbeForRead", s_probe_for_read as usize as u64);
     reg.bind("ProbeForWrite", s_probe_for_write as usize as u64);
     reg.bind("RtlGetVersion", s_rtl_get_version as usize as u64);
+    reg.bind("ExRaiseAccessViolation", seh.access_violation_va);
+    reg.bind("ExRaiseStatus", seh.raise_va);
+    reg.bind("RtlUnwindEx", seh.unwind_entry_va);
     reg.bind(
         "RtlAreAllAccessesGranted",
         s_rtl_are_all_accesses_granted as usize as u64,
@@ -15474,6 +15559,16 @@ fn register_trampolines() -> bool {
     );
     reg.bind("PsGetThreadId", s_ps_get_thread_id as usize as u64);
     reg.bind("KeIsAttachedProcess", s_ke_is_attached_process as usize as u64);
+    reg.bind("KeAttachProcess", process_attach::ke_attach_process as *const () as usize as u64);
+    reg.bind("KeDetachProcess", process_attach::ke_detach_process as *const () as usize as u64);
+    reg.bind(
+        "KeStackAttachProcess",
+        process_attach::ke_stack_attach_process as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeUnstackDetachProcess",
+        process_attach::ke_unstack_detach_process as *const () as usize as u64,
+    );
     reg.bind(
         "PsGetThreadProcessId",
         s_ps_get_thread_process_id as usize as u64,
@@ -15579,6 +15674,14 @@ fn register_trampolines() -> bool {
     reg.bind(
         "IoBuildDeviceIoControlRequest",
         source_irp::build_device_io_control_request as *const () as u64,
+    );
+    reg.bind(
+        "IoBuildSynchronousFsdRequest",
+        source_irp::build_synchronous_fsd_request as *const () as u64,
+    );
+    reg.bind(
+        "IofCallDriver",
+        source_call_router::iof_call_driver as *const () as u64,
     );
     reg.bind(
         "KeUserModeCallback",
@@ -15803,7 +15906,7 @@ fn object_type_cell_value(name: &str) -> Option<u64> {
 
 /// Per-frame W^X rights for the loaded image (2 = RX code / RW_NX = RW data). A `static` (not a
 /// stack array or heap Vec): the rootserver stack is bounded and the heap is spent.
-static mut CODE_RIGHTS: [u64; WIN32K_IMAGE_FRAMES as usize] = [RW_NX; WIN32K_IMAGE_FRAMES as usize];
+static mut CODE_RIGHTS: [u64; WIN32K_IMAGE_FRAMES as usize] = [RO_NX; WIN32K_IMAGE_FRAMES as usize];
 
 /// The per-frame rights `load_into` computed (for `spawn_win32k_host`'s W^X mapping).
 pub fn code_rights() -> &'static [u64] {
@@ -16123,6 +16226,7 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) ->
 
     // Copy each section into its virtual address; compute per-frame rights.
     let rights = &mut *core::ptr::addr_of_mut!(CODE_RIGHTS);
+    rights.fill(RO_NX);
     for s in 0..num_sections {
         let sh = sec_table + s * 40;
         let va = read_unaligned((sh + 12) as *const u32) as u64;
@@ -16132,11 +16236,10 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) ->
         let chars = read_unaligned((sh + 36) as *const u32);
         let n = raw_size.min(WIN32K_IMAGE_FRAMES * 0x1000 - va);
         copy_bytes(code_va + va, src_va + raw_ptr, n);
-        // IMAGE_SCN_MEM_EXECUTE = 0x2000_0000 → RX (rights 2); else RW_NX.
-        let r = if chars & 0x2000_0000 != 0 {
-            2u64
-        } else {
-            RW_NX
+        let r = match nt_pe_loader::Protection::from_section_characteristics(chars) {
+            nt_pe_loader::Protection::ReadExecute => 2,
+            nt_pe_loader::Protection::ReadWrite => RW_NX,
+            nt_pe_loader::Protection::ReadOnly => RO_NX,
         };
         let span = va + vsize.max(raw_size);
         let mut p = va & !0xFFF;
@@ -16523,8 +16626,26 @@ unsafe fn select_existing_ps_provider_context(
     WIN32K_CURRENT_CLIENT_PI.store(pi, Ordering::Relaxed);
     WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
     WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
-    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, supplied_eprocess);
-    write_volatile(SLOT_W32PROCESS as *mut u64, process_ctx_w32process(process_index));
+    write_volatile(
+        (WIN32K_KPCR_VA + 0x60) as *mut u64,
+        if supplied_ethread != 0 {
+            process_attach::selected_process(supplied_ethread, supplied_eprocess)
+        } else {
+            supplied_eprocess
+        },
+    );
+    write_volatile(
+        SLOT_W32PROCESS as *mut u64,
+        if supplied_ethread != 0 {
+            process_attach::selected_win32process(
+                supplied_ethread,
+                supplied_eprocess,
+                process_ctx_w32process(process_index),
+            )
+        } else {
+            process_ctx_w32process(process_index)
+        },
+    );
     write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, selected_teb);
     if let Some(thread_index) = thread_index {
         write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, supplied_ethread);
@@ -18552,6 +18673,7 @@ pub unsafe fn load_driver_into(
         return None;
     }
 
+    rights_out.fill(RO_NX);
     copy_bytes(dst_va, src_va, size_of_headers.min(cap));
     for s in 0..num_sections {
         let sh = sec_table + s * 40;
@@ -18565,10 +18687,10 @@ pub unsafe fn load_driver_into(
         }
         let n = raw_size.min(cap - va);
         copy_bytes(dst_va + va, src_va + raw_ptr, n);
-        let r = if chars & 0x2000_0000 != 0 {
-            2u64
-        } else {
-            RW_NX
+        let r = match nt_pe_loader::Protection::from_section_characteristics(chars) {
+            nt_pe_loader::Protection::ReadExecute => 2,
+            nt_pe_loader::Protection::ReadWrite => RW_NX,
+            nt_pe_loader::Protection::ReadOnly => RO_NX,
         };
         let span = va.saturating_add(vsize.max(raw_size)).min(cap);
         let mut p = va & !0xFFF;

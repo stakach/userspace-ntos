@@ -39,7 +39,7 @@ pub(crate) mod hosted_exception_stack;
 #[path = "hosted_c_specific_handler.rs"]
 mod hosted_c_specific_handler;
 #[path = "hosted_seh_component.rs"]
-mod hosted_seh_component;
+pub(crate) mod hosted_seh_component;
 
 pub(crate) fn hosted_seh_linkage(
     channel: &crate::spawn_hosts::PumpChannel,
@@ -138,6 +138,14 @@ pub(crate) mod hosted_sync_relations;
 mod hosted_kernel_win32k_buffered_ioctl;
 #[path = "hosted_kernel_win32k_source_ioctl.rs"]
 mod hosted_kernel_win32k_source_ioctl;
+#[path = "hosted_kernel_win32k_source_pnp.rs"]
+mod hosted_kernel_win32k_source_pnp;
+#[path = "hosted_kernel_win32k_source_fsd.rs"]
+mod hosted_kernel_win32k_source_fsd;
+#[path = "hosted_kernel_win32k_source_admission.rs"]
+mod hosted_kernel_win32k_source_admission;
+#[path = "hosted_driver_relation_source.rs"]
+mod hosted_driver_relation_source;
 #[path = "hosted_kernel_file_cancel.rs"]
 mod hosted_kernel_file_cancel;
 #[path = "hosted_kernel_file_write.rs"]
@@ -54968,6 +54976,64 @@ pub(crate) unsafe fn service_win32k_source_ioctl_release(
     hosted_kernel_win32k_source_ioctl::release_token(ch, token, source)
 }
 
+pub(crate) unsafe fn service_win32k_source_pnp(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    packet: u64,
+    packet_length: u64,
+    stack_pointer: u64,
+    handler: *mut ExecNtHandler,
+) -> Option<i32> {
+    hosted_kernel_win32k_source_pnp::submit(
+        ch, reply_cap, packet, packet_length, stack_pointer, handler,
+    )
+}
+
+pub(crate) unsafe fn service_win32k_source_pnp_completion(
+    ch: &crate::spawn_hosts::PumpChannel,
+    token: u64,
+    source: u64,
+) -> Option<i32> {
+    hosted_kernel_win32k_source_pnp::completion_for_token(ch, token, source)
+}
+
+pub(crate) unsafe fn service_win32k_source_pnp_release(
+    ch: &crate::spawn_hosts::PumpChannel,
+    token: u64,
+    source: u64,
+) -> i32 {
+    hosted_kernel_win32k_source_pnp::release_token(ch, token, source)
+}
+
+pub(crate) unsafe fn service_win32k_source_fsd(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    packet: u64,
+    packet_length: u64,
+    stack_pointer: u64,
+    handler: *mut ExecNtHandler,
+) -> Option<i32> {
+    hosted_kernel_win32k_source_fsd::submit(
+        ch, reply_cap, packet, packet_length, stack_pointer, handler,
+    )
+}
+
+pub(crate) unsafe fn service_win32k_source_fsd_completion(
+    ch: &crate::spawn_hosts::PumpChannel,
+    token: u64,
+    source: u64,
+) -> Option<i32> {
+    hosted_kernel_win32k_source_ioctl::completion_for_token(ch, token, source)
+}
+
+pub(crate) unsafe fn service_win32k_source_fsd_release(
+    ch: &crate::spawn_hosts::PumpChannel,
+    token: u64,
+    source: u64,
+) -> i32 {
+    hosted_kernel_win32k_source_ioctl::release_token(ch, token, source)
+}
+
 pub(crate) unsafe fn service_win32k_file_query_delivered(
     ch: &crate::spawn_hosts::PumpChannel,
     packet: u64,
@@ -54992,6 +55058,8 @@ pub(crate) unsafe fn redrive_hosted_driver_zw_read_query_file(handler: *mut Exec
     hosted_kernel_win32k_async_read::redrive(handler);
     hosted_kernel_win32k_buffered_ioctl::redrive(handler);
     hosted_kernel_win32k_source_ioctl::redrive(handler);
+    hosted_kernel_win32k_source_pnp::redrive(handler);
+    hosted_kernel_win32k_source_fsd::redrive(handler);
     hosted_kernel_file_cancel::redrive(handler);
 }
 

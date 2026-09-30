@@ -2085,8 +2085,21 @@ pub(crate) unsafe fn component_pump_continue_receive(
     }
     crate::provider_bugcheck::stop_if_pending();
     let mut reply_cap = previous.reply_cap;
+    let Some(mut seh) = hosted_seh_pump::SehLease::claim(ch, reply_cap, false) else {
+        let mut outcome = PumpLoopOutcome::new();
+        outcome.accounting = previous.accounting;
+        outcome.wall_label = nt_unwind::seh_transport::RAISE_LABEL;
+        return Ok(pump_finish_slice(ch, outcome, reply_cap));
+    };
     let first = pump_recv(ch, reply_cap);
-    let outcome = component_pump_loop(ch, first, &mut reply_cap, previous.accounting);
+    let mut outcome = component_pump_loop(ch, first, &mut reply_cap, previous.accounting, &mut seh.pump);
+    let suspended = outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended;
+    if !seh.finish(ch, reply_cap, suspended) {
+        outcome.callback_suspended = false;
+        outcome.provider_wait_suspended = false;
+        outcome.lpc_wait_suspended = false;
+        outcome.wall_label = nt_unwind::seh_transport::RAISE_LABEL;
+    }
     Ok(pump_finish_slice(ch, outcome, reply_cap))
 }
 
@@ -2184,6 +2197,12 @@ unsafe fn component_pump_enter(
     // SAME outstanding Call — which is the whole of what used to be a bespoke resume preamble.
     let request_tag = pump_request_tag(ch, resume);
     let mut reply_cap = ch.reply_cap;
+    let Some(mut seh) = hosted_seh_pump::SehLease::claim(ch, reply_cap, resume != PumpResume::None) else {
+        let mut outcome = PumpLoopOutcome::new();
+        outcome.accounting = accounting;
+        outcome.wall_label = nt_unwind::seh_transport::RAISE_LABEL;
+        return pump_finish_slice(ch, outcome, reply_cap);
+    };
     if ch.initial == InitialAction::RecvFirst {
         trace_component_handoff(b"pump-recvfirst-enter", ch.tcb, reply_cap, request_tag);
     }
@@ -2192,7 +2211,14 @@ unsafe fn component_pump_enter(
     } else {
         pump_recv(ch, reply_cap)
     };
-    let outcome = component_pump_loop(ch, first, &mut reply_cap, accounting);
+    let mut outcome = component_pump_loop(ch, first, &mut reply_cap, accounting, &mut seh.pump);
+    let suspended = outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended;
+    if !seh.finish(ch, reply_cap, suspended) {
+        outcome.callback_suspended = false;
+        outcome.provider_wait_suspended = false;
+        outcome.lpc_wait_suspended = false;
+        outcome.wall_label = nt_unwind::seh_transport::RAISE_LABEL;
+    }
     if ch.initial == InitialAction::RecvFirst {
         let detail = if outcome.completed {
             ch.dispatch_label
@@ -2253,12 +2279,12 @@ unsafe fn component_pump_loop(
     first: PumpMessage,
     reply_cap: &mut u64,
     accounting: nt_user_host::component_pump::ComponentPumpAccounting,
+    seh: &mut hosted_seh_pump::SehPump,
 ) -> PumpLoopOutcome {
     let mut channel = *ch;
     let ch = &mut channel;
     let mut msg = first;
     let mut outcome = PumpLoopOutcome::new();
-    let mut seh = hosted_seh_pump::SehPump::new();
     outcome.accounting = accounting;
     loop {
         if let Some(reply) = msg.shared_reply {
@@ -2637,6 +2663,106 @@ unsafe fn component_pump_loop(
             };
             pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
             continue;
+        } else if label == crate::win32k_subsystem::W32_SOURCE_PNP_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let result = if shared_pump::authenticated_badge(ch, msg.badge) {
+                crate::service_sec_image::service_win32k_source_pnp_request(
+                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                Some(nt_process::STATUS_INVALID_PARAMETER as i32)
+            };
+            if let Some(status) = result {
+                pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+            } else if shared_pump::autonomous(ch) {
+                outcome.provider_wait_suspended = true;
+                break;
+            } else {
+                msg = pump_recv(ch, *reply_cap);
+            }
+            continue;
+        } else if label == crate::win32k_subsystem::W32_SOURCE_PNP_COMPLETION_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let result = if shared_pump::authenticated_badge(ch, msg.badge) {
+                crate::service_sec_image::service_win32k_source_pnp_completion(
+                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                Some(nt_process::STATUS_INVALID_PARAMETER as i32)
+            };
+            if let Some(status) = result {
+                pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+            } else if shared_pump::autonomous(ch) {
+                outcome.provider_wait_suspended = true;
+                break;
+            } else {
+                msg = pump_recv(ch, *reply_cap);
+            }
+            continue;
+        } else if label == crate::win32k_subsystem::W32_SOURCE_PNP_RELEASE_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let status = if shared_pump::authenticated_badge(ch, msg.badge) {
+                crate::service_sec_image::service_win32k_source_pnp_release(
+                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                nt_process::STATUS_INVALID_PARAMETER as i32
+            };
+            pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+            continue;
+        } else if label == crate::win32k_subsystem::W32_SOURCE_FSD_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let result = if shared_pump::authenticated_badge(ch, msg.badge) {
+                crate::service_sec_image::service_win32k_source_fsd_request(
+                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                Some(nt_process::STATUS_INVALID_PARAMETER as i32)
+            };
+            if let Some(status) = result {
+                pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+            } else if shared_pump::autonomous(ch) {
+                outcome.provider_wait_suspended = true;
+                break;
+            } else {
+                msg = pump_recv(ch, *reply_cap);
+            }
+            continue;
+        } else if label == crate::win32k_subsystem::W32_SOURCE_FSD_COMPLETION_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let result = if shared_pump::authenticated_badge(ch, msg.badge) {
+                crate::service_sec_image::service_win32k_source_fsd_completion(
+                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                Some(nt_process::STATUS_INVALID_PARAMETER as i32)
+            };
+            if let Some(status) = result {
+                pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+            } else if shared_pump::autonomous(ch) {
+                outcome.provider_wait_suspended = true;
+                break;
+            } else {
+                msg = pump_recv(ch, *reply_cap);
+            }
+            continue;
+        } else if label == crate::win32k_subsystem::W32_SOURCE_FSD_RELEASE_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let status = if shared_pump::authenticated_badge(ch, msg.badge) {
+                crate::service_sec_image::service_win32k_source_fsd_release(
+                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                nt_process::STATUS_INVALID_PARAMETER as i32
+            };
+            pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+            continue;
         } else if label == crate::win32k_subsystem::W32_GUI_CLIENT_INFO_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
@@ -2858,6 +2984,26 @@ unsafe fn component_pump_loop(
                 nt_process::STATUS_INVALID_PARAMETER
             };
             pump_reply_recv_into!(ch, *reply_cap, msg, REQUEST_TAG_LEN, status as u64);
+            continue;
+        } else if label == crate::win32k_subsystem::W32_PROCESS_ATTACH_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let (status, current, saved, attached) = if shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::win32k_glue::service_process_attach(
+                    ch,
+                    nt_user_host::provider_kernel_activation::KernelProviderServiceEnvelope {
+                        badge: msg.badge,
+                        message_info: msg.mi,
+                        reply_cap: *reply_cap,
+                    },
+                    msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u32 as u64, current, saved, attached);
             continue;
         } else if label == crate::win32k_subsystem::W32_PS_LABEL
             && ch.caps.kind == ReqKind::Syscall
@@ -3301,7 +3447,9 @@ unsafe fn component_pump_loop(
                 | nt_unwind::seh_transport::BEGIN_UNWIND_LABEL
                 | nt_unwind::seh_transport::FAULT_BEGIN_LABEL
         )
-            && ch.caps.kind == ReqKind::Irp
+            && (ch.caps.kind == ReqKind::Irp
+                || (ch.caps.kind == ReqKind::Syscall
+                    && crate::win32k_seh_image::linkage(ch, *reply_cap).is_some()))
         {
             let call = nt_unwind::seh_transport::SehCall::parse(
                 msg.mi,
@@ -3577,13 +3725,18 @@ unsafe fn component_pump_loop(
             continue;
         } else if label == 6 {
             outcome.accounting.record_fault();
-            let native_fault = ch.caps.kind == ReqKind::Irp
+            let native_fault = (ch.caps.kind == ReqKind::Irp
+                || (ch.caps.kind == ReqKind::Syscall
+                    && crate::win32k_seh_image::linkage(ch, *reply_cap).is_some()))
                 && (msg.m3 & 1 != 0
                     || msg.m1 < 0x10000
                     || msg.m1 >= 0x0000_8000_0000_0000
                     || (ch.image_frames != 0
                         && msg.m1 >= ch.code_va
-                        && msg.m1 < ch.code_va + ch.image_frames * 0x1000));
+                        && msg.m1 < ch.code_va + ch.image_frames * 0x1000)
+                    || (msg.m1 >= crate::win32k_seh_image::IMAGE_VA
+                        && msg.m1 < crate::win32k_seh_image::IMAGE_VA
+                            + crate::win32k_seh_image::MAX_FRAMES as u64 * 0x1000));
             if native_fault {
                 if !seh.begin_cpu_fault(
                     ch, *reply_cap, msg.badge, label,
@@ -3617,7 +3770,9 @@ unsafe fn component_pump_loop(
                 pump_reply_recv_into!(ch, *reply_cap, msg, 1, next_ip);
                 continue;
             }
-            if ch.caps.kind == ReqKind::Irp
+            if (ch.caps.kind == ReqKind::Irp
+                || (ch.caps.kind == ReqKind::Syscall
+                    && crate::win32k_seh_image::linkage(ch, *reply_cap).is_some()))
                 && seh.begin_cpu_fault(
                     ch, *reply_cap, msg.badge, label,
                     [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
@@ -3663,7 +3818,17 @@ unsafe fn component_pump_loop(
                 pump_reply_recv_into!(ch, *reply_cap, msg, 1, msg.m0 + 2);
                 continue;
             }
-            // Not a skippable int-0x2c — fall through to the wall.
+            // An actual win32k kernel exception takes the same retained SEH transport as hosted
+            // IRP drivers; the checked-build assertion above is the only instruction skip.
+            if crate::win32k_seh_image::linkage(ch, *reply_cap).is_some()
+                && seh.begin_cpu_fault(
+                    ch, *reply_cap, msg.badge, label,
+                    [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+                )
+            {
+                msg = pump_reply_recv_retained_cpu_fault(ch, *reply_cap);
+                continue;
+            }
             if ch.caps.client_attach {
                 win32k_wall_diag(ch, label, msg.m0, msg.m1, msg.m2, msg.m3);
                 crate::win32k_glue::win32k_dispatch_backtrace();

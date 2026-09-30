@@ -53,7 +53,17 @@ struct WorkerIdentity {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FaultSourceIdentity {
+pub(crate) enum FaultSourceIdentity {
+    Driver(DriverFaultSource),
+    Win32k {
+        route: PeerRoute,
+        dispatch: LaneDispatchIdentity,
+        tcb: u64,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DriverFaultSource {
     instance: usize,
     domain: HostedDomainIdentity,
     route: PeerRoute,
@@ -61,6 +71,136 @@ pub(crate) struct FaultSourceIdentity {
     tcb: u64,
     thread_handle: u64,
     worker: Option<WorkerIdentity>,
+}
+
+struct Win32kStackReader {
+    channel: crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    component_base: u64,
+    exec_base: u64,
+    length: u64,
+}
+
+enum StackLease {
+    Driver(HostedStackReader),
+    Win32k(Win32kStackReader),
+}
+
+impl Win32kStackReader {
+    fn new(channel: &crate::spawn_hosts::PumpChannel, reply_cap: u64, badge: u64) -> Option<Self> {
+        let (route, dispatch, component_base, length) = unsafe {
+            crate::win32k_glue::win32k_physical_stack_route_for_channel(
+                channel.tcb,
+                channel.fault_ep,
+                reply_cap,
+            )?
+        };
+        if route.badge() != badge || channel.ingress_route != Some(route) {
+            return None;
+        }
+        let exec_base = unsafe {
+            crate::win32k_glue::win32k_stack_alias_for_route(route, component_base, length)?
+        };
+        let reader = Self {
+            channel: *channel,
+            reply_cap,
+            badge,
+            route,
+            dispatch,
+            component_base,
+            exec_base,
+            length,
+        };
+        reader.still_live().then_some(reader)
+    }
+
+    fn still_live(&self) -> bool {
+        let current = unsafe {
+            crate::win32k_glue::win32k_physical_stack_route_for_channel(
+                self.channel.tcb,
+                self.channel.fault_ep,
+                self.reply_cap,
+            )
+        };
+        current.is_some_and(|(route, dispatch, base, length)| {
+            route == self.route
+                && route.badge() == self.badge
+                && dispatch == self.dispatch
+                && base == self.component_base
+                && length == self.length
+                && unsafe {
+                    crate::win32k_glue::win32k_stack_alias_for_route(route, base, length)
+                } == Some(self.exec_base)
+        })
+    }
+}
+
+impl StackLease {
+    fn new(channel: &crate::spawn_hosts::PumpChannel, reply_cap: u64, badge: u64) -> Option<Self> {
+        match channel.caps.kind {
+            crate::spawn_hosts::ReqKind::Irp => {
+                HostedStackReader::new(channel, reply_cap, badge).map(Self::Driver)
+            }
+            crate::spawn_hosts::ReqKind::Syscall => {
+                Win32kStackReader::new(channel, reply_cap, badge).map(Self::Win32k)
+            }
+            _ => None,
+        }
+    }
+
+    fn still_live(&self) -> bool {
+        match self {
+            Self::Driver(reader) => reader.still_live(),
+            Self::Win32k(reader) => reader.still_live(),
+        }
+    }
+
+    fn bounds(&self) -> Option<(u64, u64)> {
+        let (base, length) = match self {
+            Self::Driver(reader) => (reader.component_base, reader.length),
+            Self::Win32k(reader) => (reader.component_base, reader.length),
+        };
+        Some((base, base.checked_add(length)?))
+    }
+
+    fn translate(&self, address: u64, bytes: u64) -> Option<u64> {
+        let (base, length, exec) = match self {
+            Self::Driver(reader) => (reader.component_base, reader.length, reader.exec_base),
+            Self::Win32k(reader) => (reader.component_base, reader.length, reader.exec_base),
+        };
+        translate_component_range(address, bytes, base, length, exec)
+    }
+
+    fn tcb(&self) -> u64 {
+        match self {
+            Self::Driver(reader) => reader.tcb,
+            Self::Win32k(reader) => reader.channel.tcb,
+        }
+    }
+
+    fn fault_source(&self) -> FaultSourceIdentity {
+        match self {
+            Self::Driver(reader) => reader.fault_source(),
+            Self::Win32k(reader) => FaultSourceIdentity::Win32k {
+                route: reader.route,
+                dispatch: reader.dispatch,
+                tcb: reader.channel.tcb,
+            },
+        }
+    }
+}
+
+impl StackReader for StackLease {
+    fn read_u64(&self, address: u64) -> Option<u64> {
+        if address & 7 != 0 || !self.still_live() {
+            return None;
+        }
+        let exec = self.translate(address, 8)?;
+        Some(unsafe { core::ptr::read_volatile(exec as *const u64) })
+    }
 }
 
 pub(crate) struct CapturedCpuFault {
@@ -178,7 +318,7 @@ impl HostedStackReader {
     }
 
     fn fault_source(&self) -> FaultSourceIdentity {
-        FaultSourceIdentity {
+        FaultSourceIdentity::Driver(DriverFaultSource {
             instance: self.instance,
             domain: self.domain,
             route: self.route,
@@ -186,7 +326,44 @@ impl HostedStackReader {
             tcb: self.tcb,
             thread_handle: self.thread_handle,
             worker: self.worker,
+        })
+    }
+}
+
+fn linkage_for_channel(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+) -> Option<nt_unwind::seh_linkage_image::SehLinkageImage> {
+    match channel.caps.kind {
+        crate::spawn_hosts::ReqKind::Irp => {
+            instance_for_pump_channel(channel, reply_cap)?.1.seh_linkage
         }
+        crate::spawn_hosts::ReqKind::Syscall => {
+            crate::win32k_seh_image::linkage(channel, reply_cap)
+        }
+        _ => None,
+    }
+}
+
+fn with_catalog<R>(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    use_catalog: impl FnOnce(&dyn ExceptionImageReader) -> R,
+) -> Option<R> {
+    match channel.caps.kind {
+        crate::spawn_hosts::ReqKind::Irp => {
+            let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
+            let domain = instance_domain_identity(inst)?;
+            super::hosted_exception_images::with_catalog(instance, domain, |catalog| {
+                use_catalog(catalog)
+            })
+        }
+        crate::spawn_hosts::ReqKind::Syscall => {
+            crate::win32k_seh_image::with_catalog(channel, reply_cap, |catalog| {
+                use_catalog(catalog)
+            })
+        }
+        _ => None,
     }
 }
 
@@ -195,7 +372,7 @@ pub(crate) fn fault_source_identity(
     reply_cap: u64,
     badge: u64,
 ) -> Option<FaultSourceIdentity> {
-    let reader = HostedStackReader::new(channel, reply_cap, badge)?;
+    let reader = StackLease::new(channel, reply_cap, badge)?;
     reader.still_live().then(|| reader.fault_source())
 }
 
@@ -208,12 +385,10 @@ pub(crate) fn capture_cpu_fault(
     label: u64,
     words: [u64; 5],
 ) -> Option<CapturedCpuFault> {
-    let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
-    let domain = instance_domain_identity(inst)?;
-    let linkage = inst.seh_linkage?;
+    let linkage = linkage_for_channel(channel, reply_cap)?;
     with_reader(channel, reply_cap, badge, |stack, low, high| {
-        let reader = HostedStackReader::new(channel, reply_cap, badge)?;
-        let snapshot = unsafe { crate::thread_context::LegacyThreadContext::read(reader.tcb).ok()? };
+        let reader = StackLease::new(channel, reply_cap, badge)?;
+        let snapshot = unsafe { crate::thread_context::LegacyThreadContext::read(reader.tcb()).ok()? };
         if !reader.still_live() || snapshot.registers[0] != words[0] {
             return None;
         }
@@ -237,7 +412,7 @@ pub(crate) fn capture_cpu_fault(
         if original_rsp > high || entry_rsp.checked_sub(0x4000)? < low {
             return None;
         }
-        let step = super::hosted_exception_images::with_catalog(instance, domain, |catalog| {
+        let step = with_catalog(channel, reply_cap, |catalog| {
             let mut walk = ExceptionWalk::new(
                 WalkMode::Search,
                 exception,
@@ -292,7 +467,7 @@ pub(super) fn with_reader<R>(
     badge: u64,
     use_reader: impl for<'a> FnOnce(&'a dyn StackReader, u64, u64) -> R,
 ) -> Option<R> {
-    let reader = HostedStackReader::new(channel, reply_cap, badge)?;
+    let reader = StackLease::new(channel, reply_cap, badge)?;
     let (low, high) = reader.bounds()?;
     let result = use_reader(&reader, low, high);
     reader.still_live().then_some(result)
@@ -343,18 +518,11 @@ pub(crate) fn initialize_restore_packet(
     token: u64,
     resume_va: u64,
 ) -> Result<(), PacketWriteError> {
-    let reader =
-        HostedStackReader::new(channel, reply_cap, badge).ok_or(PacketWriteError::Refused)?;
+    let reader = StackLease::new(channel, reply_cap, badge).ok_or(PacketWriteError::Refused)?;
     if packet_va == 0 || packet_va & 15 != 0 || token == 0 || resume_va == 0 {
         return Err(PacketWriteError::Refused);
     }
-    let exec = translate_component_range(
-        packet_va,
-        core::mem::size_of::<SehHandlerPacket>() as u64,
-        reader.component_base,
-        reader.length,
-        reader.exec_base,
-    )
+    let exec = reader.translate(packet_va, core::mem::size_of::<SehHandlerPacket>() as u64)
     .ok_or(PacketWriteError::Refused)?;
     if !reader.still_live() {
         return Err(PacketWriteError::Refused);
@@ -388,19 +556,12 @@ pub(crate) fn write_handler_packet(
     address: u64,
     packet: &SehHandlerPacket,
 ) -> Result<(), PacketWriteError> {
-    let reader =
-        HostedStackReader::new(channel, reply_cap, badge).ok_or(PacketWriteError::Refused)?;
+    let reader = StackLease::new(channel, reply_cap, badge).ok_or(PacketWriteError::Refused)?;
     let length = core::mem::size_of::<SehHandlerPacket>() as u64;
     if address == 0 || address & 15 != 0 || !reader.still_live() {
         return Err(PacketWriteError::Refused);
     }
-    let exec = translate_component_range(
-        address,
-        length,
-        reader.component_base,
-        reader.length,
-        reader.exec_base,
-    )
+    let exec = reader.translate(address, length)
     .ok_or(PacketWriteError::Refused)?;
     // Ownership and bounds are established before the first write. Once a byte may have reached
     // the component's stack, failure is uncertain even if the final lease check rejects it.
@@ -500,11 +661,9 @@ pub(crate) fn capture_raise_first_step(
     context_address: u64,
     status_word: u64,
 ) -> Option<Result<SehRaiseFirstPass, RaiseCaptureError>> {
-    let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
-    let domain = instance_domain_identity(inst)?;
-    let linkage = inst.seh_linkage?;
+    let linkage = linkage_for_channel(channel, reply_cap)?;
     with_reader(channel, reply_cap, badge, |reader, low, high| {
-        super::hosted_exception_images::with_catalog(instance, domain, |catalog| {
+        with_catalog(channel, reply_cap, |catalog| {
             let raw = RawContext::capture_bounded(reader, context_address, low, high)
                 .map_err(RaiseCaptureError::Context)?;
             linkage
@@ -524,11 +683,9 @@ pub(crate) fn capture_unwind_first_step(
     request_va: u64,
     packet_va: u64,
 ) -> Option<Result<SehRaiseFirstPass, UnwindCaptureError>> {
-    let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
-    let domain = instance_domain_identity(inst)?;
-    let linkage = inst.seh_linkage?;
+    let linkage = linkage_for_channel(channel, reply_cap)?;
     with_reader(channel, reply_cap, badge, |reader, low, high| {
-        super::hosted_exception_images::with_catalog(instance, domain, |catalog| {
+        with_catalog(channel, reply_cap, |catalog| {
             let packet_end = packet_va
                 .checked_add(core::mem::size_of::<SehHandlerPacket>() as u64)
                 .ok_or(UnwindCaptureError::Packet)?;
@@ -664,10 +821,8 @@ pub(crate) fn advance_raise_walk(
     badge: u64,
     mut walk: ExceptionWalk,
 ) -> Option<Result<FirstRaiseStep, WalkError>> {
-    let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
-    let domain = instance_domain_identity(inst)?;
     with_reader(channel, reply_cap, badge, |reader, _, _| {
-        super::hosted_exception_images::with_catalog(instance, domain, |catalog| loop {
+        with_catalog(channel, reply_cap, |catalog| loop {
             match walk.step(catalog, reader)? {
                 WalkStep::Continue(next) => walk = next,
                 WalkStep::Invoke(handler) => return Ok(FirstRaiseStep::Invoke(handler)),
@@ -688,11 +843,9 @@ pub(crate) fn start_target_unwind(
     target_frame: u64,
     target_ip: u64,
 ) -> Option<Result<FirstRaiseStep, WalkError>> {
-    let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
-    let domain = instance_domain_identity(inst)?;
-    let linkage = inst.seh_linkage?;
+    let linkage = linkage_for_channel(channel, reply_cap)?;
     with_reader(channel, reply_cap, badge, |reader, low, high| {
-        super::hosted_exception_images::with_catalog(instance, domain, |catalog| {
+        with_catalog(channel, reply_cap, |catalog| {
             catalog
                 .lookup_exception_function(target_ip)
                 .map_err(WalkError::ImageLookup)?;
@@ -737,23 +890,15 @@ pub(crate) fn publish_restore_context(
     captured: &RawContext,
     context: Context,
 ) -> Option<Result<u64, RawContextRestoreError>> {
-    let (instance, inst) = instance_for_pump_channel(channel, reply_cap)?;
-    let domain = instance_domain_identity(inst)?;
-    let reader = HostedStackReader::new(channel, reply_cap, badge)?;
+    let reader = StackLease::new(channel, reply_cap, badge)?;
     let (low, high) = reader.bounds()?;
     let destination =
         packet_va.checked_add(core::mem::offset_of!(SehHandlerPacket, original_context) as u64)?;
     let length = core::mem::size_of::<RawContext>() as u64;
-    let exec = translate_component_range(
-        destination,
-        length,
-        reader.component_base,
-        reader.length,
-        reader.exec_base,
-    )?;
+    let exec = reader.translate(destination, length)?;
     let mut raw = captured.clone();
     raw.update_from_context(&context);
-    let validation = super::hosted_exception_images::with_catalog(instance, domain, |catalog| {
+    let validation = with_catalog(channel, reply_cap, |catalog| {
         raw.validate_restore(captured, low, high, |pc| {
             catalog.lookup_exception_function(pc).is_ok()
         })

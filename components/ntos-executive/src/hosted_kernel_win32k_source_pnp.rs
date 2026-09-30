@@ -46,6 +46,7 @@ struct Work {
     reply_acked: bool,
     ack_claimed: bool,
     cancel_requested: bool,
+    indeterminate: bool,
 }
 
 struct CompletionWait {
@@ -213,6 +214,7 @@ pub(crate) unsafe fn submit(
         terminal_claimed: false, terminal_published: false, event_claimed: false,
         event_signaled: false, packet_prepared: false, reply_entered: false,
         reply_acked: false, ack_claimed: false, cancel_requested: false,
+        indeterminate: false,
     };
     let index = if let Some(index) = slot {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
@@ -369,6 +371,8 @@ impl Work {
                 status, information, receipt,
             }) => {
                 if receipt.status() != status || receipt.information() != information {
+                    self.receipt = Some(receipt);
+                    self.indeterminate = true;
                     return false;
                 }
                 self.receipt = Some(receipt);
@@ -377,13 +381,20 @@ impl Work {
                 self.canonical_irp = Some(irp_id);
                 self.pending = true;
             }
-            Ok(nt_io_manager::ExternalPnpDispatchResult::ReturnedPayload { .. })
-            | Ok(nt_io_manager::ExternalPnpDispatchResult::Indeterminate { .. }) => {
+            Ok(nt_io_manager::ExternalPnpDispatchResult::ReturnedPayload { receipt, .. }) => {
+                self.receipt = Some(receipt);
+                self.indeterminate = true;
+                return false;
+            }
+            Ok(nt_io_manager::ExternalPnpDispatchResult::Indeterminate { irp_id, .. }) => {
+                self.canonical_irp = Some(irp_id);
+                self.indeterminate = true;
                 return false;
             }
             Err(rejection) => {
                 let (status, prepared) = rejection.into_parts();
                 if io_manager_mut().discard_prepared_external_pnp(prepared).is_err() {
+                    self.indeterminate = true;
                     return false;
                 }
                 self.terminal = Some((status.raw() as u32, 0));
@@ -427,6 +438,97 @@ impl Work {
         let identity = (self.route, self.source_address, self.token);
         let index = (&*core::ptr::addr_of!(ACTIVE)).iter().position(|row| *row == identity)
             .expect("cancelled PnP identity");
+        (&mut *core::ptr::addr_of_mut!(ACTIVE)).swap_remove(index);
+        super::hosted_kernel_win32k_source_admission::retire(
+            self.route, self.source_address, self.source_ticket, self.source_generation,
+        );
+        true
+    }
+
+    unsafe fn finish_cancelled_after_entry(&mut self, handler: *mut ExecNtHandler) -> bool {
+        if self.reply_entered || self.relation_claimed || self.terminal_claimed
+            || self.event_claimed
+        {
+            return false;
+        }
+        if self.indeterminate && self.canonical_irp.is_none() && self.receipt.is_none() {
+            return false;
+        }
+        if let Some(irp) = self.canonical_irp {
+            if !self.cancel_requested {
+                self.cancel_requested = true;
+                let _ = cancel_irp_if_pending(irp.raw());
+            }
+            if self.receipt.is_none() {
+                let Some(receipt) = io_manager_mut().take_completed_external_pnp_receipt(irp)
+                else { return false };
+                self.receipt = Some(receipt);
+            }
+        }
+        if let Some(receipt) = self.receipt.as_ref() {
+            if receipt.origin_device_id() != self.target.device_id()
+                || receipt.minor() != nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS
+                || receipt.relation_type() != Some(nt_pnp_abi::TARGET_DEVICE_RELATION)
+                || receipt.driver_pending() != self.canonical_irp.is_some()
+                || self.canonical_irp.is_some_and(|irp| receipt.irp_id() != irp)
+            {
+                crate::provider_bugcheck::report(0xc4, [self.source_address, receipt.irp_id().raw(), 0, 61]);
+            }
+            if receipt.status().is_success() {
+                if receipt.information() == 0 { return false; }
+                if self.source_allocation.is_none() {
+                    let Some(source) = hosted_driver_relation_source::DriverRelationSource::capture(
+                        receipt.completion_driver_id(), receipt.information(),
+                    ) else { return false };
+                    self.source_allocation = Some(source);
+                }
+                if self.source_pdo.is_none() {
+                    let source = self.source_allocation.as_ref().expect("cancelled PnP source allocation");
+                    if !source.validate() { return false; }
+                    let Some(domain) = source.domain() else { return false };
+                    let Ok(objects) = nt_pnp_manager::copy_device_relations_x64(source.bytes())
+                    else { return false };
+                    if objects.len() != 1 { return false; }
+                    let Some(pdo) = io_manager_mut().hosted_device_by_identity(domain, objects[0])
+                    else { return false };
+                    let Some(registration) = io_manager_mut()
+                        .hosted_device_pointer_registration(domain, objects[0])
+                    else { return false };
+                    if registration.device_id() != pdo { return false; }
+                    let Ok(reference) = io_manager_mut()
+                        .take_hosted_device_pointer_reference(registration)
+                    else { return false };
+                    self.source_pdo = Some(reference);
+                }
+            } else if receipt.information() != 0 {
+                return false;
+            }
+        }
+        if let Some(irp) = self.canonical_irp {
+            if self.ack_claimed { return false; }
+            self.ack_claimed = true;
+            if acknowledge_completed_irp_strict(irp.raw()).is_err() { return false; }
+            self.canonical_irp = None;
+        }
+        if let Some(mut reference) = self.source_pdo.take() {
+            reference.release(io_manager_mut()).expect("cancelled PnP PDO reference");
+        }
+        if let Some(source) = self.source_allocation.take() {
+            if !source.retire() {
+                crate::provider_bugcheck::report(0xc4, [self.source_address, 0, 0, 62]);
+            }
+        }
+        if !crate::win32k_subsystem::abort_source_target_relation_dispatch(&mut self.source) {
+            return false;
+        }
+        if let Some(event) = self.event.take() { release_event(handler, event); }
+        self.target.release(io_manager_mut()).expect("cancelled entered PnP target");
+        runtime::acknowledge_retained_service_cancellation(
+            self.route, self.dispatch, self.reply, self.token,
+        ).expect("cancelled entered PnP Reply");
+        let identity = (self.route, self.source_address, self.token);
+        let index = (&*core::ptr::addr_of!(ACTIVE)).iter().position(|row| *row == identity)
+            .expect("cancelled entered PnP identity");
         (&mut *core::ptr::addr_of_mut!(ACTIVE)).swap_remove(index);
         super::hosted_kernel_win32k_source_admission::retire(
             self.route, self.source_address, self.source_ticket, self.source_generation,
@@ -649,17 +751,9 @@ impl Work {
         if runtime::retained_service_cancelled(
             self.route, self.dispatch, self.reply, self.token,
         ) && !self.reply_entered {
-            // After provider entry, cancellation does not identify whether the driver already
-            // transferred a relation allocation and PDO reference. Quarantine every owner here;
-            // a cancelled route cannot safely publish IOSB/Event or replay driver dispatch.
-            if let Some(irp) = self.canonical_irp {
-                if !self.cancel_requested {
-                    self.cancel_requested = true;
-                    let _ = cancel_irp_if_pending(irp.raw());
-                }
-            }
-            return false;
+            return self.finish_cancelled_after_entry(handler);
         }
+        if self.indeterminate { return false; }
         if self.pending && !self.reply_entered {
             return self.publish_reply(STATUS_PENDING as u32);
         }

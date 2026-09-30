@@ -124,12 +124,21 @@ pub(super) unsafe fn service_autonomous(route: PeerRoute) -> Result<(), runtime:
             .ok_or(runtime::Error::PhysicalIdentity)?;
         let message = runtime::stored_current_message(route)?;
         let mut reply = channel.reply_cap;
+        let mut seh = hosted_seh_pump::SehLease::claim(&channel, reply, true)
+            .ok_or(runtime::Error::PhysicalIdentity)?;
         let outcome = component_pump_loop(
             &channel,
             PumpMessage::from_received(message),
             &mut reply,
             nt_user_host::component_pump::ComponentPumpAccounting::new(false),
+            &mut seh.pump,
         );
+        let suspended = outcome.callback_suspended
+            || outcome.provider_wait_suspended
+            || outcome.lpc_wait_suspended;
+        if !seh.finish(&channel, reply, suspended) {
+            return Err(runtime::Error::PhysicalIdentity);
+        }
         // An autonomous thread does not speak the dispatch-worker completion protocol. Only
         // the acknowledged service Reply can complete its invocation and return this lane idle.
         if outcome.completed

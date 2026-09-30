@@ -2,6 +2,7 @@
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use nt_component_suspension::{peer_registry::PeerRoute, LaneDispatchIdentity};
 use nt_unwind::{
     exception_walk::{
         FirstRaiseStep, HandlerContexts, HandlerInvocation, SecondChanceReason, WalkOutcome,
@@ -15,7 +16,85 @@ use nt_unwind::{
 use super::PumpChannel;
 use crate::driver_launch::{hosted_exception_stack as stack, hosted_seh_linkage};
 
+fn linkage_for_channel(
+    channel: &PumpChannel,
+    reply: u64,
+) -> Option<nt_unwind::seh_linkage_image::SehLinkageImage> {
+    match channel.caps.kind {
+        crate::spawn_hosts::ReqKind::Irp => hosted_seh_linkage(channel, reply),
+        crate::spawn_hosts::ReqKind::Syscall => crate::win32k_seh_image::linkage(channel, reply),
+        _ => None,
+    }
+}
+
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+const RETAINED_SLOTS: usize = 128;
+
+struct RetainedSlot {
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    pump: Option<SehPump>,
+}
+
+static mut RETAINED: [Option<RetainedSlot>; RETAINED_SLOTS] = [const { None }; RETAINED_SLOTS];
+
+pub(super) struct SehLease {
+    slot: usize,
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    pub(super) pump: SehPump,
+}
+
+fn physical_key(channel: &PumpChannel, reply: u64) -> Option<(PeerRoute, LaneDispatchIdentity)> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let route = unsafe { runtime::channel_route(channel).ok()?? };
+    if unsafe { runtime::current_reply(route).ok()? } != reply {
+        return None;
+    }
+    Some((route, unsafe { runtime::dispatch(route).ok()? }))
+}
+
+impl SehLease {
+    /// An active slot is reserved before sending the dispatch reply. Resumes may take only the
+    /// exact retained route, dispatch generation and Reply; a fresh nested invocation on that
+    /// same physical lane cannot silently replace an ancestor's exception state.
+    pub(super) fn claim(channel: &PumpChannel, reply: u64, resume: bool) -> Option<Self> {
+        let (route, dispatch) = physical_key(channel, reply)?;
+        let slots = unsafe { &mut *core::ptr::addr_of_mut!(RETAINED) };
+        if let Some((slot, record)) = slots.iter_mut().enumerate().find_map(|(slot, record)| {
+            record.as_mut().filter(|record| record.route == route).map(|record| (slot, record))
+        }) {
+            if !resume || record.dispatch != dispatch || record.reply != reply {
+                return None;
+            }
+            return Some(Self { slot, route, dispatch, pump: record.pump.take()? });
+        }
+        let slot = slots.iter().position(Option::is_none)?;
+        slots[slot] = Some(RetainedSlot { route, dispatch, reply, pump: None });
+        Some(Self { slot, route, dispatch, pump: SehPump::new() })
+    }
+
+    pub(super) fn finish(&mut self, channel: &PumpChannel, reply: u64, suspended: bool) -> bool {
+        let slots = unsafe { &mut *core::ptr::addr_of_mut!(RETAINED) };
+        let Some(record) = slots.get_mut(self.slot).and_then(Option::as_mut) else {
+            return false;
+        };
+        if record.route != self.route || record.dispatch != self.dispatch || record.pump.is_some() {
+            return false;
+        }
+        if self.pump.retained() {
+            // On a wall the same owner is retained for quarantine, not dropped. No continuation
+            // may take it unless a later exact physical resume is explicitly admitted.
+            record.reply = reply;
+            record.pump = Some(core::mem::replace(&mut self.pump, SehPump::new()));
+            return !suspended || physical_key(channel, reply) == Some((self.route, self.dispatch));
+        }
+        slots[self.slot] = None;
+        true
+    }
+}
 
 enum Phase {
     Prepare(HandlerInvocation),
@@ -188,7 +267,7 @@ impl SehPump {
                 return None;
             }
             self.active.try_reserve(1).ok()?;
-            let linkage = hosted_seh_linkage(channel, reply)?;
+            let linkage = linkage_for_channel(channel, reply)?;
             stack::initialize_restore_packet(
                 channel, reply, badge, packet_va, token, linkage.resume_va,
             ).ok()?;
@@ -256,7 +335,7 @@ impl SehPump {
             if token == 0 || self.active.len() >= 64 {
                 return None;
             }
-            let linkage = hosted_seh_linkage(channel, reply)?;
+            let linkage = linkage_for_channel(channel, reply)?;
             stack::initialize_restore_packet(
                 channel,
                 reply,
@@ -319,7 +398,7 @@ impl SehPump {
                 let Phase::Prepare(invocation) = active.phase.take()? else {
                     return None;
                 };
-                let linkage = hosted_seh_linkage(channel, reply)?;
+                let linkage = linkage_for_channel(channel, reply)?;
                 let mut packet = match invocation.contexts {
                     HandlerContexts::Search { .. } => {
                         SehHandlerPacket::prepare_search(&active.captured, &invocation, packet_va)

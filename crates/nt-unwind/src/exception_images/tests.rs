@@ -425,6 +425,22 @@ fn image_overlap_and_duplicate_bases_are_rejected() {
 }
 
 #[test]
+fn catalog_append_is_ordered_and_refuses_overlap_without_mutation() {
+    let first = AdmittedExceptionImage::from_mapped_image(BASE, mapped_pe()).unwrap();
+    let mut catalog = ExceptionImageCatalog::new(vec![first]).unwrap();
+    let overlap = AdmittedExceptionImage::from_mapped_image(BASE + 0x2000, mapped_pe()).unwrap();
+    assert_eq!(catalog.append(overlap), Err(ImageAdmissionError::ImageOverlap));
+    assert_eq!(catalog.image_count(), 1);
+    let later = AdmittedExceptionImage::from_mapped_image(BASE + 0x8000, mapped_pe()).unwrap();
+    catalog.append(later).unwrap();
+    assert_eq!(catalog.image_count(), 2);
+    assert!(matches!(
+        catalog.lookup_exception_function(BASE + 0x9010),
+        Ok(ExceptionFunction::Function { image_base, .. }) if image_base == BASE + 0x8000
+    ));
+}
+
+#[test]
 fn malformed_pe_never_becomes_a_leaf_catalog() {
     let mut bytes = mapped_pe();
     bytes[0] = 0;

@@ -48,6 +48,7 @@ mod storage_host;
 mod system_modules;
 mod video_device;
 mod win32k_pe;
+mod win32k_seh_image;
 mod win32k_session_runtime;
 mod win32k_subsystem;
 pub(crate) use service_sec_image::*;
@@ -18401,6 +18402,9 @@ unsafe fn release_hosted_thread_win32_context(
     }
 
     if let Some(expected) = thread_win32 {
+        if !win32k_glue::retire_thread_attach(client) {
+            return false;
+        }
         let flags = if final_mechanism {
             win32k_subsystem::PS_WIN32_PROVIDER_RETAIN_THREAD_CONTEXT
         } else {
@@ -30906,6 +30910,25 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     CAP_INIT_THREAD_VSPACE,
                 );
             }
+            let mut seh_image = win32k_seh_image::load_from_os(
+                &exec_fs().expect("win32k requires the mounted OS filesystem"),
+            )
+                .expect("win32k exception linkage PE missing or invalid");
+            let seh_frames = seh_image.frame_count();
+            let seh_base = alloc_frame();
+            for _ in 1..seh_frames {
+                let _ = alloc_frame();
+            }
+            for frame in 0..seh_frames {
+                let _ = page_map(
+                    copy_cap(seh_base + frame),
+                    win32k_seh_image::IMAGE_VA + frame * 0x1000,
+                    RW_NX,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+            }
+            seh_image.install().expect("win32k exception linkage installation failed");
+            seh_image.publish_imports().expect("win32k exception linkage import publication failed");
             let pool_base = alloc_frame();
             for _ in 1..win32k_subsystem::WIN32K_POOL_FRAMES {
                 let _ = alloc_frame();
@@ -31134,13 +31157,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 NLS_OEM_SIZE.load(Ordering::Relaxed) as usize,
                 NLS_CASE_SIZE.load(Ordering::Relaxed) as usize,
             ];
+            let win32k_image_size = win32k_seh_image::primary_image_size(
+                WIN32KBUF_VADDR,
+                win32k_size,
+            )
+            .expect("staged win32k PE image size invalid");
             let entry_rva =
                 match win32k_subsystem::load_into(WIN32KBUF_VADDR, win32k_size, nls_sizes) {
                     Some(entry_rva) => {
                         let _ = register_system_module(
                             b"reactos\\system32\\win32k.sys",
                             win32k_subsystem::WIN32K_CODE_VA,
-                            win32k_pe::WIN32K_PE.size_of_image,
+                            win32k_image_size,
                         );
                         entry_rva
                     }
@@ -31215,6 +31243,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     count: win32k_subsystem::WIN32K_IMAGE_FRAMES,
                     rights: Rights::PerFrame(code_rights_static),
                     pts: 2,
+                };
+                n += 1;
+                regions[n] = Region {
+                    source: FrameSource::Alias(seh_base),
+                    base_va: win32k_seh_image::IMAGE_VA,
+                    count: seh_frames,
+                    rights: Rights::PerFrame(
+                        seh_image.publish_frame_rights()
+                            .expect("win32k SEH frame rights already published"),
+                    ),
+                    pts: 0,
                 };
                 n += 1;
                 // The aux PT window (DATA/SHARED/ARG live here) — a single PT built ahead of those frames.
@@ -31430,6 +31469,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 WIN32K_ROOT_IMAGE_MAP_OWNER.store(sc.map_cap_bank.owner as u64, Ordering::Relaxed);
                 sc
             };
+            win32k_seh_image::publish(
+                primary_component.pml4,
+                seh_image,
+                win32k_image_size,
+            )
+            .expect("win32k exception image catalog rejected");
             let host_pml4 = primary_component.pml4;
             let primary_cnode = primary_component.cnode;
             let primary_sched_context = primary_component.sched_context;

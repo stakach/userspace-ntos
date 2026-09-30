@@ -105,7 +105,7 @@ fn command_loop(mut command: SehCommand, packet_va: u64) -> ! {
 /// Bound per instance into the support PE's initially zero `SehRaiseDispatch` slot. The component
 /// never returns to `SehRaiseStatus`: it is either restored through the support PE or contained.
 #[inline(never)]
-pub(super) extern "win64" fn raise_dispatch(context_va: u64, status: u32) -> ! {
+pub(crate) extern "win64" fn raise_dispatch(context_va: u64, status: u32) -> ! {
     let mut packet = MaybeUninit::<SehHandlerPacket>::uninit();
     let packet_va = packet.as_mut_ptr() as u64;
     let command = exchange(SehCall::Raise { context_va, status });
@@ -115,7 +115,7 @@ pub(super) extern "win64" fn raise_dispatch(context_va: u64, status: u32) -> ! {
 /// Bound into the instance's admitted `SehUnwindDispatch` slot. A target unwind restores from
 /// this packet even when there is no intervening language handler to prepare one.
 #[inline(never)]
-pub(super) extern "win64" fn unwind_dispatch(request_va: u64) -> ! {
+pub(crate) extern "win64" fn unwind_dispatch(request_va: u64) -> ! {
     let mut packet = MaybeUninit::<SehHandlerPacket>::uninit();
     let packet_va = packet.as_mut_ptr() as u64;
     let record_va = unsafe { ptr::read_volatile((request_va + 0x10) as *const u64) };
@@ -139,7 +139,7 @@ pub(super) extern "win64" fn unwind_dispatch(request_va: u64) -> ! {
 /// The token is not authority on its own: the owning pump also matches the physical route and
 /// dispatch before it reads this packet or advances the saved exception walk.
 #[inline(never)]
-pub(super) extern "win64" fn fault_dispatch(token: u64) -> ! {
+pub(crate) extern "win64" fn fault_dispatch(token: u64) -> ! {
     let mut packet = MaybeUninit::<SehHandlerPacket>::uninit();
     let packet_va = packet.as_mut_ptr() as u64;
     let command = exchange(SehCall::FaultBegin { token, packet_va });

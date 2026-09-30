@@ -263,6 +263,51 @@ impl Work {
         true
     }
 
+    unsafe fn finish_cancelled_after_entry(&mut self, handler: *mut ExecNtHandler) -> bool {
+        if self.reply_entered || self.terminal_claimed || self.event_claimed {
+            return false;
+        }
+        if let Some(irp) = self.irp {
+            if !self.cancel_requested {
+                self.cancel_requested = true;
+                let _ = cancel_irp_if_pending(irp.raw());
+            }
+            let Some(completion) = completed_irp_snapshot_exact(irp.raw()) else {
+                return false;
+            };
+            if completion.id != irp
+                || completion.client_id != ClientId(IO_MANAGER_COMPONENT_ID)
+                || completion.file_id.is_some()
+                || completion.device_id != self.target.device_id()
+                || completion.major != self.source.major
+                || completion.completion_origin != IrpCompletionOrigin::Driver
+            {
+                crate::provider_bugcheck::report(0xc4, [self.source_address, irp.raw(), 0, 60]);
+            }
+            if self.ack_claimed {
+                return false;
+            }
+            self.ack_claimed = true;
+            if acknowledge_completed_irp_strict(irp.raw()).is_err() {
+                return false;
+            }
+            self.irp = None;
+        }
+        if !crate::win32k_subsystem::abort_source_fsd_dispatch(&mut self.source) {
+            return false;
+        }
+        if let Some(event) = self.event.take() { release_event(handler, event); }
+        self.target.release(io_manager_mut()).expect("cancelled entered FSD target");
+        runtime::acknowledge_retained_service_cancellation(
+            self.route, self.dispatch, self.reply, self.token,
+        ).expect("cancelled entered FSD Reply");
+        cancel_external_source(self.route, self.source_address, self.token);
+        super::hosted_kernel_win32k_source_admission::retire(
+            self.route, self.source_address, self.source_ticket, self.source_generation,
+        );
+        true
+    }
+
     unsafe fn enter(&mut self) -> bool {
         if self.entered { return true; }
         if !self.source.validate() || self.target.validate(io_manager_mut()).is_err() {
@@ -412,13 +457,7 @@ impl Work {
         if runtime::retained_service_cancelled(
             self.route, self.dispatch, self.reply, self.token,
         ) && !self.reply_entered {
-            if let Some(irp) = self.irp {
-                if !self.cancel_requested {
-                    self.cancel_requested = true;
-                    let _ = cancel_irp_if_pending(irp.raw());
-                }
-            }
-            return false;
+            return self.finish_cancelled_after_entry(handler);
         }
         if self.pending && !self.reply_entered {
             return self.publish_reply(STATUS_PENDING as u32);

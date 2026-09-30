@@ -325,7 +325,7 @@ pub(super) unsafe fn service_event(
     result.unwrap_or_else(|status| (status as i32, 0, 0, 0))
 }
 
-pub(super) unsafe fn validate_win32k_service_call(
+pub(crate) unsafe fn validate_win32k_service_call(
     channel: &spawn_hosts::PumpChannel,
     envelope: nt_user_host::provider_kernel_activation::KernelProviderServiceEnvelope,
     expected_message_info: u64,
@@ -440,6 +440,9 @@ pub(crate) unsafe fn finish_observed_driver_entry_return(
     else {
         return Ok(None);
     };
+    if !crate::win32k_glue::retire_kernel_attach(caller) {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
     let shared = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
         .peer_route(caller.dispatch().lane())
         .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?
