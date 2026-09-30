@@ -122,6 +122,65 @@ fn each_section_and_view_owns_an_independent_reference() {
 }
 
 #[test]
+fn permanent_namespace_reference_survives_creator_close_and_blocks_purge() {
+    let mut table = ImageSectionTable::new();
+    let mut io = Purge::default();
+    let creator = section(&mut table, file());
+    let permanent = table.reference_permanent(creator).unwrap();
+    table.close_section(creator).unwrap();
+    assert_eq!(table.flush_for_write(file(), &mut io), Err(ImageFlushError::InUse));
+    let opened = table.open_permanent(permanent).unwrap();
+    table.release_permanent(permanent).unwrap();
+    assert_eq!(table.open_permanent(permanent), Err(ImageSectionError::InvalidReference));
+    assert_eq!(table.flush_for_write(file(), &mut io), Err(ImageFlushError::InUse));
+    table.close_section(opened).unwrap();
+    assert_eq!(table.flush_for_write(file(), &mut io), Ok(()));
+    assert_eq!(io.calls, [(creator.area(), file())]);
+}
+
+#[test]
+fn permanent_reference_is_independent_of_handles_views_and_reused_slots() {
+    let mut table = ImageSectionTable::new();
+    let mut io = Purge::default();
+    let creator = section(&mut table, file());
+    let first = table.reference_permanent(creator).unwrap();
+    let second = table.reference_permanent(creator).unwrap();
+    let opened = table.open_permanent(first).unwrap();
+    let view = table.reference_view(opened).unwrap();
+    table.close_section(creator).unwrap();
+    table.close_section(opened).unwrap();
+    table.release_permanent(first).unwrap();
+    assert_eq!(table.release_permanent(first), Err(ImageSectionError::InvalidReference));
+    assert_eq!(table.flush_for_write(file(), &mut io), Err(ImageFlushError::InUse));
+    let reopened = table.open_permanent(second).unwrap();
+    table.release_permanent(second).unwrap();
+    assert_eq!(table.flush_for_write(file(), &mut io), Err(ImageFlushError::InUse));
+    table.close_section(reopened).unwrap();
+    assert_eq!(table.flush_for_write(file(), &mut io), Err(ImageFlushError::InUse));
+    table.release_view(view).unwrap();
+    assert_eq!(table.flush_for_write(file(), &mut io), Ok(()));
+    let new_creator = section(&mut table, file());
+    let new_permanent = table.reference_permanent(new_creator).unwrap();
+    assert_ne!(first, new_permanent);
+    assert_eq!(table.open_permanent(first), Err(ImageSectionError::InvalidReference));
+    table.release_permanent(new_permanent).unwrap();
+    table.close_section(new_creator).unwrap();
+}
+
+#[test]
+fn permanent_token_cannot_cross_image_tables() {
+    let mut a = ImageSectionTable::new();
+    let mut b = ImageSectionTable::new();
+    let creator = section(&mut a, file());
+    let permanent = a.reference_permanent(creator).unwrap();
+    assert_eq!(b.open_permanent(permanent), Err(ImageSectionError::InvalidReference));
+    assert_eq!(b.release_permanent(permanent), Err(ImageSectionError::InvalidReference));
+    assert_eq!(b.reference_permanent(creator), Err(ImageSectionError::InvalidReference));
+    a.release_permanent(permanent).unwrap();
+    a.close_section(creator).unwrap();
+}
+
+#[test]
 fn idle_cache_can_be_reused_before_purge_but_not_without_a_reference() {
     let mut table = ImageSectionTable::new();
     let mut io = Purge::default();

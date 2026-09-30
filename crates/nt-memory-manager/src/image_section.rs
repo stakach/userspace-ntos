@@ -45,6 +45,21 @@ pub struct ImageViewRef {
     generation: u64,
 }
 
+/// The object namespace's independent ownership of a permanent image Section. The namespace
+/// owns the name and directory identity; this token owns only the image backing reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "release only after the namespace object is removed"]
+pub struct ImagePermanentRef {
+    area: ImageAreaId,
+    generation: u64,
+}
+
+impl ImagePermanentRef {
+    pub fn area(self) -> ImageAreaId {
+        self.area
+    }
+}
+
 impl ImageViewRef {
     pub fn area(self) -> ImageAreaId {
         self.area
@@ -100,6 +115,7 @@ struct Area {
 enum ReferenceKind {
     Section,
     View,
+    Permanent,
 }
 
 struct Reference {
@@ -279,6 +295,49 @@ impl ImageSectionTable {
             area: section.area,
             generation,
         })
+    }
+
+    /// The native namespace creates its name separately. Before publishing that object, retain
+    /// one independent reference so closing its creator's handle cannot retire the image.
+    pub fn reference_permanent(
+        &mut self,
+        section: ImageSectionRef,
+    ) -> Result<ImagePermanentRef, ImageSectionError> {
+        self.reference_index(section.area, section.generation, ReferenceKind::Section)?;
+        let generation = self.add_reference(section.area, ReferenceKind::Permanent)?;
+        Ok(ImagePermanentRef {
+            area: section.area,
+            generation,
+        })
+    }
+
+    /// Opening a named Section acquires a regular handle reference, independent of namespace
+    /// ownership. The native object namespace must authenticate its name before calling this.
+    pub fn open_permanent(
+        &mut self,
+        permanent: ImagePermanentRef,
+    ) -> Result<ImageSectionRef, ImageSectionError> {
+        self.reference_index(permanent.area, permanent.generation, ReferenceKind::Permanent)?;
+        let generation = self.add_reference(permanent.area, ReferenceKind::Section)?;
+        Ok(ImageSectionRef {
+            area: permanent.area,
+            generation,
+        })
+    }
+
+    /// Remove the namespace's reference after its object is withdrawn. Handles and views may
+    /// still keep the same image alive, including after the namespace name is reused.
+    pub fn release_permanent(
+        &mut self,
+        permanent: ImagePermanentRef,
+    ) -> Result<(), ImageSectionError> {
+        let index = self.reference_index(
+            permanent.area,
+            permanent.generation,
+            ReferenceKind::Permanent,
+        )?;
+        self.references[index] = None;
+        Ok(())
     }
 
     /// Acquire before effectful mapping, keeping this reference through mapping failure until
