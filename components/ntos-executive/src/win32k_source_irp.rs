@@ -3,15 +3,15 @@
 
 use super::*;
 use nt_io_manager::kernel_irp_builder::{
-    validate_kernel_irp_dispatch_cursor, validate_new_kernel_irp_packet, KernelIrpDispatchCursor,
-    KernelIrpDispatchHeader,
+    plan_device_io_control_request, validate_kernel_irp_dispatch_cursor,
+    validate_new_kernel_irp_packet, KernelIrpDispatchCursor, KernelIrpDispatchHeader,
 };
 use nt_io_manager::provider_source_irp::{
     ProviderSourceIrpAllocation, ProviderSourceIrpLedger, ProviderSourceIrpTicket,
 };
 use nt_io_manager::{
-    initialize_wdm_irp_thread_list, write_wdm_irp, WdmIrpInit, WDM_X64_IO_STACK_LOCATION_SIZE,
-    WDM_X64_IRP_SIZE,
+    initialize_wdm_irp_thread_list, write_wdm_io_stack_location, write_wdm_irp, WdmIrpInit,
+    WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IRP_SIZE,
 };
 use nt_provider_wait::{ProviderAllocationPin, ProviderAllocationSnapshot};
 
@@ -142,6 +142,98 @@ pub(super) unsafe fn allocate(stack_count: u8) -> Option<(u64, ProviderSourceIrp
             );
             None
         }
+    }
+}
+
+/// Construct a win32k-owned, file-less METHOD_BUFFERED request. This publishes
+/// no device request; dispatch must retain the source, SystemBuffer, Event, and
+/// IOSB before entry. Every failed construction retires its exact allocations.
+pub(super) extern "win64" fn build_device_io_control_request(
+    code: u32,
+    device: u64,
+    input: u64,
+    input_length: u32,
+    output: u64,
+    output_length: u32,
+    internal: u8,
+    event: u64,
+    iosb: u64,
+) -> u64 {
+    unsafe {
+        use nt_io_abi::ioctl;
+        const MAX_BUFFER: u32 = nt_io_manager::win32k_source_irp_ioctl_wire::MAX_BUFFER_BYTES;
+        if ioctl::method(code) != ioctl::METHOD_BUFFERED
+            || input_length > MAX_BUFFER
+            || output_length > MAX_BUFFER
+            || (input_length != 0 && input == 0)
+            || (output_length != 0 && output == 0)
+            || iosb == 0
+            || !provider_pool_contains(device)
+            || device
+                .checked_add(0x50)
+                .is_none_or(|end| end > WIN32K_POOL_VADDR + WIN32K_POOL_FRAMES * 0x1000)
+        {
+            return 0;
+        }
+        if crate::driver_launch::win32k_device_pointers::reference(device).is_err() {
+            return 0;
+        }
+        let stack_count = read_unaligned((device + 0x4c) as *const u8);
+        if crate::driver_launch::win32k_device_pointers::dereference(device).is_err() {
+            crate::provider_bugcheck::report(0xc4, [0x57495250, device, 4, 0]);
+        }
+        let Ok(plan) = plan_device_io_control_request(
+            code,
+            internal != 0,
+            stack_count,
+            device,
+            input,
+            input_length,
+            output,
+            output_length,
+        ) else {
+            return 0;
+        };
+        let Some((irp, ticket)) = allocate(stack_count) else {
+            return 0;
+        };
+        let system_buffer = if plan.system_buffer_len == 0 {
+            0
+        } else {
+            pool_alloc(u64::from(plan.system_buffer_len))
+        };
+        if plan.system_buffer_len != 0 && system_buffer == 0 {
+            if !retire(irp, ticket) {
+                crate::provider_bugcheck::report(0xc4, [0x57495250, irp, 1, 0]);
+            }
+            return 0;
+        }
+        if plan.system_buffer_input_len != 0 {
+            core::ptr::copy_nonoverlapping(
+                input as *const u8,
+                system_buffer as *mut u8,
+                input_length as usize,
+            );
+        }
+        let stack = irp + plan.next_stack_offset as u64;
+        let stack_bytes =
+            core::slice::from_raw_parts_mut(stack as *mut u8, WDM_X64_IO_STACK_LOCATION_SIZE);
+        if write_wdm_io_stack_location(stack_bytes, plan.stack).is_err() {
+            if system_buffer != 0 && !provider_pool_free(system_buffer) {
+                crate::provider_bugcheck::report(0xc4, [0x57495250, system_buffer, 2, 0]);
+            }
+            if !retire(irp, ticket) {
+                crate::provider_bugcheck::report(0xc4, [0x57495250, irp, 3, 0]);
+            }
+            return 0;
+        }
+        write_unaligned((irp + 0x10) as *mut u32, plan.irp_flags);
+        write_unaligned((irp + 0x18) as *mut u64, system_buffer);
+        write_unaligned((irp + 0x48) as *mut u64, iosb);
+        write_unaligned((irp + 0x50) as *mut u64, event);
+        write_unaligned((irp + 0x70) as *mut u64, plan.user_buffer);
+        write_unaligned((irp + 0x98) as *mut u64, s_current_thread());
+        irp
     }
 }
 

@@ -233,6 +233,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("IoGetRelatedDeviceObject", Partial, "resolves the canonical live attachment-stack top and returns it only through an exact win32k video Device projection"),
     e("IoGetDeviceObjectPointer", Partial, "opens the dynamically published video route, access-checks it through Object Manager, and returns retained WDM File/Device projections"),
     e("IofCallDriver", TrapIfCalled, "device-stack I/O not reached on the win32k init path; traps if called"),
+    e("IoBuildDeviceIoControlRequest", Partial, "bounded METHOD_BUFFERED requests allocate a win32k-owned source IRP; dispatch and completion remain gated"),
     e("IoBuildSynchronousFsdRequest", TrapIfCalled, "device-stack I/O not reached on the win32k init path; traps if called"),
     // --- Se ---
     e("SeQueryAuthenticationIdToken", Partial, "subject-context/privilege checks routed to nt-security"),
