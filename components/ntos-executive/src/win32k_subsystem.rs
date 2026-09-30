@@ -11063,6 +11063,11 @@ unsafe fn record_process_client_peb(process_index: usize, client_peb: u64) {
 }
 
 unsafe fn initialize_eprocess_body(eprocess: u64, process_id: u64, client_peb: u64) {
+    // Published Ps bodies already carry their identity and PEB. Only win32k-owned compatibility
+    // bodies need this local layout; rewriting a canonical body would corrupt its owner state.
+    if crate::ps_object_backing::contains_address(eprocess) {
+        return;
+    }
     let q = eprocess + 0x900;
     let zstr = eprocess + 0xA00;
     let synthetic_peb = eprocess + 0x800;

@@ -1348,6 +1348,46 @@ unsafe fn select_win32k_client_window(client: Win32kClientContext) -> bool {
     }
 }
 
+unsafe fn grant_win32k_client_ps_bodies(client: Win32kClientContext) -> Result<(), u32> {
+    let Some(caller) = client.logical_caller else {
+        return if client.tid == 0 && client.tcb == 0 {
+            Ok(())
+        } else {
+            Err(nt_process::STATUS_INVALID_PARAMETER)
+        };
+    };
+    let catalog = (&*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS))
+        .identity()
+        .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+    let domain = crate::current_win32k_provider_domain()
+        .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+    let provider = crate::ps_object_provider::ProviderRoot::new(
+        catalog,
+        domain,
+        WIN32K_HOST_PML4.load(Ordering::Acquire),
+    )?;
+    crate::service_sec_image::with_provider_process_manager(|pm| {
+        let lifetime = caller.thread();
+        if pm.thread_lifetime(lifetime.thread_id()) != Some(lifetime)
+            || pm.process_kernel_object(lifetime.process_id()) != Some(client.eprocess)
+            || pm.thread_kernel_object(lifetime.thread_id()) != Some(client.ethread)
+        {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        use crate::ps_object_backing::PublishedBody;
+        for body in [PublishedBody::Process, PublishedBody::Thread] {
+            crate::ps_object_backing::grant_published_body(
+                pm,
+                lifetime,
+                body,
+                provider,
+                crate::ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+            )?;
+        }
+        Ok(())
+    })
+}
+
 fn win32k_dispatch_client_identity(
     dispatch_id: u64,
     client_pi: u32,
@@ -6682,6 +6722,9 @@ unsafe fn win32k_dispatch_wide_observed(
     }
     if attach_client && !select_win32k_client_window(client) {
         return (0xC000_0001u64, false);
+    }
+    if grant_win32k_client_ps_bodies(client).is_err() {
+        return (nt_process::STATUS_INVALID_PARAMETER as u64, false);
     }
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
     clear_published_win32k_context();
