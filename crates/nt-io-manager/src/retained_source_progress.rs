@@ -10,6 +10,7 @@ pub enum RetainedSourceProgress {
     AwaitingReply {
         acknowledged: bool,
     },
+    AwaitingOriginArmed,
     AwaitingCompletion {
         completion_ready: bool,
         cancellation_pending: bool,
@@ -29,7 +30,7 @@ pub enum RetainedSourceProgress {
 impl RetainedSourceProgress {
     pub const fn ready_for_nested_step(self) -> bool {
         match self {
-            Self::Indeterminate => false,
+            Self::Indeterminate | Self::AwaitingOriginArmed => false,
             Self::AwaitingDispatch { provider_ready } => provider_ready,
             Self::PublishReply | Self::Retirement => true,
             Self::AwaitingReply { acknowledged } => acknowledged,
@@ -82,6 +83,7 @@ mod tests {
         }
         .ready_for_nested_step());
         assert!(!Progress::Indeterminate.ready_for_nested_step());
+        assert!(!Progress::AwaitingOriginArmed.ready_for_nested_step());
     }
 
     #[test]

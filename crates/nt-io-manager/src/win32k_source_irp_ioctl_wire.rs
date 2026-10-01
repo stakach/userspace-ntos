@@ -15,7 +15,8 @@ pub const STATUS_PENDING: u32 = 0x103;
 const KIND: u32 = 1;
 const VERSION: u32 = 4;
 const TERMINAL_KIND: u32 = 4;
-const TERMINAL_VERSION: u32 = 1;
+// Low 16 bits are the version; high 16 bits are immutable delivery mode.
+const TERMINAL_VERSION: u32 = 2;
 const TOKEN_OFF: usize = 88;
 const INFORMATION_OFF: usize = 96;
 const STATUS_OFF: usize = 104;
@@ -62,6 +63,7 @@ pub struct SourceIrpIoctlRequest<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourceIoctlTerminalHandoff<'a> {
+    pub delivery: TerminalDelivery,
     pub nonce: u64,
     pub token: u64,
     pub source_irp_va: u64,
@@ -76,7 +78,7 @@ pub struct SourceIoctlTerminalHandoff<'a> {
     pub output: &'a [u8],
 }
 
-pub use crate::source_terminal::TerminalPublication;
+pub use crate::source_terminal::{TerminalDelivery, TerminalPublication};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourceIoctlTerminalAck<'a> {
@@ -449,7 +451,7 @@ pub fn encode_terminal_handoff(
     }
     packet.fill(0);
     put_u32(packet, 0, TERMINAL_KIND);
-    put_u32(packet, 4, TERMINAL_VERSION);
+    put_u32(packet, 4, TERMINAL_VERSION | ((handoff.delivery as u32) << 16));
     put_u64(packet, 8, handoff.nonce);
     put_u64(packet, 16, handoff.token);
     put_u64(packet, 24, handoff.source_irp_va);
@@ -470,7 +472,7 @@ fn terminal_header(packet: &[u8]) -> Result<SourceIoctlTerminalHandoff<'_>, Wire
     if packet.len() < TERMINAL_HEADER_BYTES
         || (u64_at(packet, 96) != 0 && !matches!(u32_at(packet, 88), 3 | 4))
         || u32_at(packet, 0) != TERMINAL_KIND
-        || u32_at(packet, 4) != TERMINAL_VERSION
+        || (u32_at(packet, 4) & 0xffff) != TERMINAL_VERSION
         || u32_at(packet, 76) as usize != packet.len() - TERMINAL_HEADER_BYTES
         || packet[104..TERMINAL_HEADER_BYTES]
             .iter()
@@ -479,6 +481,7 @@ fn terminal_header(packet: &[u8]) -> Result<SourceIoctlTerminalHandoff<'_>, Wire
         return Err(WireError::Malformed);
     }
     let handoff = SourceIoctlTerminalHandoff {
+        delivery: TerminalDelivery::decode(u32_at(packet, 4) >> 16).ok_or(WireError::Malformed)?,
         nonce: u64_at(packet, 8),
         token: u64_at(packet, 16),
         source_irp_va: u64_at(packet, 24),
@@ -595,6 +598,7 @@ mod tests {
     #[test]
     fn prepare_commit_and_stopped_discard_do_not_skip_or_replay_phases() {
         let handoff = SourceIoctlTerminalHandoff {
+            delivery: TerminalDelivery::Inline,
             nonce: 1,
             token: 2,
             source_irp_va: 3,
@@ -829,6 +833,7 @@ mod tests {
             request.code = ioctl::ctl_code(0x22, 0x801, method, ioctl::FILE_ANY_ACCESS);
             let output = [1u8, 2];
             let handoff = SourceIoctlTerminalHandoff {
+            delivery: TerminalDelivery::Inline,
                 nonce: request.nonce,
                 token: 10,
                 source_irp_va: request.source_irp_va,

@@ -9,7 +9,8 @@ pub const STATUS_PENDING: u32 = 0x103;
 const KIND: u32 = 2;
 const VERSION: u32 = 2;
 const TERMINAL_KIND: u32 = 3;
-const TERMINAL_VERSION: u32 = 1;
+// Low 16 bits are the version; high 16 bits are immutable delivery mode.
+const TERMINAL_VERSION: u32 = 2;
 const TOKEN_OFF: usize = 80;
 const STATUS_OFF: usize = 88;
 const INFORMATION_OFF: usize = 96;
@@ -51,6 +52,7 @@ pub enum SourcePnpResponse {
 /// retained allocation leases and physical destination identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourcePnpTerminalHandoff {
+    pub delivery: TerminalDelivery,
     pub nonce: u64,
     pub token: u64,
     pub source_irp_va: u64,
@@ -65,7 +67,7 @@ pub struct SourcePnpTerminalHandoff {
     pub pdo_va: u64,
 }
 
-pub use crate::source_terminal::TerminalPublication;
+pub use crate::source_terminal::{TerminalDelivery, TerminalPublication};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourcePnpTerminalAck {
@@ -277,7 +279,7 @@ pub fn encode_terminal_handoff(
     }
     packet.fill(0);
     put_u32(packet, 0, TERMINAL_KIND);
-    put_u32(packet, 4, TERMINAL_VERSION);
+    put_u32(packet, 4, TERMINAL_VERSION | ((handoff.delivery as u32) << 16));
     put_u64(packet, 8, handoff.nonce);
     put_u64(packet, 16, handoff.token);
     put_u64(packet, 24, handoff.source_irp_va);
@@ -298,13 +300,14 @@ fn terminal_header(packet: &[u8]) -> Result<SourcePnpTerminalHandoff, WireError>
     }
     if (u64_at(packet, 104) != 0 && !matches!(u32_at(packet, 96), 3 | 4))
         || u32_at(packet, 0) != TERMINAL_KIND
-        || u32_at(packet, 4) != TERMINAL_VERSION
+        || (u32_at(packet, 4) & 0xffff) != TERMINAL_VERSION
         || u32_at(packet, 76) != 0
         || packet[112..].iter().any(|byte| *byte != 0)
     {
         return Err(WireError::Malformed);
     }
     let handoff = SourcePnpTerminalHandoff {
+        delivery: TerminalDelivery::decode(u32_at(packet, 4) >> 16).ok_or(WireError::Malformed)?,
         nonce: u64_at(packet, 8),
         token: u64_at(packet, 16),
         source_irp_va: u64_at(packet, 24),
@@ -415,6 +418,7 @@ mod tests {
 
     fn terminal() -> SourcePnpTerminalHandoff {
         SourcePnpTerminalHandoff {
+            delivery: TerminalDelivery::Inline,
             nonce: 1,
             token: 8,
             source_irp_va: 0x1000,

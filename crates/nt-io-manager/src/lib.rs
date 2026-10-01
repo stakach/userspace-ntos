@@ -92,6 +92,7 @@ pub mod win32k_source_irp_ioctl_wire;
 pub mod win32k_source_pnp_wire;
 pub mod win32k_source_fsd_wire;
 pub mod source_terminal;
+pub mod source_pending_armed;
 pub mod file_directory_query_wire;
 mod lock_control;
 mod set_information_completion;

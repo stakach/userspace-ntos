@@ -1,5 +1,33 @@
 //! Two-phase source completion. Publication is not permission to release pins.
 
+/// Private terminal IPC result: no origin resources were extracted and no payload was written.
+pub const TERMINAL_NOT_READY: i32 = 0xc0e9_0001u32 as i32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalDelivery { Inline = 1, Pending = 2 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OriginCallPhase { Calling, Armed(u64), Indeterminate }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalAdmission { Ready, NotReady, Rejected }
+
+impl TerminalDelivery {
+    pub fn decode(raw: u32) -> Option<Self> {
+        match raw { 1 => Some(Self::Inline), 2 => Some(Self::Pending), _ => None }
+    }
+
+    pub fn admit(self, phase: OriginCallPhase, token: u64) -> TerminalAdmission {
+        if token == 0 { return TerminalAdmission::Rejected; }
+        match (self, phase) {
+            (Self::Inline, OriginCallPhase::Calling) => TerminalAdmission::Ready,
+            (Self::Pending, OriginCallPhase::Calling) => TerminalAdmission::NotReady,
+            (Self::Pending, OriginCallPhase::Armed(found)) if found == token => TerminalAdmission::Ready,
+            _ => TerminalAdmission::Rejected,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalPublication {
     Published,
@@ -93,6 +121,28 @@ pub fn same_terminal_packet(prepared: &[u8], current: &[u8], phase_offset: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_reply_acknowledgement_is_not_origin_acceptance() {
+        assert_eq!(TerminalDelivery::Pending.admit(OriginCallPhase::Calling, 41), TerminalAdmission::NotReady);
+        assert_eq!(TerminalDelivery::Inline.admit(OriginCallPhase::Calling, 41), TerminalAdmission::Ready);
+        assert_eq!(TerminalDelivery::Pending.admit(OriginCallPhase::Armed(41), 41), TerminalAdmission::Ready);
+        assert_eq!(TerminalDelivery::Pending.admit(OriginCallPhase::Armed(42), 41), TerminalAdmission::Rejected);
+        assert_eq!(TerminalDelivery::Inline.admit(OriginCallPhase::Armed(41), 41), TerminalAdmission::Rejected);
+        assert_eq!(TerminalDelivery::Pending.admit(OriginCallPhase::Indeterminate, 41), TerminalAdmission::Rejected);
+        assert_eq!(TerminalDelivery::Pending.admit(OriginCallPhase::Calling, 0), TerminalAdmission::Rejected);
+    }
+
+    #[test]
+    fn terminal_delivery_is_part_of_immutable_packet_identity() {
+        let before = [0u8; 40];
+        let mut changed = before;
+        changed[4] = 1;
+        assert!(!same_terminal_packet(&before, &changed, 16));
+        assert_eq!(TerminalDelivery::decode(0), None);
+        assert_eq!(TerminalDelivery::decode(1), Some(TerminalDelivery::Inline));
+        assert_eq!(TerminalDelivery::decode(2), Some(TerminalDelivery::Pending));
+    }
 
     #[test]
     fn publication_requires_a_second_authenticated_commit() {

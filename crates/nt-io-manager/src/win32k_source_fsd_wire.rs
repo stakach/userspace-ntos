@@ -19,7 +19,8 @@ const STATUS_OFF: usize = 112;
 const COMPLETED_OFF: usize = 116;
 const OUTPUT_LENGTH_OFF: usize = 120;
 const TERMINAL_KIND: u32 = 4;
-const TERMINAL_VERSION: u32 = 1;
+// Low 16 bits are the version; high 16 bits are immutable delivery mode.
+const TERMINAL_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceFsdRequest<'a> {
@@ -53,6 +54,7 @@ pub enum SourceFsdResponse<'a> {
 /// Root's canonical completion projected back to the retained win32k origin.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceFsdTerminalHandoff<'a> {
+    pub delivery: TerminalDelivery,
     pub nonce: u64,
     pub token: u64,
     pub source_irp_va: u64,
@@ -63,7 +65,7 @@ pub struct SourceFsdTerminalHandoff<'a> {
     pub output: &'a [u8],
 }
 
-pub use crate::source_terminal::TerminalPublication;
+pub use crate::source_terminal::{TerminalDelivery, TerminalPublication};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceFsdTerminalAck<'a> {
@@ -133,7 +135,7 @@ pub fn encode_terminal_handoff(
     }
     packet.fill(0);
     put_u32(packet, 0, TERMINAL_KIND);
-    put_u32(packet, 4, TERMINAL_VERSION);
+    put_u32(packet, 4, TERMINAL_VERSION | ((handoff.delivery as u32) << 16));
     put_u64(packet, 8, handoff.nonce);
     put_u64(packet, 16, handoff.token);
     put_u64(packet, 24, handoff.source_irp_va);
@@ -149,13 +151,14 @@ pub fn encode_terminal_handoff(
 fn terminal_header(packet: &[u8]) -> Result<SourceFsdTerminalHandoff<'_>, WireError> {
     if packet.len() < TERMINAL_HEADER_BYTES
         || u32_at(packet, 0) != TERMINAL_KIND
-        || u32_at(packet, 4) != TERMINAL_VERSION
+        || (u32_at(packet, 4) & 0xffff) != TERMINAL_VERSION
         || packet.len() != terminal_packet_len(u32_at(packet, 52) as usize)?
         || (u64_at(packet, 72) != 0 && !matches!(u32_at(packet, 64), 3 | 4))
     {
         return Err(WireError::Malformed);
     }
     let handoff = SourceFsdTerminalHandoff {
+        delivery: TerminalDelivery::decode(u32_at(packet, 4) >> 16).ok_or(WireError::Malformed)?,
         nonce: u64_at(packet, 8),
         token: u64_at(packet, 16),
         source_irp_va: u64_at(packet, 24),
@@ -477,6 +480,7 @@ mod tests {
     #[test]
     fn prepare_commit_and_stopped_discard_do_not_skip_or_replay_phases() {
         let handoff = SourceFsdTerminalHandoff {
+            delivery: TerminalDelivery::Inline,
             nonce: 1,
             token: 2,
             source_irp_va: 3,
@@ -567,6 +571,7 @@ mod tests {
     fn terminal_handoff_requires_exact_origin_and_ack() {
         let request = request(major::IRP_MJ_READ, DIRECT, &[], &[9, 8, 7, 6], 4);
         let handoff = SourceFsdTerminalHandoff {
+            delivery: TerminalDelivery::Inline,
             nonce: request.nonce,
             token: 7,
             source_irp_va: request.source_irp_va,
@@ -598,6 +603,7 @@ mod tests {
     #[test]
     fn terminal_rejects_pending_and_oversized_output() {
         let handoff = SourceFsdTerminalHandoff {
+            delivery: TerminalDelivery::Inline,
             nonce: 1,
             token: 2,
             source_irp_va: 3,
