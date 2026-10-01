@@ -57097,8 +57097,9 @@ pub(crate) unsafe fn service_win32k_file_ioctl_release(
     hosted_kernel_win32k_buffered_ioctl::release_token(ch, token, handle)
 }
 
-pub(crate) unsafe fn service_win32k_gdi_image_request(packet: u64, length: u64) -> (i32, u64) {
-    crate::win32k_glue::service_gdi_image_request(packet, length)
+pub(crate) unsafe fn service_win32k_gdi_image_request(packet: u64, length: u64,
+    source: crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalSource) -> (i32, u64) {
+    crate::win32k_glue::service_gdi_image_request(packet, length, source)
 }
 
 pub(crate) unsafe fn service_win32k_source_ioctl(

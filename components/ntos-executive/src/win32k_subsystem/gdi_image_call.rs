@@ -21,6 +21,20 @@ unsafe fn fatal(address: u64, reason: u64) -> ! {
 }
 
 pub(super) unsafe fn set_information(class: u64, buffer: u64, length: u64) -> i32 {
+    let mut stage: &'static [u8] = b"header";
+    let status = set_information_inner(class, buffer, length, &mut stage);
+    if status < 0 {
+        print_str(b"[gdi-image-origin] rejected stage="); print_str(stage);
+        print_str(b" status=0x"); print_hex(status as u32);
+        print_str(b" class="); print_u64(class);
+        print_str(b" buffer=0x"); print_hex_u64(buffer);
+        print_str(b" length="); print_u64(length); print_str(b"\n");
+    }
+    status
+}
+
+unsafe fn set_information_inner(class: u64, buffer: u64, length: u64,
+    stage: &mut &'static [u8]) -> i32 {
     let expected = match class {
         26 => 0x38,
         27 => 8,
@@ -32,9 +46,11 @@ pub(super) unsafe fn set_information(class: u64, buffer: u64, length: u64) -> i3
     if buffer == 0 || buffer.checked_add(length).is_none() {
         return STATUS_ACCESS_VIOLATION_I32;
     }
+    *stage = b"activation";
     let Some(activation) = active_provider_stack_event_activation() else {
         return STATUS_ACCESS_VIOLATION_I32;
     };
+    *stage = b"output-pin";
     let output = match file_ioctl_target::pin_output(activation, buffer, length) {
         Ok(pin) => pin,
         Err(status) => return status,
@@ -42,6 +58,7 @@ pub(super) unsafe fn set_information(class: u64, buffer: u64, length: u64) -> i3
     let request = if class == 27 {
         Request::Unload(read_unaligned(buffer as *const u64))
     } else {
+        *stage = b"name-header";
         let name_len = read_unaligned(buffer as *const u16) as u64;
         let maximum = read_unaligned((buffer + 2) as *const u16) as u64;
         let address = read_unaligned((buffer + 8) as *const u64);
@@ -49,6 +66,7 @@ pub(super) unsafe fn set_information(class: u64, buffer: u64, length: u64) -> i3
             file_ioctl_target::release_output(output);
             return STATUS_INVALID_PARAMETER_I32;
         }
+        *stage = b"name-pin";
         let input = match provider_input::pin_input(activation, address, name_len) {
             Ok(pin) => pin,
             Err(status) => {
@@ -56,6 +74,7 @@ pub(super) unsafe fn set_information(class: u64, buffer: u64, length: u64) -> i3
                 return status;
             }
         };
+        *stage = b"name-capture";
         let mut leaf = [0u8; GDI_DRIVER_LEAF_CAP];
         let count = gdi_driver_leaf_from_wname(address, name_len as usize, &mut leaf);
         provider_input::release_input(input, W32_GDI_LOAD_LABEL);
@@ -65,17 +84,20 @@ pub(super) unsafe fn set_information(class: u64, buffer: u64, length: u64) -> i3
         };
         Request::Load(alloc::string::String::from_utf8_lossy(&leaf[..count]).into_owned())
     };
+    *stage = b"encode";
     let Some(bytes) = system_image_request::encode(&request) else {
         file_ioctl_target::release_output(output);
         return STATUS_INVALID_PARAMETER_I32;
     };
     let _durable = crate::allocator::enter_durable();
+    *stage = b"packet-allocation";
     let Some((packet, mut storage)) =
         allocate_root_provider_pool_packet(bytes.len() + core::mem::size_of::<Outstanding>())
     else {
         file_ioctl_target::release_output(output);
         return STATUS_INSUFFICIENT_RESOURCES_I32;
     };
+    *stage = b"packet-pin";
     let Some(packet_pin) = pin_root_provider_pool_packet(packet) else {
         if !retire_root_provider_pool_packet(packet) {
             fatal(buffer, 2);
@@ -84,6 +106,7 @@ pub(super) unsafe fn set_information(class: u64, buffer: u64, length: u64) -> i3
         return STATUS_INSUFFICIENT_RESOURCES_I32;
     };
     storage[..bytes.len()].copy_from_slice(&bytes);
+    *stage = b"packet-publish";
     if !publish_provider_pool_packet(packet, &storage) {
         if !retire_pinned_root_provider_pool_packet(packet, packet_pin) {
             fatal(buffer, 1);
@@ -106,6 +129,11 @@ pub(super) unsafe fn set_information(class: u64, buffer: u64, length: u64) -> i3
         });
         REQUESTS.store(row_address, Ordering::Release);
     }
+    print_str(b"[gdi-image-origin] broker-request class="); print_u64(class);
+    print_str(b" buffer=0x"); print_hex_u64(buffer);
+    print_str(b" length="); print_u64(length);
+    print_str(b" packet=0x"); print_hex_u64(packet.address()); print_str(b"\n");
+    *stage = b"broker-result";
     let (words, raw, handle, spare, reserved) = crate::driver_launch::call_on4_raw(
         (W32_GDI_LOAD_LABEL << 12) | 4,
         packet.address(),

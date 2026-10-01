@@ -848,7 +848,6 @@ static mut USER_CALLBACK_SAS_SEQUENCE: nt_user_callback::SasWmCreateNestedSequen
     nt_user_callback::SasWmCreateNestedSequence::new();
 static USER_CALLBACK_SAS_SEQUENCE_ACTIVE: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_SAS_SEQUENCE_CALLBACK_ID: AtomicU64 = AtomicU64::new(0);
-static WIN32K_GDI_LOADER_PML4: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STATIC_IMPORT_DEPENDENCIES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STATIC_IMPORTS_LOADED: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STATIC_IMPORT_IAT_PATCHES: AtomicU64 = AtomicU64::new(0);
@@ -5716,8 +5715,9 @@ pub(crate) use process_attach_root::retire_kernel_attach;
 /// Checked system-image loading owns its mappings and opaque module allocation independently.
 #[path = "win32k_image_loader.rs"]
 mod image_loader;
-pub(crate) unsafe fn service_gdi_image_request(pointer: u64, length: u64) -> (i32, u64) {
-    image_loader::service_request(pointer, length)
+pub(crate) unsafe fn service_gdi_image_request(pointer: u64, length: u64,
+    source: crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalSource) -> (i32, u64) {
+    image_loader::service_request(pointer, length, source)
 }
 unsafe fn driver_image_frame_count(src_va: u64) -> Option<u64> {
     let e = core::ptr::read_unaligned((src_va + 0x3c) as *const u32) as u64;
@@ -5749,10 +5749,6 @@ fn reserve_win32k_static_import_va(next_va: &mut u64, frames: u64) -> Option<u64
     }
     *next_va = end;
     Some(aligned)
-}
-
-pub(crate) fn register_win32k_gdi_loader(host_pml4: u64) {
-    WIN32K_GDI_LOADER_PML4.store(host_pml4, Ordering::Relaxed);
 }
 
 

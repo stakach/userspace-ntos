@@ -4485,24 +4485,51 @@ pub(crate) unsafe fn service_win32k_gdi_image_request(
     length: u64,
     spare: [u64; 2],
 ) -> (i32, u64) {
+    let rejected = |stage: &[u8], status: u32| {
+        print_str(b"[gdi-image-ingress] rejected stage="); print_str(stage);
+        print_str(b" status=0x"); print_hex(status);
+        print_str(b" tcb=0x"); print_hex_u64(channel.tcb);
+        print_str(b" packet=0x"); print_hex_u64(packet);
+        print_str(b" length="); print_u64(length); print_str(b"\n");
+        (status as i32, 0)
+    };
     if spare != [0; 2] {
-        return (nt_process::STATUS_INVALID_PARAMETER as i32, 0);
+        return rejected(b"spare", nt_process::STATUS_INVALID_PARAMETER);
     }
     let (route, dispatch, _) = match authenticate_win32k_service_request(
         channel, reply_cap, badge, mi,
         (crate::win32k_subsystem::W32_GDI_LOAD_LABEL << 12) | 4,
     ) {
         Ok(owner) => owner,
-        Err(status) => return (status as i32, 0),
+        Err(status) => return rejected(b"authentication", status),
     };
     if !matches!(crate::win32k_glue::win32k_physical_stack_route_for_channel(
         channel.tcb, channel.fault_ep, reply_cap,
     ), Some((physical_route, physical_dispatch, _, _))
         if physical_route == route && physical_dispatch == dispatch)
     {
-        return (nt_process::STATUS_INVALID_PARAMETER as i32, 0);
+        return rejected(b"physical-stack-route", nt_process::STATUS_INVALID_PARAMETER);
     }
-    crate::driver_launch::service_win32k_gdi_image_request(packet, length)
+    use spawn_hosts::shared_ingress::owner::runtime;
+    let source = match runtime::physical_source(route) {
+        Ok(source) => source,
+        Err(_) => return rejected(b"physical-source", nt_process::STATUS_INVALID_PARAMETER),
+    };
+    if source.tcb != channel.tcb || source.pml4 != channel.pml4 {
+        return rejected(b"physical-vspace", nt_process::STATUS_INVALID_PARAMETER);
+    }
+    let runtime::PhysicalDomain::Provider { catalog, domain } = source.domain else {
+        return rejected(b"provider-kind", nt_process::STATUS_INVALID_PARAMETER);
+    };
+    if (&*core::ptr::addr_of!(crate::PROVIDER_WAIT_DOMAINS)).identity() != Some(catalog)
+        || !crate::win32k_provider_domain_is_current(domain)
+    {
+        return rejected(b"provider-generation", nt_process::STATUS_INVALID_PARAMETER);
+    }
+    print_str(b"[gdi-image-ingress] admitted tcb=0x"); print_hex_u64(channel.tcb);
+    print_str(b" packet=0x"); print_hex_u64(packet);
+    print_str(b" length="); print_u64(length); print_str(b"\n");
+    crate::driver_launch::service_win32k_gdi_image_request(packet, length, source)
 }
 
 /// Directory-object requests carry only inline IPC words; all authority is reconstructed here.

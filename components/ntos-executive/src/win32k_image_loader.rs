@@ -436,42 +436,50 @@ pub(crate) unsafe fn unload(handle: u64) -> i32 {
     }
 }
 
-pub(crate) unsafe fn service_request(pointer: u64, length: u64) -> (i32, u64) {
+pub(crate) unsafe fn service_request(pointer: u64, length: u64,
+    source: crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalSource) -> (i32, u64) {
     use nt_pe_loader::system_image_request::{self, Request};
+    let rejected = |stage: &[u8], status: i32| {
+        print_str(b"[gdi-image-root] rejected stage="); print_str(stage);
+        print_str(b" status=0x"); print_hex(status as u32);
+        print_str(b" packet=0x"); print_hex_u64(pointer);
+        print_str(b" length="); print_u64(length); print_str(b"\n");
+        (status, 0)
+    };
     if length != system_image_request::PACKET_BYTES as u64 {
-        return (0xc000_000du32 as i32, 0);
+        return rejected(b"packet-length", 0xc000_000du32 as i32);
     }
     let _durable = crate::allocator::enter_durable();
     let Ok((lease, bytes)) =
         win32k_subsystem::capture_provider_pool_packet(pointer, length as usize)
     else {
-        return (0xc000_000du32 as i32, 0);
+        return rejected(b"packet-capture", 0xc000_000du32 as i32);
     };
     let Some(request) = system_image_request::decode(&bytes) else {
-        return (0xc000_000du32 as i32, 0);
+        return rejected(b"packet-decode", 0xc000_000du32 as i32);
     };
     if !win32k_subsystem::provider_pool_packet_lease_live(lease) {
-        return (0xc000_000du32 as i32, 0);
+        return rejected(b"packet-live", 0xc000_000du32 as i32);
     }
     match request {
         Request::Unload(handle) => (unload(handle), 0),
         Request::Load(name) => {
-            let pml4 = WIN32K_GDI_LOADER_PML4.load(Ordering::Acquire);
+            let pml4 = source.pml4;
             if pml4 == 0 {
-                return (0xc000_00a3u32 as i32, 0);
+                return rejected(b"caller-vspace", 0xc000_00a3u32 as i32);
             }
             let (base, size) = match load_installed(&name, pml4) {
                 Ok(image) => image,
-                Err(error) => return (error.ntstatus(), 0),
+                Err(error) => return rejected(b"load-installed", error.ntstatus()),
             };
             let Some(handle) = module_handle(base, size) else {
-                return (0xc000_0008u32 as i32, 0);
+                return rejected(b"module-handle", 0xc000_0008u32 as i32);
             };
             let Some(module) = (&*core::ptr::addr_of!(LOADED))
                 .iter()
                 .find(|record| record.handle().address == handle)
             else {
-                return (0xc000_0008u32 as i32, 0);
+                return rejected(b"module-record", 0xc000_0008u32 as i32);
             };
             let image = module.image();
             if !win32k_subsystem::register_gdi_driver_image(
@@ -485,11 +493,11 @@ pub(crate) unsafe fn service_request(pointer: u64, length: u64) -> (i32, u64) {
                 },
                 size,
             ) {
-                return (0xc000_009au32 as i32, 0);
+                return rejected(b"image-publication", 0xc000_009au32 as i32);
             }
             match acquire_load(handle) {
                 Ok(()) => (0, handle),
-                Err(status) => (status, 0),
+                Err(status) => rejected(b"load-reference", status),
             }
         }
     }

@@ -209,7 +209,6 @@ impl DriverEntryCompletion {
         if !win32k_glue::initialize_win32k_physical_lane(channel.pml4) {
             panic!("win32k secondary execution lane failed its ready handshake");
         }
-        register_win32k_gdi_loader(channel.pml4);
         // HARDWARE\\DEVICEMAP\\VIDEO is still published by the real started videoprt miniport.
         if let Some(display_spec) = system_hive_display_driver_spec() {
             let view = display_spec.win32k_spec();
