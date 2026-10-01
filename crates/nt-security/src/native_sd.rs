@@ -23,7 +23,9 @@ pub use device_parameters_security::prepare_device_parameters_security;
 
 #[path = "registry_root_security.rs"]
 mod registry_root_security;
-pub use registry_root_security::{assign_registry_root_security, KEY_GENERIC_MAPPING};
+pub use registry_root_security::{
+    assign_registry_root_security, mounted_hive_root_security, KEY_GENERIC_MAPPING,
+};
 
 #[cfg(test)]
 #[path = "security_access_bytes_tests.rs"]

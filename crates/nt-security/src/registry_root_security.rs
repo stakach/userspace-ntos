@@ -78,6 +78,15 @@ pub fn assign_registry_root_security(
     )
 }
 
+/// A hive link gives the mounted root its effective security when the imported root has no
+/// descriptor. Keep the imported bytes intact; child keys are never covered by this policy.
+pub fn mounted_hive_root_security<'a>(
+    imported: Option<&'a [u8]>,
+    mount_root: &'a [u8],
+) -> &'a [u8] {
+    imported.filter(|descriptor| !descriptor.is_empty()).unwrap_or(mount_root)
+}
+
 #[cfg(test)]
 #[path = "registry_root_security_tests.rs"]
 mod tests;

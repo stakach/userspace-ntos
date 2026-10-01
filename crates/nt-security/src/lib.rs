@@ -63,7 +63,7 @@ pub use key_open::{authorize_key_open, authorize_key_backup_restore, prepare_key
 pub use key_creation::{prepare_key_creation_security, KeyCreationAudit, KeyHandleSecurityAudit, PreparedKeyCreationSecurity};
 pub use native_acl_inheritance::{inherit_native_acl, NativeAclInheritance};
 pub use native_sd::{
-    assign_registry_root_security, KEY_GENERIC_MAPPING,
+    assign_registry_root_security, mounted_hive_root_security, KEY_GENERIC_MAPPING,
     assign_object_security, assign_object_security_with_audit, capture_object_type_list,
     capture_security_descriptor_bytes, capture_security_descriptor_for_access,
     security_descriptor_bytes_for_access,
@@ -94,9 +94,9 @@ pub use hosted_token_projection::{
 pub use token::{
     plan_client_impersonation, token_can_impersonate, AccessToken, AnonymousLogonTokenIds,
     ClientImpersonationPlan, GroupAdjustment, GroupAdjustmentPlan, GroupAdjustmentSummary,
-    PrivilegeAdjustment, PrivilegeAdjustmentSummary, SecurityContextTrackingMode,
+    InvalidSidMetadata, PrivilegeAdjustment, PrivilegeAdjustmentSummary, SecurityContextTrackingMode,
     SecurityImpersonationLevel, SecurityQualityOfService, TokenAuditPolicy, TokenGroup, TokenId,
-    TokenPrivilege, TokenSource, TokenStatistics, TokenStore, TokenType, SE_ASSIGN_PRIMARY_TOKEN,
+    TokenPrivilege, TokenSidField, TokenSource, TokenStatistics, TokenStore, TokenType, SE_ASSIGN_PRIMARY_TOKEN,
     SE_AUDIT, SE_BACKUP, SE_CHANGE_NOTIFY, SE_CREATE_GLOBAL, SE_CREATE_PAGEFILE,
     SE_CREATE_PERMANENT, SE_CREATE_TOKEN, SE_DEBUG, SE_IMPERSONATE, SE_INCREASE_BASE_PRIORITY,
     SE_INCREASE_QUOTA, SE_LOAD_DRIVER, SE_LOCK_MEMORY, SE_MANAGE_VOLUME, SE_PRIVILEGE_ENABLED,
