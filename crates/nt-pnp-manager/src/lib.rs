@@ -10,16 +10,20 @@
 
 extern crate alloc;
 
+mod accepted_pdo_provider;
 mod bus_properties;
 mod bus_relations;
 mod critical_child_start;
 mod relation_owners;
+mod retained_lower_pnp_forward;
 mod target_device_relation;
 
+pub use accepted_pdo_provider::*;
 pub use bus_properties::*;
 pub use bus_relations::*;
 pub use critical_child_start::*;
 pub use relation_owners::*;
+pub use retained_lower_pnp_forward::*;
 pub use target_device_relation::*;
 
 use alloc::string::{String, ToString};

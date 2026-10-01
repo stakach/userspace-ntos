@@ -58,6 +58,7 @@ mod hosted_file_lifetime_tests;
 mod hosted_device_pointer;
 mod hosted_attached_device_reference;
 mod hosted_safe_attach;
+mod hosted_file_system_registry;
 pub mod hosted_pool_range;
 pub mod hosted_kernel_read_delivery;
 pub mod inline_file_retirement;
@@ -301,6 +302,7 @@ pub struct IoManager<P> {
     device_references: device_reference::DeviceReferenceStore,
     file_references: file_reference::FileReferenceStore,
     hosted_device_pointers: hosted_device_pointer::HostedDevicePointerStore,
+    hosted_file_systems: hosted_file_system_registry::HostedFileSystemRegistry,
     files: GenStore<FileId, FileRecord>,
     irps: GenStore<IrpId, IrpRecord>,
     hosted_domains: GenStore<HostedDomainId, HostedDomainRecord>,
@@ -325,6 +327,7 @@ impl<P> IoManager<P> {
             device_references: device_reference::DeviceReferenceStore::default(),
             file_references: file_reference::FileReferenceStore::default(),
             hosted_device_pointers: hosted_device_pointer::HostedDevicePointerStore::default(),
+            hosted_file_systems: hosted_file_system_registry::HostedFileSystemRegistry::default(),
             files: GenStore::new(),
             irps: GenStore::new(),
             hosted_domains: GenStore::new(),

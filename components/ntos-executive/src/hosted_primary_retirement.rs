@@ -7,6 +7,7 @@ enum Effect {
     ClearHeader(u64),
     MapBank(crate::spawn_hosts::ComponentMapCapBank),
     Unmap(u64),
+    TableUnmap(u64),
     Delete(u64),
     Recycle(u64),
     Child { cnode: u64, slot: u64 },
@@ -64,10 +65,6 @@ unsafe fn prepare(
     let runs = [
         (inst.stack_frame_base, inst.stack_frame_count),
         (inst.image_frame_base, inst.image_frames),
-        (
-            inst.exception_snapshot_frame_base,
-            inst.exception_snapshot_frames,
-        ),
         (inst.pool_frame_base, FSD_POOL_FRAMES),
         (inst.data_frame_base, FSD_DATA_FRAMES),
         (inst.shared_frame_base, FSD_SHARED_FRAMES),
@@ -81,7 +78,9 @@ unsafe fn prepare(
         })?;
     let capacity = frame_count
         .checked_mul(2)?
+        .checked_add(hosted_pretransport_retirement::enrolled_frame_count(instance_index).checked_mul(2)?)?
         .checked_add(exec.map_or(0, Vec::len).checked_mul(3)?)?
+        .checked_add(hosted_pretransport_retirement::table_count(instance_index).checked_mul(3)?)?
         .checked_add(paging_count.checked_mul(2)?)?
         .checked_add(CT_IO_PORT_CAPACITY as usize + 32)?;
     let _durable = crate::allocator::enter_durable();
@@ -148,6 +147,18 @@ unsafe fn prepare(
     // inst.fault_ep is the global shared endpoint, never a per-driver deletion obligation.
     let releases = &mut *core::ptr::addr_of_mut!(RELEASES);
     releases.try_reserve(1).ok()?;
+    let tables = hosted_pretransport_retirement::take_transport_tables(instance_index)?;
+    let enrolled_frames = hosted_pretransport_retirement::take_enrolled_frames(instance_index)
+        .expect("enrolled frame receipt follows enrolled table receipt");
+    for (cap, mapped) in tables.into_iter().rev() {
+        if mapped {
+            effects.push(Effect::TableUnmap(cap));
+        }
+        delete(&mut effects, cap);
+    }
+    for cap in enrolled_frames.into_iter().rev() {
+        delete(&mut effects, cap);
+    }
     let index = releases.len();
     releases.push(Release {
         instance: instance_index,
@@ -171,6 +182,160 @@ unsafe fn prepare(
         mappings.retain(|row| row.domain != domain || row.pml4 != inst.pml4);
     }
     Some(index)
+}
+
+unsafe fn prepare_unenrolled(
+    instance_index: usize,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+) -> Option<usize> {
+    if let Some(index) = (&*core::ptr::addr_of!(RELEASES)).iter().position(|row| {
+        row.instance == instance_index
+            && row.domain == domain
+            && row.tcb == inst.tcb
+            && row.pml4 == inst.pml4
+    }) {
+        return Some(index);
+    }
+    let capacity = usize::try_from(inst.stack_frame_count)
+        .ok()?
+        .checked_mul(2)?
+        .checked_add(CT_IO_PORT_CAPACITY as usize + 24)?;
+    let _durable = crate::allocator::enter_durable();
+    let mut effects = Vec::new();
+    effects.try_reserve_exact(capacity).ok()?;
+    effects.push(Effect::MapBank(inst.map_cap_bank));
+    for offset in (0..inst.stack_frame_count).rev() {
+        delete(&mut effects, inst.stack_frame_base.checked_add(offset)?);
+    }
+    if inst.cnode != 0 {
+        effects.push(Effect::Child {
+            cnode: inst.cnode,
+            slot: CT_RESULT_NTFN,
+        });
+        for slot in 0..CT_IO_PORT_CAPACITY {
+            effects.push(Effect::Child {
+                cnode: inst.cnode,
+                slot: CT_IO_PORT_BASE + slot,
+            });
+        }
+        effects.push(Effect::Child {
+            cnode: inst.cnode,
+            slot: CT_PML4,
+        });
+    }
+    for cap in [
+        inst.sched_context,
+        inst.tcb,
+        inst.cnode,
+        inst.raw_cnode,
+        inst.pml4,
+    ] {
+        delete(&mut effects, cap);
+    }
+    let releases = &mut *core::ptr::addr_of_mut!(RELEASES);
+    releases.try_reserve(1).ok()?;
+    let index = releases.len();
+    releases.push(Release {
+        instance: instance_index,
+        domain,
+        tcb: inst.tcb,
+        pml4: inst.pml4,
+        effects,
+        next: 0,
+        entered: false,
+        shared_retired: false,
+        finished: false,
+    });
+    Some(index)
+}
+
+unsafe fn execute_effects(index: usize) -> bool {
+    while row(index).next < row(index).effects.len() {
+        let effect = row(index).effects[row(index).next];
+        row(index).entered = true;
+        let status = match effect {
+            Effect::ClearHeader(shared) => {
+                clear_shared_registry_identity_at(shared);
+                0
+            }
+            Effect::MapBank(bank) => {
+                if crate::spawn_hosts::release_component_map_cap_bank(bank).failures == 0 {
+                    0
+                } else {
+                    u64::MAX
+                }
+            }
+            Effect::Unmap(cap) => page_unmap_r(cap),
+            Effect::TableUnmap(cap) => {
+                paging_struct_map_r(cap, sel4_rt::LBL_X86_PAGE_TABLE_UNMAP, 0, 0)
+            }
+            Effect::Delete(cap) => cnode_delete_r(cap),
+            Effect::Recycle(cap) => {
+                if crate::root_slot_recycle::publish_empty(cap).is_ok() {
+                    0
+                } else {
+                    u64::MAX
+                }
+            }
+            Effect::Child { cnode, slot } => cnode_delete_in_cnode_r(cnode, slot),
+        };
+        if status != 0 {
+            return false;
+        }
+        row(index).next += 1;
+        row(index).entered = false;
+    }
+    true
+}
+
+pub(super) unsafe fn release_unenrolled(instance_index: usize, inst: DriverInstance) -> bool {
+    let Some(domain) = instance_domain_identity(inst) else {
+        return false;
+    };
+    if hosted_ingress_sources::primary_enrollment(instance_index).is_some()
+        || (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES))
+            .as_ref()
+            .is_some_and(|rows| rows.iter().any(|row| row.instance == instance_index))
+    {
+        return false;
+    }
+    let Some(index) = prepare_unenrolled(instance_index, inst, domain) else {
+        return false;
+    };
+    if row(index).finished {
+        return true;
+    }
+    if row(index).entered {
+        return false;
+    }
+    if !row(index).shared_retired {
+        row(index).entered = true;
+        if inst.reply_cap != 0
+            && crate::spawn_hosts::shared_ingress::owner::runtime::return_initial_reply(
+                inst.reply_cap,
+                inst.tcb,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if inst.main_thread_id != 0 {
+            let Some(table) = hosted_driver_thread_table_mut(instance_index) else {
+                return false;
+            };
+            if table.remove(inst.main_thread_id).is_none() {
+                return false;
+            }
+        }
+        row(index).shared_retired = true;
+        row(index).entered = false;
+    }
+    if !execute_effects(index) || !hosted_pretransport_retirement::retire_early(instance_index) {
+        return false;
+    }
+    row(index).finished = true;
+    true
 }
 
 pub(super) unsafe fn started(instance_index: usize, inst: DriverInstance) -> bool {
@@ -253,41 +418,19 @@ pub(super) unsafe fn release(instance_index: usize, inst: DriverInstance) -> boo
         }
     }
     // Exact primary stop/drain and worker retirement precede canonical Ps alias teardown.
-    if driver_thread_projection::retire_stopped(route, inst).is_err() { return false; }
-    if driver_ps_context::retire(inst).is_err() { return false; }
-    while row(index).next < row(index).effects.len() {
-        let effect = row(index).effects[row(index).next];
-        row(index).entered = true;
-        let status = match effect {
-            Effect::ClearHeader(shared) => {
-                clear_shared_registry_identity_at(shared);
-                0
-            }
-            Effect::MapBank(bank) => {
-                if crate::spawn_hosts::release_component_map_cap_bank(bank).failures == 0 {
-                    0
-                } else {
-                    u64::MAX
-                }
-            }
-            Effect::Unmap(cap) => page_unmap_r(cap),
-            Effect::Delete(cap) => cnode_delete_r(cap),
-            Effect::Recycle(cap) => {
-                if crate::root_slot_recycle::publish_empty(cap).is_ok() {
-                    0
-                } else {
-                    u64::MAX
-                }
-            }
-            Effect::Child { cnode, slot } => cnode_delete_in_cnode_r(cnode, slot),
-        };
-        if status != 0 {
-            return false;
-        }
-        row(index).next += 1;
-        row(index).entered = false;
+    if driver_thread_projection::retire_stopped(route, inst).is_err() {
+        return false;
+    }
+    if driver_ps_context::retire(inst).is_err() {
+        return false;
+    }
+    if !execute_effects(index) {
+        return false;
     }
     if !hosted_ingress_sources::finish_physical_retirement(enrollment.physical) {
+        return false;
+    }
+    if !hosted_pretransport_retirement::finish(instance_index) {
         return false;
     }
     if let Some(table) = hosted_driver_thread_table_mut(instance_index) {

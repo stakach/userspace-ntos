@@ -13,10 +13,10 @@ nt-io-manager = { workspace = true }
 nt-pnp-abi = { workspace = true }
 nt-status = { workspace = true }
 nt-provider-wait = { workspace = true }
+nt-types = { workspace = true }
 
 [dev-dependencies]
 nt-io-abi = { workspace = true }
-nt-types = { workspace = true }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

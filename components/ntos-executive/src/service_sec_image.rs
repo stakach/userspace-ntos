@@ -5566,7 +5566,8 @@ pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
     let read = crate::driver_launch::redrive_nested_hosted_read(handler);
     let flush = crate::driver_launch::redrive_nested_hosted_flush(handler);
     let query_information = crate::driver_launch::redrive_nested_hosted_query_information(handler);
-    create || query || write || read || flush || query_information
+    let lower_pnp = crate::driver_launch::redrive_nested_hosted_lower_pnp(handler);
+    create || query || write || read || flush || query_information || lower_pnp
 }
 
 pub(crate) unsafe fn watchdog_defer_if_hosted_work_can_run(site: &[u8]) -> bool {
@@ -9459,6 +9460,8 @@ pub(crate) unsafe fn service_sec_image(
             crate::driver_launch::redrive_hosted_read_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_flush_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_information_forward(nt_handler as *mut _);
+            crate::driver_launch::redrive_hosted_lower_pnp_forward(nt_handler as *mut _);
+            crate::driver_launch::redrive_accepted_pdo_provider_retirement();
             crate::driver_launch::redrive_hosted_driver_zw_fs_control_file(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_driver_zw_write_file(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_driver_zw_read_query_file(nt_handler as *mut _);

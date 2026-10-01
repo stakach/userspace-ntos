@@ -323,7 +323,9 @@ impl<P> IoManager<P> {
         registration: HostedDevicePointerRegistration,
     ) -> Result<(), NtStatus> {
         let index = self.pointer_row_index(registration)?;
-        if self.hosted_device_pointers.rows[index].callers.is_some() {
+        if self.hosted_device_pointers.rows[index].callers.is_some()
+            || self.hosted_file_systems.retains_registration(registration)
+        {
             return Err(NtStatus::DEVICE_BUSY);
         }
         self.update_pointer_row(index, |io, row| {

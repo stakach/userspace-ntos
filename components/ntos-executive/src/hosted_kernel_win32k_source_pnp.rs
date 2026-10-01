@@ -5,7 +5,7 @@ use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_io_manager::hosted_forward_target::HostedForwardTarget;
 use nt_io_manager::win32k_source_pnp_wire as wire;
 use nt_kernel_exec::{EventObjectId, EventSignalMode};
-use nt_provider_wait::{ProviderAllocationCatalog, ProviderArenaIdentity};
+use nt_provider_wait::{ProviderAllocationCatalog, ProviderAllocationSnapshot, ProviderArenaIdentity};
 
 use super::hosted_kernel_win32k_source_ioctl::{capture_event, release_event, CanonicalEvent, Target};
 
@@ -36,6 +36,8 @@ struct Work {
     source_allocation: Option<hosted_driver_relation_source::DriverRelationSource>,
     source_pdo: Option<nt_io_manager::HostedDevicePointerReference>,
     allocations: ProviderAllocationCatalog,
+    source_snapshot: Option<ProviderAllocationSnapshot>,
+    destination_snapshot: Option<ProviderAllocationSnapshot>,
     relation_claimed: bool,
     terminal_claimed: bool,
     terminal_published: bool,
@@ -210,6 +212,7 @@ pub(crate) unsafe fn submit(
         packet_lease, packet, canonical_irp: None, receipt: None, pending: false, entered: false,
         terminal: None, relation: None, relation_allocation: None, source_allocation: None,
         source_pdo: None, allocations: ProviderAllocationCatalog::new(),
+        source_snapshot: None, destination_snapshot: None,
         relation_claimed: false,
         terminal_claimed: false, terminal_published: false, event_claimed: false,
         event_signaled: false, packet_prepared: false, reply_entered: false,
@@ -538,7 +541,6 @@ impl Work {
 
     unsafe fn prepare_relation(&mut self) -> bool {
         if self.terminal.is_some() { return true; }
-        if self.relation_claimed { return false; }
         let receipt = self.receipt.as_ref().expect("terminal PnP receipt");
         if !receipt.status().is_success() {
             if receipt.information() != 0 { return false; }
@@ -549,9 +551,17 @@ impl Work {
             return false;
         }
         self.relation_claimed = true;
-        let Some(source_allocation) = hosted_driver_relation_source::DriverRelationSource::capture(
-            receipt.completion_driver_id(), receipt.information(),
-        ) else { return false };
+        if self.source_allocation.is_none() {
+            let Some(source_allocation) = hosted_driver_relation_source::DriverRelationSource::capture(
+                receipt.completion_driver_id(), receipt.information(),
+            ) else { return false };
+            self.source_allocation = Some(source_allocation);
+        }
+        let source_allocation = self.source_allocation.as_ref()
+            .expect("claimed PnP source allocation");
+        if !source_allocation.validate() || source_allocation.address() != receipt.information() {
+            return false;
+        }
         let Some(source_domain) = source_allocation.domain() else { return false };
         let Ok(objects) = nt_pnp_manager::copy_device_relations_x64(source_allocation.bytes())
         else { return false };
@@ -566,72 +576,82 @@ impl Work {
         if source_registration.device_id() != canonical_pdo {
             return false;
         }
-        let Ok(source_reference) = io_manager_mut()
-            .take_hosted_device_pointer_reference(source_registration)
-        else { return false };
-        self.source_pdo = Some(source_reference);
+        if self.source_pdo.is_none() {
+            let Ok(source_reference) = io_manager_mut()
+                .take_hosted_device_pointer_reference(source_registration)
+            else { return false };
+            self.source_pdo = Some(source_reference);
+        }
+        if !self.source_pdo.as_ref().is_some_and(|reference| {
+            reference.is_held() && reference.device_id() == canonical_pdo
+        }) { return false; }
         let projected_pdo = match crate::win32k_device_consumer::ensure_projection(canonical_pdo) {
             Ok(address) => address,
             Err(_) => return false,
         };
-        let Some(relation_allocation) = crate::win32k_subsystem::allocate_source_target_relation()
-        else { return false };
-        if !source_allocation.validate() || !relation_allocation.validate() {
-            self.source_allocation = Some(source_allocation);
+        if self.relation_allocation.is_none() {
+            let Some(relation_allocation) = crate::win32k_subsystem::allocate_source_target_relation()
+            else { return false };
             self.relation_allocation = Some(relation_allocation);
+        }
+        let relation_allocation = self.relation_allocation.as_ref()
+            .expect("claimed PnP destination allocation");
+        if !source_allocation.validate() || !relation_allocation.validate() {
             return false;
         }
-        let source_snapshot = match self.allocations.register(
-            ProviderArenaIdentity { id: 1, generation: source_allocation.generation() },
-            source_allocation.address(),
-            nt_pnp_manager::TARGET_DEVICE_RELATIONS_X64_BYTES as u64,
-        ) {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                self.source_allocation = Some(source_allocation);
-                self.relation_allocation = Some(relation_allocation);
-                return false;
-            }
+        let relation_bytes = nt_pnp_manager::TARGET_DEVICE_RELATIONS_X64_BYTES as u64;
+        let source_arena = ProviderArenaIdentity {
+            id: 1, generation: source_allocation.generation(),
+        };
+        let source_snapshot = if let Some(snapshot) = self.source_snapshot {
+            if self.allocations.active_exact_capacity(
+                source_arena, source_allocation.address(), relation_bytes,
+            ) != Ok(snapshot) { return false; }
+            snapshot
+        } else {
+            let Ok(snapshot) = self.allocations.register(
+                source_arena, source_allocation.address(), relation_bytes,
+            ) else { return false };
+            self.source_snapshot = Some(snapshot);
+            snapshot
         };
         let destination_native = relation_allocation.native_identity();
-        if self.allocations.register(
-            ProviderArenaIdentity {
-                id: 2,
-                generation: destination_native.allocation_generation,
-            },
-            relation_allocation.address(),
-            nt_pnp_manager::TARGET_DEVICE_RELATIONS_X64_BYTES as u64,
-        ).is_err() {
-            self.source_allocation = Some(source_allocation);
-            self.relation_allocation = Some(relation_allocation);
-            return false;
-        }
-        let mut relation = match nt_pnp_manager::TargetRelationDelivery::capture(
-            io_manager_mut(), &mut self.allocations, receipt, self.target.device_id(),
-            source_allocation.address(), source_snapshot, source_allocation.bytes(),
-            source_pdo_address, self.target.registration().domain(), projected_pdo, canonical_pdo,
-            relation_allocation.address(),
-        ) {
-            Ok(relation) => relation,
-            Err(_) => {
-                self.source_allocation = Some(source_allocation);
-                self.relation_allocation = Some(relation_allocation);
-                return false;
-            }
+        let destination_arena = ProviderArenaIdentity {
+            id: 2, generation: destination_native.allocation_generation,
         };
-        let written = relation_allocation.with_bytes(|bytes| {
-            relation.write_relation(io_manager_mut(), &self.allocations, bytes)
-        });
-        if !matches!(written, Some(Ok(()))) {
-            self.source_allocation = Some(source_allocation);
-            self.relation_allocation = Some(relation_allocation);
+        if let Some(snapshot) = self.destination_snapshot {
+            if self.allocations.active_exact_capacity(
+                destination_arena, relation_allocation.address(), relation_bytes,
+            ) != Ok(snapshot) { return false; }
+        } else {
+            let Ok(snapshot) = self.allocations.register(
+                destination_arena, relation_allocation.address(), relation_bytes,
+            ) else { return false };
+            self.destination_snapshot = Some(snapshot);
+        }
+        if self.relation.is_none() {
+            let source_bytes = *source_allocation.bytes();
+            let relation_address = relation_allocation.address();
+            let Ok(relation) = nt_pnp_manager::TargetRelationDelivery::capture(
+                io_manager_mut(), &mut self.allocations, receipt, self.target.device_id(),
+                source_allocation.address(), source_snapshot, &source_bytes,
+                source_pdo_address, self.target.registration().domain(), projected_pdo,
+                canonical_pdo, relation_address,
+            ) else { return false };
             self.relation = Some(relation);
-            return false;
+        }
+        let relation = self.relation.as_mut().expect("claimed PnP relation delivery");
+        match relation.phase() {
+            nt_pnp_manager::TargetRelationPhase::Prepared => {
+                let written = relation_allocation.with_bytes(|bytes| {
+                    relation.write_relation(io_manager_mut(), &self.allocations, bytes)
+                });
+                if !matches!(written, Some(Ok(()))) { return false; }
+            }
+            nt_pnp_manager::TargetRelationPhase::RelationWritten => {}
+            _ => return false,
         }
         self.terminal = Some((receipt.status().raw() as u32, relation_allocation.address()));
-        self.source_allocation = Some(source_allocation);
-        self.relation_allocation = Some(relation_allocation);
-        self.relation = Some(relation);
         true
     }
 

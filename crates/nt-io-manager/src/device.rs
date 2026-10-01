@@ -13,6 +13,9 @@ impl DeviceType {
     pub const BEEP: DeviceType = DeviceType(0x0000_0001);
     pub const DISK: DeviceType = DeviceType(0x0000_0007);
     pub const DISK_FILE_SYSTEM: DeviceType = DeviceType(0x0000_0008);
+    pub const CD_ROM_FILE_SYSTEM: DeviceType = DeviceType(0x0000_0003);
+    pub const NETWORK_FILE_SYSTEM: DeviceType = DeviceType(0x0000_0014);
+    pub const TAPE_FILE_SYSTEM: DeviceType = DeviceType(0x0000_0020);
     pub const KEYBOARD: DeviceType = DeviceType(0x0000_000b);
     pub const NAMED_PIPE: DeviceType = DeviceType(0x0000_0011);
     pub const NULL: DeviceType = DeviceType(0x0000_0015);
@@ -44,6 +47,7 @@ bitflags::bitflags! {
         const DIRECT_IO = 0x0000_0010;
         const DEVICE_HAS_NAME = 0x0000_0040;
         const DEVICE_INITIALIZING = 0x0000_0080;
+        const LOW_PRIORITY_FILESYSTEM = 0x0001_0000;
     }
 }
 
