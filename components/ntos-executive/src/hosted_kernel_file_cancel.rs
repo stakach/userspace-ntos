@@ -20,7 +20,6 @@ struct Work {
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<usize> = Vec::new();
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
 /// Park the provider Reply until all current-thread IRPs on the exact File have drained.
@@ -92,7 +91,7 @@ pub(crate) unsafe fn submit_win32k(
         return Some(STATUS_INSUFFICIENT_RESOURCES);
     }
     let token =
-        match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
+        match runtime::next_service_wait_token() {
             Ok(token) => token,
             Err(_) => {
                 crate::service_sec_image::with_provider_process_manager(|pm| actor.release(pm))

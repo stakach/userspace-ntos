@@ -4354,7 +4354,8 @@ pub(crate) unsafe fn service_win32k_event_request(
             };
             handler
                 .provider_reset_local_event(provider, arg1)
-                .map(|previous| (0, u64::from(previous), 0, 0))
+                .and_then(|previous| handler.provider_read_local_event_with_sequence(provider, arg1)
+                    .map(|(_, sequence)| (0, u64::from(previous), 0, sequence)))
                 .unwrap_or_else(|status| (status as i32, 0, 0, 0))
         }
         crate::win32k_subsystem::W32_EVENT_OP_CLEAR_LOCAL => {
@@ -4363,7 +4364,8 @@ pub(crate) unsafe fn service_win32k_event_request(
             };
             handler
                 .provider_clear_local_event(provider, arg1)
-                .map(|()| (0, 0, 0, 0))
+                .and_then(|()| handler.provider_read_local_event_with_sequence(provider, arg1)
+                    .map(|(_, sequence)| (0, 0, 0, sequence)))
                 .unwrap_or_else(|status| (status as i32, 0, 0, 0))
         }
         crate::win32k_subsystem::W32_EVENT_OP_READ_LOCAL => {
@@ -4371,8 +4373,8 @@ pub(crate) unsafe fn service_win32k_event_request(
                 return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
             };
             handler
-                .provider_read_local_event(provider, arg1)
-                .map(|signaled| (0, u64::from(signaled), 0, 0))
+                .provider_read_local_event_with_sequence(provider, arg1)
+                .map(|(signaled, sequence)| (0, u64::from(signaled), 0, sequence))
                 .unwrap_or_else(|status| (status as i32, 0, 0, 0))
         }
         crate::win32k_subsystem::W32_TIMER_OP_PUBLISH_LOCAL
@@ -4472,6 +4474,35 @@ unsafe fn authenticate_win32k_service_request(
     }
     let caller = crate::provider_registry_caller::resolve(channel)?;
     Ok((route, dispatch, caller))
+}
+
+pub(crate) unsafe fn service_win32k_gdi_image_request(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    packet: u64,
+    length: u64,
+    spare: [u64; 2],
+) -> (i32, u64) {
+    if spare != [0; 2] {
+        return (nt_process::STATUS_INVALID_PARAMETER as i32, 0);
+    }
+    let (route, dispatch, _) = match authenticate_win32k_service_request(
+        channel, reply_cap, badge, mi,
+        (crate::win32k_subsystem::W32_GDI_LOAD_LABEL << 12) | 4,
+    ) {
+        Ok(owner) => owner,
+        Err(status) => return (status as i32, 0),
+    };
+    if !matches!(crate::win32k_glue::win32k_physical_stack_route_for_channel(
+        channel.tcb, channel.fault_ep, reply_cap,
+    ), Some((physical_route, physical_dispatch, _, _))
+        if physical_route == route && physical_dispatch == dispatch)
+    {
+        return (nt_process::STATUS_INVALID_PARAMETER as i32, 0);
+    }
+    crate::driver_launch::service_win32k_gdi_image_request(packet, length)
 }
 
 /// Directory-object requests carry only inline IPC words; all authority is reconstructed here.
@@ -4913,56 +4944,6 @@ pub(crate) unsafe fn service_win32k_source_ioctl_request(
     )
 }
 
-pub(crate) unsafe fn service_win32k_source_ioctl_completion(
-    channel: &spawn_hosts::PumpChannel,
-    reply_cap: u64,
-    badge: u64,
-    mi: u64,
-    token: u64,
-    source: u64,
-    reserved1: u64,
-    reserved2: u64,
-) -> Option<i32> {
-    if reserved1 != 0 || reserved2 != 0 {
-        return Some(nt_process::STATUS_INVALID_PARAMETER as i32);
-    }
-    if let Err(status) = authenticate_win32k_service_request(
-        channel,
-        reply_cap,
-        badge,
-        mi,
-        (crate::win32k_subsystem::W32_SOURCE_IOCTL_COMPLETION_LABEL << 12) | 4,
-    ) {
-        return Some(status as i32);
-    }
-    crate::driver_launch::service_win32k_source_ioctl_completion(channel, token, source)
-}
-
-pub(crate) unsafe fn service_win32k_source_ioctl_release(
-    channel: &spawn_hosts::PumpChannel,
-    reply_cap: u64,
-    badge: u64,
-    mi: u64,
-    token: u64,
-    source: u64,
-    reserved1: u64,
-    reserved2: u64,
-) -> i32 {
-    if reserved1 != 0 || reserved2 != 0 {
-        return nt_process::STATUS_INVALID_PARAMETER as i32;
-    }
-    if let Err(status) = authenticate_win32k_service_request(
-        channel,
-        reply_cap,
-        badge,
-        mi,
-        (crate::win32k_subsystem::W32_SOURCE_IOCTL_RELEASE_LABEL << 12) | 4,
-    ) {
-        return status as i32;
-    }
-    crate::driver_launch::service_win32k_source_ioctl_release(channel, token, source)
-}
-
 pub(crate) unsafe fn service_win32k_source_pnp_request(
     channel: &spawn_hosts::PumpChannel,
     reply_cap: u64,
@@ -4983,46 +4964,6 @@ pub(crate) unsafe fn service_win32k_source_pnp_request(
     crate::driver_launch::service_win32k_source_pnp(
         channel, reply_cap, packet, length, stack_pointer, handler,
     )
-}
-
-pub(crate) unsafe fn service_win32k_source_pnp_completion(
-    channel: &spawn_hosts::PumpChannel,
-    reply_cap: u64,
-    badge: u64,
-    mi: u64,
-    token: u64,
-    source: u64,
-    reserved1: u64,
-    reserved2: u64,
-) -> Option<i32> {
-    if reserved1 != 0 || reserved2 != 0 {
-        return Some(nt_process::STATUS_INVALID_PARAMETER as i32);
-    }
-    if let Err(status) = authenticate_win32k_service_request(
-        channel, reply_cap, badge, mi,
-        (crate::win32k_subsystem::W32_SOURCE_PNP_COMPLETION_LABEL << 12) | 4,
-    ) { return Some(status as i32); }
-    crate::driver_launch::service_win32k_source_pnp_completion(channel, token, source)
-}
-
-pub(crate) unsafe fn service_win32k_source_pnp_release(
-    channel: &spawn_hosts::PumpChannel,
-    reply_cap: u64,
-    badge: u64,
-    mi: u64,
-    token: u64,
-    source: u64,
-    reserved1: u64,
-    reserved2: u64,
-) -> i32 {
-    if reserved1 != 0 || reserved2 != 0 {
-        return nt_process::STATUS_INVALID_PARAMETER as i32;
-    }
-    if let Err(status) = authenticate_win32k_service_request(
-        channel, reply_cap, badge, mi,
-        (crate::win32k_subsystem::W32_SOURCE_PNP_RELEASE_LABEL << 12) | 4,
-    ) { return status as i32; }
-    crate::driver_launch::service_win32k_source_pnp_release(channel, token, source)
 }
 
 pub(crate) unsafe fn service_win32k_source_fsd_request(
@@ -5047,44 +4988,25 @@ pub(crate) unsafe fn service_win32k_source_fsd_request(
     )
 }
 
-pub(crate) unsafe fn service_win32k_source_fsd_completion(
+pub(crate) unsafe fn service_win32k_source_armed_request(
     channel: &spawn_hosts::PumpChannel,
     reply_cap: u64,
     badge: u64,
     mi: u64,
-    token: u64,
-    source: u64,
-    reserved1: u64,
-    reserved2: u64,
-) -> Option<i32> {
-    if reserved1 != 0 || reserved2 != 0 {
-        return Some(nt_process::STATUS_INVALID_PARAMETER as i32);
-    }
-    if let Err(status) = authenticate_win32k_service_request(
-        channel, reply_cap, badge, mi,
-        (crate::win32k_subsystem::W32_SOURCE_FSD_COMPLETION_LABEL << 12) | 4,
-    ) { return Some(status as i32); }
-    crate::driver_launch::service_win32k_source_fsd_completion(channel, token, source)
-}
-
-pub(crate) unsafe fn service_win32k_source_fsd_release(
-    channel: &spawn_hosts::PumpChannel,
-    reply_cap: u64,
-    badge: u64,
-    mi: u64,
-    token: u64,
-    source: u64,
-    reserved1: u64,
-    reserved2: u64,
+    packet: u64,
+    length: u64,
+    spare: [u64; 2],
 ) -> i32 {
-    if reserved1 != 0 || reserved2 != 0 {
+    if spare != [0; 2] {
         return nt_process::STATUS_INVALID_PARAMETER as i32;
     }
     if let Err(status) = authenticate_win32k_service_request(
         channel, reply_cap, badge, mi,
-        (crate::win32k_subsystem::W32_SOURCE_FSD_RELEASE_LABEL << 12) | 4,
-    ) { return status as i32; }
-    crate::driver_launch::service_win32k_source_fsd_release(channel, token, source)
+        (crate::win32k_subsystem::W32_SOURCE_ARMED_LABEL << 12) | 4,
+    ) {
+        return status as i32;
+    }
+    crate::driver_launch::service_win32k_source_armed(channel, packet, length)
 }
 
 pub(crate) unsafe fn service_win32k_file_query_delivered(
@@ -5567,7 +5489,9 @@ pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
     let flush = crate::driver_launch::redrive_nested_hosted_flush(handler);
     let query_information = crate::driver_launch::redrive_nested_hosted_query_information(handler);
     let lower_pnp = crate::driver_launch::redrive_nested_hosted_lower_pnp(handler);
-    create || query || write || read || flush || query_information || lower_pnp
+    let kernel_file_query = crate::driver_launch::redrive_nested_hosted_kernel_file_read_query(handler);
+    let source = crate::driver_launch::redrive_nested_win32k_source_work(handler);
+    create || query || write || read || flush || query_information || lower_pnp || kernel_file_query || source
 }
 
 pub(crate) unsafe fn watchdog_defer_if_hosted_work_can_run(site: &[u8]) -> bool {
@@ -9357,14 +9281,19 @@ pub(crate) unsafe fn service_sec_image(
     // Boot-milestone watchdog state is wall-clock based (iteration counts are useless here:
     // each win32k dispatch is a whole-component TCG round-trip taking SECONDS, so the loop does only
     // ~1-2 iterations/sec and an iter-count stall never trips within the boot budget). `last_progress_t`
-    // is the monotonic time (100ns units) at the last epoch bump (a new image/page publication or
-    // one-shot shell milestone). If no progress happens for STALL_BUDGET_100NS of
+    // is the monotonic time (100ns units) at the last epoch bump (a new image/page publication,
+    // one-shot shell milestone, or committed registry mutation). If no progress happens for STALL_BUDGET_100NS of
     // WALL-CLOCK time, forward progress is impossible (every live process cooperatively parked with no
     // signaler, or a slow win32k live-lock that WALLs without loading/filling anything new) → QUIESCE
     // (break → run the gate + qemu_exit). Generous enough that a genuinely-advancing (even if slow)
     // boot phase — which keeps filling pages / loading DLLs — never trips; only a true stall does.
     const STALL_BUDGET_100NS: u64 = 45 * 10_000_000; // 45 s of NO forward progress
-    let mut last_progress_epoch = boot_progress_epoch();
+    let progress_epoch = || {
+        boot_progress_epoch().wrapping_add(
+            crate::CM_RUNTIME_SYSTEM_MUTATION_COMMITS.load(Ordering::Relaxed),
+        )
+    };
+    let mut last_progress_epoch = progress_epoch();
     let mut last_progress_t = monotonic_time_100ns();
     let mut stall_deferrals =
         nt_hosted_runtime::ProgressDeferralBudget::new(last_progress_epoch, 2);
@@ -9581,7 +9510,7 @@ pub(crate) unsafe fn service_sec_image(
         // progress); quiesce if no progress for STALL_BUDGET_100NS.
         {
             let quiesce_started = crate::disk_census_ticks();
-            let ep = boot_progress_epoch();
+            let ep = progress_epoch();
             let now = monotonic_time_100ns();
             {
                 let slot = census_slot(badge);

@@ -15,46 +15,18 @@ use core::mem::{align_of, size_of};
 use core::ptr::{copy_nonoverlapping, null_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// Base of the RW heap region the broker maps into each component. Sits just past the executive
-/// ELF + rust-micro's rootserver aux pages (guard + stack + IPC + BootInfo + extra-BootInfo), which
-/// float RIGHT AFTER the loaded image; the release profile is size-optimised so the image stays
-/// well below this base (if it grows into the aux zone the RO extra-BootInfo page can land on
-/// HEAP_BASE and `map_own_heap`'s RW map silently fails → first heap write faults RO at 0x480000).
-/// Relocated FAR above the executive ELF (its own dedicated 2 MiB page table at 0x2000_0000 =
-/// 256 MiB past IMAGE_BASE), so the ELF + rootserver aux pages (which float RIGHT AFTER the loaded
-/// image) have the full 64 MiB reserve to grow into without ever reaching the heap. It used to sit
-/// only 512 KiB above IMAGE_BASE, so a growing image pushed the RO extra-BootInfo aux page onto
-/// HEAP_BASE and the first heap write faulted RO at 0x480000.
-pub const HEAP_BASE: usize = 0x0000_0100_2000_0000;
-/// Heap size in 4 KiB frames — the allocator's hard cap. Now that the VA layout is roomy, the
-/// executive gets a dedicated desktop-sized arena (was a cramped 128 KiB that OOM'd during registry
-/// enum, once forcing per-syscall mark/reset). Spawned services map a declared subset of this address
-/// range; ordinary components use [`DEFAULT_SERVICE_HEAP_FRAMES`].
-/// ★ RAISED 512 -> 1536 (2 MiB -> 6 MiB). The 2 MiB cap was measured at **1953957/2097152 = 93%**
-/// at the winlogon profile frontier. A heap that reaches its cap does not panic: allocations start
-/// returning null and callers quietly take their error paths, which is what a mysteriously slow,
-/// never-quiescing boot looks like from outside. The materialised profile tree and the per-user hive
-/// load need headroom above that, so the executive gets it.
-/// ★ RAISED 1536 -> 1792 (6 MiB -> 7 MiB) once Dbgk stopped allocating late and instead precharged
-/// bounded `DEBUG_OBJECT` slots/event queues. That is durable NT object state, not transient proof
-/// scaffolding, and the previous full boot ended with only a few KiB free under the 6 MiB cap.
-/// ★ RAISED 1792 -> 2048 (7 MiB -> 8 MiB) when the live mutable-hive authority started owning
-/// installed setup state and shell COM class provisioning directly in mounted hives. The prior green
-/// boot measured 6.82 MiB used under the 7 MiB cap, leaving too little room for that durable CM
-/// state. Spawned service heaps remain capped separately below.
-/// ★ RAISED 2048 -> 4096 (8 MiB -> 16 MiB) after the growable PnP launch/status cleanup produced a
-/// real desktop proof with only about 128 KiB left under the executive bump cap while the measured
-/// root-Untyped pool still had about 59 MiB free. This is a local executive-arena ceiling, not a
-/// boot-image or general VM-memory limit.
-/// ★ RAISED 4096 -> 6144 (16 MiB -> 24 MiB) when real boot-hive checkpoints replaced the
-/// journal-only acknowledgement. Retaining the five primary images raised the measured live floor
-/// to 14.24 MiB and left only 861 KiB contiguous, causing Explorer process-parameter construction
-/// to fail. The extra 8 MiB is mapped from root Untyped at runtime and does not enlarge the loaded
-/// executable or initrd. Isolated-service heap profiles remain independently bounded.
-/// ★ RAISED 6144 -> 8192 (24 MiB -> 32 MiB) after the newer ReactOS image and real win32k static
-/// dependency loading left 790 KiB durable headroom before the 2.39 MiB object-wait table reserve.
-/// The 4 MiB transient partition remains separate; this adds runtime root Untyped frames only.
-pub const HEAP_FRAMES: u64 = 8192;
+/// The component-local heap VA. The root reserves the 64 MiB band ending at the original scratch
+/// base; its lower 32 MiB is mapped initially and later durable pages are committed on demand.
+/// This band is above the executive image and worker mirrors. Isolated components have separate
+/// VSpaces and retain their declared heap profiles at the same VA.
+pub const HEAP_BASE: usize = 0x0000_0100_1e00_0000;
+/// Maximum VA reservation in 4 KiB frames, including the root transient lane. Physical pages
+/// beyond the initial root commitment are retyped and mapped only when allocations need them.
+/// Spawned services map a separately declared subset, ordinarily [`DEFAULT_SERVICE_HEAP_FRAMES`].
+pub const HEAP_FRAMES: u64 = 16384;
+/// Frames committed before the root executive starts serving requests. Further durable pages are
+/// mapped only as allocations require them; isolated services still use their declared profiles.
+pub const EXECUTIVE_INITIAL_HEAP_FRAMES: u64 = 8192;
 /// Default heap frames mapped into an isolated component. Services that own larger durable state
 /// declare a larger profile at spawn time instead of charging every component for that capacity.
 pub const DEFAULT_SERVICE_HEAP_FRAMES: u64 = 128;
@@ -66,6 +38,8 @@ const HEAP_SIZE: usize = (HEAP_FRAMES as usize) * 0x1000;
 pub const EXECUTIVE_TRANSIENT_HEAP_FRAMES: u64 = 1024;
 const EXECUTIVE_TRANSIENT_HEAP_SIZE: usize = (EXECUTIVE_TRANSIENT_HEAP_FRAMES as usize) * 0x1000;
 const _: () = assert!(EXECUTIVE_TRANSIENT_HEAP_FRAMES < HEAP_FRAMES);
+pub const EXECUTIVE_DURABLE_HEAP_FRAMES: u64 = HEAP_FRAMES - EXECUTIVE_TRANSIENT_HEAP_FRAMES;
+const _: () = assert!(EXECUTIVE_INITIAL_HEAP_FRAMES < EXECUTIVE_DURABLE_HEAP_FRAMES);
 const CTR: usize = HEAP_BASE; // 8-byte bump offset, in the RW heap
 const FREE_HEAD: usize = HEAP_BASE + 8; // 8-byte address of the first free-list node
 /// Component-local metadata words available to modules that cannot use mutable image statics.
@@ -81,17 +55,31 @@ const TRANSIENT_CTR: usize = HEAP_BASE + 96; // bytes consumed downward from the
 const TRANSIENT_DEPTH: usize = HEAP_BASE + 104; // nested transient allocation scopes
 const TRANSIENT_HIGH_WATER: usize = HEAP_BASE + 112; // peak transient bytes consumed
 const ALLOC_LOCK: usize = HEAP_BASE + 120; // shared across lanes mapping the same heap frames
+const ROOT_COMMITTED_BYTES: usize = HEAP_BASE + 128; // root-only durable pages mapped from Untyped
+const DCERPC_TRACE_STATE: usize = HEAP_BASE + 136; // component-local tracing state pointer
+const DRIVER_OBJECT_EXTENSIONS_STATE: usize = HEAP_BASE + 144; // component-local append-only extension head
 const ALLOC_UNLOCKED: usize = 0;
 const ALLOC_HELD: usize = 1;
 const ALLOC_POISONED: usize = 2;
-const DATA: usize = HEAP_BASE + 128; // allocations start past allocator/local metadata
+const DATA: usize = HEAP_BASE + 152; // allocations start past allocator/local metadata
 const _: () = assert!(MAPPED_HEAP_BYTES + size_of::<usize>() <= OOM_REPORTED);
 const _: () = assert!(OOM_SCOPE_LEN + size_of::<usize>() <= TRANSIENT_CTR);
 const _: () = assert!(TRANSIENT_HIGH_WATER + size_of::<usize>() <= DATA);
 const _: () = assert!(ALLOC_LOCK + size_of::<usize>() <= DATA);
+const _: () = assert!(ROOT_COMMITTED_BYTES + size_of::<usize>() <= DATA);
+const _: () = assert!(DCERPC_TRACE_STATE + size_of::<usize>() <= DATA);
+const _: () = assert!(DRIVER_OBJECT_EXTENSIONS_STATE + size_of::<usize>() <= DATA);
 const WORD: usize = size_of::<usize>();
 const ALLOC_GRANULE: usize = align_of::<usize>();
 const FREE_NODE_SIZE: usize = WORD * 2; // { size, next } stored inside the freed block
+
+pub(crate) fn dcerpc_trace_state_anchor() -> &'static AtomicUsize {
+    unsafe { &*(DCERPC_TRACE_STATE as *const AtomicUsize) }
+}
+
+pub(crate) fn driver_object_extensions_anchor() -> &'static AtomicUsize {
+    unsafe { &*(DRIVER_OBJECT_EXTENSIONS_STATE as *const AtomicUsize) }
+}
 
 struct Bump;
 
@@ -386,6 +374,44 @@ pub unsafe fn initialize_mapped_heap(frames: u64) -> bool {
     true
 }
 
+/// Publish root heap pages only after their frame caps and RW mappings are installed. Called at
+/// boot and by the root's allocation path while the heap lock is held.
+pub(crate) unsafe fn publish_root_heap_commit(frames: u64) {
+    let current = (unsafe { read_word(ROOT_COMMITTED_BYTES) } / 0x1000) as u64;
+    assert!(unsafe { read_word(MAPPED_HEAP_BYTES) } == 0);
+    assert!(frames >= EXECUTIVE_INITIAL_HEAP_FRAMES);
+    assert!(frames <= EXECUTIVE_DURABLE_HEAP_FRAMES);
+    assert!(frames >= current);
+    unsafe { write_word(ROOT_COMMITTED_BYTES, frames as usize * 0x1000) };
+}
+
+pub(crate) fn root_heap_committed_frames() -> u64 {
+    (unsafe { read_word(ROOT_COMMITTED_BYTES) } / 0x1000) as u64
+}
+
+/// Round a requested root allocation up to a 2 MiB commitment step. The terminal 4 MiB remains
+/// permanently reserved for transient allocations and can never become durable storage.
+pub(crate) fn root_commit_target(current_frames: u64, requested_end: usize) -> Option<u64> {
+    let requested_bytes = requested_end.checked_sub(HEAP_BASE)?;
+    let requested_frames = (requested_bytes as u64).div_ceil(0x1000);
+    if current_frames < EXECUTIVE_INITIAL_HEAP_FRAMES
+        || current_frames > EXECUTIVE_DURABLE_HEAP_FRAMES
+        || requested_frames > EXECUTIVE_DURABLE_HEAP_FRAMES
+    {
+        return None;
+    }
+    if requested_frames <= current_frames {
+        return Some(current_frames);
+    }
+    let next_window = current_frames.checked_add(512)?;
+    let requested_window = requested_frames.div_ceil(512) * 512;
+    Some(
+        requested_window
+            .max(next_window)
+            .min(EXECUTIVE_DURABLE_HEAP_FRAMES),
+    )
+}
+
 #[inline]
 fn heap_size() -> usize {
     let configured = unsafe { read_word(MAPPED_HEAP_BYTES) };
@@ -419,12 +445,24 @@ fn transient_heap_start() -> usize {
 
 #[inline]
 fn durable_heap_end() -> usize {
-    transient_heap_start()
+    if transient_heap_size() != 0 {
+        HEAP_BASE + unsafe { read_word(ROOT_COMMITTED_BYTES) }
+    } else {
+        mapped_heap_end()
+    }
 }
 
 #[inline]
 fn durable_heap_capacity() -> usize {
     durable_heap_end().saturating_sub(DATA)
+}
+
+#[inline]
+fn ensure_durable_end(end: usize) -> bool {
+    if end <= durable_heap_end() {
+        return true;
+    }
+    transient_heap_size() != 0 && unsafe { crate::grow_own_heap(end) }
 }
 
 #[inline]
@@ -711,7 +749,7 @@ impl Bump {
         };
         let requested_end = start.saturating_add(layout.size());
         let end = match start.checked_add(size) {
-            Some(e) if e <= durable_heap_end() => e,
+            Some(e) if ensure_durable_end(e) => e,
             _ => {
                 report_oom(
                     layout.size(),
@@ -831,8 +869,7 @@ unsafe impl GlobalAlloc for Bump {
             None => return null_mut(),
         };
         let cur_end = DATA + unsafe { read_word(CTR) };
-        let durable_heap_end = durable_heap_end();
-        if start >= DATA && old_end <= durable_heap_end && old_end == cur_end {
+        if start >= DATA && old_end <= durable_heap_end() && old_end == cur_end {
             let Some(new_end) = start.checked_add(new_block_size) else {
                 report_oom(
                     new_size,
@@ -843,18 +880,10 @@ unsafe impl GlobalAlloc for Bump {
                 );
                 return null_mut();
             };
-            if new_end <= durable_heap_end {
+            if ensure_durable_end(new_end) {
                 unsafe { write_word(CTR, new_end - DATA) };
                 return ptr;
             }
-            report_oom(
-                new_size,
-                old_layout.align(),
-                old_end - DATA,
-                start - DATA,
-                new_end - DATA,
-            );
-            return null_mut();
         }
 
         if unsafe { grow_in_place_from_adjacent_free(start, old_block_size, new_block_size) } {
@@ -935,5 +964,39 @@ pub fn usage() -> HeapUsage {
         transient_used: unsafe { read_word(TRANSIENT_CTR) },
         transient_high_water: unsafe { read_word(TRANSIENT_HIGH_WATER) },
         transient_capacity: transient_heap_size(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_commitment_crosses_initial_boundary_without_touching_transient_lane() {
+        let initial_end = HEAP_BASE + EXECUTIVE_INITIAL_HEAP_FRAMES as usize * 0x1000;
+        assert_eq!(
+            root_commit_target(EXECUTIVE_INITIAL_HEAP_FRAMES, initial_end),
+            Some(EXECUTIVE_INITIAL_HEAP_FRAMES)
+        );
+        assert_eq!(
+            root_commit_target(EXECUTIVE_INITIAL_HEAP_FRAMES, initial_end + 1),
+            Some(EXECUTIVE_INITIAL_HEAP_FRAMES + 512)
+        );
+        assert_eq!(
+            root_commit_target(
+                EXECUTIVE_INITIAL_HEAP_FRAMES,
+                initial_end + 513 * 0x1000,
+            ),
+            Some(EXECUTIVE_INITIAL_HEAP_FRAMES + 1024)
+        );
+        let durable_end = HEAP_BASE + EXECUTIVE_DURABLE_HEAP_FRAMES as usize * 0x1000;
+        assert_eq!(
+            root_commit_target(EXECUTIVE_INITIAL_HEAP_FRAMES, durable_end),
+            Some(EXECUTIVE_DURABLE_HEAP_FRAMES)
+        );
+        assert_eq!(
+            root_commit_target(EXECUTIVE_DURABLE_HEAP_FRAMES, durable_end + 1),
+            None
+        );
     }
 }

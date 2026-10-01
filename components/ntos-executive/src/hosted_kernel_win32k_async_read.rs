@@ -46,7 +46,6 @@ static mut EXECUTING: Vec<usize> = Vec::new();
 type OperationIdentity = (nt_component_suspension::peer_registry::PeerRoute, u64, u64);
 static mut ACTIVE: Vec<OperationIdentity> = Vec::new();
 static mut COMPLETED: Vec<OperationIdentity> = Vec::new();
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
 fn wire_status(error: wire::AsyncReadWireError) -> i32 {
@@ -223,7 +222,7 @@ pub(crate) unsafe fn submit(
         return Some(STATUS_INSUFFICIENT_RESOURCES);
     }
     let token =
-        match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
+        match runtime::next_service_wait_token() {
             Ok(token) if token != 0 => token,
             _ => {
                 crate::service_sec_image::with_provider_process_manager(|pm| actor.release(pm))

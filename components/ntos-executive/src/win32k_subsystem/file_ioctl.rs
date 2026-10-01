@@ -60,10 +60,13 @@ unsafe fn reserve_ioctl(
     let next = local_id
         .checked_add(1)
         .ok_or(STATUS_INSUFFICIENT_RESOURCES_I32)?;
-    let (_, iosb_pin) = provider_input::stack_catalog_mut()
-        .ok_or(STATUS_NOT_SUPPORTED_I32)?
-        .pin_active_range(activation, iosb, 16)
-        .map_err(|_| STATUS_ACCESS_VIOLATION_I32)?;
+    let (_, iosb_pin) = {
+        let mut metadata = ProviderMetadataGuard::acquire();
+        provider_input::stack_catalog_mut(&mut metadata)
+            .ok_or(STATUS_NOT_SUPPORTED_I32)?
+            .pin_active_range(activation, iosb, 16)
+            .map_err(|_| STATUS_ACCESS_VIOLATION_I32)?
+    };
     let output_pin = match file_ioctl_target::pin_output(
         activation,
         if output_length == 0 { 0 } else { output },

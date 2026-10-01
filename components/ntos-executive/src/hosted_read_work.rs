@@ -54,7 +54,6 @@ struct RetainedAck {
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<(usize, DriverInstance, u64)> = Vec::new();
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
 fn status_for_capture(error: hosted_read_capture::CaptureError) -> i32 {
@@ -175,9 +174,7 @@ pub(super) unsafe fn submit(
         source.release().expect("unentered READ allocation rollback");
         return Some(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
     }
-    let token = match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-        next.checked_add(1)
-    }) {
+    let token = match runtime::next_service_wait_token() {
         Ok(token) => token,
         Err(_) => {
             let mut actor = actor;
@@ -606,9 +603,7 @@ pub(super) unsafe fn acknowledge(
         Ok(reply) => reply,
         Err(_) => return Some(STATUS_INVALID_HANDLE_LOCAL),
     };
-    let token = match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-        next.checked_add(1)
-    }) {
+    let token = match runtime::next_service_wait_token() {
         Ok(token) => token,
         Err(_) => return Some(STATUS_INSUFFICIENT_RESOURCES_LOCAL),
     };

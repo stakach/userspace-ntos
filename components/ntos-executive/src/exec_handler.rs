@@ -7226,11 +7226,36 @@ impl ExecNtHandler {
             return Ok(self.overlay.key_security_descriptor(index).map(alloc::vec::Vec::from));
         }
         if let Some(key) = self.mutable_registry_key(target) {
-            return Ok(self.mutable_hives.key_security_descriptor(key).map(alloc::vec::Vec::from));
+            let descriptor = self.mutable_hives.key_security_descriptor(key);
+            let mount_root = self.mutable_hives.hive(key.hive)
+                .is_some_and(|hive| key.key == hive.root());
+            let mount_security = if matches!(key.hive, HIVE_SEL_SOFTWARE | HIVE_SEL_SECURITY | HIVE_SEL_SAM) {
+                &self.registry_machine_root_security_descriptor
+            } else {
+                &self.registry_user_root_security_descriptor
+            };
+            return Ok(if mount_root {
+                Some(nt_security::mounted_hive_root_security(
+                    descriptor, mount_security,
+                ).to_vec())
+            } else {
+                descriptor.map(alloc::vec::Vec::from)
+            });
         }
         if let Some((hive, key)) = self.base_hive(target) {
+            let mount_security = if matches!(hive_sel(target), HIVE_SEL_SOFTWARE | HIVE_SEL_SECURITY | HIVE_SEL_SAM) {
+                &self.registry_machine_root_security_descriptor
+            } else {
+                &self.registry_user_root_security_descriptor
+            };
             return hive.key_security_descriptor(key)
-                .map(|descriptor| descriptor.map(alloc::vec::Vec::from))
+                .map(|descriptor| if key == hive.root() {
+                    Some(nt_security::mounted_hive_root_security(
+                        descriptor, mount_security,
+                    ).to_vec())
+                } else {
+                    descriptor.map(alloc::vec::Vec::from)
+                })
                 .map_err(|_| 0xC000_0079);
         }
         Ok(None)
@@ -24291,6 +24316,17 @@ impl ExecNtHandler {
             return Err(STATUS_INVALID_PARAMETER);
         }
         self.provider_local_events().read(provider, local_identity)
+    }
+
+    pub(crate) fn provider_read_local_event_with_sequence(
+        &mut self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        local_identity: u64,
+    ) -> Result<(bool, u64), u32> {
+        if !crate::win32k_provider_domain_is_current(provider) {
+            return Err(0xC000_000D);
+        }
+        self.provider_local_events().read_with_sequence(provider, local_identity)
     }
 
     pub(crate) fn provider_retire_local_event(

@@ -58,7 +58,6 @@ struct Work {
 }
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static mut EXECUTING: Vec<usize> = Vec::new();
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
@@ -135,9 +134,7 @@ pub(super) unsafe fn submit(
         }).expect("unadmitted provider CREATE owners");
         return rejected(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
     }
-    let token = match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-        next.checked_add(1)
-    }) {
+    let token = match runtime::next_service_wait_token() {
         Ok(token) => token,
         Err(_) => {
             let mut actor = actor;

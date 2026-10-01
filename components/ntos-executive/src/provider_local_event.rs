@@ -169,8 +169,18 @@ impl<'a> LocalEventState<'a> {
     }
 
     pub(crate) fn read(&self, provider: ProviderDomainIdentity, local: u64) -> Result<bool, u32> {
-        self.identity(provider, local)
-            .map(|(_, _, _, signaled)| signaled)
+        self.read_with_sequence(provider, local).map(|(signaled, _)| signaled)
+    }
+
+    pub(crate) fn read_with_sequence(
+        &self,
+        provider: ProviderDomainIdentity,
+        local: u64,
+    ) -> Result<(bool, u64), u32> {
+        let (_, index, _, _) = self.identity(provider, local)?;
+        self.events.query_with_sequence(index as u64)
+            .map(|(_, signaled, sequence)| (signaled, sequence))
+            .ok_or(INVALID_PARAMETER)
     }
 
     pub(crate) fn retire(
@@ -326,16 +336,16 @@ pub(crate) unsafe fn signal(
         } else if mode == nt_kernel_exec::EventSignalMode::Pulse {
             assert!(handler.events.clear_existing(index as u64));
         }
-        let (_, current) = handler
+        let (_, current, sequence) = handler
             .events
-            .query_existing(index as u64)
+            .query_with_sequence(index as u64)
             .expect("pinned local Event lost its dispatcher backing");
         let current = if mode == nt_kernel_exec::EventSignalMode::Set {
             current
         } else {
             false
         };
-        Ok((0, u64::from(previous), u64::from(current), 0))
+        Ok((0, u64::from(previous), u64::from(current), sequence))
     })();
     if let Some(retired) = handler
         .event_objects

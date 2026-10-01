@@ -6,11 +6,17 @@ use nt_io_manager::hosted_forward_target::HostedForwardTarget;
 use nt_io_manager::win32k_source_pnp_wire as wire;
 use nt_kernel_exec::{EventObjectId, EventSignalMode};
 use nt_provider_wait::{ProviderAllocationCatalog, ProviderAllocationSnapshot, ProviderArenaIdentity};
+use nt_io_manager::kernel_irp_builder::{
+    validate_kernel_irp_dispatch_cursor, KernelIrpDispatchHeader,
+};
+use nt_io_manager::{WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IRP_SIZE};
 
-use super::hosted_kernel_win32k_source_ioctl::{capture_event, release_event, CanonicalEvent, Target};
+use super::hosted_kernel_win32k_source_ioctl::{
+    capture_event, next_source_reply_token, release_event, CanonicalEvent,
+};
 
 type Route = nt_component_suspension::peer_registry::PeerRoute;
-type Identity = (Route, u64, u64);
+const STATUS_CANCELLED: u32 = 0xc000_0120;
 
 struct Work {
     route: Route,
@@ -20,19 +26,24 @@ struct Work {
     source_address: u64,
     source_ticket: u64,
     source_generation: u64,
-    source: crate::win32k_subsystem::SourcePnpDispatchLease,
+    nonce: u64,
+    iosb_va: u64,
+    source: crate::win32k_subsystem::ProviderPoolPacketLease,
     target: HostedForwardTarget,
     event: Option<CanonicalEvent>,
-    iosb_target: Target,
-    packet_lease: crate::win32k_subsystem::ProviderPoolPacketLease,
+    packet_lease: Option<crate::win32k_subsystem::ProviderPoolPacketLease>,
     packet: Vec<u8>,
     canonical_irp: Option<IrpId>,
     receipt: Option<nt_io_manager::ExternalPnpTerminalReceipt>,
     pending: bool,
+    origin_armed: bool,
     entered: bool,
     terminal: Option<(u32, u64)>,
     relation: Option<nt_pnp_manager::TargetRelationDelivery>,
-    relation_allocation: Option<crate::win32k_subsystem::SourceRelationAllocationLease>,
+    projected_pdo: Option<u64>,
+    relation_allocation: crate::win32k_subsystem::ProviderPoolPacketLease,
+    relation_address: u64,
+    relation_generation: u64,
     source_allocation: Option<hosted_driver_relation_source::DriverRelationSource>,
     source_pdo: Option<nt_io_manager::HostedDevicePointerReference>,
     allocations: ProviderAllocationCatalog,
@@ -43,32 +54,89 @@ struct Work {
     terminal_published: bool,
     event_claimed: bool,
     event_signaled: bool,
+    event_barrier: Option<crate::source_event_completion::Barrier>,
+    terminal_handoff: Option<wire::SourcePnpTerminalHandoff>,
+    terminal_packet: Option<crate::win32k_subsystem::ProviderPoolPacketLease>,
+    terminal_acknowledged: bool,
+    origin_commit_requested: bool,
+    origin_committed: bool,
+    discarding: bool,
     packet_prepared: bool,
     reply_entered: bool,
     reply_acked: bool,
     ack_claimed: bool,
+    resources_claimed: bool,
+    resources_committed: bool,
+    relation_transferred: bool,
     cancel_requested: bool,
     indeterminate: bool,
 }
 
-struct CompletionWait {
-    identity: Identity,
-    route: Route,
-    dispatch: nt_component_suspension::LaneDispatchIdentity,
-    reply: u64,
-    wait_token: u64,
-    reply_entered: bool,
-    cancelled: bool,
-}
-
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<usize> = Vec::new();
-static mut ACTIVE: Vec<Identity> = Vec::new();
-static mut COMPLETED: Vec<Identity> = Vec::new();
-static mut COMPLETION_WAITS: Vec<CompletionWait> = Vec::new();
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
-static NEXT_WAIT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn capture_source(
+    request: &wire::SourcePnpRequest,
+) -> Result<crate::win32k_subsystem::ProviderPoolPacketLease, i32> {
+    let (header_lease, header) = crate::win32k_subsystem::capture_provider_pool_packet(
+        request.source_irp_va, WDM_X64_IRP_SIZE,
+    ).map_err(|status| status as i32)?;
+    let packet_size = u16::from_le_bytes([header[2], header[3]]) as usize;
+    let stack_count = header[0x42];
+    let expected_size = WDM_X64_IRP_SIZE
+        .checked_add(stack_count as usize * WDM_X64_IO_STACK_LOCATION_SIZE)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    if packet_size != expected_size
+        || stack_count == 0
+        || stack_count == u8::MAX
+        || header_lease.native_identity().allocation_generation
+            != request.native_allocation_generation
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let (lease, packet) = crate::win32k_subsystem::capture_provider_pool_packet(
+        request.source_irp_va, packet_size,
+    ).map_err(|status| status as i32)?;
+    if lease.native_identity() != header_lease.native_identity()
+        || lease.capacity() < packet_size as u64
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let header = KernelIrpDispatchHeader {
+        irp_type: u16::from_le_bytes([packet[0], packet[1]]),
+        packet_size: packet_size as u16,
+        stack_count,
+        current_location: packet[0x43],
+        current_stack_location: u64::from_le_bytes(packet[0xb8..0xc0].try_into().unwrap()),
+    };
+    let cursor = validate_kernel_irp_dispatch_cursor(
+        request.source_irp_va, packet_size as u64, stack_count, header,
+    ).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let stack = nt_io_manager::decode_wdm_kernel_built_io_stack(
+        &packet[cursor.next_stack_offset
+            ..cursor.next_stack_offset + WDM_X64_IO_STACK_LOCATION_SIZE],
+    ).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    if stack.major != nt_io_abi::major::IRP_MJ_PNP
+        || stack.minor != nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS
+        || stack.device_object != request.device_object_va
+        || stack.file_object != 0
+        || !matches!(stack.parameters,
+            nt_io_manager::WdmIoStackParameters::PnpQueryDeviceRelations {
+                relation_type: nt_pnp_abi::TARGET_DEVICE_RELATION,
+            })
+        || u64::from_le_bytes(packet[0x08..0x10].try_into().unwrap()) != 0
+        || u32::from_le_bytes(packet[0x10..0x14].try_into().unwrap()) != 0
+        || u64::from_le_bytes(packet[0x18..0x20].try_into().unwrap()) != 0
+        || u64::from_le_bytes(packet[0x70..0x78].try_into().unwrap()) != 0
+        || u64::from_le_bytes(packet[0x48..0x50].try_into().unwrap()) != request.iosb_va
+        || (u64::from_le_bytes(packet[0x50..0x58].try_into().unwrap()) == 0)
+            != request.event.is_none()
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(lease)
+}
 
 pub(crate) unsafe fn submit(
     channel: &crate::spawn_hosts::PumpChannel,
@@ -79,20 +147,28 @@ pub(crate) unsafe fn submit(
     handler: *mut ExecNtHandler,
 ) -> Option<i32> {
     let _durable = crate::allocator::enter_durable();
+    print_str(b"[source-pnp-root] submit packet=0x");
+    print_hex_u64(packet_address);
+    print_str(b" bytes=0x");
+    print_hex_u64(packet_length);
+    print_str(b" stack=0x");
+    print_hex_u64(stack_pointer);
+    print_str(b"\n");
     let route = match runtime::channel_route(channel) {
         Ok(Some(route)) => route,
-        _ => return Some(STATUS_INVALID_HANDLE),
+        _ => { print_str(b"[source-pnp-root] no route\n"); return Some(STATUS_INVALID_HANDLE); },
     };
     let dispatch = match runtime::dispatch(route) {
         Ok(dispatch) => dispatch,
-        _ => return Some(STATUS_INVALID_HANDLE),
+        _ => { print_str(b"[source-pnp-root] no dispatch\n"); return Some(STATUS_INVALID_HANDLE); },
     };
     if crate::win32k_glue::win32k_stack_alias_for_route(route, stack_pointer, 1).is_none() {
+        print_str(b"[source-pnp-root] stack alias denied\n");
         return Some(STATUS_ACCESS_DENIED);
     }
     let reply = match runtime::current_reply(route) {
         Ok(reply) => reply,
-        _ => return Some(STATUS_INVALID_HANDLE),
+        _ => { print_str(b"[source-pnp-root] no reply\n"); return Some(STATUS_INVALID_HANDLE); },
     };
     if packet_length != wire::PACKET_BYTES as u64 {
         return Some(STATUS_INVALID_BUFFER_SIZE as i32);
@@ -101,13 +177,27 @@ pub(crate) unsafe fn submit(
         packet_address, wire::PACKET_BYTES,
     ) {
         Ok(captured) => captured,
-        Err(status) => return Some(status as i32),
+        Err(status) => {
+            print_str(b"[source-pnp-root] packet capture status=0x");
+            print_hex(status as u32);
+            print_str(b"\n");
+            return Some(status as i32);
+        },
     };
     let request = match wire::decode_request(&packet) {
         Ok(request) => request,
-        Err(_) => return Some(STATUS_INVALID_PARAMETER),
+        Err(_) => {
+            print_str(b"[source-pnp-root] invalid request packet\n");
+            return Some(STATUS_INVALID_PARAMETER);
+        }
     };
     if super::hosted_kernel_win32k_source_admission::contains(request.source_irp_va) {
+        print_str(b"[source-pnp-root] source already admitted\n");
+        return Some(STATUS_INVALID_PARAMETER);
+    }
+    if (&*core::ptr::addr_of!(WORK)).iter().any(|row| {
+        row.as_ref().is_some_and(|work| work.route == route && work.nonce == request.nonce)
+    }) {
         return Some(STATUS_INVALID_PARAMETER);
     }
     let access = match crate::win32k_device_consumer::authenticate(
@@ -115,7 +205,12 @@ pub(crate) unsafe fn submit(
     ) {
         Ok(access) if access.dispatch() == dispatch => access,
         Ok(_) => return Some(STATUS_ACCESS_DENIED),
-        Err(status) => return Some(status),
+        Err(status) => {
+            print_str(b"[source-pnp-root] device authentication status=0x");
+            print_hex(status as u32);
+            print_str(b"\n");
+            return Some(status);
+        }
     };
     let mut target = match HostedForwardTarget::capture(
         io_manager_mut(), access.domain(), access.address(),
@@ -125,45 +220,50 @@ pub(crate) unsafe fn submit(
             target.release(io_manager_mut()).expect("mismatched PnP target");
             return Some(STATUS_INVALID_DEVICE_REQUEST as i32);
         }
-        Err(status) => return Some(status.raw()),
+        Err(status) => {
+            print_str(b"[source-pnp-root] canonical target status=0x");
+            print_hex(status.raw() as u32);
+            print_str(b"\n");
+            return Some(status.raw());
+        }
     };
     let mut event = match capture_event(handler, request.event) {
         Ok(event) => event,
         Err(status) => {
+            print_str(b"[source-pnp-root] Event capture status=0x");
+            print_hex(status as u32);
+            print_str(b"\n");
             target.release(io_manager_mut()).expect("unentered PnP target");
             return Some(status);
         }
     };
-    let mut source = match crate::win32k_subsystem::admit_source_target_relation_dispatch(
-        request.source_irp_va, request.device_object_va, stack_pointer,
-    ) {
+    let source = match capture_source(&request) {
         Ok(source) => source,
         Err(status) => {
+            print_str(b"[source-pnp-root] native source admission status=0x");
+            print_hex(status as u32);
+            print_str(b"\n");
             if let Some(event) = event.take() { release_event(handler, event); }
             target.release(io_manager_mut()).expect("unentered PnP target");
             return Some(status);
         }
     };
-    if !source.validate()
-        || source.source_address() != request.source_irp_va
-        || source.source_ticket_serial() != request.source_ticket_serial
-        || source.source_native_generation() != request.native_allocation_generation
-        || source.device != request.device_object_va
-        || request.relation_type != nt_pnp_abi::TARGET_DEVICE_RELATION
-        || source.event != request.event
-        || source.event.is_some() != source.event_body().is_some()
+    let relation_allocation = match crate::win32k_subsystem::capture_provider_pool_packet(
+        request.relation_allocation_va, nt_pnp_manager::TARGET_DEVICE_RELATIONS_X64_BYTES,
+    ) {
+        Ok((lease, _)) if lease.native_identity().allocation_generation
+            == request.relation_allocation_generation
+            && request.relation_allocation_va != request.source_irp_va
+            && request.relation_allocation_va != packet_address => lease,
+        _ => {
+            if let Some(event) = event.take() { release_event(handler, event); }
+            target.release(io_manager_mut()).expect("unentered PnP target");
+            return Some(STATUS_INVALID_PARAMETER);
+        }
+    };
+    if request.iosb_va == 0
+        || super::hosted_kernel_win32k_source_ioctl::Target::capture(route, request.iosb_va, 16).is_none()
     {
-        if !crate::win32k_subsystem::abort_source_target_relation_dispatch(&mut source) {
-            crate::provider_bugcheck::report(0xc4, [request.source_irp_va, 0, 0, 40]);
-        }
-        if let Some(event) = event.take() { release_event(handler, event); }
-        target.release(io_manager_mut()).expect("mismatched PnP target");
-        return Some(STATUS_INVALID_PARAMETER);
-    }
-    let Some(iosb_target) = Target::capture(route, source.iosb_va, 16) else {
-        if !crate::win32k_subsystem::abort_source_target_relation_dispatch(&mut source) {
-            crate::provider_bugcheck::report(0xc4, [request.source_irp_va, 0, 0, 41]);
-        }
         if let Some(event) = event.take() { release_event(handler, event); }
         target.release(io_manager_mut()).expect("unentered PnP target");
         return Some(STATUS_INVALID_PARAMETER);
@@ -171,52 +271,50 @@ pub(crate) unsafe fn submit(
     let slot = (&*core::ptr::addr_of!(WORK)).iter().enumerate().find_map(|(index, row)| {
         (row.is_none() && !(&*core::ptr::addr_of!(EXECUTING)).contains(&index)).then_some(index)
     });
-    if (slot.is_none() && (&mut *core::ptr::addr_of_mut!(WORK)).try_reserve(1).is_err())
-        || (&mut *core::ptr::addr_of_mut!(ACTIVE)).try_reserve(1).is_err()
-        || (&mut *core::ptr::addr_of_mut!(COMPLETED)).try_reserve(1).is_err()
+    if slot.is_none() && (&mut *core::ptr::addr_of_mut!(WORK)).try_reserve(1).is_err()
     {
-        if !crate::win32k_subsystem::abort_source_target_relation_dispatch(&mut source) {
-            crate::provider_bugcheck::report(0xc4, [request.source_irp_va, 0, 0, 42]);
-        }
+        print_str(b"[source-pnp-root] work reserve failed\n");
         if let Some(event) = event.take() { release_event(handler, event); }
         target.release(io_manager_mut()).expect("unentered PnP target");
         return Some(STATUS_INSUFFICIENT_RESOURCES);
     }
-    let token = match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
-        Ok(token) if token != 0 => token,
+    let token = match next_source_reply_token() {
+        Some(token) => token,
         _ => {
-            if !crate::win32k_subsystem::abort_source_target_relation_dispatch(&mut source) {
-                crate::provider_bugcheck::report(0xc4, [request.source_irp_va, 0, 0, 43]);
-            }
+            print_str(b"[source-pnp-root] reply token exhausted\n");
             if let Some(event) = event.take() { release_event(handler, event); }
             target.release(io_manager_mut()).expect("unentered PnP target");
             return Some(STATUS_INSUFFICIENT_RESOURCES);
         }
     };
-    let source_address = source.source_address();
-    let source_ticket = source.source_ticket_serial();
-    let source_generation = source.source_native_generation();
+    let source_address = request.source_irp_va;
+    let source_ticket = request.source_ticket_serial;
+    let source_generation = request.native_allocation_generation;
     if !super::hosted_kernel_win32k_source_admission::register(
         route, source_address, source_ticket, source_generation,
     ) {
-        if !crate::win32k_subsystem::abort_source_target_relation_dispatch(&mut source) {
-            crate::provider_bugcheck::report(0xc4, [source_address, token, 0, 58]);
-        }
+        print_str(b"[source-pnp-root] source registration failed\n");
         if let Some(event) = event.take() { release_event(handler, event); }
         target.release(io_manager_mut()).expect("unentered PnP target");
         return Some(STATUS_INSUFFICIENT_RESOURCES);
     }
     let work = Work {
         route, dispatch, reply, token, source_address, source_ticket, source_generation,
-        source, target, event, iosb_target,
-        packet_lease, packet, canonical_irp: None, receipt: None, pending: false, entered: false,
-        terminal: None, relation: None, relation_allocation: None, source_allocation: None,
+        nonce: request.nonce, iosb_va: request.iosb_va, source, target, event,
+        packet_lease: Some(packet_lease), packet, canonical_irp: None, receipt: None, pending: false, origin_armed: false, entered: false,
+        terminal: None, relation: None, projected_pdo: None, relation_allocation,
+        relation_address: request.relation_allocation_va,
+        relation_generation: request.relation_allocation_generation,
+        source_allocation: None,
         source_pdo: None, allocations: ProviderAllocationCatalog::new(),
         source_snapshot: None, destination_snapshot: None,
         relation_claimed: false,
         terminal_claimed: false, terminal_published: false, event_claimed: false,
-        event_signaled: false, packet_prepared: false, reply_entered: false,
-        reply_acked: false, ack_claimed: false, cancel_requested: false,
+        event_signaled: false, event_barrier: None, terminal_handoff: None, terminal_packet: None,
+        terminal_acknowledged: false, origin_commit_requested: false, origin_committed: false, discarding: false,
+        packet_prepared: false, reply_entered: false,
+        reply_acked: false, ack_claimed: false, resources_claimed: false,
+        resources_committed: false, relation_transferred: false, cancel_requested: false,
         indeterminate: false,
     };
     let index = if let Some(index) = slot {
@@ -228,131 +326,106 @@ pub(crate) unsafe fn submit(
         rows.len() - 1
     };
     if runtime::park_retained_service(route, token).is_err() {
+        print_str(b"[source-pnp-root] retained service park failed\n");
         super::hosted_kernel_win32k_source_admission::retire(
             route, source_address, source_ticket, source_generation,
         );
         let mut work = (&mut *core::ptr::addr_of_mut!(WORK))[index].take().unwrap();
-        if !crate::win32k_subsystem::abort_source_target_relation_dispatch(&mut work.source) {
-            crate::provider_bugcheck::report(0xc4, [source_address, token, 0, 44]);
-        }
         if let Some(event) = work.event.take() { release_event(handler, event); }
         work.target.release(io_manager_mut()).expect("unparked PnP target");
         return Some(STATUS_INSUFFICIENT_RESOURCES);
     }
-    (&mut *core::ptr::addr_of_mut!(ACTIVE)).push((route, source_address, token));
+    print_str(b"[source-pnp-root] admitted and parked\n");
     None
 }
 
-pub(crate) unsafe fn completion_for_token(
-    channel: &crate::spawn_hosts::PumpChannel,
-    token: u64,
-    source: u64,
-) -> Option<i32> {
-    let _durable = crate::allocator::enter_durable();
-    if token == 0 || source == 0 { return Some(STATUS_INVALID_PARAMETER); }
-    let Ok(Some(route)) = runtime::channel_route(channel) else {
-        return Some(STATUS_INVALID_HANDLE);
+/// Authenticated broker receipt, not inference from native Reply acknowledgement.
+pub(super) unsafe fn arm_pending(
+    route: Route,
+    identity: nt_io_manager::source_pending_armed::PendingArmedIdentity,
+) -> Result<(), i32> {
+    use nt_io_manager::source_pending_armed::{PendingArmedIdentity, PendingSourceKind};
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
+    let Some(work) = rows.iter_mut().filter_map(Option::as_mut).find(|work| {
+        work.route == route && work.nonce == identity.nonce
+    }) else { return Err(STATUS_INVALID_PARAMETER); };
+    let expected = PendingArmedIdentity {
+        kind: PendingSourceKind::Pnp, nonce: work.nonce, token: work.token,
+        source_irp_va: work.source_address, source_ticket_serial: work.source_ticket,
+        native_allocation_generation: work.source_generation,
     };
-    let identity = (route, source, token);
-    if (&*core::ptr::addr_of!(COMPLETED)).contains(&identity) {
-        return Some(STATUS_SUCCESS);
-    }
-    if !(&*core::ptr::addr_of!(ACTIVE)).contains(&identity)
-        || (&*core::ptr::addr_of!(COMPLETION_WAITS)).iter().any(|wait| wait.identity == identity)
-    {
-        return Some(STATUS_INVALID_PARAMETER);
-    }
-    let dispatch = match runtime::dispatch(route) {
-        Ok(dispatch) => dispatch,
-        _ => return Some(STATUS_INVALID_HANDLE),
-    };
-    let reply = match runtime::current_reply(route) {
-        Ok(reply) => reply,
-        _ => return Some(STATUS_INVALID_HANDLE),
-    };
-    if (&mut *core::ptr::addr_of_mut!(COMPLETION_WAITS)).try_reserve(1).is_err() {
-        return Some(STATUS_INSUFFICIENT_RESOURCES);
-    }
-    let wait_token = match NEXT_WAIT_TOKEN.fetch_update(
-        Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1),
-    ) {
-        Ok(token) if token != 0 => token,
-        _ => return Some(STATUS_INSUFFICIENT_RESOURCES),
-    };
-    if runtime::park_retained_service(route, wait_token).is_err() {
-        return Some(STATUS_DEVICE_NOT_READY);
-    }
-    (&mut *core::ptr::addr_of_mut!(COMPLETION_WAITS)).push(CompletionWait {
-        identity, route, dispatch, reply, wait_token, reply_entered: false, cancelled: false,
-    });
-    None
-}
-
-unsafe fn redrive_completion_waits() {
-    let mut index = 0;
-    while index < (&*core::ptr::addr_of!(COMPLETION_WAITS)).len() {
-        let wait = &mut (&mut *core::ptr::addr_of_mut!(COMPLETION_WAITS))[index];
-        if !wait.cancelled && runtime::retained_service_cancelled(
-            wait.route, wait.dispatch, wait.reply, wait.wait_token,
-        ) {
-            runtime::acknowledge_retained_service_cancellation(
-                wait.route, wait.dispatch, wait.reply, wait.wait_token,
-            ).expect("PnP completion wait cancellation");
-            wait.cancelled = true;
-        }
-        if wait.cancelled {
-            if let Some(completed) = (&*core::ptr::addr_of!(COMPLETED))
-                .iter().position(|identity| *identity == wait.identity)
-            {
-                (&mut *core::ptr::addr_of_mut!(COMPLETED)).swap_remove(completed);
-                (&mut *core::ptr::addr_of_mut!(COMPLETION_WAITS)).swap_remove(index);
-            } else { index += 1; }
-            continue;
-        }
-        if !(&*core::ptr::addr_of!(COMPLETED)).contains(&wait.identity) {
-            index += 1;
-            continue;
-        }
-        if !wait.reply_entered {
-            wait.reply_entered = true;
-            let _ = runtime::wake_service(
-                wait.route, wait.dispatch, wait.reply, wait.wait_token, STATUS_SUCCESS,
-            );
-        }
-        let acknowledged = runtime::reconcile_retained_service_reply(
-            wait.route, wait.dispatch, wait.reply, wait.wait_token,
-        ).expect("PnP completion Reply identity");
-        if !acknowledged { index += 1; continue; }
-        runtime::retire_stopped_acknowledged_retained_service(
-            wait.route, wait.dispatch, wait.reply, wait.wait_token,
-        ).expect("PnP completion Reply retirement");
-        (&mut *core::ptr::addr_of_mut!(COMPLETION_WAITS)).swap_remove(index);
-    }
-}
-
-pub(crate) unsafe fn release_token(
-    channel: &crate::spawn_hosts::PumpChannel,
-    token: u64,
-    source: u64,
-) -> i32 {
-    let _durable = crate::allocator::enter_durable();
-    if token == 0 || source == 0 { return STATUS_INVALID_PARAMETER; }
-    let Ok(Some(route)) = runtime::channel_route(channel) else { return STATUS_INVALID_HANDLE };
-    let identity = (route, source, token);
-    redrive_completion_waits();
-    if (&*core::ptr::addr_of!(COMPLETION_WAITS)).iter().any(|wait| wait.identity == identity) {
-        return STATUS_PENDING as i32;
-    }
-    let Some(index) = (&*core::ptr::addr_of!(COMPLETED)).iter().position(|row| *row == identity)
-    else { return STATUS_INVALID_PARAMETER };
-    (&mut *core::ptr::addr_of_mut!(COMPLETED)).swap_remove(index);
-    STATUS_SUCCESS
+    if identity != expected || !work.pending || !work.reply_entered || work.indeterminate
+        || !runtime::retained_service_reply_acknowledged(
+            work.route, work.dispatch, work.reply, work.token,
+        ).unwrap_or(false)
+    { return Err(STATUS_INVALID_PARAMETER); }
+    work.origin_armed = true;
+    Ok(())
 }
 
 impl Work {
+    unsafe fn ready_for_nested_step(&self) -> bool {
+        use nt_io_manager::retained_source_progress::RetainedSourceProgress as Progress;
+        let progress = if self.indeterminate {
+            Progress::Indeterminate
+        } else if runtime::retained_service_owner_stopped(self.route, self.dispatch, self.reply, self.token) {
+            Progress::Stopped {
+                cancellation_pending: self.canonical_irp.is_some() && !self.cancel_requested,
+                completion_ready: self.canonical_irp.is_none_or(|irp| nested_irp_completion_ready_exact(irp.raw())),
+                broker_stopped: runtime::retained_service_owner_stopped_at_broker(
+                    self.route, self.dispatch, self.reply, self.token,
+                ) && self.event_barrier.is_none(),
+                source_lane_ready: crate::win32k_glue::source_terminal_dispatch_ready(),
+            }
+        } else if !self.entered {
+            Progress::AwaitingDispatch { provider_ready:
+                super::hosted_kernel_win32k_source_ioctl::target_dispatch_ready(self.target.device_id()) }
+        } else if self.pending && !self.reply_entered {
+            Progress::PublishReply
+        } else if self.reply_entered && !self.reply_acked {
+            Progress::AwaitingReply { acknowledged: runtime::retained_service_reply_acknowledged(
+                self.route, self.dispatch, self.reply, self.token,
+            ).unwrap_or(false) }
+        } else if self.pending && !self.origin_armed {
+            Progress::AwaitingOriginArmed
+        } else if self.pending && self.receipt.is_none() {
+            Progress::AwaitingCompletion {
+                completion_ready: self.canonical_irp.is_some_and(|irp| nested_irp_completion_ready_exact(irp.raw())),
+                cancellation_pending: false,
+            }
+        } else if !self.origin_committed {
+            Progress::Terminal { source_lane_ready: crate::win32k_glue::source_terminal_dispatch_ready() }
+        } else {
+            Progress::Retirement
+        };
+        progress.ready_for_nested_step()
+    }
+
+    fn progress_state(&self) -> [u64; 18] {
+        [self.entered as u64, self.pending as u64, self.reply_entered as u64,
+            self.reply_acked as u64, self.receipt.is_some() as u64, self.terminal.is_some() as u64,
+            self.terminal_acknowledged as u64, self.origin_commit_requested as u64,
+            self.origin_committed as u64, self.event_claimed as u64, self.event_signaled as u64,
+            self.ack_claimed as u64, self.cancel_requested as u64, self.resources_committed as u64,
+            self.indeterminate as u64, self.terminal_packet.is_some() as u64,
+            self.relation.is_some() as u64, self.relation_transferred as u64]
+    }
+
+    unsafe fn source_live(&self) -> bool {
+        crate::win32k_subsystem::provider_pool_packet_lease_live(self.source)
+            && self.source.native_identity().allocation_generation == self.source_generation
+    }
+
+    unsafe fn relation_live(&self) -> bool {
+        crate::win32k_subsystem::provider_pool_packet_lease_live(self.relation_allocation)
+            && self.relation_allocation.native_identity().allocation_generation
+                == self.relation_generation
+    }
+
     unsafe fn enter(&mut self) -> bool {
         if self.entered { return true; }
-        if !self.source.validate() || self.target.validate(io_manager_mut()).is_err() {
+        if !self.source_live() || !self.relation_live()
+            || self.target.validate(io_manager_mut()).is_err() {
             return false;
         }
         self.entered = true;
@@ -418,125 +491,17 @@ impl Work {
             if result.is_err() { return false; }
             self.packet_prepared = true;
         }
+        let Some(packet_lease) = self.packet_lease else { return false };
         if !crate::win32k_subsystem::publish_provider_pool_packet(
-            self.packet_lease, &self.packet,
+            packet_lease, &self.packet,
         ) { return false; }
         self.reply_entered = true;
+        self.packet_lease = None;
+        drop(core::mem::take(&mut self.packet));
         let _ = runtime::wake_service(
             self.route, self.dispatch, self.reply, self.token, status as i32,
         );
         false
-    }
-
-    unsafe fn finish_cancelled_before_entry(&mut self, handler: *mut ExecNtHandler) -> bool {
-        if self.entered || self.reply_entered { return false; }
-        if !crate::win32k_subsystem::abort_source_target_relation_dispatch(&mut self.source) {
-            return false;
-        }
-        if let Some(event) = self.event.take() { release_event(handler, event); }
-        self.target.release(io_manager_mut()).expect("cancelled PnP target");
-        runtime::acknowledge_retained_service_cancellation(
-            self.route, self.dispatch, self.reply, self.token,
-        ).expect("cancelled PnP Reply");
-        let identity = (self.route, self.source_address, self.token);
-        let index = (&*core::ptr::addr_of!(ACTIVE)).iter().position(|row| *row == identity)
-            .expect("cancelled PnP identity");
-        (&mut *core::ptr::addr_of_mut!(ACTIVE)).swap_remove(index);
-        super::hosted_kernel_win32k_source_admission::retire(
-            self.route, self.source_address, self.source_ticket, self.source_generation,
-        );
-        true
-    }
-
-    unsafe fn finish_cancelled_after_entry(&mut self, handler: *mut ExecNtHandler) -> bool {
-        if self.reply_entered || self.relation_claimed || self.terminal_claimed
-            || self.event_claimed
-        {
-            return false;
-        }
-        if self.indeterminate && self.canonical_irp.is_none() && self.receipt.is_none() {
-            return false;
-        }
-        if let Some(irp) = self.canonical_irp {
-            if !self.cancel_requested {
-                self.cancel_requested = true;
-                let _ = cancel_irp_if_pending(irp.raw());
-            }
-            if self.receipt.is_none() {
-                let Some(receipt) = io_manager_mut().take_completed_external_pnp_receipt(irp)
-                else { return false };
-                self.receipt = Some(receipt);
-            }
-        }
-        if let Some(receipt) = self.receipt.as_ref() {
-            if receipt.origin_device_id() != self.target.device_id()
-                || receipt.minor() != nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS
-                || receipt.relation_type() != Some(nt_pnp_abi::TARGET_DEVICE_RELATION)
-                || receipt.driver_pending() != self.canonical_irp.is_some()
-                || self.canonical_irp.is_some_and(|irp| receipt.irp_id() != irp)
-            {
-                crate::provider_bugcheck::report(0xc4, [self.source_address, receipt.irp_id().raw(), 0, 61]);
-            }
-            if receipt.status().is_success() {
-                if receipt.information() == 0 { return false; }
-                if self.source_allocation.is_none() {
-                    let Some(source) = hosted_driver_relation_source::DriverRelationSource::capture(
-                        receipt.completion_driver_id(), receipt.information(),
-                    ) else { return false };
-                    self.source_allocation = Some(source);
-                }
-                if self.source_pdo.is_none() {
-                    let source = self.source_allocation.as_ref().expect("cancelled PnP source allocation");
-                    if !source.validate() { return false; }
-                    let Some(domain) = source.domain() else { return false };
-                    let Ok(objects) = nt_pnp_manager::copy_device_relations_x64(source.bytes())
-                    else { return false };
-                    if objects.len() != 1 { return false; }
-                    let Some(pdo) = io_manager_mut().hosted_device_by_identity(domain, objects[0])
-                    else { return false };
-                    let Some(registration) = io_manager_mut()
-                        .hosted_device_pointer_registration(domain, objects[0])
-                    else { return false };
-                    if registration.device_id() != pdo { return false; }
-                    let Ok(reference) = io_manager_mut()
-                        .take_hosted_device_pointer_reference(registration)
-                    else { return false };
-                    self.source_pdo = Some(reference);
-                }
-            } else if receipt.information() != 0 {
-                return false;
-            }
-        }
-        if let Some(irp) = self.canonical_irp {
-            if self.ack_claimed { return false; }
-            self.ack_claimed = true;
-            if acknowledge_completed_irp_strict(irp.raw()).is_err() { return false; }
-            self.canonical_irp = None;
-        }
-        if let Some(mut reference) = self.source_pdo.take() {
-            reference.release(io_manager_mut()).expect("cancelled PnP PDO reference");
-        }
-        if let Some(source) = self.source_allocation.take() {
-            if !source.retire() {
-                crate::provider_bugcheck::report(0xc4, [self.source_address, 0, 0, 62]);
-            }
-        }
-        if !crate::win32k_subsystem::abort_source_target_relation_dispatch(&mut self.source) {
-            return false;
-        }
-        if let Some(event) = self.event.take() { release_event(handler, event); }
-        self.target.release(io_manager_mut()).expect("cancelled entered PnP target");
-        runtime::acknowledge_retained_service_cancellation(
-            self.route, self.dispatch, self.reply, self.token,
-        ).expect("cancelled entered PnP Reply");
-        let identity = (self.route, self.source_address, self.token);
-        let index = (&*core::ptr::addr_of!(ACTIVE)).iter().position(|row| *row == identity)
-            .expect("cancelled entered PnP identity");
-        (&mut *core::ptr::addr_of_mut!(ACTIVE)).swap_remove(index);
-        super::hosted_kernel_win32k_source_admission::retire(
-            self.route, self.source_address, self.source_ticket, self.source_generation,
-        );
-        true
     }
 
     unsafe fn prepare_relation(&mut self) -> bool {
@@ -547,7 +512,8 @@ impl Work {
             self.terminal = Some((receipt.status().raw() as u32, 0));
             return true;
         }
-        if !self.source.validate() || self.target.validate(io_manager_mut()).is_err() {
+        if !self.source_live() || !self.relation_live()
+            || self.target.validate(io_manager_mut()).is_err() {
             return false;
         }
         self.relation_claimed = true;
@@ -589,14 +555,8 @@ impl Work {
             Ok(address) => address,
             Err(_) => return false,
         };
-        if self.relation_allocation.is_none() {
-            let Some(relation_allocation) = crate::win32k_subsystem::allocate_source_target_relation()
-            else { return false };
-            self.relation_allocation = Some(relation_allocation);
-        }
-        let relation_allocation = self.relation_allocation.as_ref()
-            .expect("claimed PnP destination allocation");
-        if !source_allocation.validate() || !relation_allocation.validate() {
+        self.projected_pdo = Some(projected_pdo);
+        if !source_allocation.validate() || !self.relation_live() {
             return false;
         }
         let relation_bytes = nt_pnp_manager::TARGET_DEVICE_RELATIONS_X64_BYTES as u64;
@@ -615,23 +575,23 @@ impl Work {
             self.source_snapshot = Some(snapshot);
             snapshot
         };
-        let destination_native = relation_allocation.native_identity();
+        let destination_native = self.relation_allocation.native_identity();
         let destination_arena = ProviderArenaIdentity {
             id: 2, generation: destination_native.allocation_generation,
         };
         if let Some(snapshot) = self.destination_snapshot {
             if self.allocations.active_exact_capacity(
-                destination_arena, relation_allocation.address(), relation_bytes,
+                destination_arena, self.relation_address, relation_bytes,
             ) != Ok(snapshot) { return false; }
         } else {
             let Ok(snapshot) = self.allocations.register(
-                destination_arena, relation_allocation.address(), relation_bytes,
+                destination_arena, self.relation_address, relation_bytes,
             ) else { return false };
             self.destination_snapshot = Some(snapshot);
         }
         if self.relation.is_none() {
             let source_bytes = *source_allocation.bytes();
-            let relation_address = relation_allocation.address();
+            let relation_address = self.relation_address;
             let Ok(relation) = nt_pnp_manager::TargetRelationDelivery::capture(
                 io_manager_mut(), &mut self.allocations, receipt, self.target.device_id(),
                 source_allocation.address(), source_snapshot, &source_bytes,
@@ -643,33 +603,104 @@ impl Work {
         let relation = self.relation.as_mut().expect("claimed PnP relation delivery");
         match relation.phase() {
             nt_pnp_manager::TargetRelationPhase::Prepared => {
-                let written = relation_allocation.with_bytes(|bytes| {
-                    relation.write_relation(io_manager_mut(), &self.allocations, bytes)
-                });
-                if !matches!(written, Some(Ok(()))) { return false; }
+                let mut bytes = [0u8; nt_pnp_manager::TARGET_DEVICE_RELATIONS_X64_BYTES];
+                if relation.write_relation(io_manager_mut(), &self.allocations, &mut bytes).is_err() {
+                    return false;
+                }
+                if !crate::win32k_subsystem::publish_provider_pool_packet(
+                    self.relation_allocation, &bytes,
+                ) {
+                    self.indeterminate = true;
+                    return false;
+                }
             }
             nt_pnp_manager::TargetRelationPhase::RelationWritten => {}
             _ => return false,
         }
-        self.terminal = Some((receipt.status().raw() as u32, relation_allocation.address()));
+        self.terminal = Some((receipt.status().raw() as u32, self.relation_address));
         true
     }
 
-    unsafe fn publish_terminal(&mut self, handler: *mut ExecNtHandler) -> bool {
+    unsafe fn deliver_terminal(&mut self) -> bool {
+        if self.terminal_acknowledged { return true; }
+        let (status, information) = self.terminal.expect("PnP terminal result");
+        if self.terminal_handoff.is_none() {
+            if !self.source_live() || !self.relation_live() { return false; }
+            let handoff = wire::SourcePnpTerminalHandoff {
+            delivery: if self.pending { wire::TerminalDelivery::Pending } else { wire::TerminalDelivery::Inline },
+                nonce: self.nonce,
+                token: self.token,
+                source_irp_va: self.source_address,
+                source_ticket_serial: self.source_ticket,
+                native_allocation_generation: self.source_generation,
+                iosb_va: self.iosb_va,
+                relation_allocation_va: self.relation_address,
+                relation_allocation_generation: self.relation_generation,
+                status,
+                information,
+                pdo_va: if status & 0x8000_0000 == 0 { self.projected_pdo.unwrap_or(0) } else { 0 },
+            };
+            let Some((lease, mut packet)) =
+                crate::win32k_subsystem::allocate_root_provider_pool_packet(
+                    wire::TERMINAL_PACKET_BYTES,
+                )
+            else { return false };
+            if wire::encode_terminal_handoff(handoff, &mut packet).is_err()
+                || !crate::win32k_subsystem::publish_provider_pool_packet(lease, &packet)
+            {
+                if !crate::win32k_subsystem::retire_root_provider_pool_packet(lease) {
+                    crate::provider_bugcheck::report(0xc4, [self.source_address, self.token, 0, 63]);
+                }
+                return false;
+            }
+            self.terminal_handoff = Some(handoff);
+            self.terminal_packet = Some(lease);
+        }
+        if self.discarding { return true; }
+        let lease = self.terminal_packet.expect("retained terminal packet");
+        let dispatch = crate::win32k_glue::dispatch_source_pnp_terminal(
+            lease.address(), wire::TERMINAL_PACKET_BYTES as u64,
+        );
+        match dispatch {
+            crate::win32k_glue::SourcePnpTerminalDispatch::NotEntered(_) => return false,
+            crate::win32k_glue::SourcePnpTerminalDispatch::Returned(status)
+                if status == nt_io_manager::source_terminal::TERMINAL_NOT_READY => return false,
+            crate::win32k_glue::SourcePnpTerminalDispatch::Returned(0) => {}
+            _ => { self.indeterminate = true; return false; }
+        }
+        let (actual, packet) = match crate::win32k_subsystem::capture_provider_pool_packet(
+            lease.address(), wire::TERMINAL_PACKET_BYTES,
+        ) {
+            Ok(captured) => captured,
+            Err(_) => {
+                self.indeterminate = true;
+                return false;
+            }
+        };
+        let ack = wire::decode_terminal_ack(&packet);
+        if actual.native_identity() != lease.native_identity()
+            || !matches!(ack, Ok(ack) if
+                ack.handoff == self.terminal_handoff.expect("retained terminal handoff")
+                    && ack.publication == wire::TerminalPublication::Published)
+        {
+            self.indeterminate = true;
+            return false;
+        }
+        self.terminal_acknowledged = true;
+        true
+    }
+
+    unsafe fn accept_terminal_ack(&mut self) -> bool {
+        if !self.terminal_acknowledged {
+            return false;
+        }
         if !self.terminal_published {
             if self.terminal_claimed { return false; }
-            let Some(iosb_address) = self.iosb_target.address_if_live(self.route) else { return false };
-            if !self.source.validate()
-                || self.source_allocation.as_ref().is_some_and(|source| !source.validate())
-                || self.relation_allocation.as_ref().is_some_and(|relation| !relation.validate())
-            {
+            if self.source_allocation.as_ref().is_some_and(|source| !source.validate()) {
                 return false;
             }
             let (status, information) = self.terminal.expect("PnP terminal status");
             self.terminal_claimed = true;
-            if !self.source.publish_terminal(status, information, iosb_address) {
-                return false;
-            }
             if let Some(relation) = &mut self.relation {
                 if relation.iosb_published(nt_status::NtStatus(status as i32), information).is_err() {
                     crate::provider_bugcheck::report(0xc4, [self.source_address, information, 0, 45]);
@@ -677,6 +708,11 @@ impl Work {
             }
             self.terminal_published = true;
         }
+        true
+    }
+
+    unsafe fn signal_event(&mut self, handler: *mut ExecNtHandler) -> bool {
+        if !self.terminal_published || !self.terminal_acknowledged { return false; }
         if !self.event_signaled {
             if self.event_claimed { return false; }
             if let Some(event) = &self.event {
@@ -687,12 +723,12 @@ impl Work {
                     &mut (*handler).event_objects,
                 ).identity(event.provider, event.local);
                 if !matches!(actual, Ok((id, _, _, _)) if id == event.id) { return false; }
+                let barrier = match crate::source_event_completion::capture(handler, event.id) {
+                    Ok(barrier) => barrier,
+                    Err(_) => return false,
+                };
+                self.event_barrier = Some(barrier);
                 self.event_claimed = true;
-                if crate::provider_local_event::signal(
-                    &mut *handler, event.provider, event.local, EventSignalMode::Set,
-                ).is_err() || !self.source.mirror_event_signaled() {
-                    return false;
-                }
             } else {
                 self.event_claimed = true;
             }
@@ -701,8 +737,32 @@ impl Work {
         true
     }
 
-    unsafe fn retire(&mut self, handler: *mut ExecNtHandler) -> bool {
-        if !self.source.validate() || self.target.validate(io_manager_mut()).is_err() {
+    unsafe fn commit_origin(&mut self, handler: *mut ExecNtHandler) -> bool {
+        if self.indeterminate { return false; }
+        if self.origin_committed { return self.event_barrier.is_none(); }
+        if !self.terminal_acknowledged || !self.event_signaled { return false; }
+        let length = wire::TERMINAL_PACKET_BYTES;
+        if !super::hosted_kernel_win32k_source_ioctl::commit_origin_packet(
+            &mut self.terminal_packet, length, 96,
+            &mut self.origin_commit_requested, &mut self.indeterminate, false,
+            self.event_barrier.map_or(0, |barrier| barrier.sequence()),
+            crate::win32k_glue::dispatch_source_pnp_terminal,
+        ) { return false; }
+        self.origin_committed = true;
+        if let Some(barrier) = self.event_barrier {
+            if crate::source_event_completion::release(handler, barrier).is_err() {
+                self.indeterminate = true;
+                return false;
+            }
+            self.event_barrier = None;
+        }
+        true
+    }
+
+    unsafe fn commit_terminal(&mut self, handler: *mut ExecNtHandler) -> bool {
+        if self.resources_committed { return true; }
+        if !self.terminal_acknowledged || !self.terminal_published
+            || self.target.validate(io_manager_mut()).is_err() {
             return false;
         }
         if let Some(irp) = self.canonical_irp {
@@ -711,6 +771,7 @@ impl Work {
             if acknowledge_completed_irp_strict(irp.raw()).is_err() { return false; }
             self.canonical_irp = None;
         }
+        if !self.relation_transferred {
         if let Some(relation) = &mut self.relation {
             let receipt = self.receipt.as_ref().expect("successful PnP receipt");
             // Pending completion requires the strict ACK above. An inline return has already
@@ -724,14 +785,14 @@ impl Work {
             }
             let transferred = relation.transfer(io_manager_mut(), &mut self.allocations)
                 .expect("acknowledged PnP relation transfer");
-            let allocation = self.relation_allocation.as_mut()
-                .expect("acknowledged win32k relation allocation");
-            if transferred.relation.base != allocation.address()
+            if transferred.relation.base != self.relation_address
                 || transferred.pdo_reference.address() != transferred.projected_pdo
-                || !allocation.transfer_to_caller()
+                || Some(transferred.projected_pdo) != self.projected_pdo
             {
                 crate::provider_bugcheck::report(0xc4, [self.source_address, transferred.relation.base, 0, 47]);
             }
+        }
+        self.relation_transferred = true;
         }
         if let Some(mut reference) = self.source_pdo.take() {
             reference.release(io_manager_mut())
@@ -742,19 +803,128 @@ impl Work {
                 crate::provider_bugcheck::report(0xc4, [self.source_address, 0, 0, 48]);
             }
         }
-        if !crate::win32k_subsystem::release_source_target_relation_dispatch(&mut self.source) {
-            return false;
-        }
+        if !self.signal_event(handler) || !self.commit_origin(handler) { return false; }
         if let Some(event) = self.event.take() { release_event(handler, event); }
         self.target.release(io_manager_mut()).expect("terminal PnP target");
+        self.resources_committed = true;
+        true
+    }
+
+    unsafe fn retire(&mut self) -> bool {
+        if !self.resources_committed || !self.reply_acked { return false; }
         runtime::retire_stopped_acknowledged_retained_service(
             self.route, self.dispatch, self.reply, self.token,
         ).expect("PnP Reply retirement");
-        let identity = (self.route, self.source_address, self.token);
-        let index = (&*core::ptr::addr_of!(ACTIVE)).iter().position(|row| *row == identity)
-            .expect("active PnP identity");
-        (&mut *core::ptr::addr_of_mut!(ACTIVE)).swap_remove(index);
-        (&mut *core::ptr::addr_of_mut!(COMPLETED)).push(identity);
+        super::hosted_kernel_win32k_source_admission::retire(
+            self.route, self.source_address, self.source_ticket, self.source_generation,
+        );
+        true
+    }
+
+    unsafe fn finish_stopped(&mut self, handler: *mut ExecNtHandler) -> bool {
+        if self.indeterminate { return false; }
+        if let Some(irp) = self.canonical_irp {
+            if !self.cancel_requested {
+                self.cancel_requested = true;
+                let _ = cancel_irp_if_pending(irp.raw());
+            }
+            if self.receipt.is_none() {
+                let Some(receipt) = io_manager_mut().take_completed_external_pnp_receipt(irp) else { return false };
+                self.receipt = Some(receipt);
+            }
+        }
+        // Only a sealed stop while physically parked in this broker Call proves local guards
+        // cannot be held. A stopped-running or whole-domain owner remains quarantined.
+        if !runtime::retained_service_owner_stopped_at_broker(
+            self.route, self.dispatch, self.reply, self.token,
+        ) { return false; }
+        if self.event_barrier.is_some() || self.resources_committed {
+            // Canonical transfer/signal preparation already began; do not turn an uncertain
+            // committed terminal into a new cancellation transaction.
+            return false;
+        }
+        {
+        if let Some(receipt) = self.receipt.as_ref() {
+            if receipt.origin_device_id() != self.target.device_id()
+                || receipt.minor() != nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS
+                || receipt.relation_type() != Some(nt_pnp_abi::TARGET_DEVICE_RELATION)
+                || receipt.driver_pending() != self.pending
+                || self.canonical_irp.is_some_and(|irp| receipt.irp_id() != irp)
+            {
+                crate::provider_bugcheck::report(0xc4, [self.source_address, receipt.irp_id().raw(), 0, 61]);
+            }
+            if receipt.status().is_success() {
+                if receipt.information() == 0 { return false; }
+                if self.source_allocation.is_none() {
+                    let Some(source) = hosted_driver_relation_source::DriverRelationSource::capture(
+                        receipt.completion_driver_id(), receipt.information(),
+                    ) else { return false };
+                    self.source_allocation = Some(source);
+                }
+                if self.source_pdo.is_none() {
+                    let source = self.source_allocation.as_ref().expect("cancelled PnP source allocation");
+                    if !source.validate() { return false; }
+                    let Some(domain) = source.domain() else { return false };
+                    let Ok(objects) = nt_pnp_manager::copy_device_relations_x64(source.bytes())
+                    else { return false };
+                    if objects.len() != 1 { return false; }
+                    let Some(pdo) = io_manager_mut().hosted_device_by_identity(domain, objects[0])
+                    else { return false };
+                    let Some(registration) = io_manager_mut()
+                        .hosted_device_pointer_registration(domain, objects[0])
+                    else { return false };
+                    if registration.device_id() != pdo { return false; }
+                    let Ok(reference) = io_manager_mut()
+                        .take_hosted_device_pointer_reference(registration)
+                    else { return false };
+                    self.source_pdo = Some(reference);
+                }
+            } else if receipt.information() != 0 {
+                return false;
+            }
+        }
+            if let Some(irp) = self.canonical_irp {
+                if self.ack_claimed { return false; }
+                self.ack_claimed = true;
+                if acknowledge_completed_irp_strict(irp.raw()).is_err() {
+                    self.indeterminate = true;
+                    return false;
+                }
+                self.canonical_irp = None;
+            }
+            if let Some(relation) = &mut self.relation {
+                let receipt = self.receipt.as_ref().expect("stopped PnP exact receipt");
+                if relation.discard_after_canonical_retirement(io_manager_mut(), &mut self.allocations, receipt).is_err() {
+                    self.indeterminate = true;
+                    return false;
+                }
+            }
+            self.relation = None;
+            if self.terminal_packet.is_none() { self.terminal = Some((0xc000_0120, 0)); }
+            self.discarding = true;
+            if !self.deliver_terminal() { return false; }
+            let length = wire::TERMINAL_PACKET_BYTES;
+            if !super::hosted_kernel_win32k_source_ioctl::commit_origin_packet(
+                &mut self.terminal_packet, length, 96,
+                &mut self.origin_commit_requested, &mut self.indeterminate, true, 0,
+                crate::win32k_glue::dispatch_source_pnp_terminal,
+            ) { return false; }
+            self.origin_committed = true;
+            if let Some(mut reference) = self.source_pdo.take() {
+                reference.release(io_manager_mut()).expect("stopped PnP source PDO");
+            }
+            if let Some(source) = self.source_allocation.take() {
+                if !source.retire() { self.indeterminate = true; return false; }
+            }
+        }
+        if !self.resources_committed {
+            if let Some(event) = self.event.take() { release_event(handler, event); }
+            self.target.release(io_manager_mut()).expect("stopped source target");
+            self.resources_committed = true;
+        }
+        runtime::acknowledge_retained_service_cancellation(
+            self.route, self.dispatch, self.reply, self.token,
+        ).expect("sealed broker-stopped source Reply");
         super::hosted_kernel_win32k_source_admission::retire(
             self.route, self.source_address, self.source_ticket, self.source_generation,
         );
@@ -762,24 +932,22 @@ impl Work {
     }
 
     unsafe fn advance(&mut self, handler: *mut ExecNtHandler) -> bool {
-        if !self.entered && runtime::retained_service_cancelled(
-            self.route, self.dispatch, self.reply, self.token,
-        ) {
-            return self.finish_cancelled_before_entry(handler);
+        if runtime::retained_service_owner_stopped(self.route, self.dispatch, self.reply, self.token) {
+            return self.finish_stopped(handler);
+        }
+        if !self.entered && !super::hosted_kernel_win32k_source_ioctl::target_dispatch_ready(self.target.device_id()) {
+            return false;
         }
         if !self.enter() { return false; }
-        if runtime::retained_service_cancelled(
-            self.route, self.dispatch, self.reply, self.token,
-        ) && !self.reply_entered {
-            return self.finish_cancelled_after_entry(handler);
-        }
         if self.indeterminate { return false; }
         if self.pending && !self.reply_entered {
             return self.publish_reply(STATUS_PENDING as u32);
         }
         if !self.pending && !self.reply_entered {
             if self.receipt.is_some() && !self.prepare_relation() { return false; }
-            if !self.publish_terminal(handler) { return false; }
+            if !self.deliver_terminal()
+                || !self.accept_terminal_ack()
+                || !self.commit_terminal(handler) { return false; }
             let (status, _) = self.terminal.expect("inline PnP terminal");
             return self.publish_reply(status);
         }
@@ -789,6 +957,7 @@ impl Work {
             ).expect("PnP Reply identity");
             if !self.reply_acked { return false; }
         }
+        if self.pending && !self.origin_armed { return false; }
         if self.pending && self.receipt.is_none() {
             let Some(irp) = self.canonical_irp else { return false };
             let Some(receipt) = io_manager_mut().take_completed_external_pnp_receipt(irp)
@@ -804,31 +973,52 @@ impl Work {
             self.receipt = Some(receipt);
         }
         if self.pending {
-            if !self.prepare_relation() || !self.publish_terminal(handler) { return false; }
+            if !self.prepare_relation()
+                || !self.deliver_terminal()
+                || !self.accept_terminal_ack()
+                || !self.commit_terminal(handler) { return false; }
         }
-        self.retire(handler)
+        self.retire()
     }
 }
 
-pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
+unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> bool {
     let _durable = crate::allocator::enter_durable();
-    redrive_completion_waits();
     let count = (&*core::ptr::addr_of!(WORK)).len();
-    if count == 0 { return; }
+    if count == 0 { return false; }
     let start = CURSOR.load(Ordering::Relaxed) as usize % count;
     let Some((index, mut work)) = (0..count).find_map(|step| {
         let index = (start + step) % count;
         if (&*core::ptr::addr_of!(EXECUTING)).contains(&index) { return None; }
+        if nested_ready_only && !(&*core::ptr::addr_of!(WORK))[index]
+            .as_ref().is_some_and(|work| work.ready_for_nested_step()) { return None; }
         (&mut *core::ptr::addr_of_mut!(WORK))[index].take().map(|work| (index, work))
-    }) else { return };
+    }) else { return false };
     if (&mut *core::ptr::addr_of_mut!(EXECUTING)).try_reserve(1).is_err() {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
-        return;
+        return false;
     }
     (&mut *core::ptr::addr_of_mut!(EXECUTING)).push(index);
     CURSOR.store(index as u64 + 1, Ordering::Relaxed);
+    let before = work.progress_state();
     let done = work.advance(handler);
+    let progressed = done || before != work.progress_state();
     if !done { (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work); }
     assert_eq!((&mut *core::ptr::addr_of_mut!(EXECUTING)).pop(), Some(index));
-    redrive_completion_waits();
+    progressed
+}
+
+pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
+    let _ = redrive_one(handler, false);
+}
+
+pub(super) unsafe fn nested_work_ready() -> bool {
+    (&*core::ptr::addr_of!(WORK)).iter().enumerate().any(|(index, row)| {
+        !(&*core::ptr::addr_of!(EXECUTING)).contains(&index)
+            && row.as_ref().is_some_and(|work| work.ready_for_nested_step())
+    })
+}
+
+pub(super) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
+    redrive_one(handler, true)
 }

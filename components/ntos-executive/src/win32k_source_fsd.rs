@@ -114,14 +114,6 @@ impl SourceFsdDispatchLease {
         true
     }
 
-    pub(crate) unsafe fn mirror_event_signaled(&self) -> bool {
-        if !self.validate() { return false; }
-        if self.event_lease.is_some() {
-            let _metadata = ProviderMetadataGuard::acquire();
-            mirror_projected_event_state(self.event_va, true);
-        }
-        true
-    }
 }
 
 pub(crate) unsafe fn admit(
@@ -346,14 +338,9 @@ pub(crate) unsafe fn admit(
     result
 }
 
-unsafe fn finish(lease: &mut SourceFsdDispatchLease, retire_source: bool) -> bool {
+unsafe fn finish(lease: &mut SourceFsdDispatchLease, retire_source: bool, mirror_event: Option<u64>) -> bool {
     if !lease.validate() { return false; }
-    if let Some(event) = lease.event_lease.take() {
-        let _metadata = ProviderMetadataGuard::acquire();
-        if provider_local_events_mut().is_none_or(|events| events.release_lease(event).is_err()) {
-            crate::provider_bugcheck::report(0xc4, [W32_SOURCE_FSD_LABEL, lease.event_va, 0, 9]);
-        }
-    }
+    let event = lease.event_lease.take();
     file_ioctl_target::release_output(core::mem::replace(
         &mut lease.output_pin, file_ioctl_target::PinnedIoctlOutput::None,
     ));
@@ -376,13 +363,18 @@ unsafe fn finish(lease: &mut SourceFsdDispatchLease, retire_source: bool) -> boo
     {
         crate::provider_bugcheck::report(0xc4, [W32_SOURCE_FSD_LABEL, address, 0, 11]);
     }
-    true
+    source_irp::finish_terminal_event(event, lease.event_va, mirror_event)
 }
 
 pub(crate) unsafe fn release(lease: &mut SourceFsdDispatchLease) -> bool {
-    finish(lease, true)
+    finish(lease, true, None)
+}
+
+pub(crate) unsafe fn commit(lease: &mut SourceFsdDispatchLease, sequence: u64) -> bool {
+    if lease.event_lease.is_some() != (sequence != 0) { return false; }
+    finish(lease, true, Some(sequence))
 }
 
 pub(crate) unsafe fn abort(lease: &mut SourceFsdDispatchLease) -> bool {
-    finish(lease, false)
+    finish(lease, false, None)
 }

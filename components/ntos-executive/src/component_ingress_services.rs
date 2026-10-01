@@ -1,6 +1,7 @@
 //! Retained autonomous services and asynchronous driver wait Replies.
 
 use super::*;
+use crate::{print_hex_u64, print_str};
 
 #[derive(Clone, Copy, PartialEq)]
 enum WaitPhase {
@@ -16,19 +17,25 @@ enum WaitPhase {
 }
 
 impl WaitPhase {
-    fn blocks_new_dispatch(self, same_dispatch: bool) -> bool {
-        match self {
-            Self::Finished => false,
-            // The Call and Reply have finished, but its semantic owner still needs the exact
-            // tombstone. A later dispatch on the same physical route must not wait for that.
-            Self::CompletedAcknowledged => same_dispatch,
-            _ => true,
-        }
+    fn blocks_new_call(self) -> bool {
+        use nt_component_suspension::ServiceWaitOccupancy;
+        let occupancy = match self {
+            Self::Finished => ServiceWaitOccupancy::Retired,
+            Self::CompletedAcknowledged => ServiceWaitOccupancy::ReplyAcknowledged,
+            _ => ServiceWaitOccupancy::InFlight,
+        };
+        occupancy.blocks_new_call()
     }
 
     fn has_cancellable_call(self) -> bool {
         !matches!(self, Self::Finished | Self::CompletedAcknowledged)
     }
+}
+static SERVICE_WAIT_TOKENS: nt_component_suspension::ServiceWaitTokenIssuer =
+    nt_component_suspension::ServiceWaitTokenIssuer::new();
+
+pub(crate) fn next_service_wait_token() -> Result<u64, ()> {
+    SERVICE_WAIT_TOKENS.issue().ok_or(())
 }
 #[derive(Clone, Copy, PartialEq)]
 enum WaitKind {
@@ -125,19 +132,50 @@ fn service_source_supported(kind: PhysicalSourceKind) -> bool {
 }
 
 unsafe fn park(route: PeerRoute, token: u64, kind: WaitKind) -> Result<(), Error> {
-    let source = physical_source(route)?;
+    let source = physical_source(route).map_err(|error| {
+        print_str(b"[retained-park] physical source lookup failed\n");
+        error
+    })?;
     if !service_source_supported(source.kind) {
+        print_str(b"[retained-park] unsupported physical source kind\n");
         return Err(Error::Protocol);
     }
-    let dispatch = dispatch(route)?;
-    let reply = current_reply(route)?;
+    let dispatch = dispatch(route).map_err(|error| {
+        print_str(b"[retained-park] dispatch lookup failed\n");
+        error
+    })?;
+    let reply = current_reply(route).map_err(|error| {
+        print_str(b"[retained-park] current reply lookup failed\n");
+        error
+    })?;
     let autonomous = matches!(source.kind, PhysicalSourceKind::SystemThread { .. });
     let waits = &mut *core::ptr::addr_of_mut!(WAITS);
-    if token == 0
-        || waits.iter().any(|row| {
-            row.route == route && row.phase.blocks_new_dispatch(row.dispatch == dispatch)
-        })
-    {
+    if token == 0 {
+        print_str(b"[retained-park] zero token\n");
+        return Err(Error::Admission);
+    }
+    if let Some(row) = waits.iter().find(|row| {
+        row.route == route && row.phase.blocks_new_call()
+    }) {
+        print_str(b"[retained-park] existing route wait token=0x");
+        print_hex_u64(token);
+        print_str(b" prior=0x");
+        print_hex_u64(row.token);
+        print_str(b" phase=");
+        print_str(match row.phase {
+            WaitPhase::Entering => b"entering",
+            WaitPhase::Parked => b"parked",
+            WaitPhase::ReplyEntered => b"reply-entered",
+            WaitPhase::Acknowledged => b"acknowledged",
+            WaitPhase::Resumed => b"resumed",
+            WaitPhase::CompletedAcknowledged => b"completed-acknowledged",
+            WaitPhase::StoppedAcknowledged => b"stopped-acknowledged",
+            WaitPhase::Cancelled => b"cancelled",
+            WaitPhase::Finished => b"finished",
+        });
+        print_str(b" same-dispatch=");
+        crate::print_u64(u64::from(row.dispatch == dispatch));
+        print_str(b"\n");
         return Err(Error::Admission);
     }
     let index = if let Some(index) = waits
@@ -147,7 +185,10 @@ unsafe fn park(route: PeerRoute, token: u64, kind: WaitKind) -> Result<(), Error
         index
     } else {
         let _durable = crate::allocator::enter_durable();
-        waits.try_reserve(1).map_err(|_| Error::Capacity)?;
+        waits.try_reserve(1).map_err(|_| {
+            print_str(b"[retained-park] wait capacity failed\n");
+            Error::Capacity
+        })?;
         waits.push(Wait {
             route,
             dispatch,
@@ -178,6 +219,9 @@ unsafe fn park(route: PeerRoute, token: u64, kind: WaitKind) -> Result<(), Error
         .suspend_running(route.identity().lane, reply, token)
         .is_err()
     {
+        print_str(b"[retained-park] lane suspend failed token=0x");
+        print_hex_u64(token);
+        print_str(b"\n");
         // Lane admission has no native effect and preserves its prior phase on failure.
         waits[index].phase = WaitPhase::Finished;
         return Err(Error::Admission);
@@ -320,6 +364,28 @@ pub(crate) unsafe fn wake_file_create_service(
         token,
         ServiceCompletion::FileCreate(completion),
     )
+}
+
+/// Observe exact Reply acknowledgement without changing wait phases or performing a send.
+pub(crate) unsafe fn retained_service_reply_acknowledged(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+) -> Result<bool, Error> {
+    let wait = (&*core::ptr::addr_of!(WAITS)).iter().find(|row| {
+        row.kind == WaitKind::RetainedSemantic && row.route == route
+            && row.dispatch == dispatch && row.reply == reply && row.token == token
+    }).ok_or(Error::Admission)?;
+    match wait.phase {
+        WaitPhase::Acknowledged | WaitPhase::Resumed | WaitPhase::CompletedAcknowledged
+        | WaitPhase::StoppedAcknowledged | WaitPhase::Finished => Ok(true),
+        WaitPhase::ReplyEntered => owner()
+            .receiver.as_ref().expect("ready receiver")
+            .stored_reply_acknowledged(route, dispatch, reply)
+            .map_err(|_| Error::Retirement),
+        _ => Ok(false),
+    }
 }
 
 /// A send may have consumed the physical Reply even if its wrapper returned an error.
@@ -671,6 +737,59 @@ pub(crate) unsafe fn retained_service_cancelled(
     })
 }
 
+/// Exact semantic ownership plus a sealed installation stop, including Calls whose
+/// pending Reply was acknowledged before the owner stopped. Missing routes are not proof.
+pub(crate) unsafe fn retained_service_owner_stopped(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+) -> bool {
+    use nt_component_suspension::PeerRetirementPhase;
+    let exact = (&*core::ptr::addr_of!(WAITS)).iter().any(|wait| {
+        wait.kind == WaitKind::RetainedSemantic
+            && wait.route == route
+            && wait.dispatch == dispatch
+            && wait.reply == reply
+            && wait.token == token
+            && matches!(
+                wait.phase,
+                WaitPhase::Cancelled
+                    | WaitPhase::StoppedAcknowledged
+                    | WaitPhase::CompletedAcknowledged
+            )
+    });
+    exact
+        && owner().installations.iter().any(|installation| {
+            installation.route() == route
+                && matches!(
+                    installation.phase(),
+                    PeerInstallationPhase::Retiring(
+                        PeerRetirementPhase::Stopped
+                            | PeerRetirementPhase::Drained
+                            | PeerRetirementPhase::ClearingFault
+                            | PeerRetirementPhase::FaultCleared
+                            | PeerRetirementPhase::DeletingChild
+                            | PeerRetirementPhase::ChildDeleted
+                            | PeerRetirementPhase::DeletingRoot
+                            | PeerRetirementPhase::RootDeleted
+                    )
+                )
+        })
+}
+
+/// No acknowledged Reply could have returned the component to provider code. Its original
+/// broker Call is still the safe point at which the origin released its metadata guards.
+pub(crate) unsafe fn retained_service_owner_stopped_at_broker(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+) -> bool {
+    retained_service_cancelled(route, dispatch, reply, token)
+        && retained_service_owner_stopped(route, dispatch, reply, token)
+}
+
 pub(crate) unsafe fn acknowledge_retained_service_cancellation(
     route: PeerRoute,
     dispatch: LaneDispatchIdentity,
@@ -744,10 +863,9 @@ mod tests {
 
     #[test]
     fn completed_semantic_tombstone_does_not_block_next_dispatch() {
-        assert!(WaitPhase::CompletedAcknowledged.blocks_new_dispatch(true));
-        assert!(!WaitPhase::CompletedAcknowledged.blocks_new_dispatch(false));
+        assert!(!WaitPhase::CompletedAcknowledged.blocks_new_call());
         assert!(!WaitPhase::CompletedAcknowledged.has_cancellable_call());
-        assert!(WaitPhase::Parked.blocks_new_dispatch(false));
+        assert!(WaitPhase::Parked.blocks_new_call());
         assert!(WaitPhase::Parked.has_cancellable_call());
     }
 }

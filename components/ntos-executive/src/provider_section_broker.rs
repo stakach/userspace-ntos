@@ -94,7 +94,6 @@ struct MetadataWork {
 }
 
 static mut PENDING: Vec<Pending> = Vec::new();
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static NEXT_RETRY: AtomicU64 = AtomicU64::new(0);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 static EXECUTING: AtomicBool = AtomicBool::new(false);
@@ -126,10 +125,7 @@ unsafe fn create(
     request: SectionCreateRequest,
 ) -> Result<(u64, u64), u32> {
     let owner_pi = handler.native_section_owner_pi(caller)?;
-    let token = NEXT_TOKEN
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-            next.checked_add(1)
-        })
+    let token = spawn_hosts::shared_ingress::owner::runtime::next_service_wait_token()
         .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     let owner = Owner {
         route,
@@ -274,9 +270,7 @@ pub(crate) unsafe fn submit(
                 return Err(STATUS_INVALID_HANDLE);
             }
         };
-        let token = match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-            next.checked_add(1)
-        }) {
+        let token = match spawn_hosts::shared_ingress::owner::runtime::next_service_wait_token() {
             Ok(token) => token,
             Err(_) => {
                 reference

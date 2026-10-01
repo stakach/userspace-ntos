@@ -30,6 +30,16 @@ static mut FRAME_RIGHTS: [u64; MAX_FRAMES] = [RO_NX; MAX_FRAMES];
 static IMPORTS_READY: AtomicBool = AtomicBool::new(false);
 static mut IMPORT_LINKAGE: Option<SehLinkageImage> = None;
 
+/// Export authority comes from the exact admitted image, never an arbitrary mapped pointer.
+pub(crate) unsafe fn win32k_exports(pml4: u64) -> Option<nt_pe_loader::module_namespace::ImageExports> {
+    if !PUBLISHED.load(Ordering::Acquire) { return None; }
+    let state = (&*core::ptr::addr_of!(STATE)).as_ref()?;
+    if state.pml4 != pml4 || !crate::win32k_provider_domain_is_current(state.provider) { return None; }
+    let catalog = state.catalog.try_borrow().ok()?;
+    let image = catalog.images().iter().find(|image| image.base() == crate::win32k_subsystem::WIN32K_CODE_VA)?;
+    nt_pe_loader::module_namespace::ImageExports::from_mapped("win32k.sys", image.base(), image.mapped_bytes()).ok()
+}
+
 pub(crate) struct Prepared {
     bytes: Vec<u8>,
     rights: [u64; MAX_FRAMES],

@@ -427,9 +427,17 @@ pub(super) extern "win64" fn build_synchronous_fsd_request(
                 end > WIN32K_POOL_VADDR + WIN32K_POOL_FRAMES * 0x1000
             })
         {
+            print_str(b"[win32k-fsd-builder] rejected arguments major=0x");
+            print_hex_u64(major as u64);
+            print_str(b" device=0x");
+            print_hex_u64(device);
+            print_str(b" iosb=0x");
+            print_hex_u64(iosb);
+            print_str(b"\n");
             return 0;
         }
         if crate::driver_launch::win32k_device_pointers::reference(device).is_err() {
+            print_str(b"[win32k-fsd-builder] device reference rejected\n");
             return 0;
         }
         let stack_count = read_unaligned((device + 0x4c) as *const u8);
@@ -438,6 +446,7 @@ pub(super) extern "win64" fn build_synchronous_fsd_request(
             crate::provider_bugcheck::report(0xc4, [0x57495250, device, 4, 30]);
         }
         let Some(activation) = active_provider_stack_event_activation() else {
+            print_str(b"[win32k-fsd-builder] no provider activation\n");
             return 0;
         };
         let byte_offset = if transfer {
@@ -460,6 +469,15 @@ pub(super) extern "win64" fn build_synchronous_fsd_request(
             length,
             byte_offset,
         ) else {
+            print_str(b"[win32k-fsd-builder] invalid plan major=0x");
+            print_hex_u64(major as u64);
+            print_str(b" device=0x");
+            print_hex_u64(device);
+            print_str(b" stack=0x");
+            print_hex_u64(stack_count as u64);
+            print_str(b" flags=0x");
+            print_hex_u64(device_flags as u64);
+            print_str(b"\n");
             return 0;
         };
         let mut write_copy = Vec::new();
@@ -475,6 +493,7 @@ pub(super) extern "win64" fn build_synchronous_fsd_request(
             }
         }
         let Some((irp, ticket)) = allocate(stack_count) else {
+            print_str(b"[win32k-fsd-builder] IRP allocation failed\n");
             return 0;
         };
         let allocation = {
@@ -568,6 +587,7 @@ pub(super) extern "win64" fn build_synchronous_fsd_request(
             true
         };
         if !built {
+            print_str(b"[win32k-fsd-builder] materialization failed\n");
             if let Some((_, _, pin)) = output_target {
                 file_ioctl_target::release_output(pin);
             }
@@ -602,6 +622,11 @@ pub(super) extern "win64" fn build_synchronous_fsd_request(
         write_unaligned((irp + 0x50) as *mut u64, event);
         write_unaligned((irp + 0x70) as *mut u64, plan.user_buffer);
         write_unaligned((irp + 0x98) as *mut u64, s_current_thread());
+        print_str(b"[win32k-fsd-builder] built major=0x");
+        print_hex_u64(major as u64);
+        print_str(b" irp=0x");
+        print_hex_u64(irp);
+        print_str(b"\n");
         irp
     }
 }
@@ -629,23 +654,38 @@ pub(super) struct SourceIrpDispatchLease {
 /// The provider catalog and native pool identities must still describe this packet.
 pub(super) unsafe fn retain_dispatch(address: u64) -> Option<SourceIrpDispatchLease> {
     if !provider_pool_contains(address) {
+        print_str(b"[source-irp-retain] outside provider pool\n");
         return None;
     }
-    let (mut metadata, _pool) = provider_metadata_pool_lock()?;
-    let (ticket, allocation) = ledger()?.allocation_at(WIN32K_POOL_VADDR, address)?;
-    if registered_provider_wait_domain() != Some(allocation.provider)
-        || provider_allocations_unlocked(&mut metadata)?
-            .snapshot_active(allocation.catalog.identity)
-            .ok()?
-            != allocation.catalog
-    {
+    let (mut metadata, _pool) = provider_metadata_pool_lock().or_else(|| {
+        print_str(b"[source-irp-retain] metadata lock unavailable\n");
+        None
+    })?;
+    let source_ledger = ledger().or_else(|| {
+        print_str(b"[source-irp-retain] ledger unavailable\n");
+        None
+    })?;
+    let (ticket, allocation) = source_ledger.allocation_at(WIN32K_POOL_VADDR, address).or_else(|| {
+        print_str(b"[source-irp-retain] allocation ledger missing\n");
+        None
+    })?;
+    if registered_provider_wait_domain() != Some(allocation.provider) {
+        print_str(b"[source-irp-retain] provider domain changed\n");
+        return None;
+    }
+    let catalog = provider_allocations_unlocked(&mut metadata).or_else(|| {
+        print_str(b"[source-irp-retain] provider catalog unavailable\n");
+        None
+    })?;
+    if catalog.snapshot_active(allocation.catalog.identity).ok() != Some(allocation.catalog) {
+        print_str(b"[source-irp-retain] provider catalog mismatch\n");
         return None;
     }
     let memory = ProviderPoolMemory;
     let offset = address - WIN32K_POOL_VADDR;
     if shared_pool::allocation_identity(&memory, offset) != Ok(allocation.native)
-        || shared_pool::allocation_capacity(&memory, offset) != Ok(allocation.native_capacity)
-    {
+        || shared_pool::allocation_capacity(&memory, offset) != Ok(allocation.native_capacity) {
+        print_str(b"[source-irp-retain] native pool generation mismatch\n");
         return None;
     }
     let header = KernelIrpDispatchHeader {
@@ -661,8 +701,20 @@ pub(super) unsafe fn retain_dispatch(address: u64) -> Option<SourceIrpDispatchLe
         allocation.stack_count,
         header,
     )
-    .ok()?;
-    ledger()?.pin(ticket, allocation).ok()?;
+    .map_err(|_| {
+        print_str(b"[source-irp-retain] WDM cursor invalid location=0x");
+        print_hex(header.current_location as u32);
+        print_str(b" stack=0x");
+        print_hex_u64(header.current_stack_location);
+        print_str(b" count=0x");
+        print_hex(header.stack_count as u32);
+        print_str(b" size=0x");
+        print_hex(header.packet_size as u32);
+        print_str(b"\n");
+    }).ok()?;
+    ledger()?.pin(ticket, allocation).map_err(|_| {
+        print_str(b"[source-irp-retain] ledger pin rejected\n");
+    }).ok()?;
     Some(SourceIrpDispatchLease {
         ticket,
         allocation,
@@ -933,8 +985,9 @@ pub(super) unsafe fn target_live(
     match pin {
         file_ioctl_target::PinnedIoctlOutput::None => length == 0,
         file_ioctl_target::PinnedIoctlOutput::Stack(pin) => {
+            let mut metadata = ProviderMetadataGuard::acquire();
             pin.range() == (address, length)
-                && provider_input::stack_catalog_mut().is_some_and(|catalog| {
+                && provider_input::stack_catalog_mut(&mut metadata).is_some_and(|catalog| {
                     catalog.validate_pin(*pin).is_ok()
                 })
         }
@@ -984,6 +1037,18 @@ impl SourceBufferedDispatchLease {
         &self,
     ) -> Option<shared_pool::AllocationIdentity> {
         self.system_buffer.as_ref().map(|buffer| buffer.native)
+    }
+
+    pub(crate) fn mdl_native_identity(&self) -> Option<shared_pool::AllocationIdentity> {
+        self.auxiliary.mdl.map(|(_, identity)| identity)
+    }
+
+    pub(crate) fn mdl_address(&self) -> Option<u64> {
+        self.auxiliary.mdl.map(|(address, _)| address)
+    }
+
+    pub(crate) fn input_target_address(&self) -> Option<u64> {
+        self.auxiliary.input_target.map(|(address, _)| address)
     }
 
     pub(crate) fn event_body(&self) -> Option<u64> {
@@ -1090,17 +1155,6 @@ impl SourceBufferedDispatchLease {
         true
     }
 
-    /// Called only after the canonical Event was signaled for this exact lease.
-    pub(crate) unsafe fn mirror_event_signaled(&self) -> bool {
-        if !self.is_live() {
-            return false;
-        }
-        if self.event_lease.is_some() {
-            let _metadata = ProviderMetadataGuard::acquire();
-            mirror_projected_event_state(self.event_va, true);
-        }
-        true
-    }
 }
 
 pub(super) unsafe fn try_signal_event_lease(
@@ -1476,6 +1530,7 @@ pub(crate) unsafe fn admit_buffered_dispatch(
 unsafe fn finish_buffered_dispatch(
     lease: &mut SourceBufferedDispatchLease,
     retire_source: bool,
+    mirror_event: Option<u64>,
 ) -> bool {
     if !lease.is_live() {
         return false;
@@ -1486,12 +1541,7 @@ unsafe fn finish_buffered_dispatch(
             return false;
         }
     }
-    if let Some(event) = lease.event_lease.take() {
-        let _metadata = ProviderMetadataGuard::acquire();
-        if provider_local_events_mut().is_none_or(|events| events.release_lease(event).is_err()) {
-            crate::provider_bugcheck::report(0xc4, [0x57495250, lease.event_va, 0, 17]);
-        }
-    }
+    let event = lease.event_lease.take();
     file_ioctl_target::release_output(core::mem::replace(
         &mut lease.output_pin,
         file_ioctl_target::PinnedIoctlOutput::None,
@@ -1519,11 +1569,45 @@ unsafe fn finish_buffered_dispatch(
     {
         crate::provider_bugcheck::report(0xc4, [0x57495250, address, 0, 15]);
     }
-    true
+    finish_terminal_event(event, lease.event_va, mirror_event)
 }
 
 pub(crate) unsafe fn release_buffered_dispatch(lease: &mut SourceBufferedDispatchLease) -> bool {
-    finish_buffered_dispatch(lease, true)
+    finish_buffered_dispatch(lease, true, None)
+}
+
+pub(crate) unsafe fn commit_buffered_dispatch(lease: &mut SourceBufferedDispatchLease, sequence: u64) -> bool {
+    if lease.event_lease.is_some() != (sequence != 0) { return false; }
+    finish_buffered_dispatch(lease, true, Some(sequence))
+}
+
+pub(crate) unsafe fn finish_terminal_event(
+    event: Option<nt_provider_wait::ProviderLocalEventLease>,
+    body: u64,
+    mirror_sequence: Option<u64>,
+) -> bool {
+    let Some(event) = event else { return true };
+    let _metadata = ProviderMetadataGuard::acquire();
+    let valid = provider_local_events().is_some_and(|events| {
+        events.snapshot(event.id).is_ok_and(|snapshot| {
+            snapshot.body == body && snapshot.canonical == Some(event.canonical)
+        })
+    });
+    if !valid {
+        crate::provider_bugcheck::report(0xc4, [0x57495250, body, 0, 93]);
+    }
+    // The source is already retired; publishing local signaled state cannot expose live IRP pins.
+    if let Some(sequence) = mirror_sequence {
+        let apply = provider_local_events_mut().expect("retained completion Event catalog")
+            .observe_state(event, sequence, true).unwrap_or_else(|_| {
+                crate::provider_bugcheck::report(0xc4, [0x57495250, body, sequence, 95])
+            });
+        if apply { mirror_projected_event_state(body, true); }
+    }
+    if provider_local_events_mut().is_none_or(|events| events.release_lease(event).is_err()) {
+        crate::provider_bugcheck::report(0xc4, [0x57495250, body, 0, 94]);
+    }
+    true
 }
 
 /// Transfer admission to the authenticated root transaction without retiring
@@ -1531,14 +1615,14 @@ pub(crate) unsafe fn release_buffered_dispatch(lease: &mut SourceBufferedDispatc
 pub(crate) unsafe fn release_buffered_admission(
     lease: &mut SourceBufferedDispatchLease,
 ) -> bool {
-    finish_buffered_dispatch(lease, false)
+    finish_buffered_dispatch(lease, false, None)
 }
 
 #[path = "win32k_source_irp_pnp.rs"]
 mod pnp;
 pub(crate) use pnp::{
     SourcePnpDispatchLease, abort_pnp_dispatch, admit_pnp_target_relation,
-    release_pnp_dispatch,
+    release_pnp_dispatch, commit_pnp_dispatch,
 };
 
 #[path = "win32k_source_irp_relation.rs"]

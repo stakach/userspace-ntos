@@ -38,6 +38,8 @@ mod provider_wait_context;
 mod source_irp;
 #[path = "win32k_source_irp_aux.rs"]
 mod source_irp_aux;
+#[path = "win32k_subsystem/push_lock.rs"]
+mod push_lock;
 #[path = "win32k_source_irp_call.rs"]
 mod source_irp_call;
 #[path = "win32k_source_pnp_call.rs"]
@@ -50,7 +52,8 @@ mod source_fsd_call;
 mod source_call_router;
 #[path = "win32k_process_attach.rs"]
 mod process_attach;
-pub(crate) use source_irp::SourceBufferedDispatchLease;
+#[path = "win32k_thread_execution.rs"]
+mod thread_execution;
 pub(crate) use source_irp::{SourcePnpDispatchLease, SourceRelationAllocationLease};
 pub(crate) use source_fsd::SourceFsdDispatchLease;
 
@@ -95,26 +98,6 @@ pub(crate) unsafe fn allocate_source_target_relation() -> Option<SourceRelationA
     source_irp::allocate_target_relation()
 }
 
-pub(crate) unsafe fn admit_source_buffered_ioctl_dispatch(
-    irp: u64,
-    device: u64,
-    stack_pointer: u64,
-    route: Option<nt_component_suspension::peer_registry::PeerRoute>,
-) -> Result<SourceBufferedDispatchLease, i32> {
-    source_irp::admit_buffered_dispatch(irp, device, stack_pointer, route)
-}
-
-pub(crate) unsafe fn release_source_buffered_ioctl_dispatch(
-    lease: &mut SourceBufferedDispatchLease,
-) -> bool {
-    source_irp::release_buffered_dispatch(lease)
-}
-
-pub(crate) unsafe fn abort_source_buffered_ioctl_dispatch(
-    lease: &mut SourceBufferedDispatchLease,
-) -> bool {
-    source_irp::release_buffered_admission(lease)
-}
 #[path = "win32k_subsystem/provider_input.rs"]
 mod provider_input;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
@@ -530,13 +513,15 @@ pub const SH_REQ_TOKEN_AUTH: u64 = 0x1B8; // in: packed primary-token Authentica
 pub const SH_REQ_TOKEN_USER_SID_LEN: u64 = 0x1C0; // in: native user SID byte length
 pub const SH_REQ_TOKEN_USER_SID_PTR: u64 = 0x1C8; // in: component VA of native user SID bytes
 pub const WIN32K_TOKEN_USER_SID_MAX: usize = 68; // SID header + 15 sub-authorities
-pub const SH_GDI_LOAD_LEAF_LEN: u64 = 0x1D0; // in: ASCII driver leaf byte length
-pub const SH_GDI_LOAD_STATUS: u64 = 0x1D8; // out: executive load NTSTATUS
-pub const SH_GDI_LOAD_LEAF: u64 = 0x1E0; // in: lower-case ASCII driver leaf bytes
-pub const SH_GDI_LOAD_LEAF_CAP: usize = 24;
 pub const SH_REQ_GENERATION: u64 = 0x1F8; // in: exact hosted-process identity generation
 pub const WIN32K_REQUEST_SSDT: u64 = 0;
 pub const WIN32K_REQUEST_PS_PROVIDER: u64 = 1;
+pub const WIN32K_REQUEST_SOURCE_PNP_TERMINAL: u64 = 2;
+pub const WIN32K_REQUEST_SOURCE_FSD_TERMINAL: u64 = 3;
+pub const WIN32K_REQUEST_SOURCE_IOCTL_TERMINAL: u64 = 4;
+/// Executive-authenticated logical user origin. Component admission additionally requires a
+/// registered SSDT entry before publishing UserMode to its selected KTHREAD.
+pub const WIN32K_REQUEST_USER_ORIGIN: u64 = 1 << 63;
 pub const PS_WIN32_PROVIDER_THREAD_EXIT: u64 = 1;
 pub const PS_WIN32_PROVIDER_PROCESS_EXIT: u64 = 2;
 pub const PS_WIN32_PROVIDER_FINALIZE_PROCESS_OBJECTS: u64 = 3;
@@ -547,7 +532,6 @@ const _: () = assert!(SH_SAS_AHELIST > SH_REQ_NARGS);
 /// tail of the existing shared page; both the component stub and executive pump access it here.
 pub const SH_USER_CALLBACK: u64 = 0x200;
 const _: () = assert!(SH_REQ_TOKEN_USER_SID_PTR + 8 <= SH_USER_CALLBACK);
-const _: () = assert!(SH_GDI_LOAD_LEAF + SH_GDI_LOAD_LEAF_CAP as u64 <= SH_USER_CALLBACK);
 const _: () = assert!(SH_REQ_GENERATION + 8 <= SH_USER_CALLBACK);
 const _: () = assert!(SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRAME_SIZE <= 0x1000);
 /// Provider-owned `WIN32_CALLOUTS_FPNS` metadata copied out by `PsEstablishWin32Callouts`. These
@@ -1373,16 +1357,11 @@ pub const W32_FILE_IOCTL_LABEL: u64 = 0x799;
 pub const W32_FILE_IOCTL_COMPLETION_LABEL: u64 = 0x79a;
 pub const W32_FILE_IOCTL_RELEASE_LABEL: u64 = 0x79b;
 pub const W32_SOURCE_IOCTL_LABEL: u64 = 0x7a0;
-pub const W32_SOURCE_IOCTL_COMPLETION_LABEL: u64 = 0x7a1;
-pub const W32_SOURCE_IOCTL_RELEASE_LABEL: u64 = 0x7a2;
 pub const W32_GUI_CLIENT_INFO_LABEL: u64 = 0x7a3;
 pub const W32_PROCESS_ATTACH_LABEL: u64 = 0x7a4;
 pub const W32_SOURCE_PNP_LABEL: u64 = 0x7a5;
-pub const W32_SOURCE_PNP_COMPLETION_LABEL: u64 = 0x7a6;
-pub const W32_SOURCE_PNP_RELEASE_LABEL: u64 = 0x7a7;
 pub const W32_SOURCE_FSD_LABEL: u64 = 0x7a8;
-pub const W32_SOURCE_FSD_COMPLETION_LABEL: u64 = 0x7a9;
-pub const W32_SOURCE_FSD_RELEASE_LABEL: u64 = 0x7aa;
+pub const W32_SOURCE_ARMED_LABEL: u64 = 0x7aa;
 pub const W32_ATTACH_PLAIN: u64 = 1;
 pub const W32_ATTACH_DETACH: u64 = 2;
 pub const W32_ATTACH_STACK: u64 = 3;
@@ -1505,7 +1484,6 @@ const _: () =
     assert!(VIDEO_IOCTL_OUT_BUF as usize + VIDEO_IOCTL_OUT_CAP <= WIN32K_VIDEO_IOCTL_BYTES);
 static WIN32K_VIDEO_IOCTL_TRACE: AtomicU64 = AtomicU64::new(0);
 static WIN32K_VIDEO_IOCTL_REQUEST_TRACE: AtomicU64 = AtomicU64::new(0);
-static GDI_DRIVER_IMPORT_TRACE: AtomicU64 = AtomicU64::new(0);
 
 const LPC_SERVICE_PORT_HANDLE: u64 = 0x00;
 const LPC_SERVICE_OPERATION: u64 = 0x08;
@@ -1732,6 +1710,55 @@ pub(crate) struct ProviderPoolPacketLease {
     length: usize,
     provider: nt_provider_wait::ProviderDomainIdentity,
     allocation: shared_pool::AllocationIdentity,
+    capacity: u64,
+}
+
+impl ProviderPoolPacketLease {
+    pub(crate) fn address(self) -> u64 { self.pointer }
+    pub(crate) fn native_identity(self) -> shared_pool::AllocationIdentity { self.allocation }
+    pub(crate) fn capacity(self) -> u64 { self.capacity }
+}
+
+pub(crate) unsafe fn pin_root_provider_pool_packet(lease: ProviderPoolPacketLease)
+    -> Option<nt_provider_wait::ProviderAllocationPin>
+{
+    if registered_provider_wait_domain() != Some(lease.provider) { return None; }
+    let arena = fixed_provider_arena_identity(PROVIDER_ARENA_SHARED_POOL_ID)?;
+    let (mut metadata, _pool) = provider_metadata_pool_lock()?;
+    let memory = ProviderPoolMemory;
+    let offset = lease.pointer - WIN32K_POOL_VADDR;
+    if shared_pool::allocation_identity(&memory, offset) != Ok(lease.allocation)
+        || shared_pool::allocation_capacity(&memory, offset) != Ok(lease.capacity) { return None; }
+    let catalog = provider_allocations_unlocked(&mut metadata)?;
+    let snapshot = catalog.register(arena, lease.pointer, lease.capacity).ok()?;
+    match catalog.pin_containing(lease.pointer, lease.capacity) {
+        Ok((_, pin)) => Some(pin),
+        Err(_) => {
+            if catalog.begin_retirement(snapshot.identity).is_err()
+                || catalog.retire(snapshot.identity) != Ok(snapshot)
+            { crate::provider_bugcheck::report(0xc4, [lease.pointer, 0, 0, 113]); }
+            None
+        }
+    }
+}
+
+pub(crate) unsafe fn retire_pinned_root_provider_pool_packet(
+    lease: ProviderPoolPacketLease, pin: nt_provider_wait::ProviderAllocationPin,
+) -> bool {
+    if registered_provider_wait_domain() != Some(lease.provider) { return false; }
+    let Some((mut metadata, _pool)) = provider_metadata_pool_lock() else { return false; };
+    let mut memory = ProviderPoolMemory;
+    let offset = lease.pointer - WIN32K_POOL_VADDR;
+    if shared_pool::allocation_identity(&memory, offset) != Ok(lease.allocation)
+        || shared_pool::allocation_capacity(&memory, offset) != Ok(lease.capacity) { return false; }
+    let Some(catalog) = provider_allocations_unlocked(&mut metadata) else { return false; };
+    let Ok(snapshot) = catalog.begin_retirement_from_pin(pin) else { return false; };
+    if snapshot.base != lease.pointer || snapshot.capacity != lease.capacity { return false; }
+    if shared_pool::free(&mut memory, offset).is_err() { return false; }
+    if catalog.retire(snapshot.identity) != Ok(snapshot) {
+        crate::provider_bugcheck::report(0xc4, [lease.pointer, 0, 0, 114]);
+    }
+    true
 }
 
 pub(crate) unsafe fn capture_provider_pool_packet(
@@ -1756,7 +1783,41 @@ pub(crate) unsafe fn capture_provider_pool_packet(
     bytes.try_reserve_exact(length).map_err(|_| STATUS_INSUFFICIENT_RESOURCES_I32 as u32)?;
     bytes.resize(length, 0);
     core::ptr::copy_nonoverlapping(pointer as *const u8, bytes.as_mut_ptr(), length);
-    Ok((ProviderPoolPacketLease { pointer, length, provider, allocation }, bytes))
+    Ok((ProviderPoolPacketLease { pointer, length, provider, allocation, capacity }, bytes))
+}
+
+pub(crate) unsafe fn allocate_root_provider_pool_packet(
+    length: usize,
+) -> Option<(ProviderPoolPacketLease, Vec<u8>)> {
+    if length == 0 || length as u64 >= WIN32K_POOL_FRAMES * 0x1000 {
+        return None;
+    }
+    let provider = registered_provider_wait_domain()?;
+    let _guard = provider_pool_lock()?;
+    let mut memory = ProviderPoolMemory;
+    let native = shared_pool::allocate(&mut memory, length as u64, true).ok()?;
+    let pointer = WIN32K_POOL_VADDR + native.payload_offset;
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(length).is_err() {
+        shared_pool::free(&mut memory, native.payload_offset).ok()?;
+        return None;
+    }
+    bytes.resize(length, 0);
+    Some((ProviderPoolPacketLease {
+        pointer, length, provider, allocation: native.identity, capacity: native.capacity,
+    }, bytes))
+}
+
+pub(crate) unsafe fn retire_root_provider_pool_packet(lease: ProviderPoolPacketLease) -> bool {
+    if registered_provider_wait_domain() != Some(lease.provider) {
+        return false;
+    }
+    let Some(_guard) = provider_pool_lock() else { return false };
+    let mut memory = ProviderPoolMemory;
+    let offset = lease.pointer - WIN32K_POOL_VADDR;
+    shared_pool::allocation_identity(&memory, offset) == Ok(lease.allocation)
+        && shared_pool::allocation_capacity(&memory, offset) == Ok(lease.capacity)
+        && shared_pool::free(&mut memory, offset).is_ok()
 }
 
 pub(crate) unsafe fn publish_provider_pool_packet(
@@ -4425,7 +4486,6 @@ unsafe fn finish_provider_stack_event_activation(
     }
     file_read::release_completed_for_activation(activation);
     file_ioctl::release_completed_for_activation(activation);
-    source_irp_call::release_completed_for_activation(activation);
     // Event retirement may broker IPC. Keep no catalog borrow across reentrant execution.
     if !retire_provider_local_events_for_backing(activation.backing()) {
         return false;
@@ -4730,7 +4790,7 @@ unsafe fn provider_local_event_signal_lease_or_park(
 
 unsafe fn provider_local_event_call(event: u64, op: u64) -> (u64, u64) {
     let lease = provider_local_event_signal_lease_or_park(event);
-    let (status, out1, out2, _) = win32k_event_broker_call(op, lease.id.raw(), 0, 0);
+    let (status, out1, out2, sequence) = win32k_event_broker_call(op, lease.id.raw(), 0, 0);
     if status != 0 {
         print_str(b"[win32k-event] canonical local Event operation failed\n");
         park();
@@ -4743,7 +4803,11 @@ unsafe fn provider_local_event_call(event: u64, op: u64) -> (u64, u64) {
     };
     let released = {
         let _metadata = ProviderMetadataGuard::acquire();
-        mirror_projected_event_state(event, signaled);
+        let apply = provider_local_events_mut().expect("local Event catalog disappeared")
+            .observe_state(lease, sequence, signaled).unwrap_or_else(|_| {
+                crate::provider_bugcheck::report(0xc4, [W32_EVENT_LABEL, lease.id.raw(), sequence, 96])
+            });
+        if apply { mirror_projected_event_state(event, signaled); }
         provider_local_events_mut()
             .expect("local Event catalog disappeared")
             .release_lease(lease)
@@ -5827,22 +5891,7 @@ unsafe fn registered_kernel_image_containing(address: u64) -> Option<(u64, &'sta
     {
         (WIN32K_CODE_VA, WIN32K_IMAGE_BYTES as usize)
     } else {
-        let records = GDI_DRIVER_RECORDS_PTR.load(Ordering::Acquire);
-        let count = GDI_DRIVER_RECORDS_LEN.load(Ordering::Acquire);
-        let mut found = (0u64, 0usize);
-        if records != 0 {
-            for index in 0..count {
-                let record = read_volatile(gdi_driver_record_ptr(records, index));
-                let Some(end) = record.image.checked_add(u64::from(record.image_len)) else {
-                    continue;
-                };
-                if (record.image..end).contains(&address) {
-                    found = (record.image, record.image_len as usize);
-                    break;
-                }
-            }
-        }
-        found
+        gdi_images::image_containing(address).unwrap_or((0, 0))
     };
     if length == 0 {
         None
@@ -12650,216 +12699,11 @@ extern "win64" fn s_wcsnicmp(a: u64, b: u64, n: u64) -> i32 {
     0
 }
 
-/// `NTSTATUS ZwSetSystemInformation(SYSTEM_INFORMATION_CLASS, PVOID, ULONG)`. win32k's
-/// `LDEVOBJ_bLoadImage` loads a GDI driver by calling this with class
-/// `SystemLoadGdiDriverInformation` (26) + a `SYSTEM_GDI_DRIVER_INFORMATION` whose DriverName it
-/// filled; the "kernel" loads the driver + fills ImageAddress/EntryPoint/ExportSectionPointer/etc.
-/// The executive registers each hosted GDI driver image as it is loaded, and this import resolves
-/// only against that registered state (offsets: DriverName@0, ImageAddress@0x10,
-/// SectionPointer@0x18, EntryPoint@0x20, ExportSectionPointer@0x28, ImageLength@0x30). Other
-/// classes → benign success.
-/// Case-insensitive: does the wide DriverName [name_buf, +name_len bytes) end with the ASCII tail?
-unsafe fn wname_ends_with(name_buf: u64, name_len: usize, tail: &[u8]) -> bool {
-    if name_buf == 0 || name_len < tail.len() * 2 {
-        return false;
-    }
-    for (k, &wc) in tail.iter().enumerate() {
-        let off = name_buf + (name_len as u64 - (tail.len() - k) as u64 * 2);
-        let c = read_unaligned(off as *const u16);
-        let lc = if (b'A' as u16..=b'Z' as u16).contains(&c) {
-            c + 32
-        } else {
-            c
-        };
-        if lc != wc as u16 {
-            return false;
-        }
-    }
-    true
-}
 
-const GDI_DRIVER_LEAF_CAP: usize = 24;
-
-#[derive(Clone, Copy)]
-struct GdiDriverRecord {
-    leaf: [u8; GDI_DRIVER_LEAF_CAP],
-    leaf_len: u8,
-    image: u64,
-    entry: u64,
-    expdir: u64,
-    image_len: u32,
-}
-
-impl GdiDriverRecord {
-    const EMPTY: Self = Self {
-        leaf: [0; GDI_DRIVER_LEAF_CAP],
-        leaf_len: 0,
-        image: 0,
-        entry: 0,
-        expdir: 0,
-        image_len: 0,
-    };
-
-    fn leaf_bytes(&self) -> &[u8] {
-        &self.leaf[..self.leaf_len as usize]
-    }
-}
-
-const GDI_DRIVER_RECORD_INITIAL_CAP: u64 = 4;
-static GDI_DRIVER_RECORDS_PTR: AtomicU64 = AtomicU64::new(0);
-static GDI_DRIVER_RECORDS_LEN: AtomicU64 = AtomicU64::new(0);
-static GDI_DRIVER_RECORDS_CAP: AtomicU64 = AtomicU64::new(0);
-
-fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    for i in 0..a.len() {
-        if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
-            return false;
-        }
-    }
-    true
-}
-
-unsafe fn gdi_driver_record_ptr(base: u64, index: u64) -> *mut GdiDriverRecord {
-    (base + index * core::mem::size_of::<GdiDriverRecord>() as u64) as *mut GdiDriverRecord
-}
-
-unsafe fn ensure_gdi_driver_record_capacity(required: u64) -> bool {
-    let cap = GDI_DRIVER_RECORDS_CAP.load(Ordering::Relaxed);
-    if cap >= required {
-        return true;
-    }
-    let mut new_cap = if cap == 0 {
-        GDI_DRIVER_RECORD_INITIAL_CAP
-    } else {
-        cap.saturating_mul(2)
-    };
-    while new_cap < required {
-        let next = new_cap.saturating_mul(2);
-        if next <= new_cap {
-            return false;
-        }
-        new_cap = next;
-    }
-    let Some(bytes) = (core::mem::size_of::<GdiDriverRecord>() as u64).checked_mul(new_cap) else {
-        return false;
-    };
-    let new_base = pool_alloc(bytes);
-    if new_base == 0 {
-        return false;
-    }
-    let old_base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
-    let len = GDI_DRIVER_RECORDS_LEN.load(Ordering::Relaxed);
-    if old_base != 0 {
-        for index in 0..len {
-            let rec = read_volatile(gdi_driver_record_ptr(old_base, index));
-            write_volatile(gdi_driver_record_ptr(new_base, index), rec);
-        }
-    }
-    GDI_DRIVER_RECORDS_PTR.store(new_base, Ordering::Relaxed);
-    GDI_DRIVER_RECORDS_CAP.store(new_cap, Ordering::Relaxed);
-    true
-}
-
-fn register_gdi_driver_image(
-    leaf: &[u8],
-    image: u64,
-    entry: u64,
-    expdir: u64,
-    image_len: u32,
-) -> bool {
-    if leaf.is_empty() || leaf.len() > GDI_DRIVER_LEAF_CAP || image == 0 || image_len == 0 {
-        return false;
-    }
-    let record = registered_gdi_driver_record(leaf, image, entry, expdir, image_len);
-    unsafe {
-        let len = GDI_DRIVER_RECORDS_LEN.load(Ordering::Relaxed);
-        let base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
-        if base != 0 {
-            for index in 0..len {
-                let ptr = gdi_driver_record_ptr(base, index);
-                let rec = read_volatile(ptr);
-                if ascii_eq_ignore_case(rec.leaf_bytes(), leaf) {
-                    write_volatile(ptr, record);
-                    return true;
-                }
-            }
-        }
-        let Some(required) = len.checked_add(1) else {
-            return false;
-        };
-        if !ensure_gdi_driver_record_capacity(required) {
-            return false;
-        }
-        let base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
-        if base == 0 {
-            return false;
-        }
-        write_volatile(gdi_driver_record_ptr(base, len), record);
-        GDI_DRIVER_RECORDS_LEN.store(required, Ordering::Relaxed);
-        true
-    }
-}
-
-fn registered_gdi_driver_record(
-    leaf: &[u8],
-    image: u64,
-    entry: u64,
-    expdir: u64,
-    image_len: u32,
-) -> GdiDriverRecord {
-    let mut rec = GdiDriverRecord::EMPTY;
-    rec.leaf_len = leaf.len() as u8;
-    for (idx, &b) in leaf.iter().enumerate() {
-        rec.leaf[idx] = b.to_ascii_lowercase();
-    }
-    rec.image = image;
-    rec.entry = entry;
-    rec.expdir = expdir;
-    rec.image_len = image_len;
-    rec
-}
-
-unsafe fn registered_gdi_driver_for_name(
-    name_buf: u64,
-    name_len: usize,
-) -> Option<GdiDriverRecord> {
-    let base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
-    let len = GDI_DRIVER_RECORDS_LEN.load(Ordering::Relaxed);
-    if base == 0 {
-        return None;
-    }
-    for index in 0..len {
-        let rec = read_volatile(gdi_driver_record_ptr(base, index));
-        if wname_ends_with(name_buf, name_len, rec.leaf_bytes()) {
-            return Some(rec);
-        }
-    }
-    None
-}
-
-fn registered_gdi_driver_for_leaf(leaf: &[u8]) -> Option<GdiDriverRecord> {
-    unsafe {
-        let base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
-        let len = GDI_DRIVER_RECORDS_LEN.load(Ordering::Relaxed);
-        if base == 0 {
-            return None;
-        }
-        for index in 0..len {
-            let rec = read_volatile(gdi_driver_record_ptr(base, index));
-            if ascii_eq_ignore_case(rec.leaf_bytes(), leaf) {
-                return Some(rec);
-            }
-        }
-    }
-    None
-}
-
-pub(crate) fn gdi_driver_registered(leaf: &[u8]) -> bool {
-    registered_gdi_driver_for_leaf(leaf).is_some()
-}
+#[path = "win32k_subsystem/gdi_images.rs"]
+mod gdi_images;
+use gdi_images::*;
+pub(crate) use gdi_images::{register_gdi_driver_image, gdi_driver_registered};
 
 unsafe fn gdi_driver_leaf_from_wname(
     name_buf: u64,
@@ -12891,75 +12735,20 @@ unsafe fn gdi_driver_leaf_from_wname(
     Some(leaf_chars)
 }
 
-unsafe fn request_gdi_driver_load(leaf: &[u8]) -> i32 {
-    if leaf.is_empty() || leaf.len() > SH_GDI_LOAD_LEAF_CAP {
-        return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
-    }
-    write_volatile(
-        (WIN32K_SHARED_VADDR + SH_GDI_LOAD_LEAF_LEN) as *mut u64,
-        leaf.len() as u64,
-    );
-    write_volatile(
-        (WIN32K_SHARED_VADDR + SH_GDI_LOAD_STATUS) as *mut i32,
-        0x0000_0103, // STATUS_PENDING, overwritten by the executive before reply.
-    );
-    for i in 0..SH_GDI_LOAD_LEAF_CAP {
-        let b = if i < leaf.len() {
-            leaf[i].to_ascii_lowercase()
-        } else {
-            0
-        };
-        write_volatile(
-            (WIN32K_SHARED_VADDR + SH_GDI_LOAD_LEAF + i as u64) as *mut u8,
-            b,
-        );
-    }
-    let (_label, _tag, _, _, _) = crate::driver_launch::call_on(W32_GDI_LOAD_LABEL << 12);
-    read_volatile((WIN32K_SHARED_VADDR + SH_GDI_LOAD_STATUS) as *const i32)
+#[path = "win32k_subsystem/gdi_image_call.rs"]
+mod gdi_image_call;
+
+extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, len: u64) -> i32 {
+    let _mode = unsafe { thread_execution::PreviousModeScope::enter(nt_kernel_abi::ps_reactos_x64::ThreadPreviousMode::KernelMode) };
+    unsafe { gdi_image_call::set_information(class, buf, len) }
 }
 
-extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -> i32 {
-    const SYSTEM_LOAD_GDI_DRIVER_INFORMATION: u64 = 26;
-    if class != SYSTEM_LOAD_GDI_DRIVER_INFORMATION || buf == 0 {
-        return 0; // STATUS_SUCCESS (unmodelled classes are no-ops)
-    }
-    unsafe {
-        // Read DriverName (UNICODE_STRING @ buf+0: u16 Length, u16 Max, u32 pad, u64 Buffer).
-        let name_len = read_unaligned(buf as *const u16) as usize;
-        let name_buf = read_unaligned((buf + 8) as *const u64);
-        let mut requested_leaf = [0u8; GDI_DRIVER_LEAF_CAP];
-        if let Some(leaf_len) = gdi_driver_leaf_from_wname(name_buf, name_len, &mut requested_leaf)
-        {
-            let leaf = &requested_leaf[..leaf_len];
-            if !gdi_driver_registered(leaf) {
-                let status = request_gdi_driver_load(leaf);
-                if status != 0 {
-                    return status;
-                }
-            }
-        }
-        let Some(driver) = registered_gdi_driver_for_name(name_buf, name_len) else {
-            print_str(b"[win32k gdidrv] ZwSetSystemInformation(GdiDriver) unknown driver\n");
-            return 0xC000_0135u32 as i32; // STATUS_DLL_NOT_FOUND
-        };
-        if driver.image == 0 {
-            return 0xC000_0135u32 as i32;
-        }
-        write_unaligned((buf + 0x10) as *mut u64, driver.image); // ImageAddress
-        write_unaligned((buf + 0x18) as *mut u64, driver.image); // SectionPointer (non-null placeholder)
-        write_unaligned((buf + 0x20) as *mut u64, driver.entry); // EntryPoint (= DrvEnableDriver for display DLL)
-        write_unaligned((buf + 0x28) as *mut u64, driver.expdir); // ExportSectionPointer
-        write_unaligned((buf + 0x30) as *mut u32, driver.image_len); // ImageLength
-        print_str(b"[win32k gdidrv] hosted ");
-        print_str(driver.leaf_bytes());
-        print_str(b" -> image=0x");
-        print_hex((driver.image >> 32) as u32);
-        print_hex(driver.image as u32);
-        print_str(b"\n");
-    }
-    0
+extern "win64" fn s_nt_set_system_information(class: u64, buf: u64, len: u64) -> i32 {
+    let expected = match class { 26 => 0x38, 27 => 8, _ => return 0xc000_0003u32 as i32 };
+    if len != expected { return 0xc000_0004u32 as i32; }
+    if thread_execution::previous_mode() != 0 { return 0xc000_0061u32 as i32; }
+    unsafe { gdi_image_call::set_information(class, buf, len) }
 }
-
 // --- video-device registry import + display miniport IOCTL intercept --------------------------
 //
 // win32k's EngpUpdateGraphicsDeviceList / InitDisplayDriver (ReactOS win32ss/gdi/eng/device.c +
@@ -15490,7 +15279,7 @@ fn register_trampolines() -> bool {
     );
     reg.bind(
         "NtSetSystemInformation",
-        s_zw_set_system_information as usize as u64,
+        s_nt_set_system_information as usize as u64,
     );
     reg.bind("ZwOpenFile", file_open::open as *const () as usize as u64);
     reg.bind("ZwCreateFile", file_open::create as *const () as usize as u64);
@@ -15703,6 +15492,10 @@ fn register_trampolines() -> bool {
         source_call_router::iof_call_driver as *const () as u64,
     );
     reg.bind(
+        "IoCallDriver",
+        source_call_router::iof_call_driver as *const () as u64,
+    );
+    reg.bind(
         "KeUserModeCallback",
         s_ke_user_mode_callback_rendezvous as usize as u64,
     );
@@ -15772,10 +15565,14 @@ fn register_trampolines() -> bool {
         "ExReleaseFastMutexUnsafeAndLeaveCriticalRegion",
         s_ex_release_fast_mutex_unsafe_and_leave_critical_region as usize as u64,
     );
-    reg.bind("ExfAcquirePushLockExclusive", s_true as usize as u64);
-    reg.bind("ExfTryToWakePushLock", s_true as usize as u64);
-    reg.bind("KeSetKernelStackSwapEnable", s_true as usize as u64);
-    reg.bind("ExGetPreviousMode", s_true as usize as u64);
+    reg.bind("ExfAcquirePushLockExclusive", push_lock::acquire_exclusive as *const () as u64);
+    reg.bind("ExfAcquirePushLockShared", push_lock::acquire_shared as *const () as u64);
+    reg.bind("ExfReleasePushLockExclusive", push_lock::release_exclusive as *const () as u64);
+    reg.bind("ExfReleasePushLockShared", push_lock::release_shared as *const () as u64);
+    reg.bind("ExfReleasePushLock", push_lock::release_generic as *const () as u64);
+    reg.bind("ExfTryToWakePushLock", push_lock::try_to_wake as *const () as u64);
+    reg.bind("KeSetKernelStackSwapEnable", thread_execution::set_stack_swap_enable as usize as u64);
+    reg.bind("ExGetPreviousMode", thread_execution::previous_mode as usize as u64);
     // --- batch 5: RTL security descriptors / ACLs / SIDs ---
     reg.bind(
         "RtlCreateSecurityDescriptor",
@@ -16103,32 +15900,6 @@ fn import_name_eq(import_name: &[u8], expected: &[u8]) -> bool {
             .all(|(&actual, &expected)| actual == expected)
 }
 
-unsafe fn trace_gdi_driver_import(import_name: &[u8], slot: u64, addr: u64, direct: bool) {
-    if !import_name_eq(import_name, b"EngDeviceIoControl") {
-        return;
-    }
-    let seq = GDI_DRIVER_IMPORT_TRACE.fetch_add(1, Ordering::Relaxed);
-    if seq >= 16 {
-        return;
-    }
-    print_str(b"[win32k-gdidrv-import] ");
-    print_str(import_name);
-    print_str(b" slot=0x");
-    print_hex((slot >> 32) as u32);
-    print_hex(slot as u32);
-    print_str(b" addr=0x");
-    print_hex((addr >> 32) as u32);
-    print_hex(addr as u32);
-    print_str(b" direct=");
-    print_u64(direct as u64);
-    print_str(b"\n");
-}
-
-unsafe fn log_unresolved_gdi_driver_import(import_name: &[u8]) {
-    print_str(b"[win32k-gdidrv-import] unresolved ");
-    print_str(import_name);
-    print_str(b"\n");
-}
 
 unsafe fn log_unresolved_win32k_import(import_name: &[u8]) {
     print_str(b"[win32k-import] unresolved ");
@@ -16805,6 +16576,9 @@ unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) 
             Ok(selected) => selected,
             Err(status) => return status as u64,
         };
+    let _previous_mode = thread_index.map(|_| thread_execution::PreviousModeScope::enter(
+        nt_kernel_abi::ps_reactos_x64::ThreadPreviousMode::KernelMode,
+    ));
     let pid = process_ctx_pid(process_index);
 
     match command {
@@ -16891,7 +16665,12 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let callback_frame =
         (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *const nt_user_callback::CallbackFrame;
     let header = read_volatile(core::ptr::addr_of!((*callback_frame).header));
-    let request_kind = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_KIND) as *const u64);
+    let request = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_KIND) as *const u64);
+    let request_kind = request & !WIN32K_REQUEST_USER_ORIGIN;
+    let user_origin = request & WIN32K_REQUEST_USER_ORIGIN != 0;
+    if user_origin && request_kind != WIN32K_REQUEST_SSDT {
+        return (STATUS_INVALID_PARAMETER_I32, STATUS_INVALID_PARAMETER_I32 as u32 as u64);
+    }
     let owner = if request_kind == WIN32K_REQUEST_SSDT {
         match hosted_wait_owner_at_dispatch(header) {
             Ok(owner) => owner,
@@ -16925,6 +16704,18 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     if request_kind == WIN32K_REQUEST_PS_PROVIDER {
         let result = dispatch_ps_provider_command(a0, a1, a2);
         return (result as u32 as i32, result);
+    }
+    if request_kind == WIN32K_REQUEST_SOURCE_PNP_TERMINAL {
+        let result = source_pnp_call::complete_terminal(a0, a1);
+        return (result, result as u32 as u64);
+    }
+    if request_kind == WIN32K_REQUEST_SOURCE_FSD_TERMINAL {
+        let result = source_fsd_call::complete_terminal(a0, a1);
+        return (result, result as u32 as u64);
+    }
+    if request_kind == WIN32K_REQUEST_SOURCE_IOCTL_TERMINAL {
+        let result = source_irp_call::complete_terminal(a0, a1);
+        return (result, result as u32 as u64);
     }
     if request_kind != WIN32K_REQUEST_SSDT {
         return (0xC000_000Du32 as i32, 0xC000_000Du32 as u64);
@@ -17012,6 +16803,12 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     ) else {
         return (0xC000_009Au32 as i32, 0xC000_009Au32 as u64);
     };
+    let mode = if user_origin && registered_win32k_provider_argc(ssn).is_some() {
+        nt_kernel_abi::ps_reactos_x64::ThreadPreviousMode::UserMode
+    } else {
+        nt_kernel_abi::ps_reactos_x64::ThreadPreviousMode::KernelMode
+    };
+    let _previous_mode = thread_execution::PreviousModeScope::enter(mode);
     let process_attached = ensure_win32k_process_attached(process_index, process_role);
     let threadinfo_ready = process_attached && ensure_win32k_threadinfo(thread_index, client_teb);
     if !process_attached || !threadinfo_ready {
@@ -17185,6 +16982,11 @@ unsafe fn dispatch_gdi_batch_flush_callout(client_pi: u64, client_teb: u64) -> u
 }
 
 unsafe fn dispatch_win32_job_callout(job: u64, callout_type: u32, data: u64) -> u64 {
+    let _previous_mode = (current_ethread() != 0).then(|| {
+        thread_execution::PreviousModeScope::enter(
+            nt_kernel_abi::ps_reactos_x64::ThreadPreviousMode::KernelMode,
+        )
+    });
     if callout_type == PS_W32_JOB_CONTROL_REMOVE_PROCESS {
         return remove_process_from_win32_job(job, data) as u64;
     }
@@ -18531,72 +18333,10 @@ unsafe fn record_registered_ntuser_handler() {
 // win32k. The same loader also resolves static win32k import DLLs discovered from win32k's own PE
 // import table.
 
-/// dxgthk.sys loaded-image base in win32k's VSpace (size_of_image 0x5000 -> 8 frames / one 2 MiB PT).
-pub const DXGTHK_VA: u64 = 0x0000_0100_0850_0000;
-pub const DXGTHK_LOAD_FRAMES: u64 = 8;
-/// dxg.sys loaded-image base in win32k's VSpace (size_of_image 0xd000 -> 16 frames / one 2 MiB PT).
-pub const DXG_VA: u64 = 0x0000_0100_0860_0000;
-pub const DXG_LOAD_FRAMES: u64 = 16;
-/// Display driver loaded-image base in win32k's VSpace. ReactOS' current registry selects the
-/// linear-framebuffer driver, whose size_of_image is 0x8000, so this reserves one 8-frame PT window.
-/// win32k loads the selected display DLL dynamically via ZwSetSystemInformation.
-pub const FRAMEBUF_VA: u64 = 0x0000_0100_0890_0000;
-pub const FRAMEBUF_LOAD_FRAMES: u64 = 8;
-/// Keyboard layout DLL loaded-image base in win32k's VSpace. size_of_image 0x4000 -> 4 frames;
-/// reserve 8 frames in its own PT-aligned window. win32k loads the registry-selected layout DLL via
-/// ZwSetSystemInformation, then resolves KbdLayerDescriptor from its export directory.
-pub const KEYBOARD_LAYOUT_VA: u64 = 0x0000_0100_08A0_0000;
-pub const KEYBOARD_LAYOUT_LOAD_FRAMES: u64 = 8;
-/// The complete display PCI BAR mapped into win32k's VSpace, RW. The executive video-device
-/// boundary returns an offset in this aperture for `IOCTL_VIDEO_MAP_VIDEO_MEMORY`; the bootloader
-/// framebuffer fields describe the initial scanout geometry only.
+/// Reserved caller aperture for the assigned display resource grant. Actual visibility belongs
+/// to the video-memory mapping transaction, never to loading a particular display image.
 pub const WIN32K_FB_VA: u64 = 0x0000_0100_0900_0000;
 
-/// Record the loaded display DLL info selected from the SYSTEM hive. Some ReactOS display DLLs have
-/// no export directory; win32k's `EngFindImageProcAddress("DrvEnableDriver")` can special-case to
-/// `EntryPoint` (ldevobj.c), so ExportSectionPointer may be 0.
-pub fn record_display_driver(
-    spec: &DisplayRegistrySpec<'_>,
-    entry_rva: u32,
-    export_dir_rva: u32,
-    image_len: u32,
-) -> bool {
-    let expd = if export_dir_rva != 0 {
-        FRAMEBUF_VA + export_dir_rva as u64
-    } else {
-        0
-    };
-    register_gdi_driver_image(
-        spec.display_driver_leaf,
-        FRAMEBUF_VA,
-        FRAMEBUF_VA + entry_rva as u64,
-        expd,
-        image_len,
-    ) && crate::video_device::hosted_video_device_route_ready()
-}
-
-/// Record the loaded keyboard-layout DLL info. win32k uses the export directory to find
-/// KbdLayerDescriptor; the PE entry may be zero.
-pub fn record_keyboard_layout_driver(
-    _layout_id: &[u8],
-    layout_file: &[u8],
-    entry_rva: u32,
-    export_dir_rva: u32,
-    image_len: u32,
-) -> bool {
-    let expd = if export_dir_rva != 0 {
-        KEYBOARD_LAYOUT_VA + export_dir_rva as u64
-    } else {
-        0
-    };
-    register_gdi_driver_image(
-        layout_file,
-        KEYBOARD_LAYOUT_VA,
-        KEYBOARD_LAYOUT_VA + entry_rva as u64,
-        expd,
-        image_len,
-    )
-}
 
 /// Walk an already-mapped image's export table (data-dir 0) at `base`; return the VA of the export
 /// named `name` (nul-terminated), or 0. Handles FORWARDER exports: dxgthk's Eng* exports forward to
@@ -18658,18 +18398,16 @@ unsafe fn pe_export_lookup(base: u64, name: &[u8]) -> u64 {
                     return 0;
                 }
                 let func = core::slice::from_raw_parts(func_ptr as *const u8, fl);
-                let is_win32k = dot >= 6
-                    && read_volatile(s as *const u8).to_ascii_lowercase() == b'w'
-                    && read_volatile((s + 1) as *const u8).to_ascii_lowercase() == b'i'
-                    && read_volatile((s + 2) as *const u8).to_ascii_lowercase() == b'n'
-                    && read_volatile((s + 3) as *const u8).to_ascii_lowercase() == b'3'
-                    && read_volatile((s + 4) as *const u8).to_ascii_lowercase() == b'2'
-                    && read_volatile((s + 5) as *const u8).to_ascii_lowercase() == b'k';
-                if is_win32k {
+                let Ok(module) = core::str::from_utf8(core::slice::from_raw_parts(s as *const u8, dot)) else { return 0; };
+                if module.eq_ignore_ascii_case("win32k") {
                     return pe_export_lookup(WIN32K_CODE_VA, func);
                 }
-                // ntoskrnl / hal forwarder → trampoline.
-                let name = core::str::from_utf8_unchecked(func);
+                let names = if module.eq_ignore_ascii_case("ntoskrnl") {
+                    WIN32K_NTOSKRNL_IMPORTS
+                } else if module.eq_ignore_ascii_case("hal") { WIN32K_HAL_IMPORTS }
+                else { return 0; };
+                let Ok(name) = core::str::from_utf8(func) else { return 0; };
+                if !names.contains(&name) { return 0; }
                 return export_addr(name);
             }
             return base + far;
@@ -18678,204 +18416,6 @@ unsafe fn pe_export_lookup(base: u64, name: &[u8]) -> u64 {
     0
 }
 
-/// Load a driver PE (raw bytes at `src_va`) into `dst_va` (frames pre-mapped RW in BOTH the executive
-/// and win32k). Copies headers + sections, applies DIR64 relocs for `dst_va`, patches the IAT
-/// (dxgthk imports -> `dxgthk_base` exports; ntoskrnl/hal -> [`export_addr`]), records per-frame
-/// rights in `rights_out`. Returns `(entry_rva, export_dir_rva, size_of_image)` or None. HEAP-FREE.
-pub unsafe fn load_driver_into(
-    src_va: u64,
-    dst_va: u64,
-    max_frames: u64,
-    rights_out: &mut [u64],
-    dxgthk_base: u64,
-) -> Option<(u32, u32, u32)> {
-    let e = read_unaligned((src_va + 0x3c) as *const u32) as u64;
-    let nt = src_va + e;
-    if read_unaligned(nt as *const u32) != 0x0000_4550 {
-        return None;
-    }
-    let file_hdr = nt + 4;
-    let num_sections = read_unaligned((file_hdr + 2) as *const u16) as u64;
-    let size_opt_hdr = read_unaligned((file_hdr + 16) as *const u16) as u64;
-    let opt = file_hdr + 20;
-    let entry_rva = read_unaligned((opt + 16) as *const u32);
-    let image_base = read_unaligned((opt + 24) as *const u64);
-    let size_of_headers = read_unaligned((opt + 60) as *const u32) as u64;
-    let size_of_image = read_unaligned((opt + 56) as *const u32);
-    let export_dir_rva = read_unaligned((opt + 112) as *const u32);
-    let sec_table = opt + size_opt_hdr;
-    let cap = max_frames * 0x1000;
-    if cap == 0 || size_of_image == 0 || size_of_image as u64 > cap || size_of_headers > cap {
-        return None;
-    }
-
-    rights_out.fill(RO_NX);
-    copy_bytes(dst_va, src_va, size_of_headers.min(cap));
-    for s in 0..num_sections {
-        let sh = sec_table + s * 40;
-        let va = read_unaligned((sh + 12) as *const u32) as u64;
-        let raw_size = read_unaligned((sh + 16) as *const u32) as u64;
-        let raw_ptr = read_unaligned((sh + 20) as *const u32) as u64;
-        let vsize = read_unaligned((sh + 8) as *const u32) as u64;
-        let chars = read_unaligned((sh + 36) as *const u32);
-        if va >= cap {
-            continue;
-        }
-        let n = raw_size.min(cap - va);
-        copy_bytes(dst_va + va, src_va + raw_ptr, n);
-        let r = match nt_pe_loader::Protection::from_section_characteristics(chars) {
-            nt_pe_loader::Protection::ReadExecute => 2,
-            nt_pe_loader::Protection::ReadWrite => RW_NX,
-            nt_pe_loader::Protection::ReadOnly => RO_NX,
-        };
-        let span = va.saturating_add(vsize.max(raw_size)).min(cap);
-        let mut p = va & !0xFFF;
-        while p < span {
-            let idx = (p / 0x1000) as usize;
-            if idx < rights_out.len() {
-                rights_out[idx] = r;
-            }
-            p += 0x1000;
-        }
-    }
-
-    // DIR64 relocs for the load at dst_va.
-    let delta = dst_va.wrapping_sub(image_base);
-    if delta != 0 {
-        let reloc_rva = read_unaligned((opt + 112 + 5 * 8) as *const u32) as u64;
-        let reloc_size = read_unaligned((opt + 112 + 5 * 8 + 4) as *const u32) as u64;
-        if reloc_rva != 0 && !image_rva_span_ok(reloc_rva, reloc_size, cap) {
-            return None;
-        }
-        let mut off = 0u64;
-        while reloc_rva != 0 && off + 8 <= reloc_size {
-            let block_rva = reloc_rva + off;
-            let page_rva = read_unaligned((dst_va + block_rva) as *const u32) as u64;
-            let block = read_unaligned((dst_va + block_rva + 4) as *const u32) as u64;
-            if block < 8 || block > reloc_size - off {
-                return None;
-            }
-            let cnt = (block - 8) / 2;
-            for i in 0..cnt {
-                let ent = read_unaligned((dst_va + block_rva + 8 + i * 2) as *const u16);
-                if (ent >> 12) == 10 {
-                    let t = page_rva + (ent & 0xFFF) as u64;
-                    if image_rva_span_ok(t, 8, cap) {
-                        let v = read_unaligned((dst_va + t) as *const u64);
-                        write_unaligned((dst_va + t) as *mut u64, v.wrapping_add(delta));
-                    }
-                }
-            }
-            off += block;
-        }
-    }
-
-    // Patch the IAT: resolve per import descriptor by DLL name.
-    let imp_rva = read_unaligned((opt + 112 + 8) as *const u32) as u64;
-    if imp_rva != 0 {
-        let imp_size = read_unaligned((opt + 112 + 8 + 4) as *const u32) as u64;
-        if !image_rva_span_ok(imp_rva, imp_size, cap) {
-            return None;
-        }
-        let imp_end = imp_rva + imp_size;
-        let mut desc_rva = imp_rva;
-        while desc_rva + 20 <= imp_end {
-            let desc = dst_va + desc_rva;
-            let ilt = read_unaligned(desc as *const u32) as u64;
-            let iat = read_unaligned((desc + 16) as *const u32) as u64;
-            let dll_name_rva = read_unaligned((desc + 12) as *const u32) as u64;
-            if ilt == 0 && iat == 0 {
-                break;
-            }
-            let is_dxgthk = dll_name_rva != 0
-                && image_c_string_has_prefix_ignore_case(dst_va, dll_name_rva, cap, 31, b"dxgthk");
-            // ftfd.dll imports its 8 Eng*/Rtl thunks from win32k.sys — resolve against win32k's
-            // own export table (real Eng* code + forwarders to ntoskrnl handled by pe_export_lookup).
-            let is_win32k = dll_name_rva != 0
-                && image_c_string_has_prefix_ignore_case(dst_va, dll_name_rva, cap, 31, b"win32k");
-            let thunk_rva = if ilt != 0 { ilt } else { iat };
-            if !image_rva_span_ok(thunk_rva, 8, cap) || !image_rva_span_ok(iat, 8, cap) {
-                return None;
-            }
-            let names = dst_va + thunk_rva;
-            let slots = dst_va + iat;
-            let mut k = 0u64;
-            let thunk_cap = ((cap - thunk_rva) / 8).min((cap - iat) / 8);
-            let mut terminated = false;
-            while k < thunk_cap {
-                let thunk = read_unaligned((names + k * 8) as *const u64);
-                if thunk == 0 {
-                    terminated = true;
-                    break;
-                }
-                if thunk & 0x8000_0000_0000_0000 == 0 {
-                    let name_rva = thunk & 0x7FFF_FFFF;
-                    if !image_rva_span_ok(name_rva, 2, cap) {
-                        return None;
-                    }
-                    let name_ptr = dst_va + name_rva + 2;
-                    let cstr_len = image_c_string_len(dst_va, name_rva + 2, cap, 63)?;
-                    let import_name = core::slice::from_raw_parts(name_ptr as *const u8, cstr_len);
-                    let (addr, direct) = if import_name_eq(import_name, b"EngDeviceIoControl") {
-                        (s_eng_device_io_control as usize as u64, true)
-                    } else if is_dxgthk {
-                        if dxgthk_base == 0 {
-                            log_unresolved_gdi_driver_import(import_name);
-                            return None;
-                        }
-                        let addr = pe_export_lookup(dxgthk_base, import_name);
-                        if addr == 0 {
-                            log_unresolved_gdi_driver_import(import_name);
-                            return None;
-                        }
-                        (addr, false)
-                    } else if is_win32k {
-                        let addr = pe_export_lookup(WIN32K_CODE_VA, import_name);
-                        if addr == 0 {
-                            log_unresolved_gdi_driver_import(import_name);
-                            return None;
-                        }
-                        (addr, false)
-                    } else {
-                        let name = core::str::from_utf8_unchecked(import_name);
-                        let addr = export_addr(name);
-                        if addr == 0 {
-                            log_unresolved_gdi_driver_import(import_name);
-                            return None;
-                        }
-                        (addr, false)
-                    };
-                    trace_gdi_driver_import(import_name, slots + k * 8, addr, direct);
-                    write_unaligned((slots + k * 8) as *mut u64, addr);
-                }
-                k += 1;
-            }
-            if !terminated {
-                return None;
-            }
-            desc_rva += 20;
-        }
-    }
-
-    Some((entry_rva, export_dir_rva, size_of_image))
-}
-
-/// Record the loaded dxg.sys info for the ZwSetSystemInformation trampoline. Called by the executive
-/// after `load_driver_into(dxg)`.
-pub fn record_dxg(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
-    let expd = if export_dir_rva != 0 {
-        DXG_VA + export_dir_rva as u64
-    } else {
-        0
-    };
-    let _ = register_gdi_driver_image(
-        b"dxg.sys",
-        DXG_VA,
-        DXG_VA + entry_rva as u64,
-        expd,
-        image_len,
-    );
-}
 
 /// Return the Nth non-native static dependency imported by win32k. Native imports (`ntoskrnl.*` and
 /// `hal.*`) are bound by the normal trampoline registry during `load_into`; every other DLL must be

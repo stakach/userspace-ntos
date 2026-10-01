@@ -98,6 +98,7 @@ mod ps_bootstrap;
 mod dispatcher_bootstrap;
 mod timer_deadline;
 mod provider_local_event;
+mod source_event_completion;
 mod provider_local_timer_request;
 mod provider_dispatcher_backend;
 mod provider_file_wait;
@@ -831,6 +832,10 @@ const _: () = {
     );
     assert!(tp_worker_stack_mirror_va(0, TP_WORKER_LEGACY_SLOT_COUNT) == TP_WORKER_AUX_EXEC_BASE);
     assert!(
+        tp_worker_env_scratch_va(MAX_PI - 1, TP_WORKER_SLOT_COUNT - 1) + 0x4000
+            <= allocator::HEAP_BASE as u64
+    );
+    assert!(
         tp_worker_stack_mirror_va(TP_WORKER_PI_COUNT, 0)
             == TP_WORKER_AUX_EXEC_BASE
                 + ((TP_WORKER_SLOT_COUNT - TP_WORKER_LEGACY_SLOT_COUNT) * TP_WORKER_PI_COUNT)
@@ -1292,6 +1297,7 @@ pub const DEMAND_SCRATCH_WINDOW: u64 = 0x0400_0000; // 64 MiB per process
                                                     // paging level, so this layout does not depend on boot-image page tables.
 pub const SMSS_SCRATCH_BASE: u64 = allocator::HEAP_BASE as u64 + allocator::HEAP_FRAMES * 0x1000;
 const _: () = assert!(SMSS_SCRATCH_BASE & 0x1f_ffff == 0);
+const _: () = assert!(SMSS_SCRATCH_BASE == 0x0000_0100_2200_0000);
 /// csrss's demand-fault scratch window (own 64 MiB, PTs mapped at spawn).
 pub const CSRSS_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + DEMAND_SCRATCH_WINDOW;
 /// Fault-endpoint badge for the THIRD hosted process (winlogon). Distinct from smss (0) + csrss (2).
@@ -5423,6 +5429,8 @@ fn root_cap_ownership_spec(passed: &mut u64) {
     let unmap_refusals = ROOT_SLOT_PIN_UNMAP_REFUSALS.load(Ordering::Relaxed);
     let move_refusals = ROOT_SLOT_PIN_MOVE_REFUSALS.load(Ordering::Relaxed);
     let required_heap_pts = allocator::HEAP_FRAMES.div_ceil(512);
+    let mapped_heap_frames = allocator::root_heap_committed_frames()
+        + allocator::EXECUTIVE_TRANSIENT_HEAP_FRAMES;
     print_str(b"[cap-owner] pinned-root-slots=");
     print_u64(pinned);
     print_str(b" delete-refusals=");
@@ -5434,7 +5442,7 @@ fn root_cap_ownership_spec(passed: &mut u64) {
     print_str(b"\n");
     check(
         b"exec_root_vspace_caps_lifetime_owned",
-        pinned >= allocator::HEAP_FRAMES + required_heap_pts + 1
+        pinned >= mapped_heap_frames + required_heap_pts + 1
             && delete_refusals == 0
             && unmap_refusals == 0
             && move_refusals == 0,
@@ -14964,17 +14972,16 @@ pub(crate) unsafe fn map_image_skeleton(pml4: u64, img_count: u64) {
     map_cluster_pt(pml4);
 }
 
-/// Map the executive's OWN heap (so its front-end can allocate). Builds the heap PT first (the
-/// heap is relocated far above the image, so — unlike before — the kernel's ELF PTs don't cover
-/// it), then maps all HEAP_FRAMES at the relocated `HEAP_BASE`.
-unsafe fn map_own_heap() {
-    map_heap_pts(CAP_INIT_THREAD_VSPACE, allocator::HEAP_FRAMES);
-    let Some(frame_base) = try_alloc_slot_run(allocator::HEAP_FRAMES) else {
-        panic!("required executive heap cap run allocation failed");
+/// Map one contiguous root heap span. This path uses only cap/syscall/static bookkeeping, so the
+/// allocator can invoke it while holding its own lock when the durable arena needs more pages.
+unsafe fn map_own_heap_frames(first: u64, count: u64) -> bool {
+    let Some(frame_base) = try_alloc_slot_run(count) else {
+        print_str(b"[paging] executive heap cap run unavailable\n");
+        return false;
     };
     let mut retyped = 0u64;
-    while retyped < allocator::HEAP_FRAMES {
-        let batch = (allocator::HEAP_FRAMES - retyped).min(ROOT_RETYPE_FAN_OUT_LIMIT);
+    while retyped < count {
+        let batch = (count - retyped).min(ROOT_RETYPE_FAN_OUT_LIMIT);
         let error = untyped_retype_r(
             CAP_INIT_UNTYPED,
             OBJ_X86_4K_PAGE,
@@ -14987,7 +14994,7 @@ unsafe fn map_own_heap() {
             print_hex((frame_base >> 32) as u32);
             print_hex(frame_base as u32);
             print_str(b" index=");
-            print_u64(retyped);
+            print_u64(first + retyped);
             print_str(b" batch=");
             print_u64(batch);
             print_str(b" error=");
@@ -14997,10 +15004,10 @@ unsafe fn map_own_heap() {
         }
         retyped += batch;
     }
-    root_slot_pin_run(frame_base, allocator::HEAP_FRAMES);
-    for i in 0..allocator::HEAP_FRAMES {
+    root_slot_pin_run(frame_base, count);
+    for i in 0..count {
         let f = frame_base + i;
-        let va = allocator::HEAP_BASE as u64 + i * 0x1000;
+        let va = allocator::HEAP_BASE as u64 + (first + i) * 0x1000;
         let map = page_map_r(f, va, RW_NX, CAP_INIT_THREAD_VSPACE);
         if map != 0 {
             let _ = cnode_delete_recycle_r(f);
@@ -15015,11 +15022,47 @@ unsafe fn map_own_heap() {
             print_str(b"\n");
             panic!("required executive heap page map failed");
         }
-        // The initial rootserver has no external pager. Touch every page while the mapping
-        // operation and cap are still in scope so a bad kernel mapping cannot survive until a
-        // late allocator memcpy and appear as an unserviceable user fault.
+        // The initial rootserver has no external pager. Detect bad maps at their source.
         core::ptr::write_volatile(va as *mut u8, 0);
     }
+    true
+}
+
+/// Map initial durable pages and the fixed transient lane without committing the intervening VA.
+unsafe fn map_own_heap() {
+    map_heap_pts(CAP_INIT_THREAD_VSPACE, allocator::HEAP_FRAMES);
+    if !map_own_heap_frames(0, allocator::EXECUTIVE_INITIAL_HEAP_FRAMES) {
+        panic!("required executive heap cap run allocation failed");
+    }
+    if !map_own_heap_frames(
+        allocator::EXECUTIVE_DURABLE_HEAP_FRAMES,
+        allocator::EXECUTIVE_TRANSIENT_HEAP_FRAMES,
+    ) {
+        panic!("required executive transient heap cap run allocation failed");
+    }
+    allocator::publish_root_heap_commit(allocator::EXECUTIVE_INITIAL_HEAP_FRAMES);
+}
+
+/// Called under the allocator lock. Publish the expanded durable bound only after all new frame
+/// mappings exist; a failed cap reservation leaves the old bound intact.
+pub(crate) unsafe fn grow_own_heap(requested_end: usize) -> bool {
+    let current = allocator::root_heap_committed_frames();
+    let Some(target) = allocator::root_commit_target(current, requested_end) else {
+        return false;
+    };
+    if target == current {
+        return true;
+    }
+    if !map_own_heap_frames(current, target - current) {
+        return false;
+    }
+    allocator::publish_root_heap_commit(target);
+    print_str(b"[heap] executive durable committed frames=");
+    print_u64(target);
+    print_str(b"/ ");
+    print_u64(allocator::EXECUTIVE_DURABLE_HEAP_FRAMES);
+    print_str(b"\n");
+    true
 }
 
 /// Build a spawned service's VSpace: image RO+X, private heap, private stack, and

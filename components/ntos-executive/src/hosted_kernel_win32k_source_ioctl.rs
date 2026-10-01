@@ -4,10 +4,194 @@ use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_io_manager::hosted_forward_target::HostedForwardTarget;
 use nt_io_manager::win32k_source_irp_ioctl_wire as wire;
+use nt_io_manager::kernel_irp_builder::{
+    validate_kernel_irp_dispatch_cursor, KernelIrpDispatchHeader,
+};
+use nt_io_manager::{WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IRP_SIZE};
 use nt_kernel_exec::{EventLeaseId, EventLeaseKind, EventObjectId, EventSignalMode};
 
 type Route = nt_component_suspension::peer_registry::PeerRoute;
-type Identity = (Route, u64, u64);
+const STATUS_CANCELLED: u32 = 0xc000_0120;
+
+pub(super) unsafe fn commit_origin_packet(
+    packet: &mut Option<crate::win32k_subsystem::ProviderPoolPacketLease>,
+    length: usize,
+    phase_offset: usize,
+    requested: &mut bool,
+    indeterminate: &mut bool,
+    discard: bool,
+    signal_sequence: u64,
+    dispatch: unsafe fn(u64, u64) -> crate::win32k_glue::SourcePnpTerminalDispatch,
+) -> bool {
+    use nt_io_manager::source_terminal::{same_terminal_packet, TerminalPublication};
+    if *indeterminate { return false; }
+    let Some(lease) = *packet else { return false };
+    let (actual, mut before) = match crate::win32k_subsystem::capture_provider_pool_packet(lease.address(), length) {
+        Ok(captured) => captured,
+        Err(_) => { *indeterminate = true; return false; }
+    };
+    if actual.native_identity() != lease.native_identity() { *indeterminate = true; return false; }
+    let command = if discard { TerminalPublication::DiscardRequested } else { TerminalPublication::CommitRequested };
+    let stage = u32::from_le_bytes(before[phase_offset..phase_offset + 4].try_into().unwrap());
+    let status = u32::from_le_bytes(before[phase_offset + 4..phase_offset + 8].try_into().unwrap());
+    let previous = if stage == 0 && status == 0 { None } else { TerminalPublication::decode(stage, status) };
+    if !*requested {
+        if !command.can_follow(previous) { *indeterminate = true; return false; }
+        let (stage, status) = command.words();
+        before[phase_offset..phase_offset + 4].copy_from_slice(&stage.to_le_bytes());
+        before[phase_offset + 4..phase_offset + 8].copy_from_slice(&status.to_le_bytes());
+        before[phase_offset + 8..phase_offset + 16].copy_from_slice(&signal_sequence.to_le_bytes());
+        if !crate::win32k_subsystem::publish_provider_pool_packet(lease, &before) { return false; }
+        *requested = true;
+    } else if previous != Some(command)
+        || u64::from_le_bytes(before[phase_offset + 8..phase_offset + 16].try_into().unwrap()) != signal_sequence
+    { *indeterminate = true; return false; }
+    match dispatch(lease.address(), length as u64) {
+        crate::win32k_glue::SourcePnpTerminalDispatch::NotEntered(_) => return false,
+        crate::win32k_glue::SourcePnpTerminalDispatch::Returned(0) => {}
+        _ => { *indeterminate = true; return false; }
+    }
+    let (actual, after) = match crate::win32k_subsystem::capture_provider_pool_packet(lease.address(), length) {
+        Ok(captured) => captured,
+        Err(_) => { *indeterminate = true; return false; }
+    };
+    let expected = if discard { TerminalPublication::Discarded } else { TerminalPublication::Committed };
+    let stage = u32::from_le_bytes(after[phase_offset..phase_offset + 4].try_into().unwrap());
+    let status = u32::from_le_bytes(after[phase_offset + 4..phase_offset + 8].try_into().unwrap());
+    if actual.native_identity() != lease.native_identity()
+        || !same_terminal_packet(&before, &after, phase_offset)
+        || TerminalPublication::decode(stage, status) != Some(expected)
+        || u64::from_le_bytes(after[phase_offset + 8..phase_offset + 16].try_into().unwrap()) != signal_sequence
+        || !crate::win32k_subsystem::retire_root_provider_pool_packet(lease)
+    { *indeterminate = true; return false; }
+    *packet = None;
+    true
+}
+
+struct RootSource {
+    internal: bool,
+    irp: crate::win32k_subsystem::ProviderPoolPacketLease,
+    system_buffer: Option<crate::win32k_subsystem::ProviderPoolPacketLease>,
+    mdl: Option<crate::win32k_subsystem::ProviderPoolPacketLease>,
+}
+
+impl RootSource {
+    unsafe fn live(&self) -> bool {
+        crate::win32k_subsystem::provider_pool_packet_lease_live(self.irp)
+            && self.system_buffer.is_none_or(|lease| {
+                crate::win32k_subsystem::provider_pool_packet_lease_live(lease)
+            })
+            && self.mdl.is_none_or(|lease| {
+                crate::win32k_subsystem::provider_pool_packet_lease_live(lease)
+            })
+    }
+}
+
+unsafe fn capture_source(request: &wire::SourceIrpIoctlRequest<'_>) -> Result<RootSource, i32> {
+    use nt_io_abi::{ioctl, major};
+    let (header_lease, header) = crate::win32k_subsystem::capture_provider_pool_packet(
+        request.source_irp_va, WDM_X64_IRP_SIZE,
+    ).map_err(|status| status as i32)?;
+    let stack_count = header[0x42];
+    let packet_size = u16::from_le_bytes([header[2], header[3]]) as usize;
+    let expected_size = WDM_X64_IRP_SIZE
+        .checked_add(stack_count as usize * WDM_X64_IO_STACK_LOCATION_SIZE)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    if stack_count == 0 || stack_count == u8::MAX || packet_size != expected_size
+        || header_lease.native_identity().allocation_generation
+            != request.native_allocation_generation
+    { return Err(STATUS_INVALID_PARAMETER); }
+    let (irp, bytes) = crate::win32k_subsystem::capture_provider_pool_packet(
+        request.source_irp_va, packet_size,
+    ).map_err(|status| status as i32)?;
+    if irp.native_identity() != header_lease.native_identity() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let cursor = validate_kernel_irp_dispatch_cursor(
+        request.source_irp_va, packet_size as u64, stack_count,
+        KernelIrpDispatchHeader {
+            irp_type: u16::from_le_bytes(bytes[0..2].try_into().unwrap()),
+            packet_size: packet_size as u16,
+            stack_count,
+            current_location: bytes[0x43],
+            current_stack_location: u64::from_le_bytes(bytes[0xb8..0xc0].try_into().unwrap()),
+        },
+    ).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let stack = nt_io_manager::decode_wdm_kernel_built_io_stack(
+        &bytes[cursor.next_stack_offset
+            ..cursor.next_stack_offset + WDM_X64_IO_STACK_LOCATION_SIZE],
+    ).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let nt_io_manager::WdmIoStackParameters::DeviceControl {
+        output_buffer_length, input_buffer_length, io_control_code, type3_input_buffer,
+    } = stack.parameters else { return Err(STATUS_INVALID_PARAMETER) };
+    let method = ioctl::method(request.code);
+    let input_len = u32::try_from(request.input.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let system_len = if method == ioctl::METHOD_BUFFERED {
+        input_len.max(request.output_capacity)
+    } else if method == ioctl::METHOD_NEITHER { 0 } else { input_len };
+    let flags = u32::from_le_bytes(bytes[0x10..0x14].try_into().unwrap());
+    let expected_flags = if system_len == 0 { 0 } else {
+        nt_io_manager::kernel_irp_builder::IRP_BUFFERED_IO
+            | nt_io_manager::kernel_irp_builder::IRP_DEALLOCATE_BUFFER
+            | if method == ioctl::METHOD_BUFFERED && request.output_va != 0 {
+                nt_io_manager::kernel_irp_builder::IRP_INPUT_OPERATION
+            } else { 0 }
+    };
+    let mdl_va = u64::from_le_bytes(bytes[0x08..0x10].try_into().unwrap());
+    let system_va = u64::from_le_bytes(bytes[0x18..0x20].try_into().unwrap());
+    let user_buffer = u64::from_le_bytes(bytes[0x70..0x78].try_into().unwrap());
+    let iosb_va = u64::from_le_bytes(bytes[0x48..0x50].try_into().unwrap());
+    let event_va = u64::from_le_bytes(bytes[0x50..0x58].try_into().unwrap());
+    if !matches!(stack.major, major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL)
+        || stack.minor != 0 || stack.device_object != request.device_object_va
+        || stack.file_object != 0 || io_control_code != request.code
+        || input_buffer_length != input_len || output_buffer_length != request.output_capacity
+        || flags != expected_flags || system_va != request.system_buffer_va
+        || mdl_va != request.mdl_va || iosb_va != request.iosb_va
+        || event_va != request.event_body_va
+        || match method {
+            ioctl::METHOD_BUFFERED => type3_input_buffer != 0 || user_buffer != request.output_va,
+            ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT => {
+                type3_input_buffer != 0 || user_buffer != 0
+            }
+            ioctl::METHOD_NEITHER => {
+                type3_input_buffer != request.input_va || user_buffer != request.output_va
+            }
+            _ => true,
+        }
+    { return Err(STATUS_INVALID_PARAMETER); }
+    let system_buffer = if system_len == 0 { None } else {
+        let (lease, data) = crate::win32k_subsystem::capture_provider_pool_packet(
+            system_va, system_len as usize,
+        ).map_err(|status| status as i32)?;
+        if lease.native_identity().allocation_generation != request.system_buffer_generation
+            || &data[..request.input.len()] != request.input
+        { return Err(STATUS_INVALID_PARAMETER); }
+        Some(lease)
+    };
+    let mdl = if mdl_va == 0 { None } else {
+        let (lease, data) = crate::win32k_subsystem::capture_provider_pool_packet(
+            mdl_va, nt_mdl::MDL_SIZE,
+        ).map_err(|status| status as i32)?;
+        let i16_at = |offset: usize| i16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
+        let u32_at = |offset: usize| u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        let u64_at = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        if lease.native_identity().allocation_generation != request.mdl_generation
+            || i16_at(nt_mdl::MDL_OFF_SIZE as usize) != nt_mdl::MDL_SIZE as i16
+            || i16_at(nt_mdl::MDL_OFF_FLAGS as usize)
+                != (nt_mdl::MDL_MAPPED_TO_SYSTEM_VA | nt_mdl::MDL_PAGES_LOCKED)
+            || u64_at(nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA as usize) != request.output_va
+            || u64_at(nt_mdl::MDL_OFF_START_VA as usize) != request.output_va & !0xfff
+            || u32_at(nt_mdl::MDL_OFF_BYTE_COUNT as usize) != request.output_capacity
+            || u32_at(nt_mdl::MDL_OFF_BYTE_OFFSET as usize) != (request.output_va & 0xfff) as u32
+        { return Err(STATUS_INVALID_PARAMETER); }
+        Some(lease)
+    };
+    Ok(RootSource {
+        internal: stack.major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL,
+        irp, system_buffer, mdl,
+    })
+}
 
 pub(super) enum Target {
     None,
@@ -55,11 +239,18 @@ struct Work {
     source_address: u64,
     source_ticket: u64,
     source_generation: u64,
-    source: crate::win32k_subsystem::SourceBufferedDispatchLease,
+    nonce: u64,
+    code: u32,
+    internal: bool,
+    output_capacity: u32,
+    output_va: u64,
+    iosb_va: u64,
+    source: RootSource,
     target: HostedForwardTarget,
     event: Option<CanonicalEvent>,
-    packet_lease: crate::win32k_subsystem::ProviderPoolPacketLease,
+    packet_lease: Option<crate::win32k_subsystem::ProviderPoolPacketLease>,
     packet: Vec<u8>,
+    input: Vec<u8>,
     output: Vec<u8>,
     output_target: Target,
     iosb_target: Target,
@@ -69,59 +260,36 @@ struct Work {
     reply_entered: bool,
     reply_acked: bool,
     pending: bool,
+    origin_armed: bool,
     terminal: Option<(u32, u64)>,
     output_captured: bool,
     terminal_claimed: bool,
     terminal_published: bool,
+    terminal_handoff: bool,
+    terminal_packet: Option<crate::win32k_subsystem::ProviderPoolPacketLease>,
+    terminal_acknowledged: bool,
+    origin_commit_requested: bool,
+    origin_committed: bool,
+    discarding: bool,
     event_claimed: bool,
     event_signaled: bool,
+    event_barrier: Option<crate::source_event_completion::Barrier>,
     ack_claimed: bool,
     cancel_requested: bool,
-    cancel_ack_claimed: bool,
+    cancellation_terminal: bool,
+    resources_claimed: bool,
+    resources_committed: bool,
+    indeterminate: bool,
 }
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<usize> = Vec::new();
-static mut ACTIVE: Vec<Identity> = Vec::new();
-static mut COMPLETED: Vec<Identity> = Vec::new();
-struct CompletionWait {
-    identity: Identity,
-    route: Route,
-    dispatch: nt_component_suspension::LaneDispatchIdentity,
-    reply: u64,
-    wait_token: u64,
-    reply_entered: bool,
-    cancelled: bool,
-}
-static mut COMPLETION_WAITS: Vec<CompletionWait> = Vec::new();
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
-static NEXT_WAIT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
-pub(super) unsafe fn reserve_external_source_token() -> Option<u64> {
-    (&mut *core::ptr::addr_of_mut!(ACTIVE)).try_reserve(1).ok()?;
-    (&mut *core::ptr::addr_of_mut!(COMPLETED)).try_reserve(1).ok()?;
-    NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-        .ok().filter(|token| *token != 0)
-}
-
-pub(super) unsafe fn register_external_source(route: Route, source: u64, token: u64) {
-    (&mut *core::ptr::addr_of_mut!(ACTIVE)).push((route, source, token));
-}
-
-pub(super) unsafe fn complete_external_source(route: Route, source: u64, token: u64) {
-    let identity = (route, source, token);
-    let index = (&*core::ptr::addr_of!(ACTIVE)).iter().position(|row| *row == identity)
-        .expect("active external source identity");
-    (&mut *core::ptr::addr_of_mut!(ACTIVE)).swap_remove(index);
-    (&mut *core::ptr::addr_of_mut!(COMPLETED)).push(identity);
-}
-
-pub(super) unsafe fn cancel_external_source(route: Route, source: u64, token: u64) {
-    let identity = (route, source, token);
-    let index = (&*core::ptr::addr_of!(ACTIVE)).iter().position(|row| *row == identity)
-        .expect("cancelled external source identity");
-    (&mut *core::ptr::addr_of_mut!(ACTIVE)).swap_remove(index);
+pub(super) fn next_source_reply_token() -> Option<u64> {
+    runtime::next_service_wait_token()
+        .ok()
+        .filter(|token| *token != 0)
 }
 
 fn wire_status(error: wire::WireError) -> i32 {
@@ -174,146 +342,6 @@ pub(super) unsafe fn capture_event(
         local: expected.local_id,
         provider,
     }))
-}
-
-pub(crate) unsafe fn completion_for_token(
-    channel: &crate::spawn_hosts::PumpChannel,
-    token: u64,
-    source: u64,
-) -> Option<i32> {
-    let _durable = crate::allocator::enter_durable();
-    if token == 0 || source == 0 {
-        return Some(STATUS_INVALID_PARAMETER);
-    }
-    let Ok(Some(route)) = runtime::channel_route(channel) else {
-        return Some(STATUS_INVALID_HANDLE);
-    };
-    let identity = (route, source, token);
-    if (&*core::ptr::addr_of!(COMPLETED)).contains(&identity) {
-        return Some(STATUS_SUCCESS);
-    }
-    if !(&*core::ptr::addr_of!(ACTIVE)).contains(&identity)
-        || (&*core::ptr::addr_of!(COMPLETION_WAITS))
-            .iter()
-            .any(|wait| wait.identity == identity)
-    {
-        return Some(STATUS_INVALID_PARAMETER);
-    }
-    let dispatch = match runtime::dispatch(route) {
-        Ok(dispatch) => dispatch,
-        _ => return Some(STATUS_INVALID_HANDLE),
-    };
-    let reply = match runtime::current_reply(route) {
-        Ok(reply) => reply,
-        _ => return Some(STATUS_INVALID_HANDLE),
-    };
-    if (&mut *core::ptr::addr_of_mut!(COMPLETION_WAITS))
-        .try_reserve(1)
-        .is_err()
-    {
-        return Some(STATUS_INSUFFICIENT_RESOURCES);
-    }
-    let wait_token = match NEXT_WAIT_TOKEN.fetch_update(
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-        |n| n.checked_add(1),
-    ) {
-        Ok(token) if token != 0 => token,
-        _ => return Some(STATUS_INSUFFICIENT_RESOURCES),
-    };
-    if runtime::park_retained_service(route, wait_token).is_err() {
-        return Some(STATUS_DEVICE_NOT_READY);
-    }
-    (&mut *core::ptr::addr_of_mut!(COMPLETION_WAITS)).push(CompletionWait {
-        identity,
-        route,
-        dispatch,
-        reply,
-        wait_token,
-        reply_entered: false,
-        cancelled: false,
-    });
-    None
-}
-
-pub(super) unsafe fn redrive_completion_waits() {
-    let mut index = 0;
-    while index < (&*core::ptr::addr_of!(COMPLETION_WAITS)).len() {
-        let wait = &mut (&mut *core::ptr::addr_of_mut!(COMPLETION_WAITS))[index];
-        if !wait.cancelled && runtime::retained_service_cancelled(
-            wait.route, wait.dispatch, wait.reply, wait.wait_token,
-        ) {
-            runtime::acknowledge_retained_service_cancellation(
-                wait.route, wait.dispatch, wait.reply, wait.wait_token,
-            ).expect("source IOCTL completion wait cancellation");
-            wait.cancelled = true;
-        }
-        if wait.cancelled {
-            if let Some(completed) = (&*core::ptr::addr_of!(COMPLETED))
-                .iter()
-                .position(|identity| *identity == wait.identity)
-            {
-                (&mut *core::ptr::addr_of_mut!(COMPLETED)).swap_remove(completed);
-                (&mut *core::ptr::addr_of_mut!(COMPLETION_WAITS)).swap_remove(index);
-            } else {
-                index += 1;
-            }
-            continue;
-        }
-        if !(&*core::ptr::addr_of!(COMPLETED)).contains(&wait.identity) {
-            index += 1;
-            continue;
-        }
-        if !wait.reply_entered {
-            wait.reply_entered = true;
-            let _ = runtime::wake_service(
-                wait.route, wait.dispatch, wait.reply, wait.wait_token, STATUS_SUCCESS,
-            );
-        }
-        let acknowledged = runtime::reconcile_retained_service_reply(
-            wait.route, wait.dispatch, wait.reply, wait.wait_token,
-        ).expect("source IOCTL completion wait Reply identity");
-        if !acknowledged {
-            index += 1;
-            continue;
-        }
-        runtime::retire_stopped_acknowledged_retained_service(
-            wait.route, wait.dispatch, wait.reply, wait.wait_token,
-        ).expect("source IOCTL completion wait retirement");
-        (&mut *core::ptr::addr_of_mut!(COMPLETION_WAITS)).swap_remove(index);
-    }
-}
-
-pub(crate) unsafe fn release_token(
-    channel: &crate::spawn_hosts::PumpChannel,
-    token: u64,
-    source: u64,
-) -> i32 {
-    let _durable = crate::allocator::enter_durable();
-    if token == 0 || source == 0 {
-        return STATUS_INVALID_PARAMETER;
-    }
-    let Ok(Some(route)) = runtime::channel_route(channel) else {
-        return STATUS_INVALID_HANDLE;
-    };
-    let identity = (route, source, token);
-    // An admitted successor Call on this physical route proves the blocked completion Reply
-    // was acknowledged and its lane resumed. An indeterminate Reply leaves the lane suspended.
-    redrive_completion_waits();
-    if (&*core::ptr::addr_of!(COMPLETION_WAITS))
-        .iter()
-        .any(|wait| wait.identity == identity)
-    {
-        return STATUS_PENDING as i32;
-    }
-    let Some(index) = (&*core::ptr::addr_of!(COMPLETED))
-        .iter()
-        .position(|row| *row == identity)
-    else {
-        return STATUS_INVALID_PARAMETER;
-    };
-    (&mut *core::ptr::addr_of_mut!(COMPLETED)).swap_remove(index);
-    STATUS_SUCCESS
 }
 
 pub(crate) unsafe fn submit(
@@ -385,12 +413,7 @@ pub(crate) unsafe fn submit(
             return Some(status);
         }
     };
-    let source = match crate::win32k_subsystem::admit_source_buffered_ioctl_dispatch(
-        request.source_irp_va,
-        request.device_object_va,
-        provider_stack_pointer,
-        Some(route),
-    ) {
+    let source = match capture_source(&request) {
         Ok(source) => source,
         Err(status) => {
             if let Some(event) = event.take() { release_event(handler, event); }
@@ -398,41 +421,19 @@ pub(crate) unsafe fn submit(
             return Some(status);
         }
     };
-    let matches = source.validate()
-        && source.source_address() == request.source_irp_va
-        && source.source_ticket_serial() == request.source_ticket_serial
-        && source.source_native_generation() == request.native_allocation_generation
-        && source.device == request.device_object_va
-        && source.code == request.code
-        && source.method == nt_io_abi::ioctl::method(request.code)
-        && source.input.as_slice() == request.input
-        && source.output_initial.as_slice() == request.output_initial
-        && source.output_capacity == request.output_capacity
-        && source.event == request.event
-        && source.event.is_some() == source.event_body().is_some();
-    let mut source = source;
-    if !matches {
-        if !crate::win32k_subsystem::abort_source_buffered_ioctl_dispatch(&mut source) {
-            crate::provider_bugcheck::report(0xc4, [request.source_irp_va, 0, 0, 0]);
-        }
-        if let Some(event) = event.take() { release_event(handler, event); }
-        target.release(io_manager_mut()).expect("mismatched source IOCTL target");
-        return Some(STATUS_INVALID_PARAMETER);
-    }
-    let output_target = if source.method == nt_io_abi::ioctl::METHOD_IN_DIRECT {
+    let output_target = if nt_io_abi::ioctl::method(request.code)
+        == nt_io_abi::ioctl::METHOD_IN_DIRECT {
         Some(Target::None)
     } else {
-        Target::capture(route, source.output_va, u64::from(source.output_capacity))
+        Target::capture(route, request.output_va, u64::from(request.output_capacity))
     };
-    let iosb_target = Target::capture(route, source.iosb_va, 16);
+    let iosb_target = Target::capture(route, request.iosb_va, 16);
     let (Some(output_target), Some(iosb_target)) = (output_target, iosb_target) else {
-        if !crate::win32k_subsystem::abort_source_buffered_ioctl_dispatch(&mut source) {
-            crate::provider_bugcheck::report(0xc4, [request.source_irp_va, 0, 0, 1]);
-        }
         if let Some(event) = event.take() { release_event(handler, event); }
         target.release(io_manager_mut()).expect("unentered source IOCTL target");
         return Some(STATUS_INVALID_PARAMETER);
     };
+    let mut input = Vec::new();
     let mut output = Vec::new();
     let slot = (&*core::ptr::addr_of!(WORK))
         .iter()
@@ -440,56 +441,54 @@ pub(crate) unsafe fn submit(
         .find_map(|(index, row)| {
             (row.is_none() && !(&*core::ptr::addr_of!(EXECUTING)).contains(&index)).then_some(index)
         });
-    if output.try_reserve_exact(request.output_capacity as usize).is_err()
+    if input.try_reserve_exact(request.input.len()).is_err()
+        || output.try_reserve_exact(request.output_capacity as usize).is_err()
         || (slot.is_none() && (&mut *core::ptr::addr_of_mut!(WORK)).try_reserve(1).is_err())
-        || (&mut *core::ptr::addr_of_mut!(ACTIVE)).try_reserve(1).is_err()
-        || (&mut *core::ptr::addr_of_mut!(COMPLETED)).try_reserve(1).is_err()
     {
-        if !crate::win32k_subsystem::abort_source_buffered_ioctl_dispatch(&mut source) {
-            crate::provider_bugcheck::report(0xc4, [request.source_irp_va, 0, 0, 2]);
-        }
         if let Some(event) = event.take() { release_event(handler, event); }
         target.release(io_manager_mut()).expect("unentered source IOCTL target");
         return Some(STATUS_INSUFFICIENT_RESOURCES);
     }
+    input.extend_from_slice(request.input);
     output.resize(request.output_capacity as usize, 0);
-    if !source.output_initial.is_empty() {
-        output.copy_from_slice(&source.output_initial);
+    if !request.output_initial.is_empty() {
+        output.copy_from_slice(request.output_initial);
     }
-    let token = match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
-        Ok(token) if token != 0 => token,
+    let token = match next_source_reply_token() {
+        Some(token) => token,
         _ => {
-            if !crate::win32k_subsystem::abort_source_buffered_ioctl_dispatch(&mut source) {
-                crate::provider_bugcheck::report(0xc4, [request.source_irp_va, 0, 0, 3]);
-            }
             if let Some(event) = event.take() { release_event(handler, event); }
             target.release(io_manager_mut()).expect("unentered source IOCTL target");
             return Some(STATUS_INSUFFICIENT_RESOURCES);
         }
     };
-    let source_address = source.source_address();
-    let source_ticket = source.source_ticket_serial();
-    let source_generation = source.source_native_generation();
+    let source_address = request.source_irp_va;
+    let source_ticket = request.source_ticket_serial;
+    let source_generation = request.native_allocation_generation;
     if !super::hosted_kernel_win32k_source_admission::register(
         route, source_address, source_ticket, source_generation,
     ) {
-        if !crate::win32k_subsystem::abort_source_buffered_ioctl_dispatch(&mut source) {
-            crate::provider_bugcheck::report(0xc4, [source_address, token, 0, 57]);
-        }
         if let Some(event) = event.take() { release_event(handler, event); }
         target.release(io_manager_mut()).expect("unentered source IOCTL target");
         return Some(STATUS_INSUFFICIENT_RESOURCES);
     }
+    let internal = source.internal;
     let work = Work {
         route, dispatch, reply, token, source_address, source_ticket, source_generation,
+        nonce: request.nonce, code: request.code,
+        internal,
+        output_capacity: request.output_capacity, output_va: request.output_va,
+        iosb_va: request.iosb_va,
         source, target, event,
-        packet_lease, packet, output, output_target, iosb_target,
+        packet_lease: Some(packet_lease), packet, input, output, output_target, iosb_target,
         irp: None, entered: false, packet_prepared: false,
         reply_entered: false, reply_acked: false,
-        pending: false, terminal: None, output_captured: false,
+        pending: false, origin_armed: false, terminal: None, output_captured: false,
         terminal_claimed: false, terminal_published: false,
-        event_claimed: false, event_signaled: false, ack_claimed: false,
-        cancel_requested: false, cancel_ack_claimed: false,
+        terminal_handoff: false, terminal_packet: None, terminal_acknowledged: false, origin_commit_requested: false, origin_committed: false, discarding: false,
+        event_claimed: false, event_signaled: false, event_barrier: None, ack_claimed: false,
+        cancel_requested: false, cancellation_terminal: false,
+        resources_claimed: false, resources_committed: false, indeterminate: false,
     };
     let index = if let Some(index) = slot {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
@@ -506,58 +505,102 @@ pub(crate) unsafe fn submit(
         let mut work = (&mut *core::ptr::addr_of_mut!(WORK))[index]
             .take()
             .expect("unparked source IOCTL");
-        if !crate::win32k_subsystem::abort_source_buffered_ioctl_dispatch(&mut work.source) {
-            crate::provider_bugcheck::report(0xc4, [source_address, token, 0, 4]);
-        }
         if let Some(event) = work.event.take() { release_event(handler, event); }
         work.target.release(io_manager_mut()).expect("unparked source IOCTL target");
         return Some(STATUS_INSUFFICIENT_RESOURCES);
     }
-    (&mut *core::ptr::addr_of_mut!(ACTIVE)).push((route, source_address, token));
     None
 }
 
+pub(super) unsafe fn target_dispatch_ready(device_id: nt_io_manager::DeviceId) -> bool {
+    let Some((target_index, _, _)) = hosted_driver_device_route_by_device_id(device_id.raw()) else {
+        return true;
+    };
+    let provider_index = hosted_provider_dispatch_route_for_instance(target_index)
+        .map_or(target_index, |route| route.provider_instance);
+    let Some(route) = hosted_ingress_sources::primary_route(provider_index) else { return true; };
+    !matches!(runtime::ready_for_admission(route), Ok(false))
+}
+
+/// Authenticated broker receipt, not inference from native Reply acknowledgement.
+pub(super) unsafe fn arm_pending(
+    route: Route,
+    identity: nt_io_manager::source_pending_armed::PendingArmedIdentity,
+) -> Result<(), i32> {
+    use nt_io_manager::source_pending_armed::{PendingArmedIdentity, PendingSourceKind};
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
+    let Some(work) = rows.iter_mut().filter_map(Option::as_mut).find(|work| {
+        work.route == route && work.nonce == identity.nonce
+    }) else { return Err(STATUS_INVALID_PARAMETER); };
+    let expected = PendingArmedIdentity {
+        kind: PendingSourceKind::Ioctl, nonce: work.nonce, token: work.token,
+        source_irp_va: work.source_address, source_ticket_serial: work.source_ticket,
+        native_allocation_generation: work.source_generation,
+    };
+    if identity != expected || !work.pending || !work.reply_entered || work.indeterminate
+        || !runtime::retained_service_reply_acknowledged(
+            work.route, work.dispatch, work.reply, work.token,
+        ).unwrap_or(false)
+    { return Err(STATUS_INVALID_PARAMETER); }
+    work.origin_armed = true;
+    Ok(())
+}
+
 impl Work {
-    unsafe fn finish_cancelled(&mut self, handler: *mut ExecNtHandler) -> bool {
-        if self.reply_entered {
-            return false;
-        }
-        if let Some(irp) = self.irp {
-            if !self.cancel_requested {
-                self.cancel_requested = true;
-                let _ = cancel_irp_if_pending(irp.raw());
+    unsafe fn ready_for_nested_step(&self) -> bool {
+        use nt_io_manager::retained_source_progress::RetainedSourceProgress as Progress;
+        let progress = if self.indeterminate {
+            Progress::Indeterminate
+        } else if runtime::retained_service_owner_stopped(self.route, self.dispatch, self.reply, self.token) {
+            Progress::Stopped {
+                cancellation_pending: self.irp.is_some() && !self.cancel_requested,
+                completion_ready: self.irp.is_none_or(|irp| nested_device_control_completion_ready_exact(irp.raw())),
+                broker_stopped: runtime::retained_service_owner_stopped_at_broker(
+                    self.route, self.dispatch, self.reply, self.token,
+                ) && self.event_barrier.is_none(),
+                source_lane_ready: crate::win32k_glue::source_terminal_dispatch_ready(),
             }
-            if self.cancel_ack_claimed || completed_device_control_irp_exact(irp.raw()).is_none() {
-                return false;
+        } else if !self.entered {
+            Progress::AwaitingDispatch { provider_ready: target_dispatch_ready(self.target.device_id()) }
+        } else if self.pending && !self.reply_entered {
+            Progress::PublishReply
+        } else if self.reply_entered && !self.reply_acked {
+            Progress::AwaitingReply { acknowledged: runtime::retained_service_reply_acknowledged(
+                self.route, self.dispatch, self.reply, self.token,
+            ).unwrap_or(false) }
+        } else if self.pending && !self.origin_armed {
+            Progress::AwaitingOriginArmed
+        } else if self.pending && self.terminal.is_none() {
+            Progress::AwaitingCompletion {
+                completion_ready: self.irp.is_some_and(|irp| nested_device_control_completion_ready_exact(irp.raw())),
+                cancellation_pending: false,
             }
-            self.cancel_ack_claimed = true;
-            if acknowledge_completed_irp_strict(irp.raw()).is_err() {
-                return false;
-            }
-            self.irp = None;
-        }
-        if !crate::win32k_subsystem::abort_source_buffered_ioctl_dispatch(&mut self.source) {
-            return false;
-        }
-        if let Some(event) = self.event.take() {
-            release_event(handler, event);
-        }
-        self.target
-            .release(io_manager_mut())
-            .expect("cancelled source IOCTL target");
-        runtime::acknowledge_retained_service_cancellation(
-            self.route, self.dispatch, self.reply, self.token,
-        ).expect("cancelled source IOCTL Reply");
-        let identity = (self.route, self.source_address, self.token);
-        let index = (&*core::ptr::addr_of!(ACTIVE))
-            .iter()
-            .position(|row| *row == identity)
-            .expect("cancelled source IOCTL identity");
-        (&mut *core::ptr::addr_of_mut!(ACTIVE)).swap_remove(index);
-        super::hosted_kernel_win32k_source_admission::retire(
-            self.route, self.source_address, self.source_ticket, self.source_generation,
-        );
-        true
+        } else if !self.origin_committed {
+            Progress::Terminal { source_lane_ready: crate::win32k_glue::source_terminal_dispatch_ready() }
+        } else {
+            Progress::Retirement
+        };
+        progress.ready_for_nested_step()
+    }
+
+    fn progress_state(&self) -> [u64; 16] {
+        [self.entered as u64, self.pending as u64, self.reply_entered as u64,
+            self.reply_acked as u64, self.terminal.is_some() as u64, self.output_captured as u64,
+            self.terminal_acknowledged as u64, self.origin_commit_requested as u64,
+            self.origin_committed as u64, self.event_claimed as u64, self.event_signaled as u64,
+            self.ack_claimed as u64, self.cancel_requested as u64, self.resources_committed as u64,
+            self.indeterminate as u64, self.terminal_packet.is_some() as u64]
+    }
+
+    fn completion_matches(&self, completion: &crate::driver_launch::HostedCompletedDeviceControlIrp) -> bool {
+        let expected_major = if self.internal {
+            major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+        } else {
+            major::IRP_MJ_DEVICE_CONTROL
+        };
+        completion.client_id == IO_MANAGER_COMPONENT_ID
+            && completion.device_id == self.target.device_id().raw()
+            && completion.major == expected_major
     }
 
     unsafe fn publish_reply(&mut self, status: u32) -> bool {
@@ -570,7 +613,7 @@ impl Work {
             } else {
                 let (_, information) = self.terminal.expect("inline source IOCTL terminal");
                 let output_len = wire::completion_output_len(
-                    self.source.code, status, information, self.source.output_capacity,
+                    self.code, status, information, self.output_capacity,
                 );
                 wire::publish_inline_terminal(
                     &mut self.packet,
@@ -583,13 +626,16 @@ impl Work {
             if result.is_err() { return false; }
             self.packet_prepared = true;
         }
+        let Some(packet_lease) = self.packet_lease else { return false };
         if !crate::win32k_subsystem::publish_provider_pool_packet(
-            self.packet_lease,
+            packet_lease,
             &self.packet,
         ) {
             return false;
         }
         self.reply_entered = true;
+        self.packet_lease = None;
+        drop(core::mem::take(&mut self.packet));
         let _ = runtime::wake_service(
             self.route,
             self.dispatch,
@@ -606,7 +652,7 @@ impl Work {
         }
         let (status, information) = self.terminal.expect("source IOCTL terminal");
         let length = wire::completion_output_len(
-            self.source.code, status, information, self.source.output_capacity,
+            self.code, status, information, self.output_capacity,
         );
         if let Some(irp) = self.irp {
             if length != 0 {
@@ -623,25 +669,100 @@ impl Work {
     unsafe fn output_slice(&self) -> &[u8] {
         let (status, information) = self.terminal.expect("source IOCTL terminal");
         let length = wire::completion_output_len(
-            self.source.code, status, information, self.source.output_capacity,
+            self.code, status, information, self.output_capacity,
         );
         &self.output[..length]
     }
 
-    unsafe fn publish_terminal(&mut self, handler: *mut ExecNtHandler) -> bool {
-        if !self.terminal_published {
-            if self.terminal_claimed { return false; }
-            let Some(output_address) = self.output_target.address_if_live(self.route) else { return false };
-            let Some(iosb_address) = self.iosb_target.address_if_live(self.route) else { return false };
-            let (status, information) = self.terminal.expect("source IOCTL terminal");
-            self.terminal_claimed = true;
-            if !self.source.publish_terminal(
-                status, information, self.output_slice(), output_address, iosb_address,
-            ) {
+    unsafe fn deliver_terminal(&mut self) -> bool {
+        if self.terminal_acknowledged { return true; }
+        if self.indeterminate { return false; }
+        let (status, information) = self.terminal.expect("source IOCTL terminal");
+        if !self.terminal_handoff {
+            if !self.source.live()
+                || (!self.discarding && (self.output_target.address_if_live(self.route).is_none()
+                    || self.iosb_target.address_if_live(self.route).is_none()))
+            { return false; }
+            let output = self.output_slice();
+            let Ok(length) = wire::terminal_packet_len(output.len()) else { return false };
+            let Some((lease, mut packet)) =
+                crate::win32k_subsystem::allocate_root_provider_pool_packet(length)
+            else { return false };
+            let handoff = wire::SourceIoctlTerminalHandoff {
+            delivery: if self.pending { wire::TerminalDelivery::Pending } else { wire::TerminalDelivery::Inline },
+                nonce: self.nonce,
+                token: self.token,
+                source_irp_va: self.source_address,
+                source_ticket_serial: self.source_ticket,
+                native_allocation_generation: self.source_generation,
+                code: self.code,
+                iosb_va: self.iosb_va,
+                output_va: self.output_va,
+                output_capacity: self.output_capacity,
+                status,
+                information,
+                output,
+            };
+            if wire::encode_terminal_handoff(handoff, &mut packet).is_err()
+                || !crate::win32k_subsystem::publish_provider_pool_packet(lease, &packet)
+            {
+                if !crate::win32k_subsystem::retire_root_provider_pool_packet(lease) {
+                    crate::provider_bugcheck::report(0xc4, [self.source_address, self.token, 0, 73]);
+                }
                 return false;
             }
+            self.terminal_handoff = true;
+            self.terminal_packet = Some(lease);
+        }
+        if self.discarding { return true; }
+        let lease = self.terminal_packet.expect("retained IOCTL terminal packet");
+        match crate::win32k_glue::dispatch_source_ioctl_terminal(
+            lease.address(),
+            wire::terminal_packet_len(self.output_slice().len()).unwrap() as u64,
+        ) {
+            crate::win32k_glue::SourceIoctlTerminalDispatch::NotEntered(_) => return false,
+            crate::win32k_glue::SourceIoctlTerminalDispatch::Returned(status)
+                if status == nt_io_manager::source_terminal::TERMINAL_NOT_READY => return false,
+            crate::win32k_glue::SourceIoctlTerminalDispatch::Returned(0) => {}
+            _ => { self.indeterminate = true; return false; }
+        }
+        let length = wire::terminal_packet_len(self.output_slice().len()).unwrap();
+        let (actual, packet) = match crate::win32k_subsystem::capture_provider_pool_packet(
+            lease.address(), length,
+        ) {
+            Ok(captured) => captured,
+            Err(_) => { self.indeterminate = true; return false; }
+        };
+        let expected = wire::SourceIoctlTerminalHandoff {
+            delivery: if self.pending { wire::TerminalDelivery::Pending } else { wire::TerminalDelivery::Inline },
+            nonce: self.nonce, token: self.token,
+            source_irp_va: self.source_address,
+            source_ticket_serial: self.source_ticket,
+            native_allocation_generation: self.source_generation,
+            code: self.code, iosb_va: self.iosb_va,
+            output_va: self.output_va, output_capacity: self.output_capacity,
+            status, information, output: self.output_slice(),
+        };
+        if actual.native_identity() != lease.native_identity()
+            || !matches!(wire::decode_terminal_ack(&packet), Ok(ack) if
+                ack.handoff == expected && ack.publication == wire::TerminalPublication::Published)
+        { self.indeterminate = true; return false; }
+        self.terminal_acknowledged = true;
+        true
+    }
+
+    unsafe fn accept_terminal_ack(&mut self) -> bool {
+        if !self.terminal_acknowledged { return false; }
+        if !self.terminal_published {
+            if self.terminal_claimed { return false; }
+            self.terminal_claimed = true;
             self.terminal_published = true;
         }
+        true
+    }
+
+    unsafe fn signal_event(&mut self, handler: *mut ExecNtHandler) -> bool {
+        if !self.terminal_published || !self.terminal_acknowledged { return false; }
         if !self.event_signaled {
             if self.event_claimed { return false; }
             if let Some(event) = &self.event {
@@ -654,16 +775,12 @@ impl Work {
                 if !matches!(actual, Ok((id, _, _, _)) if id == event.id) {
                     return false;
                 }
+                let barrier = match crate::source_event_completion::capture(handler, event.id) {
+                    Ok(barrier) => barrier,
+                    Err(_) => return false,
+                };
+                self.event_barrier = Some(barrier);
                 self.event_claimed = true;
-                let observed = crate::provider_local_event::signal(
-                    &mut *handler, event.provider, event.local, EventSignalMode::Set,
-                );
-                if observed.is_err() {
-                    return false;
-                }
-                if !self.source.mirror_event_signaled() {
-                    return false;
-                }
             } else {
                 self.event_claimed = true;
             }
@@ -672,33 +789,110 @@ impl Work {
         true
     }
 
-    unsafe fn retire(&mut self, handler: *mut ExecNtHandler) -> bool {
-        if !self.source.validate() {
-            return false;
-        }
-        if let Some(irp) = self.irp {
-            if self.ack_claimed {
+    unsafe fn commit_origin(&mut self, handler: *mut ExecNtHandler) -> bool {
+        if self.indeterminate { return false; }
+        if self.origin_committed { return self.event_barrier.is_none(); }
+        if !self.terminal_acknowledged || !self.event_signaled { return false; }
+        let length = wire::terminal_packet_len(self.output_slice().len()).unwrap();
+        if !commit_origin_packet(
+            &mut self.terminal_packet, length, 88,
+            &mut self.origin_commit_requested, &mut self.indeterminate, false,
+            self.event_barrier.map_or(0, |barrier| barrier.sequence()),
+            crate::win32k_glue::dispatch_source_ioctl_terminal,
+        ) { return false; }
+        self.origin_committed = true;
+        if let Some(barrier) = self.event_barrier {
+            if crate::source_event_completion::release(handler, barrier).is_err() {
+                self.indeterminate = true;
                 return false;
             }
+            self.event_barrier = None;
+        }
+        true
+    }
+
+    unsafe fn commit_terminal(&mut self, handler: *mut ExecNtHandler) -> bool {
+        if self.resources_committed { return true; }
+        if !self.terminal_acknowledged
+            || !self.terminal_published
+            || self.target.validate(io_manager_mut()).is_err() { return false; }
+        if let Some(irp) = self.irp {
+            if self.ack_claimed { return false; }
             self.ack_claimed = true;
             if acknowledge_completed_irp_strict(irp.raw()).is_err() {
                 return false;
             }
             self.irp = None;
         }
-        if !crate::win32k_subsystem::release_source_buffered_ioctl_dispatch(&mut self.source) {
-            return false;
-        }
+        if !self.signal_event(handler) || !self.commit_origin(handler) { return false; }
         if let Some(event) = self.event.take() { release_event(handler, event); }
         self.target.release(io_manager_mut()).expect("terminal source IOCTL target");
+        self.resources_committed = true;
+        true
+    }
+
+    unsafe fn retire(&mut self) -> bool {
+        if !self.resources_committed || !self.reply_acked { return false; }
         runtime::retire_stopped_acknowledged_retained_service(
             self.route, self.dispatch, self.reply, self.token,
         ).expect("source IOCTL Reply retirement");
-        let identity = (self.route, self.source_address, self.token);
-        let index = (&*core::ptr::addr_of!(ACTIVE)).iter().position(|row| *row == identity)
-            .expect("active source IOCTL identity");
-        (&mut *core::ptr::addr_of_mut!(ACTIVE)).swap_remove(index);
-        (&mut *core::ptr::addr_of_mut!(COMPLETED)).push(identity);
+        super::hosted_kernel_win32k_source_admission::retire(
+            self.route, self.source_address, self.source_ticket, self.source_generation,
+        );
+        true
+    }
+
+    unsafe fn finish_stopped(&mut self, handler: *mut ExecNtHandler) -> bool {
+        if self.indeterminate { return false; }
+        if let Some(irp) = self.irp {
+            if !self.cancel_requested {
+                self.cancel_requested = true;
+                let _ = cancel_irp_if_pending(irp.raw());
+            }
+            let Some(completion) = completed_device_control_irp_exact(irp.raw()) else { return false };
+            if !self.completion_matches(&completion) {
+                crate::provider_bugcheck::report(0xc4, [self.source_address, irp.raw(), 0, 94]);
+            }
+        }
+        // Only a sealed stop while physically parked in this broker Call proves local guards
+        // cannot be held. A stopped-running or whole-domain owner remains quarantined.
+        if !runtime::retained_service_owner_stopped_at_broker(
+            self.route, self.dispatch, self.reply, self.token,
+        ) { return false; }
+        if self.event_barrier.is_some() || self.resources_committed {
+            // Canonical transfer/signal preparation already began; do not turn an uncertain
+            // committed terminal into a new cancellation transaction.
+            return false;
+        }
+        {
+            if let Some(irp) = self.irp {
+                if self.ack_claimed { return false; }
+                self.ack_claimed = true;
+                if acknowledge_completed_irp_strict(irp.raw()).is_err() {
+                    self.indeterminate = true;
+                    return false;
+                }
+                self.irp = None;
+            }
+            if self.terminal_packet.is_none() { self.terminal = Some((0xc000_0120, 0)); }
+            self.discarding = true;
+            if !self.deliver_terminal() { return false; }
+            let length = wire::terminal_packet_len(self.output_slice().len()).unwrap();
+            if !commit_origin_packet(
+                &mut self.terminal_packet, length, 88,
+                &mut self.origin_commit_requested, &mut self.indeterminate, true, 0,
+                crate::win32k_glue::dispatch_source_ioctl_terminal,
+            ) { return false; }
+            self.origin_committed = true;
+        }
+        if !self.resources_committed {
+            if let Some(event) = self.event.take() { release_event(handler, event); }
+            self.target.release(io_manager_mut()).expect("stopped source target");
+            self.resources_committed = true;
+        }
+        runtime::acknowledge_retained_service_cancellation(
+            self.route, self.dispatch, self.reply, self.token,
+        ).expect("sealed broker-stopped source Reply");
         super::hosted_kernel_win32k_source_admission::retire(
             self.route, self.source_address, self.source_ticket, self.source_generation,
         );
@@ -706,23 +900,24 @@ impl Work {
     }
 
     unsafe fn advance(&mut self, handler: *mut ExecNtHandler) -> bool {
+        if runtime::retained_service_owner_stopped(self.route, self.dispatch, self.reply, self.token) {
+            return self.finish_stopped(handler);
+        }
         if !self.entered {
-            if runtime::retained_service_cancelled(self.route, self.dispatch, self.reply, self.token) {
-                return self.finish_cancelled(handler);
-            }
-            if !self.source.validate() || self.target.validate(io_manager_mut()).is_err() {
+            if !target_dispatch_ready(self.target.device_id()) { return false; }
+            if !self.source.live() || self.target.validate(io_manager_mut()).is_err() {
                 return false;
             }
             self.entered = true;
-            let result = if self.source.internal {
+            let result = if self.internal {
                 io_manager_mut().internal_device_control_exact_device(
-                    ClientId(IO_MANAGER_COMPONENT_ID), self.target.device_id(), self.source.code,
-                    &self.source.input, &mut self.output,
+                    ClientId(IO_MANAGER_COMPONENT_ID), self.target.device_id(), self.code,
+                    &self.input, &mut self.output,
                 )
             } else {
                 io_manager_mut().device_control_exact_device(
-                    ClientId(IO_MANAGER_COMPONENT_ID), self.target.device_id(), self.source.code,
-                    &self.source.input, &mut self.output,
+                    ClientId(IO_MANAGER_COMPONENT_ID), self.target.device_id(), self.code,
+                    &self.input, &mut self.output,
                 )
             };
             match result {
@@ -736,16 +931,12 @@ impl Work {
                 Err(status) => self.terminal = Some((status.raw() as u32, 0)),
             }
         }
-        if runtime::retained_service_cancelled(self.route, self.dispatch, self.reply, self.token)
-            && !self.reply_entered
-        {
-            return self.finish_cancelled(handler);
-        }
         if self.pending && !self.reply_entered {
             return self.publish_reply(STATUS_PENDING as u32);
         }
         if !self.pending && !self.reply_entered {
-            if !self.capture_output() || !self.publish_terminal(handler) {
+            if !self.capture_output() || !self.deliver_terminal()
+                || !self.accept_terminal_ack() || !self.commit_terminal(handler) {
                 return false;
             }
             let (status, _) = self.terminal.expect("inline source IOCTL terminal");
@@ -757,50 +948,62 @@ impl Work {
             ).expect("source IOCTL Reply identity");
             if !self.reply_acked { return false; }
         }
+        if self.pending && !self.origin_armed { return false; }
         if self.pending && self.terminal.is_none() {
             let Some(irp) = self.irp else { return false };
             let Some(completion) = completed_device_control_irp_exact(irp.raw()) else {
                 return false;
             };
-            let expected_major = if self.source.internal {
-                major::IRP_MJ_INTERNAL_DEVICE_CONTROL
-            } else {
-                major::IRP_MJ_DEVICE_CONTROL
-            };
-            if completion.client_id != IO_MANAGER_COMPONENT_ID
-                || completion.device_id != self.target.device_id().raw()
-                || completion.major != expected_major
-            {
+            if !self.completion_matches(&completion) {
                 crate::provider_bugcheck::report(0xc4, [self.source_address, irp.raw(), 0, 5]);
             }
             self.terminal = Some((completion.status, completion.information));
         }
-        if self.pending && (!self.capture_output() || !self.publish_terminal(handler)) {
+        if self.pending && (!self.capture_output() || !self.deliver_terminal()
+            || !self.accept_terminal_ack() || !self.commit_terminal(handler)) {
             return false;
         }
-        self.retire(handler)
+        self.retire()
     }
 }
 
-pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
+unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> bool {
     let _durable = crate::allocator::enter_durable();
-    redrive_completion_waits();
     let count = (&*core::ptr::addr_of!(WORK)).len();
-    if count == 0 { return; }
+    if count == 0 { return false; }
     let start = CURSOR.load(Ordering::Relaxed) as usize % count;
     let Some((index, mut work)) = (0..count).find_map(|step| {
         let index = (start + step) % count;
         if (&*core::ptr::addr_of!(EXECUTING)).contains(&index) { return None; }
+        if nested_ready_only && !(&*core::ptr::addr_of!(WORK))[index]
+            .as_ref().is_some_and(|work| work.ready_for_nested_step()) { return None; }
         (&mut *core::ptr::addr_of_mut!(WORK))[index].take().map(|work| (index, work))
-    }) else { return };
+    }) else { return false };
     if (&mut *core::ptr::addr_of_mut!(EXECUTING)).try_reserve(1).is_err() {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
-        return;
+        return false;
     }
     (&mut *core::ptr::addr_of_mut!(EXECUTING)).push(index);
     CURSOR.store(index as u64 + 1, Ordering::Relaxed);
+    let before = work.progress_state();
     let done = work.advance(handler);
+    let progressed = done || before != work.progress_state();
     if !done { (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work); }
     assert_eq!((&mut *core::ptr::addr_of_mut!(EXECUTING)).pop(), Some(index));
-    redrive_completion_waits();
+    progressed
+}
+
+pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
+    let _ = redrive_one(handler, false);
+}
+
+pub(super) unsafe fn nested_work_ready() -> bool {
+    (&*core::ptr::addr_of!(WORK)).iter().enumerate().any(|(index, row)| {
+        !(&*core::ptr::addr_of!(EXECUTING)).contains(&index)
+            && row.as_ref().is_some_and(|work| work.ready_for_nested_step())
+    })
+}
+
+pub(super) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
+    redrive_one(handler, true)
 }

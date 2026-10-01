@@ -9,6 +9,7 @@ pub(super) struct DriverRelationSource {
     pointer: u64,
     generation: u64,
     bytes: [u8; nt_pnp_manager::TARGET_DEVICE_RELATIONS_X64_BYTES],
+    video_reference: Option<hosted_video_target_relation::SourceReference>,
 }
 
 impl DriverRelationSource {
@@ -31,7 +32,10 @@ impl DriverRelationSource {
         }
         let mut bytes = [0; nt_pnp_manager::TARGET_DEVICE_RELATIONS_X64_BYTES];
         core::ptr::copy_nonoverlapping(mapped as *const u8, bytes.as_mut_ptr(), bytes.len());
-        Some(Self { inst, pointer, generation, bytes })
+        let video_reference = hosted_video_target_relation::claim(
+            completion_driver, index, pointer, generation,
+        );
+        Some(Self { inst, pointer, generation, bytes, video_reference })
     }
 
     pub(super) const fn address(&self) -> u64 { self.pointer }
@@ -57,7 +61,7 @@ impl DriverRelationSource {
     }
 
     /// Only after canonical ACK and after transferring the caller's independent PDO reference.
-    pub(super) unsafe fn retire(self) -> bool {
+    pub(super) unsafe fn retire(mut self) -> bool {
         let Some(_guard) = hosted_instance_pool_lock(self.inst.exec_pool_va) else { return false };
         let Some((mapped, capacity)) =
             hosted_pool_allocation_exec_range(self.inst.exec_pool_va, self.pointer)
@@ -69,6 +73,10 @@ impl DriverRelationSource {
         {
             return false;
         }
-        hosted_instance_pool_free_unlocked(self.inst, self.pointer)
+        if !hosted_instance_pool_free_unlocked(self.inst, self.pointer) {
+            return false;
+        }
+        drop(_guard);
+        self.video_reference.take().is_none_or(|reference| reference.release())
     }
 }

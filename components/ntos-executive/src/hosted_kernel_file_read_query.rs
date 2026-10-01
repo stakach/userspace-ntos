@@ -83,7 +83,6 @@ enum PacketSource {
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<usize> = Vec::new();
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
 fn capture_packet(
@@ -331,7 +330,7 @@ unsafe fn submit_captured(
         return Some(STATUS_INSUFFICIENT_RESOURCES);
     }
     let token =
-        match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
+        match runtime::next_service_wait_token() {
             Ok(token) => token,
             Err(_) => {
                 crate::service_sec_image::with_provider_process_manager(|pm| actor.release(pm))
@@ -383,6 +382,48 @@ unsafe fn submit_captured(
 }
 
 impl Work {
+    unsafe fn provider_dispatch_ready(&self) -> bool {
+        let Some((target_index, _, _)) =
+            hosted_driver_device_route_by_device_id(self.file.device_id())
+        else {
+            return true;
+        };
+        let provider_index = hosted_provider_dispatch_route_for_instance(target_index)
+            .map_or(target_index, |route| route.provider_instance);
+        let Some(route) = hosted_ingress_sources::primary_route(provider_index) else {
+            return true;
+        };
+        !matches!(runtime::ready_for_admission(route), Ok(false))
+    }
+
+    unsafe fn ready_for_nested_step(&self) -> bool {
+        use nt_io_manager::retained_file_query_progress::RetainedFileQueryProgress as Progress;
+        let progress = if self.cancelled() {
+            Progress::Cancellation {
+                request_pending: self.pending_irp.is_some() && !self.cancel_requested,
+                completion_ready: self.pending_irp
+                    .is_none_or(|irp| nested_file_irp_completion_ready_exact(irp.raw())),
+            }
+        } else if self.reply_entered {
+            Progress::AwaitingReply {
+                acknowledged: runtime::retained_service_reply_acknowledged(
+                    self.route, self.dispatch, self.reply, self.token,
+                ).unwrap_or(false),
+                delivery_pending: self.delivery_required && !self.delivery_acked,
+            }
+        } else if !self.entered {
+            Progress::AwaitingDispatch { provider_ready: self.provider_dispatch_ready() }
+        } else if self.terminal.is_some() {
+            Progress::Terminal
+        } else {
+            Progress::AwaitingCompletion {
+                completion_ready: self.pending_irp
+                    .is_some_and(|irp| nested_file_irp_completion_ready_exact(irp.raw())),
+            }
+        };
+        progress.ready_for_nested_step()
+    }
+
     fn checked_terminal(&self, status: u32, information: u64) -> (u32, u64) {
         if matches!(
             self.operation,
@@ -468,6 +509,9 @@ impl Work {
         if !self.entered {
             if self.cancelled() {
                 return self.finish_cancelled(handler);
+            }
+            if !self.provider_dispatch_ready() {
+                return false;
             }
             if let Err(status) = self.actor.validate(&(*handler).pm) {
                 self.entered = true;
@@ -680,11 +724,11 @@ impl Work {
     }
 }
 
-pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
+unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> bool {
     let _durable = crate::allocator::enter_durable();
     let count = (&*core::ptr::addr_of!(WORK)).len();
     if count == 0 {
-        return;
+        return false;
     }
     let start = CURSOR.load(Ordering::Relaxed) as usize % count;
     let Some((index, mut work)) = (0..count).find_map(|step| {
@@ -692,22 +736,45 @@ pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
         if (&*core::ptr::addr_of!(EXECUTING)).contains(&index) {
             return None;
         }
+        if nested_ready_only && !(&*core::ptr::addr_of!(WORK))[index]
+            .as_ref().is_some_and(|work| work.ready_for_nested_step())
+        {
+            return None;
+        }
         (&mut *core::ptr::addr_of_mut!(WORK))[index]
             .take()
             .map(|work| (index, work))
     }) else {
-        return;
+        return false;
     };
     if (&mut *core::ptr::addr_of_mut!(EXECUTING))
         .try_reserve(1)
         .is_err()
     {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
-        return;
+        return false;
     }
     (&mut *core::ptr::addr_of_mut!(EXECUTING)).push(index);
     CURSOR.store(index as u64 + 1, Ordering::Relaxed);
+    let before = (
+        work.entered,
+        work.pending_irp.map(|irp| irp.raw()),
+        work.terminal,
+        work.cancel_requested,
+        work.reply_entered,
+        work.delivery_required,
+        work.delivery_acked,
+    );
     let done = work.advance(handler);
+    let progressed = done || before != (
+        work.entered,
+        work.pending_irp.map(|irp| irp.raw()),
+        work.terminal,
+        work.cancel_requested,
+        work.reply_entered,
+        work.delivery_required,
+        work.delivery_acked,
+    );
     if !done {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
     }
@@ -715,6 +782,22 @@ pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
         (&mut *core::ptr::addr_of_mut!(EXECUTING)).pop(),
         Some(index)
     );
+    progressed
+}
+
+pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
+    let _ = redrive_one(handler, false);
+}
+
+pub(super) unsafe fn nested_work_ready() -> bool {
+    (&*core::ptr::addr_of!(WORK)).iter().enumerate().any(|(index, row)| {
+        !(&*core::ptr::addr_of!(EXECUTING)).contains(&index)
+            && row.as_ref().is_some_and(|work| work.ready_for_nested_step())
+    })
+}
+
+pub(super) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
+    redrive_one(handler, true)
 }
 
 /// Win32k calls this only after copying the completed packet into the caller's buffer and IOSB.

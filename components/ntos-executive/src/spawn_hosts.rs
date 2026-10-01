@@ -1241,7 +1241,7 @@ const W32_FAULT_LOG_LIMIT: u64 = 60;
 const W32_ASSERT_SKIP_BOUND: u64 = 4000;
 
 /// win32k WALL diagnostic (relocated VERBATIM from `win32k_dispatch_wide`'s tail): label + fault
-/// IP/addr, RVA relative to the win32k image + dxg, and the UserException number/flags.
+/// IP/addr, RVA relative to the win32k image, and the UserException number/flags.
 #[inline(never)]
 unsafe fn win32k_wall_diag(ch: &PumpChannel, label: u64, m0: u64, m1: u64, m2: u64, m3: u64) {
     crate::print_str(b"[w32disp] WALL label=");
@@ -1251,8 +1251,6 @@ unsafe fn win32k_wall_diag(ch: &PumpChannel, label: u64, m0: u64, m1: u64, m2: u
     crate::print_hex(m0 as u32);
     crate::print_str(b" RVA=0x");
     crate::print_hex(m0.wrapping_sub(ch.code_va) as u32);
-    crate::print_str(b" dxgRVA=0x");
-    crate::print_hex(m0.wrapping_sub(crate::win32k_subsystem::DXG_VA) as u32);
     crate::print_str(b" m1=0x");
     crate::print_hex((m1 >> 32) as u32);
     crate::print_hex(m1 as u32);
@@ -2403,8 +2401,14 @@ unsafe fn component_pump_loop(
         } else if label == crate::win32k_subsystem::W32_GDI_LOAD_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
-            let status = pump_service_gdi_driver_load();
-            pump_reply_recv_into!(ch, *reply_cap, msg, REQUEST_TAG_LEN, status as u32 as u64);
+            let (status, module) = if shared_pump::authenticated_badge(ch, msg.badge) {
+                crate::service_sec_image::service_win32k_gdi_image_request(
+                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, [msg.m2, msg.m3],
+                )
+            } else {
+                (nt_process::STATUS_INVALID_PARAMETER as i32, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, module, 0, 0);
             continue;
         } else if label == crate::win32k_subsystem::W32_VIDEO_IOCTL_LABEL
             && ch.caps.kind == ReqKind::Syscall
@@ -2632,37 +2636,6 @@ unsafe fn component_pump_loop(
                 msg = pump_recv(ch, *reply_cap);
             }
             continue;
-        } else if label == crate::win32k_subsystem::W32_SOURCE_IOCTL_COMPLETION_LABEL
-            && ch.caps.kind == ReqKind::Syscall
-        {
-            let result = if shared_pump::authenticated_badge(ch, msg.badge) {
-                crate::service_sec_image::service_win32k_source_ioctl_completion(
-                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3,
-                )
-            } else {
-                Some(nt_process::STATUS_INVALID_PARAMETER as i32)
-            };
-            if let Some(status) = result {
-                pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
-            } else if shared_pump::autonomous(ch) {
-                outcome.provider_wait_suspended = true;
-                break;
-            } else {
-                msg = pump_recv(ch, *reply_cap);
-            }
-            continue;
-        } else if label == crate::win32k_subsystem::W32_SOURCE_IOCTL_RELEASE_LABEL
-            && ch.caps.kind == ReqKind::Syscall
-        {
-            let status = if shared_pump::authenticated_badge(ch, msg.badge) {
-                crate::service_sec_image::service_win32k_source_ioctl_release(
-                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3,
-                )
-            } else {
-                nt_process::STATUS_INVALID_PARAMETER as i32
-            };
-            pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
-            continue;
         } else if label == crate::win32k_subsystem::W32_SOURCE_PNP_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
@@ -2681,37 +2654,6 @@ unsafe fn component_pump_loop(
             } else {
                 msg = pump_recv(ch, *reply_cap);
             }
-            continue;
-        } else if label == crate::win32k_subsystem::W32_SOURCE_PNP_COMPLETION_LABEL
-            && ch.caps.kind == ReqKind::Syscall
-        {
-            let result = if shared_pump::authenticated_badge(ch, msg.badge) {
-                crate::service_sec_image::service_win32k_source_pnp_completion(
-                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3,
-                )
-            } else {
-                Some(nt_process::STATUS_INVALID_PARAMETER as i32)
-            };
-            if let Some(status) = result {
-                pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
-            } else if shared_pump::autonomous(ch) {
-                outcome.provider_wait_suspended = true;
-                break;
-            } else {
-                msg = pump_recv(ch, *reply_cap);
-            }
-            continue;
-        } else if label == crate::win32k_subsystem::W32_SOURCE_PNP_RELEASE_LABEL
-            && ch.caps.kind == ReqKind::Syscall
-        {
-            let status = if shared_pump::authenticated_badge(ch, msg.badge) {
-                crate::service_sec_image::service_win32k_source_pnp_release(
-                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3,
-                )
-            } else {
-                nt_process::STATUS_INVALID_PARAMETER as i32
-            };
-            pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
             continue;
         } else if label == crate::win32k_subsystem::W32_SOURCE_FSD_LABEL
             && ch.caps.kind == ReqKind::Syscall
@@ -2732,31 +2674,12 @@ unsafe fn component_pump_loop(
                 msg = pump_recv(ch, *reply_cap);
             }
             continue;
-        } else if label == crate::win32k_subsystem::W32_SOURCE_FSD_COMPLETION_LABEL
-            && ch.caps.kind == ReqKind::Syscall
-        {
-            let result = if shared_pump::authenticated_badge(ch, msg.badge) {
-                crate::service_sec_image::service_win32k_source_fsd_completion(
-                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3,
-                )
-            } else {
-                Some(nt_process::STATUS_INVALID_PARAMETER as i32)
-            };
-            if let Some(status) = result {
-                pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
-            } else if shared_pump::autonomous(ch) {
-                outcome.provider_wait_suspended = true;
-                break;
-            } else {
-                msg = pump_recv(ch, *reply_cap);
-            }
-            continue;
-        } else if label == crate::win32k_subsystem::W32_SOURCE_FSD_RELEASE_LABEL
+        } else if label == crate::win32k_subsystem::W32_SOURCE_ARMED_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
             let status = if shared_pump::authenticated_badge(ch, msg.badge) {
-                crate::service_sec_image::service_win32k_source_fsd_release(
-                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3,
+                crate::service_sec_image::service_win32k_source_armed_request(
+                    ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, [msg.m2, msg.m3],
                 )
             } else {
                 nt_process::STATUS_INVALID_PARAMETER as i32
@@ -3891,11 +3814,6 @@ unsafe fn pump_service_user_callback(
     let lane =
         crate::win32k_glue::win32k_physical_lane_for_channel(ch.tcb, ch.fault_ep, ch.reply_cap)?;
     crate::win32k_glue::service_user_callback(lane)
-}
-
-#[inline(never)]
-unsafe fn pump_service_gdi_driver_load() -> i32 {
-    crate::win32k_glue::service_gdi_driver_load()
 }
 
 #[inline(never)]

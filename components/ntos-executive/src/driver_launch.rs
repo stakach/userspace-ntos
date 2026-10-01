@@ -170,6 +170,8 @@ mod hosted_kernel_win32k_source_fsd;
 mod hosted_kernel_win32k_source_admission;
 #[path = "hosted_driver_relation_source.rs"]
 mod hosted_driver_relation_source;
+#[path = "hosted_video_target_relation.rs"]
+mod hosted_video_target_relation;
 #[path = "hosted_kernel_file_cancel.rs"]
 mod hosted_kernel_file_cancel;
 #[path = "hosted_kernel_file_write.rs"]
@@ -220,6 +222,7 @@ use core::sync::atomic::{compiler_fence, AtomicBool, AtomicI32, AtomicU32, Atomi
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use nt_compat_exports::{
     DriverExportRegistry, DriverExportRegistryStats, DRIVER_EXPORT_INITIAL_RESERVE,
 };
@@ -2768,32 +2771,66 @@ const EMPTY_DCERPC_CONTEXT_FLOW: DceRpcContextFlow = DceRpcContextFlow {
     request_count: 0,
 };
 
-static mut DCERPC_READ_REASSEMBLY: Option<Vec<DceRpcReadAssembly>> = None;
-static mut DCERPC_READ_REASSEMBLY_TRACE_COUNT: u32 = 0;
-static mut DCERPC_READ_REASSEMBLY_CONTEXT_TRACE_COUNT: u32 = 0;
-static mut DCERPC_CONTEXT_FLOW: Option<Vec<DceRpcContextFlow>> = None;
-static mut DCERPC_CONTEXT_FLOW_CREATE_TRACE_COUNT: u32 = 0;
-static mut DCERPC_CONTEXT_FLOW_USE_TRACE_COUNT: u32 = 0;
-static mut DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT: u32 = 0;
-
-unsafe fn dcerpc_read_reassembly_table_mut() -> &'static mut Vec<DceRpcReadAssembly> {
-    let slot = &mut *core::ptr::addr_of_mut!(DCERPC_READ_REASSEMBLY);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    slot.as_mut().unwrap()
+struct DceRpcTraceData {
+    read_reassembly: Vec<DceRpcReadAssembly>,
+    context_flow: Vec<DceRpcContextFlow>,
+    read_trace_count: u32,
+    read_context_trace_count: u32,
+    flow_create_trace_count: u32,
+    flow_use_trace_count: u32,
+    flow_miss_trace_count: u32,
 }
 
-unsafe fn dcerpc_context_flow_table_mut() -> &'static mut Vec<DceRpcContextFlow> {
-    let slot = &mut *core::ptr::addr_of_mut!(DCERPC_CONTEXT_FLOW);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    slot.as_mut().unwrap()
+struct DceRpcTraceState {
+    locked: AtomicBool,
+    data: UnsafeCell<DceRpcTraceData>,
 }
 
-unsafe fn dcerpc_context_flow_table() -> Option<&'static Vec<DceRpcContextFlow>> {
-    (&*core::ptr::addr_of!(DCERPC_CONTEXT_FLOW)).as_ref()
+// The heap-local anchor and this lock serialize all access by workers in one component VSpace.
+unsafe impl Sync for DceRpcTraceState {}
+
+fn with_dcerpc_trace_data<R>(f: impl FnOnce(&mut DceRpcTraceData) -> R) -> R {
+    let _durable = crate::allocator::enter_durable();
+    let anchor = crate::allocator::dcerpc_trace_state_anchor();
+    let mut pointer = anchor.load(Ordering::Acquire);
+    if pointer == 0 {
+        let candidate = Box::into_raw(Box::new(DceRpcTraceState {
+            locked: AtomicBool::new(false),
+            data: UnsafeCell::new(DceRpcTraceData {
+                read_reassembly: Vec::new(),
+                context_flow: Vec::new(),
+                read_trace_count: 0,
+                read_context_trace_count: 0,
+                flow_create_trace_count: 0,
+                flow_use_trace_count: 0,
+                flow_miss_trace_count: 0,
+            }),
+        })) as usize;
+        pointer = match anchor.compare_exchange(0, candidate, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => candidate,
+            Err(existing) => {
+                unsafe { drop(Box::from_raw(candidate as *mut DceRpcTraceState)) };
+                existing
+            }
+        };
+    }
+    let state = unsafe { &*(pointer as *const DceRpcTraceState) };
+    while state
+        .locked
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    struct Unlock<'a>(&'a AtomicBool);
+    impl Drop for Unlock<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let _unlock = Unlock(&state.locked);
+    f(unsafe { &mut *state.data.get() })
 }
 
 impl PipeCcbView {
@@ -2921,11 +2958,24 @@ unsafe fn trace_dcerpc_read_reassembly(
         return;
     }
 
-    if let Some(index) = dcerpc_read_reassembly_active_slot(file_id) {
-        let complete = dcerpc_read_reassembly_append(index, payload, chunk_len);
+    with_dcerpc_trace_data(|data| unsafe {
+        trace_dcerpc_read_reassembly_locked(data, file_id, status, info, payload, chunk_len)
+    });
+}
+
+unsafe fn trace_dcerpc_read_reassembly_locked(
+    data: &mut DceRpcTraceData,
+    file_id: u64,
+    status: u32,
+    info: u64,
+    payload: u64,
+    chunk_len: u64,
+) {
+    if let Some(index) = dcerpc_read_reassembly_active_slot(data, file_id) {
+        let complete = dcerpc_read_reassembly_append(data, index, payload, chunk_len);
         if complete {
-            dcerpc_read_reassembly_emit(index, status, info);
-            dcerpc_read_reassembly_clear(index);
+            dcerpc_read_reassembly_emit(data, index, status, info);
+            dcerpc_read_reassembly_clear(data, index);
         }
         return;
     }
@@ -2942,18 +2992,17 @@ unsafe fn trace_dcerpc_read_reassembly(
         return;
     }
 
-    let index = dcerpc_read_reassembly_new_slot(file_id);
-    dcerpc_read_reassembly_start(index, file_id, frag_len);
-    let complete = dcerpc_read_reassembly_append(index, payload, chunk_len);
+    let index = dcerpc_read_reassembly_new_slot(data, file_id);
+    dcerpc_read_reassembly_start(data, index, file_id, frag_len);
+    let complete = dcerpc_read_reassembly_append(data, index, payload, chunk_len);
     if complete {
-        dcerpc_read_reassembly_emit(index, status, info);
-        dcerpc_read_reassembly_clear(index);
+        dcerpc_read_reassembly_emit(data, index, status, info);
+        dcerpc_read_reassembly_clear(data, index);
     }
 }
 
-unsafe fn dcerpc_read_reassembly_active_slot(fid: u64) -> Option<usize> {
-    let table = dcerpc_read_reassembly_table_mut();
-    for (index, entry) in table.iter().enumerate() {
+fn dcerpc_read_reassembly_active_slot(data: &DceRpcTraceData, fid: u64) -> Option<usize> {
+    for (index, entry) in data.read_reassembly.iter().enumerate() {
         if entry.fid == fid && entry.frag_len >= 16 && entry.len < entry.frag_len {
             return Some(index);
         }
@@ -2961,21 +3010,19 @@ unsafe fn dcerpc_read_reassembly_active_slot(fid: u64) -> Option<usize> {
     None
 }
 
-unsafe fn dcerpc_read_reassembly_new_slot(fid: u64) -> usize {
-    let table = dcerpc_read_reassembly_table_mut();
-    for (index, entry) in table.iter().enumerate() {
+fn dcerpc_read_reassembly_new_slot(data: &mut DceRpcTraceData, fid: u64) -> usize {
+    for (index, entry) in data.read_reassembly.iter().enumerate() {
         if entry.fid == 0 || entry.fid == fid {
             return index;
         }
     }
-    let index = table.len();
-    table.push(EMPTY_DCERPC_READ_ASSEMBLY);
+    let index = data.read_reassembly.len();
+    data.read_reassembly.push(EMPTY_DCERPC_READ_ASSEMBLY);
     index
 }
 
-unsafe fn dcerpc_read_reassembly_start(index: usize, fid: u64, frag_len: u16) {
-    let table = dcerpc_read_reassembly_table_mut();
-    table[index] = DceRpcReadAssembly {
+fn dcerpc_read_reassembly_start(data: &mut DceRpcTraceData, index: usize, fid: u64, frag_len: u16) {
+    data.read_reassembly[index] = DceRpcReadAssembly {
         fid,
         frag_len,
         len: 0,
@@ -2983,9 +3030,13 @@ unsafe fn dcerpc_read_reassembly_start(index: usize, fid: u64, frag_len: u16) {
     };
 }
 
-unsafe fn dcerpc_read_reassembly_append(index: usize, payload: u64, chunk_len: u64) -> bool {
-    let table = dcerpc_read_reassembly_table_mut();
-    let entry = &mut table[index];
+unsafe fn dcerpc_read_reassembly_append(
+    data: &mut DceRpcTraceData,
+    index: usize,
+    payload: u64,
+    chunk_len: u64,
+) -> bool {
+    let entry = &mut data.read_reassembly[index];
     let target_len = core::cmp::min(entry.frag_len as usize, DCERPC_READ_REASSEMBLY_BYTES);
     let have = entry.len as usize;
     if have >= target_len {
@@ -2999,25 +3050,28 @@ unsafe fn dcerpc_read_reassembly_append(index: usize, payload: u64, chunk_len: u
     entry.len as usize >= target_len
 }
 
-unsafe fn dcerpc_read_reassembly_emit(index: usize, status: u32, info: u64) {
-    let table = dcerpc_read_reassembly_table_mut();
-    let entry = table[index];
+unsafe fn dcerpc_read_reassembly_emit(
+    data: &mut DceRpcTraceData,
+    index: usize,
+    status: u32,
+    info: u64,
+) {
+    let entry = data.read_reassembly[index];
     let view = dcerpc_pdu_view(entry.buf.as_ptr() as u64, entry.len as u64);
     let Some(view) = view else {
         return;
     };
-    dcerpc_trace_context_flow(entry.fid, view);
+    dcerpc_trace_context_flow_locked(data, entry.fid, view);
     let force_late = dcerpc_pdu_has_context(view) || view.ptype == 3;
-    if DCERPC_READ_REASSEMBLY_TRACE_COUNT >= DCERPC_READ_REASSEMBLY_TRACE_CAP {
+    if data.read_trace_count >= DCERPC_READ_REASSEMBLY_TRACE_CAP {
         if !force_late
-            || DCERPC_READ_REASSEMBLY_CONTEXT_TRACE_COUNT
-                >= DCERPC_READ_REASSEMBLY_CONTEXT_TRACE_CAP
+            || data.read_context_trace_count >= DCERPC_READ_REASSEMBLY_CONTEXT_TRACE_CAP
         {
             return;
         }
-        DCERPC_READ_REASSEMBLY_CONTEXT_TRACE_COUNT += 1;
+        data.read_context_trace_count += 1;
     } else {
-        DCERPC_READ_REASSEMBLY_TRACE_COUNT += 1;
+        data.read_trace_count += 1;
     }
     print_str(b"[fsd-pipe-rpc-read] fid=0x");
     print_hex(entry.fid as u32);
@@ -3038,30 +3092,34 @@ fn dcerpc_pdu_has_context(pdu: DceRpcPduView) -> bool {
 }
 
 unsafe fn dcerpc_trace_context_flow(fid: u64, pdu: DceRpcPduView) {
+    with_dcerpc_trace_data(|data| unsafe { dcerpc_trace_context_flow_locked(data, fid, pdu) });
+}
+
+unsafe fn dcerpc_trace_context_flow_locked(
+    data: &mut DceRpcTraceData,
+    fid: u64,
+    pdu: DceRpcPduView,
+) {
     if !matches!(pdu.ptype, 0 | 2 | 3) {
         return;
     }
     for context in pdu.context_handles.iter().flatten() {
-        let existing_index = dcerpc_context_flow_find(context.uuid);
+        let existing_index = dcerpc_context_flow_find(data, context.uuid);
         let seen_response = existing_index
-            .and_then(|index| {
-                dcerpc_context_flow_table()
-                    .and_then(|table| table.get(index))
-                    .map(|entry| entry.response_count != 0)
-            })
+            .and_then(|index| data.context_flow.get(index))
+            .map(|entry| entry.response_count != 0)
             .unwrap_or(false);
-        let Some(index) = existing_index.or_else(|| dcerpc_context_flow_alloc(context.uuid)) else {
+        let Some(index) = existing_index.or_else(|| dcerpc_context_flow_alloc(data, context.uuid)) else {
             if pdu.ptype == 0
-                && DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT < DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP
+                && data.flow_miss_trace_count < DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP
             {
-                DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT += 1;
+                data.flow_miss_trace_count += 1;
                 dcerpc_print_context_flow(b"drop", fid, pdu, *context, None, false);
             }
             continue;
         };
 
-        let table = dcerpc_context_flow_table_mut();
-        let entry = &mut table[index];
+        let entry = &mut data.context_flow[index];
         match pdu.ptype {
             0 => {
                 if entry.first_request_fid == 0 {
@@ -3074,14 +3132,14 @@ unsafe fn dcerpc_trace_context_flow(fid: u64, pdu: DceRpcPduView) {
                 if seen_response {
                     let first_use = entry.request_count == 1;
                     if first_use
-                        && DCERPC_CONTEXT_FLOW_USE_TRACE_COUNT < DCERPC_CONTEXT_FLOW_USE_TRACE_CAP
+                        && data.flow_use_trace_count < DCERPC_CONTEXT_FLOW_USE_TRACE_CAP
                     {
-                        DCERPC_CONTEXT_FLOW_USE_TRACE_COUNT += 1;
+                        data.flow_use_trace_count += 1;
                         dcerpc_print_context_flow(b"use", fid, pdu, *context, Some(*entry), true);
                     }
-                } else if DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT < DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP
+                } else if data.flow_miss_trace_count < DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP
                 {
-                    DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT += 1;
+                    data.flow_miss_trace_count += 1;
                     dcerpc_print_context_flow(b"miss", fid, pdu, *context, Some(*entry), false);
                 }
             }
@@ -3094,17 +3152,17 @@ unsafe fn dcerpc_trace_context_flow(fid: u64, pdu: DceRpcPduView) {
                 entry.last_response_fid = fid;
                 entry.response_count = entry.response_count.saturating_add(1);
                 if first_response
-                    && DCERPC_CONTEXT_FLOW_CREATE_TRACE_COUNT < DCERPC_CONTEXT_FLOW_CREATE_TRACE_CAP
+                    && data.flow_create_trace_count < DCERPC_CONTEXT_FLOW_CREATE_TRACE_CAP
                 {
-                    DCERPC_CONTEXT_FLOW_CREATE_TRACE_COUNT += 1;
+                    data.flow_create_trace_count += 1;
                     dcerpc_print_context_flow(b"create", fid, pdu, *context, Some(*entry), true);
                 }
             }
             3 => {
                 if !seen_response
-                    && DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT < DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP
+                    && data.flow_miss_trace_count < DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP
                 {
-                    DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT += 1;
+                    data.flow_miss_trace_count += 1;
                     dcerpc_print_context_flow(
                         b"fault-miss",
                         fid,
@@ -3120,9 +3178,8 @@ unsafe fn dcerpc_trace_context_flow(fid: u64, pdu: DceRpcPduView) {
     }
 }
 
-unsafe fn dcerpc_context_flow_find(uuid: [u8; 16]) -> Option<usize> {
-    let table = dcerpc_context_flow_table()?;
-    for (index, entry) in table.iter().enumerate() {
+fn dcerpc_context_flow_find(data: &DceRpcTraceData, uuid: [u8; 16]) -> Option<usize> {
+    for (index, entry) in data.context_flow.iter().enumerate() {
         if (entry.response_count != 0 || entry.request_count != 0) && entry.uuid == uuid {
             return Some(index);
         }
@@ -3130,9 +3187,8 @@ unsafe fn dcerpc_context_flow_find(uuid: [u8; 16]) -> Option<usize> {
     None
 }
 
-unsafe fn dcerpc_context_flow_alloc(uuid: [u8; 16]) -> Option<usize> {
-    let table = dcerpc_context_flow_table_mut();
-    for (index, entry) in table.iter_mut().enumerate() {
+fn dcerpc_context_flow_alloc(data: &mut DceRpcTraceData, uuid: [u8; 16]) -> Option<usize> {
+    for (index, entry) in data.context_flow.iter_mut().enumerate() {
         if entry.response_count == 0 && entry.request_count == 0 {
             *entry = DceRpcContextFlow {
                 uuid,
@@ -3141,8 +3197,8 @@ unsafe fn dcerpc_context_flow_alloc(uuid: [u8; 16]) -> Option<usize> {
             return Some(index);
         }
     }
-    let index = table.len();
-    table.push(DceRpcContextFlow {
+    let index = data.context_flow.len();
+    data.context_flow.push(DceRpcContextFlow {
         uuid,
         ..EMPTY_DCERPC_CONTEXT_FLOW
     });
@@ -3204,8 +3260,8 @@ unsafe fn dcerpc_print_context_flow(
     print_str(b"\n");
 }
 
-unsafe fn dcerpc_read_reassembly_clear(index: usize) {
-    if let Some(entry) = dcerpc_read_reassembly_table_mut().get_mut(index) {
+fn dcerpc_read_reassembly_clear(data: &mut DceRpcTraceData, index: usize) {
+    if let Some(entry) = data.read_reassembly.get_mut(index) {
         *entry = EMPTY_DCERPC_READ_ASSEMBLY;
     }
 }
@@ -5409,15 +5465,50 @@ const _: () = assert!(
 type HostedRegistryIdentityId = usize;
 const INVALID_HOSTED_REGISTRY_IDENTITY_ID: HostedRegistryIdentityId = usize::MAX;
 
-#[derive(Clone, Copy)]
-struct DriverObjectExtensionSlot {
+struct DriverObjectExtensionNode {
     driver_object: u64,
     client_id: u64,
     extension: u64,
-    used: bool,
+    next: usize,
+    retired: AtomicBool,
 }
 
-static mut DRIVER_OBJECT_EXTENSIONS: Option<Vec<DriverObjectExtensionSlot>> = None;
+const DRIVER_OBJECT_EXTENSION_BODY_OFFSET: usize =
+    (core::mem::size_of::<DriverObjectExtensionNode>() + 15) & !15;
+
+// Nodes are immutable after release-publication except for retirement. Neither nodes nor their
+// extension bodies are reclaimed before all component lanes stop and the VSpace pool is torn down.
+// This lets a higher-priority DPC read a preempted worker's list without blocking that worker.
+unsafe fn find_component_driver_object_extension(
+    mut pointer: usize,
+    driver_object: u64,
+    client_id: u64,
+) -> u64 {
+    while pointer != 0 {
+        let node = &*(pointer as *const DriverObjectExtensionNode);
+        if node.driver_object == driver_object
+            && node.client_id == client_id
+            && !node.retired.load(Ordering::Acquire)
+        {
+            return node.extension;
+        }
+        pointer = node.next;
+    }
+    0
+}
+
+fn clear_component_driver_object_extensions(driver_object: u64) {
+    // DriverUnload must already own callback/worker quiescence: no new extension publications
+    // may race this retirement. Retaining storage also protects readers admitted before unload.
+    let mut pointer = crate::allocator::driver_object_extensions_anchor().load(Ordering::Acquire);
+    while pointer != 0 {
+        let node = unsafe { &*(pointer as *const DriverObjectExtensionNode) };
+        if node.driver_object == driver_object {
+            node.retired.store(true, Ordering::Release);
+        }
+        pointer = node.next;
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct HostedAscii<const N: usize> {
@@ -7210,79 +7301,62 @@ extern "win64" fn s_io_allocate_driver_object_extension(
         return STATUS_INVALID_PARAMETER;
     }
     unsafe {
-        let table = driver_object_extensions_mut();
-        if table.iter().any(|slot| {
-            slot.used && slot.driver_object == driver_object && slot.client_id == client_id
-        }) {
-            write_unaligned(extension_out as *mut u64, 0);
+        write_unaligned(extension_out as *mut u64, 0);
+        let anchor = crate::allocator::driver_object_extensions_anchor();
+        let mut head = anchor.load(Ordering::Acquire);
+        if find_component_driver_object_extension(head, driver_object, client_id) != 0 {
             return STATUS_OBJECT_NAME_COLLISION;
         }
-        let reusable = table.iter().position(|slot| !slot.used);
-        let extension = pool_alloc(size as u64);
-        if extension == 0 {
-            write_unaligned(extension_out as *mut u64, 0);
+        let Some(allocation_size) =
+            (DRIVER_OBJECT_EXTENSION_BODY_OFFSET as u64).checked_add(size as u64)
+        else {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        };
+        let allocation = pool_alloc(allocation_size);
+        if allocation == 0 {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
+        let extension = allocation + DRIVER_OBJECT_EXTENSION_BODY_OFFSET as u64;
         core::ptr::write_bytes(extension as *mut u8, 0, size as usize);
-        let slot = DriverObjectExtensionSlot {
-            driver_object,
-            client_id,
-            extension,
-            used: true,
-        };
-        if let Some(idx) = reusable {
-            table[idx] = slot;
-        } else {
-            table.push(slot);
+        let candidate = allocation as *mut DriverObjectExtensionNode;
+        core::ptr::write(
+            candidate,
+            DriverObjectExtensionNode {
+                driver_object,
+                client_id,
+                extension,
+                next: head,
+                retired: AtomicBool::new(false),
+            },
+        );
+        loop {
+            (*candidate).next = head;
+            match anchor.compare_exchange(
+                head,
+                allocation as usize,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => {
+                    head = current;
+                    if find_component_driver_object_extension(head, driver_object, client_id) != 0 {
+                        // This candidate was never published, so no reader can retain it.
+                        pool_free(allocation);
+                        return STATUS_OBJECT_NAME_COLLISION;
+                    }
+                }
+            }
         }
         write_unaligned(extension_out as *mut u64, extension);
+        STATUS_SUCCESS
     }
-    STATUS_SUCCESS
 }
 
 /// `PVOID IoGetDriverObjectExtension(PDRIVER_OBJECT, PVOID ClientId)`.
 extern "win64" fn s_io_get_driver_object_extension(driver_object: u64, client_id: u64) -> u64 {
-    unsafe {
-        let Some(table) = driver_object_extensions() else {
-            return 0;
-        };
-        table
-            .iter()
-            .find(|slot| {
-                slot.used && slot.driver_object == driver_object && slot.client_id == client_id
-            })
-            .map(|slot| slot.extension)
-            .unwrap_or(0)
-    }
-}
-
-unsafe fn driver_object_extensions_mut() -> &'static mut Vec<DriverObjectExtensionSlot> {
-    let slot = &mut *core::ptr::addr_of_mut!(DRIVER_OBJECT_EXTENSIONS);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    slot.as_mut().unwrap()
-}
-
-unsafe fn driver_object_extensions() -> Option<&'static Vec<DriverObjectExtensionSlot>> {
-    (*core::ptr::addr_of!(DRIVER_OBJECT_EXTENSIONS)).as_ref()
-}
-
-unsafe fn clear_driver_object_extensions_for_driver_object(driver_object: u64) {
-    if driver_object == 0 {
-        return;
-    }
-    let Some(table) = (*core::ptr::addr_of_mut!(DRIVER_OBJECT_EXTENSIONS)).as_mut() else {
-        return;
-    };
-    for slot in table.iter_mut() {
-        if slot.used && slot.driver_object == driver_object {
-            slot.driver_object = 0;
-            slot.client_id = 0;
-            slot.extension = 0;
-            slot.used = false;
-        }
-    }
+    let head = crate::allocator::driver_object_extensions_anchor().load(Ordering::Acquire);
+    unsafe { find_component_driver_object_extension(head, driver_object, client_id) }
 }
 
 
@@ -7451,26 +7525,6 @@ unsafe fn hosted_resource_identity_active() -> bool {
         || read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LEN) as *const u64) != 0
 }
 
-unsafe fn hosted_pdo_known(pdo: u64) -> bool {
-    pdo != 0
-        && (hosted_device_binding_by_pdo_object(pdo).is_some()
-            || read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64) == pdo)
-}
-
-unsafe fn hosted_registry_identity_by_pdo_object(pdo: u64) -> Option<HostedDriverRegistryIdentity> {
-    if let Some(identity_id) = hosted_registry_identity_id_by_pdo_object(pdo) {
-        if let Some(identity) = hosted_registry_identity(identity_id) {
-            return Some(identity);
-        }
-    }
-    let inflight_pdo = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
-    if inflight_pdo == pdo {
-        shared_registry_identity()
-    } else {
-        None
-    }
-}
-
 unsafe fn hosted_registry_identity_id_by_pdo_object(pdo: u64) -> Option<HostedRegistryIdentityId> {
     if pdo == 0 {
         return None;
@@ -7490,10 +7544,17 @@ unsafe fn hosted_registry_identity_id_by_pdo_object(pdo: u64) -> Option<HostedRe
 }
 
 unsafe fn hosted_device_object_known(device_object: u64) -> bool {
-    device_object != 0
-        && (hosted_device_binding_by_device_object(device_object).is_some()
-            || read_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DEVICE_OBJECT) as *const u64)
-                == device_object)
+    if device_object == 0
+        || component_pool_allocation_capacity(device_object)
+            .is_none_or(|capacity| capacity < 0x50)
+    {
+        return false;
+    }
+    let driver_object = read_unaligned((device_object + 8) as *const u64);
+    driver_object != 0
+        && component_pool_allocation_capacity(driver_object)
+            .is_some_and(|capacity| capacity >= WDM_X64_DRIVER_OBJECT_SIZE as u64)
+        && driver_object == read_volatile((FSD_SHARED_VADDR + SH_DRVOBJ) as *const u64)
 }
 
 unsafe fn trace_io_get_device_property(
@@ -7588,44 +7649,6 @@ fn build_hosted_interface_link(
         return None;
     }
     Some(out)
-}
-
-fn parse_hosted_interface_reference(
-    symbolic_link: &HostedAscii<HOSTED_INTERFACE_LINK_MAX>,
-    guid: &HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>,
-    instance_path: &HostedAscii<HOSTED_INSTANCE_PATH_MAX>,
-) -> Option<HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>> {
-    let base = build_hosted_interface_link(
-        guid,
-        instance_path,
-        &HostedAscii::<HOSTED_DRIVER_KEY_NAME_MAX>::empty(),
-    )?;
-    if symbolic_link.len < base.len {
-        return None;
-    }
-    let mut i = 0usize;
-    while i < base.len {
-        if ascii_upcase_u8(symbolic_link.bytes[i]) != ascii_upcase_u8(base.bytes[i]) {
-            return None;
-        }
-        i += 1;
-    }
-    if symbolic_link.len == base.len {
-        return Some(HostedAscii::empty());
-    }
-    if symbolic_link.bytes[base.len] != b'\\' {
-        return None;
-    }
-    let mut reference = HostedAscii::<HOSTED_DRIVER_KEY_NAME_MAX>::empty();
-    i = base.len + 1;
-    while i < symbolic_link.len {
-        let byte = symbolic_link.bytes[i];
-        if byte == b'\\' || byte == b'/' || !reference.push_byte(byte) {
-            return None;
-        }
-        i += 1;
-    }
-    (!reference.is_empty()).then_some(reference)
 }
 
 unsafe fn hosted_device_interface_registrations_mut(
@@ -7743,15 +7766,6 @@ extern "win64" fn s_io_register_device_interface(
             0,
         );
 
-        if !hosted_pdo_known(pdo) {
-            return STATUS_INVALID_PARAMETER;
-        }
-        let Some(identity) = hosted_registry_identity_by_pdo_object(pdo) else {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        };
-        let Some(guid) = guid_to_hosted_ascii(class_guid) else {
-            return STATUS_INVALID_PARAMETER;
-        };
         let reference = if reference_string == 0 {
             HostedAscii::<HOSTED_DRIVER_KEY_NAME_MAX>::empty()
         } else {
@@ -7770,21 +7784,19 @@ extern "win64" fn s_io_register_device_interface(
         {
             return STATUS_INVALID_DEVICE_REQUEST;
         }
-        let Some(symbolic_link) =
-            build_hosted_interface_link(&guid, &identity.instance_path, &reference)
-        else {
-            return STATUS_INVALID_PARAMETER;
-        };
-        let status = write_allocated_unicode_string_from_ascii(symbolic_link_name, &symbolic_link);
-        if status < 0 {
-            return status;
+        let output_len = HOSTED_INTERFACE_LINK_MAX * 2 + 2;
+        let output = pool_alloc(output_len as u64);
+        if output == 0 {
+            return STATUS_INSUFFICIENT_RESOURCES;
         }
         let _reply_guard = component_device_reply_lock();
         clear_hosted_device_interface_arg();
-        let capture_status = copy_ascii_to_hosted_device_interface_arg(&symbolic_link);
-        if capture_status < 0 {
-            s_rtl_free_unicode_string(symbolic_link_name);
-            return capture_status;
+        if !reference.is_empty() {
+            let capture_status = copy_ascii_to_hosted_device_interface_arg(&reference);
+            if capture_status < 0 {
+                pool_free(output);
+                return capture_status;
+            }
         }
         let broker_status = hosted_device_interface_operation(
             HOSTED_DEVICE_OP_REGISTER_INTERFACE,
@@ -7792,11 +7804,37 @@ extern "win64" fn s_io_register_device_interface(
             read_unaligned(class_guid as *const u64),
             read_unaligned((class_guid + 8) as *const u64),
         );
-        clear_hosted_device_interface_arg();
         if broker_status < 0 {
-            s_rtl_free_unicode_string(symbolic_link_name);
+            clear_hosted_device_interface_arg();
+            pool_free(output);
+            return broker_status;
         }
-        broker_status
+        let Some(symbolic_link) = shared_path_ascii_at::<HOSTED_INTERFACE_LINK_MAX>(
+            FSD_ARG_VADDR,
+            HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN,
+            HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF,
+        ) else {
+            crate::provider_bugcheck::report(
+                0xc4,
+                [HOSTED_DEVICE_OP_REGISTER_INTERFACE, pdo, 0, 0],
+            );
+        };
+        let len = symbolic_link.len * 2;
+        for (index, byte) in symbolic_link.as_bytes().iter().enumerate() {
+            write_unaligned((output + index as u64 * 2) as *mut u16, *byte as u16);
+        }
+        write_unaligned((output + len as u64) as *mut u16, 0);
+        write_unaligned(
+            (symbolic_link_name + UNICODE_STRING_LENGTH_OFFSET) as *mut u16,
+            len as u16,
+        );
+        write_unaligned(
+            (symbolic_link_name + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16,
+            output_len as u16,
+        );
+        write_unaligned((symbolic_link_name + UNICODE_STRING_BUFFER_OFFSET) as *mut u64, output);
+        clear_hosted_device_interface_arg();
+        STATUS_SUCCESS
     }
 }
 
@@ -13175,7 +13213,7 @@ fn park_hosted_driver_wait(
     if waiters.len() == waiters.capacity() && waiters.try_reserve(4).is_err() {
         return None;
     }
-    let sequence = crate::next_dispatcher_wait_sequence();
+    let sequence = crate::spawn_hosts::shared_ingress::owner::runtime::next_service_wait_token().ok()?;
     let shared = HostedDriverSharedWait { route, dispatch, token: sequence };
     waiters.push(HostedDriverRawWaiter {
         instance,
@@ -20192,7 +20230,6 @@ unsafe fn abort_hosted_provider_dispatch_route_construction(
             None => {}
             Some(_) => return false,
         }
-        clear_driver_object_extensions_for_driver_object(route.provider_driver_object);
     }
     release_hosted_provider_dispatch_route_allocations(route)
 }
@@ -20272,7 +20309,6 @@ unsafe fn teardown_hosted_provider_dispatch_route(
     if !release_hosted_provider_dispatch_route_allocations(route) {
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
-    clear_driver_object_extensions_for_driver_object(route.provider_driver_object);
     Ok(())
 }
 
@@ -34305,6 +34341,7 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
             return (0xC000_0010u32 as i32, 0); // STATUS_INVALID_DEVICE_REQUEST
         }
         call_hosted_pe(unload, &[request_drv]);
+        clear_component_driver_object_extensions(request_drv);
         return (0, 0);
     }
     if major == FSD_DISPATCH_CANCEL_IRP {
@@ -38289,7 +38326,6 @@ unsafe fn load_driver_reserved(
         print_str(b"[driver-launch] DriverEntry failed; removing ");
         print_str(driver_object_path.as_bytes());
         print_str(b"\n");
-        clear_driver_object_extensions_for_driver_object(drvobj);
         return Err(if finished {
             nt_status::NtStatus(de_status)
         } else {
@@ -38305,7 +38341,6 @@ unsafe fn load_driver_reserved(
         );
         if planned_images.primary_offset == 0 && planned_images.dependencies.is_empty() {
             let Some(singleton_image_frames) = frames_for_image_len(image_len as u64) else {
-                clear_driver_object_extensions_for_driver_object(drvobj);
                 return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
             };
             if !register_hosted_provider_singleton(
@@ -38319,7 +38354,6 @@ unsafe fn load_driver_reserved(
                 pool_base,
                 FSD_POOL_FRAMES,
             ) {
-                clear_driver_object_extensions_for_driver_object(drvobj);
                 return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
             }
         }
@@ -38387,7 +38421,6 @@ unsafe fn load_driver_reserved(
             print_str(b" for ");
             print_str(driver_object_path.as_bytes());
             print_str(b"\n");
-            clear_driver_object_extensions_for_driver_object(drvobj);
             return Err(status);
         }
     };
@@ -38413,6 +38446,13 @@ unsafe fn spawn_fsd_component(
     // SAFETY: rights is heap-leaked by the loader for the component lifetime.
     let rights_static: &'static [u64] = core::mem::transmute::<&[u64], &'static [u64]>(rights);
     let regions = [
+        Region {
+            source: FrameSource::FreshZeroed,
+            base_va: allocator::HEAP_BASE as u64,
+            count: allocator::DEFAULT_SERVICE_HEAP_FRAMES,
+            rights: Rights::Uniform(RW_NX),
+            pts: 0,
+        },
         // Hosted driver image, W^X, with enough PTs for the loaded image lane.
         Region {
             source: FrameSource::AliasList(image_frame_caps),
@@ -38466,7 +38506,7 @@ unsafe fn spawn_fsd_component(
         entry: fsd_component_entry,
         image_rights: Rights::Uniform(3), // RWX (trampolines live in the shared executive image)
         lazy_image: true,
-        map_heap_pt: false,
+        map_heap_pt: true,
         stack_base: FSD_STACK_VADDR,
         stack_frames: FSD_STACK_FRAMES,
         stack_dedicated_pt: true,
@@ -39179,6 +39219,55 @@ pub(crate) struct HostedCompletedDeviceControlIrp {
     pub major: u8,
     pub status: u32,
     pub information: u64,
+}
+
+/// Selection hint only. Do not pump, claim backend ownership, or prepare a detached File owner
+/// before the nested runner has parked its parent invocation.
+unsafe fn nested_irp_completion_ready_exact(irp_id: u64) -> bool {
+    if irp_id == 0 { return false; }
+    let io = io_manager_mut();
+    if io.completed_irp(IrpId(irp_id)).is_some() { return true; }
+    let Some(irp) = io.irp(IrpId(irp_id)) else { return false; };
+    let Some(stack) = irp.current_stack() else { return false; };
+    let Some((instance_index, inst)) = instance_by_driver_id(stack.driver_id.raw()) else {
+        return false;
+    };
+    if !inst.ready { return true; }
+    if instance_domain_identity(inst).is_none() { return false; }
+    let storage_instance = hosted_completion_storage_instance(instance_index);
+    if instance(storage_instance).and_then(instance_domain_identity).is_none() { return false; }
+    let Some(win) = ExecVaWindow::try_for_instance(storage_instance) else { return false; };
+    let head = &*((win.data_va + FSD_PENDING_IRP_HEAD_OFF) as *const AtomicU64);
+    let mut node = head.load(Ordering::Acquire);
+    let mut steps = 0;
+    while node != 0 && steps < POOL_FREE_LIST_MAX {
+        let Some(node_exec) = pending_irp_node_exec_va(win, node) else { return false; };
+        let state = pending_irp_owner_state(node_exec).load(Ordering::Acquire);
+        if hosted_irp_state_kind(state) == HOSTED_IRP_READY
+            && pending_irp_canonical_id(node_exec).load(Ordering::Acquire) == irp_id
+            && pending_irp_owner_state(node_exec).load(Ordering::Acquire) == state
+        {
+            // The generation-tagged owner remains READY for this exact canonical id. Native
+            // advance must still claim and validate its domain/completion after parent parking.
+            return true;
+        }
+        node = read_volatile(node_exec as *const u64);
+        steps += 1;
+    }
+    false
+}
+
+unsafe fn nested_file_irp_completion_ready_exact(irp_id: u64) -> bool {
+    io_manager_mut().irp(IrpId(irp_id)).is_some_and(|irp| irp.file_id.is_some())
+        && nested_irp_completion_ready_exact(irp_id)
+}
+
+unsafe fn nested_device_control_completion_ready_exact(irp_id: u64) -> bool {
+    io_manager_mut().irp(IrpId(irp_id)).is_some_and(|irp| {
+        irp.file_id.is_none() && matches!(irp.origin_major,
+            nt_io_abi::major::IRP_MJ_DEVICE_CONTROL
+                | nt_io_abi::major::IRP_MJ_INTERNAL_DEVICE_CONTROL)
+    }) && nested_irp_completion_ready_exact(irp_id)
 }
 
 unsafe fn completed_irp_snapshot_exact(irp_id: u64) -> Option<nt_io_manager::CompletedIrp> {
@@ -44248,12 +44337,21 @@ impl DriverDispatchBackend for HostedDriverBackend {
         let binding = hosted_device_binding_by_device_id(irp.device_id.raw())
             .filter(|binding| binding.instance == route_instance);
         if let Some(binding) = binding {
+            let video_port_initialized = unsafe { hosted_instance_video_port_initialized(route_inst) };
+            if nt_video_miniport::owns_target_device_relation(
+                video_port_initialized,
+                irp.minor,
+                match &irp.parameters {
+                    IoParameters::Pnp(parameters) => parameters.relation_type(),
+                    _ => None,
+                },
+            ) {
+                return unsafe { hosted_video_target_relation::dispatch(binding, irp) };
+            }
             let video_port_intercepts_minor = irp.minor
                 == nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS
                 || irp.minor == IRP_MN_START_DEVICE as u8;
-            if video_port_intercepts_minor
-                && unsafe { hosted_instance_video_port_initialized(route_inst) }
-            {
+            if video_port_intercepts_minor && video_port_initialized {
                 return unsafe {
                     dispatch_video_pnp_irp_for_instance(
                         route_instance,
@@ -47773,8 +47871,9 @@ unsafe fn copy_hosted_device_relations_result(
             .ok_or(HostedDriverAllocationCopyError::InvalidPointer)?;
     let capacity =
         usize::try_from(capacity).map_err(|_| HostedDriverAllocationCopyError::InvalidPointer)?;
+    let generation = read_volatile((exec_pointer - 8) as *const u64);
     let allocation = core::slice::from_raw_parts(exec_pointer as *const u8, capacity);
-    match nt_pnp_manager::copy_device_relations_x64(allocation) {
+    let result = match nt_pnp_manager::copy_device_relations_x64(allocation) {
         Ok(objects) => {
             if hosted_instance_pool_free_unlocked(inst, component_pointer) {
                 Ok(objects)
@@ -47792,7 +47891,18 @@ unsafe fn copy_hosted_device_relations_result(
                 Err(HostedDriverAllocationCopyError::ReleaseFailed)
             }
         }
+    };
+    drop(_guard);
+    if !matches!(result, Err(HostedDriverAllocationCopyError::ReleaseFailed | HostedDriverAllocationCopyError::RetryResources)) {
+        if let Some(reference) = hosted_video_target_relation::claim_allocation(
+            instance_index, component_pointer, generation,
+        ) {
+            if !reference.release() {
+                crate::provider_bugcheck::report(0xc4, [component_pointer, generation, 0, 64]);
+            }
+        }
     }
+    result
 }
 
 unsafe fn copy_hosted_query_id_result(
@@ -51572,18 +51682,26 @@ pub(crate) fn service_hosted_device(
         if inst.exec_arg_va == 0 {
             return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
         }
-        let Some(symbolic_link) = (unsafe {
-            shared_path_ascii_at::<HOSTED_INTERFACE_LINK_MAX>(
-                inst.exec_arg_va,
-                HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN,
-                HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF,
-            )
-        }) else {
-            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        let reference_len = unsafe {
+            read_volatile((inst.exec_arg_va + HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN) as *const u16)
+        } as usize;
+        let reference = if reference_len == 0 {
+            HostedAscii::<HOSTED_DRIVER_KEY_NAME_MAX>::empty()
+        } else {
+            let Some(reference) = (unsafe {
+                shared_path_ascii_at::<HOSTED_DRIVER_KEY_NAME_MAX>(
+                    inst.exec_arg_va,
+                    HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN,
+                    HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF,
+                )
+            }) else {
+                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+            };
+            if reference.as_bytes().iter().any(|byte| *byte == b'\\' || *byte == b'/') {
+                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+            }
+            reference
         };
-        if parse_nt_path(symbolic_link.as_str()).is_none() {
-            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
-        }
         let class_guid = [arg2, arg3];
         let Some(guid) = guid_words_to_hosted_ascii(class_guid) else {
             return (STATUS_INVALID_PARAMETER, 0, 0, 0);
@@ -51598,11 +51716,12 @@ pub(crate) fn service_hosted_device(
         }) else {
             return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
         };
-        let Some(reference) =
-            parse_hosted_interface_reference(&symbolic_link, &guid, &instance_path)
-        else {
+        let Some(symbolic_link) = build_hosted_interface_link(&guid, &instance_path, &reference) else {
             return (STATUS_INVALID_PARAMETER, 0, 0, 0);
         };
+        if parse_nt_path(symbolic_link.as_str()).is_none() {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
         return match unsafe {
             register_hosted_device_interface(
                 owner_domain,
@@ -51612,7 +51731,24 @@ pub(crate) fn service_hosted_device(
                 symbolic_link,
             )
         } {
-            Ok(()) => (STATUS_SUCCESS, 0, 0, 0),
+            Ok(()) => {
+                unsafe {
+                    let len = symbolic_link.len * 2;
+                    for (index, byte) in symbolic_link.as_bytes().iter().enumerate() {
+                        write_volatile(
+                            (inst.exec_arg_va
+                                + HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF
+                                + index as u64 * 2) as *mut u16,
+                            *byte as u16,
+                        );
+                    }
+                    write_volatile(
+                        (inst.exec_arg_va + HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN) as *mut u16,
+                        len as u16,
+                    );
+                }
+                (STATUS_SUCCESS, 0, 0, 0)
+            }
             Err(status) => (status.raw(), 0, 0, 0),
         };
     }
@@ -55019,11 +55155,6 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     if let Some(inst) = inst {
-        unsafe {
-            clear_driver_object_extensions_for_driver_object(inst.driver_object);
-        }
-    }
-    if let Some(inst) = inst {
         if inst.driver_id != 0 {
             let Some(domain) = instance_domain_identity(inst) else {
                 return Err(nt_status::NtStatus::INVALID_PARAMETER);
@@ -56219,7 +56350,13 @@ unsafe fn acquire_hosted_interrupt_lock_for_thread(
                     grant_generation: 0,
                 };
             }
-            let token = crate::next_dispatcher_wait_sequence();
+            let Some(token) = crate::spawn_hosts::shared_ingress::owner::runtime::next_service_wait_token().ok() else {
+                return HostedDriverInterruptServiceResult::Reply {
+                    status: STATUS_INSUFFICIENT_RESOURCES,
+                    interrupt_id: 0,
+                    grant_generation: 0,
+                };
+            };
             let shared = HostedDriverSharedWait {
                 route: caller.route,
                 dispatch,
@@ -56936,6 +57073,10 @@ pub(crate) unsafe fn service_win32k_file_ioctl_release(
     hosted_kernel_win32k_buffered_ioctl::release_token(ch, token, handle)
 }
 
+pub(crate) unsafe fn service_win32k_gdi_image_request(packet: u64, length: u64) -> (i32, u64) {
+    crate::win32k_glue::service_gdi_image_request(packet, length)
+}
+
 pub(crate) unsafe fn service_win32k_source_ioctl(
     ch: &crate::spawn_hosts::PumpChannel,
     reply_cap: u64,
@@ -56947,22 +57088,6 @@ pub(crate) unsafe fn service_win32k_source_ioctl(
     hosted_kernel_win32k_source_ioctl::submit(
         ch, reply_cap, packet, packet_length, provider_stack_pointer, handler,
     )
-}
-
-pub(crate) unsafe fn service_win32k_source_ioctl_completion(
-    ch: &crate::spawn_hosts::PumpChannel,
-    token: u64,
-    source: u64,
-) -> Option<i32> {
-    hosted_kernel_win32k_source_ioctl::completion_for_token(ch, token, source)
-}
-
-pub(crate) unsafe fn service_win32k_source_ioctl_release(
-    ch: &crate::spawn_hosts::PumpChannel,
-    token: u64,
-    source: u64,
-) -> i32 {
-    hosted_kernel_win32k_source_ioctl::release_token(ch, token, source)
 }
 
 pub(crate) unsafe fn service_win32k_source_pnp(
@@ -56978,22 +57103,6 @@ pub(crate) unsafe fn service_win32k_source_pnp(
     )
 }
 
-pub(crate) unsafe fn service_win32k_source_pnp_completion(
-    ch: &crate::spawn_hosts::PumpChannel,
-    token: u64,
-    source: u64,
-) -> Option<i32> {
-    hosted_kernel_win32k_source_pnp::completion_for_token(ch, token, source)
-}
-
-pub(crate) unsafe fn service_win32k_source_pnp_release(
-    ch: &crate::spawn_hosts::PumpChannel,
-    token: u64,
-    source: u64,
-) -> i32 {
-    hosted_kernel_win32k_source_pnp::release_token(ch, token, source)
-}
-
 pub(crate) unsafe fn service_win32k_source_fsd(
     ch: &crate::spawn_hosts::PumpChannel,
     reply_cap: u64,
@@ -57007,20 +57116,42 @@ pub(crate) unsafe fn service_win32k_source_fsd(
     )
 }
 
-pub(crate) unsafe fn service_win32k_source_fsd_completion(
-    ch: &crate::spawn_hosts::PumpChannel,
-    token: u64,
-    source: u64,
-) -> Option<i32> {
-    hosted_kernel_win32k_source_ioctl::completion_for_token(ch, token, source)
-}
-
-pub(crate) unsafe fn service_win32k_source_fsd_release(
-    ch: &crate::spawn_hosts::PumpChannel,
-    token: u64,
-    source: u64,
+pub(crate) unsafe fn service_win32k_source_armed(
+    channel: &crate::spawn_hosts::PumpChannel,
+    packet: u64,
+    length: u64,
 ) -> i32 {
-    hosted_kernel_win32k_source_ioctl::release_token(ch, token, source)
+    use nt_io_manager::source_pending_armed::{self as wire, PendingSourceKind};
+    let _durable = crate::allocator::enter_durable();
+    let route = match crate::spawn_hosts::shared_ingress::owner::runtime::channel_route(channel) {
+        Ok(Some(route)) => route,
+        _ => return nt_process::STATUS_INVALID_HANDLE as i32,
+    };
+    if length != wire::PACKET_BYTES as u64 {
+        return nt_process::STATUS_INVALID_PARAMETER as i32;
+    }
+    let (lease, bytes) = match crate::win32k_subsystem::capture_provider_pool_packet(
+        packet, wire::PACKET_BYTES,
+    ) {
+        Ok(captured) => captured,
+        Err(status) => return status as i32,
+    };
+    let identity = match wire::decode(&bytes) {
+        Ok(identity) => identity,
+        Err(_) => return nt_process::STATUS_INVALID_PARAMETER as i32,
+    };
+    if !crate::win32k_subsystem::provider_pool_packet_lease_live(lease) {
+        return nt_process::STATUS_INVALID_PARAMETER as i32;
+    }
+    let result = match identity.kind {
+        PendingSourceKind::Ioctl => hosted_kernel_win32k_source_ioctl::arm_pending(route, identity),
+        PendingSourceKind::Pnp => hosted_kernel_win32k_source_pnp::arm_pending(route, identity),
+        PendingSourceKind::Fsd => hosted_kernel_win32k_source_fsd::arm_pending(route, identity),
+    };
+    match result {
+        Ok(()) => 0,
+        Err(status) => status,
+    }
 }
 
 pub(crate) unsafe fn service_win32k_file_query_delivered(
@@ -57040,6 +57171,27 @@ pub(crate) unsafe fn service_win32k_file_cancel(
     handle: u64,
 ) -> Option<i32> {
     hosted_kernel_file_cancel::submit_win32k(ch, handle, 0)
+}
+
+pub(crate) unsafe fn nested_hosted_kernel_file_read_query_ready() -> bool {
+    hosted_kernel_file_read_query::nested_work_ready()
+}
+
+pub(crate) unsafe fn nested_win32k_source_work_ready() -> bool {
+    hosted_kernel_win32k_source_ioctl::nested_work_ready()
+        || hosted_kernel_win32k_source_pnp::nested_work_ready()
+        || hosted_kernel_win32k_source_fsd::nested_work_ready()
+}
+
+pub(crate) unsafe fn redrive_nested_win32k_source_work(handler: *mut ExecNtHandler) -> bool {
+    let ioctl = hosted_kernel_win32k_source_ioctl::redrive_nested_ready(handler);
+    let pnp = hosted_kernel_win32k_source_pnp::redrive_nested_ready(handler);
+    let fsd = hosted_kernel_win32k_source_fsd::redrive_nested_ready(handler);
+    ioctl || pnp || fsd
+}
+
+pub(crate) unsafe fn redrive_nested_hosted_kernel_file_read_query(handler: *mut ExecNtHandler) -> bool {
+    hosted_kernel_file_read_query::redrive_nested_ready(handler)
 }
 
 pub(crate) unsafe fn redrive_hosted_driver_zw_read_query_file(handler: *mut ExecNtHandler) {

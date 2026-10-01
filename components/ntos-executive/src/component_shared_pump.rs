@@ -13,7 +13,9 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
             || crate::driver_launch::nested_hosted_read_ready()
             || crate::driver_launch::nested_hosted_flush_ready()
             || crate::driver_launch::nested_hosted_query_information_ready()
-            || crate::driver_launch::nested_hosted_lower_pnp_ready() {
+            || crate::driver_launch::nested_hosted_lower_pnp_ready()
+            || crate::driver_launch::nested_hosted_kernel_file_read_query_ready()
+            || crate::driver_launch::nested_win32k_source_work_ready() {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,

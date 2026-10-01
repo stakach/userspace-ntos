@@ -35,7 +35,6 @@ struct Work {
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<usize> = Vec::new();
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
 fn ready(status: u32) -> SubmitResult {
@@ -97,9 +96,7 @@ pub(crate) unsafe fn submit(
             .expect("unsubmitted RoutedFile close actor");
         return ready(STATUS_NO_MEMORY);
     }
-    let token = match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-        next.checked_add(1)
-    }) {
+    let token = match runtime::next_service_wait_token() {
         Ok(token) => token,
         Err(_) => {
             drop(capture);

@@ -3,7 +3,7 @@
 use super::*;
 use nt_io_abi::major;
 
-/// Dormant until all three root source services are native-verified.
+/// Route only source-ledger IRPs with an authenticated next WDM stack.
 pub(super) extern "win64" fn iof_call_driver(device: u64, irp: u64) -> i32 {
     unsafe {
         let Some(source) = source_irp::retain_dispatch(irp) else {

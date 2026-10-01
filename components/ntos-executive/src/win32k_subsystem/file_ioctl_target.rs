@@ -54,13 +54,15 @@ pub(super) unsafe fn pin_output(
     if address == 0 || address.checked_add(length).is_none() {
         return Err(STATUS_INVALID_PARAMETER_I32);
     }
-    if let Some(catalog) = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS)).as_mut()
     {
-        if catalog.resolve(address, length).is_ok() {
-            return catalog
-                .pin_active_range(activation, address, length)
-                .map(|(_, pin)| PinnedIoctlOutput::Stack(pin))
-                .map_err(|_| STATUS_ACCESS_VIOLATION_I32);
+        let mut metadata = ProviderMetadataGuard::acquire();
+        if let Some(catalog) = provider_input::stack_catalog_mut(&mut metadata) {
+            if catalog.resolve(address, length).is_ok() {
+                return catalog
+                    .pin_active_range(activation, address, length)
+                    .map(|(_, pin)| PinnedIoctlOutput::Stack(pin))
+                    .map_err(|_| STATUS_ACCESS_VIOLATION_I32);
+            }
         }
     }
     if provider_pool_contains(address) {
@@ -90,8 +92,8 @@ pub(super) unsafe fn release_output(pin: PinnedIoctlOutput) {
     let released = match pin {
         PinnedIoctlOutput::None | PinnedIoctlOutput::Image => true,
         PinnedIoctlOutput::Stack(pin) => {
-            (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
-                .as_mut()
+            let mut metadata = ProviderMetadataGuard::acquire();
+            provider_input::stack_catalog_mut(&mut metadata)
                 .is_some_and(|catalog| catalog.release_pin(pin).is_ok())
         }
         PinnedIoctlOutput::Pool(pin) => {

@@ -75,16 +75,6 @@ impl SourcePnpDispatchLease {
         true
     }
 
-    pub(crate) unsafe fn mirror_event_signaled(&self) -> bool {
-        if !self.validate() {
-            return false;
-        }
-        if self.event_lease.is_some() {
-            let _metadata = ProviderMetadataGuard::acquire();
-            mirror_projected_event_state(self.event_va, true);
-        }
-        true
-    }
 }
 
 pub(crate) unsafe fn admit_pnp_target_relation(
@@ -93,23 +83,36 @@ pub(crate) unsafe fn admit_pnp_target_relation(
     stack_pointer: u64,
 ) -> Result<SourcePnpDispatchLease, i32> {
     use nt_io_abi::major;
-    let mut source = Some(retain_dispatch(address).ok_or(STATUS_INVALID_PARAMETER_I32)?);
+    let mut source = Some(match retain_dispatch(address) {
+        Some(source) => source,
+        None => {
+            print_str(b"[source-pnp-admit] exact IRP retention failed\n");
+            return Err(STATUS_INVALID_PARAMETER_I32);
+        }
+    });
     let result = (|| {
         let source_ref = source.as_ref().unwrap();
         let auxiliary = source_irp_aux::snapshot_exact(source_ref.ticket, source_ref.allocation)
-            .ok_or(STATUS_INVALID_PARAMETER_I32)?;
+            .ok_or_else(|| {
+                print_str(b"[source-pnp-admit] auxiliary identity missing\n");
+                STATUS_INVALID_PARAMETER_I32
+            })?;
         if auxiliary.system_buffer.is_some()
             || auxiliary.mdl.is_some()
             || auxiliary.input_target.is_some()
             || auxiliary.output_target.is_some()
         {
+            print_str(b"[source-pnp-admit] unexpected transfer backing\n");
             return Err(STATUS_INVALID_PARAMETER_I32);
         }
         let stack_address = address + source_ref.cursor.next_stack_offset as u64;
         let stack = nt_io_manager::decode_wdm_kernel_built_io_stack(
             core::slice::from_raw_parts(stack_address as *const u8, WDM_X64_IO_STACK_LOCATION_SIZE),
         )
-        .map_err(|_| STATUS_INVALID_PARAMETER_I32)?;
+        .map_err(|_| {
+            print_str(b"[source-pnp-admit] WDM stack decode failed\n");
+            STATUS_INVALID_PARAMETER_I32
+        })?;
         if stack.major != major::IRP_MJ_PNP
             || stack.minor != nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS
             || stack.device_object != device
@@ -125,6 +128,7 @@ pub(crate) unsafe fn admit_pnp_target_relation(
             || read_volatile((address + 0x18) as *const u64) != 0
             || read_volatile((address + 0x70) as *const u64) != 0
         {
+            print_str(b"[source-pnp-admit] WDM stack fields mismatch\n");
             return Err(STATUS_INVALID_PARAMETER_I32);
         }
         let iosb_va = read_volatile((address + 0x48) as *const u64);
@@ -138,13 +142,25 @@ pub(crate) unsafe fn admit_pnp_target_relation(
                     catalog.active(binding.handle).ok()
                 })
         }
-        .ok_or(STATUS_NOT_SUPPORTED_I32)?;
-        let iosb_pin = file_ioctl_target::pin_output(activation, iosb_va, 16)?;
+        .ok_or_else(|| {
+            print_str(b"[source-pnp-admit] stack activation missing\n");
+            STATUS_NOT_SUPPORTED_I32
+        })?;
+        let iosb_pin = file_ioctl_target::pin_output(activation, iosb_va, 16)
+            .map_err(|status| {
+                print_str(b"[source-pnp-admit] IOSB pin rejected status=0x");
+                print_hex(status as u32);
+                print_str(b" address=0x");
+                print_hex_u64(iosb_va);
+                print_str(b"\n");
+                status
+            })?;
         let event_lease = if event_va == 0 {
             None
         } else if let Some(event) = try_signal_event_lease(event_va) {
             Some(event)
         } else {
+            print_str(b"[source-pnp-admit] Event lease unavailable\n");
             file_ioctl_target::release_output(iosb_pin);
             return Err(STATUS_INVALID_PARAMETER_I32);
         };
@@ -171,16 +187,11 @@ pub(crate) unsafe fn admit_pnp_target_relation(
     result
 }
 
-unsafe fn finish_pnp_dispatch(lease: &mut SourcePnpDispatchLease, retire_source: bool) -> bool {
+unsafe fn finish_pnp_dispatch(lease: &mut SourcePnpDispatchLease, retire_source: bool, mirror_event: Option<u64>) -> bool {
     if !lease.validate() {
         return false;
     }
-    if let Some(event) = lease.event_lease.take() {
-        let _metadata = ProviderMetadataGuard::acquire();
-        if provider_local_events_mut().is_none_or(|events| events.release_lease(event).is_err()) {
-            crate::provider_bugcheck::report(0xc4, [0x57495250, lease.event_va, 0, 35]);
-        }
-    }
+    let event = lease.event_lease.take();
     file_ioctl_target::release_output(core::mem::replace(
         &mut lease.iosb_pin,
         file_ioctl_target::PinnedIoctlOutput::None,
@@ -195,13 +206,18 @@ unsafe fn finish_pnp_dispatch(lease: &mut SourcePnpDispatchLease, retire_source:
     {
         crate::provider_bugcheck::report(0xc4, [0x57495250, address, 0, 36]);
     }
-    true
+    finish_terminal_event(event, lease.event_va, mirror_event)
 }
 
 pub(crate) unsafe fn release_pnp_dispatch(lease: &mut SourcePnpDispatchLease) -> bool {
-    finish_pnp_dispatch(lease, true)
+    finish_pnp_dispatch(lease, true, None)
+}
+
+pub(crate) unsafe fn commit_pnp_dispatch(lease: &mut SourcePnpDispatchLease, sequence: u64) -> bool {
+    if lease.event_lease.is_some() != (sequence != 0) { return false; }
+    finish_pnp_dispatch(lease, true, Some(sequence))
 }
 
 pub(crate) unsafe fn abort_pnp_dispatch(lease: &mut SourcePnpDispatchLease) -> bool {
-    finish_pnp_dispatch(lease, false)
+    finish_pnp_dispatch(lease, false, None)
 }
