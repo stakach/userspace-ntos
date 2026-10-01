@@ -87,6 +87,7 @@ pub mod retained_file_close_progress;
 pub mod retained_source_progress;
 pub mod win32k_async_read_wire;
 pub mod win32k_section_create_wire;
+pub mod win32k_mm_section_wire;
 pub mod win32k_section_map_wire;
 pub mod win32k_buffered_ioctl_wire;
 pub mod win32k_source_irp_ioctl_wire;

@@ -73,7 +73,7 @@ pub use runtime_section::{
     GenericSection, GenericSectionBacking, GenericSectionFlushPlan, GenericSectionTable,
     GenericSectionTableStats, GenericSectionView, ProviderSectionView, ProviderVspaceIdentity,
     PendingSectionFrames, SectionRetirement, SectionRetirementIo,
-    SectionIdentity, SectionPagePublication, SectionPagePublicationError,
+    SectionIdentity, SectionReference, SectionPagePublication, SectionPagePublicationError,
     SectionRetirementResource, RoutedSectionLease, GENERIC_SECTION_BACKING_ANON,
     SectionFileIdentity, SectionMountBindingError, SectionMountBindings, SectionMountId, SectionMountIds,
     GENERIC_SECTION_BACKING_DISK, GENERIC_SECTION_BACKING_NONE, GENERIC_SECTION_BACKING_OVERLAY,

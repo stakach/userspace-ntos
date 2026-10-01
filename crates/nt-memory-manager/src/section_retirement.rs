@@ -15,6 +15,12 @@ pub struct SectionIdentity {
     pub(super) generation: u64,
 }
 
+impl SectionIdentity {
+    pub const fn index(self) -> usize {
+        self.index
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SectionRetirement {
     section_index: usize,
