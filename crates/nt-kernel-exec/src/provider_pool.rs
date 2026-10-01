@@ -10,7 +10,7 @@ pub const HEADER_SIZE: u64 = 32;
 pub const DATA_OFFSET: u64 = 0x1000;
 pub const LOCK_OFFSET: u64 = 0x10;
 pub const MAGIC_OFFSET: u64 = 0x18;
-pub const MAGIC: u64 = 0x504f_4f4c_0000_0003;
+pub const MAGIC: u64 = 0x504f_4f4c_0000_0004;
 
 const BUMP_OFFSET: u64 = 0;
 const FREE_HEAD_OFFSET: u64 = 8;
@@ -27,6 +27,9 @@ const STATS_ARENA_HIGH_WATER: u64 = 0x50;
 const STATS_OOM: u64 = 0x58;
 const STATS_CORRUPTION: u64 = 0x60;
 const NEXT_ALLOCATION_GENERATION: u64 = 0x68;
+const NEXT_PIN_TOKEN: u64 = 0x70;
+const ARENA_AUTHORITY: u64 = 0x78;
+static NEXT_ARENA_AUTHORITY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// Minimal memory boundary used by both the volatile provider mapping and host specs.
 pub trait PoolMemory {
@@ -63,6 +66,14 @@ pub struct AllocationIdentity {
     pub allocation_generation: u64,
 }
 
+/// Exact physical-arena incarnation and exclusive owner. Offsets alone are never authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExclusivePin {
+    arena: u64,
+    allocation: AllocationIdentity,
+    token: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AllocationLocation {
     pub identity: AllocationIdentity,
@@ -80,6 +91,10 @@ pub enum PoolError {
     InvalidPointer,
     NotAllocated,
     GenerationExhausted,
+    ArenaExhausted,
+    PinExhausted,
+    Pinned,
+    StalePin,
     Corrupt,
 }
 
@@ -119,6 +134,9 @@ fn checked_align(value: u64) -> Result<u64, PoolError> {
 fn initialized<M: PoolMemory>(memory: &M) -> bool {
     memory.len() >= DATA_OFFSET + HEADER_SIZE + ALIGNMENT
         && memory.read_u64(MAGIC_OFFSET) == Some(MAGIC)
+        && memory
+            .read_u64(ARENA_AUTHORITY)
+            .is_some_and(|authority| authority != 0)
 }
 
 /// Initialize a freshly mapped arena. The embedding boundary must guarantee exclusive access and
@@ -127,11 +145,19 @@ pub fn initialize<M: PoolMemory>(memory: &mut M) -> Result<(), PoolError> {
     if memory.len() < DATA_OFFSET + HEADER_SIZE + ALIGNMENT {
         return Err(PoolError::ArenaTooSmall);
     }
-    for offset in (0..=NEXT_ALLOCATION_GENERATION).step_by(8) {
+    let authority = NEXT_ARENA_AUTHORITY
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |next| next.checked_add(1),
+        )
+        .map_err(|_| PoolError::ArenaExhausted)?;
+    for offset in (0..=ARENA_AUTHORITY).step_by(8) {
         write(memory, offset, 0)?;
     }
     write(memory, BUMP_OFFSET, DATA_OFFSET)?;
     write(memory, STATS_ARENA_HIGH_WATER, DATA_OFFSET)?;
+    write(memory, ARENA_AUTHORITY, authority)?;
     write(memory, MAGIC_OFFSET, MAGIC)?;
     Ok(())
 }
@@ -165,6 +191,73 @@ pub fn allocation_identity<M: PoolMemory>(
         allocation_id: payload,
         allocation_generation: generation,
     })
+}
+
+/// The embedding owner must serialize all operations with the arena's physical lock.
+pub fn pin_exclusive<M: PoolMemory>(
+    memory: &mut M,
+    allocation: AllocationIdentity,
+) -> Result<ExclusivePin, PoolError> {
+    if allocation_identity(memory, allocation.allocation_id)? != allocation {
+        return Err(PoolError::StalePin);
+    }
+    let word = allocation.allocation_id - HEADER_SIZE + HEADER_RESERVED_OFFSET;
+    if read(memory, word)? != 0 {
+        return Err(PoolError::Pinned);
+    }
+    let token = read(memory, NEXT_PIN_TOKEN)?
+        .checked_add(1)
+        .ok_or(PoolError::PinExhausted)?;
+    let arena = read(memory, ARENA_AUTHORITY)?;
+    write(memory, NEXT_PIN_TOKEN, token)?;
+    write(memory, word, token)?;
+    Ok(ExclusivePin {
+        arena,
+        allocation,
+        token,
+    })
+}
+
+pub fn pin_live<M: PoolMemory>(memory: &M, pin: ExclusivePin) -> bool {
+    validate_pin(memory, pin).is_ok()
+}
+
+fn validate_pin<M: PoolMemory>(memory: &M, pin: ExclusivePin) -> Result<(), PoolError> {
+    if read(memory, ARENA_AUTHORITY)? != pin.arena || pin.token == 0 {
+        return Err(PoolError::StalePin);
+    }
+    let allocation =
+        allocation_identity(memory, pin.allocation.allocation_id).map_err(|error| {
+            if error == PoolError::Corrupt {
+                error
+            } else {
+                PoolError::StalePin
+            }
+        })?;
+    if allocation != pin.allocation
+        || read(
+            memory,
+            pin.allocation.allocation_id - HEADER_SIZE + HEADER_RESERVED_OFFSET,
+        )? != pin.token
+    {
+        return Err(PoolError::StalePin);
+    }
+    Ok(())
+}
+
+pub fn release_pin<M: PoolMemory>(memory: &mut M, pin: ExclusivePin) -> Result<(), PoolError> {
+    validate_pin(memory, pin)?;
+    write(
+        memory,
+        pin.allocation.allocation_id - HEADER_SIZE + HEADER_RESERVED_OFFSET,
+        0,
+    )
+}
+
+/// Validate ownership and free in one serialized operation, with no unpinned intermediate state.
+pub fn retire_pinned<M: PoolMemory>(memory: &mut M, pin: ExclusivePin) -> Result<u64, PoolError> {
+    validate_pin(memory, pin)?;
+    free_owned(memory, pin.allocation.allocation_id, Some(pin))
 }
 
 /// Locate the live allocation containing an embedded provider object. Free blocks and header bytes
@@ -201,7 +294,7 @@ pub fn containing_allocation<M: PoolMemory>(
                 return Err(PoolError::NotAllocated);
             }
             let generation = read(memory, header + ALLOCATION_GENERATION_OFFSET)?;
-            if generation == 0 || read(memory, header + HEADER_RESERVED_OFFSET)? != 0 {
+            if generation == 0 {
                 return Err(PoolError::Corrupt);
             }
             return Ok(AllocationLocation {
@@ -234,7 +327,6 @@ fn live_allocation<M: PoolMemory>(memory: &M, payload: u64) -> Result<(u64, u64)
     let capacity = read(memory, header)?;
     let marker = read(memory, header + 8)?;
     let generation = read(memory, header + ALLOCATION_GENERATION_OFFSET)?;
-    let reserved = read(memory, header + HEADER_RESERVED_OFFSET)?;
     let end = header
         .checked_add(HEADER_SIZE)
         .and_then(|value| value.checked_add(capacity))
@@ -243,7 +335,7 @@ fn live_allocation<M: PoolMemory>(memory: &M, payload: u64) -> Result<(u64, u64)
     if marker != ALLOC_MARKER || capacity == 0 || capacity & (ALIGNMENT - 1) != 0 || end > bump {
         return Err(PoolError::NotAllocated);
     }
-    if generation == 0 || reserved != 0 {
+    if generation == 0 {
         return Err(PoolError::Corrupt);
     }
     Ok((capacity, generation))
@@ -414,6 +506,14 @@ fn record_allocation<M: PoolMemory>(memory: &mut M, capacity: u64, reused: bool)
 }
 
 pub fn free<M: PoolMemory>(memory: &mut M, payload: u64) -> Result<u64, PoolError> {
+    free_owned(memory, payload, None)
+}
+
+fn free_owned<M: PoolMemory>(
+    memory: &mut M,
+    payload: u64,
+    pin: Option<ExclusivePin>,
+) -> Result<u64, PoolError> {
     if !initialized(memory) {
         return Err(PoolError::NotInitialized);
     }
@@ -441,8 +541,11 @@ pub fn free<M: PoolMemory>(memory: &mut M, payload: u64) -> Result<u64, PoolErro
         add_stat(memory, STATS_INVALID_FREES, 1);
         return Err(PoolError::NotAllocated);
     }
-    if generation == 0 || reserved != 0 {
+    if generation == 0 {
         return Err(note_corruption(memory));
+    }
+    if reserved != 0 && pin.is_none() {
+        return Err(PoolError::Pinned);
     }
 
     let mut previous = 0u64;
@@ -459,6 +562,7 @@ pub fn free<M: PoolMemory>(memory: &mut M, payload: u64) -> Result<u64, PoolErro
 
     write(memory, header, capacity)?;
     write(memory, header + 8, next)?;
+    write(memory, header + HEADER_RESERVED_OFFSET, 0)?;
     if previous == 0 {
         write(memory, FREE_HEAD_OFFSET, header)?;
     } else {
@@ -581,6 +685,123 @@ mod tests {
         let mut memory = Bytes(vec![0; 0x3000]);
         initialize(&mut memory).unwrap();
         memory
+    }
+
+    #[test]
+    fn bootstrap_exclusive_pin_needs_only_shared_arena_and_denies_free() {
+        let mut memory = arena();
+        let allocation = allocate(&mut memory, 64, true).unwrap();
+        let pin = pin_exclusive(&mut memory, allocation.identity).unwrap();
+        assert_eq!(
+            allocation_identity(&memory, allocation.payload_offset),
+            Ok(allocation.identity)
+        );
+        assert_eq!(
+            allocation_capacity(&memory, allocation.payload_offset),
+            Ok(64)
+        );
+        assert_eq!(
+            containing_allocation(&memory, allocation.payload_offset + 8, 8)
+                .unwrap()
+                .identity,
+            allocation.identity
+        );
+        assert_eq!(
+            free(&mut memory, allocation.payload_offset),
+            Err(PoolError::Pinned)
+        );
+        assert!(pin_live(&memory, pin));
+        retire_pinned(&mut memory, pin).unwrap();
+        assert!(!pin_live(&memory, pin));
+        assert_eq!(retire_pinned(&mut memory, pin), Err(PoolError::StalePin));
+    }
+
+    #[test]
+    fn exclusive_pin_rejects_cross_arena_even_when_allocation_identity_matches() {
+        let mut first = arena();
+        let mut second = arena();
+        let a = allocate(&mut first, 64, false).unwrap();
+        let b = allocate(&mut second, 64, false).unwrap();
+        assert_eq!(a.identity, b.identity);
+        let pin = pin_exclusive(&mut first, a.identity).unwrap();
+        let other = pin_exclusive(&mut second, b.identity).unwrap();
+        assert!(!pin_live(&second, pin));
+        assert_eq!(retire_pinned(&mut second, pin), Err(PoolError::StalePin));
+        assert!(pin_live(&second, other));
+    }
+
+    #[test]
+    fn stale_and_duplicate_pin_release_cannot_release_new_owner() {
+        let mut memory = arena();
+        let allocation = allocate(&mut memory, 64, false).unwrap();
+        let blocker = allocate(&mut memory, 64, false).unwrap();
+        let first = pin_exclusive(&mut memory, allocation.identity).unwrap();
+        assert_eq!(
+            pin_exclusive(&mut memory, allocation.identity),
+            Err(PoolError::Pinned)
+        );
+        release_pin(&mut memory, first).unwrap();
+        assert_eq!(release_pin(&mut memory, first), Err(PoolError::StalePin));
+        let second = pin_exclusive(&mut memory, allocation.identity).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(retire_pinned(&mut memory, first), Err(PoolError::StalePin));
+        retire_pinned(&mut memory, second).unwrap();
+        let reused = allocate(&mut memory, 64, false).unwrap();
+        assert_eq!(reused.payload_offset, allocation.payload_offset);
+        assert_ne!(reused.identity, allocation.identity);
+        let third = pin_exclusive(&mut memory, reused.identity).unwrap();
+        assert_eq!(retire_pinned(&mut memory, second), Err(PoolError::StalePin));
+        assert!(pin_live(&memory, third));
+        retire_pinned(&mut memory, third).unwrap();
+        free(&mut memory, blocker.payload_offset).unwrap();
+    }
+
+    #[test]
+    fn exclusive_pin_token_exhaustion_has_no_effect() {
+        let mut memory = arena();
+        let allocation = allocate(&mut memory, 64, false).unwrap();
+        write(&mut memory, NEXT_PIN_TOKEN, u64::MAX).unwrap();
+        let before = memory.0.clone();
+        assert_eq!(
+            pin_exclusive(&mut memory, allocation.identity),
+            Err(PoolError::PinExhausted)
+        );
+        assert_eq!(memory.0, before);
+        free(&mut memory, allocation.payload_offset).unwrap();
+    }
+
+    #[test]
+    fn rejected_pin_identity_and_arena_reinitialization_do_not_authorize_reuse() {
+        let mut memory = arena();
+        let allocation = allocate(&mut memory, 64, false).unwrap();
+        let mut stale = allocation.identity;
+        stale.allocation_generation += 1;
+        let before = memory.0.clone();
+        assert_eq!(pin_exclusive(&mut memory, stale), Err(PoolError::StalePin));
+        assert_eq!(memory.0, before);
+        let old = pin_exclusive(&mut memory, allocation.identity).unwrap();
+        initialize(&mut memory).unwrap();
+        let new = allocate(&mut memory, 64, false).unwrap();
+        assert_eq!(new.identity, allocation.identity);
+        let current = pin_exclusive(&mut memory, new.identity).unwrap();
+        assert_eq!(retire_pinned(&mut memory, old), Err(PoolError::StalePin));
+        assert!(pin_live(&memory, current));
+    }
+
+    #[test]
+    fn failed_pinned_retirement_does_not_consume_pin() {
+        let mut memory = arena();
+        let allocation = allocate(&mut memory, 64, false).unwrap();
+        let pin = pin_exclusive(&mut memory, allocation.identity).unwrap();
+        write(&mut memory, FREE_HEAD_OFFSET, 1).unwrap();
+        let pin_word = allocation.payload_offset - HEADER_SIZE + HEADER_RESERVED_OFFSET;
+        let before = read(&memory, pin_word).unwrap();
+        assert_eq!(retire_pinned(&mut memory, pin), Err(PoolError::Corrupt));
+        // Corruption counters may change, but the exact physical pin stays owned.
+        assert_eq!(read(&memory, pin_word), Ok(before));
+        write(&mut memory, FREE_HEAD_OFFSET, 0).unwrap();
+        assert!(pin_live(&memory, pin));
+        retire_pinned(&mut memory, pin).unwrap();
     }
 
     #[test]

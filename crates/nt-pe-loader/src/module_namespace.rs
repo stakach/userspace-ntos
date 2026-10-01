@@ -36,6 +36,71 @@ mod tests {
     }
 
     #[test]
+    fn extensionless_core_forwarders_preserve_the_registered_role() {
+        for (name, role) in [
+            ("NTOSKRNL", CoreRole::Kernel),
+            ("ntkrnlmp", CoreRole::Kernel),
+            ("NTKRNLPA", CoreRole::Kernel),
+            ("ntkrpamp", CoreRole::Kernel),
+            ("HAL", CoreRole::Hal),
+        ] {
+            let images = vec![module(
+                "helper.dll",
+                0x10000,
+                ExportTarget::Forwarder(alloc::format!("{name}.Entry")),
+            )];
+            assert_eq!(
+                resolve_with_core(
+                    &images,
+                    "helper.dll",
+                    &Symbol::Name("Entry".into()),
+                    |actual, symbol| (actual == role && *symbol == Symbol::Name("Entry".into()))
+                        .then_some(0x12340)
+                ),
+                Ok(0x12340),
+                "forwarder module {name}",
+            );
+        }
+        for unknown in ["unknownmodule", "unknownmodule.dll", "ntoskrnl.dll"] {
+            let images = vec![module(
+                "helper.dll",
+                0x10000,
+                ExportTarget::Forwarder(alloc::format!("{unknown}.Entry")),
+            )];
+            assert_eq!(
+                resolve_with_core(
+                    &images,
+                    "helper.dll",
+                    &Symbol::Name("Entry".into()),
+                    |_, _| panic!("unknown module must not enter the core namespace")
+                ),
+                Err(NamespaceError::MissingModule),
+            );
+        }
+    }
+
+    #[test]
+    fn dxgthk_win32k_forwarder_uses_the_admitted_provider_image() {
+        let images = vec![
+            module(
+                "dxgthk.sys",
+                0x10000,
+                ExportTarget::Forwarder("win32k.Entry".into()),
+            ),
+            module("win32k.sys", 0x20000, ExportTarget::Rva(0x200)),
+        ];
+        assert_eq!(
+            resolve_with_core(
+                &images,
+                "dxgthk.sys",
+                &Symbol::Name("Entry".into()),
+                |_, _| panic!("win32k is an admitted provider image, not the core kernel")
+            ),
+            Ok(0x20200),
+        );
+    }
+
+    #[test]
     fn exports_come_from_the_actual_named_image() {
         let images = vec![
             module("first.dll", 0x10000, ExportTarget::Rva(0x100)),
@@ -122,6 +187,20 @@ pub fn core_role(name: &str) -> Option<CoreRole> {
         "hal.dll" => Some(CoreRole::Hal),
         _ => None,
     }
+}
+
+/// Normalize PE forwarder basenames without widening explicit import namespaces.
+pub fn forwarder_module(name: &str) -> Result<String, NamespaceError> {
+    let mut module = module_leaf(name)?;
+    if !module.contains('.') {
+        let suffix = match module.as_str() {
+            "ntoskrnl" | "ntkrnlmp" | "ntkrnlpa" | "ntkrpamp" => ".exe",
+            "win32k" => ".sys",
+            _ => ".dll",
+        };
+        module.push_str(suffix);
+    }
+    Ok(module)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -355,10 +434,7 @@ pub fn resolve_with_core<F: FnMut(CoreRole, &Symbol) -> Option<u64>>(
                 let (dll, target) = value
                     .rsplit_once('.')
                     .ok_or(NamespaceError::InvalidExport)?;
-                let mut dll = module_leaf(dll)?;
-                if !dll.contains('.') {
-                    dll.push_str(".dll");
-                }
+                let dll = forwarder_module(dll)?;
                 let target = if let Some(n) = target.strip_prefix('#') {
                     Symbol::Ordinal(n.parse().map_err(|_| NamespaceError::InvalidExport)?)
                 } else {
