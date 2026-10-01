@@ -215,14 +215,11 @@ unsafe fn resolve_import(
         let Symbol::Name(name) = symbol else {
             return Err(LoadFailure::MissingExport);
         };
-        let names = match role {
-            module_namespace::CoreRole::Kernel => nt_compat_exports::WIN32K_NTOSKRNL_IMPORTS,
-            module_namespace::CoreRole::Hal => nt_compat_exports::WIN32K_HAL_IMPORTS,
+        let module = match role {
+            module_namespace::CoreRole::Kernel => "ntoskrnl.exe",
+            module_namespace::CoreRole::Hal => "hal.dll",
         };
-        if !names.contains(&name.as_str()) {
-            return Err(LoadFailure::MissingExport);
-        }
-        let address = win32k_subsystem::export_addr(&name);
+        let address = win32k_subsystem::export_addr_for_module(module, &name);
         return (address != 0)
             .then_some(address)
             .ok_or(LoadFailure::MissingExport);

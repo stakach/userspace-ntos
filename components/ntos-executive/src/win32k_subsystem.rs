@@ -9600,6 +9600,18 @@ extern "win64" fn s_current_process_id() -> u64 {
     WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed)
 }
 
+/// Thread ownership does not change when its APC environment attaches to another process.
+extern "win64" fn s_current_thread_process_id() -> u64 {
+    unsafe {
+        let thread = current_ethread();
+        if thread == 0 {
+            crate::provider_bugcheck::report(0xc4, [0x5053434944, thread, 0, 1]);
+        }
+        read_volatile((thread + nt_kernel_abi::ps_reactos_x64::ETHREAD_CLIENT_ID_PROCESS as u64)
+            as *const u64)
+    }
+}
+
 unsafe fn zero_region(base: u64, size: u64) {
     let mut offset = 0u64;
     while offset < size {
@@ -15349,7 +15361,7 @@ fn register_trampolines() -> bool {
     );
     reg.bind(
         "PsGetCurrentThreadProcessId",
-        s_current_process_id as usize as u64,
+        s_current_thread_process_id as usize as u64,
     );
     reg.bind("PsGetProcessId", s_ps_get_process_id as usize as u64);
     reg.bind("PsIsSystemProcess", s_ps_is_system_process as *const () as usize as u64);
@@ -15663,6 +15675,11 @@ pub fn export_addr(name: &str) -> u64 {
         return 0;
     }
     unsafe { (*core::ptr::addr_of!(WIN32K_EXPORTS)).lookup(name).unwrap_or(0) }
+}
+
+pub(crate) fn export_addr_for_module(module: &str, name: &str) -> u64 {
+    if !initialize_export_registry() { return 0; }
+    unsafe { (&*core::ptr::addr_of!(WIN32K_EXPORTS)).lookup_module(module, name).unwrap_or(0) }
 }
 
 /// (name, cell value). The six **object-type** cells (`Ps*Type`, `Ex*ObjectType`, `LpcPortObjectType`)

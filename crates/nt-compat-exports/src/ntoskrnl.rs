@@ -14,6 +14,11 @@ const fn e(name: &'static str, status: ExportStatus, notes: &'static str) -> Exp
 
 /// The MVP `ntoskrnl.exe` exports + their v0.1 status.
 pub const NTOSKRNL: &[ExportDescriptor] = &[
+    // --- compiler memory helpers and thread owner identity ---
+    e("memcpy", Implemented, "native byte copy returns the destination"),
+    e("memmove", Implemented, "overlap-safe native byte copy returns the destination"),
+    e("memset", Implemented, "native byte fill returns the destination"),
+    e("PsGetCurrentThreadProcessId", Implemented, "reads the selected canonical ETHREAD Cid.UniqueProcess, independent of APC process attachment"),
     // --- device / symlink / IRP (implemented by the runtime, M6–M7) ---
     e("IoCreateDevice", Implemented, ""),
     e("IoDeleteDevice", Implemented, ""),

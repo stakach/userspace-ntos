@@ -567,6 +567,7 @@ dependencies = [
 name = "nt-pe-loader"
 version = "0.1.0"
 dependencies = [
+ "nt-compat-exports",
  "proptest",
 ]
 

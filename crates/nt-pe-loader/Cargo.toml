@@ -13,6 +13,7 @@ std = []
 
 [dev-dependencies]
 proptest = "1"
+nt-compat-exports = { path = "../nt-compat-exports" }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

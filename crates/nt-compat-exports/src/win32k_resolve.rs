@@ -26,11 +26,21 @@ pub const WIN32K_EXPORT_INITIAL_RESERVE: usize = DRIVER_EXPORT_INITIAL_RESERVE;
 /// contract (`ntoskrnl.exe` MVP + win32k's extra ntoskrnl surface + `hal.dll`).
 /// Scans the `const` slices — no allocation. Symbol names are case-sensitive.
 pub fn export_descriptor(name: &str) -> Option<&'static ExportDescriptor> {
+    export_descriptors().find(|descriptor| descriptor.name == name)
+}
+
+fn export_descriptors() -> impl Iterator<Item = &'static ExportDescriptor> {
     ntoskrnl::NTOSKRNL
         .iter()
         .chain(win32k::WIN32K_NTOSKRNL.iter())
         .chain(hal::HAL.iter())
-        .find(|d| d.name == name)
+}
+
+/// Module ownership is independent of which symbols one particular image imports.
+pub fn module_export_descriptor(module: &str, name: &str) -> Option<&'static ExportDescriptor> {
+    export_descriptors().find(|descriptor| {
+        descriptor.dll.eq_ignore_ascii_case(module) && descriptor.name == name
+    })
 }
 
 /// The 11 `ntoskrnl.exe` **data exports** win32k dereferences at init, in cell-index order.
