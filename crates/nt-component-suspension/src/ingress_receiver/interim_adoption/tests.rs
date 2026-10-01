@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    IngressReplyObservation, LaneBinding, LanePhase, SuspensionCaller, SuspensionKey,
+    IngressReplyObservation, LaneBinding, LaneError, LanePhase, SuspensionCaller, SuspensionKey,
     SuspensionOwner,
 };
 
@@ -401,6 +401,16 @@ fn resuming_suspension_preserves_frame_continuation_and_completion() {
     assert_eq!(lanes.lane(lane).unwrap().resume_epoch, resume_epoch);
     assert_eq!(lanes.active_dispatch_identity(lane), Ok(Some(dispatch)));
     assert_eq!(lanes.suspension_count(lane), Ok(1));
+    let next = SuspensionKey::provider_wait(100);
+    assert_eq!(
+        lanes.rearm_running(lane, 40, key, next, 10, owner, 5678),
+        Err(LaneError::WrongBinding)
+    );
+    assert_eq!(
+        lanes.rearm_running(lane, lanes.binding(lane).unwrap().reply_object, key, next, 10, owner, 5678),
+        Ok(())
+    );
+    assert_eq!(lanes.frame(lane, next).unwrap().unwrap().continuation, 5678);
 }
 
 #[test]

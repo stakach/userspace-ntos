@@ -226,7 +226,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "issue #88: win32k production bindings are incomplete"]
     fn win32k_production_bindings_cover_required_imports() {
         // Parse the actual executive registration code. A descriptor's Available status does not
         // prove that the production win32k registry binds a trampoline for it.
