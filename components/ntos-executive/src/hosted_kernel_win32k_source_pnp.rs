@@ -451,6 +451,10 @@ impl Work {
                     self.indeterminate = true;
                     return false;
                 }
+                if status.is_success() {
+                    super::source_observability::terminal(super::source_observability::Kind::Pnp, 0);
+                }
+                super::source_observability::canonical(super::source_observability::Kind::Pnp);
                 self.receipt = Some(receipt);
             }
             Ok(nt_io_manager::ExternalPnpDispatchResult::Pending { irp_id }) => {
@@ -749,6 +753,7 @@ impl Work {
             crate::win32k_glue::dispatch_source_pnp_terminal,
         ) { return false; }
         self.origin_committed = true;
+        super::source_observability::origin(super::source_observability::Kind::Pnp);
         if let Some(barrier) = self.event_barrier {
             if crate::source_event_completion::release(handler, barrier).is_err() {
                 self.indeterminate = true;
@@ -769,6 +774,7 @@ impl Work {
             if self.ack_claimed { return false; }
             self.ack_claimed = true;
             if acknowledge_completed_irp_strict(irp.raw()).is_err() { return false; }
+            super::source_observability::canonical(super::source_observability::Kind::Pnp);
             self.canonical_irp = None;
         }
         if !self.relation_transferred {
@@ -818,6 +824,7 @@ impl Work {
         super::hosted_kernel_win32k_source_admission::retire(
             self.route, self.source_address, self.source_ticket, self.source_generation,
         );
+        super::source_observability::retired(super::source_observability::Kind::Pnp);
         true
     }
 
@@ -970,6 +977,7 @@ impl Work {
             {
                 crate::provider_bugcheck::report(0xc4, [self.source_address, irp.raw(), 0, 49]);
             }
+            super::source_observability::terminal(super::source_observability::Kind::Pnp, 0);
             self.receipt = Some(receipt);
         }
         if self.pending {

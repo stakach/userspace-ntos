@@ -623,6 +623,19 @@ pub(crate) unsafe fn acquire_hosted_pnp_context_lease() -> Result<ContextLease, 
         })
 }
 
+pub(crate) unsafe fn retain_hosted_pnp_context_lease(
+    existing: ContextLeaseIdentity,
+) -> Result<ContextLease, nt_status::NtStatus> {
+    hosted_pnp_context_authority_mut().registry.retain_lease(existing)
+        .map_err(|error| match error {
+            nt_pnp_context::RetainError::Lease(_)
+            | nt_pnp_context::RetainError::Acquire(nt_pnp_context::AcquireError::NoActiveContext) => {
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST
+            }
+            nt_pnp_context::RetainError::Acquire(_) => nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+        })
+}
+
 pub(crate) unsafe fn hosted_pnp_context_description<'a>(
     lease: &'a ContextLease,
 ) -> Result<&'a HostedPnpContextDescription, nt_status::NtStatus> {
@@ -736,9 +749,13 @@ pub(crate) struct HostedPciDmaWindow {
     pub(crate) len: u64,
 }
 
+/// Success acknowledges consumption of the exact lease, not completion of physical teardown.
+/// Failed backing cleanup transfers to the pre-reserved retirement journal; callers must not
+/// retry the consumed lease. Authentication and reservation failures leave it held.
 pub(crate) unsafe fn release_hosted_pnp_context_lease(
     lease: ContextLeaseIdentity,
 ) -> Result<(), nt_status::NtStatus> {
+    let _durable = crate::allocator::enter_durable();
     let owner = {
         let authority = hosted_pnp_context_authority_mut();
         authority
@@ -751,7 +768,9 @@ pub(crate) unsafe fn release_hosted_pnp_context_lease(
             .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
     };
     if let Some(owner) = owner {
-        retire_or_retain(owner)?;
+        if let Err(owner) = owner.retire() {
+            hosted_pnp_context_authority_mut().pending_retirements.push(owner);
+        }
     }
     Ok(())
 }

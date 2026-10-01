@@ -158,6 +158,8 @@ pub(crate) mod hosted_sync_relations;
 mod hosted_kernel_win32k_buffered_ioctl;
 #[path = "hosted_kernel_win32k_source_ioctl.rs"]
 mod hosted_kernel_win32k_source_ioctl;
+#[path = "hosted_video_caller_aperture.rs"]
+mod hosted_video_caller_aperture;
 #[path = "hosted_kernel_win32k_source_pnp.rs"]
 mod hosted_kernel_win32k_source_pnp;
 #[path = "hosted_lower_pnp_capture.rs"]
@@ -168,6 +170,8 @@ mod hosted_lower_pnp_work;
 mod hosted_kernel_win32k_source_fsd;
 #[path = "hosted_kernel_win32k_source_admission.rs"]
 mod hosted_kernel_win32k_source_admission;
+#[path = "hosted_source_observability.rs"]
+pub(crate) mod source_observability;
 #[path = "hosted_driver_relation_source.rs"]
 mod hosted_driver_relation_source;
 #[path = "hosted_video_target_relation.rs"]
@@ -16791,6 +16795,9 @@ extern "win64" fn s_video_port_map_memory(
     unsafe {
         let requested_len = read_unaligned(length as *const u32);
         let space = read_unaligned(in_io_space as *const u32);
+        if read_unaligned(virtual_address as *const u64) != 0 {
+            return VP_ERROR_INVALID_FUNCTION;
+        }
         if requested_len == 0 {
             return VP_ERROR_INVALID_PARAMETER;
         }
@@ -16830,13 +16837,10 @@ extern "win64" fn s_video_port_map_memory(
 /// `VP_STATUS VideoPortUnmapMemory(...)`.
 extern "win64" fn s_video_port_unmap_memory(
     _hw_device_extension: u64,
-    virtual_address: u64,
+    _virtual_address: u64,
     _process_handle: u64,
 ) -> u32 {
-    if virtual_address != 0 {
-        s_mm_unmap_io_space(virtual_address, 0);
-    }
-    VP_NO_ERROR
+    VP_ERROR_INVALID_FUNCTION
 }
 
 extern "win64" fn s_video_port_read_register_ushort(register: u64) -> u16 {
@@ -47276,6 +47280,10 @@ unsafe fn retire_hosted_device_port_caps(
 unsafe fn remove_hosted_device_resource_state(
     binding: HostedDeviceBinding,
 ) -> Result<(), nt_status::NtStatus> {
+    if hosted_video_caller_aperture::blocks_device_retirement(binding.device_id)
+        || hosted_video_caller_aperture::blocks_device_retirement(binding.pdo_device_id) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     let states = hosted_device_resource_states_mut();
     let Some(index) = states.iter().position(|state| {
         state.device_id != 0
@@ -51213,6 +51221,10 @@ unsafe fn clear_hosted_resource_projection(
     binding: HostedDeviceBinding,
     sh: u64,
 ) -> Result<(), nt_status::NtStatus> {
+    if hosted_video_caller_aperture::blocks_device_retirement(binding.device_id)
+        || hosted_video_caller_aperture::blocks_device_retirement(binding.pdo_device_id) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     if !hosted_file_owners::device_quiesced(binding.device_id)
         || !hosted_file_owners::device_quiesced(binding.pdo_device_id)
     {
@@ -54901,6 +54913,12 @@ pub(crate) struct HostedVideoRouteInfo {
 
 fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
     if let Some(inst) = instance(i) {
+        if instance_domain_identity(inst).is_some_and(|domain| unsafe {
+            hosted_video_caller_aperture::blocks_domain_retirement(
+                crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalDomain::Hosted(domain))
+        }) {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
         if inst.tcb != 0
             && unsafe { hosted_pretransport_retirement::early_rollback_eligible(i) }
             && hosted_ingress_sources::primary_enrollment(i).is_none()
@@ -55196,6 +55214,12 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
 }
 
 fn finish_instance_physical_release(i: usize, inst: DriverInstance) -> Result<(), nt_status::NtStatus> {
+    if instance_domain_identity(inst).is_some_and(|domain| unsafe {
+        hosted_video_caller_aperture::blocks_domain_retirement(
+            crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalDomain::Hosted(domain))
+    }) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     if !unsafe { release_driver_component_mechanism(i, inst) } {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }

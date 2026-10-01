@@ -33928,6 +33928,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // client-GDI path now works and msgina's real dialog code creates windows. winlogon then parks in
     // the nested modal message pump (blocked on credential input a headless host can't supply).
     check_logon_dialog_gates(&mut passed);
+    if let Some(covered) = driver_launch::source_observability::report() {
+        check(b"exec_source_native_milestone_coverage", covered, &mut passed);
+    }
 
     // Report both the address-space watermark and actual reusable storage. Durable objects can sit
     // above dropped allocations, so the bump alone is not a live-memory or headroom measurement.

@@ -832,7 +832,7 @@ fn dispatch_video_port_owned_control(
             output[24..32].copy_from_slice(&video_device_object.to_le_bytes());
             Some(Ok(VIDEO_WIN32K_CALLBACKS_SIZE_X64))
         }
-        IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Some(Ok(0)),
+        IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Some(Err(VideoMiniportError::UnsupportedIoctl)),
         _ => None,
     }
 }

@@ -801,6 +801,7 @@ impl Work {
             crate::win32k_glue::dispatch_source_ioctl_terminal,
         ) { return false; }
         self.origin_committed = true;
+        super::source_observability::origin(super::source_observability::Kind::Ioctl);
         if let Some(barrier) = self.event_barrier {
             if crate::source_event_completion::release(handler, barrier).is_err() {
                 self.indeterminate = true;
@@ -822,6 +823,7 @@ impl Work {
             if acknowledge_completed_irp_strict(irp.raw()).is_err() {
                 return false;
             }
+            super::source_observability::canonical(super::source_observability::Kind::Ioctl);
             self.irp = None;
         }
         if !self.signal_event(handler) || !self.commit_origin(handler) { return false; }
@@ -839,6 +841,7 @@ impl Work {
         super::hosted_kernel_win32k_source_admission::retire(
             self.route, self.source_address, self.source_ticket, self.source_generation,
         );
+        super::source_observability::retired(super::source_observability::Kind::Ioctl);
         true
     }
 
@@ -908,8 +911,16 @@ impl Work {
             if !self.source.live() || self.target.validate(io_manager_mut()).is_err() {
                 return false;
             }
+            let aperture = if self.internal { Ok(()) } else {
+                super::hosted_video_caller_aperture::prepare(
+                    self.route, self.dispatch, self.reply, self.token, &self.target,
+                    self.code, &self.input, self.output_capacity,
+                )
+            };
             self.entered = true;
-            let result = if self.internal {
+            let result = if let Err(status) = aperture {
+                Err(status)
+            } else if self.internal {
                 io_manager_mut().internal_device_control_exact_device(
                     ClientId(IO_MANAGER_COMPONENT_ID), self.target.device_id(), self.code,
                     &self.input, &mut self.output,
@@ -926,6 +937,10 @@ impl Work {
                     self.pending = true;
                 }
                 Ok(nt_io_manager::ExternalDispatchResult::Completed { status, information, .. }) => {
+                    if status.is_success() {
+                        super::source_observability::terminal(super::source_observability::Kind::Ioctl, self.code);
+                    }
+                    super::source_observability::canonical(super::source_observability::Kind::Ioctl);
                     self.terminal = Some((status.raw() as u32, information));
                 }
                 Err(status) => self.terminal = Some((status.raw() as u32, 0)),
@@ -958,6 +973,7 @@ impl Work {
                 crate::provider_bugcheck::report(0xc4, [self.source_address, irp.raw(), 0, 5]);
             }
             self.terminal = Some((completion.status, completion.information));
+            super::source_observability::terminal(super::source_observability::Kind::Ioctl, self.code);
         }
         if self.pending && (!self.capture_output() || !self.deliver_terminal()
             || !self.accept_terminal_ack() || !self.commit_terminal(handler)) {

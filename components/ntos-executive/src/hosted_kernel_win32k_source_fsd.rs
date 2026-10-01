@@ -413,6 +413,13 @@ pub(super) unsafe fn arm_pending(
 }
 
 impl Work {
+    fn observation_kind(&self) -> super::source_observability::Kind {
+        if self.source.major == major::IRP_MJ_READ {
+            super::source_observability::Kind::Read
+        } else {
+            super::source_observability::Kind::Write
+        }
+    }
     unsafe fn ready_for_nested_step(&self) -> bool {
         use nt_io_manager::retained_source_progress::RetainedSourceProgress as Progress;
         let progress = if self.indeterminate {
@@ -490,7 +497,13 @@ impl Work {
             }
             Ok(nt_io_manager::ExternalDispatchResult::Completed {
                 status, information, ..
-            }) => self.terminal = Some((status.raw() as u32, information)),
+            }) => {
+                if status.is_success() {
+                    super::source_observability::terminal(self.observation_kind(), 0);
+                }
+                super::source_observability::canonical(self.observation_kind());
+                self.terminal = Some((status.raw() as u32, information));
+            }
             Err(status) => self.terminal = Some((status.raw() as u32, 0)),
         }
         true
@@ -645,6 +658,7 @@ impl Work {
             if self.ack_claimed { return false; }
             self.ack_claimed = true;
             if acknowledge_completed_irp_strict(irp.raw()).is_err() { return false; }
+            super::source_observability::canonical(self.observation_kind());
             self.irp = None;
         }
         self.signal_event(handler) && self.commit_origin(handler)
@@ -662,6 +676,7 @@ impl Work {
             crate::win32k_glue::dispatch_source_fsd_terminal,
         ) { return false; }
         self.origin_committed = true;
+        super::source_observability::origin(self.observation_kind());
         if let Some(barrier) = self.event_barrier {
             if crate::source_event_completion::release(handler, barrier).is_err() {
                 self.indeterminate = true;
@@ -681,6 +696,7 @@ impl Work {
             if self.ack_claimed { return false; }
             self.ack_claimed = true;
             if acknowledge_completed_irp_strict(irp.raw()).is_err() { return false; }
+            super::source_observability::canonical(self.observation_kind());
             self.irp = None;
         }
         if let Some(event) = self.event.take() { release_event(handler, event); }
@@ -691,6 +707,7 @@ impl Work {
         super::hosted_kernel_win32k_source_admission::retire(
             self.route, self.source_address, self.source_ticket, self.source_generation,
         );
+        super::source_observability::retired(self.observation_kind());
         true
     }
 
@@ -789,6 +806,7 @@ impl Work {
                 crate::provider_bugcheck::report(0xc4, [self.source_address, irp.raw(), 0, 56]);
             }
             self.terminal = Some((completion.status.raw() as u32, completion.information));
+            super::source_observability::terminal(self.observation_kind(), 0);
         }
         if self.pending && (!self.capture_output() || !self.deliver_terminal()
             || !self.commit_canonical(handler)) {
