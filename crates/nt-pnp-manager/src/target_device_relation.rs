@@ -106,7 +106,9 @@ impl TargetRelationDelivery {
         } else {
             Err(TargetRelationError::WrongSourceAllocation)
         };
-        allocations.release_pin(source_pin).map_err(TargetRelationError::Allocation)?;
+        allocations
+            .release_pin(source_pin)
+            .map_err(TargetRelationError::Allocation)?;
         let objects = parsed?;
         if objects.len() != 1 || objects[0] != authenticated_source_pdo {
             return Err(TargetRelationError::WrongSourcePdo);
@@ -127,7 +129,9 @@ impl TargetRelationDelivery {
             }
         };
         if relation.base != relation_address {
-            allocations.release_pin(pin).map_err(TargetRelationError::Allocation)?;
+            allocations
+                .release_pin(pin)
+                .map_err(TargetRelationError::Allocation)?;
             pdo.release(io).map_err(TargetRelationError::Reference)?;
             return Err(TargetRelationError::WrongAllocationBase);
         }
@@ -169,7 +173,11 @@ impl TargetRelationDelivery {
     }
 
     /// Called only after the native adapter has written the real caller IOSB.
-    pub fn iosb_published(&mut self, status: NtStatus, information: u64) -> Result<(), TargetRelationError> {
+    pub fn iosb_published(
+        &mut self,
+        status: NtStatus,
+        information: u64,
+    ) -> Result<(), TargetRelationError> {
         if self.phase != TargetRelationPhase::RelationWritten {
             return Err(TargetRelationError::WrongPhase);
         }
@@ -205,11 +213,17 @@ impl TargetRelationDelivery {
         }
         self.validate(io, allocations)?;
         if let Some(pin) = self.pin {
-            allocations.release_pin(pin).map_err(TargetRelationError::Allocation)?;
+            allocations
+                .release_pin(pin)
+                .map_err(TargetRelationError::Allocation)?;
             self.pin = None;
         }
-        let reference = self.pdo.as_mut().ok_or(TargetRelationError::WrongPhase)?
-            .transfer_reference(io).map_err(TargetRelationError::Reference)?;
+        let reference = self
+            .pdo
+            .as_mut()
+            .ok_or(TargetRelationError::WrongPhase)?
+            .transfer_reference(io)
+            .map_err(TargetRelationError::Reference)?;
         self.pdo = None;
         self.phase = TargetRelationPhase::Transferred;
         Ok(TransferredTargetRelation {
@@ -229,7 +243,47 @@ impl TargetRelationDelivery {
             return Err(TargetRelationError::WrongPhase);
         }
         if let Some(pin) = self.pin {
-            allocations.release_pin(pin).map_err(TargetRelationError::Allocation)?;
+            allocations
+                .release_pin(pin)
+                .map_err(TargetRelationError::Allocation)?;
+            self.pin = None;
+        }
+        if let Some(pdo) = self.pdo.as_mut() {
+            pdo.release(io).map_err(TargetRelationError::Reference)?;
+            self.pdo = None;
+        }
+        self.phase = TargetRelationPhase::Aborted;
+        Ok(())
+    }
+
+    /// A stopped consumer cannot receive an IOSB. The native owner calls this only after
+    /// strict canonical ACK (or the inline receipt's canonical retirement), never on Reply ACK.
+    pub fn discard_after_canonical_retirement<P>(
+        &mut self,
+        io: &mut IoManager<P>,
+        allocations: &mut ProviderAllocationCatalog,
+        receipt: &ExternalPnpTerminalReceipt,
+    ) -> Result<(), TargetRelationError> {
+        if receipt.irp_id() != self.irp
+            || receipt.status() != self.status
+            || receipt.minor() != nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS
+            || receipt.relation_type() != Some(nt_pnp_abi::TARGET_DEVICE_RELATION)
+        {
+            return Err(TargetRelationError::WrongIrp);
+        }
+        if !matches!(
+            self.phase,
+            TargetRelationPhase::Prepared
+                | TargetRelationPhase::RelationWritten
+                | TargetRelationPhase::IosbPublished
+        ) {
+            return Err(TargetRelationError::WrongPhase);
+        }
+        self.validate(io, allocations)?;
+        if let Some(pin) = self.pin {
+            allocations
+                .release_pin(pin)
+                .map_err(TargetRelationError::Allocation)?;
             self.pin = None;
         }
         if let Some(pdo) = self.pdo.as_mut() {
@@ -245,10 +299,15 @@ impl TargetRelationDelivery {
         io: &IoManager<P>,
         allocations: &ProviderAllocationCatalog,
     ) -> Result<(), TargetRelationError> {
-        self.pdo.as_ref().ok_or(TargetRelationError::WrongPhase)?
-            .validate(io).map_err(TargetRelationError::Reference)?;
+        self.pdo
+            .as_ref()
+            .ok_or(TargetRelationError::WrongPhase)?
+            .validate(io)
+            .map_err(TargetRelationError::Reference)?;
         if allocations.snapshot_active(self.relation.identity) != Ok(self.relation) {
-            return Err(TargetRelationError::Allocation(ProviderAllocationError::StaleIdentity));
+            return Err(TargetRelationError::Allocation(
+                ProviderAllocationError::StaleIdentity,
+            ));
         }
         Ok(())
     }
