@@ -62545,6 +62545,24 @@ pub(crate) fn hosted_file_cleanup_terminal(file_id: u64) -> bool {
     })
 }
 
+pub(crate) fn nested_hosted_file_lifecycle_ready(file_id: u64) -> bool {
+    hosted_file_lifecycle_owners::nested_ready(FileId(file_id))
+}
+
+pub(crate) fn nested_hosted_file_lifecycle_work_ready() -> bool {
+    hosted_file_lifecycle_owners::nested_work_ready()
+}
+
+pub(crate) fn redrive_nested_hosted_file_lifecycle_work() -> bool {
+    hosted_file_lifecycle_owners::nested_work_step(unsafe { crate::initial_system_driver_caller() })
+}
+
+pub(crate) fn redrive_nested_hosted_file_lifecycle(file_id: u64) -> bool {
+    hosted_file_lifecycle_owners::nested_step(
+        FileId(file_id), unsafe { crate::initial_system_driver_caller() },
+    )
+}
+
 /// The caller retains an authenticated File capture or an adopted Busy/reference grant.
 pub(crate) fn encode_owned_hosted_file_query_information(
     file_id: u64,

@@ -519,6 +519,8 @@ pub const WIN32K_REQUEST_PS_PROVIDER: u64 = 1;
 pub const WIN32K_REQUEST_SOURCE_PNP_TERMINAL: u64 = 2;
 pub const WIN32K_REQUEST_SOURCE_FSD_TERMINAL: u64 = 3;
 pub const WIN32K_REQUEST_SOURCE_IOCTL_TERMINAL: u64 = 4;
+#[cfg(feature = "source-irp-integration")]
+pub const WIN32K_REQUEST_SOURCE_IRP_PROBE: u64 = 5;
 /// Executive-authenticated logical user origin. Component admission additionally requires a
 /// registered SSDT entry before publishing UserMode to its selected KTHREAD.
 pub const WIN32K_REQUEST_USER_ORIGIN: u64 = 1 << 63;
@@ -16679,6 +16681,24 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let user_origin = request & WIN32K_REQUEST_USER_ORIGIN != 0;
     if user_origin && request_kind != WIN32K_REQUEST_SSDT {
         return (STATUS_INVALID_PARAMETER_I32, STATUS_INVALID_PARAMETER_I32 as u32 as u64);
+    }
+    #[cfg(feature = "source-irp-integration")]
+    if request_kind == WIN32K_REQUEST_SOURCE_IRP_PROBE {
+        let Some(_kernel_activation) = capture_kernel_provider_stack_activation() else {
+            let status = 0xC000_0008u32;
+            return (status as i32, status as u64);
+        };
+        if event_reclaim_pending_marker().load(Ordering::Acquire) != 0
+            && !drain_retired_event_provider_bodies()
+        {
+            let status = 0xC000_0001u32;
+            return (status as i32, status as u64);
+        }
+        let a0 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *const u64);
+        let a1 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A1) as *const u64);
+        let a2 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A2) as *const u64);
+        let result = crate::win32k_glue::source_irp_integration::component_probe(a0, a1, a2);
+        return (result, result as u32 as u64);
     }
     let owner = if request_kind == WIN32K_REQUEST_SSDT {
         match hosted_wait_owner_at_dispatch(header) {

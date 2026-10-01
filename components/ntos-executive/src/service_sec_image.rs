@@ -5517,8 +5517,10 @@ pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
     let query_information = crate::driver_launch::redrive_nested_hosted_query_information(handler);
     let lower_pnp = crate::driver_launch::redrive_nested_hosted_lower_pnp(handler);
     let kernel_file_query = crate::driver_launch::redrive_nested_hosted_kernel_file_read_query(handler);
+    let lifecycle = crate::driver_launch::redrive_nested_hosted_file_lifecycle_work();
+    let close = crate::hosted_routed_file_close_work::redrive_nested_ready(handler);
     let source = crate::driver_launch::redrive_nested_win32k_source_work(handler);
-    create || query || write || read || flush || query_information || lower_pnp || kernel_file_query || source
+    create || query || write || read || flush || query_information || lower_pnp || kernel_file_query || lifecycle || close || source
 }
 
 pub(crate) unsafe fn watchdog_defer_if_hosted_work_can_run(site: &[u8]) -> bool {
@@ -9018,6 +9020,12 @@ pub(crate) unsafe fn service_sec_image(
             driver_launch::drain_hosted_driver_dpcs(),
             &mut nt_handler,
         );
+    }
+    #[cfg(feature = "source-irp-integration")]
+    {
+        // The live handler and source redrive context exist; SMSS is still suspended.
+        let status = crate::win32k_glue::source_irp_integration::run_configured();
+        assert_eq!(status, 0, "native source IRP fixture did not prove completion");
     }
     #[cfg(not(feature = "mup-provider-kernel-only"))]
     {
@@ -25471,8 +25479,8 @@ unsafe fn synchronous_file_wait_park(
 }
 
 /// Start the one canonical lifecycle owned by the transferred final-handle
-/// reference. The policy state is committed before entering the manager because
-/// inline driver completion may re-enter the service loop.
+/// reference. This is bookkeeping only: the retained lifecycle runner enters the
+/// driver after this handler borrow ends, including from a held nested pump.
 pub(crate) unsafe fn start_file_cleanup(nt_handler: &mut ExecNtHandler, file_id: u64) {
     let first_start = nt_handler
         .file_completion
@@ -25492,7 +25500,6 @@ pub(crate) unsafe fn start_file_cleanup(nt_handler: &mut ExecNtHandler, file_id:
     }
     driver_launch::release_hosted_file(file_id)
         .expect("canonical File cleanup was rejected before driver acceptance");
-    driver_launch::pump_hosted_file_lifecycle();
     // CLEANUP can complete retained reads/listens. Their ordinary completion
     // owners must publish and ACK before the manager is allowed to send CLOSE.
     nt_handler.pipe_endpoint_progress = true;

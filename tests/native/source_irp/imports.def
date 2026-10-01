@@ -1,0 +1,16 @@
+LIBRARY ntoskrnl.exe
+EXPORTS
+    DbgPrint
+    KeInitializeEvent
+    KeWaitForSingleObject
+    KeSetEvent
+    IoCreateDevice
+    IoDeleteDevice
+    IofCompleteRequest
+    PsCreateSystemThread
+    PsTerminateSystemThread
+    ZwWaitForSingleObject
+    ZwClose
+    IoBuildSynchronousFsdRequest
+    IoBuildDeviceIoControlRequest
+    IofCallDriver

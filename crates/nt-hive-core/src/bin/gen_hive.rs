@@ -50,6 +50,7 @@ enum GeneratedHiveProfile {
     SehTerminalUnhandledIntegration,
     SehTerminalExitIntegration,
     MupProviderIntegration,
+    SourceIrpIntegration,
 }
 
 fn generated_hive_profile_from_name(name: &str) -> Option<GeneratedHiveProfile> {
@@ -61,6 +62,7 @@ fn generated_hive_profile_from_name(name: &str) -> Option<GeneratedHiveProfile> 
         "seh-terminal-unhandled" => Some(GeneratedHiveProfile::SehTerminalUnhandledIntegration),
         "seh-terminal-exit" => Some(GeneratedHiveProfile::SehTerminalExitIntegration),
         "mup-provider" => Some(GeneratedHiveProfile::MupProviderIntegration),
+        "source-irp-integration" => Some(GeneratedHiveProfile::SourceIrpIntegration),
         _ => None,
     }
 }
@@ -69,7 +71,7 @@ fn generated_hive_profile_from_env() -> GeneratedHiveProfile {
     match std::env::var("NTOS_IMAGE_PROFILE") {
         Ok(value) => generated_hive_profile_from_name(&value).unwrap_or_else(|| {
             panic!(
-                "unsupported NTOS_IMAGE_PROFILE '{value}'; supported: production, pending-start, live-device-action, seh-driver, seh-terminal-unhandled, seh-terminal-exit, mup-provider"
+                "unsupported NTOS_IMAGE_PROFILE '{value}'; supported: production, pending-start, live-device-action, seh-driver, seh-terminal-unhandled, seh-terminal-exit, mup-provider, source-irp-integration"
             )
         }),
         Err(std::env::VarError::NotPresent) => GeneratedHiveProfile::Production,
@@ -1228,10 +1230,29 @@ fn build_hive_with_configuration(
         );
     }
 
+    if profile == GeneratedHiveProfile::SourceIrpIntegration {
+        let service = hive.create_key(r"ControlSet001\Services\SourceIrpProbeTarget");
+        hive.set_value(service, "ImagePath", RegistryValueType::ExpandSz,
+            utf16le_sz(r"system32\drivers\source_irp_target.sys"));
+        hive.set_dword(service, "Type", SERVICE_FILE_SYSTEM_DRIVER);
+        hive.set_dword(service, "Start", SERVICE_SYSTEM_START);
+        hive.set_dword(service, "ErrorControl", 1);
+        hive.set_value(service, "Group", RegistryValueType::Sz, utf16le_sz("File System"));
+        let parameters = hive.create_key(r"ControlSet001\Services\SourceIrpProbeTarget\Parameters");
+        for (name, value) in [
+            ("ProbeDeviceName", r"\Device\SourceIrpProbe"),
+            ("ProbeSourceImage", "source_irp_probe.sys"),
+            ("ProbeSourceExport", "SourceIrpProbe"),
+        ] {
+            hive.set_value(parameters, name, RegistryValueType::Sz, utf16le_sz(value));
+        }
+    }
+
     let initial_network_devnodes = match profile {
         GeneratedHiveProfile::Production
         | GeneratedHiveProfile::PendingStartIntegration
         | GeneratedHiveProfile::MupProviderIntegration
+        | GeneratedHiveProfile::SourceIrpIntegration
         | GeneratedHiveProfile::SehDriverIntegration
         | GeneratedHiveProfile::SehTerminalUnhandledIntegration
         | GeneratedHiveProfile::SehTerminalExitIntegration => {
@@ -1428,6 +1449,31 @@ mod tests {
                 .open_key(r"ControlSet001\Services\PendingStartTest")
                 .is_none());
         }
+    }
+
+    #[test]
+    fn source_irp_profile_declares_metadata_without_production_fixture() {
+        assert!(build_hive().open_key(r"ControlSet001\Services\SourceIrpProbeTarget").is_none());
+        let hive = build_hive_with_configuration(
+            generated_e1000_adapters(1), GeneratedDisplayMode::DEFAULT,
+            GeneratedHiveProfile::SourceIrpIntegration,
+        );
+        let key = hive.open_key(r"ControlSet001\Services\SourceIrpProbeTarget").unwrap();
+        assert_eq!(hive.query_dword(key, "Type"), Some(SERVICE_FILE_SYSTEM_DRIVER));
+        assert_eq!(hive.query_dword(key, "Start"), Some(SERVICE_SYSTEM_START));
+        assert_eq!(hive.query_value(key, "ImagePath"), Some((RegistryValueType::ExpandSz,
+            utf16le_sz(r"system32\drivers\source_irp_target.sys").as_slice())));
+        let parameters = hive.open_key(r"ControlSet001\Services\SourceIrpProbeTarget\Parameters").unwrap();
+        for (name, expected) in [
+            ("ProbeDeviceName", r"\Device\SourceIrpProbe"),
+            ("ProbeSourceImage", "source_irp_probe.sys"),
+            ("ProbeSourceExport", "SourceIrpProbe"),
+        ] {
+            assert_eq!(hive.query_value(parameters, name),
+                       Some((RegistryValueType::Sz, utf16le_sz(expected).as_slice())));
+        }
+        assert_eq!(generated_hive_profile_from_name("source-irp-integration"),
+                   Some(GeneratedHiveProfile::SourceIrpIntegration));
     }
 
     #[test]
@@ -2167,6 +2213,7 @@ mod tests {
             (GeneratedHiveProfile::SehTerminalUnhandledIntegration, 1),
             (GeneratedHiveProfile::SehTerminalExitIntegration, 1),
             (GeneratedHiveProfile::MupProviderIntegration, 1),
+            (GeneratedHiveProfile::SourceIrpIntegration, 1),
         ] {
             let bytes = encode_image(&build_hive_with_configuration(
                 generated_e1000_adapters(count),

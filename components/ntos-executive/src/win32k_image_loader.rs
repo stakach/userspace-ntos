@@ -408,6 +408,26 @@ pub(crate) unsafe fn acquire_load(handle: u64) -> Result<(), i32> {
         .map_err(|_| 0xc000_009au32 as i32)
 }
 
+#[cfg(feature = "source-irp-integration")]
+pub(super) unsafe fn probe_export(handle: u64, name: &str, length: u64, executable: bool) -> Option<u64> {
+    let provider = crate::current_win32k_provider_domain()?;
+    let module = (&*core::ptr::addr_of!(LOADED)).iter().find(|module| {
+        module.handle().address == handle && module.backing().provider == provider
+            && module.image().image_owner == WIN32K_ROOT_IMAGE_MAP_OWNER.load(Ordering::Acquire)
+            && module.load_references() != 0
+            && win32k_subsystem::provider_pool_packet_lease_live(module.backing().handle)
+    })?;
+    let export = module.backing().exports.exports.iter().find(|export| export.name == name)?;
+    let nt_pe_loader::module_namespace::ExportTarget::Rva(rva) = &export.target else { return None; };
+    let end = u64::from(*rva).checked_add(length)?;
+    if length == 0 || end > u64::from(module.image().size) {
+        return None;
+    }
+    let rights = module.backing().rights.get(*rva as usize / 0x1000..=((end - 1) / 0x1000) as usize)?;
+    if executable && rights.iter().any(|rights| *rights != 2) { return None; }
+    module.image().base.checked_add(u64::from(*rva))
+}
+
 pub(crate) unsafe fn unload(handle: u64) -> i32 {
     let Some(module) = (&mut *core::ptr::addr_of_mut!(LOADED))
         .iter_mut()

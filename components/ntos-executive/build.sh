@@ -10,6 +10,9 @@ mkdir -p ../../rust-micro/.tmp
 SEH_LINKAGE_STAGE=../../rust-micro/.tmp/nt-seh-linkage.dll
 rm -f "$SEH_LINKAGE_STAGE" ../../rust-micro/.tmp/rootserver.elf
 IMAGE_PROFILE="${NTOS_IMAGE_PROFILE:-production}"
+if [ "$IMAGE_PROFILE" = source-irp-integration ]; then
+  set -- "$@" --features source-irp-integration
+fi
 if [ "${NTOS_MUP_PROVIDER_KERNEL_ONLY:-0}" = 1 ]; then
   if [ "$IMAGE_PROFILE" != mup-provider ]; then
     echo "NTOS_MUP_PROVIDER_KERNEL_ONLY requires NTOS_IMAGE_PROFILE=mup-provider" >&2

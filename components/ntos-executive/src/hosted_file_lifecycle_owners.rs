@@ -23,6 +23,7 @@ struct Row {
     payload: Option<Payload>,
     retry_after: u64,
     blocked: Option<nt_status::NtStatus>,
+    executing: bool,
 }
 
 static mut ROWS: Vec<Row> = Vec::new();
@@ -78,6 +79,7 @@ pub(super) fn reserve(
         payload: None,
         retry_after: 0,
         blocked: None,
+        executing: false,
     });
     Ok(())
 }
@@ -281,19 +283,125 @@ fn drive_retained(file_id: FileId, owner: RetainedFileLifecycle) -> bool {
 }
 
 fn drive_payload(file_id: FileId, executor: NativeHandleCaller) -> bool {
-    let index = index(file_id).expect("lifecycle File owner missing");
-    if rows()[index].retry_after > monotonic_time_100ns() {
+    let slot = index(file_id).expect("lifecycle File owner missing");
+    if rows()[slot].executing || rows()[slot].retry_after > monotonic_time_100ns() {
         return false;
     }
-    let Some(payload) = rows()[index].payload.take() else { return false };
-    rows()[index].blocked = None;
-    rows()[index].retry_after = 0;
-    match payload {
+    let Some(payload) = rows()[slot].payload.take() else { return false };
+    rows()[slot].executing = true;
+    rows()[slot].blocked = None;
+    rows()[slot].retry_after = 0;
+    let progress = match payload {
         Payload::Prepared(prepared) => dispatch_prepared(file_id, prepared, executor),
         Payload::Returned(returned) => finish_returned(file_id, returned),
         Payload::Retained(owner) => drive_retained(file_id, owner),
         Payload::AckReturned(returned) => finish_ack(file_id, returned),
+    };
+    rows()[index(file_id).expect("executing lifecycle owner retained")].executing = false;
+    progress
+}
+
+fn route_ready(instance_index: usize) -> bool {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    if !instance(instance_index).is_some_and(|instance| instance.ready) { return false; }
+    let provider = unsafe { hosted_provider_dispatch_route_for_instance(instance_index) }
+        .map_or(instance_index, |route| route.provider_instance);
+    if !instance(provider).is_some_and(|instance| instance.ready) { return false; }
+    let Some(route) = hosted_ingress_sources::primary_route(provider) else { return false; };
+    matches!(unsafe { runtime::ready_for_admission(route) }, Ok(true))
+}
+
+fn projection_ready(projection: &IrpProjection) -> bool {
+    route_live(projection).is_some_and(route_ready)
+}
+
+fn queued_route_ready(file_id: FileId) -> bool {
+    let Some(file) = io_manager_mut().file(file_id) else { return false; };
+    let Some((instance, _, _)) = hosted_driver_device_route_by_device_id(file.device_id.raw())
+        else { return false; };
+    route_ready(instance)
+}
+
+/// No queue claims, backend polling or native effects occur before parent parking.
+pub(super) fn nested_ready(file_id: FileId) -> bool {
+    let Some(index) = index(file_id) else { return false; };
+    let row = &rows()[index];
+    if row.executing || row.retry_after > monotonic_time_100ns() { return false; }
+    match row.payload.as_ref() {
+        Some(Payload::Prepared(prepared)) => projection_ready(prepared.projection()),
+        Some(Payload::Returned(_)) | Some(Payload::AckReturned(_)) => true,
+        Some(Payload::Retained(owner)) => !owner.acknowledgement_is_uncertain()
+            && projection_ready(owner.projection())
+            && (io_manager_mut().retained_file_lifecycle_ack_ready(owner)
+                || (io_manager_mut().completed_irp(owner.irp_id()).is_none()
+                    && unsafe { nested_file_irp_completion_ready_exact(owner.irp_id().raw()) })),
+        None => io_manager_mut().file(file_id).is_none()
+            || (io_manager_mut().queued_peer_file_lifecycle_ready(file_id).unwrap_or(false)
+                && queued_route_ready(file_id)),
     }
+}
+
+/// Drive only this canonical File's lifecycle, never another queued owner's operation.
+pub(super) fn nested_step(file_id: FileId, executor: NativeHandleCaller) -> bool {
+    if !nested_ready(file_id) { return false; }
+    let _durable = crate::allocator::enter_durable();
+    let slot = index(file_id).expect("ready lifecycle owner");
+    if rows()[slot].payload.is_none() && io_manager_mut().file(file_id).is_none() {
+        release_requestor(slot);
+        return true;
+    }
+    let before = (rows()[slot].retry_after, rows()[slot].blocked);
+    let mut completion_progress = false;
+    if matches!(rows()[slot].payload, Some(Payload::Retained(_))) {
+        // The exact READY hint was observed above. Transfer native completion to the
+        // canonical manager before selecting its authenticated completion ACK.
+        let was_ready = match rows()[slot].payload.as_ref() {
+            Some(Payload::Retained(owner)) => io_manager_mut().retained_file_lifecycle_ack_ready(owner),
+            _ => false,
+        };
+        rows()[slot].executing = true;
+        pump_io_manager();
+        let slot = index(file_id).expect("completion-draining lifecycle owner retained");
+        rows()[slot].executing = false;
+        completion_progress = !was_ready && match rows()[slot].payload.as_ref() {
+            Some(Payload::Retained(owner)) => io_manager_mut().retained_file_lifecycle_ack_ready(owner),
+            _ => false,
+        };
+    }
+    let slot = index(file_id).expect("ready lifecycle owner retained");
+    let progress = if rows()[slot].payload.is_some() {
+        drive_payload(file_id, executor)
+    } else {
+        let tid = rows()[slot].requestor.thread_lifetime().thread_id() as u64;
+        let prepared = match io_manager_mut().prepare_queued_peer_file_lifecycle(file_id, tid) {
+            Ok(Some(prepared)) => prepared,
+            _ => return false,
+        };
+        rows()[slot].executing = true;
+        let progress = dispatch_prepared(file_id, prepared, executor);
+        rows()[index(file_id).expect("executing lifecycle owner")].executing = false;
+        progress
+    };
+    let slot = index(file_id).expect("stepped lifecycle owner retained");
+    progress || completion_progress || before != (rows()[slot].retry_after, rows()[slot].blocked)
+}
+
+pub(super) fn nested_work_ready() -> bool {
+    let count = rows().len();
+    for slot in 0..count {
+        let file_id = rows()[slot].file_id;
+        if nested_ready(file_id) { return true; }
+    }
+    false
+}
+
+pub(super) fn nested_work_step(executor: NativeHandleCaller) -> bool {
+    let count = rows().len();
+    for slot in 0..count {
+        let file_id = rows()[slot].file_id;
+        if nested_ready(file_id) { return nested_step(file_id, executor); }
+    }
+    false
 }
 
 /// Drive bounded work without keeping an I/O-manager borrow across driver entry.
@@ -313,7 +421,7 @@ pub(super) fn pump(executor: NativeHandleCaller) -> usize {
         let prepared = match io_manager_mut().prepare_next_queued_peer_file_lifecycle(|file_id| {
             rows()
                 .iter()
-                .find(|row| row.file_id == file_id && row.payload.is_none())
+                .find(|row| row.file_id == file_id && row.payload.is_none() && !row.executing)
                 .map(|row| row.requestor.thread_lifetime().thread_id() as u64)
         }) {
             Ok(Some(prepared)) => prepared,
@@ -321,7 +429,9 @@ pub(super) fn pump(executor: NativeHandleCaller) -> usize {
             Err(_) => break,
         };
         let file_id = prepared.file_id();
+        rows()[index(file_id).expect("queued lifecycle owner")].executing = true;
         progress += usize::from(dispatch_prepared(file_id, prepared, executor));
+        rows()[index(file_id).expect("executing lifecycle owner")].executing = false;
     }
     progress + retire()
 }
@@ -332,7 +442,7 @@ pub(super) fn retire() -> usize {
     let mut retired = 0;
     let mut cursor = 0;
     while cursor < rows().len() {
-        if rows()[cursor].payload.is_none()
+        if !rows()[cursor].executing && rows()[cursor].payload.is_none()
             && io_manager_mut().file(rows()[cursor].file_id).is_none()
         {
             release_requestor(cursor);

@@ -72,6 +72,9 @@ cross-domain driver READ, FLUSH, and buffered QUERY_INFORMATION requests,
 including immediate and pending completion through the source driver's event
 and IOSB. READ and QUERY_INFORMATION check exact output bytes; FLUSH checks
 zero completion information.
+The optional `tests/native/source_irp/run.sh` profile checks real fileless READ/WRITE
+and all four IOCTL methods through win32k, including immediate and pending completion.
+It verifies bytes, IOSBs and retirement counters; production images omit its fixtures.
 
 The kernel is a **pinned git submodule**, not vendored source: `userspace-ntos`
 depends on an exact kernel SHA (its syscall/invocation ABI is tightly coupled),

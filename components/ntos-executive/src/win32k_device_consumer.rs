@@ -256,6 +256,18 @@ pub(crate) unsafe fn ensure_projection(device: nt_io_manager::DeviceId) -> Resul
     Ok(address)
 }
 
+#[cfg(feature = "source-irp-integration")]
+pub(crate) unsafe fn retain_probe_projection(
+    device: nt_io_manager::DeviceId,
+) -> Result<nt_io_manager::HostedDevicePointerRegistration, i32> {
+    let address = ensure_projection(device)?;
+    let registration = live_consumer()?.projections.iter()
+        .find(|row| row.device == device && row.address == address && row.bound)
+        .and_then(|row| row.registration).ok_or(STATUS_DEVICE_NOT_READY)?;
+    io_manager_mut().reference_hosted_device_pointer(registration).map_err(|status| status.raw())?;
+    Ok(registration)
+}
+
 /// Root-only publication after a genuine open. The consumer's physical domain owns the File
 /// address, independently of the hosted driver that completed CREATE.
 pub(crate) unsafe fn bind_file_projection(

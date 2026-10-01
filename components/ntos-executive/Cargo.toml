@@ -22,6 +22,8 @@ debug-trace = []
 # Native Mup/provider integration boots the normal executive service loop without
 # requiring the unrelated win32k import catalog. Production admission is unchanged.
 mup-provider-kernel-only = []
+# Validation-only win32k-origin IRP caller; excluded from production images.
+source-irp-integration = []
 
 [dependencies]
 # Kernel ABI + SURT transport.

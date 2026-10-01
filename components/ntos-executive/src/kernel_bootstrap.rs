@@ -1,4 +1,4 @@
-//! Owned DriverEntry destination carried by the canonical kernel activation.
+//! Owned kernel-job destinations carried by canonical provider activations.
 
 use super::*;
 use nt_user_host::provider_kernel_pump::{
@@ -7,14 +7,20 @@ use nt_user_host::provider_kernel_pump::{
 };
 use nt_user_host::provider_kernel_wait::{KernelProviderWaitRecipient, KernelProviderWaitState};
 
-pub(super) struct DriverEntryRecipient {
+pub(super) enum KernelJobDestination {
+    DriverEntry,
+    Executive(alloc::sync::Arc<AtomicU64>),
+}
+
+pub(super) struct KernelJobRecipient {
     // Physical layout template only; Reply is resolved from the live dispatch at each entry.
     channel: spawn_hosts::PumpChannel,
     wait: KernelProviderWaitState,
     observation: Option<spawn_hosts::PumpResult>,
+    destination: KernelJobDestination,
 }
 
-impl KernelProviderWaitRecipient for DriverEntryRecipient {
+impl KernelProviderWaitRecipient for KernelJobRecipient {
     fn kernel_wait_state(&mut self) -> &mut KernelProviderWaitState {
         &mut self.wait
     }
@@ -27,7 +33,7 @@ fn pump_error(error: PumpProgressError) -> u32 {
     }
 }
 
-impl DriverEntryRecipient {
+impl KernelJobRecipient {
     pub(super) fn new(mut channel: spawn_hosts::PumpChannel) -> Result<Self, u32> {
         let wait = KernelProviderWaitState::new(channel.reply_cap).map_err(pump_error)?;
         channel.reply_cap = 0;
@@ -35,7 +41,26 @@ impl DriverEntryRecipient {
             wait,
             channel,
             observation: None,
+            destination: KernelJobDestination::DriverEntry,
         })
+    }
+
+    pub(super) fn executive(
+        channel: spawn_hosts::PumpChannel,
+        result: alloc::sync::Arc<AtomicU64>,
+    ) -> Result<Self, u32> {
+        let mut recipient = Self::new(channel)?;
+        recipient.destination = KernelJobDestination::Executive(result);
+        Ok(recipient)
+    }
+
+    pub(super) fn is_driver_entry(&self) -> bool {
+        matches!(self.destination, KernelJobDestination::DriverEntry)
+    }
+
+    pub(super) fn return_status_offset(&self) -> u64 {
+        if self.is_driver_entry() { win32k_subsystem::SH_DE_STATUS }
+        else { win32k_subsystem::SH_REQ_STATUS }
     }
 
     pub(super) fn matches(&self, channel: &spawn_hosts::PumpChannel) -> bool {
@@ -185,13 +210,13 @@ impl DriverEntryRecipient {
 }
 
 /// Non-copyable ownership delivered only by successful canonical completion acknowledgment.
-pub(crate) struct DriverEntryCompletion {
+pub(crate) struct KernelJobCompletion {
     status: i32,
-    recipient: DriverEntryRecipient,
+    recipient: KernelJobRecipient,
 }
 
-impl DriverEntryCompletion {
-    pub(super) fn new(status: u32, recipient: DriverEntryRecipient) -> Self {
+impl KernelJobCompletion {
+    pub(super) fn new(status: u32, recipient: KernelJobRecipient) -> Self {
         Self {
             status: status as i32,
             recipient,
@@ -200,6 +225,12 @@ impl DriverEntryCompletion {
 
     /// Readiness is the initiating bootstrap consumer's work, not a generic Reply effect.
     pub(crate) unsafe fn initialize(self) -> bool {
+        if let KernelJobDestination::Executive(result) = &self.recipient.destination {
+            // This destination receives the retained result only after the activation ACK
+            // transferred the recipient and released its canonical requestor references.
+            result.store((1u64 << 32) | u64::from(self.status as u32), Ordering::Release);
+            return true;
+        }
         if self.status < 0 {
             return false;
         }

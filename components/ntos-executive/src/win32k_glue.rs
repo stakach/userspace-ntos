@@ -5715,6 +5715,9 @@ pub(crate) use process_attach_root::retire_kernel_attach;
 /// Checked system-image loading owns its mappings and opaque module allocation independently.
 #[path = "win32k_image_loader.rs"]
 mod image_loader;
+#[cfg(feature = "source-irp-integration")]
+#[path = "source_irp_integration.rs"]
+pub(crate) mod source_irp_integration;
 pub(crate) unsafe fn service_gdi_image_request(pointer: u64, length: u64,
     source: crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalSource) -> (i32, u64) {
     image_loader::service_request(pointer, length, source)
@@ -6170,6 +6173,61 @@ unsafe fn win32k_dispatch_wide_observed(
     attach_client: bool,
     entered: Option<&mut bool>,
 ) -> (u64, bool) {
+    win32k_dispatch_wide_observed_inner(
+        ssn, a0, a1, a2, a3, caller_sp, stack_args, completion_args, output_stage,
+        paint_output, client, request_kind, attach_client, entered, None,
+    )
+}
+
+/// Executive native work uses a real canonical requestor and a distinct owned completion
+/// destination. Ordinary hosted/SSDT dispatches remain on their existing return path.
+unsafe fn win32k_dispatch_kernel_job_observed(
+    request_kind: u64,
+    arguments: [u64; 4],
+    entered: &mut bool,
+) -> (u64, bool) {
+    use crate::service_sec_image::kernel_provider_activation::{
+        capture_kernel_job, run_kernel_job, KernelJobResult,
+    };
+    let _durable = crate::allocator::enter_durable();
+    let result = KernelJobResult::new();
+    let native = crate::initial_system_driver_caller();
+    let mut client = executive_win32k_client();
+    client.pi = 0;
+    let mut execute = |mut channel: crate::spawn_hosts::PumpChannel, lane| {
+        channel.client_pi = 0;
+        channel.client_generation = 0;
+        channel.caps.provider_wait = true;
+        let caller = capture_kernel_job(&channel, lane, native, &result)?;
+        run_kernel_job(caller, &result)
+    };
+    win32k_dispatch_wide_observed_inner(
+        0, arguments[0], arguments[1], arguments[2], arguments[3], 0, &[],
+        [0; 4], None, None, client, request_kind, false, Some(entered),
+        Some(&mut execute),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn win32k_dispatch_wide_observed_inner(
+    ssn: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    caller_sp: u64,
+    stack_args: &[u64],
+    completion_args: [u64; 4],
+    output_stage: Option<nt_user_callback::DispatchOutputStage>,
+    paint_output: Option<nt_user_callback::PaintOutputClaim>,
+    client: Win32kClientContext,
+    request_kind: u64,
+    attach_client: bool,
+    entered: Option<&mut bool>,
+    kernel_job: Option<&mut dyn FnMut(
+        crate::spawn_hosts::PumpChannel, nt_component_suspension::LaneHandle,
+    ) -> Result<(u64, bool), u32>>,
+) -> (u64, bool) {
     // Reject before attachment or shared request writes, not only at later lane acquisition.
     if crate::component_execution_is_busy()
         || !win32k_client_context_is_admitted(client)
@@ -6416,6 +6474,15 @@ unsafe fn win32k_dispatch_wide_observed(
     };
     if let Some(entered) = entered {
         *entered = true;
+    }
+    if let Some(execute) = kernel_job {
+        let result = execute(ch, lane);
+        core::ptr::write(
+            core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch,
+        );
+        // Canonical kernel completion already retired this exact physical dispatch. Hosted
+        // finish_win32k_lane_return must not repeat it. Failed/unknown work stays owned.
+        return result.unwrap_or_else(|status| (u64::from(status), false));
     }
     let pr = crate::spawn_hosts::component_pump(&ch);
     if attach_client {
