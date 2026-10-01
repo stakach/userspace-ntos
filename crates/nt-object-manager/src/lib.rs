@@ -133,8 +133,9 @@ impl ObjectManager {
         Ok(())
     }
 
-    /// Open a handle to `object` for `client` with `granted_access`. Increments
-    /// the object's handle + pointer counts (the handle holds a strong reference).
+    /// Open a handle to `object` for `client` with `granted_access`. Generic
+    /// rights are mapped through the object's type before recording the grant.
+    /// Increments the object's handle + pointer counts.
     pub fn open_handle(
         &mut self,
         client: ClientId,
@@ -142,13 +143,18 @@ impl ObjectManager {
         granted_access: AccessMask,
         attributes: ObjAttrFlags,
     ) -> Result<HandleValue, NtStatus> {
+        let mapping = self
+            .object_type(object.type_id())
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .generic_mapping();
         self.clients
-            .open_handle(client, object.clone(), granted_access, attributes)
+            .open_handle(client, object.clone(), mapping.map(granted_access), attributes)
     }
 
     /// Reference an object by handle (spec §11.5). Enforces `expected_type`
     /// (`STATUS_OBJECT_TYPE_MISMATCH`) and that `desired_access` is within the
-    /// handle's granted access (`STATUS_ACCESS_DENIED`). Returns a new counted
+    /// handle's granted access after type-specific generic mapping
+    /// (`STATUS_ACCESS_DENIED`). Returns a new counted
     /// reference. A stale/unknown handle yields `STATUS_INVALID_HANDLE`.
     pub fn reference_by_handle(
         &self,
@@ -157,8 +163,15 @@ impl ObjectManager {
         expected_type: Option<ObjectTypeId>,
         desired_access: AccessMask,
     ) -> Result<ObjectRef, NtStatus> {
-        self.clients
-            .reference_by_handle(client, handle, expected_type, desired_access)
+        let (object, granted_access) = self.clients.resolve_handle(client, handle, expected_type)?;
+        let mapping = self
+            .object_type(object.type_id())
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .generic_mapping();
+        if !granted_access.contains(mapping.map(desired_access)) {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        Ok(object)
     }
 
     /// Close a handle in `client`'s table (decrements handle + pointer counts).
@@ -204,7 +217,12 @@ mod tests {
         ObjectTypeDef {
             name,
             valid_access: AccessMask::GENERIC_ALL,
-            generic_mapping: GenericMapping::default(),
+            generic_mapping: GenericMapping {
+                generic_read: AccessMask::GENERIC_READ,
+                generic_write: AccessMask::GENERIC_WRITE,
+                generic_execute: AccessMask::GENERIC_EXECUTE,
+                generic_all: AccessMask::GENERIC_ALL,
+            },
             delete,
         }
     }
@@ -1309,5 +1327,45 @@ mod tests {
                 matches!(b, ObjectBody::File(f) if f.device == dev.id() && f.owner_local_id == 9)
             )
         });
+    }
+
+    #[test]
+    fn direct_file_handle_maps_generic_access() {
+        use nt_types::rights::file as file_rights;
+
+        let mut om = bootstrapped();
+        let owner = ComponentId(7);
+        let device_dir = om.lookup_path(&path("\\Device"), CI).unwrap();
+        let device = om
+            .create_device(&device_dir, &uni("AccessTest"), owner, 1, true)
+            .unwrap();
+        let file = om.create_file(owner, 9, device.id()).unwrap();
+        let client = test_client(&mut om);
+        let file_type = om.file_type();
+        let handle = om
+            .open_handle(
+                client,
+                &file,
+                AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE,
+                ObjAttrFlags::empty(),
+            )
+            .unwrap();
+
+        assert!(om
+            .reference_by_handle(
+                client,
+                handle,
+                file_type,
+                file_rights::READ_DATA | file_rights::WRITE_DATA,
+            )
+            .is_ok());
+        assert!(om
+            .reference_by_handle(client, handle, file_type, AccessMask::GENERIC_READ)
+            .is_ok());
+        assert_eq!(
+            om.reference_by_handle(client, handle, file_type, AccessMask::DELETE)
+                .unwrap_err(),
+            NtStatus::ACCESS_DENIED
+        );
     }
 }
