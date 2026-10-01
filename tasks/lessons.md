@@ -292,3 +292,23 @@ diagnosis-free failure.
 - A successful build only proves the exact source tree it compiled. Even a readability-only patch
   can match a neighboring function and move a binding to the wrong scope. Inspect the final diff
   and rerun the native compile after every post-build source edit, before pushing or merging.
+
+## Shared Images Are Not Shared Heaps
+- A shared executable's mutable static must not contain a `Vec`, `Box`, or other private-heap
+  pointer used from multiple VSpaces. Keep its ownership anchor in component-local mapped
+  metadata; workers in that VSpace may share it, but the executive must use authenticated wires.
+- Diagnostic tables obey the same rule as kernel state. RPC tracing once corrupted the
+  executive allocator and token SID metadata by sharing a private-heap vector header.
+
+## Accepted Work Needs Nested Progress
+- Fixing an admission rejection can expose a masked deadlock. Every retained service accepted
+  during a synchronous component pump needs a ready/step path that does not depend on returning
+  to the outer service loop. Exclude pending, uncertain, and delivery-only states from busy retry.
+- Publish completion data, retire source backing, and then expose the completion signal. A Reply
+  acknowledgement is neither source retirement nor permission to wake a caller into reused IRP
+  storage. Stopped cleanup also requires the exact broker safe point, not just a stopped TCB.
+- Readiness predicates must not call helpers that pump, claim, cancel, or acknowledge work. Inspect
+  exact immutable readiness first; perform effects only after parking the parent execution lane.
+- Reply acknowledgement does not prove the resumed origin has recorded its pending token. Use an
+  authenticated pending-armed receipt before sibling completion delivery, rather than guessing
+  from a private phase or repeatedly invoking a no-effect terminal callback.
