@@ -6,6 +6,7 @@
 
 use alloc::vec::Vec;
 
+use crate::event_deferred_signal::{DeferredEventSignal, DeferredEventSignals};
 use crate::irql::IrqlState;
 
 /// `KEVENT` type.
@@ -74,11 +75,12 @@ struct Event {
 #[derive(Default)]
 pub struct EventStore {
     events: Vec<Event>,
+    deferred_signals: DeferredEventSignals,
 }
 
 impl EventStore {
     pub fn new() -> Self {
-        Self { events: Vec::new() }
+        Self::default()
     }
 
     /// Construct a store whose backing allocation can be made before a rewindable
@@ -86,6 +88,7 @@ impl EventStore {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             events: Vec::with_capacity(capacity),
+            deferred_signals: DeferredEventSignals::default(),
         }
     }
 
@@ -103,6 +106,10 @@ impl EventStore {
 
     /// `KeInitializeEvent(Event, Type, State)`.
     pub fn initialize(&mut self, ptr: u64, kind: EventKind, signaled: bool) {
+        assert!(
+            !self.deferred_signals.contains(ptr),
+            "Event reinitialization retains an unpublished completion signal"
+        );
         let e = self.slot(ptr);
         e.kind = kind;
         e.signaled = signaled;
@@ -111,6 +118,9 @@ impl EventStore {
     /// Fallible `KeInitializeEvent` for executive paths that must return a real NT allocation
     /// failure instead of depending on a late heap grow.
     pub fn try_initialize(&mut self, ptr: u64, kind: EventKind, signaled: bool) -> bool {
+        if self.deferred_signals.contains(ptr) {
+            return false;
+        }
         if let Some(i) = self.events.iter().position(|e| e.ptr == ptr) {
             let e = &mut self.events[i];
             e.kind = kind;
@@ -136,11 +146,44 @@ impl EventStore {
     /// Remove an initialized event identity. The executive uses this to roll back an object whose
     /// newly-created handle could not be published to its caller.
     pub fn remove_existing(&mut self, ptr: u64) -> bool {
+        if self.deferred_signals.contains(ptr) {
+            return false;
+        }
         let Some(index) = self.events.iter().position(|event| event.ptr == ptr) else {
             return false;
         };
         self.events.remove(index);
         true
+    }
+
+    /// Prepare an operation's completion Set without altering independently observable state.
+    /// The executive must also retain the canonical Event object and its backing lease.
+    pub fn begin_deferred_signal(&mut self, ptr: u64) -> Result<DeferredEventSignal, ()> {
+        if !self.contains(ptr) {
+            return Err(());
+        }
+        self.deferred_signals.begin(ptr)
+    }
+
+    /// Publish exactly once, after the origin's terminal acknowledgement. This is the signal's
+    /// linearization point; independent signals, waits and resets before it remain effective.
+    /// The adapter must arbitrate ready dispatcher waits after this returns.
+    pub fn commit_deferred_signal(&mut self, token: DeferredEventSignal) -> Result<bool, ()> {
+        let index = self
+            .events
+            .iter()
+            .position(|event| event.ptr == token.native_identity())
+            .ok_or(())?;
+        self.deferred_signals.retire(token)?;
+        let event = &mut self.events[index];
+        let previous = event.signaled;
+        event.signaled = true;
+        Ok(previous)
+    }
+
+    /// Cancel an operation that has not committed a visible completion signal.
+    pub fn cancel_deferred_signal(&mut self, token: DeferredEventSignal) -> Result<(), ()> {
+        self.deferred_signals.retire(token)
     }
 
     /// Return the dispatcher type and signal state for an initialized event.
@@ -266,6 +309,10 @@ impl EventStore {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "event_deferred_signal_tests.rs"]
+mod deferred_signal_tests;
 
 #[cfg(test)]
 mod tests {
