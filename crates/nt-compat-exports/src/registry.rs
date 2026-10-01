@@ -443,7 +443,8 @@ mod tests {
 
     #[test]
     fn win32k_import_lists_have_expected_counts() {
-        assert_eq!(crate::WIN32K_NTOSKRNL_IMPORTS.len(), 224);
+        // Includes RtlUnwind, reached through ftfd's real win32k export forwarder.
+        assert_eq!(crate::WIN32K_NTOSKRNL_IMPORTS.len(), 225);
         assert_eq!(crate::WIN32K_HAL_IMPORTS.len(), 1);
         assert_eq!(crate::WIN32K_FTFD_IMPORTS.len(), 34);
         // No duplicate names within the ntoskrnl import list.

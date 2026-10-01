@@ -4,9 +4,9 @@
 //!
 //! win32k.sys imports **224** functions from `ntoskrnl.exe`, **1** from `hal.dll`
 //! (`KeQueryPerformanceCounter`, in [`crate::hal`]), and **34** `FT_*` FreeType
-//! functions from `ftfd.dll` (the font driver) — the FreeType imports have no
-//! kernel dependency and are intentionally out of scope here (see
-//! [`WIN32K_FTFD_IMPORTS`]).
+//! functions from `ftfd.dll` (the font driver). FreeType's win32k imports include
+//! forwarded kernel exports; those targets use the same canonical metadata below.
+//! The FT_* export names are listed separately in [`WIN32K_FTFD_IMPORTS`].
 //!
 //! Each descriptor's [`ExportStatus`](crate::ExportStatus) reflects how it is
 //! serviced: `Implemented`/`Partial` = wired to a real `nt-*` subsystem (or
@@ -16,6 +16,29 @@
 
 use crate::ExportStatus::*;
 use crate::{ExportDescriptor, ExportStatus};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ftfd_win32k_core_forwarders_have_canonical_metadata() {
+        for name in ["RtlMultiByteToUnicodeN", "KeBugCheckEx", "RtlUnwind"] {
+            assert!(
+                WIN32K_NTOSKRNL_IMPORTS.contains(&name),
+                "missing allowed core export {name}"
+            );
+            let descriptor = WIN32K_NTOSKRNL
+                .iter()
+                .chain(crate::ntoskrnl::NTOSKRNL.iter())
+                .find(|descriptor| descriptor.name == name && descriptor.dll == "ntoskrnl.exe")
+                .unwrap_or_else(|| panic!("missing canonical descriptor {name}"));
+            if name == "RtlUnwind" {
+                assert_eq!(descriptor.status, Implemented);
+            }
+        }
+    }
+}
 
 const fn e(name: &'static str, status: ExportStatus, notes: &'static str) -> ExportDescriptor {
     ExportDescriptor {
@@ -222,6 +245,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("RtlTestBit", Partial, "RTL_BITMAP ops over the caller's buffer"),
     e("RtlTimeToTimeFields", Implemented, "host-tested NT epoch/calendar conversion in nt-kernel-exec"),
     e("RtlUnwindEx", Implemented, "native SEH unwind through the admitted support image"),
+    e("RtlUnwind", Implemented, "legacy unwind ABI through the admitted native SEH support image"),
     e("RtlUpcaseUnicodeChar", Implemented, "validated l_intl three-level signed-delta uppercase mapping"),
     e("RtlAnsiCharToUnicodeChar", Implemented, "single-character CP1252 decode with native source-pointer advance"),
     e("RtlImageDirectoryEntryToData", Partial, "checked mapped-image directory resolution over registered extents; raw-file views require explicit extent publication"),
@@ -448,6 +472,7 @@ pub const WIN32K_NTOSKRNL_IMPORTS: &[&str] = &[
     "RtlTimeToTimeFields",
     "ExSystemTimeToLocalTime",
     "RtlUnwindEx",
+    "RtlUnwind",
     "RtlUpcaseUnicodeChar",
     "RtlAnsiCharToUnicodeChar",
     "PsProcessType",
