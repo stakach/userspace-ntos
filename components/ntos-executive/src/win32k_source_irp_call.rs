@@ -457,7 +457,7 @@ pub(super) extern "win64" fn iof_call_driver(device: u64, irp: u64) -> i32 {
                 mdl_va: admission.mdl_address().unwrap_or(0),
                 mdl_generation: mdl_identity
                     .map_or(0, |identity| identity.allocation_generation),
-                input_va: admission.input_target_address().unwrap_or(0),
+                input_va: admission.type3_input_buffer_address().unwrap_or(0),
                 event_body_va: admission.event_body().unwrap_or(0),
             },
             core::slice::from_raw_parts_mut(packet as *mut u8, total),

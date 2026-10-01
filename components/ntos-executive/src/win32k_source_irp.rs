@@ -1051,8 +1051,13 @@ impl SourceBufferedDispatchLease {
         self.auxiliary.mdl.map(|(address, _)| address)
     }
 
-    pub(crate) fn input_target_address(&self) -> Option<u64> {
-        self.auxiliary.input_target.map(|(address, _)| address)
+    pub(crate) fn type3_input_buffer_address(&self) -> Option<u64> {
+        // IN_DIRECT's auxiliary input target is its readable MDL second buffer, not Type3.
+        if self.method == nt_io_abi::ioctl::METHOD_NEITHER {
+            self.auxiliary.input_target.map(|(address, _)| address)
+        } else {
+            None
+        }
     }
 
     pub(crate) fn event_body(&self) -> Option<u64> {
