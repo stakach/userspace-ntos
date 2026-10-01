@@ -22361,6 +22361,46 @@ pub(crate) unsafe fn service_sec_image(
                 .pm
                 .create_thread(target, selftests::DBGK_BREAKIN_CODE_VA, 0, false)
                 .unwrap_or(0);
+            let target_backing = if peb_registered && target_main != 0
+                && nt_handler.pm.set_peb_base(target, SMSS_PEB_VA)
+            {
+                let scratch = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+                let lifetime = nt_handler.pm.thread_lifetime(target_main)
+                    .expect("debugger target main thread has an exact lifetime");
+                match ps_object_backing::prepare_process(&nt_handler.pm, target, scratch) {
+                    Ok(process_body) => {
+                        match ps_object_backing::prepare_thread(&nt_handler.pm, lifetime, scratch) {
+                            Ok(_) => {
+                                if ps_object_backing::publish_prepared_pair(
+                                    &mut nt_handler.pm, lifetime,
+                                ).is_ok() {
+                                    true
+                                } else {
+                                    ps_object_backing::abort_prepared_thread(
+                                        &nt_handler.pm, lifetime, scratch,
+                                    ).expect("failed debugger target retains unpublished thread body");
+                                    ps_object_backing::abort_unpublished(
+                                        &nt_handler.pm, process_body, scratch,
+                                    ).expect("failed debugger target retains unpublished process body");
+                                    false
+                                }
+                            }
+                            Err(_) => {
+                                ps_object_backing::abort_prepared_thread(
+                                    &nt_handler.pm, lifetime, scratch,
+                                ).expect("failed debugger target retains unpublished thread body");
+                                ps_object_backing::abort_unpublished(
+                                    &nt_handler.pm, process_body, scratch,
+                                ).expect("failed debugger target retains unpublished process body");
+                                false
+                            }
+                        }
+                    }
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
             // The target's pre-created spare ETHREAD pool — the same reset-safe pool every hosted
             // process gets at boot, and what a runtime thread create draws from.
             let pool_tid = nt_handler.pm.create_dormant_thread(target).unwrap_or(0);
@@ -22412,6 +22452,7 @@ pub(crate) unsafe fn service_sec_image(
                 && mark_win_ok
                 && code_mapped
                 && target_main != 0
+                && target_backing
                 && pool_tid != 0
                 && target_registered
                 && pool_registered
@@ -22881,10 +22922,37 @@ pub(crate) unsafe fn service_sec_image(
                     h_target, A_STACK_BASE, A_STACK_SIZE, u64::from(nt_address_space::MEM_RELEASE),
                 ]), 0, "diagnostic retains target context until real caller VAD release succeeds");
             }
-            if let Some(previous) = saved_target_proc {
+            for handle in [h_target, h_target_no_create] {
+                if handle != 0 && nt_handler.pm.lookup_handle(
+                    debugger_pid, handle as nt_process::Handle,
+                ).is_some() {
+                    nt_handler.pm.close_handle(debugger_pid, handle as nt_process::Handle)
+                        .expect("debugger fixture closes its target process handle");
+                }
+            }
+            let breakin_pm_tid = u32::try_from(breakin_runtime_tid)
+                .expect("debugger fixture runtime thread ID fits the process manager");
+            for tid in [target_main, pool_tid, breakin_pm_tid] {
+                while tid != 0 && nt_handler.pm.close_handle_by_object(
+                    debugger_pid, nt_process::HandleObject::Thread(tid),
+                ) {}
+            }
+            while nt_handler.pm.close_handle_by_object(
+                debugger_pid, nt_process::HandleObject::Process(target),
+            ) {}
+            if saved_target_proc.is_some() {
                 assert!(process_vm_region_map(test_pi).is_some_and(|map| map.extent_count() == 0));
                 let (_, failed) = process_user_page_tables_release(test_pi, &mut nt_handler);
                 assert_eq!(failed, 0, "diagnostic retains charged target page tables on failure");
+            }
+            if let Some(claim) = brk_test_claim {
+                let _ = csrss_frame_take(test_pi as u64, SMSS_PEB_VA);
+                nt_handler.clear_temporary_pool_thread_slot(test_pi, 0);
+                assert!(nt_handler.release_temporary_process_slot(claim),
+                    "debugger fixture releases its temporary process slot");
+                PM_INITIAL_THREAD_DONE.fetch_and(!(1u64 << test_pi), Ordering::Relaxed);
+            }
+            if let Some(previous) = saved_target_proc {
                 if let Some(accounting) = nt_handler.process_commit.accounting(target) {
                     assert_eq!(accounting.current_bytes, 0);
                     assert_eq!(nt_handler.process_commit.unregister(target), Some(accounting));
@@ -22893,11 +22961,21 @@ pub(crate) unsafe fn service_sec_image(
                 assert_eq!((&*ctx.procs)[test_pi].pml4, target_pml4);
                 (&mut *ctx.procs)[test_pi] = previous;
             }
-            if let Some(claim) = brk_test_claim {
-                let _ = csrss_frame_take(test_pi as u64, SMSS_PEB_VA);
-                nt_handler.clear_temporary_pool_thread_slot(test_pi, 0);
-                let _ = nt_handler.release_temporary_process_slot(claim);
-                PM_INITIAL_THREAD_DONE.fetch_and(!(1u64 << test_pi), Ordering::Relaxed);
+            assert!(nt_handler.pm.process_debug_port(target).is_none(),
+                "debugger fixture detaches before retiring target Ps bodies");
+            nt_handler.pm.terminate_process(target, nt_process::STATUS_SUCCESS)
+                .expect("debugger fixture terminates its throwaway target");
+            let retirement = nt_handler.pm.withdraw_process_object_if_unreferenced(target)
+                .expect("debugger fixture releases every target object reference");
+            let backing = ps_object_backing::retire_withdrawn(
+                &nt_handler.pm,
+                &retirement,
+                ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+            ).expect("debugger fixture retires its canonical Ps bodies");
+            let _deletion = nt_handler.pm.finish_process_object_retirement(retirement)
+                .expect("debugger fixture finishes canonical Ps retirement");
+            if ps_object_backing::release_retired_addresses(backing).is_err() {
+                panic!("debugger fixture retains retired Ps address slots");
             }
             nt_handler.remote_thread_request = None;
 
