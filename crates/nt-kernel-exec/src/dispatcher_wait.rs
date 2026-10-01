@@ -75,7 +75,7 @@ pub fn dispatcher_ready(
     object: DispatcherObject,
 ) -> bool {
     match object {
-        DispatcherObject::Event(identity) => events.read_state(identity),
+        DispatcherObject::Event(identity) => events.wait_ready(identity),
         DispatcherObject::Semaphore(identity) => semaphores
             .query(identity)
             .is_some_and(|(current, _maximum)| current > 0),

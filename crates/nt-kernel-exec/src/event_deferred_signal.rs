@@ -12,11 +12,21 @@ pub struct DeferredEventSignal {
     authority: u64,
     native: u64,
     serial: u64,
+    generation: u64,
+    state_sequence: u64,
 }
 
 impl DeferredEventSignal {
     pub const fn native_identity(self) -> u64 {
         self.native
+    }
+
+    pub const fn state_sequence(self) -> u64 {
+        self.state_sequence
+    }
+
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
     }
 }
 
@@ -41,7 +51,12 @@ impl DeferredEventSignals {
         self.pending.iter().any(|token| token.native == native)
     }
 
-    pub(crate) fn begin(&mut self, native: u64) -> Result<DeferredEventSignal, ()> {
+    pub(crate) fn begin(
+        &mut self,
+        native: u64,
+        generation: u64,
+        state_sequence: u64,
+    ) -> Result<DeferredEventSignal, ()> {
         let serial = self.next_serial;
         let next = serial.checked_add(1).ok_or(())?;
         self.pending.try_reserve(1).map_err(|_| ())?;
@@ -56,6 +71,8 @@ impl DeferredEventSignals {
             authority: self.authority,
             native,
             serial,
+            generation,
+            state_sequence,
         };
         self.pending.push(token);
         self.next_serial = next;
@@ -83,9 +100,9 @@ mod tests {
     #[test]
     fn exhausted_serial_does_not_reuse_or_retire_existing_ownership() {
         let mut signals = DeferredEventSignals::default();
-        let prior = signals.begin(7).unwrap();
+        let prior = signals.begin(7, 1, 2).unwrap();
         signals.next_serial = u64::MAX;
-        assert_eq!(signals.begin(7), Err(()));
+        assert_eq!(signals.begin(7, 1, 3), Err(()));
         assert!(signals.contains(7));
         assert_eq!(signals.retire(prior), Ok(()));
         assert!(!signals.contains(7));
