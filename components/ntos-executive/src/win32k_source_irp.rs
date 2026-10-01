@@ -87,6 +87,10 @@ pub(super) unsafe fn allocate(stack_count: u8) -> Option<(u64, ProviderSourceIrp
         rollback(catalog, &mut memory, native.payload_offset, None, None);
         return None;
     }
+    if shared_pool::validate_private_admission(&memory, native.identity).is_err() {
+        rollback(catalog, &mut memory, native.payload_offset, None, None);
+        return None;
+    }
     let Ok(snapshot) = catalog.register(arena, address, native.capacity) else {
         rollback(catalog, &mut memory, native.payload_offset, None, None);
         return None;

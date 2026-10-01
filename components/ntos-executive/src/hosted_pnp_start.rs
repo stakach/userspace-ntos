@@ -2035,7 +2035,7 @@ unsafe fn try_publish_hosted_video_route(
         &crate::video_device::HostedVideoDeviceRegistration {
             device_id,
             service_registry_path: service_registry_path.as_slice(),
-            allocate_projection: crate::win32k_subsystem::pool_alloc_export,
+            allocate_projection: crate::win32k_subsystem::allocate_root_provider_pool_allocation,
         },
     );
     report.video_route_published |= published;

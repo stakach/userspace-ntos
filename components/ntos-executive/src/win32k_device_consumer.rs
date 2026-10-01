@@ -10,7 +10,7 @@ struct Projection {
     registration: Option<nt_io_manager::HostedDevicePointerRegistration>,
     bound: bool,
     pdo_identity: Option<nt_pnp_manager::DevnodeIdentity>,
-    owned_allocation: Option<(u64, u64)>,
+    owned_allocation: Option<crate::win32k_subsystem::RootProviderPoolAllocation>,
 }
 
 struct Consumer {
@@ -207,17 +207,17 @@ pub(crate) unsafe fn ensure_projection(device: nt_io_manager::DeviceId) -> Resul
     let device_size = nt_io_manager::WDM_X64_DEVICE_OBJECT_SIZE as u64;
     let size = driver_size + extension_size + device_size;
     let (base, address) = if let Some(row) = consumer.projections.iter().find(|row| row.device == device) {
-        let (base, recorded_size) = row.owned_allocation.ok_or(STATUS_DEVICE_NOT_READY)?;
+        let allocation = row.owned_allocation.ok_or(STATUS_DEVICE_NOT_READY)?;
+        let (base, recorded_size) = (allocation.address(), allocation.length());
         if recorded_size != size || row.address != base + driver_size + extension_size {
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
         (base, row.address)
     } else {
         consumer.projections.try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        let base = crate::win32k_subsystem::pool_alloc_export(size);
-        if base == 0 {
-            return Err(STATUS_INSUFFICIENT_RESOURCES);
-        }
+        let allocation = crate::win32k_subsystem::allocate_root_provider_pool_allocation(size)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let base = allocation.address();
         let address = base + driver_size + extension_size;
         // Retain the exact pool allocation even if native body initialization fails.
         consumer.projections.push(Projection {
@@ -226,7 +226,7 @@ pub(crate) unsafe fn ensure_projection(device: nt_io_manager::DeviceId) -> Resul
             registration: None,
             bound: false,
             pdo_identity,
-            owned_allocation: Some((base, size)),
+            owned_allocation: Some(allocation),
         });
         (base, address)
     };
@@ -574,8 +574,8 @@ pub(crate) unsafe fn retire_quiescent_projections() -> Result<(), i32> {
             }
             row.bound = false;
         }
-        if let Some((address, size)) = row.owned_allocation {
-            if !crate::win32k_subsystem::release_consumer_projection(address, size) {
+        if let Some(allocation) = row.owned_allocation {
+            if !crate::win32k_subsystem::retire_root_provider_pool_allocation(allocation) {
                 return Err(STATUS_DEVICE_NOT_READY);
             }
             row.owned_allocation = None;

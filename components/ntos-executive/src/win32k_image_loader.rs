@@ -7,7 +7,7 @@ use nt_pe_loader::system_module::{SystemImageIdentity, SystemModule, SystemModul
 
 struct NativeBacking {
     handle: crate::win32k_subsystem::ProviderPoolPacketLease,
-    handle_pin: nt_provider_wait::ProviderAllocationPin,
+    handle_pin: crate::win32k_subsystem::SharedPoolPin,
     vspace_cap: u64,
     frame_base: u64,
     frame_count: u64,
@@ -267,11 +267,8 @@ unsafe fn resolve_import(
         }
         module_namespace::ExportTarget::Forwarder(target) => {
             let (module, name) = target.rsplit_once('.').ok_or(LoadFailure::InvalidImage)?;
-            let mut module =
-                module_namespace::module_leaf(module).map_err(|_| LoadFailure::InvalidImage)?;
-            if !module.contains('.') {
-                module.push_str(".dll");
-            }
+            let module = module_namespace::forwarder_module(module)
+                .map_err(|_| LoadFailure::InvalidImage)?;
             let symbol = if let Some(ordinal) = name.strip_prefix('#') {
                 Symbol::Ordinal(ordinal.parse().map_err(|_| LoadFailure::InvalidImage)?)
             } else {
@@ -647,18 +644,7 @@ fn frame_records(count: usize, value: u64) -> Option<Vec<u64>> {
     Some(records)
 }
 
-pub(crate) unsafe fn load_one_driver(
-    src_va: u64,
-    source_len: u32,
-    name: &str,
-    dst_va: u64,
-    frames: u64,
-    host_pml4: u64,
-) -> Option<(u32, u32, u32)> {
-    load_one_driver_result(src_va, source_len, name, dst_va, frames, host_pml4).ok()
-}
-
-unsafe fn load_one_driver_result(
+pub(super) unsafe fn load_one_driver_result(
     src_va: u64,
     source_len: u32,
     name: &str,

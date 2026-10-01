@@ -1633,7 +1633,8 @@ unsafe fn provider_pool_alloc(size: u64, zero: bool) -> u64 {
             Err(error) => Err(Failure::Native(error as u64)),
             Ok(allocation) => {
                 let payload = WIN32K_POOL_VADDR + allocation.payload_offset;
-                if provider_allocations_unlocked(&mut metadata)
+                if shared_pool::validate_private_admission(&memory, allocation.identity).is_ok()
+                    && provider_allocations_unlocked(&mut metadata)
                     .is_some_and(|catalog| catalog.register(arena, payload, allocation.capacity).is_ok())
                 {
                     Ok(payload)
@@ -1719,47 +1720,43 @@ impl ProviderPoolPacketLease {
     pub(crate) fn capacity(self) -> u64 { self.capacity }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SharedPoolPin {
+    provider: nt_provider_wait::ProviderDomainIdentity,
+    allocation: shared_pool::AllocationIdentity,
+    native: shared_pool::ExclusivePin,
+}
+
 pub(crate) unsafe fn pin_root_provider_pool_packet(lease: ProviderPoolPacketLease)
-    -> Option<nt_provider_wait::ProviderAllocationPin>
+    -> Option<SharedPoolPin>
 {
     if registered_provider_wait_domain() != Some(lease.provider) { return None; }
-    let arena = fixed_provider_arena_identity(PROVIDER_ARENA_SHARED_POOL_ID)?;
-    let (mut metadata, _pool) = provider_metadata_pool_lock()?;
-    let memory = ProviderPoolMemory;
+    let _pool = provider_pool_lock()?;
+    let mut memory = ProviderPoolMemory;
     let offset = lease.pointer - WIN32K_POOL_VADDR;
     if shared_pool::allocation_identity(&memory, offset) != Ok(lease.allocation)
         || shared_pool::allocation_capacity(&memory, offset) != Ok(lease.capacity) { return None; }
-    let catalog = provider_allocations_unlocked(&mut metadata)?;
-    let snapshot = catalog.register(arena, lease.pointer, lease.capacity).ok()?;
-    match catalog.pin_containing(lease.pointer, lease.capacity) {
-        Ok((_, pin)) => Some(pin),
-        Err(_) => {
-            if catalog.begin_retirement(snapshot.identity).is_err()
-                || catalog.retire(snapshot.identity) != Ok(snapshot)
-            { crate::provider_bugcheck::report(0xc4, [lease.pointer, 0, 0, 113]); }
-            None
-        }
-    }
+    let native = shared_pool::pin_exclusive(&mut memory, lease.allocation).ok()?;
+    Some(SharedPoolPin { provider: lease.provider, allocation: lease.allocation, native })
 }
 
 pub(crate) unsafe fn retire_pinned_root_provider_pool_packet(
-    lease: ProviderPoolPacketLease, pin: nt_provider_wait::ProviderAllocationPin,
+    lease: ProviderPoolPacketLease, pin: SharedPoolPin,
 ) -> bool {
-    if registered_provider_wait_domain() != Some(lease.provider) { return false; }
-    let Some((mut metadata, _pool)) = provider_metadata_pool_lock() else { return false; };
+    if registered_provider_wait_domain() != Some(lease.provider)
+        || pin.provider != lease.provider || pin.allocation != lease.allocation { return false; }
+    let Some(_pool) = provider_pool_lock() else { return false; };
     let mut memory = ProviderPoolMemory;
     let offset = lease.pointer - WIN32K_POOL_VADDR;
     if shared_pool::allocation_identity(&memory, offset) != Ok(lease.allocation)
         || shared_pool::allocation_capacity(&memory, offset) != Ok(lease.capacity) { return false; }
-    let Some(catalog) = provider_allocations_unlocked(&mut metadata) else { return false; };
-    let Ok(snapshot) = catalog.begin_retirement_from_pin(pin) else { return false; };
-    if snapshot.base != lease.pointer || snapshot.capacity != lease.capacity { return false; }
-    if shared_pool::free(&mut memory, offset).is_err() { return false; }
-    if catalog.retire(snapshot.identity) != Ok(snapshot) {
-        crate::provider_bugcheck::report(0xc4, [lease.pointer, 0, 0, 114]);
-    }
-    true
+    // Validation and freeing are one physical-lock operation; never expose an unpinned gap.
+    shared_pool::retire_pinned(&mut memory, pin.native).is_ok()
 }
+
+mod root_pool;
+pub(crate) use root_pool::{RootProviderPoolAllocation, allocate_root_provider_pool_allocation,
+    retire_root_provider_pool_allocation};
 
 pub(crate) unsafe fn capture_provider_pool_packet(
     pointer: u64,
@@ -1971,11 +1968,6 @@ pub(crate) unsafe fn property_pool_free(p: u64) {
     if !provider_pool_free(p) {
         panic!("device-property snapshot pool ownership failure");
     }
-}
-
-/// Release an executive-owned consumer projection only after its canonical receipts retire.
-pub(crate) unsafe fn release_consumer_projection(address: u64, size: u64) -> bool {
-    size != 0 && provider_pool_release_owned(&[(address, size)])
 }
 
 unsafe fn provider_pool_note_invalid_free() {

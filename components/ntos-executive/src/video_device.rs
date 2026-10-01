@@ -14,6 +14,7 @@ use nt_io_manager::{
     WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE,
 };
 use nt_status::NtStatus;
+use crate::win32k_subsystem::RootProviderPoolAllocation;
 use nt_video_miniport::{
     VideoMiniportError, IOCTL_VIDEO_INIT_WIN32K_CALLBACKS, IOCTL_VIDEO_UNMAP_VIDEO_MEMORY,
     VIDEO_DEVICE_MAP_KEY, VIDEO_DEVICE_MAP_MAX_OBJECT_VALUE, VIDEO_WIN32K_CALLBACKS_SIZE_X64,
@@ -39,7 +40,7 @@ pub(crate) struct HostedVideoDeviceRegistration<'a> {
     pub(crate) service_registry_path: &'a [u8],
     /// Allocates the projected IO object bodies in the importing component's VSpace. Ownership stays
     /// in this module; the pointer values must still be dereferenceable by win32k.
-    pub(crate) allocate_projection: unsafe fn(u64) -> u64,
+    pub(crate) allocate_projection: unsafe fn(u64) -> Option<RootProviderPoolAllocation>,
 }
 
 #[derive(Clone, Copy)]
@@ -52,6 +53,9 @@ struct VideoRegistrationMetadata {
     service_registry_path_ptr: u64,
     service_registry_path_len: usize,
 }
+
+// Published metadata may outlive route replacement; these session owners retain every backing.
+static mut VIDEO_METADATA_ALLOCATIONS: Vec<RootProviderPoolAllocation> = Vec::new();
 
 impl VideoRegistrationMetadata {
     fn ready(&self) -> bool {
@@ -77,6 +81,8 @@ impl VideoRegistrationMetadata {
 
 #[derive(Clone, Copy)]
 struct VideoProjectionObjects {
+    driver_allocation: Option<RootProviderPoolAllocation>,
+    device_allocation: Option<RootProviderPoolAllocation>,
     driver: u64,
     device: u64,
     initialized: bool,
@@ -85,6 +91,8 @@ struct VideoProjectionObjects {
 impl VideoProjectionObjects {
     const fn empty() -> Self {
         Self {
+            driver_allocation: None,
+            device_allocation: None,
             driver: 0,
             device: 0,
             initialized: false,
@@ -359,7 +367,7 @@ unsafe fn video_registration_metadata_from_paths(
     driver_object_path: &[u8],
     device_path: &[u8],
     service_registry_path: &[u8],
-    allocate_projection: unsafe fn(u64) -> u64,
+    allocate_projection: unsafe fn(u64) -> Option<RootProviderPoolAllocation>,
 ) -> Option<VideoRegistrationMetadata> {
     if !ascii_metadata_component_valid(driver_object_path)
         || !ascii_metadata_component_valid(device_path)
@@ -375,10 +383,12 @@ unsafe fn video_registration_metadata_from_paths(
     if total_len_u64 as usize != total_len {
         return None;
     }
-    let base = allocate_projection(total_len_u64);
-    if base == 0 {
-        return None;
-    }
+    let _durable = crate::allocator::enter_durable();
+    let owners = &mut *addr_of_mut!(VIDEO_METADATA_ALLOCATIONS);
+    owners.try_reserve(1).ok()?;
+    let allocation = allocate_projection(total_len_u64)?;
+    owners.push(allocation);
+    let base = allocation.address();
     let driver_object_path_ptr = base;
     copy_ascii_metadata(driver_object_path, driver_object_path_ptr);
     let device_path_ptr = driver_object_path_ptr + driver_object_path.len() as u64;
@@ -452,17 +462,20 @@ pub(crate) fn video_device_projection_proofs() -> (u64, u64, u64, u64) {
 }
 
 #[inline(never)]
-unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> u64) -> bool {
+unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> Option<RootProviderPoolAllocation>) -> bool {
     if video_state_snapshot().objects.ready() {
         return true;
     }
     let driver_len = WDM_X64_DRIVER_OBJECT_SIZE + WDM_X64_DRIVER_EXTENSION_SIZE;
     if video_state_snapshot().objects.driver == 0 {
-        (*addr_of_mut!(VIDEO_STATE)).objects.driver = allocate_projection(driver_len as u64);
+        let Some(allocation) = allocate_projection(driver_len as u64) else { return false; };
+        (*addr_of_mut!(VIDEO_STATE)).objects.driver_allocation = Some(allocation);
+        (*addr_of_mut!(VIDEO_STATE)).objects.driver = allocation.address();
     }
     if video_state_snapshot().objects.device == 0 {
-        (*addr_of_mut!(VIDEO_STATE)).objects.device =
-            allocate_projection(WDM_X64_DEVICE_OBJECT_SIZE as u64);
+        let Some(allocation) = allocate_projection(WDM_X64_DEVICE_OBJECT_SIZE as u64) else { return false; };
+        (*addr_of_mut!(VIDEO_STATE)).objects.device_allocation = Some(allocation);
+        (*addr_of_mut!(VIDEO_STATE)).objects.device = allocation.address();
     }
     let objects = video_state_snapshot().objects;
     let driver = objects.driver;

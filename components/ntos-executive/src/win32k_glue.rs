@@ -5716,7 +5716,6 @@ pub(crate) use process_attach_root::retire_kernel_attach;
 /// Checked system-image loading owns its mappings and opaque module allocation independently.
 #[path = "win32k_image_loader.rs"]
 mod image_loader;
-pub(crate) use image_loader::load_one_driver;
 pub(crate) unsafe fn service_gdi_image_request(pointer: u64, length: u64) -> (i32, u64) {
     image_loader::service_request(pointer, length)
 }
@@ -5835,8 +5834,8 @@ pub(crate) unsafe fn load_win32k_static_import_drivers(host_pml4: u64) {
             dep_index += 1;
             continue;
         };
-        match load_one_driver(src, file_size, core::str::from_utf8(dll).unwrap_or(""), image_va, image_frames, host_pml4) {
-            Some((entry, _expdir, len)) => {
+        match image_loader::load_one_driver_result(src, file_size, core::str::from_utf8(dll).unwrap_or(""), image_va, image_frames, host_pml4) {
+            Ok((entry, _expdir, len)) => {
                 let _ = register_system_module(&path[..path_len], image_va, len);
                 let patched = win32k_subsystem::patch_win32k_static_import(dll, image_va);
                 print_str(b"[win32k-svc] hosted static win32k import ");
@@ -5862,9 +5861,11 @@ pub(crate) unsafe fn load_win32k_static_import_drivers(host_pml4: u64) {
                     WIN32K_STATIC_IMPORT_IAT_PATCHES.fetch_add(patched as u64, Ordering::Relaxed);
                 }
             }
-            None => {
+            Err(failure) => {
                 print_str(b"[win32k-svc] static win32k import load failed: ");
                 print_str(dll);
+                print_str(b" status=0x");
+                print_hex(failure.ntstatus() as u32);
                 print_str(b"\n");
                 WIN32K_STATIC_IMPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
             }

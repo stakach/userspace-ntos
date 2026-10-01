@@ -8,12 +8,14 @@ use nt_io_manager::{
     WDM_X64_FILE_OBJECT_SIZE,
 };
 use nt_status::NtStatus;
+use crate::win32k_subsystem::RootProviderPoolAllocation;
 
 struct Row {
     id: u64,
     handle: u64,
     file: u64,
     address: u64,
+    allocation: Option<RootProviderPoolAllocation>,
     identity: Option<HostedFileIdentity>,
     projection: Option<ConsumerFileProjection>,
     handle_closed: bool,
@@ -83,6 +85,7 @@ pub(super) unsafe fn reserve() -> Result<u64, NtStatus> {
         handle: 0,
         file: 0,
         address: 0,
+        allocation: None,
         identity: None,
         projection: None,
         handle_closed: false,
@@ -120,7 +123,7 @@ pub(super) unsafe fn prepare(
     id: u64,
     device_id: u64,
     device_address: u64,
-    allocate: unsafe fn(u64) -> u64,
+    allocate: unsafe fn(u64) -> Option<RootProviderPoolAllocation>,
 ) -> Result<u64, NtStatus> {
     let index = index_for(id).ok_or(NtStatus::INVALID_HANDLE)?;
     let row = snapshot(index);
@@ -147,15 +150,15 @@ pub(super) unsafe fn prepare(
 unsafe fn prepare_inner(
     index: usize,
     device_id: u64,
-    allocate: unsafe fn(u64) -> u64,
+    allocate: unsafe fn(u64) -> Option<RootProviderPoolAllocation>,
 ) -> Result<u64, NtStatus> {
     let file = snapshot(index).file;
-    let address = allocate(WDM_X64_FILE_OBJECT_SIZE as u64);
-    if address == 0 {
-        return Err(NtStatus::INSUFFICIENT_RESOURCES);
-    }
+    let allocation = allocate(WDM_X64_FILE_OBJECT_SIZE as u64)
+        .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+    let address = allocation.address();
     // Allocation ownership must survive initialization errors and reentrant route retirement.
     rows_mut()[index].as_mut().unwrap().address = address;
+    rows_mut()[index].as_mut().unwrap().allocation = Some(allocation);
     if snapshot(index).retiring {
         return Err(NtStatus::DELETE_PENDING);
     }
@@ -306,15 +309,13 @@ unsafe fn retire_inner(index: usize) -> bool {
         }
         rows_mut()[index].as_mut().unwrap().identity = None;
     }
-    let address = snapshot(index).address;
-    if address != 0 {
-        if !crate::win32k_subsystem::release_consumer_projection(
-            address,
-            WDM_X64_FILE_OBJECT_SIZE as u64,
-        ) {
+    if let Some(allocation) = rows()[index].as_ref().unwrap().allocation {
+        if allocation.address() != snapshot(index).address
+            || !crate::win32k_subsystem::retire_root_provider_pool_allocation(allocation) {
             return false;
         }
         rows_mut()[index].as_mut().unwrap().address = 0;
+        rows_mut()[index].as_mut().unwrap().allocation = None;
     }
     true
 }

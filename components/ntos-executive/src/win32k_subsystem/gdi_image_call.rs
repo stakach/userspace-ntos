@@ -6,7 +6,7 @@ use nt_pe_loader::system_image_request::{self, Request};
 struct Outstanding {
     next: u64,
     packet: ProviderPoolPacketLease,
-    packet_pin: nt_provider_wait::ProviderAllocationPin,
+    packet_pin: SharedPoolPin,
     output: file_ioctl_target::PinnedIoctlOutput,
     address: u64,
     length: u64,

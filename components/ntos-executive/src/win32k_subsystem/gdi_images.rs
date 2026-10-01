@@ -33,6 +33,8 @@ const GDI_DRIVER_RECORD_INITIAL_CAP: u64 = 4;
 static GDI_DRIVER_RECORDS_PTR: AtomicU64 = AtomicU64::new(0);
 static GDI_DRIVER_RECORDS_LEN: AtomicU64 = AtomicU64::new(0);
 static GDI_DRIVER_RECORDS_CAP: AtomicU64 = AtomicU64::new(0);
+// Root-only owners; component readers consume only the shared immutable array facts.
+static mut ROOT_RECORD_ALLOCATIONS: Vec<RootProviderPoolAllocation> = Vec::new();
 
 pub(super) fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -70,10 +72,16 @@ pub(super) unsafe fn ensure_gdi_driver_record_capacity(required: u64) -> bool {
     let Some(bytes) = (core::mem::size_of::<GdiDriverRecord>() as u64).checked_mul(new_cap) else {
         return false;
     };
-    let new_base = pool_alloc(bytes);
-    if new_base == 0 {
+    let _durable = crate::allocator::enter_durable();
+    let owners = &mut *core::ptr::addr_of_mut!(ROOT_RECORD_ALLOCATIONS);
+    if owners.try_reserve(1).is_err() {
         return false;
     }
+    let Some(allocation) = allocate_root_provider_pool_allocation(bytes) else {
+        return false;
+    };
+    let new_base = allocation.address();
+    owners.push(allocation);
     let old_base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
     let len = GDI_DRIVER_RECORDS_LEN.load(Ordering::Relaxed);
     if old_base != 0 {
