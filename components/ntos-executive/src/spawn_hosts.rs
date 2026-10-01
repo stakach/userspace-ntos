@@ -3703,6 +3703,22 @@ unsafe fn component_pump_loop(
                 msg = pump_recv(ch, *reply_cap);
             }
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_ZW_LOAD_DRIVER_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_ZW_LOAD_DRIVER_LABEL << 12) | 1)
+            {
+                unsafe {
+                    crate::driver_launch::service_hosted_driver_zw_load_driver(
+                        ch, msg.m0, msg.badge, *reply_cap,
+                    )
+                }
+            } else {
+                STATUS_INVALID_PARAMETER_I32
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 1, status as u32 as u64, 0, 0, 0);
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_REGISTRY_LABEL
             && ch.caps.kind == ReqKind::Irp
         {

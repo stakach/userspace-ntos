@@ -14,6 +14,11 @@ extern crate alloc;
 mod retained_snapshot_integration;
 
 mod active_driver_service;
+mod driver_load_request;
+pub use driver_load_request::{
+    capture_driver_service_name, decode_driver_service_name, inspect_driver_service_name,
+    DriverServiceNameBuffer, DRIVER_SERVICE_PATH_MAX_BYTES,
+};
 mod filter_policy;
 pub use filter_policy::DeviceFilterPolicySnapshot;
 mod runtime_key;

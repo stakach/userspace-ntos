@@ -106,6 +106,7 @@ mod provider_ps;
 mod sec_image_diagnostic;
 use process_vm_retirement::reclaim_final_process_vm;
 mod hosted_driver_projection;
+mod hosted_safe_attach;
 mod rendezvous;
 mod writable_fs;
 pub(crate) use rendezvous::*;

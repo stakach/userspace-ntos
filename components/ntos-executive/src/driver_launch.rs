@@ -37,6 +37,17 @@ mod hosted_thread_resources;
 mod hosted_primary_retirement;
 #[path = "hosted_exception_images.rs"]
 mod hosted_exception_images;
+#[path = "hosted_zw_load_driver.rs"]
+mod hosted_zw_load_driver;
+
+pub(crate) unsafe fn service_hosted_driver_zw_load_driver(
+    channel: &crate::spawn_hosts::PumpChannel,
+    service_name: u64,
+    badge: u64,
+    reply_cap: u64,
+) -> i32 {
+    hosted_zw_load_driver::service(channel, service_name, badge, reply_cap)
+}
 #[path = "hosted_image_paging.rs"]
 mod hosted_image_paging;
 #[path = "hosted_exception_stack.rs"]
@@ -896,6 +907,7 @@ pub const FSD_SERVICE_READ_FORWARD_LABEL: u64 = 0x7A1;
 pub const FSD_SERVICE_FLUSH_FORWARD_LABEL: u64 = 0x7A2;
 pub const FSD_SERVICE_QUERY_INFORMATION_FORWARD_LABEL: u64 = 0x7A3;
 pub const FSD_SERVICE_ZW_READ_QUERY_FILE_LABEL: u64 = 0x7A4;
+pub const FSD_SERVICE_ZW_LOAD_DRIVER_LABEL: u64 = 0x7A5;
 const _: () = {
     let labels = [
         FSD_SERVICE_SOURCE_IRP_LABEL,
@@ -910,6 +922,7 @@ const _: () = {
         FSD_SERVICE_FLUSH_FORWARD_LABEL,
         FSD_SERVICE_QUERY_INFORMATION_FORWARD_LABEL,
         FSD_SERVICE_ZW_READ_QUERY_FILE_LABEL,
+        FSD_SERVICE_ZW_LOAD_DRIVER_LABEL,
     ];
     let mut i = 0;
     while i < labels.len() {
@@ -5328,6 +5341,8 @@ const HOSTED_DEVICE_OP_SET_INTERFACE_STATE: u64 = 13;
 const HOSTED_DEVICE_OP_REFERENCE_POINTER: u64 = 14;
 const HOSTED_DEVICE_OP_DEREFERENCE_POINTER: u64 = 15;
 const HOSTED_DEVICE_OP_REFERENCE_ATTACHED_TOP: u64 = 16;
+const HOSTED_DEVICE_OP_ATTACH_SAFE: u64 = 17;
+const HOSTED_DEVICE_OP_ROLLBACK_ATTACH_SAFE: u64 = 18;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN: u64 = 0;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF: u64 = 2;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
@@ -6277,6 +6292,26 @@ unsafe fn hosted_device_create(device: u64, driver: u64, extension_size: u64) ->
 
 unsafe fn hosted_device_attach(source: u64, target: u64, lower: u64) -> i32 {
     hosted_device_mutation(HOSTED_DEVICE_OP_ATTACH, source, target, lower, true)
+        .map_or_else(|status| status, |_| STATUS_SUCCESS)
+}
+
+unsafe fn hosted_device_attach_safe(source: u64, target: u64, lower: u64) -> i32 {
+    match hosted_device_mutation(HOSTED_DEVICE_OP_ATTACH_SAFE, source, target, lower, true) {
+        Ok(Some(returned)) if returned.get() == lower => STATUS_SUCCESS,
+        Ok(Some(returned)) => crate::provider_bugcheck::report(
+            0xc4,
+            [HOSTED_DEVICE_OP_ATTACH_SAFE, source, lower, returned.get()],
+        ),
+        Ok(None) => crate::provider_bugcheck::report(
+            0xc4,
+            [HOSTED_DEVICE_OP_ATTACH_SAFE, source, target, lower],
+        ),
+        Err(status) => status,
+    }
+}
+
+unsafe fn hosted_device_rollback_attach_safe(source: u64, lower: u64) -> i32 {
+    hosted_device_mutation(HOSTED_DEVICE_OP_ROLLBACK_ATTACH_SAFE, source, lower, 0, false)
         .map_or_else(|status| status, |_| STATUS_SUCCESS)
 }
 
@@ -7753,6 +7788,118 @@ fn nt_path_ascii_string(path: &NtPath) -> Option<String> {
         out.push(char::from_u32(unit as u32)?);
     }
     Some(out)
+}
+
+unsafe fn publish_safe_attach_output(output: u64, device: u64) -> Result<(), i32> {
+    let end = output
+        .checked_add(8)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    if output == 0 || output & 7 != 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if output >= FSD_POOL_VADDR + POOL_DATA_OFF && end <= component_pool_end() {
+        let _pool_guard = component_pool_lock();
+        let used_end = FSD_POOL_VADDR
+            .checked_add(read_volatile(FSD_POOL_VADDR as *const u64))
+            .filter(|used_end| *used_end <= component_pool_end())
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let mut header = FSD_POOL_VADDR + POOL_DATA_OFF;
+        let mut steps = 0u64;
+        while header.checked_add(16).is_some_and(|next| next <= used_end)
+            && steps < POOL_FREE_LIST_MAX
+        {
+            let block = header + 16;
+            let size = read_volatile(header as *const u64);
+            let block_end = block
+                .checked_add(size)
+                .filter(|block_end| *block_end <= used_end && size != 0)
+                .ok_or(STATUS_INVALID_PARAMETER)?;
+            if output >= block && end <= block_end {
+                let mut free = read_volatile((FSD_POOL_VADDR + 8) as *const u64);
+                let mut free_steps = 0u64;
+                while free != 0 {
+                    if free_steps >= POOL_FREE_LIST_MAX
+                        || free < FSD_POOL_VADDR + POOL_DATA_OFF + 16
+                        || free >= used_end
+                    {
+                        return Err(STATUS_INVALID_PARAMETER);
+                    }
+                    if free == block {
+                        return Err(STATUS_INVALID_PARAMETER);
+                    }
+                    free = read_volatile((free - 8) as *const u64);
+                    free_steps += 1;
+                }
+                write_unaligned(output as *mut u64, device);
+                return Ok(());
+            }
+            header = block_end
+                .checked_add(15)
+                .map(|next| next & !15)
+                .filter(|next| *next > header)
+                .ok_or(STATUS_INVALID_PARAMETER)?;
+            steps += 1;
+        }
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+
+    let rsp: u64;
+    core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags));
+    let in_current_stack = if rsp >= FSD_STACK_VADDR && rsp < FSD_STACK_VADDR + FSD_STACK_BYTES {
+        output >= FSD_STACK_VADDR && end <= FSD_STACK_VADDR + FSD_STACK_BYTES
+    } else if let Some(base) = hosted_worker_component_base_from_rsp(rsp) {
+        output >= base && end <= base + FSD_WORKER_STACK_FRAMES * 0x1000
+    } else {
+        false
+    };
+    if !in_current_stack {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    write_unaligned(output as *mut u64, device);
+    Ok(())
+}
+
+struct HostedSafeAttachBackend;
+
+impl crate::hosted_safe_attach::SafeAttachBackend for HostedSafeAttachBackend {
+    fn publish_output(&mut self, output: u64, device: u64) -> Result<(), i32> {
+        unsafe { publish_safe_attach_output(output, device) }
+    }
+
+    fn attach_projection(&mut self, source: u64, target: u64) -> Option<u64> {
+        unsafe { crate::hosted_driver_projection::attach_hosted_device_projection(source, target) }
+    }
+
+    fn detach_projection(&mut self, lower: u64) {
+        unsafe { crate::hosted_driver_projection::detach_hosted_device_projection(lower) }
+    }
+
+    fn attach_canonical(&mut self, source: u64, target: u64, lower: u64) -> i32 {
+        unsafe { hosted_device_attach_safe(source, target, lower) }
+    }
+
+    fn detach_canonical(&mut self, lower: u64, source: u64) -> i32 {
+        unsafe { hosted_device_rollback_attach_safe(source, lower) }
+    }
+}
+
+/// `NTSTATUS IoAttachDeviceToDeviceStackSafe(PDEVICE_OBJECT, PDEVICE_OBJECT, PDEVICE_OBJECT*)`.
+extern "win64" fn s_io_attach_device_to_device_stack_safe(
+    source: u64,
+    target: u64,
+    attached_to: u64,
+) -> i32 {
+    if !unsafe { consumer_device_object_in_local_pool(source) }
+        || !unsafe { consumer_device_object_in_local_pool(target) }
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    crate::hosted_safe_attach::attach_device_to_device_stack_safe(
+        &mut HostedSafeAttachBackend,
+        source,
+        target,
+        attached_to,
+    )
 }
 
 /// `PDEVICE_OBJECT IoAttachDeviceToDeviceStack(PDEVICE_OBJECT SourceDevice, PDEVICE_OBJECT TargetDevice)`.
@@ -32424,6 +32571,10 @@ fn register_fsd_trampolines() -> bool {
         s_io_attach_device_to_device_stack as *const () as usize as u64,
     );
     reg.bind(
+        "IoAttachDeviceToDeviceStackSafe",
+        s_io_attach_device_to_device_stack_safe as *const () as usize as u64,
+    );
+    reg.bind(
         "IoDetachDevice",
         s_io_detach_device as *const () as usize as u64,
     );
@@ -32870,6 +33021,10 @@ fn register_fsd_trampolines() -> bool {
         s_rtl_upcase_unicode_char as *const () as usize as u64,
     );
     reg.bind("ZwClose", s_zw_close as *const () as usize as u64);
+    reg.bind(
+        "ZwLoadDriver",
+        hosted_zw_load_driver::s_zw_load_driver as *const () as usize as u64,
+    );
     reg.bind(
         "NtClose",
         hosted_io_create_file_adapter::s_nt_close as *const () as usize as u64,
@@ -37302,6 +37457,9 @@ pub(crate) unsafe fn load_driver(
             print_str(b" status=0x");
             print_hex(status.raw() as u32);
             print_str(b"\n");
+            // The loader has already entered native effects. A failed rollback is an uncertain
+            // live driver, not the original terminal load error; no caller may retry it.
+            panic!("driver launch rollback indeterminate: instance={instance} status={:#x}", status.raw());
         }
     }
     loaded
@@ -50957,10 +51115,12 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_REFERENCE_POINTER
             | HOSTED_DEVICE_OP_DEREFERENCE_POINTER
             | HOSTED_DEVICE_OP_REFERENCE_ATTACHED_TOP
+            | HOSTED_DEVICE_OP_ATTACH_SAFE
+            | HOSTED_DEVICE_OP_ROLLBACK_ATTACH_SAFE
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
-    if matches!(op, HOSTED_DEVICE_OP_CREATE | HOSTED_DEVICE_OP_ATTACH | HOSTED_DEVICE_OP_DETACH | HOSTED_DEVICE_OP_DELETE) {
+    if matches!(op, HOSTED_DEVICE_OP_CREATE | HOSTED_DEVICE_OP_ATTACH | HOSTED_DEVICE_OP_DETACH | HOSTED_DEVICE_OP_DELETE | HOSTED_DEVICE_OP_ATTACH_SAFE | HOSTED_DEVICE_OP_ROLLBACK_ATTACH_SAFE) {
         let Some((_, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
             return (STATUS_ACCESS_DENIED, 0, 0, 0);
         };
@@ -51265,6 +51425,62 @@ pub(crate) fn service_hosted_device(
         };
         unsafe { hosted_add_device_rollback::record_created(rollback_slot, registration) };
         return (STATUS_SUCCESS, device_id.raw(), 0, 0);
+    }
+    if op == HOSTED_DEVICE_OP_ATTACH_SAFE {
+        let (source_instance, source_inst, _) =
+            match authenticated_hosted_device(ch, pdo_object, active_reply_cap) {
+                Ok(resolved) => resolved,
+                Err(status) => return (status.raw(), 0, 0, 0),
+            };
+        let (target_instance, _, _) =
+            match authenticated_hosted_device(ch, arg2, active_reply_cap) {
+                Ok(resolved) => resolved,
+                Err(status) => return (status.raw(), 0, 0, 0),
+            };
+        let (lower_instance, _, _) =
+            match authenticated_hosted_device(ch, arg3, active_reply_cap) {
+                Ok(resolved) => resolved,
+                Err(status) => return (status.raw(), 0, 0, 0),
+            };
+        if source_instance != target_instance || source_instance != lower_instance {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        }
+        let domain = HostedDomainIdentity {
+            domain_id: nt_io_manager::HostedDomainId(source_inst.hosted_domain_id),
+            cookie: source_inst.hosted_domain_cookie,
+        };
+        return match io_manager_mut().attach_hosted_device_to_stack_safe_checked(
+            domain, pdo_object, arg2, arg3,
+        ) {
+            Ok(lower) => (STATUS_SUCCESS, lower, 0, 0),
+            Err(status) => (status.raw(), 0, 0, 0),
+        };
+    }
+    if op == HOSTED_DEVICE_OP_ROLLBACK_ATTACH_SAFE {
+        if arg3 != 0 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        let (source_instance, source_inst, _) =
+            match authenticated_hosted_device(ch, pdo_object, active_reply_cap) {
+                Ok(resolved) => resolved,
+                Err(status) => return (status.raw(), 0, 0, 0),
+            };
+        let (lower_instance, _, _) =
+            match authenticated_hosted_device(ch, arg2, active_reply_cap) {
+                Ok(resolved) => resolved,
+                Err(status) => return (status.raw(), 0, 0, 0),
+            };
+        if source_instance != lower_instance {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        }
+        let domain = HostedDomainIdentity {
+            domain_id: nt_io_manager::HostedDomainId(source_inst.hosted_domain_id),
+            cookie: source_inst.hosted_domain_cookie,
+        };
+        return match io_manager_mut().rollback_hosted_safe_attach(domain, pdo_object, arg2) {
+            Ok(()) => (STATUS_SUCCESS, 0, 0, 0),
+            Err(status) => (status.raw(), 0, 0, 0),
+        };
     }
     if op == HOSTED_DEVICE_OP_ATTACH {
         let (source_instance, _, source_id) =
