@@ -37,6 +37,8 @@ mod hosted_thread_resources;
 mod hosted_primary_retirement;
 #[path = "hosted_exception_images.rs"]
 mod hosted_exception_images;
+#[path = "hosted_image_paging.rs"]
+mod hosted_image_paging;
 #[path = "hosted_exception_stack.rs"]
 pub(crate) mod hosted_exception_stack;
 #[path = "hosted_c_specific_handler.rs"]
@@ -5325,6 +5327,7 @@ const HOSTED_DEVICE_OP_REGISTER_INTERFACE: u64 = 12;
 const HOSTED_DEVICE_OP_SET_INTERFACE_STATE: u64 = 13;
 const HOSTED_DEVICE_OP_REFERENCE_POINTER: u64 = 14;
 const HOSTED_DEVICE_OP_DEREFERENCE_POINTER: u64 = 15;
+const HOSTED_DEVICE_OP_REFERENCE_ATTACHED_TOP: u64 = 16;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN: u64 = 0;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF: u64 = 2;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
@@ -8266,6 +8269,45 @@ extern "win64" fn s_io_get_related_device_object(file_object: u64) -> u64 {
     }
     let device = unsafe { read_unaligned((file_object + 0x08) as *const u64) };
     device
+}
+
+/// `PDEVICE_OBJECT IoGetAttachedDeviceReference(PDEVICE_OBJECT)`.
+extern "win64" fn s_io_get_attached_device_reference(device: u64) -> u64 {
+    if device == 0 {
+        return 0;
+    }
+    let (words, status, top, reserved0, reserved1) = unsafe { call_on4_raw(
+        (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
+        HOSTED_DEVICE_OP_REFERENCE_ATTACHED_TOP,
+        device,
+        0,
+        0,
+    ) };
+    if words != 4 || reserved0 != 0 || reserved1 != 0 {
+        unsafe {
+            crate::provider_bugcheck::report(
+                0xc4,
+                [FSD_SERVICE_DEVICE_LABEL, HOSTED_DEVICE_OP_REFERENCE_ATTACHED_TOP, words, status],
+            );
+        }
+    }
+    if status as u32 as i32 != STATUS_SUCCESS {
+        return 0;
+    }
+    if top == 0 || !unsafe { consumer_device_object_in_local_pool(top) } {
+        unsafe {
+            crate::provider_bugcheck::report(
+                0xc4,
+                [FSD_SERVICE_DEVICE_LABEL, HOSTED_DEVICE_OP_REFERENCE_ATTACHED_TOP, device, top],
+            );
+        }
+    }
+    top
+}
+
+/// `PVOID MmPageEntireDriver(PVOID AddressWithinSection)`.
+extern "win64" fn s_mm_page_entire_driver(address_within_section: u64) -> u64 {
+    unsafe { hosted_image_paging::page_entire_driver(address_within_section) }
 }
 
 unsafe fn csq_acquire(csq: u64) -> u8 {
@@ -32448,6 +32490,10 @@ fn register_fsd_trampolines() -> bool {
         s_io_get_related_device_object as *const () as usize as u64,
     );
     reg.bind(
+        "IoGetAttachedDeviceReference",
+        s_io_get_attached_device_reference as *const () as usize as u64,
+    );
+    reg.bind(
         "IoCreateFile",
         hosted_io_create_file_adapter::s_io_create_file as *const () as usize as u64,
     );
@@ -32511,6 +32557,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "MmBuildMdlForNonPagedPool",
         s_mm_build_mdl_for_nonpaged_pool as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmPageEntireDriver",
+        s_mm_page_entire_driver as *const () as usize as u64,
     );
     reg.bind(
         "MmProbeAndLockPages",
@@ -42882,6 +42932,34 @@ pub(crate) fn hosted_bus_reported_device_id(instance_id: &str) -> Option<u64> {
     }
 }
 
+pub(crate) unsafe fn prepare_hosted_bus_pdo_bus_number_start(
+    instance_path: &str,
+    pdo_device_id: u64,
+) -> Result<Option<nt_pnp_manager::BusReportedBusNumberStart>, nt_status::NtStatus> {
+    if hosted_bus_reported_device_id(instance_path) != Some(pdo_device_id) {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let pnp = unsafe { hosted_pnp_manager_mut() };
+    let devnode_id = pnp
+        .devnode_for_pdo(pdo_device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if !pnp
+        .instance_id(devnode_id)
+        .is_some_and(|value| value.eq_ignore_ascii_case(instance_path))
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let properties = pnp
+        .enumerated_pdo_properties(pdo_device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    nt_pnp_manager::prepare_bus_reported_bus_number_start(properties).map_err(|error| match error {
+        nt_pnp_manager::BusReportedBusNumberStartError::InsufficientResources => {
+            nt_status::NtStatus::INSUFFICIENT_RESOURCES
+        }
+        _ => nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+    })
+}
+
 pub(crate) unsafe fn hosted_function_device_id_for_instance(
     instance_id: &str,
     expected_driver_id: u64,
@@ -50878,6 +50956,7 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_SET_INTERFACE_STATE
             | HOSTED_DEVICE_OP_REFERENCE_POINTER
             | HOSTED_DEVICE_OP_DEREFERENCE_POINTER
+            | HOSTED_DEVICE_OP_REFERENCE_ATTACHED_TOP
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
@@ -50892,6 +50971,25 @@ pub(crate) fn service_hosted_device(
         if let Err(status) = unsafe { hosted_add_device_rollback::admit_mutation(domain, ch, active_reply_cap, caller_badge) } {
             return (status.raw(), 0, 0, 0);
         }
+    }
+    if op == HOSTED_DEVICE_OP_REFERENCE_ATTACHED_TOP {
+        if arg2 != 0 || arg3 != 0 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        let (_, inst, _) = match authenticated_hosted_device(ch, pdo_object, active_reply_cap) {
+            Ok(identity) => identity,
+            Err(status) => return (status.raw(), 0, 0, 0),
+        };
+        let domain = HostedDomainIdentity {
+            domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
+            cookie: inst.hosted_domain_cookie,
+        };
+        return match unsafe {
+            io_manager_mut().reference_hosted_attached_device(domain, pdo_object)
+        } {
+            Ok(top) => (STATUS_SUCCESS, top, 0, 0),
+            Err(status) => (status.raw(), 0, 0, 0),
+        };
     }
     if op == HOSTED_DEVICE_OP_REFERENCE_POINTER || op == HOSTED_DEVICE_OP_DEREFERENCE_POINTER {
         if arg2 != 0 || arg3 != 0 {

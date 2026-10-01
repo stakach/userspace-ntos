@@ -159,6 +159,27 @@ fn sealed_view_matches_slot_catalog_across_images_and_gap() {
 }
 
 #[test]
+fn sealed_view_identifies_entire_containing_loaded_image() {
+    let first = mapped_pe();
+    let second = mapped_pe();
+    let encoded = encode_two(&first, &second);
+    let view = SealedExceptionView::parse(&encoded).unwrap();
+    assert_eq!(view.image_base_containing(BASE), Some(BASE));
+    assert_eq!(view.image_base_containing(BASE + 0x1fff), Some(BASE));
+    assert_eq!(view.image_base_containing(BASE + 0x2000), None);
+    assert_eq!(view.image_base_containing(BASE + 0xffff), None);
+    assert_eq!(
+        view.image_base_containing(BASE + 0x10000),
+        Some(BASE + 0x10000)
+    );
+    assert_eq!(
+        view.image_base_containing(BASE + 0x11fff),
+        Some(BASE + 0x10000)
+    );
+    assert_eq!(view.image_base_containing(BASE + 0x12000), None);
+}
+
+#[test]
 fn sealed_view_and_slot_catalog_reject_same_malformed_envelopes() {
     let first = mapped_pe();
     let second = mapped_pe();

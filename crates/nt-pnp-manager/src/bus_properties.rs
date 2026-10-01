@@ -20,6 +20,77 @@ pub enum BusPropertyCopyError {
     InsufficientResources,
 }
 
+/// An immutable bus-owned boot resource assignment that needs no HAL translation.
+///
+/// A PCI root bridge reported by ACPI has one `CmResourceTypeBusNumber` boot descriptor and no
+/// resource requirements. NT preserves that descriptor byte-for-byte in both raw and translated
+/// START_DEVICE lists. Keeping this policy beside `PdoProperties` prevents a function driver from
+/// replacing the bus PDO's already-published resource authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BusReportedBusNumberStart {
+    pub raw_resources: Vec<u8>,
+    pub translated_resources: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BusReportedBusNumberStartError {
+    Unqueried,
+    InvalidPropertyState,
+    MalformedBootResources,
+    InsufficientResources,
+}
+
+fn clone_resource_bytes(bytes: &[u8]) -> Result<Vec<u8>, BusReportedBusNumberStartError> {
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(bytes.len())
+        .map_err(|_| BusReportedBusNumberStartError::InsufficientResources)?;
+    owned.extend_from_slice(bytes);
+    Ok(owned)
+}
+
+/// Prepare the exact boot-only BusNumber resources of a bus-reported PDO.
+///
+/// `Ok(None)` means that the PDO either has no boot resources or has requirements which must use
+/// the normal resource-arbitration path. Once a bus has published a boot-only resource list, an
+/// unqueried or malformed snapshot is an authority error rather than permission to invent a
+/// replacement list.
+pub fn prepare_bus_reported_bus_number_start(
+    properties: &crate::PdoProperties,
+) -> Result<Option<BusReportedBusNumberStart>, BusReportedBusNumberStartError> {
+    match &properties.resource_requirements {
+        crate::PropertyBlobState::Unqueried => {
+            return Err(BusReportedBusNumberStartError::Unqueried)
+        }
+        crate::PropertyBlobState::Present(_) => return Ok(None),
+        crate::PropertyBlobState::KnownNone => {}
+    }
+
+    let raw = match &properties.boot_resources_raw {
+        crate::PropertyBlobState::Unqueried => {
+            return Err(BusReportedBusNumberStartError::Unqueried)
+        }
+        crate::PropertyBlobState::KnownNone => return Ok(None),
+        crate::PropertyBlobState::Present(raw) => raw,
+    };
+    match &properties.boot_resources_translated {
+        crate::PropertyBlobState::Unqueried => {
+            return Err(BusReportedBusNumberStartError::Unqueried)
+        }
+        crate::PropertyBlobState::Present(_) => {
+            return Err(BusReportedBusNumberStartError::InvalidPropertyState)
+        }
+        crate::PropertyBlobState::KnownNone => {}
+    }
+
+    nt_cm_resources::decode_single_bus_number_resource(raw)
+        .map_err(|_| BusReportedBusNumberStartError::MalformedBootResources)?;
+    Ok(Some(BusReportedBusNumberStart {
+        raw_resources: clone_resource_bytes(raw)?,
+        translated_resources: clone_resource_bytes(raw)?,
+    }))
+}
+
 /// Build the native input image required by `IRP_MN_QUERY_CAPABILITIES`.
 pub fn initialized_device_capabilities_x64() -> [u8; nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE] {
     let mut bytes = [0u8; nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE];
@@ -110,11 +181,35 @@ pub fn copy_io_resource_requirements_list(bytes: &[u8]) -> Result<Vec<u8>, BusPr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use nt_cm_resources::{
         build_io_resource_requirements_list, build_memory_interrupt_list, InterruptDescriptor,
         IoAddressRequirement, IoResourceRequirement, MemoryDescriptor,
-        CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, INTERFACE_TYPE_PCI_BUS, IO_RESOURCE_REQUIRED,
+        CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, CM_RESOURCE_TYPE_BUS_NUMBER, INTERFACE_TYPE_INTERNAL,
+        INTERFACE_TYPE_PCI_BUS, IO_RESOURCE_REQUIRED,
     };
+
+    fn exact_bus_number_resources(start: u32) -> Vec<u8> {
+        let mut bytes = vec![0u8; 40];
+        bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&(INTERFACE_TYPE_INTERNAL as u32).to_le_bytes());
+        bytes[12..14].copy_from_slice(&1u16.to_le_bytes());
+        bytes[14..16].copy_from_slice(&1u16.to_le_bytes());
+        bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
+        bytes[20] = CM_RESOURCE_TYPE_BUS_NUMBER;
+        bytes[21] = CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE;
+        bytes[24..28].copy_from_slice(&start.to_le_bytes());
+        bytes[28..32].copy_from_slice(&1u32.to_le_bytes());
+        bytes
+    }
+
+    fn bus_properties(
+        raw: crate::PropertyBlobState,
+        translated: crate::PropertyBlobState,
+        requirements: crate::PropertyBlobState,
+    ) -> crate::PdoProperties {
+        crate::PdoProperties::from_bus_queries(None, None, raw, translated, requirements)
+    }
 
     #[test]
     fn bus_information_uses_only_the_native_prefix() {
@@ -227,5 +322,92 @@ mod tests {
             copy_io_resource_requirements_list(&req).unwrap(),
             req[..req_len]
         );
+    }
+
+    #[test]
+    fn bus_number_boot_resources_are_preserved_as_both_start_lists() {
+        let resources = exact_bus_number_resources(7);
+        let properties = bus_properties(
+            crate::PropertyBlobState::Present(resources.clone()),
+            crate::PropertyBlobState::KnownNone,
+            crate::PropertyBlobState::KnownNone,
+        );
+
+        let prepared = prepare_bus_reported_bus_number_start(&properties)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.raw_resources, resources);
+        assert_eq!(prepared.translated_resources, resources);
+    }
+
+    #[test]
+    fn bus_number_start_rejects_unqueried_authority() {
+        for properties in [
+            bus_properties(
+                crate::PropertyBlobState::Unqueried,
+                crate::PropertyBlobState::KnownNone,
+                crate::PropertyBlobState::KnownNone,
+            ),
+            bus_properties(
+                crate::PropertyBlobState::Present(exact_bus_number_resources(0)),
+                crate::PropertyBlobState::Unqueried,
+                crate::PropertyBlobState::KnownNone,
+            ),
+            bus_properties(
+                crate::PropertyBlobState::Present(exact_bus_number_resources(0)),
+                crate::PropertyBlobState::KnownNone,
+                crate::PropertyBlobState::Unqueried,
+            ),
+        ] {
+            assert_eq!(
+                prepare_bus_reported_bus_number_start(&properties),
+                Err(BusReportedBusNumberStartError::Unqueried)
+            );
+        }
+    }
+
+    #[test]
+    fn bus_number_start_rejects_malformed_or_conflicting_boot_state() {
+        let mut truncated = exact_bus_number_resources(0);
+        truncated.pop();
+        let malformed = bus_properties(
+            crate::PropertyBlobState::Present(truncated),
+            crate::PropertyBlobState::KnownNone,
+            crate::PropertyBlobState::KnownNone,
+        );
+        assert_eq!(
+            prepare_bus_reported_bus_number_start(&malformed),
+            Err(BusReportedBusNumberStartError::MalformedBootResources)
+        );
+
+        let conflicting = bus_properties(
+            crate::PropertyBlobState::Present(exact_bus_number_resources(0)),
+            crate::PropertyBlobState::Present(exact_bus_number_resources(0)),
+            crate::PropertyBlobState::KnownNone,
+        );
+        assert_eq!(
+            prepare_bus_reported_bus_number_start(&conflicting),
+            Err(BusReportedBusNumberStartError::InvalidPropertyState)
+        );
+    }
+
+    #[test]
+    fn bus_number_start_leaves_no_resource_and_arbitrated_pdos_to_their_paths() {
+        let no_resources = bus_properties(
+            crate::PropertyBlobState::KnownNone,
+            crate::PropertyBlobState::KnownNone,
+            crate::PropertyBlobState::KnownNone,
+        );
+        assert_eq!(
+            prepare_bus_reported_bus_number_start(&no_resources),
+            Ok(None)
+        );
+
+        let arbitrated = bus_properties(
+            crate::PropertyBlobState::Present(exact_bus_number_resources(0)),
+            crate::PropertyBlobState::KnownNone,
+            crate::PropertyBlobState::Present(vec![1]),
+        );
+        assert_eq!(prepare_bus_reported_bus_number_start(&arbitrated), Ok(None));
     }
 }

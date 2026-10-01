@@ -56,6 +56,7 @@ mod hosted_file;
 #[cfg(test)]
 mod hosted_file_lifetime_tests;
 mod hosted_device_pointer;
+mod hosted_attached_device_reference;
 pub mod hosted_pool_range;
 pub mod hosted_kernel_read_delivery;
 pub mod inline_file_retirement;

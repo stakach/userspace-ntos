@@ -14337,6 +14337,22 @@ unsafe fn grant_hosted_devnode_resources(
     filtered_resource_requirements: alloc::vec::Vec<u8>,
 ) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus> {
     match plan {
+        PreparedHostedResourcePlan::BusReportedBusNumber { resources } => {
+            if !filtered_resource_requirements.is_empty() {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+            Ok(Some(HostedDevnodeGrant {
+                kind: HostedDevnodeGrantKind::RootBus,
+                raw_resource_list: resources.raw_resources,
+                translated_resource_list: resources.translated_resources,
+                mmio_phys: 0,
+                mmio_len: 0,
+                io_port_base: 0,
+                io_port_len: 0,
+                vector: 0,
+                dma_len: 0,
+            }))
+        }
         PreparedHostedResourcePlan::Pci {
             bus_resources,
             window,

@@ -272,6 +272,13 @@ impl<'snapshot> SealedExceptionView<'snapshot> {
         self.count
     }
 
+    /// Base of the loaded image containing `address`, including image headers and data pages.
+    /// The answer is borrowed from this admitted snapshot, not inferred from executable ranges.
+    pub fn image_base_containing(&self, address: u64) -> Option<u64> {
+        let index = self.index_containing(address)?;
+        self.descriptor(index).map(|(base, _, _)| base)
+    }
+
     pub fn read_c_scope_table(
         &self,
         image_base: u64,
