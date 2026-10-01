@@ -1028,7 +1028,7 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
     // AddressOfFunctions: give each ordinal a distinct, checkable RVA in .text (0x1000-based), EXCEPT
     // the forwarder ordinal whose "RVA" points at fwd_str_local (inside the dir range).
     // AddressOfNameOrdinals: a NON-identity map (ordinal = N-1-i) so an identity assumption fails.
-    let text_rva = |ord: u32| 0x1000 + ord * 0x10; // concrete export RVA for ordinal `ord`
+    let text_rva = |ord: u32| 0x1000 + ord * 4; // keep concrete exports outside .edata
     for i in 0..N {
         let ord = N - 1 - i; // non-identity permutation
                              // AddressOfNames[i] = the name-string RVA.
@@ -1070,7 +1070,7 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
         BASE,
         0x1000,
         0x4000,
-        &[text_section(0x1000, vec![0x90, 0xC3]), edata],
+        &[text_section(0x1000, vec![0xC3; (N * 4) as usize]), edata],
         &[(0, EDATA_VA, edata_size)], // data dir 0 = export, size = the dir range
     );
 
@@ -1083,7 +1083,7 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
     let gst_ord = N - 1 - HIGH; // AoNO[HIGH]
     assert_eq!(
         gst.rva,
-        0x1000 + gst_ord * 0x10,
+        text_rva(gst_ord),
         "high-index func RVA via AoNO/AoF"
     );
     assert_eq!(
@@ -1099,7 +1099,7 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
 
     // Boundary names (first + last in the name array) resolve correctly.
     let first = find("AFirst").expect("first export"); // name index 0 -> ordinal N-1
-    assert_eq!(first.rva, 0x1000 + (N - 1) * 0x10);
+    assert_eq!(first.rva, text_rva(N - 1));
     assert_eq!(pe.export_rva_by_name("AFirst").unwrap(), Some(first.rva));
     let last = find("ZLast").expect("last export"); // name index N-1 -> ordinal 0
     assert_eq!(last.rva, 0x1000);
@@ -1120,6 +1120,38 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
 
     // Every one of the N names resolved (no silent drop at a high index / boundary).
     assert_eq!(exports.len(), N as usize, "all names resolved");
+
+    let mapped = pe.map(BASE).unwrap();
+    let namespace = nt_pe_loader::module_namespace::ImageExports::from_mapped(
+        "actual.dll", BASE, &mapped.bytes,
+    ).unwrap();
+    use nt_pe_loader::module_namespace::{resolve, ExportTarget, Symbol};
+    assert_eq!(
+        resolve(core::slice::from_ref(&namespace), "actual.dll",
+            &Symbol::Name("GetSystemTimeAsFileTime".into())),
+        Ok(BASE + u64::from(gst.rva)),
+    );
+    assert_eq!(
+        resolve(core::slice::from_ref(&namespace), "actual.dll", &Symbol::Ordinal(gst.ordinal)),
+        Ok(BASE + u64::from(gst.rva)),
+    );
+    assert!(matches!(
+        namespace.exports.iter().find(|e| e.name == "FwdExport").unwrap().target,
+        ExportTarget::Forwarder(_),
+    ));
+    assert!(nt_pe_loader::module_namespace::ImageExports::from_mapped("actual.dll", BASE, &mapped.bytes[..0x100]).is_err());
+
+    let mut unterminated_forwarder = mapped.bytes.clone();
+    unterminated_forwarder[(EDATA_VA + edata_size - 1) as usize] = b'X';
+    assert!(nt_pe_loader::module_namespace::ImageExports::from_mapped(
+        "actual.dll", BASE, &unterminated_forwarder,
+    ).is_err(), "a forwarder must terminate inside the export directory");
+
+    let mut invalid_target = mapped.bytes.clone();
+    put_u32(&mut invalid_target, (EDATA_VA + aof_local) as usize, 0x4000);
+    assert!(nt_pe_loader::module_namespace::ImageExports::from_mapped(
+        "actual.dll", BASE, &invalid_target,
+    ).is_err(), "a concrete export must remain inside the mapped image");
 
     let mut invalid = pe_bytes.clone();
     let ordinal_file_offset = pe.sections()[1].pointer_to_raw_data as usize + aono_local as usize;
