@@ -3,14 +3,20 @@
 
 use crate::win32k_source_irp_ioctl_wire::EventIdentity;
 
-pub const PACKET_BYTES: usize = 128;
+pub const PACKET_BYTES: usize = 136;
+pub const TERMINAL_PACKET_BYTES: usize = 128;
 pub const STATUS_PENDING: u32 = 0x103;
 const KIND: u32 = 2;
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+const TERMINAL_KIND: u32 = 3;
+const TERMINAL_VERSION: u32 = 1;
 const TOKEN_OFF: usize = 80;
 const STATUS_OFF: usize = 88;
 const INFORMATION_OFF: usize = 96;
 const COMPLETED_OFF: usize = 104;
+const IOSB_OFF: usize = 112;
+const RELATION_OFF: usize = 120;
+const RELATION_GENERATION_OFF: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourcePnpRequest {
@@ -21,12 +27,48 @@ pub struct SourcePnpRequest {
     pub device_object_va: u64,
     pub relation_type: u32,
     pub event: Option<EventIdentity>,
+    /// Win32k-owned destination for the terminal IO_STATUS_BLOCK.
+    pub iosb_va: u64,
+    /// Preallocated win32k-owned DEVICE_RELATIONS destination.
+    pub relation_allocation_va: u64,
+    pub relation_allocation_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourcePnpResponse {
     Pending { token: u64 },
     Inline { token: u64, status: u32, information: u64 },
+}
+
+/// Terminal result sent to win32k while the origin still owns the source IRP.
+/// All addresses are correlation data until the receiving lane validates its
+/// retained allocation leases and physical destination identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourcePnpTerminalHandoff {
+    pub nonce: u64,
+    pub token: u64,
+    pub source_irp_va: u64,
+    pub source_ticket_serial: u64,
+    pub native_allocation_generation: u64,
+    pub iosb_va: u64,
+    pub relation_allocation_va: u64,
+    pub relation_allocation_generation: u64,
+    pub status: u32,
+    pub information: u64,
+    /// Provider-authenticated PDO projected into the origin's DEVICE_RELATIONS.
+    pub pdo_va: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalPublication {
+    Published,
+    Failed(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourcePnpTerminalAck {
+    pub handoff: SourcePnpTerminalHandoff,
+    pub publication: TerminalPublication,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +100,9 @@ fn valid_request(request: SourcePnpRequest) -> bool {
         && request.native_allocation_generation != 0
         && request.device_object_va != 0
         && request.relation_type == nt_pnp_abi::TARGET_DEVICE_RELATION
+        && request.iosb_va != 0
+        && request.relation_allocation_va != 0
+        && request.relation_allocation_generation != 0
         && request.event.is_none_or(|event| {
             event.local_id != 0
                 && event.object_slot_plus_one != 0
@@ -86,6 +131,9 @@ pub fn encode_request(request: SourcePnpRequest, packet: &mut [u8]) -> Result<()
         put_u64(packet, 64, event.object_slot_plus_one);
         put_u64(packet, 72, event.object_generation);
     }
+    put_u64(packet, IOSB_OFF, request.iosb_va);
+    put_u64(packet, RELATION_OFF, request.relation_allocation_va);
+    put_u64(packet, RELATION_GENERATION_OFF, request.relation_allocation_generation);
     Ok(())
 }
 
@@ -94,7 +142,7 @@ fn header(packet: &[u8]) -> Result<SourcePnpRequest, WireError> {
         return Err(WireError::LengthMismatch);
     }
     if u32_at(packet, 0) != KIND || u32_at(packet, 4) != VERSION || u32_at(packet, 52) != 0
-        || packet[108..].iter().any(|byte| *byte != 0)
+        || packet[108..IOSB_OFF].iter().any(|byte| *byte != 0)
     {
         return Err(WireError::Malformed);
     }
@@ -114,6 +162,9 @@ fn header(packet: &[u8]) -> Result<SourcePnpRequest, WireError> {
         device_object_va: u64_at(packet, 40),
         relation_type: u32_at(packet, 48),
         event,
+        iosb_va: u64_at(packet, IOSB_OFF),
+        relation_allocation_va: u64_at(packet, RELATION_OFF),
+        relation_allocation_generation: u64_at(packet, RELATION_GENERATION_OFF),
     };
     if !valid_request(request) {
         return Err(WireError::Malformed);
@@ -187,6 +238,130 @@ pub fn decode_response(packet: &[u8]) -> Result<SourcePnpResponse, WireError> {
     }
 }
 
+fn valid_terminal(handoff: SourcePnpTerminalHandoff) -> bool {
+    handoff.nonce != 0
+        && handoff.token != 0
+        && handoff.source_irp_va != 0
+        && handoff.source_ticket_serial != 0
+        && handoff.native_allocation_generation != 0
+        && handoff.iosb_va != 0
+        && handoff.relation_allocation_va != 0
+        && handoff.relation_allocation_generation != 0
+        && handoff.status != STATUS_PENDING
+        && if handoff.status & 0x8000_0000 == 0 {
+            handoff.information == handoff.relation_allocation_va && handoff.pdo_va != 0
+        } else {
+            handoff.information == 0 && handoff.pdo_va == 0
+        }
+}
+
+pub fn encode_terminal_handoff(
+    handoff: SourcePnpTerminalHandoff,
+    packet: &mut [u8],
+) -> Result<(), WireError> {
+    if packet.len() != TERMINAL_PACKET_BYTES {
+        return Err(WireError::LengthMismatch);
+    }
+    if !valid_terminal(handoff) {
+        return Err(WireError::Malformed);
+    }
+    packet.fill(0);
+    put_u32(packet, 0, TERMINAL_KIND);
+    put_u32(packet, 4, TERMINAL_VERSION);
+    put_u64(packet, 8, handoff.nonce);
+    put_u64(packet, 16, handoff.token);
+    put_u64(packet, 24, handoff.source_irp_va);
+    put_u64(packet, 32, handoff.source_ticket_serial);
+    put_u64(packet, 40, handoff.native_allocation_generation);
+    put_u64(packet, 48, handoff.iosb_va);
+    put_u64(packet, 56, handoff.relation_allocation_va);
+    put_u64(packet, 64, handoff.relation_allocation_generation);
+    put_u32(packet, 72, handoff.status);
+    put_u64(packet, 80, handoff.information);
+    put_u64(packet, 88, handoff.pdo_va);
+    Ok(())
+}
+
+fn terminal_header(packet: &[u8]) -> Result<SourcePnpTerminalHandoff, WireError> {
+    if packet.len() != TERMINAL_PACKET_BYTES {
+        return Err(WireError::LengthMismatch);
+    }
+    if u32_at(packet, 0) != TERMINAL_KIND
+        || u32_at(packet, 4) != TERMINAL_VERSION
+        || u32_at(packet, 76) != 0
+        || packet[104..].iter().any(|byte| *byte != 0)
+    {
+        return Err(WireError::Malformed);
+    }
+    let handoff = SourcePnpTerminalHandoff {
+        nonce: u64_at(packet, 8),
+        token: u64_at(packet, 16),
+        source_irp_va: u64_at(packet, 24),
+        source_ticket_serial: u64_at(packet, 32),
+        native_allocation_generation: u64_at(packet, 40),
+        iosb_va: u64_at(packet, 48),
+        relation_allocation_va: u64_at(packet, 56),
+        relation_allocation_generation: u64_at(packet, 64),
+        status: u32_at(packet, 72),
+        information: u64_at(packet, 80),
+        pdo_va: u64_at(packet, 88),
+    };
+    if !valid_terminal(handoff) {
+        return Err(WireError::Malformed);
+    }
+    Ok(handoff)
+}
+
+pub fn decode_terminal_handoff(packet: &[u8]) -> Result<SourcePnpTerminalHandoff, WireError> {
+    let handoff = terminal_header(packet)?;
+    if u32_at(packet, 96) != 0 || u32_at(packet, 100) != 0 {
+        return Err(WireError::Malformed);
+    }
+    Ok(handoff)
+}
+
+pub fn terminal_matches_request(
+    request: SourcePnpRequest,
+    handoff: SourcePnpTerminalHandoff,
+) -> bool {
+    request.nonce == handoff.nonce
+        && request.source_irp_va == handoff.source_irp_va
+        && request.source_ticket_serial == handoff.source_ticket_serial
+        && request.native_allocation_generation == handoff.native_allocation_generation
+        && request.iosb_va == handoff.iosb_va
+        && request.relation_allocation_va == handoff.relation_allocation_va
+        && request.relation_allocation_generation == handoff.relation_allocation_generation
+}
+
+/// The origin publishes this only after it has durably written the terminal
+/// source IRP, IOSB, relation buffer, and any Event signal. A failed or missing
+/// acknowledgement leaves the provider completion indeterminate.
+pub fn publish_terminal_ack(
+    packet: &mut [u8],
+    publication: TerminalPublication,
+) -> Result<(), WireError> {
+    decode_terminal_handoff(packet)?;
+    match publication {
+        TerminalPublication::Published => put_u32(packet, 96, 1),
+        TerminalPublication::Failed(status) if status != 0 => {
+            put_u32(packet, 96, 2);
+            put_u32(packet, 100, status);
+        }
+        TerminalPublication::Failed(_) => return Err(WireError::Malformed),
+    }
+    Ok(())
+}
+
+pub fn decode_terminal_ack(packet: &[u8]) -> Result<SourcePnpTerminalAck, WireError> {
+    let handoff = terminal_header(packet)?;
+    let publication = match (u32_at(packet, 96), u32_at(packet, 100)) {
+        (1, 0) => TerminalPublication::Published,
+        (2, status) if status != 0 => TerminalPublication::Failed(status),
+        _ => return Err(WireError::Malformed),
+    };
+    Ok(SourcePnpTerminalAck { handoff, publication })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +379,25 @@ mod tests {
                 object_slot_plus_one: 5,
                 object_generation: 6,
             }),
+            iosb_va: 0x3000,
+            relation_allocation_va: 0x4000,
+            relation_allocation_generation: 7,
+        }
+    }
+
+    fn terminal() -> SourcePnpTerminalHandoff {
+        SourcePnpTerminalHandoff {
+            nonce: 1,
+            token: 8,
+            source_irp_va: 0x1000,
+            source_ticket_serial: 2,
+            native_allocation_generation: 3,
+            iosb_va: 0x3000,
+            relation_allocation_va: 0x4000,
+            relation_allocation_generation: 7,
+            status: 0,
+            information: 0x4000,
+            pdo_va: 0x5000,
         }
     }
 
@@ -235,5 +429,62 @@ mod tests {
         assert_eq!(publish_inline_terminal(&mut packet, 9, 0, 0), Err(WireError::Malformed));
         packet[24..32].fill(0);
         assert_eq!(decode_request(&packet), Err(WireError::Malformed));
+    }
+
+    #[test]
+    fn request_requires_origin_owned_destinations() {
+        let mut packet = [0; PACKET_BYTES];
+        let mut missing = request();
+        missing.iosb_va = 0;
+        assert_eq!(encode_request(missing, &mut packet), Err(WireError::Malformed));
+        missing = request();
+        missing.relation_allocation_generation = 0;
+        assert_eq!(encode_request(missing, &mut packet), Err(WireError::Malformed));
+        encode_request(request(), &mut packet).unwrap();
+        packet[RELATION_OFF..RELATION_OFF + 8].fill(0);
+        assert_eq!(decode_request(&packet), Err(WireError::Malformed));
+    }
+
+    #[test]
+    fn terminal_handoff_and_exact_ack_round_trip() {
+        let mut packet = [0; TERMINAL_PACKET_BYTES];
+        encode_terminal_handoff(terminal(), &mut packet).unwrap();
+        assert_eq!(decode_terminal_handoff(&packet), Ok(terminal()));
+        assert!(terminal_matches_request(request(), terminal()));
+        publish_terminal_ack(&mut packet, TerminalPublication::Published).unwrap();
+        assert_eq!(decode_terminal_ack(&packet), Ok(SourcePnpTerminalAck {
+            handoff: terminal(), publication: TerminalPublication::Published,
+        }));
+        assert_eq!(decode_terminal_handoff(&packet), Err(WireError::Malformed));
+        assert_eq!(publish_terminal_ack(&mut packet, TerminalPublication::Published), Err(WireError::Malformed));
+    }
+
+    #[test]
+    fn terminal_rejects_wrong_destination_and_unbound_ack() {
+        let mut packet = [0; TERMINAL_PACKET_BYTES];
+        let mut handoff = terminal();
+        handoff.information = 0x5000;
+        assert_eq!(encode_terminal_handoff(handoff, &mut packet), Err(WireError::Malformed));
+        handoff = terminal();
+        handoff.relation_allocation_generation += 1;
+        assert!(!terminal_matches_request(request(), handoff));
+        encode_terminal_handoff(terminal(), &mut packet).unwrap();
+        assert_eq!(publish_terminal_ack(&mut packet, TerminalPublication::Failed(0)), Err(WireError::Malformed));
+        packet[56] ^= 1;
+        assert_eq!(decode_terminal_handoff(&packet), Err(WireError::Malformed));
+    }
+
+    #[test]
+    fn failed_terminal_and_publication_failure_are_distinct() {
+        let mut packet = [0; TERMINAL_PACKET_BYTES];
+        let mut handoff = terminal();
+        handoff.status = 0xc000_000d;
+        handoff.information = 0;
+        handoff.pdo_va = 0;
+        encode_terminal_handoff(handoff, &mut packet).unwrap();
+        publish_terminal_ack(&mut packet, TerminalPublication::Failed(0xc000_0001)).unwrap();
+        assert_eq!(decode_terminal_ack(&packet), Ok(SourcePnpTerminalAck {
+            handoff, publication: TerminalPublication::Failed(0xc000_0001),
+        }));
     }
 }

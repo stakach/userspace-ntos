@@ -21,6 +21,8 @@ mod ingress;
 pub mod badge;
 pub mod source_registry;
 mod message;
+mod service_wait;
+pub use service_wait::{ServiceWaitOccupancy, ServiceWaitTokenIssuer};
 mod receive_probe;
 pub mod peer_registry;
 mod lane_peer;

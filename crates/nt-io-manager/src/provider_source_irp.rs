@@ -483,4 +483,51 @@ mod tests {
             Err(ProviderSourceIrpError::InvalidAllocation)
         );
     }
+
+    #[test]
+    fn pending_request_packet_can_retire_while_source_irp_remains_pinned() {
+        use crate::win32k_source_pnp_wire::{
+            decode_response, encode_request, publish_pending, SourcePnpRequest,
+            SourcePnpResponse, PACKET_BYTES,
+        };
+
+        let mut ledger = ProviderSourceIrpLedger::new();
+        let (mut catalog, source) = allocation(11, 5);
+        let ticket = ledger.register(source).unwrap();
+        ledger.pin(ticket, source).unwrap();
+        let packet = catalog
+            .register(source.catalog.identity.arena, 0x1000_3000, PACKET_BYTES as u64)
+            .unwrap();
+        let (_, packet_pin) = catalog.pin_containing(packet.base, PACKET_BYTES as u64).unwrap();
+        let mut bytes = [0; PACKET_BYTES];
+        encode_request(
+            SourcePnpRequest {
+                nonce: 1,
+                source_irp_va: source.catalog.base,
+                source_ticket_serial: ticket.serial.get(),
+                native_allocation_generation: source.native.allocation_generation,
+                device_object_va: 0x2000,
+                relation_type: nt_pnp_abi::TARGET_DEVICE_RELATION,
+                event: None,
+                iosb_va: 0x3000,
+                relation_allocation_va: 0x4000,
+                relation_allocation_generation: 6,
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        publish_pending(&mut bytes, 7).unwrap();
+        assert_eq!(decode_response(&bytes), Ok(SourcePnpResponse::Pending { token: 7 }));
+
+        catalog.release_pin(packet_pin).unwrap();
+        catalog.retire(packet.identity).unwrap();
+        assert!(ledger.matches(ticket, source));
+        assert_eq!(ledger.preflight_free(ticket, source), Err(ProviderSourceIrpError::Pinned));
+
+        ledger.unpin(ticket, source).unwrap();
+        ledger.begin_free(ticket, source).unwrap();
+        catalog.begin_retirement_from_pin(source.catalog_pin).unwrap();
+        catalog.retire(source.catalog.identity).unwrap();
+        ledger.finish_free(ticket, source).unwrap();
+    }
 }

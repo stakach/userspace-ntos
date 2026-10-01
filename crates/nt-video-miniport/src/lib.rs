@@ -10,6 +10,8 @@
 mod control;
 pub use control::{classify_start_io_status, VideoControlCompletion, VideoControlProtocolError};
 mod lifecycle;
+mod pnp;
+pub use pnp::owns_target_device_relation;
 pub use lifecycle::{
     validate_device_control_requestor, VideoAdapterDiscoveryState,
     VideoHardwareInitializationState, VideoOpenAction,

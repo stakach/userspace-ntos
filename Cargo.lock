@@ -795,6 +795,7 @@ name = "nt-video-miniport"
 version = "0.1.0"
 dependencies = [
  "nt-io-manager",
+ "nt-pnp-abi",
 ]
 
 [[package]]

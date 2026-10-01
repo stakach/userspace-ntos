@@ -4,6 +4,7 @@ use crate::win32k_source_irp_ioctl_wire::EventIdentity;
 use nt_io_abi::major;
 
 pub const HEADER_BYTES: usize = 128;
+pub const TERMINAL_HEADER_BYTES: usize = 80;
 pub const MAX_BUFFER_BYTES: u32 = 64 * 1024;
 pub const MAX_PACKET_BYTES: usize = HEADER_BYTES + MAX_BUFFER_BYTES as usize;
 pub const STATUS_PENDING: u32 = 0x103;
@@ -17,6 +18,8 @@ const INFORMATION_OFF: usize = 104;
 const STATUS_OFF: usize = 112;
 const COMPLETED_OFF: usize = 116;
 const OUTPUT_LENGTH_OFF: usize = 120;
+const TERMINAL_KIND: u32 = 4;
+const TERMINAL_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceFsdRequest<'a> {
@@ -40,6 +43,31 @@ pub enum SourceFsdResponse<'a> {
     Inline { token: u64, status: u32, information: u64, output: &'a [u8] },
 }
 
+/// Root's canonical completion projected back to the retained win32k origin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceFsdTerminalHandoff<'a> {
+    pub nonce: u64,
+    pub token: u64,
+    pub source_irp_va: u64,
+    pub source_ticket_serial: u64,
+    pub native_allocation_generation: u64,
+    pub status: u32,
+    pub information: u64,
+    pub output: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalPublication {
+    Published,
+    Failed(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceFsdTerminalAck<'a> {
+    pub handoff: SourceFsdTerminalHandoff<'a>,
+    pub publication: TerminalPublication,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WireError {
     LengthMismatch,
@@ -60,6 +88,113 @@ fn put_u32(packet: &mut [u8], offset: usize, value: u32) {
 
 fn put_u64(packet: &mut [u8], offset: usize, value: u64) {
     packet[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+pub fn terminal_matches_request(
+    request: SourceFsdRequest<'_>,
+    handoff: SourceFsdTerminalHandoff<'_>,
+) -> bool {
+    request.nonce == handoff.nonce
+        && request.source_irp_va == handoff.source_irp_va
+        && request.source_ticket_serial == handoff.source_ticket_serial
+        && request.native_allocation_generation == handoff.native_allocation_generation
+        && valid_information(request, handoff.information)
+        && handoff.output.len() == completion_output_len(request, handoff.information)
+}
+
+pub fn terminal_packet_len(output_len: usize) -> Result<usize, WireError> {
+    if output_len > MAX_BUFFER_BYTES as usize {
+        return Err(WireError::LengthMismatch);
+    }
+    TERMINAL_HEADER_BYTES.checked_add(output_len).ok_or(WireError::LengthMismatch)
+}
+
+fn valid_terminal(handoff: SourceFsdTerminalHandoff<'_>) -> bool {
+    handoff.nonce != 0
+        && handoff.token != 0
+        && handoff.source_irp_va != 0
+        && handoff.source_ticket_serial != 0
+        && handoff.native_allocation_generation != 0
+        && handoff.status != STATUS_PENDING
+        && handoff.output.len() <= MAX_BUFFER_BYTES as usize
+}
+
+pub fn encode_terminal_handoff(
+    handoff: SourceFsdTerminalHandoff<'_>,
+    packet: &mut [u8],
+) -> Result<(), WireError> {
+    if !valid_terminal(handoff) || packet.len() != terminal_packet_len(handoff.output.len())? {
+        return Err(WireError::Malformed);
+    }
+    packet.fill(0);
+    put_u32(packet, 0, TERMINAL_KIND);
+    put_u32(packet, 4, TERMINAL_VERSION);
+    put_u64(packet, 8, handoff.nonce);
+    put_u64(packet, 16, handoff.token);
+    put_u64(packet, 24, handoff.source_irp_va);
+    put_u64(packet, 32, handoff.source_ticket_serial);
+    put_u64(packet, 40, handoff.native_allocation_generation);
+    put_u32(packet, 48, handoff.status);
+    put_u32(packet, 52, handoff.output.len() as u32);
+    put_u64(packet, 56, handoff.information);
+    packet[TERMINAL_HEADER_BYTES..].copy_from_slice(handoff.output);
+    Ok(())
+}
+
+fn terminal_header(packet: &[u8]) -> Result<SourceFsdTerminalHandoff<'_>, WireError> {
+    if packet.len() < TERMINAL_HEADER_BYTES
+        || u32_at(packet, 0) != TERMINAL_KIND
+        || u32_at(packet, 4) != TERMINAL_VERSION
+        || packet.len() != terminal_packet_len(u32_at(packet, 52) as usize)?
+        || u64_at(packet, 72) != 0
+    {
+        return Err(WireError::Malformed);
+    }
+    let handoff = SourceFsdTerminalHandoff {
+        nonce: u64_at(packet, 8),
+        token: u64_at(packet, 16),
+        source_irp_va: u64_at(packet, 24),
+        source_ticket_serial: u64_at(packet, 32),
+        native_allocation_generation: u64_at(packet, 40),
+        status: u32_at(packet, 48),
+        information: u64_at(packet, 56),
+        output: &packet[TERMINAL_HEADER_BYTES..],
+    };
+    valid_terminal(handoff).then_some(handoff).ok_or(WireError::Malformed)
+}
+
+pub fn decode_terminal_handoff(packet: &[u8]) -> Result<SourceFsdTerminalHandoff<'_>, WireError> {
+    let handoff = terminal_header(packet)?;
+    if u32_at(packet, 64) != 0 || u32_at(packet, 68) != 0 {
+        return Err(WireError::Malformed);
+    }
+    Ok(handoff)
+}
+
+pub fn publish_terminal_ack(
+    packet: &mut [u8],
+    publication: TerminalPublication,
+) -> Result<(), WireError> {
+    decode_terminal_handoff(packet)?;
+    match publication {
+        TerminalPublication::Published => put_u32(packet, 64, 1),
+        TerminalPublication::Failed(status) if status != 0 => {
+            put_u32(packet, 64, 2);
+            put_u32(packet, 68, status);
+        }
+        TerminalPublication::Failed(_) => return Err(WireError::Malformed),
+    }
+    Ok(())
+}
+
+pub fn decode_terminal_ack(packet: &[u8]) -> Result<SourceFsdTerminalAck<'_>, WireError> {
+    let handoff = terminal_header(packet)?;
+    let publication = match (u32_at(packet, 64), u32_at(packet, 68)) {
+        (1, 0) => TerminalPublication::Published,
+        (2, status) if status != 0 => TerminalPublication::Failed(status),
+        _ => return Err(WireError::Malformed),
+    };
+    Ok(SourceFsdTerminalAck { handoff, publication })
 }
 
 fn payload_len(request: SourceFsdRequest<'_>) -> Result<usize, WireError> {
@@ -307,5 +442,46 @@ mod tests {
         let mut packet = vec![0; packet_len(write).unwrap()];
         encode_request(write, &mut packet).unwrap();
         assert_eq!(publish_inline_terminal(&mut packet, 8, 0, 3, &[]), Err(WireError::Malformed));
+    }
+
+    #[test]
+    fn terminal_handoff_requires_exact_origin_and_ack() {
+        let request = request(major::IRP_MJ_READ, DIRECT, &[], &[9, 8, 7, 6], 4);
+        let handoff = SourceFsdTerminalHandoff {
+            nonce: request.nonce,
+            token: 7,
+            source_irp_va: request.source_irp_va,
+            source_ticket_serial: request.source_ticket_serial,
+            native_allocation_generation: request.native_allocation_generation,
+            status: 0,
+            information: 2,
+            output: &[1, 2],
+        };
+        let mut packet = vec![0; terminal_packet_len(handoff.output.len()).unwrap()];
+        encode_terminal_handoff(handoff, &mut packet).unwrap();
+        assert_eq!(decode_terminal_handoff(&packet), Ok(handoff));
+        assert!(terminal_matches_request(request, handoff));
+        publish_terminal_ack(&mut packet, TerminalPublication::Published).unwrap();
+        assert_eq!(decode_terminal_ack(&packet), Ok(SourceFsdTerminalAck {
+            handoff,
+            publication: TerminalPublication::Published,
+        }));
+        let mut wrong = handoff;
+        wrong.source_ticket_serial += 1;
+        assert!(!terminal_matches_request(request, wrong));
+        packet[24] ^= 1;
+        assert_ne!(decode_terminal_ack(&packet).unwrap().handoff, handoff);
+    }
+
+    #[test]
+    fn terminal_rejects_pending_and_oversized_output() {
+        let handoff = SourceFsdTerminalHandoff {
+            nonce: 1, token: 2, source_irp_va: 3, source_ticket_serial: 4,
+            native_allocation_generation: 5, status: STATUS_PENDING,
+            information: 0, output: &[],
+        };
+        let mut packet = [0; TERMINAL_HEADER_BYTES];
+        assert_eq!(encode_terminal_handoff(handoff, &mut packet), Err(WireError::Malformed));
+        assert_eq!(terminal_packet_len(MAX_BUFFER_BYTES as usize + 1), Err(WireError::LengthMismatch));
     }
 }

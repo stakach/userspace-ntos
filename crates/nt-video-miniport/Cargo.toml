@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+nt-pnp-abi = { workspace = true }
 
 [dev-dependencies]
 nt-io-manager = { workspace = true }
