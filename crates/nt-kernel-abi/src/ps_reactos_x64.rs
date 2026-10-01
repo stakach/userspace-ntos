@@ -22,6 +22,7 @@ pub const EPROCESS_PEB: usize = 0x2b8;
 pub const KTHREAD_APC_STATE: usize = 0x48;
 pub const KTHREAD_APC_STATE_PROCESS: usize = 0x68;
 pub const KTHREAD_TEB: usize = 0xb0;
+pub const KTHREAD_ENABLE_STACK_SWAP: usize = 0x94;
 pub const KTHREAD_PREVIOUS_MODE: usize = 0x153;
 pub const KTHREAD_APC_STATE_INDEX: usize = 0x1e4;
 pub const KTHREAD_PROCESS: usize = 0x200;
@@ -63,6 +64,41 @@ pub enum ProjectionError {
     InvalidProcessId,
     InvalidThreadId,
     IdentityMismatch,
+    InvalidPreviousMode,
+    InvalidBoolean,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadPreviousMode {
+    KernelMode = 0,
+    UserMode = 1,
+}
+
+pub fn thread_previous_mode(body: &[u8]) -> Result<ThreadPreviousMode, ProjectionError> {
+    match body.get(KTHREAD_PREVIOUS_MODE).ok_or(ProjectionError::BufferTooSmall)? {
+        0 => Ok(ThreadPreviousMode::KernelMode),
+        1 => Ok(ThreadPreviousMode::UserMode),
+        _ => Err(ProjectionError::InvalidPreviousMode),
+    }
+}
+
+pub fn exchange_thread_previous_mode(
+    body: &mut [u8], mode: ThreadPreviousMode,
+) -> Result<ThreadPreviousMode, ProjectionError> {
+    let previous = thread_previous_mode(body)?;
+    body[KTHREAD_PREVIOUS_MODE] = mode as u8;
+    Ok(previous)
+}
+
+pub fn exchange_thread_stack_swap_enable(
+    body: &mut [u8], enable: bool,
+) -> Result<bool, ProjectionError> {
+    let state = body.get_mut(KTHREAD_ENABLE_STACK_SWAP).ok_or(ProjectionError::BufferTooSmall)?;
+    if *state > 1 { return Err(ProjectionError::InvalidBoolean); }
+    let previous = *state != 0;
+    *state = u8::from(enable);
+    Ok(previous)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +187,7 @@ pub fn initialize_thread(
     let output = &mut output[..ETHREAD_BODY_BYTES];
     output.fill(0);
     output[0] = 6; // ThreadObject; the remaining dispatcher union bytes are flags, not Size.
+    output[KTHREAD_ENABLE_STACK_SWAP] = 1;
     empty_lists(output, init.body, THREAD_LIST_HEADS);
     write_u64(output, KTHREAD_APC_STATE_PROCESS, init.process_body.0);
     write_u64(
