@@ -26329,13 +26329,18 @@ unsafe fn spawn_hosted_thread_mechanism(
     let e_ipc = tcb_set_ipc_buffer_r(tcb, t.ipcbuf_va, ipcbuf);
     if e_ipc != 0 { return failed!(); }
     let e_regs = if let Some(context) = t.user_context {
-        let initial = context.initial_context.prepare_direct_install();
-        if thread_context::write(tcb, &initial, false).is_err() { return failed!(); }
-        if context.loader_va.is_some() {
-            tcb_write_registers_r(tcb, t.tramp_va, new_sp, 0)
+        let initial = if context.loader_va.is_some() {
+            match context.initial_context.prepare_loader_entry(
+                t.tramp_va, new_sp, exec_handler::HIGHEST_USER_ADDRESS,
+            ) {
+                Ok(initial) => initial,
+                Err(_) => return failed!(),
+            }
         } else {
-            0
-        }
+            context.initial_context.prepare_direct_install()
+        };
+        if thread_context::write(tcb, &initial, false).is_err() { return failed!(); }
+        0
     } else {
         tcb_write_registers_r(tcb, t.tramp_va, new_sp, 0)
     };

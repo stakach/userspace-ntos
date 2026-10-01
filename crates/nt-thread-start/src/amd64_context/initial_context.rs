@@ -145,6 +145,29 @@ impl InitialAmd64Context {
         );
         restore
     }
+
+    /// Install the loader trampoline as the fresh entry while retaining the caller's
+    /// original CONTEXT for NtContinue after loader initialization.
+    pub fn prepare_loader_entry(
+        &self,
+        trampoline_ip: u64,
+        trampoline_sp: u64,
+        highest_user_address: u64,
+    ) -> Result<LegacyContextRestore, CodecError> {
+        if trampoline_ip == 0 || trampoline_ip > highest_user_address {
+            return Err(CodecError::InvalidInstructionPointer);
+        }
+        if trampoline_sp == 0
+            || trampoline_sp > highest_user_address
+            || trampoline_sp & 15 != 0
+        {
+            return Err(CodecError::InvalidStackPointer);
+        }
+        let mut entry = self.prepare_direct_install();
+        entry.registers[0] = trampoline_ip;
+        entry.registers[1] = trampoline_sp;
+        Ok(entry)
+    }
 }
 
 #[cfg(test)]
