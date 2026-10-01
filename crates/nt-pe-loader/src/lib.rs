@@ -18,6 +18,7 @@ mod image_page_fill;
 pub mod immutable_support_image;
 pub mod system_module;
 pub mod system_image_request;
+pub mod load_failure;
 pub mod module_namespace;
 mod imports;
 mod relocs;
