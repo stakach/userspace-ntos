@@ -1,5 +1,9 @@
 //! Two-phase source completion. Publication is not permission to release pins.
 
+#[cfg(test)]
+#[path = "source_terminal_commit_progress_tests.rs"]
+mod commit_progress_tests;
+
 /// Private terminal IPC result: no origin resources were extracted and no payload was written.
 pub const TERMINAL_NOT_READY: i32 = 0xc0e9_0001u32 as i32;
 
@@ -11,6 +15,53 @@ pub enum OriginCallPhase { Calling, Armed(u64), Indeterminate }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalAdmission { Ready, NotReady, Rejected }
+
+/// Local progress of one retained origin command. The native owner keeps its exact packet,
+/// immutable command snapshot and signal sequence until packet retirement succeeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OriginCommitPhase {
+    CaptureBefore,
+    PublishCommand,
+    DispatchOrigin,
+    ReadAck,
+    RetirePacket,
+    Complete,
+    Indeterminate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OriginCommitObservation {
+    BusyNoEffect,
+    CapturedBefore,
+    CommandPublished,
+    NotEntered,
+    ReturnedSuccess,
+    Uncertain,
+    AckValidated,
+    InvalidAck,
+    PacketRetired,
+}
+
+impl OriginCommitPhase {
+    /// ACK validation uses the existing exact identity and immutable packet contracts; this
+    /// state machine orders effects but does not mint authority from a successful IPC reply.
+    pub fn observe(self, observation: OriginCommitObservation) -> Option<Self> {
+        use OriginCommitObservation as Event;
+        match (self, observation) {
+            (Self::CaptureBefore | Self::PublishCommand | Self::ReadAck | Self::RetirePacket,
+                Event::BusyNoEffect) => Some(self),
+            (Self::CaptureBefore, Event::CapturedBefore) => Some(Self::PublishCommand),
+            (Self::PublishCommand, Event::CommandPublished) => Some(Self::DispatchOrigin),
+            (Self::DispatchOrigin, Event::NotEntered) => Some(Self::DispatchOrigin),
+            (Self::DispatchOrigin, Event::ReturnedSuccess) => Some(Self::ReadAck),
+            (Self::DispatchOrigin, Event::Uncertain) | (Self::ReadAck, Event::InvalidAck) =>
+                Some(Self::Indeterminate),
+            (Self::ReadAck, Event::AckValidated) => Some(Self::RetirePacket),
+            (Self::RetirePacket, Event::PacketRetired) => Some(Self::Complete),
+            _ => None,
+        }
+    }
+}
 
 impl TerminalDelivery {
     pub fn decode(raw: u32) -> Option<Self> {
