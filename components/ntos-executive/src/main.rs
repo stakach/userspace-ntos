@@ -35,6 +35,7 @@ mod registry_security_audit;
 mod provider_registry_caller;
 mod provider_directory_broker;
 mod provider_section_broker;
+mod provider_mm_section_objects;
 mod provider_section_map_broker;
 mod provider_section_unmap_broker;
 mod provider_win32k_subject;

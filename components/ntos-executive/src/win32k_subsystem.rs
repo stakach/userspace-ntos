@@ -1769,7 +1769,9 @@ pub(crate) unsafe fn retire_pinned_root_provider_pool_packet(
 
 mod root_pool;
 pub(crate) use root_pool::{RootProviderPoolAllocation, allocate_root_provider_pool_allocation,
-    retire_root_provider_pool_allocation};
+    retire_root_provider_pool_allocation, RootPoolError,
+    try_allocate_root_provider_pool_allocation, try_retire_root_provider_pool_allocation,
+    try_capture_root_provider_pool_packet, try_publish_root_provider_pool_packet};
 
 pub(crate) unsafe fn capture_provider_pool_packet(
     pointer: u64,
@@ -4075,6 +4077,7 @@ mod directory_object;
 mod file_close;
 mod file_open;
 mod section_create;
+mod mm_section;
 mod section_map;
 mod section_unmap;
 mod file_query;
@@ -4226,6 +4229,11 @@ extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
             as u64;
     }
     if provider_pool_contains(object) {
+        match unsafe { mm_section::reference(object, false) } {
+            Ok(count) => return count,
+            Err(STATUS_INVALID_HANDLE_I32) => {},
+            Err(status) => panic!("Section pointer retain failed: {status:#010x}"),
+        }
         let (file_status, file_count, _, _) = unsafe {
             win32k_file_object_broker_call(W32_FILE_OBJECT_REFERENCE_POINTER, object, 0, 0)
         };
@@ -4305,6 +4313,11 @@ extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
             as u64;
     }
     if provider_pool_contains(object) {
+        match unsafe { mm_section::reference(object, true) } {
+            Ok(count) => return count,
+            Err(STATUS_INVALID_HANDLE_I32) => {},
+            Err(status) => panic!("Section pointer release failed: {status:#010x}"),
+        }
         let (file_status, file_count, _, _) = unsafe {
             win32k_file_object_broker_call(W32_FILE_OBJECT_DEREFERENCE_POINTER, object, 0, 0)
         };
@@ -8905,28 +8918,39 @@ unsafe fn section_view(section: u64, _size_hint: u64) -> (u64, u64) {
     (map_section(section as *mut u8, |s| heap_alloc(s, true)), sz)
 }
 
-/// `NTSTATUS MmCreateSection(PVOID *SectionObject, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER
-/// MaximumSize, ULONG SectionPageProtection, ULONG AllocationAttributes, HANDLE FileHandle,
-/// PFILE_OBJECT FileObject)` — win32k's `UserCreateHeap` creates the global USER-heap section here.
-/// Allocate a real [`session_section`](nt_memory_manager::session_section) descriptor from the pool
-/// and write it to `*SectionObject` (a no-op stub left it null → `MapGlobalUserHeap` later asserted).
+/// Kernel Section creation preserves FileObject authority and real file backing. Anonymous
+/// session heaps retain their coherent server/client aliases in the shared USER heap arena.
 extern "win64" fn s_mm_create_section(
     section_out: *mut u64,
-    _access: u64,
-    _obj_attr: u64,
+    access: u32,
+    obj_attr: u64,
     max_size: *const i64,
+    protection: u32,
+    allocation_attributes: u32,
+    file_handle: u64,
+    file_object: u64,
 ) -> i32 {
     unsafe {
-        let size = if max_size.is_null() {
-            0x0010_0000
-        } else {
-            read_unaligned(max_size) as u64
-        };
+        if section_out.is_null() { return STATUS_ACCESS_VIOLATION_I32; }
+        // Mm's legacy internal flag is consumed before the Section creation policy.
+        let allocation_attributes = allocation_attributes & !1;
+        if file_handle != 0 || file_object != 0 {
+            return mm_section::create(section_out, access, obj_attr, max_size as u64,
+                protection, allocation_attributes, file_handle, file_object);
+        }
+        if max_size.is_null() { return 0xc000_00f2u32 as i32; }
+        let size = read_unaligned(max_size);
+        if size <= 0 || (size as u64).checked_add(0xfff).is_none() {
+            return 0xc000_00f2u32 as i32;
+        }
+        if obj_attr != 0 || protection != nt_address_space::PAGE_READWRITE
+            || !matches!(allocation_attributes, 0x0400_0000 | 0x0800_0000)
+        { return STATUS_NOT_SUPPORTED_I32; }
         let desc = pool_alloc(section_object::SIZE_OF as u64);
         if desc == 0 {
             return STATUS_NO_MEMORY;
         }
-        init_section(desc as *mut u8, size);
+        init_section(desc as *mut u8, size as u64);
         register_section_descriptor(desc);
         if !section_out.is_null() {
             write_unaligned(section_out, desc);
@@ -8945,7 +8969,13 @@ extern "win64" fn s_mm_unmap_view_of_section(_process: u64, base: u64) -> i32 {
 
 /// `NTSTATUS MmUnmapViewInSessionSpace(PVOID MappedBase)` / `MmUnmapViewInSystemSpace`.
 extern "win64" fn s_mm_unmap_view_in_space(base: u64) -> i32 {
-    unsafe { unmap_section_view_addr(base) }
+    unsafe {
+        if find_section_for_view_addr(base) != 0 {
+            unmap_section_view_addr(base)
+        } else {
+            mm_section::unmap(base)
+        }
+    }
 }
 
 /// `MmMapViewInSessionSpace/MmMapViewInSystemSpace(Section, PVOID *MappedBase, PSIZE_T ViewSize)`
@@ -8954,12 +8984,24 @@ extern "win64" fn s_mm_unmap_view_in_space(base: u64) -> i32 {
 /// + `*ViewSize` (a no-op stub left `*MappedBase` null → memset(null)).
 extern "win64" fn s_mm_map_view(section: u64, base_out: *mut u64, size_io: *mut u64) -> i32 {
     unsafe {
+        if base_out.is_null() || size_io.is_null() { return STATUS_ACCESS_VIOLATION_I32; }
         let hint = if size_io.is_null() {
             0
         } else {
             read_volatile(size_io)
         };
-        let (base, size) = section_view(section, hint);
+        let mut descriptor = WIN32K_SECTION_LIST_HEAD.load(Ordering::Acquire);
+        while descriptor != 0 && descriptor != section {
+            descriptor = section_next(descriptor as *const u8);
+        }
+        let (base, size) = if descriptor == section && section != 0 {
+            section_view(section, hint)
+        } else {
+            match mm_section::map(section, hint) {
+                Ok(view) => view,
+                Err(status) => return status,
+            }
+        };
         if base == 0 {
             return STATUS_NO_MEMORY;
         }
@@ -8969,7 +9011,7 @@ extern "win64" fn s_mm_map_view(section: u64, base_out: *mut u64, size_io: *mut 
         if !size_io.is_null() {
             write_volatile(size_io, size);
         }
-        if size >= GDI_HANDLE_COUNT * GDI_TABLE_ENTRY_SIZE && size < 0x0020_0000 {
+        if descriptor != 0 && size >= GDI_HANDLE_COUNT * GDI_TABLE_ENTRY_SIZE && size < 0x0020_0000 {
             write_volatile((WIN32K_SHARED_VADDR + SH_GDI_TABLE_BASE) as *mut u64, base);
             write_volatile((WIN32K_SHARED_VADDR + SH_GDI_TABLE_SIZE) as *mut u64, size);
         }

@@ -4582,6 +4582,33 @@ pub(crate) unsafe fn service_win32k_section_create_request(
         Ok(handler) if handler.loop_ctx.is_some() => handler,
         _ => return SubmitResult::Ready((0xC000_00A3u32 as i32, 0, 0, 0)),
     };
+    use nt_io_manager::win32k_mm_section_wire as mm_wire;
+    if matches!(op, mm_wire::OP_REFERENCE | mm_wire::OP_DEREFERENCE
+        | mm_wire::OP_MAP | mm_wire::OP_UNMAP)
+    {
+        if third != 0 || (op != mm_wire::OP_MAP && second != 0) {
+            return SubmitResult::Ready((nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0));
+        }
+        let physical = match spawn_hosts::shared_ingress::owner::runtime::physical_source(route) {
+            Ok(physical) => physical,
+            Err(_) => return SubmitResult::Ready((nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0)),
+        };
+        let handler = handler as *mut ExecNtHandler;
+        let result = match op {
+            mm_wire::OP_REFERENCE => crate::provider_mm_section_objects::reference(handler, first, physical)
+                .map(|count| (count, 0)),
+            mm_wire::OP_DEREFERENCE => crate::provider_mm_section_objects::dereference(handler, first, physical)
+                .map(|count| (count, 0)),
+            mm_wire::OP_MAP => crate::provider_mm_section_objects::map(handler, first, physical, second),
+            mm_wire::OP_UNMAP => crate::provider_mm_section_objects::unmap(handler, first, physical)
+                .map(|()| (0, 0)),
+            _ => unreachable!(),
+        };
+        return SubmitResult::Ready(match result {
+            Ok((first, second)) => (0, first, second, 0),
+            Err(status) => (status as i32, 0, 0, 0),
+        });
+    }
     crate::provider_section_broker::submit(
         handler, channel, route, dispatch, caller, op, first, second, third,
     )
@@ -5520,7 +5547,9 @@ pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
     let lifecycle = crate::driver_launch::redrive_nested_hosted_file_lifecycle_work();
     let close = crate::hosted_routed_file_close_work::redrive_nested_ready(handler);
     let source = crate::driver_launch::redrive_nested_win32k_source_work(handler);
-    create || query || write || read || flush || query_information || lower_pnp || kernel_file_query || lifecycle || close || source
+    let section = crate::provider_section_broker::redrive(&mut *handler);
+    crate::provider_mm_section_objects::redrive(handler);
+    create || query || write || read || flush || query_information || lower_pnp || kernel_file_query || lifecycle || close || source || section
 }
 
 pub(crate) unsafe fn watchdog_defer_if_hosted_work_can_run(site: &[u8]) -> bool {
@@ -9418,6 +9447,7 @@ pub(crate) unsafe fn service_sec_image(
             crate::section_metadata_work::redrive(&mut nt_handler, delay_queue);
             crate::section_pagein_work::redrive(&mut nt_handler);
             crate::provider_section_broker::redrive(&mut nt_handler);
+            crate::provider_mm_section_objects::redrive(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_driver_io_create_file(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_path_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_write_forward(nt_handler as *mut _);

@@ -379,6 +379,27 @@ pub(crate) unsafe fn related_device_address(address: u64) -> Result<u64, i32> {
     win32k_device_consumer::related_file_device_address(projection)
 }
 
+/// Capture a kernel FileObject independently of its possibly closed original handle.
+pub(crate) unsafe fn capture_section_pointer(
+    address: u64,
+) -> Result<crate::driver_launch::hosted_file_capture::Capture, u32> {
+    let id = id_for_address(address).ok_or(STATUS_INVALID_HANDLE as u32)?;
+    let identity = wait_identity_for_row(id, false).map_err(|status| status as u32)?;
+    let (file_id, device_id) = {
+        let owner = row(id).ok_or(STATUS_INVALID_HANDLE as u32)?;
+        if owner.identity != Some(identity) || owner.address != address {
+            return Err(STATUS_INVALID_HANDLE as u32);
+        }
+        (owner.file_id.raw(), owner.device_id.raw())
+    };
+    // MmCreateSection's supplied FileObject path references the object directly;
+    // the canonical backing policy still validates protection and storage rights.
+    const KERNEL_FILE_DATA_ACCESS: u32 = 0x0001 | 0x0002 | 0x0020;
+    crate::driver_launch::hosted_file_capture::capture_owned(
+        file_id, device_id, KERNEL_FILE_DATA_ACCESS,
+    )
+}
+
 /// The caller has already committed the exact typed process-table close.
 pub(crate) unsafe fn handle_closed(
     owner: ProcessId,
