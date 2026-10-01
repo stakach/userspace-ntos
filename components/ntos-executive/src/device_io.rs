@@ -16,7 +16,6 @@ pub(crate) unsafe fn storage_probe(
     hive_dest: u64,
     smss_dest: u64,
     imports_dest: u64,
-    ntdll_dest: u64,
     srvbuf_dest: u64,
     win32buf_dest: u64,
     nls_ansi_dest: u64,
@@ -25,7 +24,7 @@ pub(crate) unsafe fn storage_probe(
     nls20127_dest: u64,
     win32kbuf_dest: u64,
     winlogonbuf_dest: u64,
-) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
+) -> (u32, u32, u32, u32, u32, u32, u32) {
     let mut verdict = 0u32;
     let (mut nls_ansi_size, mut nls_oem_size, mut nls_case_size) = (0u32, 0u32, 0u32);
     // Port 0 present? PxSSTS DET [11:8] != 0.
@@ -48,8 +47,7 @@ pub(crate) unsafe fn storage_probe(
     if det != 0 && (tfd & 0x89) == 0 && protective_mbr {
         verdict |= 1;
     }
-    let (mut hive_size, mut smss_size, mut imports_size, mut ntdll_size) =
-        (0u32, 0u32, 0u32, 0u32);
+    let (mut hive_size, mut smss_size, mut imports_size) = (0u32, 0u32, 0u32);
     if let Some(fs) = fat32_mount_with_census(ahci_vaddr, dma_vaddr, dma_paddr, false) {
         verdict |= 2;
         // P7-A: source every ReactOS binary BY PATH from the real \reactos\system32 tree (LFN-aware
@@ -338,38 +336,6 @@ pub(crate) unsafe fn storage_probe(
                 verdict |= 0x40;
             }
         }
-        // The real ReactOS ntdll.dll (~975 KiB) into `ntdll_dest` — smss's imports resolve here.
-        // Resolved BY PATH from \reactos\system32\ntdll.dll (verdict bit 0x100 = the by-path spec,
-        // set ONLY on a genuine path resolution), falling back to the flat ::NTDLL.DLL. Bytes are
-        // identical, so the loaded ntdll is unchanged.
-        let ntdll_ent = match open_sys32_uncached(&fs, b"ntdll.dll") {
-            Some((c, s)) => {
-                fs_hits += 1;
-                verdict |= 0x100;
-                Some((c, s, 0u8))
-            }
-            None => {
-                let r = dir_find(&fs, fs.root_cl, b"NTDLL   DLL");
-                if r.is_some() {
-                    fs_miss += 1;
-                }
-                r
-            }
-        };
-        if let Some((nc, nsz, _)) = ntdll_ent {
-            let cap = (NTDLLBUF_FRAMES * 0x1000) as u32;
-            let want = if nsz < cap { nsz } else { cap };
-            let got = fat_read_file(&fs, nc, want, ntdll_dest);
-            print_str(b"[storage-host] NTDLL.DLL size=");
-            print_u64(nsz as u64);
-            print_str(b" read=");
-            print_u64(got as u64);
-            print_str(b"\n");
-            if got == want && nsz > 0 {
-                ntdll_size = nsz;
-                verdict |= 0x80;
-            }
-        }
         // NLS code-page tables — c_1252 (ANSI), c_437 (OEM), l_intl (Unicode case).
         for (leaf, _short, dest, frames, out) in [
             (
@@ -555,7 +521,7 @@ pub(crate) unsafe fn storage_probe(
             }
         }
         // P7-A proof: publish the by-path hit/miss tally. verdict 0x200 = the WHOLE ReactOS stack
-        // (smss/csrss/csrsrv/basesrv/winsrv/ntdll + the Win32 client stack + NLS + win32k/dxg/ftfd/
+        // (smss/csrss/csrsrv/basesrv/winsrv + the Win32 client stack + NLS + win32k/dxg/ftfd/
         // arial/winlogon + the SYSTEM hive) was sourced BY PATH from the real \reactos tree
         // with ZERO fallbacks to a flat ::NAME file.
         core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0xA0) as *mut u32, fs_hits);
@@ -565,7 +531,8 @@ pub(crate) unsafe fn storage_probe(
         print_str(b" fallbacks=");
         print_u64(fs_miss as u64);
         print_str(b"\n");
-        if fs_miss == 0 && fs_hits >= 28 {
+        // ntdll is read in full by the executive's persistent file pool, not this host.
+        if fs_miss == 0 && fs_hits >= 27 {
             verdict |= 0x200;
         }
     }
@@ -574,7 +541,6 @@ pub(crate) unsafe fn storage_probe(
         hive_size,
         smss_size,
         imports_size,
-        ntdll_size,
         nls_ansi_size,
         nls_oem_size,
         nls_case_size,

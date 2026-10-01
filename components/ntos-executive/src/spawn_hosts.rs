@@ -934,7 +934,6 @@ pub(crate) unsafe fn spawn_storage_host(
     dma_frame: u64,
     shared_start: u64,
     filebuf_start: u64,
-    ntdllbuf_start: u64,
     srvbuf_start: u64,
     win32buf_start: u64,
     nls_ansi_start: u64,
@@ -948,7 +947,7 @@ pub(crate) unsafe fn spawn_storage_host(
     // Granted device resources + staging buffers, in the EXACT map order of the old spawner.
     // Component heap, then device resources (cluster PT window, no dedicated PT): AHCI BAR, DMA
     // frame, shared run. Then the staging buffers, each with its own dedicated PT(s). NLS +
-    // SYSTEM-hive share one input page table with each other, distinct from the relocated NTDLLBUF.
+    // SYSTEM-hive share one input page table with each other.
     let mut regions: [Region; 32] = [Region {
         source: FrameSource::Alias(0),
         base_va: 0,
@@ -989,19 +988,11 @@ pub(crate) unsafe fn spawn_storage_host(
         pts: 0,
     };
     n += 1;
-    // FILEBUF (own PT), NTDLLBUF (own PT), SRVBUF (own PT).
+    // FILEBUF (own PT), SRVBUF (own PT).
     regions[n] = Region {
         source: FrameSource::Alias(filebuf_start),
         base_va: FILEBUF_VADDR,
         count: FILEBUF_FRAMES,
-        rights: Rights::Uniform(RW_NX),
-        pts: 1,
-    };
-    n += 1;
-    regions[n] = Region {
-        source: FrameSource::Alias(ntdllbuf_start),
-        base_va: NTDLLBUF_VADDR,
-        count: NTDLLBUF_FRAMES,
         rights: Rights::Uniform(RW_NX),
         pts: 1,
     };

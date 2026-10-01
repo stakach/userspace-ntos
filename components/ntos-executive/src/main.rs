@@ -45,6 +45,7 @@ mod ntoskrnl_shared;
 mod server;
 mod service_sec_image;
 mod storage_host;
+mod bootstrap_image;
 mod system_modules;
 mod video_device;
 mod win32k_pe;
@@ -1244,8 +1245,8 @@ pub const CSRSS_FILEBUF_OFFSET: u64 = 0x1A000; // 104 KiB in — clear of a ~99 
 /// (past smss+csrss), size reported at STORAGE_SHARED+0x40. The loader needs it or DLL_NOT_FOUND.
 pub const CSRSRV_FILEBUF_OFFSET: u64 = 0x20000; // 128 KiB in — clear of csrss (ends ~111 KiB)
 /// basesrv.dll (~50 KiB) + winsrv.dll (~400 KiB) — csrss's dynamically-loaded ServerDlls — don't fit
-/// in FILEBUF, so they get their own 512 KiB buffer (its own 2 MiB PT), dual-mapped host<->exec like
-/// NTDLLBUF. basesrv at offset 0, winsrv at +0x10000; sizes reported at STORAGE_SHARED +0x44 / +0x48.
+/// in FILEBUF, so they get their own 512 KiB buffer (its own 2 MiB PT), dual-mapped host<->exec.
+/// basesrv at offset 0, winsrv at +0x10000; sizes reported at STORAGE_SHARED +0x44 / +0x48.
 pub const SRVBUF_VADDR: u64 = 0x0000_0100_1400_0000;
 pub const SRVBUF_FRAMES: u64 = 128; // 512 KiB
 pub const BASESRV_SRVBUF_OFFSET: u64 = 0x0;
@@ -2062,9 +2063,6 @@ impl DllArenaPagingState {
 /// Every leaf DLL (kernel32/user32/gdi32/advapi32/rpcrt4/msvcrt/ws2_32/basesrv/winsrv + lsass'
 /// lsasrv/samsrv/msv1_0 + all P5+ binaries) demand-loads with NO edit here.
 pub const DLL_PIN_COUNT: usize = 4;
-/// Buffer for the generated ntdll.dll, shared host<->exec in its own 2 MiB page table.
-pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_1440_0000;
-pub const NTDLLBUF_FRAMES: u64 = 512; // full 2 MiB page-table window
 /// NLS code-page tables (c_1252.nls/c_437.nls/l_intl.nls), shared host<->exec. They live in the
 /// shared-input 2 MiB region (0xA0_0000-0xC0_0000). spawn_sec_image later shares these frames into smss + points the PEB NLS
 /// fields at them so RtlInitNlsTables/RtlUnicodeToMultiByteN work.
@@ -2075,7 +2073,7 @@ pub const NLS_OEM_FRAMES: u64 = 20;
 pub const NLS_CASE_VADDR: u64 = 0x0000_0100_10B4_0000; // l_intl.nls (4870 B = 2 pages)
 pub const NLS_CASE_FRAMES: u64 = 4;
 /// c_20127.nls (US-ASCII, CP20127; 66082 B = 17 pages) — csrss's Win32 client stack maps the named
-/// section \Nls\NlsSectionCP20127 during a DllMain. Shares the NTDLLBUF 0xA0-0xC0 page table so it
+/// section \Nls\NlsSectionCP20127 during a DllMain. Shares the NLS input 0xA0-0xC0 page table so it
 /// needs no extra PT. Placed past the SYSTEM hive buffer.
 pub const NLS_20127_VADDR: u64 = 0x0000_0100_10B9_0000;
 pub const NLS_20127_FRAMES: u64 = 20;
@@ -2108,7 +2106,6 @@ pub const DEFHIVEBUF_VADDR: u64 = 0x0000_0100_10BC_0000;
 pub const DEFHIVEBUF_FRAMES: u64 = 40; // 160 KiB (the staged hive is 139264 B = 34 pages)
 const _: () = assert!(DEFHIVEBUF_FRAMES * 0x1000 >= 139_264);
 const _: () = assert!(DEFHIVEBUF_VADDR + DEFHIVEBUF_FRAMES * 0x1000 <= 0x0000_0100_10C0_0000);
-const _: () = assert!(NTDLLBUF_FRAMES * 0x1000 <= 0x20_0000);
 /// The real ReactOS **SOFTWARE** hive (`\reactos\system32\config\software`, **471040 B** regf) —
 /// the HKLM\Software backing store, mounted read-only at `\Registry\Machine\SOFTWARE`. Same by-path
 /// staging as SECURITY/SAM, but it is ~57x their size (115 pages), so it does NOT fit in the
@@ -29311,27 +29308,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     CAP_INIT_THREAD_VSPACE,
                 );
             }
-            // The generated ntdll buffer, mapped in the executive at its own 2 MiB region.
-            let nb_pt = alloc_slot();
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, nb_pt);
-            let _ = paging_struct_map(
-                nb_pt,
-                LBL_X86_PAGE_TABLE_MAP,
-                NTDLLBUF_VADDR,
-                CAP_INIT_THREAD_VSPACE,
-            );
-            let nb_start = alloc_frame();
-            for _ in 1..NTDLLBUF_FRAMES {
-                let _ = alloc_frame();
-            }
-            for i in 0..NTDLLBUF_FRAMES {
-                let _ = page_map(
-                    copy_cap(nb_start + i),
-                    NTDLLBUF_VADDR + i * 0x1000,
-                    RW_NX,
-                    CAP_INIT_THREAD_VSPACE,
-                );
-            }
             // NLS and hive retain their original shared-input region.
             let shared_input_pt = alloc_slot();
             let _ = untyped_retype(
@@ -29590,7 +29566,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 dma_frame,
                 shared_start,
                 fb_start,
-                nb_start,
                 srvbuf_start,
                 win32buf_start,
                 nls_starts[0],
@@ -29665,15 +29640,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 (verdict & 0x10) != 0,
                 &mut passed,
             );
-            // P7 FS-BACKED-BY-PATH: the storage host resolved + read ntdll.dll from the real
-            // install tree at \reactos\system32\ntdll.dll via a nested-directory walk (not the
-            // flat staged ::NTDLL.DLL) — the first binary loaded from a real FS BY PATH.
-            check(
-                b"exec_ntdll_loaded_from_fs_by_path",
-                (verdict & 0x100) != 0,
-                &mut passed,
-            );
-            // P7-A: the WHOLE ReactOS stack (smss/csrss/csrsrv/basesrv/winsrv/ntdll + the Win32
+            // P7-A: the storage-host stack (smss/csrss/csrsrv/basesrv/winsrv + the Win32
             // client stack + NLS + win32k/dxg/ftfd/arial/winlogon + the SYSTEM hive) was
             // sourced BY PATH from the real \reactos install tree — ZERO fallbacks to a flat ::NAME.
             let fs_hits = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0xA0) as *const u32);
@@ -32279,16 +32246,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // .text faults in live, then it calls RtlNormalizeProcessParams via the resolved
                 // IAT -> NTDLL_BASE+0x48f00 -> ntdll's .text page faults in and REAL NTDLL CODE
                 // EXECUTES. It runs until it derefs the (null) process params -> a safe stop.
-                let ntdll_size =
-                    core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x28) as *const u32);
-                assert!((ntdll_size as u64) <= NTDLLBUF_FRAMES * 0x1000);
-                let ntdll_bytes =
-                    core::slice::from_raw_parts(NTDLLBUF_VADDR as *const u8, ntdll_size as usize);
+                let ntdll_source =
+                    bootstrap_image::load_installed(b"reactos\\system32\\ntdll.dll");
+                check(
+                    b"exec_ntdll_loaded_from_fs_by_path",
+                    ntdll_source.is_some(),
+                    &mut passed,
+                );
+                let ntdll_source = ntdll_source
+                    .expect("bootstrap requires the complete installed ntdll file");
+                let ntdll_bytes = ntdll_source.bytes();
                 let si_fault = spawn_hosts::shared_ingress::owner::runtime::prepare(1)
                     .expect("hosted users share the owned executive ingress endpoint");
                 // OUR Rust ntdll IS `\reactos\system32\ntdll.dll` (make_image stages ours under that
-                // name; the real ReactOS ntdll is NOT on the image). So the ntdll bytes the storage
-                // host read into NTDLLBUF are OURS — no separate load, no flag, no fallback. We DERIVE
+                // name; the real ReactOS ntdll is NOT on the image). The persistent source above
+                // contains the complete installed file, without a staging-size limit. We DERIVE
                 // LdrpInitialize's RVA from the loaded ntdll's export table (never hardcode — it drifts
                 // across builds) and pass it to the spawn trampoline so it calls OUR loader entry.
                 if let Ok(ntdll_pe) = nt_pe_loader::PeFile::parse(ntdll_bytes) {
@@ -32309,7 +32281,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     let tp_completion_worker_rva = ntdll_export_rva("RtlpCompletionWorkerThread");
                     // Relocate ntdll for its load at NTDLL_BASE — its .data list heads etc. hold
                     // absolute self-pointers at the preferred base otherwise.
-                    apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
+                    apply_relocations_to_buf(&ntdll_pe, ntdll_source.source_va(), NTDLL_BASE);
                     // Publish it so EVERY hosted SEC_IMAGE spawn (csrss/winlogon/services/lsass, all
                     // spawned in service_sec_image.rs) calls OUR LdrpInitialize + uses the native
                     // transport — our ntdll is the ntdll for all of them, not just smss.
