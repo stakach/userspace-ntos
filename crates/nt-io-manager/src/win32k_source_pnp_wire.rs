@@ -36,8 +36,14 @@ pub struct SourcePnpRequest {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourcePnpResponse {
-    Pending { token: u64 },
-    Inline { token: u64, status: u32, information: u64 },
+    Pending {
+        token: u64,
+    },
+    Inline {
+        token: u64,
+        status: u32,
+        information: u64,
+    },
 }
 
 /// Terminal result sent to win32k while the origin still owns the source IRP.
@@ -59,11 +65,7 @@ pub struct SourcePnpTerminalHandoff {
     pub pdo_va: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TerminalPublication {
-    Published,
-    Failed(u32),
-}
+pub use crate::source_terminal::TerminalPublication;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourcePnpTerminalAck {
@@ -104,9 +106,7 @@ fn valid_request(request: SourcePnpRequest) -> bool {
         && request.relation_allocation_va != 0
         && request.relation_allocation_generation != 0
         && request.event.is_none_or(|event| {
-            event.local_id != 0
-                && event.object_slot_plus_one != 0
-                && event.object_generation != 0
+            event.local_id != 0 && event.object_slot_plus_one != 0 && event.object_generation != 0
         })
 }
 
@@ -133,7 +133,11 @@ pub fn encode_request(request: SourcePnpRequest, packet: &mut [u8]) -> Result<()
     }
     put_u64(packet, IOSB_OFF, request.iosb_va);
     put_u64(packet, RELATION_OFF, request.relation_allocation_va);
-    put_u64(packet, RELATION_GENERATION_OFF, request.relation_allocation_generation);
+    put_u64(
+        packet,
+        RELATION_GENERATION_OFF,
+        request.relation_allocation_generation,
+    );
     Ok(())
 }
 
@@ -141,7 +145,9 @@ fn header(packet: &[u8]) -> Result<SourcePnpRequest, WireError> {
     if packet.len() != PACKET_BYTES {
         return Err(WireError::LengthMismatch);
     }
-    if u32_at(packet, 0) != KIND || u32_at(packet, 4) != VERSION || u32_at(packet, 52) != 0
+    if u32_at(packet, 0) != KIND
+        || u32_at(packet, 4) != VERSION
+        || u32_at(packet, 52) != 0
         || packet[108..IOSB_OFF].iter().any(|byte| *byte != 0)
     {
         return Err(WireError::Malformed);
@@ -232,7 +238,11 @@ pub fn decode_response(packet: &[u8]) -> Result<SourcePnpResponse, WireError> {
             && ((status & 0x8000_0000 == 0 && information != 0)
                 || (status & 0x8000_0000 != 0 && information == 0)) =>
         {
-            Ok(SourcePnpResponse::Inline { token, status, information })
+            Ok(SourcePnpResponse::Inline {
+                token,
+                status,
+                information,
+            })
         }
         _ => Err(WireError::Malformed),
     }
@@ -340,26 +350,30 @@ pub fn publish_terminal_ack(
     packet: &mut [u8],
     publication: TerminalPublication,
 ) -> Result<(), WireError> {
-    decode_terminal_handoff(packet)?;
-    match publication {
-        TerminalPublication::Published => put_u32(packet, 96, 1),
-        TerminalPublication::Failed(status) if status != 0 => {
-            put_u32(packet, 96, 2);
-            put_u32(packet, 100, status);
+    terminal_header(packet)?;
+    let previous = match (u32_at(packet, 96), u32_at(packet, 100)) {
+        (0, 0) => None,
+        (stage, status) => {
+            Some(TerminalPublication::decode(stage, status).ok_or(WireError::Malformed)?)
         }
-        TerminalPublication::Failed(_) => return Err(WireError::Malformed),
+    };
+    if !publication.can_follow(previous) {
+        return Err(WireError::Malformed);
     }
+    let (stage, status) = publication.words();
+    put_u32(packet, 96, stage);
+    put_u32(packet, 100, status);
     Ok(())
 }
 
 pub fn decode_terminal_ack(packet: &[u8]) -> Result<SourcePnpTerminalAck, WireError> {
     let handoff = terminal_header(packet)?;
-    let publication = match (u32_at(packet, 96), u32_at(packet, 100)) {
-        (1, 0) => TerminalPublication::Published,
-        (2, status) if status != 0 => TerminalPublication::Failed(status),
-        _ => return Err(WireError::Malformed),
-    };
-    Ok(SourcePnpTerminalAck { handoff, publication })
+    let publication = TerminalPublication::decode(u32_at(packet, 96), u32_at(packet, 100))
+        .ok_or(WireError::Malformed)?;
+    Ok(SourcePnpTerminalAck {
+        handoff,
+        publication,
+    })
 }
 
 #[cfg(test)]
@@ -402,14 +416,44 @@ mod tests {
     }
 
     #[test]
+    fn prepare_commit_and_stopped_discard_do_not_skip_or_replay_phases() {
+        let handoff = terminal();
+        let mut packet = [0; TERMINAL_PACKET_BYTES];
+        encode_terminal_handoff(handoff, &mut packet).unwrap();
+        assert!(publish_terminal_ack(&mut packet, TerminalPublication::Committed).is_err());
+        publish_terminal_ack(&mut packet, TerminalPublication::Published).unwrap();
+        assert!(publish_terminal_ack(&mut packet, TerminalPublication::Published).is_err());
+        publish_terminal_ack(&mut packet, TerminalPublication::CommitRequested).unwrap();
+        assert_eq!(decode_terminal_ack(&packet).unwrap().handoff, handoff);
+        publish_terminal_ack(&mut packet, TerminalPublication::Committed).unwrap();
+        assert_eq!(
+            decode_terminal_ack(&packet).unwrap().publication,
+            TerminalPublication::Committed
+        );
+        assert!(publish_terminal_ack(&mut packet, TerminalPublication::Committed).is_err());
+        encode_terminal_handoff(handoff, &mut packet).unwrap();
+        publish_terminal_ack(&mut packet, TerminalPublication::DiscardRequested).unwrap();
+        publish_terminal_ack(&mut packet, TerminalPublication::Discarded).unwrap();
+        assert_eq!(
+            decode_terminal_ack(&packet).unwrap().publication,
+            TerminalPublication::Discarded
+        );
+    }
+
+    #[test]
     fn request_and_retained_terminal_round_trip() {
         let mut packet = [0; PACKET_BYTES];
         encode_request(request(), &mut packet).unwrap();
         assert_eq!(decode_request(&packet), Ok(request()));
         publish_inline_terminal(&mut packet, 7, 0, 0x3000).unwrap();
-        assert_eq!(decode_response(&packet), Ok(SourcePnpResponse::Inline {
-            token: 7, status: 0, information: 0x3000,
-        }));
+        assert_eq!(
+            decode_response(&packet),
+            Ok(SourcePnpResponse::Inline {
+                token: 7,
+                status: 0,
+                information: 0x3000,
+            })
+        );
     }
 
     #[test]
@@ -417,7 +461,10 @@ mod tests {
         let mut packet = [0; PACKET_BYTES];
         encode_request(request(), &mut packet).unwrap();
         publish_pending(&mut packet, 8).unwrap();
-        assert_eq!(decode_response(&packet), Ok(SourcePnpResponse::Pending { token: 8 }));
+        assert_eq!(
+            decode_response(&packet),
+            Ok(SourcePnpResponse::Pending { token: 8 })
+        );
         packet[INFORMATION_OFF] = 1;
         assert_eq!(decode_response(&packet), Err(WireError::Malformed));
     }
@@ -426,7 +473,10 @@ mod tests {
     fn rejects_unowned_success_and_forged_identity() {
         let mut packet = [0; PACKET_BYTES];
         encode_request(request(), &mut packet).unwrap();
-        assert_eq!(publish_inline_terminal(&mut packet, 9, 0, 0), Err(WireError::Malformed));
+        assert_eq!(
+            publish_inline_terminal(&mut packet, 9, 0, 0),
+            Err(WireError::Malformed)
+        );
         packet[24..32].fill(0);
         assert_eq!(decode_request(&packet), Err(WireError::Malformed));
     }
@@ -436,10 +486,16 @@ mod tests {
         let mut packet = [0; PACKET_BYTES];
         let mut missing = request();
         missing.iosb_va = 0;
-        assert_eq!(encode_request(missing, &mut packet), Err(WireError::Malformed));
+        assert_eq!(
+            encode_request(missing, &mut packet),
+            Err(WireError::Malformed)
+        );
         missing = request();
         missing.relation_allocation_generation = 0;
-        assert_eq!(encode_request(missing, &mut packet), Err(WireError::Malformed));
+        assert_eq!(
+            encode_request(missing, &mut packet),
+            Err(WireError::Malformed)
+        );
         encode_request(request(), &mut packet).unwrap();
         packet[RELATION_OFF..RELATION_OFF + 8].fill(0);
         assert_eq!(decode_request(&packet), Err(WireError::Malformed));
@@ -452,11 +508,18 @@ mod tests {
         assert_eq!(decode_terminal_handoff(&packet), Ok(terminal()));
         assert!(terminal_matches_request(request(), terminal()));
         publish_terminal_ack(&mut packet, TerminalPublication::Published).unwrap();
-        assert_eq!(decode_terminal_ack(&packet), Ok(SourcePnpTerminalAck {
-            handoff: terminal(), publication: TerminalPublication::Published,
-        }));
+        assert_eq!(
+            decode_terminal_ack(&packet),
+            Ok(SourcePnpTerminalAck {
+                handoff: terminal(),
+                publication: TerminalPublication::Published,
+            })
+        );
         assert_eq!(decode_terminal_handoff(&packet), Err(WireError::Malformed));
-        assert_eq!(publish_terminal_ack(&mut packet, TerminalPublication::Published), Err(WireError::Malformed));
+        assert_eq!(
+            publish_terminal_ack(&mut packet, TerminalPublication::Published),
+            Err(WireError::Malformed)
+        );
     }
 
     #[test]
@@ -464,12 +527,18 @@ mod tests {
         let mut packet = [0; TERMINAL_PACKET_BYTES];
         let mut handoff = terminal();
         handoff.information = 0x5000;
-        assert_eq!(encode_terminal_handoff(handoff, &mut packet), Err(WireError::Malformed));
+        assert_eq!(
+            encode_terminal_handoff(handoff, &mut packet),
+            Err(WireError::Malformed)
+        );
         handoff = terminal();
         handoff.relation_allocation_generation += 1;
         assert!(!terminal_matches_request(request(), handoff));
         encode_terminal_handoff(terminal(), &mut packet).unwrap();
-        assert_eq!(publish_terminal_ack(&mut packet, TerminalPublication::Failed(0)), Err(WireError::Malformed));
+        assert_eq!(
+            publish_terminal_ack(&mut packet, TerminalPublication::Failed(0)),
+            Err(WireError::Malformed)
+        );
         packet[56] ^= 1;
         assert_eq!(decode_terminal_handoff(&packet), Err(WireError::Malformed));
     }
@@ -483,8 +552,12 @@ mod tests {
         handoff.pdo_va = 0;
         encode_terminal_handoff(handoff, &mut packet).unwrap();
         publish_terminal_ack(&mut packet, TerminalPublication::Failed(0xc000_0001)).unwrap();
-        assert_eq!(decode_terminal_ack(&packet), Ok(SourcePnpTerminalAck {
-            handoff, publication: TerminalPublication::Failed(0xc000_0001),
-        }));
+        assert_eq!(
+            decode_terminal_ack(&packet),
+            Ok(SourcePnpTerminalAck {
+                handoff,
+                publication: TerminalPublication::Failed(0xc000_0001),
+            })
+        );
     }
 }

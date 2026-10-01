@@ -39,8 +39,15 @@ pub struct SourceFsdRequest<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceFsdResponse<'a> {
-    Pending { token: u64 },
-    Inline { token: u64, status: u32, information: u64, output: &'a [u8] },
+    Pending {
+        token: u64,
+    },
+    Inline {
+        token: u64,
+        status: u32,
+        information: u64,
+        output: &'a [u8],
+    },
 }
 
 /// Root's canonical completion projected back to the retained win32k origin.
@@ -56,11 +63,7 @@ pub struct SourceFsdTerminalHandoff<'a> {
     pub output: &'a [u8],
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TerminalPublication {
-    Published,
-    Failed(u32),
-}
+pub use crate::source_terminal::TerminalPublication;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceFsdTerminalAck<'a> {
@@ -106,7 +109,9 @@ pub fn terminal_packet_len(output_len: usize) -> Result<usize, WireError> {
     if output_len > MAX_BUFFER_BYTES as usize {
         return Err(WireError::LengthMismatch);
     }
-    TERMINAL_HEADER_BYTES.checked_add(output_len).ok_or(WireError::LengthMismatch)
+    TERMINAL_HEADER_BYTES
+        .checked_add(output_len)
+        .ok_or(WireError::LengthMismatch)
 }
 
 fn valid_terminal(handoff: SourceFsdTerminalHandoff<'_>) -> bool {
@@ -160,7 +165,9 @@ fn terminal_header(packet: &[u8]) -> Result<SourceFsdTerminalHandoff<'_>, WireEr
         information: u64_at(packet, 56),
         output: &packet[TERMINAL_HEADER_BYTES..],
     };
-    valid_terminal(handoff).then_some(handoff).ok_or(WireError::Malformed)
+    valid_terminal(handoff)
+        .then_some(handoff)
+        .ok_or(WireError::Malformed)
 }
 
 pub fn decode_terminal_handoff(packet: &[u8]) -> Result<SourceFsdTerminalHandoff<'_>, WireError> {
@@ -175,26 +182,30 @@ pub fn publish_terminal_ack(
     packet: &mut [u8],
     publication: TerminalPublication,
 ) -> Result<(), WireError> {
-    decode_terminal_handoff(packet)?;
-    match publication {
-        TerminalPublication::Published => put_u32(packet, 64, 1),
-        TerminalPublication::Failed(status) if status != 0 => {
-            put_u32(packet, 64, 2);
-            put_u32(packet, 68, status);
+    terminal_header(packet)?;
+    let previous = match (u32_at(packet, 64), u32_at(packet, 68)) {
+        (0, 0) => None,
+        (stage, status) => {
+            Some(TerminalPublication::decode(stage, status).ok_or(WireError::Malformed)?)
         }
-        TerminalPublication::Failed(_) => return Err(WireError::Malformed),
+    };
+    if !publication.can_follow(previous) {
+        return Err(WireError::Malformed);
     }
+    let (stage, status) = publication.words();
+    put_u32(packet, 64, stage);
+    put_u32(packet, 68, status);
     Ok(())
 }
 
 pub fn decode_terminal_ack(packet: &[u8]) -> Result<SourceFsdTerminalAck<'_>, WireError> {
     let handoff = terminal_header(packet)?;
-    let publication = match (u32_at(packet, 64), u32_at(packet, 68)) {
-        (1, 0) => TerminalPublication::Published,
-        (2, status) if status != 0 => TerminalPublication::Failed(status),
-        _ => return Err(WireError::Malformed),
-    };
-    Ok(SourceFsdTerminalAck { handoff, publication })
+    let publication = TerminalPublication::decode(u32_at(packet, 64), u32_at(packet, 68))
+        .ok_or(WireError::Malformed)?;
+    Ok(SourceFsdTerminalAck {
+        handoff,
+        publication,
+    })
 }
 
 fn payload_len(request: SourceFsdRequest<'_>) -> Result<usize, WireError> {
@@ -213,8 +224,14 @@ fn payload_len(request: SourceFsdRequest<'_>) -> Result<usize, WireError> {
         || request.device_object_va == 0
         || !matches!(request.transfer_mode, BUFFERED | DIRECT | NEITHER)
         || (!read && !write)
-        || (read && (!request.input.is_empty()
-            || request.output_initial.len() != if request.transfer_mode == BUFFERED { 0 } else { request.output_capacity as usize }))
+        || (read
+            && (!request.input.is_empty()
+                || request.output_initial.len()
+                    != if request.transfer_mode == BUFFERED {
+                        0
+                    } else {
+                        request.output_capacity as usize
+                    }))
         || (write && (request.output_capacity != 0 || !request.output_initial.is_empty()))
         || request.event.is_some_and(|event| {
             event.local_id == 0 || event.object_slot_plus_one == 0 || event.object_generation == 0
@@ -222,7 +239,10 @@ fn payload_len(request: SourceFsdRequest<'_>) -> Result<usize, WireError> {
     {
         return Err(WireError::Malformed);
     }
-    request.input.len().checked_add(request.output_initial.len())
+    request
+        .input
+        .len()
+        .checked_add(request.output_initial.len())
         .map(|length| length.max(request.output_capacity as usize))
         .filter(|length| *length <= MAX_BUFFER_BYTES as usize)
         .ok_or(WireError::LengthMismatch)
@@ -286,22 +306,27 @@ fn header(packet: &[u8]) -> Result<SourceFsdRequest<'_>, WireError> {
     let capacity = u32_at(packet, 68);
     let initial_len = if major == nt_io_abi::major::IRP_MJ_READ as u32 && mode != BUFFERED {
         capacity as usize
-    } else { 0 };
-    let request_bytes = input_len.checked_add(initial_len).ok_or(WireError::LengthMismatch)?;
-    let expected = HEADER_BYTES.checked_add(request_bytes.max(capacity as usize))
+    } else {
+        0
+    };
+    let request_bytes = input_len
+        .checked_add(initial_len)
+        .ok_or(WireError::LengthMismatch)?;
+    let expected = HEADER_BYTES
+        .checked_add(request_bytes.max(capacity as usize))
         .ok_or(WireError::LengthMismatch)?;
     if packet.len() != expected || major > u8::MAX as u32 {
         return Err(WireError::LengthMismatch);
     }
-    if u32_at(packet, 0) != KIND || u32_at(packet, 4) != VERSION
-        || u32_at(packet, 124) != 0
-    {
+    if u32_at(packet, 0) != KIND || u32_at(packet, 4) != VERSION || u32_at(packet, 124) != 0 {
         return Err(WireError::Malformed);
     }
     let event = match (u64_at(packet, 72), u64_at(packet, 80), u64_at(packet, 88)) {
         (0, 0, 0) => None,
         (local_id, object_slot_plus_one, object_generation) => Some(EventIdentity {
-            local_id, object_slot_plus_one, object_generation,
+            local_id,
+            object_slot_plus_one,
+            object_generation,
         }),
     };
     let request = SourceFsdRequest {
@@ -324,11 +349,14 @@ fn header(packet: &[u8]) -> Result<SourceFsdRequest<'_>, WireError> {
 
 pub fn decode_request(packet: &[u8]) -> Result<SourceFsdRequest<'_>, WireError> {
     let request = header(packet)?;
-    if u64_at(packet, TOKEN_OFF) != 0 || u64_at(packet, INFORMATION_OFF) != 0
-        || u32_at(packet, STATUS_OFF) != 0 || u32_at(packet, COMPLETED_OFF) != 0
+    if u64_at(packet, TOKEN_OFF) != 0
+        || u64_at(packet, INFORMATION_OFF) != 0
+        || u32_at(packet, STATUS_OFF) != 0
+        || u32_at(packet, COMPLETED_OFF) != 0
         || u32_at(packet, OUTPUT_LENGTH_OFF) != 0
         || packet[HEADER_BYTES + request.input.len() + request.output_initial.len()..]
-            .iter().any(|byte| *byte != 0)
+            .iter()
+            .any(|byte| *byte != 0)
     {
         return Err(WireError::Malformed);
     }
@@ -337,7 +365,9 @@ pub fn decode_request(packet: &[u8]) -> Result<SourceFsdRequest<'_>, WireError> 
 
 pub fn publish_pending(packet: &mut [u8], token: u64) -> Result<(), WireError> {
     decode_request(packet)?;
-    if token == 0 { return Err(WireError::Malformed); }
+    if token == 0 {
+        return Err(WireError::Malformed);
+    }
     packet[HEADER_BYTES..].fill(0);
     put_u64(packet, TOKEN_OFF, token);
     put_u32(packet, STATUS_OFF, STATUS_PENDING);
@@ -345,10 +375,15 @@ pub fn publish_pending(packet: &mut [u8], token: u64) -> Result<(), WireError> {
 }
 
 pub fn publish_inline_terminal(
-    packet: &mut [u8], token: u64, status: u32, information: u64, output: &[u8],
+    packet: &mut [u8],
+    token: u64,
+    status: u32,
+    information: u64,
+    output: &[u8],
 ) -> Result<(), WireError> {
     let request = decode_request(packet)?;
-    if token == 0 || status == STATUS_PENDING
+    if token == 0
+        || status == STATUS_PENDING
         || !valid_information(request, information)
         || output.len() != completion_output_len(request, information)
     {
@@ -370,19 +405,28 @@ pub fn decode_response(packet: &[u8]) -> Result<SourceFsdResponse<'_>, WireError
     let status = u32_at(packet, STATUS_OFF);
     let information = u64_at(packet, INFORMATION_OFF);
     let length = u32_at(packet, OUTPUT_LENGTH_OFF) as usize;
-    if token == 0 { return Err(WireError::Malformed); }
+    if token == 0 {
+        return Err(WireError::Malformed);
+    }
     match u32_at(packet, COMPLETED_OFF) {
-        0 if status == STATUS_PENDING && information == 0 && length == 0
+        0 if status == STATUS_PENDING
+            && information == 0
+            && length == 0
             && packet[HEADER_BYTES..].iter().all(|byte| *byte == 0) =>
         {
             Ok(SourceFsdResponse::Pending { token })
         }
-        1 if status != STATUS_PENDING && valid_information(request, information)
+        1 if status != STATUS_PENDING
+            && valid_information(request, information)
             && length == completion_output_len(request, information)
-            && packet[HEADER_BYTES + length..].iter().all(|byte| *byte == 0) =>
+            && packet[HEADER_BYTES + length..]
+                .iter()
+                .all(|byte| *byte == 0) =>
         {
             Ok(SourceFsdResponse::Inline {
-                token, status, information,
+                token,
+                status,
+                information,
                 output: &packet[HEADER_BYTES..HEADER_BYTES + length],
             })
         }
@@ -395,15 +439,61 @@ mod tests {
     use super::*;
     use alloc::vec;
 
-    fn request<'a>(major: u8, mode: u32, input: &'a [u8], initial: &'a [u8], capacity: u32)
-        -> SourceFsdRequest<'a>
-    {
+    fn request<'a>(
+        major: u8,
+        mode: u32,
+        input: &'a [u8],
+        initial: &'a [u8],
+        capacity: u32,
+    ) -> SourceFsdRequest<'a> {
         SourceFsdRequest {
-            nonce: 1, source_irp_va: 0x1000, source_ticket_serial: 2,
-            native_allocation_generation: 3, device_object_va: 0x2000,
-            major, transfer_mode: mode, byte_offset: 44,
-            input, output_initial: initial, output_capacity: capacity, event: None,
+            nonce: 1,
+            source_irp_va: 0x1000,
+            source_ticket_serial: 2,
+            native_allocation_generation: 3,
+            device_object_va: 0x2000,
+            major,
+            transfer_mode: mode,
+            byte_offset: 44,
+            input,
+            output_initial: initial,
+            output_capacity: capacity,
+            event: None,
         }
+    }
+
+    #[test]
+    fn prepare_commit_and_stopped_discard_do_not_skip_or_replay_phases() {
+        let handoff = SourceFsdTerminalHandoff {
+            nonce: 1,
+            token: 2,
+            source_irp_va: 3,
+            source_ticket_serial: 4,
+            native_allocation_generation: 5,
+            status: 0,
+            information: 0,
+            output: &[],
+        };
+        let mut packet = [0; TERMINAL_HEADER_BYTES];
+        encode_terminal_handoff(handoff, &mut packet).unwrap();
+        assert!(publish_terminal_ack(&mut packet, TerminalPublication::Committed).is_err());
+        publish_terminal_ack(&mut packet, TerminalPublication::Published).unwrap();
+        assert!(publish_terminal_ack(&mut packet, TerminalPublication::Published).is_err());
+        publish_terminal_ack(&mut packet, TerminalPublication::CommitRequested).unwrap();
+        assert_eq!(decode_terminal_ack(&packet).unwrap().handoff, handoff);
+        publish_terminal_ack(&mut packet, TerminalPublication::Committed).unwrap();
+        assert_eq!(
+            decode_terminal_ack(&packet).unwrap().publication,
+            TerminalPublication::Committed
+        );
+        assert!(publish_terminal_ack(&mut packet, TerminalPublication::Committed).is_err());
+        encode_terminal_handoff(handoff, &mut packet).unwrap();
+        publish_terminal_ack(&mut packet, TerminalPublication::DiscardRequested).unwrap();
+        publish_terminal_ack(&mut packet, TerminalPublication::Discarded).unwrap();
+        assert_eq!(
+            decode_terminal_ack(&packet).unwrap().publication,
+            TerminalPublication::Discarded
+        );
     }
 
     #[test]
@@ -416,9 +506,15 @@ mod tests {
             encode_request(expected, &mut packet).unwrap();
             assert_eq!(decode_request(&packet), Ok(expected));
             publish_inline_terminal(&mut packet, 5, 0, 2, &[1, 2]).unwrap();
-            assert_eq!(decode_response(&packet), Ok(SourceFsdResponse::Inline {
-                token: 5, status: 0, information: 2, output: &[1, 2],
-            }));
+            assert_eq!(
+                decode_response(&packet),
+                Ok(SourceFsdResponse::Inline {
+                    token: 5,
+                    status: 0,
+                    information: 2,
+                    output: &[1, 2],
+                })
+            );
         }
     }
 
@@ -429,7 +525,10 @@ mod tests {
         encode_request(expected, &mut packet).unwrap();
         assert_eq!(decode_request(&packet), Ok(expected));
         publish_pending(&mut packet, 6).unwrap();
-        assert_eq!(decode_response(&packet), Ok(SourceFsdResponse::Pending { token: 6 }));
+        assert_eq!(
+            decode_response(&packet),
+            Ok(SourceFsdResponse::Pending { token: 6 })
+        );
     }
 
     #[test]
@@ -437,11 +536,17 @@ mod tests {
         let read = request(major::IRP_MJ_READ, BUFFERED, &[], &[], 4);
         let mut packet = vec![0; packet_len(read).unwrap()];
         encode_request(read, &mut packet).unwrap();
-        assert_eq!(publish_inline_terminal(&mut packet, 7, 0, 5, &[0; 4]), Err(WireError::Malformed));
+        assert_eq!(
+            publish_inline_terminal(&mut packet, 7, 0, 5, &[0; 4]),
+            Err(WireError::Malformed)
+        );
         let write = request(major::IRP_MJ_WRITE, BUFFERED, &[1, 2], &[], 0);
         let mut packet = vec![0; packet_len(write).unwrap()];
         encode_request(write, &mut packet).unwrap();
-        assert_eq!(publish_inline_terminal(&mut packet, 8, 0, 3, &[]), Err(WireError::Malformed));
+        assert_eq!(
+            publish_inline_terminal(&mut packet, 8, 0, 3, &[]),
+            Err(WireError::Malformed)
+        );
     }
 
     #[test]
@@ -462,10 +567,13 @@ mod tests {
         assert_eq!(decode_terminal_handoff(&packet), Ok(handoff));
         assert!(terminal_matches_request(request, handoff));
         publish_terminal_ack(&mut packet, TerminalPublication::Published).unwrap();
-        assert_eq!(decode_terminal_ack(&packet), Ok(SourceFsdTerminalAck {
-            handoff,
-            publication: TerminalPublication::Published,
-        }));
+        assert_eq!(
+            decode_terminal_ack(&packet),
+            Ok(SourceFsdTerminalAck {
+                handoff,
+                publication: TerminalPublication::Published,
+            })
+        );
         let mut wrong = handoff;
         wrong.source_ticket_serial += 1;
         assert!(!terminal_matches_request(request, wrong));
@@ -476,12 +584,23 @@ mod tests {
     #[test]
     fn terminal_rejects_pending_and_oversized_output() {
         let handoff = SourceFsdTerminalHandoff {
-            nonce: 1, token: 2, source_irp_va: 3, source_ticket_serial: 4,
-            native_allocation_generation: 5, status: STATUS_PENDING,
-            information: 0, output: &[],
+            nonce: 1,
+            token: 2,
+            source_irp_va: 3,
+            source_ticket_serial: 4,
+            native_allocation_generation: 5,
+            status: STATUS_PENDING,
+            information: 0,
+            output: &[],
         };
         let mut packet = [0; TERMINAL_HEADER_BYTES];
-        assert_eq!(encode_terminal_handoff(handoff, &mut packet), Err(WireError::Malformed));
-        assert_eq!(terminal_packet_len(MAX_BUFFER_BYTES as usize + 1), Err(WireError::LengthMismatch));
+        assert_eq!(
+            encode_terminal_handoff(handoff, &mut packet),
+            Err(WireError::Malformed)
+        );
+        assert_eq!(
+            terminal_packet_len(MAX_BUFFER_BYTES as usize + 1),
+            Err(WireError::LengthMismatch)
+        );
     }
 }

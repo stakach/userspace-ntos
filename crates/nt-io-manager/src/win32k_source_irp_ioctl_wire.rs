@@ -76,8 +76,7 @@ pub struct SourceIoctlTerminalHandoff<'a> {
     pub output: &'a [u8],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TerminalPublication { Published, Failed(u32) }
+pub use crate::source_terminal::TerminalPublication;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourceIoctlTerminalAck<'a> {
@@ -128,7 +127,9 @@ pub fn packet_len(code: u32, input_len: u32, output_capacity: u32) -> Result<usi
     let payload = if ioctl::method(code) == ioctl::METHOD_BUFFERED {
         input_len.max(output_capacity)
     } else {
-        input_len.checked_add(output_capacity).ok_or(WireError::LengthMismatch)?
+        input_len
+            .checked_add(output_capacity)
+            .ok_or(WireError::LengthMismatch)?
     };
     Ok(HEADER_BYTES + payload as usize)
 }
@@ -183,7 +184,9 @@ fn validate(request: &SourceIrpIoctlRequest<'_>) -> Result<(), WireError> {
         }
         _ => false,
     };
-    if !expected { return Err(WireError::Malformed); }
+    if !expected {
+        return Err(WireError::Malformed);
+    }
     Ok(())
 }
 
@@ -215,7 +218,11 @@ pub fn encode_request(
     put_u64(packet, OUTPUT_VA_OFF, request.output_va);
     put_u64(packet, IOSB_VA_OFF, request.iosb_va);
     put_u64(packet, SYSTEM_BUFFER_VA_OFF, request.system_buffer_va);
-    put_u64(packet, SYSTEM_BUFFER_GENERATION_OFF, request.system_buffer_generation);
+    put_u64(
+        packet,
+        SYSTEM_BUFFER_GENERATION_OFF,
+        request.system_buffer_generation,
+    );
     put_u64(packet, MDL_VA_OFF, request.mdl_va);
     put_u64(packet, MDL_GENERATION_OFF, request.mdl_generation);
     put_u64(packet, INPUT_VA_OFF, request.input_va);
@@ -223,8 +230,7 @@ pub fn encode_request(
     packet[HEADER_BYTES..HEADER_BYTES + request.input.len()].copy_from_slice(request.input);
     if !request.output_initial.is_empty() {
         let start = HEADER_BYTES + request.input.len();
-        packet[start..start + request.output_initial.len()]
-            .copy_from_slice(request.output_initial);
+        packet[start..start + request.output_initial.len()].copy_from_slice(request.output_initial);
     }
     Ok(())
 }
@@ -346,7 +352,8 @@ pub fn publish_inline_terminal(
     let request = decode_request(packet)?;
     if token == 0
         || status == STATUS_PENDING
-        || output.len() != completion_output_len(request.code, status, information, request.output_capacity)
+        || output.len()
+            != completion_output_len(request.code, status, information, request.output_capacity)
     {
         return Err(WireError::Malformed);
     }
@@ -397,7 +404,9 @@ pub fn decode_response(packet: &[u8]) -> Result<SourceIrpIoctlResponse<'_>, Wire
 }
 
 pub fn terminal_packet_len(output_len: usize) -> Result<usize, WireError> {
-    if output_len > MAX_BUFFER_BYTES as usize { return Err(WireError::LengthMismatch); }
+    if output_len > MAX_BUFFER_BYTES as usize {
+        return Err(WireError::LengthMismatch);
+    }
     Ok(TERMINAL_HEADER_BYTES + output_len)
 }
 
@@ -428,9 +437,13 @@ pub fn encode_terminal_handoff(
         || handoff.iosb_va == 0
         || (handoff.output_capacity != 0 && handoff.output_va == 0)
         || handoff.status == STATUS_PENDING
-        || handoff.output.len() != completion_output_len(
-            handoff.code, handoff.status, handoff.information, handoff.output_capacity,
-        )
+        || handoff.output.len()
+            != completion_output_len(
+                handoff.code,
+                handoff.status,
+                handoff.information,
+                handoff.output_capacity,
+            )
     {
         return Err(WireError::Malformed);
     }
@@ -458,7 +471,9 @@ fn terminal_header(packet: &[u8]) -> Result<SourceIoctlTerminalHandoff<'_>, Wire
         || u32_at(packet, 0) != TERMINAL_KIND
         || u32_at(packet, 4) != TERMINAL_VERSION
         || u32_at(packet, 76) as usize != packet.len() - TERMINAL_HEADER_BYTES
-        || packet[96..TERMINAL_HEADER_BYTES].iter().any(|byte| *byte != 0)
+        || packet[96..TERMINAL_HEADER_BYTES]
+            .iter()
+            .any(|byte| *byte != 0)
     {
         return Err(WireError::Malformed);
     }
@@ -485,9 +500,13 @@ fn terminal_header(packet: &[u8]) -> Result<SourceIoctlTerminalHandoff<'_>, Wire
         || handoff.iosb_va == 0
         || (handoff.output_capacity != 0 && handoff.output_va == 0)
         || handoff.status == STATUS_PENDING
-        || handoff.output.len() != completion_output_len(
-            handoff.code, handoff.status, handoff.information, handoff.output_capacity,
-        )
+        || handoff.output.len()
+            != completion_output_len(
+                handoff.code,
+                handoff.status,
+                handoff.information,
+                handoff.output_capacity,
+            )
     {
         return Err(WireError::Malformed);
     }
@@ -506,26 +525,30 @@ pub fn publish_terminal_ack(
     packet: &mut [u8],
     publication: TerminalPublication,
 ) -> Result<(), WireError> {
-    decode_terminal_handoff(packet)?;
-    match publication {
-        TerminalPublication::Published => put_u32(packet, 88, 1),
-        TerminalPublication::Failed(status) if status != 0 => {
-            put_u32(packet, 88, 2);
-            put_u32(packet, 92, status);
+    terminal_header(packet)?;
+    let previous = match (u32_at(packet, 88), u32_at(packet, 92)) {
+        (0, 0) => None,
+        (stage, status) => {
+            Some(TerminalPublication::decode(stage, status).ok_or(WireError::Malformed)?)
         }
-        TerminalPublication::Failed(_) => return Err(WireError::Malformed),
+    };
+    if !publication.can_follow(previous) {
+        return Err(WireError::Malformed);
     }
+    let (stage, status) = publication.words();
+    put_u32(packet, 88, stage);
+    put_u32(packet, 92, status);
     Ok(())
 }
 
 pub fn decode_terminal_ack(packet: &[u8]) -> Result<SourceIoctlTerminalAck<'_>, WireError> {
     let handoff = terminal_header(packet)?;
-    let publication = match (u32_at(packet, 88), u32_at(packet, 92)) {
-        (1, 0) => TerminalPublication::Published,
-        (2, status) if status != 0 => TerminalPublication::Failed(status),
-        _ => return Err(WireError::Malformed),
-    };
-    Ok(SourceIoctlTerminalAck { handoff, publication })
+    let publication = TerminalPublication::decode(u32_at(packet, 88), u32_at(packet, 92))
+        .ok_or(WireError::Malformed)?;
+    Ok(SourceIoctlTerminalAck {
+        handoff,
+        publication,
+    })
 }
 
 #[cfg(test)]
@@ -554,6 +577,44 @@ mod tests {
             input_va: 0,
             event_body_va: 0,
         }
+    }
+
+    #[test]
+    fn prepare_commit_and_stopped_discard_do_not_skip_or_replay_phases() {
+        let handoff = SourceIoctlTerminalHandoff {
+            nonce: 1,
+            token: 2,
+            source_irp_va: 3,
+            source_ticket_serial: 4,
+            native_allocation_generation: 5,
+            code: 0,
+            iosb_va: 6,
+            output_va: 0,
+            output_capacity: 0,
+            status: 0,
+            information: 0,
+            output: &[],
+        };
+        let mut packet = [0; TERMINAL_HEADER_BYTES];
+        encode_terminal_handoff(handoff, &mut packet).unwrap();
+        assert!(publish_terminal_ack(&mut packet, TerminalPublication::Committed).is_err());
+        publish_terminal_ack(&mut packet, TerminalPublication::Published).unwrap();
+        assert!(publish_terminal_ack(&mut packet, TerminalPublication::Published).is_err());
+        publish_terminal_ack(&mut packet, TerminalPublication::CommitRequested).unwrap();
+        assert_eq!(decode_terminal_ack(&packet).unwrap().handoff, handoff);
+        publish_terminal_ack(&mut packet, TerminalPublication::Committed).unwrap();
+        assert_eq!(
+            decode_terminal_ack(&packet).unwrap().publication,
+            TerminalPublication::Committed
+        );
+        assert!(publish_terminal_ack(&mut packet, TerminalPublication::Committed).is_err());
+        encode_terminal_handoff(handoff, &mut packet).unwrap();
+        publish_terminal_ack(&mut packet, TerminalPublication::DiscardRequested).unwrap();
+        publish_terminal_ack(&mut packet, TerminalPublication::Discarded).unwrap();
+        assert_eq!(
+            decode_terminal_ack(&packet).unwrap().publication,
+            TerminalPublication::Discarded
+        );
     }
 
     #[test]
@@ -724,7 +785,10 @@ mod tests {
             let mut packet = vec![0; packet_len(expected.code, 2, 4).unwrap()];
             encode_request(expected, &mut packet).unwrap();
             assert_eq!(decode_request(&packet), Ok(expected));
-            assert_eq!(&packet[HEADER_BYTES..HEADER_BYTES + 6], b"in\x09\x08\x07\x06");
+            assert_eq!(
+                &packet[HEADER_BYTES..HEADER_BYTES + 6],
+                b"in\x09\x08\x07\x06"
+            );
             publish_inline_terminal(&mut packet, 17, 0xc000_000d, 0, &seed).unwrap();
             assert_eq!(
                 decode_response(&packet),
@@ -761,17 +825,24 @@ mod tests {
                 output_capacity: request.output_capacity,
                 status: 0,
                 information: 2,
-                output: if method == ioctl::METHOD_BUFFERED { &output } else { &[0; 16] },
+                output: if method == ioctl::METHOD_BUFFERED {
+                    &output
+                } else {
+                    &[0; 16]
+                },
             };
             let mut packet = vec![0; terminal_packet_len(handoff.output.len()).unwrap()];
             encode_terminal_handoff(handoff, &mut packet).unwrap();
             assert!(terminal_matches_request(request, handoff));
             assert_eq!(decode_terminal_handoff(&packet), Ok(handoff));
             publish_terminal_ack(&mut packet, TerminalPublication::Published).unwrap();
-            assert_eq!(decode_terminal_ack(&packet), Ok(SourceIoctlTerminalAck {
-                handoff,
-                publication: TerminalPublication::Published,
-            }));
+            assert_eq!(
+                decode_terminal_ack(&packet),
+                Ok(SourceIoctlTerminalAck {
+                    handoff,
+                    publication: TerminalPublication::Published,
+                })
+            );
             packet[24] ^= 1;
             assert_ne!(decode_terminal_ack(&packet).unwrap().handoff, handoff);
         }
