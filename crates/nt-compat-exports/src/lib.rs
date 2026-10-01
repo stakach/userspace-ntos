@@ -19,6 +19,7 @@ pub mod memory;
 mod ntoskrnl;
 mod registry;
 pub mod rtl;
+pub mod source_probe_metrics;
 pub mod ssdt;
 pub mod win32k;
 pub mod win32k_resolve;

@@ -44257,6 +44257,60 @@ fn hosted_irp_dispatch_request(
     })
 }
 
+fn hosted_irp_explicit_transfer_dispatch(
+    instance: usize,
+    mut ctx: DispatchContext<'_>,
+    irp: &IrpProjection,
+) -> Result<HostedIrpTransportResult, nt_status::NtStatus> {
+    let buffer = irp.buffer.ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let input_len = buffer.input_len as usize;
+    let output_len = buffer.output_len as usize;
+    let control = matches!(
+        irp.major,
+        major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+    );
+    let method = ioctl::method(projection_fsctl(irp) as u32);
+    let input_buffer = if control {
+        ctx.ioctl_input_buffer(method)
+    } else if matches!(irp.major, major::IRP_MJ_READ | major::IRP_MJ_WRITE) {
+        ctx.direct_buffer
+            .as_deref()
+            .or(ctx.user_buffer.as_deref())
+            .unwrap_or(ctx.system_buffer)
+    } else {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    };
+    let input_buffer = input_buffer
+        .get(..input_len)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let mut input = Vec::new();
+    input
+        .try_reserve_exact(input_len)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    input.extend_from_slice(input_buffer);
+    let output_buffer = if control {
+        ctx.ioctl_output_buffer_mut(method)
+    } else if let Some(buffer) = ctx.direct_buffer.as_deref_mut() {
+        buffer
+    } else if let Some(buffer) = ctx.user_buffer.as_deref_mut() {
+        buffer
+    } else {
+        &mut *ctx.system_buffer
+    };
+    let output = output_buffer
+        .get_mut(..output_len)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    // execute copies both banks into owned native transfer storage before peer entry;
+    // pending native IRPs never retain these borrowed DispatchContext slices.
+    Ok(hosted_file_dispatch::execute(
+        instance,
+        Some(unsafe { crate::initial_system_driver_caller() }),
+        irp,
+        &input,
+        output,
+    ))
+}
+
 impl DriverDispatchBackend for HostedDriverBackend {
     fn dispatch_irp(
         &mut self,
@@ -44266,21 +44320,27 @@ impl DriverDispatchBackend for HostedDriverBackend {
         if irp.requestor_tid != 0 {
             return Err(nt_status::NtStatus::INVALID_HANDLE);
         }
-        let (input_len, output_len) = projection_buffer_extents(irp, ctx.system_buffer.len());
-        let separate_output = projection_uses_separate_output(irp) && output_len != 0;
-        let output_offset = if separate_output { input_len } else { 0 };
-        let output_end = match output_offset.checked_add(output_len) {
-            Some(end) if end <= ctx.system_buffer.len() => end,
-            _ => return Err(nt_status::NtStatus::INVALID_PARAMETER),
+        let result = if ctx.has_nonbuffered_transfer() {
+            hosted_irp_explicit_transfer_dispatch(self.instance, ctx, irp)?
+        } else {
+            // Legacy File transport supplies one combined bank, with separate output
+            // following input for direct/Neither controls and EA/quota requests.
+            let (input_len, output_len) = projection_buffer_extents(irp, ctx.system_buffer.len());
+            let separate_output = projection_uses_separate_output(irp) && output_len != 0;
+            let output_offset = if separate_output { input_len } else { 0 };
+            let output_end = match output_offset.checked_add(output_len) {
+                Some(end) if end <= ctx.system_buffer.len() => end,
+                _ => return Err(nt_status::NtStatus::INVALID_PARAMETER),
+            };
+            let input = Vec::from(&ctx.system_buffer[..input_len]);
+            hosted_file_dispatch::execute(
+                self.instance,
+                Some(unsafe { crate::initial_system_driver_caller() }),
+                irp,
+                &input,
+                &mut ctx.system_buffer[output_offset..output_end],
+            )
         };
-        let input = Vec::from(&ctx.system_buffer[..input_len]);
-        let result = hosted_file_dispatch::execute(
-            self.instance,
-            Some(unsafe { crate::initial_system_driver_caller() }),
-            irp,
-            &input,
-            &mut ctx.system_buffer[output_offset..output_end],
-        );
         match result {
             HostedIrpTransportResult::NotDispatched { status } => Err(status),
             HostedIrpTransportResult::Returned {
@@ -57219,13 +57279,18 @@ pub(crate) unsafe fn redrive_nested_hosted_kernel_file_read_query(handler: *mut 
     hosted_kernel_file_read_query::redrive_nested_ready(handler)
 }
 
+pub(crate) unsafe fn redrive_win32k_source_work(handler: *mut ExecNtHandler) -> bool {
+    let ioctl = hosted_kernel_win32k_source_ioctl::redrive(handler);
+    let pnp = hosted_kernel_win32k_source_pnp::redrive(handler);
+    let fsd = hosted_kernel_win32k_source_fsd::redrive(handler);
+    ioctl || pnp || fsd
+}
+
 pub(crate) unsafe fn redrive_hosted_driver_zw_read_query_file(handler: *mut ExecNtHandler) {
     hosted_kernel_file_read_query::redrive(handler);
     hosted_kernel_win32k_async_read::redrive(handler);
     hosted_kernel_win32k_buffered_ioctl::redrive(handler);
-    hosted_kernel_win32k_source_ioctl::redrive(handler);
-    hosted_kernel_win32k_source_pnp::redrive(handler);
-    hosted_kernel_win32k_source_fsd::redrive(handler);
+    let _ = redrive_win32k_source_work(handler);
     hosted_kernel_file_cancel::redrive(handler);
 }
 

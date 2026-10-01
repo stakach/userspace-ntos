@@ -95,14 +95,15 @@ fn parameter(key: &nt_config_client::HiveKeySnapshot, name: &str) -> Result<Opti
 
 /// Profile metadata selects both the real service-created target and checked source image.
 /// Neither source packet dispatch nor production routing recognizes a fixture image/name.
-pub(crate) unsafe fn run_configured() -> i32 {
+pub(crate) unsafe fn run_configured(handler: *mut ExecNtHandler) -> i32 {
+    if handler.is_null() { return 0xc000_000du32 as i32; }
     if STARTED.swap(true, Ordering::AcqRel) { return 0xc000_009eu32 as i32; }
     let _durable = crate::allocator::enter_durable();
     *core::ptr::addr_of_mut!(OWNER) = Some(Owner {
         module: None, registration: None, reference: None,
         returned: [None; 2], indeterminate: false,
     });
-    let result = configured().and_then(|(device, source, export)| run(device, &source, &export));
+    let result = configured().and_then(|(device, source, export)| run(device, &source, &export, handler));
     let status = result.err().unwrap_or(0);
     print_str(b"[source-irp-integration] returned status=0x"); print_hex(status as u32);
     print_str(b" immediate="); print_u64(u64::from(owner().returned[0].is_some()));
@@ -139,7 +140,7 @@ unsafe fn configured() -> Result<(DeviceId, String, String), i32> {
     selection.ok_or(0xc000_0034u32 as i32)
 }
 
-unsafe fn run(device: DeviceId, source_leaf: &str, export_name: &str) -> Result<(), i32> {
+unsafe fn run(device: DeviceId, source_leaf: &str, export_name: &str, handler: *mut ExecNtHandler) -> Result<(), i32> {
     use crate::spawn_hosts::shared_ingress::owner::runtime;
     let route = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref()
         .and_then(|lanes| lanes.iter().find(|lane| lane.primary.is_some()))
@@ -158,6 +159,7 @@ unsafe fn run(device: DeviceId, source_leaf: &str, export_name: &str) -> Result<
     io.reference_hosted_device_pointer(registration).map_err(|status| status.raw())?;
     let reference = io.take_hosted_device_pointer_reference(registration).map_err(|status| status.raw())?;
     owner().reference = Some(reference);
+    let baseline = crate::driver_launch::source_observability::probe_snapshot();
     for mode in 0..2usize {
         let mut entered = false;
         let (value, completed) = win32k_dispatch_kernel_job_observed(
@@ -174,6 +176,7 @@ unsafe fn run(device: DeviceId, source_leaf: &str, export_name: &str) -> Result<
         if status != 0 { return Err(status); }
         observation?;
     }
+    prove_retirement(baseline, handler)?;
     // Do not hold any registry or owner borrow across the native lane dispatch above.
     let reference = owner().reference.as_mut().expect("canonical target reference");
     reference.release(crate::driver_launch::io_manager_mut()).map_err(|status| status.raw())?;
@@ -184,6 +187,50 @@ unsafe fn run(device: DeviceId, source_leaf: &str, export_name: &str) -> Result<
     // The loader's honest unload contract is currently unsupported. Keep the module load
     // receipt recorded instead of pretending a reference decrement retired native mappings.
     Ok(())
+}
+
+/// Event visibility precedes retirement of the retained semantic Reply. Continue the ordinary
+/// owned work pump only while it makes real progress, without borrowing the handler across IPC.
+unsafe fn prove_retirement(
+    baseline: nt_compat_exports::source_probe_metrics::Snapshot,
+    handler: *mut ExecNtHandler,
+) -> Result<(), i32> {
+    loop {
+        let delta = crate::driver_launch::source_observability::probe_snapshot()
+            .delta_since(baseline).ok_or(0xc000_0001u32 as i32)?;
+        if delta.proves_twelve_operations() {
+            report_probe_milestones(delta);
+            return Ok(());
+        }
+        if !crate::driver_launch::redrive_win32k_source_work(handler) {
+            // Keep the module and target receipts on failure; no request is replayed.
+            let final_delta = crate::driver_launch::source_observability::probe_snapshot()
+                .delta_since(baseline).ok_or(0xc000_0001u32 as i32)?;
+            report_probe_milestones(final_delta);
+            return if final_delta.proves_twelve_operations() {
+                Ok(())
+            } else {
+                Err(0xc000_0001u32 as i32)
+            };
+        }
+    }
+}
+
+fn report_probe_milestones(delta: nt_compat_exports::source_probe_metrics::Snapshot) {
+    print_str(b"[source-irp-milestones]");
+    for (name, values) in [
+        (b" ioctl=".as_slice(), delta.ioctl),
+        (b" read=".as_slice(), delta.read),
+        (b" write=".as_slice(), delta.write),
+        (b" methods=".as_slice(), delta.methods),
+    ] {
+        print_str(name);
+        for (index, value) in values.into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
+    }
+    print_str(b"\n");
 }
 
 /// Only the root's feature-only, authenticated kernel request can reach this branch. The entry

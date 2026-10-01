@@ -9024,7 +9024,7 @@ pub(crate) unsafe fn service_sec_image(
     #[cfg(feature = "source-irp-integration")]
     {
         // The live handler and source redrive context exist; SMSS is still suspended.
-        let status = crate::win32k_glue::source_irp_integration::run_configured();
+        let status = crate::win32k_glue::source_irp_integration::run_configured(nt_handler as *mut _);
         assert_eq!(status, 0, "native source IRP fixture did not prove completion");
     }
     #[cfg(not(feature = "mup-provider-kernel-only"))]

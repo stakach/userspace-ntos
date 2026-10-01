@@ -797,6 +797,7 @@ impl Work {
             {
                 crate::provider_bugcheck::report(0xc4, [self.source_address, transferred.relation.base, 0, 47]);
             }
+            record_target_relation_transfer(self, &transferred);
         }
         self.relation_transferred = true;
         }
@@ -990,6 +991,33 @@ impl Work {
     }
 }
 
+fn record_target_relation_transfer(work: &Work, transferred: &nt_pnp_manager::TransferredTargetRelation) {
+    #[cfg(feature = "source-irp-integration")]
+    {
+        let provider = work.relation_allocation.provider_identity();
+        let native = work.relation_allocation.native_identity();
+        let registration = transferred.pdo_reference;
+        let domain = registration.domain();
+        let physical = work.route.identity();
+        print_str(b"[source-receipt] relation-transfer provider="); print_u64(provider.domain);
+        print_str(b" generation="); print_u64(provider.generation);
+        print_str(b" relation="); print_u64(transferred.relation.base);
+        print_str(b" native-id="); print_u64(native.allocation_id);
+        print_str(b" native-generation="); print_u64(native.allocation_generation);
+        print_str(b" pdo="); print_u64(registration.address());
+        print_str(b" device="); print_u64(registration.device_id().raw());
+        print_str(b" domain="); print_u64(domain.domain_id.raw());
+        print_str(b" cookie="); print_u64(domain.cookie);
+        print_str(b" physical-domain="); print_u64(physical.domain);
+        print_str(b" physical-generation="); print_u64(physical.domain_generation);
+        print_str(b" executor="); print_u64(physical.executor);
+        print_str(b" dispatch="); print_u64(work.dispatch.epoch());
+        print_str(b"\n");
+    }
+    #[cfg(not(feature = "source-irp-integration"))]
+    let _ = (work, transferred);
+}
+
 unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> bool {
     let _durable = crate::allocator::enter_durable();
     let count = (&*core::ptr::addr_of!(WORK)).len();
@@ -1016,8 +1044,8 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
     progressed
 }
 
-pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
-    let _ = redrive_one(handler, false);
+pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) -> bool {
+    redrive_one(handler, false)
 }
 
 pub(super) unsafe fn nested_work_ready() -> bool {

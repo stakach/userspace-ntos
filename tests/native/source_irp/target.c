@@ -51,7 +51,10 @@ static NTSTATUS Complete(IRP *irp)
         operation = method + 2;
         if (mode > 1 || code != PROBE_IOCTL(mode, method) ||
             stack->Parameters.DeviceIoControl.InputBufferLength != PROBE_BYTES ||
-            stack->Parameters.DeviceIoControl.OutputBufferLength != PROBE_BYTES) goto done;
+            stack->Parameters.DeviceIoControl.OutputBufferLength != PROBE_BYTES) {
+            DbgPrint("[source-irp-reject] control lengths or code\n");
+            goto done;
+        }
         const uint8_t *input;
         if (method == METHOD_NEITHER) {
             if (irp->MdlAddress != NULL || irp->AssociatedSystemBuffer != NULL) goto done;
@@ -59,7 +62,10 @@ static NTSTATUS Complete(IRP *irp)
             destination = irp->UserBuffer;
         } else {
             input = irp->AssociatedSystemBuffer;
-            if (stack->Parameters.DeviceIoControl.Type3InputBuffer != NULL) goto done;
+            if (stack->Parameters.DeviceIoControl.Type3InputBuffer != NULL) {
+                DbgPrint("[source-irp-reject] unexpected Type3InputBuffer\n");
+                goto done;
+            }
             if (method == METHOD_BUFFERED) {
                 if (irp->MdlAddress != NULL) goto done;
                 destination = irp->AssociatedSystemBuffer;
@@ -69,13 +75,22 @@ static NTSTATUS Complete(IRP *irp)
                     mdl->ByteCount != PROBE_BYTES || mdl->MappedSystemVa == NULL ||
                     (mdl->MdlFlags & 3) != 3 || mdl->ByteOffset >= 4096 ||
                     (uintptr_t)mdl->StartVa + mdl->ByteOffset != (uintptr_t)mdl->MappedSystemVa)
+                {
+                    DbgPrint("[source-irp-reject] MDL layout or mapping\n");
                     goto done;
+                }
                 if (method == METHOD_IN_DIRECT) {
-                    if (!ProbeMatches(mdl->MappedSystemVa, ProbeSeed)) goto done;
+                    if (!ProbeMatches(mdl->MappedSystemVa, ProbeSeed)) {
+                        DbgPrint("[source-irp-reject] IN_DIRECT second-buffer contents\n");
+                        goto done;
+                    }
                 } else destination = mdl->MappedSystemVa;
             }
         }
-        if (!ProbeMatches(input, ProbeInput)) goto done;
+        if (!ProbeMatches(input, ProbeInput)) {
+            DbgPrint("[source-irp-reject] control input contents\n");
+            goto done;
+        }
         if (method != METHOD_IN_DIRECT && destination == NULL) goto done;
     } else goto done;
     if (destination != NULL)

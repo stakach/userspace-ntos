@@ -842,8 +842,8 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
     progressed
 }
 
-pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
-    let _ = redrive_one(handler, false);
+pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) -> bool {
+    redrive_one(handler, false)
 }
 
 pub(super) unsafe fn nested_work_ready() -> bool {

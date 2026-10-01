@@ -1720,6 +1720,7 @@ impl ProviderPoolPacketLease {
     pub(crate) fn address(self) -> u64 { self.pointer }
     pub(crate) fn native_identity(self) -> shared_pool::AllocationIdentity { self.allocation }
     pub(crate) fn capacity(self) -> u64 { self.capacity }
+    pub(crate) fn provider_identity(self) -> nt_provider_wait::ProviderDomainIdentity { self.provider }
 }
 
 #[derive(Clone, Copy)]
@@ -1916,6 +1917,7 @@ unsafe fn release_reserved_provider_pool(
     retirement: ProviderPoolRetirement,
     reclaim: Option<nt_kernel_exec::ProviderEventProjectionReclaim>,
 ) -> bool {
+    let provider = registered_provider_wait_domain();
     for allocation in retirement.allocations.iter().copied() {
         if !retire_provider_allocation_events(allocation) {
             print_str(b"[win32k-host] fatal provider-pool Event retirement commit failure\n");
@@ -1959,7 +1961,49 @@ unsafe fn release_reserved_provider_pool(
         print_str(b"[win32k-host] fatal provider-pool release commit failure\n");
         park();
     }
+    for (index, &pointer) in retirement.pointers.iter().enumerate() {
+        record_provider_allocation_free(
+            provider, pointer, retirement.shared_identities[index], retirement.allocations[index],
+        );
+    }
     true
+}
+
+fn record_provider_allocation_free(
+    provider: Option<nt_provider_wait::ProviderDomainIdentity>,
+    address: u64,
+    native: shared_pool::AllocationIdentity,
+    allocation: nt_provider_wait::ProviderAllocationSnapshot,
+) {
+    #[cfg(feature = "source-irp-integration")]
+    {
+        let Some(provider) = provider else { return; };
+        print_str(b"[source-receipt] allocation-free provider="); print_u64(provider.domain);
+        print_str(b" generation="); print_u64(provider.generation);
+        print_str(b" address="); print_u64(address);
+        print_str(b" native-id="); print_u64(native.allocation_id);
+        print_str(b" native-generation="); print_u64(native.allocation_generation);
+        print_str(b" arena="); print_u64(allocation.identity.arena.id);
+        print_str(b" arena-generation="); print_u64(allocation.identity.arena.generation);
+        print_str(b" catalog-id="); print_u64(allocation.identity.allocation_id);
+        print_str(b" catalog-generation="); print_u64(allocation.identity.generation);
+        print_str(b"\n");
+    }
+    #[cfg(not(feature = "source-irp-integration"))]
+    let _ = (provider, address, native, allocation);
+}
+
+pub(crate) fn record_device_pointer_dereference_ack(address: u64, count: u64) {
+    #[cfg(feature = "source-irp-integration")]
+    {
+        let Some(provider) = registered_provider_wait_domain() else { return; };
+        print_str(b"[source-receipt] pdo-dereference-ack provider="); print_u64(provider.domain);
+        print_str(b" generation="); print_u64(provider.generation);
+        print_str(b" address="); print_u64(address);
+        print_str(b" count="); print_u64(count); print_str(b"\n");
+    }
+    #[cfg(not(feature = "source-irp-integration"))]
+    let _ = (address, count);
 }
 
 unsafe fn provider_pool_free(p: u64) -> bool {

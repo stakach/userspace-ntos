@@ -22,6 +22,11 @@ for mode in range(2):
     if f"[source-irp-proof-complete] mode={mode} operations=6" not in text:
         sys.exit(f"Source IRP mode {mode} did not complete")
 reports = re.findall(r"\[source-native\][^\n]*", text)
+milestones = re.findall(r"\[source-irp-milestones\][^\n]*", text)
+expected_milestones = ("[source-irp-milestones] ioctl=8/8/8/8 read=2/2/2/2 "
+                       "write=2/2/2/2 methods=2/2/2/2")
+if milestones != [expected_milestones]:
+    sys.exit("Missing exact isolated twelve-operation commit/retirement proof")
 if not reports:
     sys.exit("No native source milestone report")
 report = reports[-1]

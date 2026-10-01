@@ -60,6 +60,26 @@ pub(super) fn retired(kind: Kind) {
         .fetch_add(1, Ordering::Relaxed);
 }
 
+/// The validation profile runs its isolated probe before starting NT user images.
+#[cfg(feature = "source-irp-integration")]
+pub(crate) fn probe_snapshot() -> nt_compat_exports::source_probe_metrics::Snapshot {
+    fn read(kind: Kind) -> [u64; 4] {
+        let counters = &COUNTS[kind as usize];
+        [
+            counters.terminal.load(Ordering::Relaxed),
+            counters.origin.load(Ordering::Relaxed),
+            counters.canonical.load(Ordering::Relaxed),
+            counters.retired.load(Ordering::Relaxed),
+        ]
+    }
+    nt_compat_exports::source_probe_metrics::Snapshot {
+        ioctl: read(Kind::Ioctl),
+        read: read(Kind::Read),
+        write: read(Kind::Write),
+        methods: core::array::from_fn(|index| IOCTL_METHODS[index].load(Ordering::Relaxed)),
+    }
+}
+
 /// Returns a verdict only when each source kind reached a real native terminal.
 /// This proves milestone coverage, not that every request has drained at this snapshot.
 pub(crate) fn report() -> Option<bool> {
