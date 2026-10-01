@@ -12,6 +12,13 @@ Event and request packet before entering the broker. The executive authenticates
 the physical lane and device projection, and retains the canonical operation and
 native provider resources until strict completion acknowledgement.
 
+Root-owned shared-pool allocations use physical arena-incarnation, allocation
+generation and exclusive ownership-token receipts. Ordinary frees are denied
+while pinned. Component-private catalogs admit only freshly allocated, unpinned
+blocks; they cannot adopt root-owned storage. Root projection retirement retains
+its canonical object and wait preflights before exact shared-pool retirement,
+without reading a component's private-heap catalog.
+
 For a pending operation, the origin records the returned token before sending an
 authenticated pending-armed receipt. Completion delivery waits for that receipt.
 Inline and pending delivery are distinct immutable terminal packet properties.

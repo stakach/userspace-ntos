@@ -193,6 +193,23 @@ pub fn allocation_identity<M: PoolMemory>(
     })
 }
 
+/// Admit only an exact, unowned native block into component-private lifetime metadata.
+/// The embedding owner must hold the arena's physical lock through catalog registration.
+/// Root-owned blocks retain an exclusive pin and must never be adopted by a private catalog.
+pub fn validate_private_admission<M: PoolMemory>(
+    memory: &M,
+    allocation: AllocationIdentity,
+) -> Result<(), PoolError> {
+    if allocation_identity(memory, allocation.allocation_id)? != allocation {
+        return Err(PoolError::StalePin);
+    }
+    let word = allocation.allocation_id - HEADER_SIZE + HEADER_RESERVED_OFFSET;
+    if read(memory, word)? != 0 {
+        return Err(PoolError::Pinned);
+    }
+    Ok(())
+}
+
 /// The embedding owner must serialize all operations with the arena's physical lock.
 pub fn pin_exclusive<M: PoolMemory>(
     memory: &mut M,
@@ -714,6 +731,33 @@ mod tests {
         retire_pinned(&mut memory, pin).unwrap();
         assert!(!pin_live(&memory, pin));
         assert_eq!(retire_pinned(&mut memory, pin), Err(PoolError::StalePin));
+    }
+
+    #[test]
+    fn private_catalog_admission_rejects_exclusive_owner_and_recycled_identity() {
+        let mut memory = arena();
+        let allocation = allocate(&mut memory, 64, true).unwrap();
+        assert_eq!(
+            validate_private_admission(&memory, allocation.identity),
+            Ok(())
+        );
+        let pin = pin_exclusive(&mut memory, allocation.identity).unwrap();
+        assert_eq!(
+            validate_private_admission(&memory, allocation.identity),
+            Err(PoolError::Pinned)
+        );
+        assert!(pin_live(&memory, pin));
+        retire_pinned(&mut memory, pin).unwrap();
+        let replacement = allocate(&mut memory, 64, true).unwrap();
+        assert_eq!(replacement.payload_offset, allocation.payload_offset);
+        assert_eq!(
+            validate_private_admission(&memory, allocation.identity),
+            Err(PoolError::StalePin)
+        );
+        assert_eq!(
+            validate_private_admission(&memory, replacement.identity),
+            Ok(())
+        );
     }
 
     #[test]
