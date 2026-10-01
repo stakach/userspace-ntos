@@ -38,6 +38,7 @@ mod mutant;
 pub mod np_prefix;
 pub mod provider_pool;
 pub mod process_attach;
+pub mod push_lock;
 pub mod provider_bugcheck;
 pub mod rtl_atom;
 pub mod rtl_bitmap;
