@@ -10,6 +10,7 @@ use crate::{
 
 const ENUM_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Enum";
 const CLASS_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Control\Class";
+#[cfg(test)]
 const REG_SZ: u32 = 1;
 const REG_MULTI_SZ: u32 = 7;
 
@@ -31,18 +32,11 @@ fn value<'a>(key: &'a HiveKeySnapshot, name: &str) -> Option<&'a HiveValueSnapsh
 }
 
 fn reg_sz(value: &HiveValueSnapshot) -> Result<String, i32> {
-    if value.value_type != REG_SZ || value.data.len() < 4 || value.data.len() % 2 != 0 {
+    if value.data.len() < 4 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let units: Vec<_> = value
-        .data
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect();
-    if units.last() != Some(&0) || units[..units.len() - 1].contains(&0) {
-        return Err(STATUS_INVALID_PARAMETER);
-    }
-    String::from_utf16(&units[..units.len() - 1]).map_err(|_| STATUS_INVALID_PARAMETER)
+    crate::decode_terminated_reg_sz(value.value_type, &value.data)
+        .ok_or(STATUS_INVALID_PARAMETER)
 }
 
 fn filter_list(key: &HiveKeySnapshot, name: &str) -> Result<Vec<String>, i32> {
