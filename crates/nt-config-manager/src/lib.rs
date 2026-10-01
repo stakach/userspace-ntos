@@ -17,6 +17,7 @@ extern crate alloc;
 
 mod property;
 mod registry;
+mod filter_policy;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -29,6 +30,7 @@ pub use registry::{
     encode_multi_sz, encode_sz, Registry, RegistryKeyId, RegistryTransaction, RegistryValue,
     RegistryValueType,
 };
+pub use filter_policy::{DeviceFilterPolicy, DeviceFilterPolicyError};
 
 /// The NT root-bus pseudo-devnode exposed through user-mode PnP relations.
 pub const PNP_ROOT_DEVICE_INSTANCE: &str = r"HTREE\ROOT\0";

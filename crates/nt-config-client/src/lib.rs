@@ -14,6 +14,8 @@ extern crate alloc;
 mod retained_snapshot_integration;
 
 mod active_driver_service;
+mod filter_policy;
+pub use filter_policy::DeviceFilterPolicySnapshot;
 mod runtime_key;
 mod system_mount;
 pub use system_mount::{SystemHiveMount, SystemHiveMountState};
@@ -124,7 +126,6 @@ const STATUS_REGISTRY_CORRUPT: i32 = 0xC000_014Cu32 as i32;
 const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 #[cfg(test)]
 const STATUS_DEVICE_BUSY: i32 = 0x8000_0011u32 as i32;
-#[cfg(test)]
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
 

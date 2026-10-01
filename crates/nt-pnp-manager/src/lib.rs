@@ -12,11 +12,13 @@ extern crate alloc;
 
 mod bus_properties;
 mod bus_relations;
+mod critical_child_start;
 mod relation_owners;
 mod target_device_relation;
 
 pub use bus_properties::*;
 pub use bus_relations::*;
+pub use critical_child_start::*;
 pub use relation_owners::*;
 pub use target_device_relation::*;
 
