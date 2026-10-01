@@ -1,5 +1,12 @@
 # Lessons
 
+## Shared Locks Across Suspended Provider Lanes
+- A root-side yield loop cannot acquire a lock held by an execution-held provider lane.
+  Inspect live syscall return addresses and execution holds, not only the last fault RIP.
+- Root lease revalidation must defer on contention without dropping ownership. For packet
+  effects, distinguish known zero-effect Busy from uncertainty; after a committed ACK,
+  retain readback/retirement phases and never replay the original command to retry cleanup.
+
 ## Build / verification
 - **build.sh silently leaves a STALE rootserver.elf if `cargo build` fails** (documented in
   MEMORY too). A non-ASCII char (em-dash `—`) inside a `b"..."` byte-string literal is a HARD

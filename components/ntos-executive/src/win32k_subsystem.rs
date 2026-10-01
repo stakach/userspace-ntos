@@ -1578,6 +1578,16 @@ unsafe fn provider_pool_lock() -> Option<ProviderPoolLockGuard> {
     Some(ProviderPoolLockGuard)
 }
 
+unsafe fn try_provider_pool_lock() -> Option<ProviderPoolLockGuard> {
+    if !provider_pool_ready() {
+        return None;
+    }
+    let lock = &*((WIN32K_POOL_VADDR + shared_pool::LOCK_OFFSET) as *const AtomicU64);
+    lock.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .ok()
+        .map(|_| ProviderPoolLockGuard)
+}
+
 unsafe fn provider_metadata_pool_lock() -> Option<(ProviderMetadataGuard, ProviderPoolLockGuard)> {
     if !provider_pool_ready() {
         return None;
@@ -1846,7 +1856,9 @@ pub(crate) unsafe fn provider_pool_packet_lease_live(lease: ProviderPoolPacketLe
     if registered_provider_wait_domain() != Some(lease.provider) {
         return false;
     }
-    let Some(_guard) = provider_pool_lock() else { return false };
+    // Root can hold the provider's execution while it owns this physical lock.
+    // Busy means not revalidated now, not permission to retire or discard the lease.
+    let Some(_guard) = try_provider_pool_lock() else { return false };
     let offset = lease.pointer - WIN32K_POOL_VADDR;
     let memory = ProviderPoolMemory;
     shared_pool::allocation_identity(&memory, offset) == Ok(lease.allocation)
