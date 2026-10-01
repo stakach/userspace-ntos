@@ -7,18 +7,17 @@
 
 #![no_std]
 
-mod control;
 pub mod caller_aperture;
+mod control;
 pub use control::{classify_start_io_status, VideoControlCompletion, VideoControlProtocolError};
 mod lifecycle;
 mod pnp;
-pub use pnp::owns_target_device_relation;
 pub use lifecycle::{
     validate_device_control_requestor, VideoAdapterDiscoveryState,
-    VideoHardwareInitializationState, VideoOpenAction,
-    VideoOpenCompletion, VideoPortDeviceState, VideoPortDeviceStateCell, VideoPortLifecycleError,
-    VIDEO_PORT_DEVICE_STATE_SIZE,
+    VideoHardwareInitializationState, VideoOpenAction, VideoOpenCompletion, VideoPortDeviceState,
+    VideoPortDeviceStateCell, VideoPortLifecycleError, VIDEO_PORT_DEVICE_STATE_SIZE,
 };
+pub use pnp::owns_target_device_relation;
 
 pub const FILE_DEVICE_VIDEO: u32 = 0x23;
 
@@ -697,7 +696,7 @@ impl<A: VideoMiniportAdapter> VideoPort<A> {
             IOCTL_VIDEO_INIT_WIN32K_CALLBACKS => {
                 write_win32k_callbacks(input, output, self.video_device_object)
             }
-            IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Ok(0),
+            IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Err(VideoMiniportError::UnsupportedIoctl),
             _ => self.adapter.dispatch_io_control(ioctl, input, output),
         }
     }
@@ -729,7 +728,7 @@ impl<A: VideoMiniportAdapter> VideoPort<A> {
                     self.video_device_object,
                 )
             }
-            IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Ok(0),
+            IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Err(VideoMiniportError::UnsupportedIoctl),
             _ => self.adapter.dispatch_buffered_io_control(
                 ioctl,
                 system_buffer,
@@ -1756,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn video_port_control_unmap_is_a_visible_success_noop() {
+    fn video_port_control_unmap_fails_without_changing_buffers() {
         let mut out = [0xCCu8; 8];
         assert_eq!(
             VideoPort::new(miniport(), 0x1234).dispatch_io_control(
@@ -1764,7 +1763,17 @@ mod tests {
                 &[],
                 &mut out,
             ),
-            Ok(0)
+            Err(VideoMiniportError::UnsupportedIoctl)
+        );
+        assert_eq!(out, [0xCCu8; 8]);
+        assert_eq!(
+            VideoPort::new(miniport(), 0x1234).dispatch_buffered_io_control(
+                IOCTL_VIDEO_UNMAP_VIDEO_MEMORY,
+                &mut out,
+                0,
+                8,
+            ),
+            Err(VideoMiniportError::UnsupportedIoctl)
         );
         assert_eq!(out, [0xCCu8; 8]);
     }

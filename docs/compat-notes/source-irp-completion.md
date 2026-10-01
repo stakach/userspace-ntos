@@ -44,3 +44,23 @@ Nested readiness predicates only inspect exact completed state or immutable,
 generation-bound backend readiness. They do not pump the I/O manager, claim
 completion, or retry native effects. Effectful progress starts after the parent
 execution lane has been parked.
+
+## Caller resource mappings
+
+A video-memory pointer is publishable only after all pages of the registered
+resource extent have been mapped into the authenticated physical caller's
+VSpace. The miniport's eager mapping prefix is not proof that the caller can
+access the complete aperture. Image names do not select mapping authority.
+
+Mapping identity includes the original resource-context lease, exact device,
+resource index, caller domain and generation, VSpace, physical extent and access
+rights. A separately retained context lease keeps backing alive without granting
+new dispatch authority. Mapping capabilities and caller-VSpace ownership persist
+beyond source IRP retirement; domain and resource teardown must be fenced until
+they are released. Unknown native effects quarantine ownership and forbid replay
+or reuse of the virtual range.
+
+`VideoPortMapMemory` treats an incoming non-null `VirtualAddress` as a process
+handle, not an already usable mapping address. Unsupported process mappings and
+unmap operations must fail visibly; returning success without changing mapping
+state is not an implementation.
