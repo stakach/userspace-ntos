@@ -8,6 +8,7 @@
 #![no_std]
 
 mod control;
+pub mod caller_aperture;
 pub use control::{classify_start_io_status, VideoControlCompletion, VideoControlProtocolError};
 mod lifecycle;
 mod pnp;
