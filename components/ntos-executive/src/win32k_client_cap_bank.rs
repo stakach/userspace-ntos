@@ -8,9 +8,7 @@ use nt_user_host::provider_alias_bank::{
 
 const RADIX: u32 = 12;
 const SEGMENT_SLOTS: u64 = 1u64 << RADIX;
-const SEGMENTS: usize = 24;
-static mut SEGMENT_OWNERS: [ProviderAliasSegment; SEGMENTS] =
-    [const { ProviderAliasSegment::new(RADIX) }; SEGMENTS];
+static mut SEGMENT_OWNERS: Vec<ProviderAliasSegment> = Vec::new();
 static mut BANK: Option<ProviderAliasBank> = None;
 static BORROWED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 #[path = "win32k_thread_provider_aliases.rs"]
@@ -75,8 +73,14 @@ impl ProviderAliasIo for Io {
         status(unsafe { page_map_r(root, page, rights, pml4) })
     }
     fn ensure_segment(&mut self, segment: usize) -> Result<u64, u32> {
-        let owner = unsafe { (&mut *core::ptr::addr_of_mut!(SEGMENT_OWNERS)).get_mut(segment) }
-            .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
+        let owners = unsafe { &mut *core::ptr::addr_of_mut!(SEGMENT_OWNERS) };
+        owners
+            .try_reserve_exact(segment.saturating_add(1).saturating_sub(owners.len()))
+            .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
+        while owners.len() <= segment {
+            owners.push(ProviderAliasSegment::new(RADIX));
+        }
+        let owner = &mut owners[segment];
         owner.ensure(&mut SegmentIo).map_err(|error| match error {
             BankError::Backend(status) => status,
             _ => nt_address_space::STATUS_INVALID_PARAMETER,
@@ -102,7 +106,10 @@ unsafe fn map_inner(request: ProviderAliasRequest) -> Result<(), BankError> {
     let _durable = allocator::enter_durable();
     let slot = &mut *core::ptr::addr_of_mut!(BANK);
     if slot.is_none() {
-        *slot = Some(ProviderAliasBank::new(SEGMENT_SLOTS, SEGMENTS)?);
+        *slot = Some(ProviderAliasBank::new(
+            SEGMENT_SLOTS,
+            usize::MAX / SEGMENT_SLOTS as usize,
+        )?);
     }
     slot.as_mut().unwrap().map(request, &mut Io).map(|_| ())
 }

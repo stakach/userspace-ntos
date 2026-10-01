@@ -9,6 +9,7 @@ pub mod segment;
 #[path = "thread_provider_alias_journal.rs"]
 pub mod thread_journal;
 use alloc::vec::Vec;
+use core::ops::{Index, IndexMut};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProviderAliasRequest {
@@ -150,6 +151,92 @@ impl Row {
 struct Slot {
     generation: u64,
     row: Option<Row>,
+    next_free: Option<usize>,
+}
+
+const SLOT_CHUNK_CAPACITY: usize = 256;
+
+/// Stable slot storage. Growing the table allocates one bounded chunk and never relocates an
+/// existing generation-bearing slot.
+struct SlotTable {
+    chunks: Vec<Vec<Slot>>,
+    len: usize,
+}
+
+impl SlotTable {
+    const fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn get(&self, index: usize) -> Option<&Slot> {
+        if index >= self.len {
+            return None;
+        }
+        self.chunks
+            .get(index / SLOT_CHUNK_CAPACITY)?
+            .get(index % SLOT_CHUNK_CAPACITY)
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut Slot> {
+        if index >= self.len {
+            return None;
+        }
+        self.chunks
+            .get_mut(index / SLOT_CHUNK_CAPACITY)?
+            .get_mut(index % SLOT_CHUNK_CAPACITY)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Slot> {
+        self.chunks.iter().flat_map(|chunk| chunk.iter())
+    }
+
+    fn push(&mut self, slot: Slot, capacity: usize) -> Result<usize, BankError> {
+        if self.len >= capacity {
+            return Err(BankError::InsufficientResources);
+        }
+        if self
+            .chunks
+            .last()
+            .is_none_or(|chunk| chunk.len() == SLOT_CHUNK_CAPACITY)
+        {
+            self.chunks
+                .try_reserve(1)
+                .map_err(|_| BankError::InsufficientResources)?;
+            let mut chunk = Vec::new();
+            chunk
+                .try_reserve_exact(SLOT_CHUNK_CAPACITY)
+                .map_err(|_| BankError::InsufficientResources)?;
+            self.chunks.push(chunk);
+        }
+        let index = self.len;
+        self.chunks
+            .last_mut()
+            .expect("slot chunk reserved")
+            .push(slot);
+        self.len += 1;
+        Ok(index)
+    }
+}
+
+impl Index<usize> for SlotTable {
+    type Output = Slot;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("provider alias slot index")
+    }
+}
+
+impl IndexMut<usize> for SlotTable {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        self.get_mut(index).expect("provider alias slot index")
+    }
 }
 
 struct ProcessRows {
@@ -160,12 +247,13 @@ struct ProcessRows {
 }
 
 pub struct ProviderAliasBank {
-    slots: Vec<Slot>,
-    free: Vec<usize>,
+    slots: SlotTable,
+    free_head: Option<usize>,
     processes: Vec<ProcessRows>,
     segment_cnodes: Vec<Option<u64>>,
     live: usize,
     segment_slots: u64,
+    segment_limit: usize,
     capacity: usize,
     high_water: usize,
     moves: u64,
@@ -180,18 +268,14 @@ impl ProviderAliasBank {
             .and_then(|slots| slots.checked_mul(max_segments))
             .filter(|capacity| *capacity != 0)
             .ok_or(BankError::InvalidRequest)?;
-        let mut segment_cnodes = Vec::new();
-        segment_cnodes
-            .try_reserve_exact(max_segments)
-            .map_err(|_| BankError::InsufficientResources)?;
-        segment_cnodes.resize(max_segments, None);
         Ok(Self {
-            slots: Vec::new(),
-            free: Vec::new(),
+            slots: SlotTable::new(),
+            free_head: None,
             processes: Vec::new(),
             live: 0,
-            segment_cnodes,
+            segment_cnodes: Vec::new(),
             segment_slots,
+            segment_limit: max_segments,
             capacity,
             high_water: 0,
             moves: 0,
@@ -205,6 +289,57 @@ impl ProviderAliasBank {
     }
     pub fn entry_count(&self) -> usize {
         self.slots.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// True only when the next new mapping needs another segment. Reusable retired slots do not
+    /// require growth.
+    pub fn needs_segment_for_next_slot(&self) -> bool {
+        self.free_head.is_none() && self.slots.len() == self.capacity
+    }
+
+    /// Add admissible child-CNode segments without relocating any live slot or changing handles.
+    /// The caller must make matching backend segment owners available before mapping into them.
+    pub fn extend_segments(&mut self, additional_segments: usize) -> Result<(), BankError> {
+        if additional_segments == 0 {
+            return Ok(());
+        }
+        let segments = self
+            .segment_limit
+            .checked_add(additional_segments)
+            .ok_or(BankError::InsufficientResources)?;
+        let capacity = usize::try_from(self.segment_slots)
+            .ok()
+            .and_then(|slots| slots.checked_mul(segments))
+            .ok_or(BankError::InsufficientResources)?;
+        self.segment_limit = segments;
+        self.capacity = capacity;
+        Ok(())
+    }
+
+    fn ensure_segment_metadata(&mut self, segment: usize) -> Result<(), BankError> {
+        if segment >= self.segment_limit {
+            return Err(BankError::InsufficientResources);
+        }
+        let required = segment + 1;
+        if self.segment_cnodes.len() < required {
+            self.segment_cnodes
+                .try_reserve_exact(required - self.segment_cnodes.len())
+                .map_err(|_| BankError::InsufficientResources)?;
+            self.segment_cnodes.resize(required, None);
+        }
+        Ok(())
+    }
+
+    fn publish_free(&mut self, index: usize) {
+        let next = self.free_head;
+        let slot = self.slots.get_mut(index).expect("retired slot exists");
+        debug_assert!(slot.row.is_none() && slot.next_free.is_none());
+        slot.next_free = next;
+        self.free_head = Some(index);
     }
     pub fn process_is_empty(&self, pi: usize) -> bool {
         !self.processes.iter().any(|process| process.pi == pi)
@@ -255,7 +390,9 @@ impl ProviderAliasBank {
                 return false;
             };
             let handle = current.pages[position].1;
-            let slot = &self.slots[handle.index];
+            let Some(slot) = self.slots.get(handle.index) else {
+                return false;
+            };
             if slot.generation != handle.generation {
                 return false;
             }
@@ -362,8 +499,9 @@ impl ProviderAliasBank {
                 Ok(position) => {
                     let handle = self.processes[process_index].pages[position].1;
                     let index = handle.index;
-                    assert_eq!(self.slots[index].generation, handle.generation);
-                    let row = self.slots[index].row.as_ref().expect("live page index");
+                    let slot = self.slots.get(index).expect("published page index");
+                    assert_eq!(slot.generation, handle.generation);
+                    let row = slot.row.as_ref().expect("live page index");
                     if row.claim.is_some() {
                         return Err(BankError::Claimed);
                     }
@@ -377,9 +515,12 @@ impl ProviderAliasBank {
         } else {
             0
         };
-        if self.free.is_empty() && self.slots.len() == self.capacity {
+        if self.free_head.is_none() && self.slots.len() == self.capacity {
             return Err(BankError::InsufficientResources);
         }
+        let candidate_index = self.free_head.unwrap_or_else(|| self.slots.len());
+        let candidate_segment = (candidate_index as u64 / self.segment_slots) as usize;
+        self.ensure_segment_metadata(candidate_segment)?;
         // Reserve both ownership indexing and every eventual free publication before effects.
         let mut new_pages = Vec::new();
         if let Some(index) = process_index {
@@ -395,23 +536,20 @@ impl ProviderAliasBank {
                 .try_reserve(1)
                 .map_err(|_| BankError::InsufficientResources)?;
         }
-        if self.free.is_empty() {
-            self.slots
-                .try_reserve(1)
-                .map_err(|_| BankError::InsufficientResources)?;
-            self.free
-                .try_reserve(self.slots.len() + 1 - self.free.len())
-                .map_err(|_| BankError::InsufficientResources)?;
-        }
-        let index = match self.free.pop() {
-            Some(index) => index,
-            None => {
-                self.slots.push(Slot {
+        let index = match self.free_head {
+            Some(index) => {
+                let slot = self.slots.get_mut(index).expect("free index is allocated");
+                self.free_head = slot.next_free.take();
+                index
+            }
+            None => self.slots.push(
+                Slot {
                     generation: 0,
                     row: None,
-                });
-                self.slots.len() - 1
-            }
+                    next_free: None,
+                },
+                self.capacity,
+            )?,
         };
         let process_index = process_index.unwrap_or_else(|| {
             self.processes.push(ProcessRows {
@@ -422,7 +560,8 @@ impl ProviderAliasBank {
             });
             self.processes.len() - 1
         });
-        let slot = &mut self.slots[index];
+        let slot = self.slots.get_mut(index).expect("reserved slot exists");
+        debug_assert!(slot.row.is_none() && slot.next_free.is_none());
         slot.generation += 1;
         slot.row = Some(Row {
             request,
@@ -464,7 +603,7 @@ impl ProviderAliasBank {
         io: &mut impl ProviderAliasIo,
     ) -> Result<ProviderAliasHandle, BankError> {
         let index = self.reserve(request)?;
-        let slot = &mut self.slots[index];
+        let slot = self.slots.get_mut(index).expect("reserved slot exists");
         let row = slot.row.as_mut().expect("reserved alias row");
         // Empty roots are retained after either failed copying or a completed move. Recycling
         // precedes acquiring anything else, and a moved child is never copied or mapped again.
@@ -556,22 +695,30 @@ impl ProviderAliasBank {
         let Some(process_index) = self.processes.iter().position(|current| current.pi == pi) else {
             return Ok(());
         };
-        let current = &mut self.processes[process_index];
-        if current.process != process {
+        if self.processes[process_index].process != process {
             return Err(BankError::OwnerChanged);
         }
-        for &(_, handle) in &current.pages {
-            let slot = &self.slots[handle.index];
+        let page_count = self.processes[process_index].pages.len();
+        for position in 0..page_count {
+            let handle = self.processes[process_index].pages[position].1;
+            let slot = self
+                .slots
+                .get(handle.index)
+                .expect("published page index exists");
             if slot.generation == handle.generation
                 && slot.row.as_ref().is_some_and(|row| row.claim.is_some())
             {
                 return Err(BankError::Claimed);
             }
         }
-        current.releasing = true;
+        self.processes[process_index].releasing = true;
         // Fence every row before the first backend call. Partial release cannot reopen admission.
-        for &(_, handle) in &current.pages {
-            let slot = &mut self.slots[handle.index];
+        for position in 0..page_count {
+            let handle = self.processes[process_index].pages[position].1;
+            let slot = self
+                .slots
+                .get_mut(handle.index)
+                .expect("published page index exists");
             if slot.generation != handle.generation {
                 continue;
             }
@@ -579,19 +726,26 @@ impl ProviderAliasBank {
                 row.releasing = true;
             }
         }
-        for &(_, handle) in &current.pages {
+        for position in 0..page_count {
+            let handle = self.processes[process_index].pages[position].1;
             let index = handle.index;
-            let slot = &mut self.slots[index];
-            if slot.generation != handle.generation {
-                continue;
-            }
-            let Some(row) = slot.row.as_mut() else {
-                continue;
+            let recyclable = {
+                let slot = self
+                    .slots
+                    .get_mut(index)
+                    .expect("published page index exists");
+                if slot.generation != handle.generation {
+                    continue;
+                }
+                let Some(row) = slot.row.as_mut() else {
+                    continue;
+                };
+                row.retire(io)?;
+                slot.row = None;
+                slot.generation != u64::MAX
             };
-            row.retire(io)?;
-            slot.row = None;
-            if slot.generation != u64::MAX {
-                self.free.push(index);
+            if recyclable {
+                self.publish_free(index);
             }
             self.live -= 1;
             self.releases = self.releases.saturating_add(1);
@@ -633,18 +787,24 @@ impl ProviderAliasBank {
         if self.processes[process_index].pages[position].1 != handle {
             return Err(BankError::StaleHandle);
         }
-        let slot = &mut self.slots[handle.index];
-        slot.row
-            .as_mut()
-            .expect("validated claimed row")
-            .retire(io)?;
-        slot.row = None;
+        let recyclable = {
+            let slot = self
+                .slots
+                .get_mut(handle.index)
+                .expect("validated claimed slot");
+            slot.row
+                .as_mut()
+                .expect("validated claimed row")
+                .retire(io)?;
+            slot.row = None;
+            slot.generation != u64::MAX
+        };
         self.processes[process_index].pages.remove(position);
         if self.processes[process_index].pages.is_empty() {
             self.processes.swap_remove(process_index);
         }
-        if slot.generation != u64::MAX {
-            self.free.push(handle.index);
+        if recyclable {
+            self.publish_free(handle.index);
         }
         self.live -= 1;
         self.releases = self.releases.saturating_add(1);
