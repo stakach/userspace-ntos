@@ -139,6 +139,8 @@ pub enum ProviderLocalEventError {
     LeaseUnderflow,
     WrongLease,
     RetirementMismatch,
+    InvalidStateSequence,
+    ContradictoryStateSequence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,6 +174,8 @@ struct ProviderLocalEventRecord {
     delete_pending: bool,
     wait_leases: u32,
     signal_leases: u32,
+    mirror_sequence: u64,
+    mirror_state: bool,
 }
 
 impl ProviderLocalEventRecord {
@@ -191,6 +195,8 @@ impl ProviderLocalEventRecord {
         delete_pending: false,
         wait_leases: 0,
         signal_leases: 0,
+        mirror_sequence: 0,
+        mirror_state: false,
     };
 
     fn snapshot(self, slot: usize) -> ProviderLocalEventSnapshot {
@@ -288,6 +294,7 @@ impl ProviderLocalEventCatalog {
             storage,
             kind,
             initial_state,
+            mirror_state: initial_state,
             ..ProviderLocalEventRecord::EMPTY
         };
         Ok(id)
@@ -578,6 +585,31 @@ impl ProviderLocalEventCatalog {
         Ok(())
     }
 
+    /// Called under the component metadata guard immediately before writing its KEVENT mirror.
+    /// The canonical state sequence is scoped to this exact Event generation and active lease.
+    pub fn observe_state(
+        &mut self,
+        lease: ProviderLocalEventLease,
+        sequence: u64,
+        signaled: bool,
+    ) -> Result<bool, ProviderLocalEventError> {
+        let slot = self.slot(lease.id)?;
+        if self.records[slot].canonical != Some(lease.canonical)
+            || !self.leases.contains(&lease) {
+            return Err(ProviderLocalEventError::WrongLease);
+        }
+        if sequence == 0 { return Err(ProviderLocalEventError::InvalidStateSequence); }
+        let record = &mut self.records[slot];
+        if sequence < record.mirror_sequence { return Ok(false); }
+        if sequence == record.mirror_sequence {
+            return if signaled == record.mirror_state { Ok(false) }
+                else { Err(ProviderLocalEventError::ContradictoryStateSequence) };
+        }
+        record.mirror_sequence = sequence;
+        record.mirror_state = signaled;
+        Ok(true)
+    }
+
     /// Begin retirement of one Event so legal reinitialization can mint a fresh generation.
     pub fn begin_retire_event(
         &mut self,
@@ -662,6 +694,22 @@ impl ProviderLocalEventCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_mirror_rejects_stale_or_contradictory_broker_observations() {
+        let mut catalog = ProviderLocalEventCatalog::new(provider()).unwrap();
+        let id = catalog.initialize_static(0x8000, 0, ProviderEventKind::Notification, false).unwrap();
+        catalog.bind_canonical(id, canonical(8, 1)).unwrap();
+        let lease = catalog.acquire_lease(id, ProviderLocalEventLeaseKind::Signal).unwrap();
+        assert_eq!(catalog.observe_state(lease, 3, true), Ok(true));
+        assert_eq!(catalog.observe_state(lease, 2, false), Ok(false));
+        assert_eq!(catalog.observe_state(lease, 3, true), Ok(false));
+        assert_eq!(catalog.observe_state(lease, 3, false), Err(ProviderLocalEventError::ContradictoryStateSequence));
+        assert_eq!(catalog.observe_state(lease, 4, false), Ok(true));
+        assert_eq!(catalog.observe_state(lease, 3, true), Ok(false));
+        catalog.release_lease(lease).unwrap();
+        assert_eq!(catalog.observe_state(lease, 5, true), Err(ProviderLocalEventError::WrongLease));
+    }
 
     fn provider() -> ProviderDomainIdentity {
         ProviderDomainIdentity {
