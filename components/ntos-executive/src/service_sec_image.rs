@@ -344,8 +344,8 @@ pub(crate) unsafe fn component_execution_lane_is_running(
         == Ok(nt_component_suspension::LanePhase::Running)
 }
 
-pub(crate) unsafe fn component_execution_lane_needs_capacity() -> bool {
-    (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).needs_idle_lane()
+pub(crate) unsafe fn component_execution_lane_can_grow() -> bool {
+    (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).can_add_lane()
 }
 
 pub(crate) unsafe fn component_execution_is_busy() -> bool {

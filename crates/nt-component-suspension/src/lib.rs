@@ -638,6 +638,12 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         !self.execution_busy() && self.next_idle().is_none() && self.len() < self.max_lanes
     }
 
+    /// A provider that has already checked its own idle lanes may grow while unrelated
+    /// providers still have idle workers in this shared catalog.
+    pub fn can_add_lane(&self) -> bool {
+        !self.execution_busy() && self.len() < self.max_lanes
+    }
+
     pub fn allocate(&mut self, binding: LaneBinding) -> Result<LaneHandle, LaneError> {
         self.allocate_with_phase(binding, LanePhase::Idle, false)
     }
@@ -1947,6 +1953,31 @@ mod tests {
 
         lanes.allocate(binding(3)).unwrap();
         assert!(!lanes.needs_idle_lane());
+    }
+
+    #[test]
+    fn provider_growth_is_not_blocked_by_another_providers_idle_lane() {
+        let mut lanes = ComponentSuspensionLanes::<u64, u32>::new(3, 2);
+        let provider_lane = lanes.allocate(binding(1)).unwrap();
+        let _unrelated_idle = lanes.allocate(binding(2)).unwrap();
+        lanes
+            .begin_dispatch(provider_lane, binding(1).reply_object)
+            .unwrap();
+        lanes
+            .admit_running(
+                provider_lane,
+                binding(1).reply_object,
+                SuspensionKey::provider_wait(1),
+                1,
+                owner(1),
+                10,
+            )
+            .unwrap();
+
+        assert!(!lanes.needs_idle_lane());
+        assert!(lanes.can_add_lane());
+        lanes.allocate(binding(3)).unwrap();
+        assert!(!lanes.can_add_lane());
     }
 
     #[test]

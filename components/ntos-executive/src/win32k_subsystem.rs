@@ -8550,14 +8550,14 @@ unsafe fn publish_gui_client_info_for_dispatch(
         .map(|(_, pin)| pin)
         .unwrap_or_else(|| crate::provider_bugcheck::report(0xc4, [W32_GUI_CLIENT_INFO_LABEL, address, 6, 0]));
     write_volatile(address as *mut Win32kGuiClientInfoPacket, packet);
-    let (words, raw, m1, m2, m3) = crate::driver_launch::call_on4_raw(
+    let (words, raw, _, _, _) = crate::driver_launch::call_on4_raw(
         (W32_GUI_CLIENT_INFO_LABEL << 12) | 4,
         address,
         bytes,
         0,
         0,
     );
-    if words != 1 || raw != 0 || m1 != 0 || m2 != 0 || m3 != 0 {
+    if words != 1 || raw != 0 {
         crate::provider_bugcheck::report(0xc4, [W32_GUI_CLIENT_INFO_LABEL, address, words, raw]);
     }
     release_provider_allocation_pin_or_park(packet_pin);

@@ -32,6 +32,7 @@ pub struct DesktopClientMapping {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyboardLayoutClientInfo {
     pub hkl: u64,
+    /// Zero is CP_ACP, the caller's default ANSI codepage.
     pub codepage: u16,
 }
 
@@ -88,7 +89,7 @@ impl<D: Copy + Eq> GuiClientInfoSnapshot<D> {
         if win32_thread_info == 0 {
             return Err(GuiClientInfoError::InvalidThreadInfo);
         }
-        if keyboard_layout.is_some_and(|layout| layout.hkl == 0 || layout.codepage == 0) {
+        if keyboard_layout.is_some_and(|layout| layout.hkl == 0) {
             return Err(GuiClientInfoError::InvalidKeyboardLayout);
         }
         let (client_deskinfo, client_thread_info, desktop_delta) = mapping.translate()?;
@@ -303,6 +304,24 @@ mod tests {
             ),
             Err(GuiClientInfoError::InvalidKeyboardLayout)
         );
+    }
+
+    #[test]
+    fn cp_acp_is_a_valid_keyboard_layout_codepage() {
+        let (_, owner) = owner();
+        let keyboard = KeyboardLayoutClientInfo {
+            hkl: 0x0409_0409,
+            codepage: 0,
+        };
+        let snapshot = GuiClientInfoSnapshot::capture(
+            owner,
+            owner,
+            1,
+            mapping(),
+            Some(keyboard),
+        )
+        .expect("CP_ACP is represented by zero");
+        assert_eq!(snapshot.values_for(owner).unwrap().keyboard_layout, Some(keyboard));
     }
 
     #[test]

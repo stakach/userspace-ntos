@@ -625,7 +625,7 @@ unsafe fn acquire_or_provision_win32k_execution_lane(
     if let Some(lane) = acquire_idle_win32k_execution_lane() {
         return Some(lane);
     }
-    if !crate::service_sec_image::component_execution_lane_needs_capacity() {
+    if !crate::service_sec_image::component_execution_lane_can_grow() {
         return None;
     }
     let pml4 = WIN32K_HOST_PML4.load(Ordering::Acquire);
@@ -636,17 +636,29 @@ unsafe fn acquire_or_provision_win32k_execution_lane(
 }
 
 unsafe fn acquire_idle_win32k_execution_lane() -> Option<nt_component_suspension::LaneHandle> {
-    let (handle, route) = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
-        .as_ref()?
-        .iter()
-        .find_map(|row| {
-            let handle = row.handle?;
-            (crate::service_sec_image::component_execution_lane_is_idle(handle)
-                && win32k_physical_lane_binding(handle).is_some())
-                .then_some((handle, row.route))
-        })?;
-    let dispatch = crate::spawn_hosts::shared_ingress::owner::runtime::admit(route?).ok()?;
-    (dispatch.lane() == handle).then_some(handle)
+    let lanes = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref()?;
+    for row in lanes {
+        let (Some(handle), Some(route)) = (row.handle, row.route) else {
+            continue;
+        };
+        if !crate::service_sec_image::component_execution_lane_is_idle(handle)
+            || win32k_physical_lane_binding(handle).is_none()
+        {
+            continue;
+        }
+        if !matches!(
+            crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(route),
+            Ok(true)
+        ) {
+            continue;
+        }
+        match crate::spawn_hosts::shared_ingress::owner::runtime::admit(route) {
+            Ok(dispatch) if dispatch.lane() == handle => return Some(handle),
+            Ok(_) => return None,
+            Err(_) => continue,
+        }
+    }
+    None
 }
 
 unsafe fn shared_win32k_lane_route(
