@@ -801,25 +801,6 @@ impl TokenId {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TokenSidField {
-    User,
-    Group(usize),
-    RestrictedSid(usize),
-    Owner,
-    PrimaryGroup,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct InvalidSidMetadata {
-    pub token: TokenId,
-    pub field: TokenSidField,
-    pub length: usize,
-    pub capacity: usize,
-    pub vector_address: usize,
-    pub data_pointer: usize,
-}
-
 /// Stable identities of the two security-subsystem-owned Anonymous Logon token objects.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct AnonymousLogonTokenIds {
@@ -1017,46 +998,6 @@ impl TokenStore {
             .get(id.slot())?
             .as_ref()
             .map(|entry| &entry.token)
-    }
-
-    /// Inspect SID vector headers without reading their elements. This is intended for
-    /// diagnosing corrupted token storage before an operation such as token cloning.
-    pub fn first_invalid_sid_metadata(&self) -> Option<InvalidSidMetadata> {
-        fn inspect(token: TokenId, field: TokenSidField, sid: &Sid) -> Option<InvalidSidMetadata> {
-            let length = sid.sub_authorities.len();
-            let capacity = sid.sub_authorities.capacity();
-            (length > 15 || length > capacity).then_some(InvalidSidMetadata {
-                token,
-                field,
-                length,
-                capacity,
-                vector_address: core::ptr::addr_of!(sid.sub_authorities) as usize,
-                data_pointer: sid.sub_authorities.as_ptr() as usize,
-            })
-        }
-
-        for (slot, entry) in self.objects.iter().enumerate() {
-            let Some(entry) = entry else { continue };
-            let token = TokenId((slot + 1) as u32);
-            let value = &entry.token;
-            if let Some(invalid) = inspect(token, TokenSidField::User, &value.user)
-                .or_else(|| inspect(token, TokenSidField::Owner, &value.owner))
-                .or_else(|| inspect(token, TokenSidField::PrimaryGroup, &value.primary_group))
-            {
-                return Some(invalid);
-            }
-            for (index, group) in value.groups.iter().enumerate() {
-                if let Some(invalid) = inspect(token, TokenSidField::Group(index), &group.sid) {
-                    return Some(invalid);
-                }
-            }
-            for (index, group) in value.restricted_sids.iter().enumerate() {
-                if let Some(invalid) = inspect(token, TokenSidField::RestrictedSid(index), &group.sid) {
-                    return Some(invalid);
-                }
-            }
-        }
-        None
     }
 
     pub fn reference_count(&self, id: TokenId) -> Option<u32> {
@@ -1535,33 +1476,5 @@ mod subject_reference_tests {
             assert_eq!(tokens.reference_count(primary), primary_before);
             assert_eq!(tokens.reference_count(client), client_before);
         }
-    }
-}
-
-#[cfg(test)]
-mod sid_metadata_tests {
-    use super::*;
-
-    #[test]
-    fn normal_token_sid_metadata_is_valid() {
-        let mut tokens = TokenStore::new();
-        tokens.insert(AccessToken::system());
-        tokens.insert(AccessToken::user(12));
-        assert_eq!(tokens.first_invalid_sid_metadata(), None);
-    }
-
-    #[test]
-    fn oversized_sid_metadata_identifies_the_token_field() {
-        let mut tokens = TokenStore::new();
-        let token = tokens.insert(AccessToken::system());
-        tokens.objects[token.slot()].as_mut().unwrap().token.owner = Sid::new(5, &[0; 16]);
-        let invalid = tokens.first_invalid_sid_metadata().unwrap();
-        assert_eq!(invalid.token, token);
-        assert_eq!(invalid.field, TokenSidField::Owner);
-        assert_eq!(invalid.length, 16);
-        assert!(invalid.capacity >= 16);
-        let owner = &tokens.get(token).unwrap().owner.sub_authorities;
-        assert_eq!(invalid.vector_address, owner as *const Vec<u32> as usize);
-        assert_eq!(invalid.data_pointer, owner.as_ptr() as usize);
     }
 }

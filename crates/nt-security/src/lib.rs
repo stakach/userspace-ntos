@@ -94,9 +94,9 @@ pub use hosted_token_projection::{
 pub use token::{
     plan_client_impersonation, token_can_impersonate, AccessToken, AnonymousLogonTokenIds,
     ClientImpersonationPlan, GroupAdjustment, GroupAdjustmentPlan, GroupAdjustmentSummary,
-    InvalidSidMetadata, PrivilegeAdjustment, PrivilegeAdjustmentSummary, SecurityContextTrackingMode,
+    PrivilegeAdjustment, PrivilegeAdjustmentSummary, SecurityContextTrackingMode,
     SecurityImpersonationLevel, SecurityQualityOfService, TokenAuditPolicy, TokenGroup, TokenId,
-    TokenPrivilege, TokenSidField, TokenSource, TokenStatistics, TokenStore, TokenType, SE_ASSIGN_PRIMARY_TOKEN,
+    TokenPrivilege, TokenSource, TokenStatistics, TokenStore, TokenType, SE_ASSIGN_PRIMARY_TOKEN,
     SE_AUDIT, SE_BACKUP, SE_CHANGE_NOTIFY, SE_CREATE_GLOBAL, SE_CREATE_PAGEFILE,
     SE_CREATE_PERMANENT, SE_CREATE_TOKEN, SE_DEBUG, SE_IMPERSONATE, SE_INCREASE_BASE_PRIORITY,
     SE_INCREASE_QUOTA, SE_LOAD_DRIVER, SE_LOCK_MEMORY, SE_MANAGE_VOLUME, SE_PRIVILEGE_ENABLED,
