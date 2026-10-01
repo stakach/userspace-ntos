@@ -163,7 +163,7 @@ mod tests {
 
     struct ProductionBindings {
         names: BTreeSet<std::string::String>,
-        call_driver_targets: BTreeMap<std::string::String, std::vec::Vec<std::string::String>>,
+        function_targets: BTreeMap<std::string::String, std::vec::Vec<std::string::String>>,
         data_export_loops: usize,
     }
 
@@ -179,16 +179,19 @@ mod tests {
                         ..
                     }) => {
                         self.names.insert(name.value());
-                        if matches!(name.value().as_str(), "IoCallDriver" | "IofCallDriver") {
+                        if matches!(name.value().as_str(), "IoCallDriver" | "IofCallDriver"
+                            | "ExfAcquirePushLockExclusive" | "ExfAcquirePushLockShared"
+                            | "ExfReleasePushLockExclusive" | "ExfReleasePushLockShared"
+                            | "ExfReleasePushLock" | "ExfTryToWakePushLock") {
                             let mut target = call.args.iter().nth(1).expect("binding target");
                             while let syn::Expr::Cast(cast) = target {
                                 target = &cast.expr;
                             }
                             let syn::Expr::Path(path) = target else {
-                                panic!("call-driver binding is not a function path");
+                                panic!("native binding is not a function path");
                             };
                             assert!(
-                                self.call_driver_targets
+                                self.function_targets
                                     .insert(
                                         name.value(),
                                         path.path
@@ -198,7 +201,7 @@ mod tests {
                                             .collect()
                                     )
                                     .is_none(),
-                                "duplicate call-driver binding"
+                                "duplicate native binding"
                             );
                         }
                     }
@@ -264,22 +267,40 @@ mod tests {
         let register = register.expect("production register_trampolines function is absent");
         let mut bindings = ProductionBindings {
             names: BTreeSet::new(),
-            call_driver_targets: BTreeMap::new(),
+            function_targets: BTreeMap::new(),
             data_export_loops: 0,
         };
         bindings.visit_block(&register.block);
         let call_driver = bindings
-            .call_driver_targets
+            .function_targets
             .get("IoCallDriver")
             .expect("win32k must bind IoCallDriver explicitly");
         let fast_call_driver = bindings
-            .call_driver_targets
+            .function_targets
             .get("IofCallDriver")
             .expect("win32k must bind IofCallDriver explicitly");
         assert_eq!(
             call_driver, fast_call_driver,
             "call-driver ABI aliases must share the source-IRP route"
         );
+        let registry = ExportRegistry::new();
+        for (name, target) in [
+            ("ExfAcquirePushLockExclusive", "acquire_exclusive"),
+            ("ExfAcquirePushLockShared", "acquire_shared"),
+            ("ExfReleasePushLockExclusive", "release_exclusive"),
+            ("ExfReleasePushLockShared", "release_shared"),
+            ("ExfReleasePushLock", "release_generic"),
+            ("ExfTryToWakePushLock", "try_to_wake"),
+        ] {
+            let descriptor = crate::win32k_resolve::export_descriptor(name)
+                .expect("push-lock entry point must have shared catalog metadata");
+            assert_eq!(descriptor.status, crate::ExportStatus::Partial, "{name}");
+            assert!(registry.resolve("ntoskrnl.exe", name).loads(), "{name}");
+            let actual = bindings.function_targets.get(name)
+                .expect("push-lock entry point must have a production binding");
+            assert!(actual.iter().map(std::string::String::as_str).eq(["push_lock", target]),
+                "{name} must bind its real native push-lock adapter, not a success stub");
+        }
         assert_eq!(
             bindings.data_export_loops, 1,
             "production data-export registration loop changed"

@@ -117,6 +117,24 @@ mod tests {
     }
 
     #[test]
+    fn canonical_device_and_file_bindings_are_not_success_stubs() {
+        for name in ["IoGetDeviceProperty", "ZwOpenFile", "ZwCreateFile"] {
+            let descriptor = export_descriptor(name).expect("declared canonical import");
+            assert_eq!(descriptor.status, ExportStatus::Partial, "{name}");
+            assert_ne!(descriptor.status, ExportStatus::StubSuccess, "{name}");
+        }
+    }
+
+    #[test]
+    fn lookaside_and_live_registry_bindings_are_not_success_stubs() {
+        for name in ["ExInitializePagedLookasideList", "RtlQueryRegistryValues"] {
+            let descriptor = export_descriptor(name).expect("declared subsystem import");
+            assert_eq!(descriptor.status, ExportStatus::Partial, "{name}");
+            assert_ne!(descriptor.status, ExportStatus::StubSuccess, "{name}");
+        }
+    }
+
+    #[test]
     fn registry_grows_past_bootstrap_reservation() {
         const NAMES: &[&str] = &[
             "win32k-export-00",
