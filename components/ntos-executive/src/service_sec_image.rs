@@ -25674,6 +25674,11 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
                     .take(slot)
                     .expect("completed driver START continuation disappeared");
                 match &mut pending.owner {
+                    PendingDriverStartOwner::CriticalChild { claim } => {
+                        if let Some(claim) = claim.take() {
+                            driver_launch::complete_hosted_critical_child_start(claim, status);
+                        }
+                    }
                     PendingDriverStartOwner::Boot { target, .. } => nt_handler
                         .boot_driver_start_reports
                         .merge(*target, pending.batch.report()),
@@ -25712,6 +25717,12 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
                         continue;
                     };
                     match &mut pending.owner {
+                        PendingDriverStartOwner::CriticalChild { claim } => {
+                            if let Some(claim) = claim.take() {
+                                driver_launch::quarantine_hosted_critical_child_start(claim);
+                            }
+                            None
+                        }
                         PendingDriverStartOwner::Boot {
                             target,
                             report_published,
@@ -25825,6 +25836,145 @@ unsafe fn pending_pnp_operation_redrive_all(nt_handler: &mut ExecNtHandler) -> u
     completed
 }
 
+unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u64 {
+    let Some(mount) = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT else {
+        return 0;
+    };
+    let mut progress = 0u64;
+    for _ in 0..8 {
+        let claim = match driver_launch::claim_hosted_critical_child_start(mount.identity_token()) {
+            Ok(Some(claim)) => claim,
+            Ok(None) => break,
+            Err(nt_pnp_manager::CriticalChildStartError::StalePublication) => {
+                progress += 1;
+                continue;
+            }
+            Err(_) => break,
+        };
+        progress += 1;
+        let instance = driver_launch::hosted_critical_child_instance_id(claim)
+            .expect("critical child claim lost its instance identity");
+        print_str(b"[pnp-critical-start] instance=");
+        print_str(instance.as_bytes());
+        print_str(b"\n");
+        let state = driver_launch::hosted_pnp_device_state_for_instance(instance);
+        match nt_pnp_manager::existing_device_start_disposition(state) {
+            nt_pnp_manager::ExistingDeviceStartDisposition::AlreadyStarted => {
+                driver_launch::complete_hosted_critical_child_start(claim, 0);
+                continue;
+            }
+            nt_pnp_manager::ExistingDeviceStartDisposition::Busy => {
+                driver_launch::complete_hosted_critical_child_start(
+                    claim,
+                    nt_status::NtStatus::DEVICE_BUSY.raw() as u32,
+                );
+                continue;
+            }
+            nt_pnp_manager::ExistingDeviceStartDisposition::NoSuchDevice => {
+                driver_launch::complete_hosted_critical_child_start(claim, 0xC000_000E);
+                continue;
+            }
+            nt_pnp_manager::ExistingDeviceStartDisposition::RequiresAction => {}
+        }
+        let spec = match live_config_existing_device_launch_spec(instance, SERVICE_DEMAND_START) {
+            Ok(spec) if spec.class == driver_launch::DriverClass::Device && spec.devnodes.len() == 1 => spec,
+            Ok(_) => {
+                driver_launch::complete_hosted_critical_child_start(
+                    claim,
+                    nt_status::NtStatus::INVALID_PARAMETER.raw() as u32,
+                );
+                continue;
+            }
+            Err(status) => {
+                driver_launch::complete_hosted_critical_child_start(claim, status as u32);
+                continue;
+            }
+        };
+        let reservation = match nt_handler.pending_driver_starts.reserve() {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                driver_launch::complete_hosted_critical_child_start(
+                    claim,
+                    nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32,
+                );
+                continue;
+            }
+        };
+        let context = match driver_launch::loaded_driver_pnp_start_context(&spec.driver_object_path) {
+            Some(context) => Ok(context),
+            None if driver_launch::driver_id_by_name(&spec.driver_object_path).is_some() => {
+                Err(nt_status::NtStatus::DEVICE_NOT_READY)
+            }
+            None => match exec_fs() {
+                Some(fs) => driver_launch::load_driver(
+                    &fs,
+                    &spec.image_path,
+                    spec.class,
+                    &spec.driver_object_path,
+                    initial_system_driver_caller(),
+                )
+                .and_then(|_| {
+                    driver_launch::loaded_driver_pnp_start_context(&spec.driver_object_path)
+                        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)
+                }),
+                None => Err(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND),
+            },
+        };
+        let (driver_id, ready_for_pnp) = match context {
+            Ok(context) => context,
+            Err(status) => {
+                nt_handler.pending_driver_starts.cancel(reservation)
+                    .expect("failed critical driver load lost its START reservation");
+                driver_launch::complete_hosted_critical_child_start(claim, status.raw() as u32);
+                continue;
+            }
+        };
+        if !ready_for_pnp {
+            nt_handler.pending_driver_starts.cancel(reservation)
+                .expect("non-PnP critical driver lost its START reservation");
+            driver_launch::complete_hosted_critical_child_start(
+                claim,
+                nt_status::NtStatus::DEVICE_NOT_READY.raw() as u32,
+            );
+            continue;
+        }
+        let mut batch = OwnedHostedPnpStartBatch::new_for_driver(
+            driver_id,
+            ready_for_pnp,
+            spec,
+            HostedPnpStartOptions::demand_start(),
+        );
+        match batch.drive() {
+            OwnedHostedPnpStartProgress::Complete(result) => {
+                nt_handler.pending_driver_starts.cancel(reservation)
+                    .expect("completed critical START lost its continuation reservation");
+                let status = result.map(|_| 0).unwrap_or_else(|failure| failure.status.raw() as u32);
+                driver_launch::complete_hosted_critical_child_start(claim, status);
+            }
+            OwnedHostedPnpStartProgress::AwaitingCompletion => {
+                nt_handler.pending_driver_starts.publish(
+                    reservation,
+                    PendingDriverStart {
+                        batch,
+                        owner: PendingDriverStartOwner::CriticalChild { claim: Some(claim) },
+                    },
+                ).expect("pending critical START rejected its pre-reserved continuation");
+            }
+            OwnedHostedPnpStartProgress::OwnershipLost(_) => {
+                driver_launch::quarantine_hosted_critical_child_start(claim);
+                nt_handler.pending_driver_starts.publish(
+                    reservation,
+                    PendingDriverStart {
+                        batch,
+                        owner: PendingDriverStartOwner::CriticalChild { claim: None },
+                    },
+                ).expect("uncertain critical START lost its retained continuation");
+            }
+        }
+    }
+    progress
+}
+
 // Callers execute DPCs before borrowing the handler and pass only the completed work count.
 unsafe fn pump_hosted_io_and_redrive_driver_starts(
     activated: u64,
@@ -25841,6 +25991,7 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(
         .saturating_add(video_retired)
         .saturating_add(pumped)
         .saturating_add(pending_driver_start_redrive_all(nt_handler))
+        .saturating_add(start_committed_critical_children(nt_handler))
         .saturating_add(pending_pnp_operation_redrive_all(nt_handler));
     if progress != 0 {
         FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);

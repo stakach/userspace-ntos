@@ -40463,6 +40463,9 @@ unsafe fn build_hosted_relation_mutations(
 
 unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishError> {
     let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let mount_identity = crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
+        .ok_or(HostedRelationPublishError::Retry)?
+        .identity_token();
     let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
         .as_ref()
         .ok_or(HostedRelationPublishError::Barrier(
@@ -40550,6 +40553,25 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
         return Err(HostedRelationPublishError::Retry);
     }
 
+    let mut critical_starts = Vec::new();
+    critical_starts
+        .try_reserve_exact(query.reported_children.len())
+        .map_err(|_| HostedRelationPublishError::Retry)?;
+    for child in &query.reported_children {
+        if resolve_hosted_relation_policy(expected_generation, child)?
+            .as_ref()
+            .is_some_and(|policy| policy.service_name.is_some())
+        {
+            critical_starts.push((
+                child.pdo_object_id,
+                hosted_relation_instance_path(child)?,
+            ));
+        }
+    }
+    hosted_critical_child_starts_mut()
+        .reserve_capacity(critical_starts.len())
+        .map_err(|_| HostedRelationPublishError::Retry)?;
+
     let mutations = build_hosted_relation_mutations(&prepared, &policies, &existing)?;
     if !mutations.is_empty() {
         let client_mutations: Vec<_> = mutations
@@ -40574,6 +40596,22 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
     hosted_bus_relations_mut()
         .commit_bus_relations(prepared)
         .expect("published CM relation transaction became stale before PnP commit");
+    print_str(b"[pnp-relations] committed children/critical-starts=");
+    print_u64(query.reported_children.len() as u64);
+    print_str(b"/");
+    print_u64(critical_starts.len() as u64);
+    print_str(b"\n");
+    for (pdo, instance_id) in critical_starts {
+        hosted_critical_child_starts_mut()
+            .reserve_committed_owned(
+                hosted_pnp_manager_mut(),
+                hosted_bus_relations(),
+                mount_identity,
+                pdo,
+                instance_id,
+            )
+            .expect("committed critical child lost its pre-reserved START owner");
+    }
     let catalog_update = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
         .as_mut()
         .and_then(|query| query.acpi_pci_catalog_update.take());
@@ -44873,6 +44911,7 @@ static mut HOSTED_DEVICE_RELATION_OWNERS: Option<
     nt_pnp_manager::RelationOwnerLedger<nt_pnp::AcpiPciProviderEndpoint>,
 > = None;
 static mut HOSTED_BUS_RELATIONS: Option<nt_pnp_manager::BusRelationTable> = None;
+static mut HOSTED_CRITICAL_CHILD_STARTS: Option<nt_pnp_manager::CriticalChildStartQueue> = None;
 static mut HOSTED_DEVICE_RELATION_QUERY: Option<HostedDeviceRelationQuery> = None;
 static mut HOSTED_DEVICE_RELATION_FAILURES: Option<Vec<HostedDeviceRelationFailure>> = None;
 static mut HOSTED_RESOURCE_MANAGER: Option<ResourceManager> = None;
@@ -46556,6 +46595,45 @@ unsafe fn hosted_bus_relations() -> &'static nt_pnp_manager::BusRelationTable {
     (*core::ptr::addr_of!(HOSTED_BUS_RELATIONS))
         .as_ref()
         .expect("hosted bus relation table was just initialized")
+}
+
+unsafe fn hosted_critical_child_starts_mut() -> &'static mut nt_pnp_manager::CriticalChildStartQueue {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_CRITICAL_CHILD_STARTS);
+    if slot.is_none() {
+        *slot = Some(nt_pnp_manager::CriticalChildStartQueue::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+pub(crate) unsafe fn claim_hosted_critical_child_start(
+    mount_identity: u64,
+) -> Result<Option<nt_pnp_manager::CriticalChildStartClaim>, nt_pnp_manager::CriticalChildStartError> {
+    let pnp = hosted_pnp_manager_mut();
+    let relations = hosted_bus_relations();
+    hosted_critical_child_starts_mut().claim_next(pnp, relations, mount_identity)
+}
+
+pub(crate) unsafe fn hosted_critical_child_instance_id(
+    claim: nt_pnp_manager::CriticalChildStartClaim,
+) -> Option<&'static str> {
+    hosted_critical_child_starts_mut().claimed_instance_id(claim)
+}
+
+pub(crate) unsafe fn complete_hosted_critical_child_start(
+    claim: nt_pnp_manager::CriticalChildStartClaim,
+    status: u32,
+) {
+    let queue = hosted_critical_child_starts_mut();
+    queue.complete(claim, status).expect("critical child lost its exact START claim");
+    queue.retire(claim).expect("critical child START result lost its terminal owner");
+}
+
+pub(crate) unsafe fn quarantine_hosted_critical_child_start(
+    claim: nt_pnp_manager::CriticalChildStartClaim,
+) {
+    hosted_critical_child_starts_mut()
+        .quarantine(claim)
+        .expect("critical child lost its uncertain START claim");
 }
 
 unsafe fn copy_hosted_device_relations_result(

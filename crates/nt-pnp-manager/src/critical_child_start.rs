@@ -3,17 +3,17 @@ use alloc::vec::Vec;
 
 use crate::{BusRelationTable, DevnodeIdentity, ParentRelationIdentity, PnpManager};
 
-/// One boot mount's canonical child, published by an accepted BusRelations generation.
+/// One mounted SYSTEM hive's canonical child, published by an accepted BusRelations generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CriticalChildStartKey {
-    mount_generation: u64,
+    mount_identity: u64,
     child: DevnodeIdentity,
     parent_relation: ParentRelationIdentity,
 }
 
 impl CriticalChildStartKey {
-    pub const fn mount_generation(self) -> u64 {
-        self.mount_generation
+    pub const fn mount_identity(self) -> u64 {
+        self.mount_identity
     }
 
     pub const fn child(self) -> DevnodeIdentity {
@@ -84,14 +84,21 @@ impl CriticalChildStartQueue {
         }
     }
 
+    /// Reserve queue storage before publishing a relation whose child must be started.
+    pub fn reserve_capacity(&mut self, additional: usize) -> Result<(), CriticalChildStartError> {
+        self.entries
+            .try_reserve(additional)
+            .map_err(|_| CriticalChildStartError::InsufficientResources)
+    }
+
     fn current_key(
         pnp: &PnpManager,
         relations: &BusRelationTable,
-        mount_generation: u64,
+        mount_identity: u64,
         child_pdo: u64,
         instance_id: &str,
     ) -> Result<CriticalChildStartKey, CriticalChildStartError> {
-        if mount_generation == 0 {
+        if mount_identity == 0 {
             return Err(CriticalChildStartError::InvalidMount);
         }
         if instance_id.is_empty() {
@@ -110,7 +117,7 @@ impl CriticalChildStartQueue {
             return Err(CriticalChildStartError::StalePublication);
         }
         Ok(CriticalChildStartKey {
-            mount_generation,
+            mount_identity,
             child,
             parent_relation,
         })
@@ -122,11 +129,28 @@ impl CriticalChildStartQueue {
         &mut self,
         pnp: &PnpManager,
         relations: &BusRelationTable,
-        mount_generation: u64,
+        mount_identity: u64,
         child_pdo: u64,
         instance_id: &str,
     ) -> Result<(CriticalChildStartKey, CriticalChildStartState), CriticalChildStartError> {
-        let key = Self::current_key(pnp, relations, mount_generation, child_pdo, instance_id)?;
+        let mut owned_instance = String::new();
+        owned_instance
+            .try_reserve(instance_id.len())
+            .map_err(|_| CriticalChildStartError::InsufficientResources)?;
+        owned_instance.push_str(instance_id);
+        self.reserve_committed_owned(pnp, relations, mount_identity, child_pdo, owned_instance)
+    }
+
+    /// Accept a pre-owned instance without allocating after the relation commit.
+    pub fn reserve_committed_owned(
+        &mut self,
+        pnp: &PnpManager,
+        relations: &BusRelationTable,
+        mount_identity: u64,
+        child_pdo: u64,
+        instance_id: String,
+    ) -> Result<(CriticalChildStartKey, CriticalChildStartState), CriticalChildStartError> {
+        let key = Self::current_key(pnp, relations, mount_identity, child_pdo, &instance_id)?;
         if let Some(entry) = self.entries.iter().find(|entry| entry.key == key) {
             return if entry.instance_id == instance_id {
                 Ok((key, entry.state))
@@ -143,14 +167,9 @@ impl CriticalChildStartQueue {
         self.entries
             .try_reserve(1)
             .map_err(|_| CriticalChildStartError::InsufficientResources)?;
-        let mut owned_instance = String::new();
-        owned_instance
-            .try_reserve(instance_id.len())
-            .map_err(|_| CriticalChildStartError::InsufficientResources)?;
-        owned_instance.push_str(instance_id);
         self.entries.push(StartEntry {
             key,
-            instance_id: owned_instance,
+            instance_id,
             state: CriticalChildStartState::Reserved,
             token: 0,
         });
@@ -162,7 +181,7 @@ impl CriticalChildStartQueue {
         &mut self,
         pnp: &PnpManager,
         relations: &BusRelationTable,
-        mount_generation: u64,
+        mount_identity: u64,
     ) -> Result<Option<CriticalChildStartClaim>, CriticalChildStartError> {
         let Some(index) = self
             .entries
@@ -172,14 +191,14 @@ impl CriticalChildStartQueue {
             return Ok(None);
         };
         let key = self.entries[index].key;
-        if key.mount_generation != mount_generation {
+        if key.mount_identity != mount_identity {
             self.entries[index].state = CriticalChildStartState::Uncertain;
             return Err(CriticalChildStartError::StalePublication);
         }
         if Self::current_key(
             pnp,
             relations,
-            key.mount_generation,
+            key.mount_identity,
             key.child.pdo_object_id(),
             &self.entries[index].instance_id,
         ) != Ok(key)
@@ -251,6 +270,17 @@ impl CriticalChildStartQueue {
             .iter()
             .find(|entry| entry.key == key)
             .map(|entry| entry.state)
+    }
+
+    pub fn claimed_instance_id(&self, claim: CriticalChildStartClaim) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.key == claim.key
+                    && entry.token == claim.token
+                    && entry.state == CriticalChildStartState::Claimed
+            })
+            .map(|entry| entry.instance_id.as_str())
     }
 }
 

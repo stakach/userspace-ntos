@@ -24027,6 +24027,9 @@ struct PendingDriverStartTransfer {
 }
 
 enum PendingDriverStartOwner {
+    CriticalChild {
+        claim: Option<nt_pnp_manager::CriticalChildStartClaim>,
+    },
     User {
         request: Option<nt_pnp_manager::StartDeviceRequestIdentity>,
         reply: Option<PendingPnpSyscallReply>,
