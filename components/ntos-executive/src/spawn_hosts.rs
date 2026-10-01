@@ -3120,7 +3120,7 @@ unsafe fn component_pump_loop(
         } else if label == crate::driver_launch::FSD_SERVICE_DMA_ADAPTER_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
-            let (status, adapter_id, map_registers) =
+            let (status, adapter_id, map_registers, lease_id) =
                 crate::driver_launch::service_hosted_driver_dma_adapter(
                     ch,
                     msg.m0,
@@ -3131,11 +3131,11 @@ unsafe fn component_pump_loop(
                 ch,
                 *reply_cap,
                 msg,
-                3,
+                4,
                 status as u32 as u64,
                 adapter_id,
                 map_registers,
-                0
+                lease_id
             );
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_MDL_LABEL
@@ -3165,20 +3165,35 @@ unsafe fn component_pump_loop(
         } else if label == crate::driver_launch::FSD_SERVICE_INTERRUPT_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
-            let (status, interrupt_id, grant_generation) =
-                crate::driver_launch::service_hosted_driver_interrupt(
-                    ch, msg.m0, msg.m1, *reply_cap,
-                );
-            pump_reply_recv4_into!(
-                ch,
-                *reply_cap,
-                msg,
-                3,
-                status as u32 as u64,
-                interrupt_id,
-                grant_generation,
-                0
-            );
+            match crate::driver_launch::service_hosted_driver_interrupt(
+                ch, msg.m0, msg.m1, msg.m2, msg.badge, *reply_cap,
+            ) {
+                crate::driver_launch::HostedDriverInterruptServiceResult::Reply {
+                    status,
+                    interrupt_id,
+                    grant_generation,
+                } => {
+                    pump_reply_recv4_into!(
+                        ch,
+                        *reply_cap,
+                        msg,
+                        3,
+                        status as u32 as u64,
+                        interrupt_id,
+                        grant_generation,
+                        0
+                    );
+                }
+                crate::driver_launch::HostedDriverInterruptServiceResult::SharedParked {
+                    ..
+                } => {
+                    if shared_pump::autonomous(ch) {
+                        outcome.provider_wait_suspended = true;
+                        break;
+                    }
+                    msg = pump_recv(ch, *reply_cap);
+                }
+            }
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PS_TERMINATE_SYSTEM_THREAD_LABEL
             && ch.caps.kind == ReqKind::Irp

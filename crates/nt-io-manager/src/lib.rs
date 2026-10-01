@@ -18,6 +18,7 @@ use nt_status::NtStatus;
 use nt_types::{ClientId, NtPath, ObjectId};
 
 mod banked_transfer;
+pub mod bus_interface;
 mod bounded_file_read;
 mod buffered_set_information;
 mod cancel;
@@ -73,6 +74,7 @@ pub mod retained_read_forward;
 pub mod retained_query_information_forward;
 pub mod retained_flush_forward;
 pub mod source_irp_ledger;
+pub mod source_irp_auxiliary;
 pub mod provider_source_irp;
 pub mod query_path_wire;
 pub mod io_create_file_wire;

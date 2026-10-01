@@ -59,6 +59,19 @@ pub struct DmaAdapterRequest {
 
 pub const NT5_DEVICE_DESCRIPTION_SIZE: usize = 40;
 pub const NT5_DEVICE_DESCRIPTION_MAX_VERSION: u32 = 2;
+const DMA_PAGE_SIZE: u64 = 0x1000;
+
+const fn maximum_transfer_map_registers(maximum_length: u64) -> u32 {
+    let pages = maximum_length
+        .saturating_add(DMA_PAGE_SIZE - 1)
+        / DMA_PAGE_SIZE;
+    let registers = pages.saturating_add(1);
+    if registers > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        registers as u32
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DeviceDescriptionError {
@@ -326,7 +339,10 @@ impl DmaManager {
     }
 
     /// `IoGetDmaAdapter` (spec §9): register a bus-master adapter for `owner`.
-    /// Returns the adapter ID; `num_map_registers` is a generous fixed quota (§9.5).
+    ///
+    /// NT exposes enough map registers for the maximum transfer plus one possible
+    /// unaligned leading page. PCI scatter/gather adapters do not consume HAL map
+    /// registers internally, but still report this value to their caller.
     pub fn register_adapter(
         &mut self,
         owner: DmaOwner,
@@ -339,7 +355,7 @@ impl DmaManager {
         self.adapters.push(Adapter {
             id,
             owner,
-            num_map_registers: 64,
+            num_map_registers: maximum_transfer_map_registers(max_length),
             sg_supported,
             max_length,
             dma64,
@@ -390,7 +406,7 @@ impl DmaManager {
         );
         Ok(DmaAdapterGrant {
             adapter_id,
-            num_map_registers: 64,
+            num_map_registers: maximum_transfer_map_registers(request.maximum_length),
             created: true,
         })
     }
@@ -438,6 +454,31 @@ impl DmaManager {
         if let Some(a) = self.adapters.iter_mut().find(|a| a.id == adapter_id) {
             a.active = false;
         }
+    }
+
+    /// Release one exact live adapter. Native projections use this owner-checked
+    /// operation so a stale or foreign projection cannot retire another device's
+    /// DMA authority.
+    pub fn put_adapter_for_owner(
+        &mut self,
+        owner: DmaOwner,
+        adapter_id: u64,
+    ) -> Result<(), DmaError> {
+        let has_other_owner = self
+            .adapters
+            .iter()
+            .any(|adapter| adapter.id == adapter_id && adapter.active && adapter.owner != owner);
+        let adapter = self
+            .adapters
+            .iter_mut()
+            .find(|adapter| adapter.id == adapter_id && adapter.active && adapter.owner == owner)
+            .ok_or(if has_other_owner {
+                DmaError::WrongOwner
+            } else {
+                DmaError::StaleId
+            })?;
+        adapter.active = false;
+        Ok(())
     }
 
     /// `AllocateCommonBuffer` (spec §11.1): allocate a fake logical address for a
@@ -1131,7 +1172,7 @@ mod tests {
         let replay = d.request_adapter(owner(), adapter_request()).unwrap();
 
         assert!(first.created);
-        assert_eq!(first.num_map_registers, 64);
+        assert_eq!(first.num_map_registers, 2);
         assert_eq!(
             replay,
             DmaAdapterGrant {
@@ -1139,7 +1180,7 @@ mod tests {
                 ..first
             }
         );
-        assert_eq!(d.num_map_registers(first.adapter_id), Some(64));
+        assert_eq!(d.num_map_registers(first.adapter_id), Some(2));
     }
 
     #[test]
@@ -1181,6 +1222,25 @@ mod tests {
     }
 
     #[test]
+    fn owner_checked_put_rejects_foreign_and_stale_adapter_ids() {
+        let mut d = DmaManager::new();
+        let adapter = d.request_adapter(owner(), adapter_request()).unwrap();
+
+        assert_eq!(
+            d.put_adapter_for_owner(DmaOwner::new(2, 200, 20), adapter.adapter_id),
+            Err(DmaError::WrongOwner)
+        );
+        assert_eq!(
+            d.put_adapter_for_owner(owner(), adapter.adapter_id),
+            Ok(())
+        );
+        assert_eq!(
+            d.put_adapter_for_owner(owner(), adapter.adapter_id),
+            Err(DmaError::StaleId)
+        );
+    }
+
+    #[test]
     fn adapter_request_rejects_incomplete_owner_and_zero_length() {
         let mut d = DmaManager::new();
         assert_eq!(
@@ -1200,7 +1260,7 @@ mod tests {
     fn adapter_and_common_buffer() {
         let mut d = DmaManager::new();
         let a = d.register_adapter(owner(), true, 4096, true);
-        assert_eq!(d.num_map_registers(a), Some(64));
+        assert_eq!(d.num_map_registers(a), Some(2));
         let g = d.alloc_common_buffer(owner(), a, 4096, 0x1_0000).unwrap();
         assert_eq!(g.logical_base, 0x8000_0000);
         // The sim device decodes the logical address to the backing buffer.

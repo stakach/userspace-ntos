@@ -166,6 +166,22 @@ impl SourceIrpLedger {
             .map(|row| row.allocation)
     }
 
+    pub fn registered(
+        &self,
+        owner: SourceIrpOwner,
+        domain: HostedDomainIdentity,
+        component_address: u64,
+    ) -> Option<(SourceIrpTicket, SourceIrpAllocation)> {
+        self.rows
+            .iter()
+            .find(|row| {
+                row.allocation.owner == owner
+                    && row.allocation.domain == domain
+                    && row.allocation.component_address == component_address
+            })
+            .map(|row| (row.ticket, row.allocation))
+    }
+
     /// Check an exact allocation before its owner performs an irreversible native free.
     /// The owner must serialize this check and the subsequent `retire` call.
     pub fn retirement_ready(

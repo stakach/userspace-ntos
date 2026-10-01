@@ -44,6 +44,7 @@ pub const IRP_MN_STOP_DEVICE: u8 = 0x04;
 pub const IRP_MN_QUERY_STOP_DEVICE: u8 = 0x05;
 pub const IRP_MN_CANCEL_STOP_DEVICE: u8 = 0x06;
 pub const IRP_MN_QUERY_DEVICE_RELATIONS: u8 = 0x07;
+pub const IRP_MN_QUERY_INTERFACE: u8 = 0x08;
 pub const IRP_MN_QUERY_CAPABILITIES: u8 = 0x09;
 pub const IRP_MN_QUERY_RESOURCES: u8 = 0x0A;
 pub const IRP_MN_QUERY_RESOURCE_REQUIREMENTS: u8 = 0x0B;
@@ -54,6 +55,120 @@ pub const IRP_MN_QUERY_BUS_INFORMATION: u8 = 0x15;
 /// Native NT5 x64 `DEVICE_CAPABILITIES` extent.
 pub const DEVICE_CAPABILITIES_X64_SIZE: usize = 64;
 pub const IRP_MN_SURPRISE_REMOVAL: u8 = 0x17;
+
+/// In-memory GUID bytes, matching `GUID_BUS_INTERFACE_STANDARD` in wdmguid.h.
+pub const GUID_BUS_INTERFACE_STANDARD: [u8; 16] = [
+    0x80, 0x82, 0x6b, 0x49, 0x25, 0x6f, 0xd0, 0x11, 0xbe, 0xaf, 0x08, 0x00, 0x2b, 0xe2,
+    0x09, 0x2f,
+];
+pub const BUS_INTERFACE_STANDARD_X64_SIZE: u16 = 64;
+pub const BUS_INTERFACE_QUERY_REQUEST_BYTES: usize = 20;
+pub const BUS_INTERFACE_QUERY_REPLY_BYTES: usize = 24;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BusInterfaceQueryError {
+    InvalidLength,
+    UnsupportedGuid,
+    UnsupportedVersion,
+    BufferTooSmall,
+    InvalidLease,
+}
+
+/// Pointer-free form of the `IRP_MN_QUERY_INTERFACE` stack parameters. The native interface
+/// buffer and its callback pointers are deliberately not transported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BusInterfaceQueryRequest {
+    pub interface_type: [u8; 16],
+    pub size: u16,
+    pub version: u16,
+}
+
+impl BusInterfaceQueryRequest {
+    pub const fn standard() -> Self {
+        Self {
+            interface_type: GUID_BUS_INTERFACE_STANDARD,
+            size: BUS_INTERFACE_STANDARD_X64_SIZE,
+            version: 1,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), BusInterfaceQueryError> {
+        if self.interface_type != GUID_BUS_INTERFACE_STANDARD {
+            return Err(BusInterfaceQueryError::UnsupportedGuid);
+        }
+        if self.version < 1 {
+            return Err(BusInterfaceQueryError::UnsupportedVersion);
+        }
+        if self.size < BUS_INTERFACE_STANDARD_X64_SIZE {
+            return Err(BusInterfaceQueryError::BufferTooSmall);
+        }
+        Ok(())
+    }
+
+    pub fn encode(self) -> [u8; BUS_INTERFACE_QUERY_REQUEST_BYTES] {
+        let mut bytes = [0; BUS_INTERFACE_QUERY_REQUEST_BYTES];
+        bytes[..16].copy_from_slice(&self.interface_type);
+        bytes[16..18].copy_from_slice(&self.size.to_le_bytes());
+        bytes[18..20].copy_from_slice(&self.version.to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, BusInterfaceQueryError> {
+        if bytes.len() != BUS_INTERFACE_QUERY_REQUEST_BYTES {
+            return Err(BusInterfaceQueryError::InvalidLength);
+        }
+        let mut interface_type = [0; 16];
+        interface_type.copy_from_slice(&bytes[..16]);
+        let request = Self {
+            interface_type,
+            size: u16::from_le_bytes([bytes[16], bytes[17]]),
+            version: u16::from_le_bytes([bytes[18], bytes[19]]),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+}
+
+/// A lease identifier, not a provider-domain `Context` or function pointer. A consumer-local
+/// projection must mint its own callbacks after authenticating this response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BusInterfaceQueryReply {
+    pub size: u16,
+    pub version: u16,
+    pub lease_id: u64,
+    pub device_id: u64,
+}
+
+impl BusInterfaceQueryReply {
+    pub fn encode(self) -> [u8; BUS_INTERFACE_QUERY_REPLY_BYTES] {
+        let mut bytes = [0; BUS_INTERFACE_QUERY_REPLY_BYTES];
+        bytes[..2].copy_from_slice(&self.size.to_le_bytes());
+        bytes[2..4].copy_from_slice(&self.version.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.lease_id.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.device_id.to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, BusInterfaceQueryError> {
+        if bytes.len() != BUS_INTERFACE_QUERY_REPLY_BYTES || bytes[4..8] != [0; 4] {
+            return Err(BusInterfaceQueryError::InvalidLength);
+        }
+        let reply = Self {
+            size: u16::from_le_bytes([bytes[0], bytes[1]]),
+            version: u16::from_le_bytes([bytes[2], bytes[3]]),
+            lease_id: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            device_id: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+        };
+        if reply.size != BUS_INTERFACE_STANDARD_X64_SIZE
+            || reply.version != 1
+            || reply.lease_id == 0
+            || reply.device_id == 0
+        {
+            return Err(BusInterfaceQueryError::InvalidLease);
+        }
+        Ok(reply)
+    }
+}
 
 pub const BUS_RELATIONS: u32 = 0;
 pub const EJECTION_RELATIONS: u32 = 1;
@@ -298,8 +413,37 @@ mod tests {
         assert_eq!(IRP_MN_START_DEVICE, 0);
         assert_eq!(IRP_MN_REMOVE_DEVICE, 2);
         assert_eq!(IRP_MN_QUERY_DEVICE_RELATIONS, 7);
+        assert_eq!(IRP_MN_QUERY_INTERFACE, 8);
         assert_eq!(IRP_MN_QUERY_ID, 0x13);
         assert_eq!(BUS_RELATIONS, 0);
         assert_eq!(BUS_QUERY_INSTANCE_ID, 3);
+    }
+
+    #[test]
+    fn bus_interface_query_wire_is_pointer_free_and_strict() {
+        let request = BusInterfaceQueryRequest::standard();
+        assert_eq!(BusInterfaceQueryRequest::decode(&request.encode()), Ok(request));
+        let mut too_old = request;
+        too_old.version = 0;
+        assert_eq!(too_old.validate(), Err(BusInterfaceQueryError::UnsupportedVersion));
+        let mut too_small = request;
+        too_small.size = BUS_INTERFACE_STANDARD_X64_SIZE - 1;
+        assert_eq!(too_small.validate(), Err(BusInterfaceQueryError::BufferTooSmall));
+        let mut other = request;
+        other.interface_type[0] ^= 1;
+        assert_eq!(other.validate(), Err(BusInterfaceQueryError::UnsupportedGuid));
+        assert_eq!(BusInterfaceQueryRequest::decode(&request.encode()[..19]),
+            Err(BusInterfaceQueryError::InvalidLength));
+        let reply = BusInterfaceQueryReply {
+            size: BUS_INTERFACE_STANDARD_X64_SIZE,
+            version: 1,
+            lease_id: 3,
+            device_id: 7,
+        };
+        assert_eq!(BusInterfaceQueryReply::decode(&reply.encode()), Ok(reply));
+        let mut invalid = reply.encode();
+        invalid[4] = 1;
+        assert_eq!(BusInterfaceQueryReply::decode(&invalid),
+            Err(BusInterfaceQueryError::InvalidLength));
     }
 }

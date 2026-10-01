@@ -85,6 +85,8 @@ mod hosted_file_lifecycle_owners;
 mod hosted_file_retirements;
 #[path = "hosted_source_irp_ledger.rs"]
 mod hosted_source_irp_ledger;
+#[path = "hosted_synchronous_fsd_request.rs"]
+mod hosted_synchronous_fsd_request;
 #[path = "hosted_source_create_security.rs"]
 mod hosted_source_create_security;
 #[path = "hosted_source_pool_memory.rs"]
@@ -934,13 +936,15 @@ pub const FSD_DISPATCH_DRAIN_FILE_RETIREMENTS: u64 = u64::MAX - 0x781;
 
 const HOSTED_INTERRUPT_OP_CONNECT: u64 = 1;
 const HOSTED_INTERRUPT_OP_DISCONNECT: u64 = 2;
+const HOSTED_INTERRUPT_OP_ACQUIRE_LOCK: u64 = 3;
+const HOSTED_INTERRUPT_OP_RELEASE_LOCK: u64 = 4;
 const HOSTED_MDL_OP_REGISTER: u64 = 1;
 const HOSTED_MDL_OP_BUILD_NONPAGED: u64 = 2;
 const HOSTED_MDL_OP_UPDATE: u64 = 3;
 const HOSTED_MDL_OP_UNLOCK: u64 = 4;
 const HOSTED_MDL_OP_FREE: u64 = 5;
 const HOSTED_KINTERRUPT_MAGIC: u64 = 0x4B49_4E54_5250_5431;
-const HOSTED_KINTERRUPT_SIZE: u64 = 0x50;
+const HOSTED_KINTERRUPT_SIZE: u64 = 0x70;
 const HOSTED_KINTERRUPT_VECTOR: u64 = 0x00;
 const HOSTED_KINTERRUPT_IRQL: u64 = 0x04;
 const HOSTED_KINTERRUPT_SYNCHRONIZE_IRQL: u64 = 0x05;
@@ -955,6 +959,12 @@ const HOSTED_KINTERRUPT_MAGIC_OFF: u64 = 0x30;
 const HOSTED_KINTERRUPT_PRIVATE_LOCK: u64 = 0x38;
 const HOSTED_KINTERRUPT_FLOATING_SAVE: u64 = 0x40;
 const HOSTED_KINTERRUPT_GRANT_GENERATION: u64 = 0x48;
+const HOSTED_KINTERRUPT_ACQUIRE_STATE: u64 = 0x50;
+const HOSTED_KINTERRUPT_ACQUIRE_SEQUENCE: u64 = 0x58;
+const HOSTED_KINTERRUPT_ACQUIRE_OLD_IRQL: u64 = 0x60;
+const HOSTED_KINTERRUPT_ACQUIRE_IDLE: u64 = 0;
+const HOSTED_KINTERRUPT_ACQUIRE_PENDING: u64 = 1;
+const HOSTED_KINTERRUPT_ACQUIRE_LANE: u64 = 2;
 
 #[inline]
 const fn hosted_interrupt_policy(irql: u8, mode: u8, share: u8) -> u64 {
@@ -7909,6 +7919,11 @@ extern "win64" fn s_io_allocate_irp(stack_size: u8, _charge_quota: u8) -> u64 {
             (irp + 0xb8) as *mut u64,
             stack_base + stack_count * WDM_X64_IO_STACK_LOCATION_SIZE as u64,
         );
+        let packet = core::slice::from_raw_parts_mut(irp as *mut u8, total as usize);
+        if nt_io_manager::initialize_wdm_irp_thread_list(packet, irp).is_err() {
+            pool_free(irp);
+            return 0;
+        }
         let (label, status, ticket, generation, _) = call_on4(
             (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
             1,
@@ -8556,13 +8571,12 @@ struct HostedSyncForwardContext {
     completed: AtomicBool,
 }
 
-extern "win64" fn s_io_forward_sync_completion(_device: u64, irp: u64, context: u64) -> i32 {
+extern "win64" fn s_io_forward_sync_completion(_device: u64, _irp: u64, context: u64) -> i32 {
     unsafe {
         let state = &*(context as *const HostedSyncForwardContext);
         state.completed.store(true, Ordering::Release);
-        if read_unaligned((irp + WDM_X64_IRP_PENDING_RETURNED_OFFSET) as *const u8) != 0 {
-            s_ke_set_event(context, 0, 0);
-        }
+        // An inline completion may still be followed by STATUS_PENDING; retain the wake.
+        s_ke_set_event(context, 0, 0);
     }
     nt_status::NtStatus::MORE_PROCESSING_REQUIRED.raw()
 }
@@ -8596,8 +8610,7 @@ extern "win64" fn s_io_forward_irp_synchronously(device: u64, irp: u64) -> u8 {
             if wait_status != nt_status::NtStatus::SUCCESS.raw() {
                 crate::provider_bugcheck::report(0xc4, [device, irp, event_ptr, wait_status as u32 as u64]);
             }
-        }
-        if !context.completed.load(Ordering::Acquire) {
+        } else if !context.completed.load(Ordering::Acquire) {
             crate::provider_bugcheck::report(0xc4, [device, irp, event_ptr, status as u32 as u64]);
         }
         1
@@ -9005,7 +9018,16 @@ extern "win64" fn s_io_free_mdl(mdl: u64) {
         if mdl == 0 {
             return;
         }
-        require_hosted_mdl_service(HOSTED_MDL_OP_FREE, mdl, 0, 0);
+        let status = hosted_mdl_service(HOSTED_MDL_OP_FREE, mdl, 0, 0);
+        if status != STATUS_SUCCESS && status as u32 != STATUS_PENDING {
+            s_ke_bug_check_ex(
+                0xC4,
+                0x4D44_4C53,
+                mdl,
+                status as u32 as u64,
+                hosted_thread_correlation(),
+            );
+        }
     }
 }
 
@@ -9630,6 +9652,27 @@ extern "win64" fn s_io_get_dma_adapter(
     device_description: u64,
     number_of_map_registers: *mut u32,
 ) -> u64 {
+    project_hosted_dma_adapter(pdo, device_description, number_of_map_registers)
+}
+
+/// `PDMA_ADAPTER HalGetAdapter(PDEVICE_DESCRIPTION, PULONG)` uses only the exact PDO installed
+/// by the active bus-interface callback dispatch. A call outside that dispatch has no device
+/// authority and fails closed.
+extern "win64" fn s_hal_get_adapter(
+    device_description: u64,
+    number_of_map_registers: *mut u32,
+) -> u64 {
+    let pdo = unsafe {
+        read_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DEVICE_OBJECT) as *const u64)
+    };
+    project_hosted_dma_adapter(pdo, device_description, number_of_map_registers)
+}
+
+fn project_hosted_dma_adapter(
+    pdo: u64,
+    device_description: u64,
+    number_of_map_registers: *mut u32,
+) -> u64 {
     unsafe {
         if pdo == 0 || device_description == 0 {
             return 0;
@@ -9642,8 +9685,9 @@ extern "win64" fn s_io_get_dma_adapter(
             Ok(description) => description,
             Err(_) => return 0,
         };
-        let words = description.service_words();
-        let (_label, status, granted_adapter_id, granted_map_registers, _) = call_on5(
+        let mut words = description.service_words();
+        words[0] |= HOSTED_DMA_SERVICE_REQUEST_ADAPTER << HOSTED_DMA_SERVICE_OPERATION_SHIFT;
+        let (_label, status, granted_adapter_id, granted_map_registers, granted_lease_id) = call_on5(
             (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
             pdo,
             words[0],
@@ -9653,6 +9697,7 @@ extern "win64" fn s_io_get_dma_adapter(
         );
         if status as u32 as i32 != STATUS_SUCCESS
             || granted_adapter_id == 0
+            || granted_lease_id == 0
             || granted_map_registers == 0
             || granted_map_registers > u32::MAX as u64
         {
@@ -9671,7 +9716,11 @@ extern "win64" fn s_io_get_dma_adapter(
             return 0;
         }
         let active_adapter = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
-        if dma_adapter_blob_matches(active_adapter, adapter_id) {
+        if dma_adapter_blob_matches(active_adapter, adapter_id)
+            && read_unaligned(
+                (active_adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64,
+            ) == granted_lease_id
+        {
             if !number_of_map_registers.is_null() {
                 write_unaligned(number_of_map_registers, granted_map_registers as u32);
             }
@@ -9776,6 +9825,10 @@ extern "win64" fn s_io_get_dma_adapter(
             (adapter + HOSTED_DMA_ADAPTER_GRANT_LOGICAL_OFFSET) as *mut u64,
             grant_logical,
         );
+        write_unaligned(
+            (adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *mut u64,
+            granted_lease_id,
+        );
         write_volatile(
             (FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *mut u64,
             adapter,
@@ -9792,6 +9845,23 @@ extern "win64" fn s_io_get_dma_adapter(
 extern "win64" fn s_dma_put_adapter(adapter: u64) {
     unsafe {
         if dma_adapter_blob_id(adapter).is_none() {
+            return;
+        }
+        let lease_id = read_unaligned(
+            (adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64,
+        );
+        if lease_id == 0 {
+            return;
+        }
+        let (_label, status, _, _, _) = call_on5(
+            (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+            lease_id,
+            HOSTED_DMA_SERVICE_RELEASE_ADAPTER << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+            0,
+            0,
+            0,
+        );
+        if status as u32 as i32 != STATUS_SUCCESS {
             return;
         }
         let active = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
@@ -9824,6 +9894,11 @@ const HOSTED_DMA_ADAPTER_ID_OFFSET: u64 = 0x18;
 const HOSTED_DMA_ADAPTER_GRANT_VA_OFFSET: u64 = 0x20;
 const HOSTED_DMA_ADAPTER_GRANT_LEN_OFFSET: u64 = 0x28;
 const HOSTED_DMA_ADAPTER_GRANT_LOGICAL_OFFSET: u64 = 0x30;
+const HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET: u64 = 0x38;
+const HOSTED_DMA_SERVICE_OPERATION_SHIFT: u64 = 56;
+const HOSTED_DMA_SERVICE_OPERATION_MASK: u64 = 0xff << HOSTED_DMA_SERVICE_OPERATION_SHIFT;
+const HOSTED_DMA_SERVICE_REQUEST_ADAPTER: u64 = 1;
+const HOSTED_DMA_SERVICE_RELEASE_ADAPTER: u64 = 2;
 
 #[derive(Clone, Copy)]
 struct HostedDmaAdapterMetadata {
@@ -10942,6 +11017,23 @@ extern "win64" fn s_io_register_file_system(_dev: u64) {
 }
 
 unsafe fn finish_driver_local_irp(irp: u64) {
+    let (label, begin_status, auxiliary_output_limit, _, _) = call_on4(
+        (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
+        5,
+        irp,
+        0,
+        0,
+    );
+    if label != 0
+        || (begin_status as u32 as i32 != STATUS_SUCCESS
+            && begin_status as u32 as i32
+                != nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw())
+    {
+        crate::provider_bugcheck::report(
+            0xc4,
+            [FSD_SERVICE_SOURCE_IRP_LABEL, 5, irp, begin_status],
+        );
+    }
     let status = read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const i32);
     let information =
         read_unaligned((irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *const u64);
@@ -10963,7 +11055,14 @@ unsafe fn finish_driver_local_irp(irp: u64) {
         && (status as u32 >> 30) != 3
     {
         let copy_len = component_pool_allocation_capacity(system_buffer)
-            .map(|capacity| information.min(capacity))
+            .map(|capacity| {
+                let capacity = if begin_status as u32 as i32 == STATUS_SUCCESS {
+                    capacity.min(auxiliary_output_limit)
+                } else {
+                    capacity
+                };
+                information.min(capacity)
+            })
             .unwrap_or(0);
         if copy_len != 0 {
             core::ptr::copy_nonoverlapping(
@@ -10980,6 +11079,10 @@ unsafe fn finish_driver_local_irp(irp: u64) {
         pool_free(system_buffer);
     }
     if mdl != 0 && component_pool_allocation_capacity(mdl).is_some() {
+        let mdl_flags = read_unaligned((mdl + nt_mdl::MDL_OFF_FLAGS) as *const i16);
+        if mdl_flags & nt_mdl::MDL_PAGES_LOCKED != 0 {
+            s_mm_unlock_pages(mdl);
+        }
         s_io_free_mdl(mdl);
     }
     if user_event != 0 {
@@ -12674,6 +12777,20 @@ pub(crate) enum HostedDriverWaitServiceResult {
     },
 }
 
+pub(crate) enum HostedDriverInterruptServiceResult {
+    Reply {
+        status: i32,
+        interrupt_id: u64,
+        grant_generation: u64,
+    },
+    SharedParked {
+        route: nt_component_suspension::peer_registry::PeerRoute,
+        dispatch: nt_component_suspension::LaneDispatchIdentity,
+        reply: u64,
+        token: u64,
+    },
+}
+
 pub(crate) enum HostedDriverThreadTerminateServiceResult {
     Reply(i32),
     SharedTerminated { route: nt_component_suspension::peer_registry::PeerRoute },
@@ -13263,45 +13380,108 @@ extern "win64" fn s_ke_deregister_bug_check_callback(record: u64) -> u8 {
     1
 }
 
-/// `BOOLEAN KeSynchronizeExecution(PKINTERRUPT, PKSYNCHRONIZE_ROUTINE, PVOID)`.
-extern "win64" fn s_ke_synchronize_execution(interrupt: u64, routine: u64, context: u64) -> u8 {
-    if interrupt == 0 || routine == 0 {
-        return 0;
-    }
-    unsafe {
-        if component_pool_allocation_capacity(interrupt)
+#[derive(Clone, Copy)]
+struct HostedInterruptProjection {
+    synchronize_irql: u8,
+    actual_lock: u64,
+    interrupt_id: u64,
+    grant_generation: u64,
+}
+
+unsafe fn hosted_interrupt_projection(interrupt: u64) -> Option<HostedInterruptProjection> {
+    if interrupt == 0
+        || component_pool_allocation_capacity(interrupt)
             .is_none_or(|capacity| capacity < HOSTED_KINTERRUPT_SIZE)
-            || read_unaligned((interrupt + HOSTED_KINTERRUPT_MAGIC_OFF) as *const u64)
-                != HOSTED_KINTERRUPT_MAGIC
-        {
-            return 0;
+        || read_unaligned((interrupt + HOSTED_KINTERRUPT_MAGIC_OFF) as *const u64)
+            != HOSTED_KINTERRUPT_MAGIC
+    {
+        return None;
+    }
+    let projection = HostedInterruptProjection {
+        synchronize_irql: read_unaligned(
+            (interrupt + HOSTED_KINTERRUPT_SYNCHRONIZE_IRQL) as *const u8,
+        ),
+        actual_lock: read_unaligned(
+            (interrupt + HOSTED_KINTERRUPT_ACTUAL_LOCK) as *const u64,
+        ),
+        interrupt_id: read_unaligned((interrupt + HOSTED_KINTERRUPT_ID) as *const u64),
+        grant_generation: read_unaligned(
+            (interrupt + HOSTED_KINTERRUPT_GRANT_GENERATION) as *const u64,
+        ),
+    };
+    (projection.synchronize_irql >= DISPATCH_LEVEL
+        && projection.actual_lock != 0
+        && projection.interrupt_id != 0
+        && projection.grant_generation != 0)
+        .then_some(projection)
+}
+
+#[inline]
+unsafe fn hosted_interrupt_acquire_state(interrupt: u64) -> &'static AtomicU64 {
+    &*((interrupt + HOSTED_KINTERRUPT_ACQUIRE_STATE) as *const AtomicU64)
+}
+
+unsafe fn hosted_interrupt_lock_fault(
+    operation: u64,
+    interrupt: u64,
+    detail: u64,
+) -> ! {
+    if hosted_irq_lane_context().is_some() {
+        hosted_irq_lane_protocol_fault(detail);
+    }
+    crate::provider_bugcheck::report(
+        0xc4,
+        [FSD_SERVICE_INTERRUPT_LABEL, operation, interrupt, detail],
+    )
+}
+
+/// `KIRQL KeAcquireInterruptSpinLock(PKINTERRUPT)`.
+///
+/// Raising to `SynchronizeIrql` is only the processor-local half of this operation. The retained
+/// root `ActualLock` lease serializes ordinary driver threads with ISR execution and with every
+/// other `KINTERRUPT` that was connected using the same caller-supplied spin lock.
+extern "win64" fn s_ke_acquire_interrupt_spin_lock(interrupt: u64) -> u8 {
+    unsafe {
+        let Some(projection) = hosted_interrupt_projection(interrupt) else {
+            hosted_interrupt_lock_fault(HOSTED_INTERRUPT_OP_ACQUIRE_LOCK, interrupt, 0);
+        };
+        let old_irql = hosted_current_irql();
+        if old_irql > projection.synchronize_irql {
+            hosted_interrupt_lock_fault(
+                HOSTED_INTERRUPT_OP_ACQUIRE_LOCK,
+                interrupt,
+                old_irql as u64,
+            );
         }
-        let synchronize_irql =
-            read_unaligned((interrupt + HOSTED_KINTERRUPT_SYNCHRONIZE_IRQL) as *const u8);
-        let actual_lock = read_unaligned((interrupt + HOSTED_KINTERRUPT_ACTUAL_LOCK) as *const u64);
-        let interrupt_id = read_unaligned((interrupt + HOSTED_KINTERRUPT_ID) as *const u64);
-        let grant_generation =
-            read_unaligned((interrupt + HOSTED_KINTERRUPT_GRANT_GENERATION) as *const u64);
-        if actual_lock == 0
-            || interrupt_id == 0
-            || grant_generation == 0
-            || synchronize_irql < DISPATCH_LEVEL
-        {
-            return 0;
-        }
+        let raised_from = hosted_raise_irql(projection.synchronize_irql);
+        debug_assert_eq!(old_irql, raised_from);
         if let Some((_, identity, _, _, _)) = hosted_irq_lane_context() {
+            let state = hosted_interrupt_acquire_state(interrupt);
+            if state
+                .compare_exchange(
+                    HOSTED_KINTERRUPT_ACQUIRE_IDLE,
+                    HOSTED_KINTERRUPT_ACQUIRE_PENDING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                hosted_lower_irql(old_irql);
+                hosted_irq_lane_protocol_fault(projection.interrupt_id);
+            }
             let Some(grant) = nt_hosted_runtime::HostedIrqGrantIdentity::new(
                 identity.domain_id,
                 identity.domain_cookie,
-                interrupt_id,
-                grant_generation,
+                projection.interrupt_id,
+                projection.grant_generation,
             ) else {
-                hosted_irq_lane_protocol_fault(0);
+                state.store(HOSTED_KINTERRUPT_ACQUIRE_IDLE, Ordering::Release);
+                hosted_lower_irql(old_irql);
+                hosted_irq_lane_protocol_fault(projection.interrupt_id);
             };
-            let old_irql = hosted_raise_irql(synchronize_irql);
             let acquired = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
                 kind: nt_hosted_runtime::HostedIrqServiceKind::AcquireActualLock,
-                service_id: actual_lock,
+                service_id: projection.actual_lock,
                 target_domain_id: identity.domain_id,
                 target_domain_cookie: identity.domain_cookie,
                 authority_cookie: 0,
@@ -13314,42 +13494,132 @@ extern "win64" fn s_ke_synchronize_execution(interrupt: u64, routine: u64, conte
                 || acquired.value_count != 1
                 || acquired.values[0] == 0
             {
+                state.store(HOSTED_KINTERRUPT_ACQUIRE_IDLE, Ordering::Release);
                 hosted_lower_irql(old_irql);
-                hosted_irq_lane_protocol_fault(interrupt_id);
+                hosted_irq_lane_protocol_fault(projection.interrupt_id);
             }
-            let result = call_hosted_pe(routine, &[context]) as u8;
-            let mut release_arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
-            release_arguments[0] = acquired.values[0];
+            write_unaligned(
+                (interrupt + HOSTED_KINTERRUPT_ACQUIRE_SEQUENCE) as *mut u64,
+                acquired.values[0],
+            );
+            write_unaligned(
+                (interrupt + HOSTED_KINTERRUPT_ACQUIRE_OLD_IRQL) as *mut u64,
+                old_irql as u64,
+            );
+            state.store(HOSTED_KINTERRUPT_ACQUIRE_LANE, Ordering::Release);
+        } else {
+            let (_, status, _, _, _) = call_on4(
+                (FSD_SERVICE_INTERRUPT_LABEL << 12) | 3,
+                HOSTED_INTERRUPT_OP_ACQUIRE_LOCK,
+                interrupt,
+                old_irql as u64,
+                0,
+            );
+            let status = status as u32 as i32;
+            if status != STATUS_SUCCESS {
+                hosted_lower_irql(old_irql);
+                hosted_interrupt_lock_fault(
+                    HOSTED_INTERRUPT_OP_ACQUIRE_LOCK,
+                    interrupt,
+                    status as u32 as u64,
+                );
+            }
+        }
+        old_irql
+    }
+}
+
+/// `VOID KeReleaseInterruptSpinLock(PKINTERRUPT, KIRQL)`.
+extern "win64" fn s_ke_release_interrupt_spin_lock(interrupt: u64, old_irql: u8) {
+    unsafe {
+        let Some(projection) = hosted_interrupt_projection(interrupt) else {
+            hosted_interrupt_lock_fault(HOSTED_INTERRUPT_OP_RELEASE_LOCK, interrupt, 0);
+        };
+        if hosted_current_irql() != projection.synchronize_irql {
+            hosted_interrupt_lock_fault(
+                HOSTED_INTERRUPT_OP_RELEASE_LOCK,
+                interrupt,
+                STATUS_INVALID_PARAMETER as u32 as u64,
+            );
+        }
+        if let Some((_, identity, _, _, _)) = hosted_irq_lane_context() {
+            let state = hosted_interrupt_acquire_state(interrupt);
+            let recorded_old = read_unaligned(
+                (interrupt + HOSTED_KINTERRUPT_ACQUIRE_OLD_IRQL) as *const u64,
+            );
+            if state.load(Ordering::Acquire) != HOSTED_KINTERRUPT_ACQUIRE_LANE
+                || recorded_old != old_irql as u64
+            {
+                hosted_irq_lane_protocol_fault(projection.interrupt_id);
+            }
+            let sequence = read_unaligned(
+                (interrupt + HOSTED_KINTERRUPT_ACQUIRE_SEQUENCE) as *const u64,
+            );
+            let Some(grant) = nt_hosted_runtime::HostedIrqGrantIdentity::new(
+                identity.domain_id,
+                identity.domain_cookie,
+                projection.interrupt_id,
+                projection.grant_generation,
+            ) else {
+                hosted_irq_lane_protocol_fault(projection.interrupt_id);
+            };
+            let mut arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+            arguments[0] = sequence;
             let released = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
                 kind: nt_hosted_runtime::HostedIrqServiceKind::ReleaseActualLock,
-                service_id: actual_lock,
+                service_id: projection.actual_lock,
                 target_domain_id: identity.domain_id,
                 target_domain_cookie: identity.domain_cookie,
                 authority_cookie: 0,
                 grant,
                 argument_count: 1,
-                arguments: release_arguments,
+                arguments,
             });
             if released.faulted
                 || released.status != STATUS_SUCCESS
                 || released.value_count != 0
             {
-                hosted_lower_irql(old_irql);
-                hosted_irq_lane_protocol_fault(interrupt_id);
+                hosted_irq_lane_protocol_fault(projection.interrupt_id);
             }
-            hosted_lower_irql(old_irql);
-            return result;
+            write_unaligned(
+                (interrupt + HOSTED_KINTERRUPT_ACQUIRE_SEQUENCE) as *mut u64,
+                0,
+            );
+            write_unaligned(
+                (interrupt + HOSTED_KINTERRUPT_ACQUIRE_OLD_IRQL) as *mut u64,
+                0,
+            );
+            state.store(HOSTED_KINTERRUPT_ACQUIRE_IDLE, Ordering::Release);
+        } else {
+            let (_, status, _, _, _) = call_on4(
+                (FSD_SERVICE_INTERRUPT_LABEL << 12) | 3,
+                HOSTED_INTERRUPT_OP_RELEASE_LOCK,
+                interrupt,
+                old_irql as u64,
+                0,
+            );
+            let status = status as u32 as i32;
+            if status != STATUS_SUCCESS {
+                hosted_interrupt_lock_fault(
+                    HOSTED_INTERRUPT_OP_RELEASE_LOCK,
+                    interrupt,
+                    status as u32 as u64,
+                );
+            }
         }
-        let old_irql = hosted_raise_irql(synchronize_irql);
-        // The hosted ABI exposes one logical processor. Its KSPIN_LOCK operations are therefore
-        // IRQL exclusion plus barriers; use the exact ActualLock identity retained at connect time.
-        let _actual_lock_identity = actual_lock;
-        compiler_fence(Ordering::SeqCst);
-        let result = call_hosted_pe(routine, &[context]) as u8;
-        compiler_fence(Ordering::SeqCst);
         hosted_lower_irql(old_irql);
-        result
     }
+}
+
+/// `BOOLEAN KeSynchronizeExecution(PKINTERRUPT, PKSYNCHRONIZE_ROUTINE, PVOID)`.
+extern "win64" fn s_ke_synchronize_execution(interrupt: u64, routine: u64, context: u64) -> u8 {
+    if routine == 0 || unsafe { hosted_interrupt_projection(interrupt) }.is_none() {
+        return 0;
+    }
+    let old_irql = s_ke_acquire_interrupt_spin_lock(interrupt);
+    let result = unsafe { call_hosted_pe(routine, &[context]) as u8 };
+    s_ke_release_interrupt_spin_lock(interrupt, old_irql);
+    result
 }
 
 /// `VOID KeFlushQueuedDpcs(VOID)` — drain the hosted driver's KDPC queue before returning.
@@ -32144,6 +32414,10 @@ fn register_fsd_trampolines() -> bool {
         "IoBuildDeviceIoControlRequest",
         s_io_build_device_io_control_request as *const () as usize as u64,
     );
+    reg.bind(
+        "IoBuildSynchronousFsdRequest",
+        hosted_synchronous_fsd_request::build as *const () as usize as u64,
+    );
     reg.bind("IoCancelIrp", s_io_cancel_irp as *const () as usize as u64);
     reg.bind(
         "IoAcquireCancelSpinLock",
@@ -32757,6 +33031,14 @@ fn register_fsd_trampolines() -> bool {
         s_ke_synchronize_execution as *const () as usize as u64,
     );
     reg.bind(
+        "KeAcquireInterruptSpinLock",
+        s_ke_acquire_interrupt_spin_lock as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeReleaseInterruptSpinLock",
+        s_ke_release_interrupt_spin_lock as *const () as usize as u64,
+    );
+    reg.bind(
         "KeNumberProcessors",
         core::ptr::addr_of!(KE_NUMBER_PROCESSORS_VALUE) as usize as u64,
     );
@@ -33004,6 +33286,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "HalGetInterruptVector",
         s_hal_get_interrupt_vector as *const () as usize as u64,
+    );
+    reg.bind(
+        "HalGetAdapter",
+        s_hal_get_adapter as *const () as usize as u64,
     );
     reg.bind(
         "HalAcpiQueryInterruptModel",
@@ -44641,6 +44927,31 @@ struct HostedIrqConnection {
 }
 
 #[derive(Clone, Copy)]
+struct HostedInterruptLockHolder {
+    instance: usize,
+    domain: HostedDomainIdentity,
+    thread_handle: u64,
+    interrupt_object: u64,
+    connection: InterruptConnectionIdentity,
+    lease: InterruptActualLockLease,
+    old_irql: u8,
+}
+
+#[derive(Clone, Copy)]
+struct HostedInterruptLockWaiter {
+    instance: usize,
+    domain: HostedDomainIdentity,
+    thread_handle: u64,
+    interrupt_object: u64,
+    connection: InterruptConnectionIdentity,
+    actual_lock: InterruptActualLockIdentity,
+    old_irql: u8,
+    reply_cap: u64,
+    shared: HostedDriverSharedWait,
+    wake_started: bool,
+}
+
+#[derive(Clone, Copy)]
 struct HostedIrqConnectionAuthority {
     grant: HostedIrqGrantIdentity,
     route: nt_resource_manager::ConnectedInterrupt,
@@ -44971,6 +45282,22 @@ struct HostedDeviceRetirement {
     barrier_status: Option<nt_status::NtStatus>,
 }
 
+#[derive(Clone, Copy)]
+enum HostedDmaPdoGeneration {
+    Root(nt_pnp_manager::DevnodeIdentity),
+    Child(nt_pnp_manager::ParentRelationIdentity),
+}
+
+#[derive(Clone, Copy)]
+struct HostedDmaAdapterLease {
+    lease_id: u64,
+    adapter_id: u64,
+    owner: DmaOwner,
+    consumer_domain: HostedDomainIdentity,
+    pdo_registration: nt_io_manager::HostedDevicePointerRegistration,
+    pdo_generation: HostedDmaPdoGeneration,
+}
+
 static mut HOSTED_DEVICE_BINDINGS: Option<Vec<HostedDeviceBinding>> = None;
 static mut HOSTED_DEVICE_RETIREMENTS: Option<Vec<HostedDeviceRetirement>> = None;
 static mut HOSTED_ROOT_BUS: Option<nt_root_bus::RootBus> = None;
@@ -44987,10 +45314,14 @@ static mut HOSTED_DEVICE_RELATION_QUERY: Option<HostedDeviceRelationQuery> = Non
 static mut HOSTED_DEVICE_RELATION_FAILURES: Option<Vec<HostedDeviceRelationFailure>> = None;
 static mut HOSTED_RESOURCE_MANAGER: Option<ResourceManager> = None;
 static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
+static mut HOSTED_DMA_ADAPTER_LEASES: Option<Vec<HostedDmaAdapterLease>> = None;
+static HOSTED_DMA_ADAPTER_LEASE_NEXT: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
 static mut HOSTED_DEVICE_RESOURCE_STATES: Option<Vec<HostedDeviceResourceState>> = None;
 static mut HOSTED_IRQ_CONNECTIONS: Option<Vec<HostedIrqConnection>> = None;
 static mut HOSTED_IRQ_ACTUAL_LOCKS: Option<InterruptActualLockTable> = None;
+static mut HOSTED_INTERRUPT_LOCK_HOLDERS: Option<Vec<HostedInterruptLockHolder>> = None;
+static mut HOSTED_INTERRUPT_LOCK_WAITERS: Option<Vec<HostedInterruptLockWaiter>> = None;
 static mut HOSTED_DPCS: Option<HostedDpcTable> = None;
 static mut HOSTED_PHYSICAL_IRQ_LEASES: Option<Vec<HostedPhysicalIrqLease>> = None;
 static mut HOSTED_IRQ_LINES: Option<Vec<HostedIrqLine>> = None;
@@ -45754,6 +46085,137 @@ fn hosted_dma_owner(binding: HostedDeviceBinding) -> DmaOwner {
         binding.projection_domain.cookie,
         binding.device_id,
     )
+}
+
+unsafe fn hosted_dma_adapter_leases_mut() -> &'static mut Vec<HostedDmaAdapterLease> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DMA_ADAPTER_LEASES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_dma_pdo_generation(
+    pdo_device_id: u64,
+) -> Option<HostedDmaPdoGeneration> {
+    let pnp = hosted_pnp_manager_mut();
+    let devnode = pnp.devnode_identity_for_pdo(pdo_device_id)?;
+    match pnp.parent_relation_for_pdo(pdo_device_id) {
+        Some(relation)
+            if hosted_bus_relations().relation_contains(relation.relation(), pdo_device_id) =>
+        {
+            Some(HostedDmaPdoGeneration::Child(relation))
+        }
+        Some(_) => None,
+        None => Some(HostedDmaPdoGeneration::Root(devnode)),
+    }
+}
+
+unsafe fn hosted_dma_pdo_generation_is_live(
+    pdo_device_id: u64,
+    generation: HostedDmaPdoGeneration,
+) -> bool {
+    let pnp = hosted_pnp_manager_mut();
+    match generation {
+        HostedDmaPdoGeneration::Root(identity) => {
+            pnp.devnode_identity_for_pdo(pdo_device_id) == Some(identity)
+                && pnp.parent_relation_for_pdo(pdo_device_id).is_none()
+        }
+        HostedDmaPdoGeneration::Child(relation) => {
+            pnp.parent_relation_for_pdo(pdo_device_id) == Some(relation)
+                && hosted_bus_relations().relation_contains(relation.relation(), pdo_device_id)
+        }
+    }
+}
+
+unsafe fn retain_hosted_dma_adapter_lease(
+    binding: HostedDeviceBinding,
+    adapter_id: u64,
+) -> Result<u64, nt_status::NtStatus> {
+    let owner = hosted_dma_owner(binding);
+    let pdo_device_id = nt_io_manager::DeviceId(binding.pdo_device_id);
+    let pdo_registration = hosted_device_pointer_registration(
+        binding.projection_domain,
+        binding.pdo_object,
+        pdo_device_id,
+    )?;
+    let pdo_generation = hosted_dma_pdo_generation(binding.pdo_device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let leases = hosted_dma_adapter_leases_mut();
+    if let Some(lease) = leases.iter().copied().find(|lease| {
+        lease.adapter_id == adapter_id
+            && lease.owner == owner
+            && lease.consumer_domain == binding.projection_domain
+    }) {
+        return if lease.pdo_registration == pdo_registration
+            && match (lease.pdo_generation, pdo_generation) {
+                (HostedDmaPdoGeneration::Root(left), HostedDmaPdoGeneration::Root(right)) => {
+                    left == right
+                }
+                (HostedDmaPdoGeneration::Child(left), HostedDmaPdoGeneration::Child(right)) => {
+                    left == right
+                }
+                _ => false,
+            }
+        {
+            Ok(lease.lease_id)
+        } else {
+            Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+        };
+    }
+    let lease_id = HOSTED_DMA_ADAPTER_LEASE_NEXT
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1).filter(|next| *next != 0)
+        })
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
+        .checked_add(1)
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    leases
+        .try_reserve(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    leases.push(HostedDmaAdapterLease {
+        lease_id,
+        adapter_id,
+        owner,
+        consumer_domain: binding.projection_domain,
+        pdo_registration,
+        pdo_generation,
+    });
+    Ok(lease_id)
+}
+
+unsafe fn release_hosted_dma_adapter_lease(
+    consumer_domain: HostedDomainIdentity,
+    lease_id: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let leases = hosted_dma_adapter_leases_mut();
+    let index = leases
+        .iter()
+        .position(|lease| lease.lease_id == lease_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let lease = leases[index];
+    if lease.consumer_domain != consumer_domain
+        || io_manager_mut().hosted_device_pointer_registration(
+            lease.pdo_registration.domain(),
+            lease.pdo_registration.address(),
+        ) != Some(lease.pdo_registration)
+        || !hosted_dma_pdo_generation_is_live(
+            lease.pdo_registration.device_id().raw(),
+            lease.pdo_generation,
+        )
+    {
+        return Err(nt_status::NtStatus::ACCESS_DENIED);
+    }
+    hosted_dma_manager_mut()
+        .put_adapter_for_owner(lease.owner, lease.adapter_id)
+        .map_err(hosted_dma_status)?;
+    leases.remove(index);
+    Ok(())
+}
+
+unsafe fn revoke_hosted_dma_adapter_leases(binding: HostedDeviceBinding) {
+    let owner = hosted_dma_owner(binding);
+    hosted_dma_adapter_leases_mut().retain(|lease| lease.owner != owner);
 }
 
 unsafe fn hosted_device_bindings_mut() -> &'static mut Vec<HostedDeviceBinding> {
@@ -47806,6 +48268,22 @@ unsafe fn hosted_irq_actual_locks_mut() -> &'static mut InterruptActualLockTable
     slot.as_mut().unwrap()
 }
 
+unsafe fn hosted_interrupt_lock_holders_mut() -> &'static mut Vec<HostedInterruptLockHolder> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_INTERRUPT_LOCK_HOLDERS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_interrupt_lock_waiters_mut() -> &'static mut Vec<HostedInterruptLockWaiter> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_INTERRUPT_LOCK_WAITERS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
 unsafe fn hosted_dpcs_mut() -> &'static mut HostedDpcTable {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DPCS);
     if slot.is_none() {
@@ -47864,9 +48342,29 @@ unsafe fn validate_hosted_irq_actual_lock(
 unsafe fn prepare_hosted_irq_actual_lock_retirement(
     connection: HostedIrqConnection,
 ) -> Result<(), nt_status::NtStatus> {
+    let owner = connection.rundown.identity();
+    let retained_holder = (*core::ptr::addr_of!(HOSTED_INTERRUPT_LOCK_HOLDERS))
+        .as_ref()
+        .is_some_and(|holders| holders.iter().any(|holder| holder.connection == owner));
+    let retained_waiter = (*core::ptr::addr_of!(HOSTED_INTERRUPT_LOCK_WAITERS))
+        .as_ref()
+        .is_some_and(|waiters| waiters.iter().any(|waiter| waiter.connection == owner));
+    if retained_holder || retained_waiter {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     hosted_irq_actual_locks_mut()
-        .prepare_unregister(connection.actual_lock, connection.rundown.identity())
+        .prepare_unregister(connection.actual_lock, owner)
         .map_err(hosted_irq_actual_lock_status)
+}
+
+unsafe fn release_hosted_irq_actual_lock_lease(
+    lease: InterruptActualLockLease,
+) -> Result<(), nt_status::NtStatus> {
+    hosted_irq_actual_locks_mut()
+        .release(lease)
+        .map_err(hosted_irq_actual_lock_status)?;
+    wake_hosted_interrupt_lock_waiter(lease.identity);
+    Ok(())
 }
 
 unsafe fn unregister_hosted_irq_actual_lock(
@@ -49266,6 +49764,10 @@ unsafe fn retire_hosted_irq_connection(
     if hosted_irq_connection_active(connection) && last_on_line && line_index.is_none() {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
+    // A retained holder or parked acquisition is still live connection authority. Validate that
+    // before changing rundown state or masking the physical line; a busy retirement must leave the
+    // connection fully active so the holder can release and the FIFO waiter can be resumed.
+    prepare_hosted_irq_actual_lock_retirement(connection)?;
     hosted_irq_connections_mut()[connection_index]
         .rundown
         .begin_retirement();
@@ -49288,7 +49790,6 @@ unsafe fn retire_hosted_irq_connection(
     {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
-    prepare_hosted_irq_actual_lock_retirement(connection)?;
     match hosted_resource_manager_mut().disconnect_interrupt(
         hosted_resource_owner(binding),
         interrupt_id,
@@ -50099,6 +50600,7 @@ unsafe fn clear_hosted_resource_projection(
     }
     retire_hosted_device_port_caps(binding)?;
     let _ = hosted_resource_manager_mut().revoke_owner(hosted_resource_owner(binding));
+    revoke_hosted_dma_adapter_leases(binding);
     let _ = hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
     clear_shared_address_resources(sh);
     write_volatile((sh + SH_RESOURCE_PDO_OBJECT) as *mut u64, 0);
@@ -52991,6 +53493,12 @@ unsafe fn hosted_driver_runtime_quiesced(instance: usize) -> bool {
     let waits_quiesced = (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS))
         .as_ref()
         .is_none_or(|waiters| waiters.iter().all(|waiter| waiter.instance != instance));
+    let interrupt_locks_quiesced = (*core::ptr::addr_of!(HOSTED_INTERRUPT_LOCK_HOLDERS))
+        .as_ref()
+        .is_none_or(|holders| holders.iter().all(|holder| holder.instance != instance))
+        && (*core::ptr::addr_of!(HOSTED_INTERRUPT_LOCK_WAITERS))
+            .as_ref()
+            .is_none_or(|waiters| waiters.iter().all(|waiter| waiter.instance != instance));
     let timers_quiesced = (*core::ptr::addr_of!(HOSTED_DRIVER_TIMERS))
         .as_ref()
         .and_then(|queues| queues.get(instance))
@@ -53012,7 +53520,11 @@ unsafe fn hosted_driver_runtime_quiesced(instance: usize) -> bool {
                 })
             })
     });
-    threads_quiesced && waits_quiesced && timers_quiesced && dpcs_quiesced
+    threads_quiesced
+        && waits_quiesced
+        && interrupt_locks_quiesced
+        && timers_quiesced
+        && dpcs_quiesced
         && hosted_thread_resources::quiescent(instance)
 }
 
@@ -54215,21 +54727,41 @@ pub(crate) fn service_hosted_driver_pci_config(
 pub(crate) fn service_hosted_driver_dma_adapter(
     ch: &crate::spawn_hosts::PumpChannel,
     pdo_object: u64,
-    words: [u64; 4],
+    mut words: [u64; 4],
     active_reply_cap: u64,
-) -> (i32, u64, u64) {
+) -> (i32, u64, u64, u64) {
+    let operation = words[0] >> HOSTED_DMA_SERVICE_OPERATION_SHIFT;
+    words[0] &= !HOSTED_DMA_SERVICE_OPERATION_MASK;
+    if operation == HOSTED_DMA_SERVICE_RELEASE_ADAPTER {
+        if words != [0; 4] || pdo_object == 0 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        let Some((_instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        let Some(domain) = instance_domain_identity(inst) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        return match unsafe { release_hosted_dma_adapter_lease(domain, pdo_object) } {
+            Ok(()) => (STATUS_SUCCESS, 0, 0, 0),
+            Err(status) => (status.raw(), 0, 0, 0),
+        };
+    }
+    if operation != HOSTED_DMA_SERVICE_REQUEST_ADAPTER {
+        return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+    }
     let description = match nt_dma_manager::Nt5DeviceDescription::from_service_words(words) {
         Ok(description) => description,
-        Err(_) => return (STATUS_INVALID_PARAMETER, 0, 0),
+        Err(_) => return (STATUS_INVALID_PARAMETER, 0, 0, 0),
     };
     let (instance_index, inst, pdo_device_id) =
         match authenticated_hosted_pdo(ch, pdo_object, active_reply_cap) {
             Ok(authenticated) => authenticated,
-            Err(status) => return (status.raw(), 0, 0),
+            Err(status) => return (status.raw(), 0, 0, 0),
         };
     let binding = match current_hosted_device_dispatch_binding_for_projection(instance_index) {
         Ok(binding) => binding,
-        Err(_) => return (STATUS_INVALID_DEVICE_REQUEST, 0, 0),
+        Err(_) => return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0),
     };
     if !binding.used
         || binding.projection_instance != instance_index
@@ -54238,13 +54770,13 @@ pub(crate) fn service_hosted_driver_dma_adapter(
         || binding.pdo_object != pdo_object
         || ch.shared_va != inst.exec_shared_va
     {
-        return (STATUS_ACCESS_DENIED, 0, 0);
+        return (STATUS_ACCESS_DENIED, 0, 0, 0);
     }
     let Some(state) = (unsafe { hosted_device_resource_state_by_device_id(binding.device_id) }) else {
-        return (STATUS_DEVICE_NOT_READY, 0, 0);
+        return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     };
     let Some(context_lease) = state.pnp_context_lease else {
-        return (STATUS_DEVICE_NOT_READY, 0, 0);
+        return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     };
     if state.interface_type != HOSTED_INTERFACE_TYPE_PCIBUS
         || description.interface_type as u32 != HOSTED_INTERFACE_TYPE_PCIBUS
@@ -54253,7 +54785,7 @@ pub(crate) fn service_hosted_driver_dma_adapter(
         || description.maximum_length == 0
         || state.address & !0x001F_0007 != 0
     {
-        return (STATUS_INVALID_PARAMETER, 0, 0);
+        return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
     let dev = (state.address >> 16) as u8;
     let func = state.address as u8;
@@ -54266,10 +54798,10 @@ pub(crate) fn service_hosted_driver_dma_adapter(
         )
     } {
         Ok(window) => window,
-        Err(status) => return (status.raw(), 0, 0),
+        Err(status) => return (status.raw(), 0, 0, 0),
     };
     if description.maximum_length as u64 > window.dma_len {
-        return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
+        return (STATUS_INSUFFICIENT_RESOURCES, 0, 0, 0);
     }
 
     let request = description.adapter_request();
@@ -54277,7 +54809,7 @@ pub(crate) fn service_hosted_driver_dma_adapter(
         hosted_dma_manager_mut().request_adapter(hosted_dma_owner(binding), request)
     } {
         Ok(adapter) => adapter,
-        Err(error) => return (hosted_dma_status(error).raw(), 0, 0),
+        Err(error) => return (hosted_dma_status(error).raw(), 0, 0, 0),
     };
     let targets = [binding.instance, binding.projection_instance];
     let mut target_runtimes = [None, None];
@@ -54291,7 +54823,7 @@ pub(crate) fn service_hosted_driver_dma_adapter(
                     hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
                 }
             }
-            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0);
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
         };
         let Some(domain) = instance_domain_identity(target) else {
             if adapter.created {
@@ -54299,7 +54831,7 @@ pub(crate) fn service_hosted_driver_dma_adapter(
                     hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
                 }
             }
-            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0);
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
         };
         target_runtimes[position] = Some((target_index, target, domain));
     }
@@ -54316,7 +54848,7 @@ pub(crate) fn service_hosted_driver_dma_adapter(
                     hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
                 }
             }
-            return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
+            return (STATUS_INSUFFICIENT_RESOURCES, 0, 0, 0);
         }
         for (target_index, target, domain) in target_runtimes.into_iter().flatten() {
             if let Err(status) = unsafe {
@@ -54351,7 +54883,7 @@ pub(crate) fn service_hosted_driver_dma_adapter(
                         hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
                     }
                 }
-                return (status.raw(), 0, 0);
+                return (status.raw(), 0, 0, 0);
             }
         }
         let bus_master_bits = match unsafe {
@@ -54384,14 +54916,14 @@ pub(crate) fn service_hosted_driver_dma_adapter(
                         hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
                     }
                 }
-                return (status.raw(), 0, 0);
+                return (status.raw(), 0, 0, 0);
             }
         };
         let Some(current) = (unsafe { hosted_device_resource_states_mut() })
             .iter_mut()
             .find(|current| current.device_id == binding.device_id)
         else {
-            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0);
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
         };
         current.dma_broker_va = window.dma_seed_va;
         current.dma_frame_base = window.dma_frame_base;
@@ -54421,18 +54953,42 @@ pub(crate) fn service_hosted_driver_dma_adapter(
         if state.dma_frame_base != window.dma_frame_base
             || state.dma_pages != window.dma_pages
             || state.dma_broker_va != window.dma_seed_va
-            || shared_adapter != adapter.adapter_id
             || shared_va != window.dma_va
             || shared_len != window.dma_len
             || shared_logical != window.dma_logical
         {
-            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0);
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
+        }
+        if shared_adapter != adapter.adapter_id {
+            if !adapter.created {
+                return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
+            }
+            unsafe {
+                write_volatile(
+                    (ch.shared_va + SH_DMA_ADAPTER_ID) as *mut u64,
+                    adapter.adapter_id,
+                );
+                clear_dma_allocation_records(ch.shared_va);
+            }
         }
     }
+    let lease_id = match unsafe { retain_hosted_dma_adapter_lease(binding, adapter.adapter_id) } {
+        Ok(lease_id) => lease_id,
+        Err(status) => {
+            if adapter.created {
+                let _ = unsafe {
+                    hosted_dma_manager_mut()
+                        .put_adapter_for_owner(hosted_dma_owner(binding), adapter.adapter_id)
+                };
+            }
+            return (status.raw(), 0, 0, 0);
+        }
+    };
     (
         STATUS_SUCCESS,
         adapter.adapter_id,
         adapter.num_map_registers as u64,
+        lease_id,
     )
 }
 
@@ -54547,6 +55103,13 @@ unsafe fn service_hosted_driver_mdl_for_instance(
             }
         }
         HOSTED_MDL_OP_FREE => {
+            if !hosted_source_irp_ledger::mdl_release_allowed(
+                instance_index,
+                caller_domain,
+                mdl,
+            ) {
+                return nt_status::NtStatus::PENDING.raw();
+            }
             match release_hosted_provider_ndis_buffer_shadow_by_component_mdl(
                 instance_index,
                 caller_domain,
@@ -54634,18 +55197,474 @@ pub(crate) unsafe fn service_hosted_irq_lane_mdl(
     )
 }
 
+unsafe fn hosted_interrupt_connection_for_thread_lock(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+    interrupt_object: u64,
+) -> Result<HostedIrqConnection, i32> {
+    if interrupt_object == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let mut found = None;
+    if let Some(connections) = hosted_irq_connections() {
+        for connection in connections.iter().copied().filter(|connection| {
+            connection.binding.projection_instance == instance_index
+                && connection.binding.projection_domain == domain
+                && connection.interrupt_object == interrupt_object
+                && hosted_irq_connection_active(*connection)
+        }) {
+            if found.replace(connection).is_some() {
+                return Err(STATUS_INVALID_DEVICE_REQUEST);
+            }
+        }
+    }
+    let connection = found.ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    if !hosted_irq_projection_matches(connection)
+        || validate_hosted_irq_actual_lock(connection).is_err()
+    {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    Ok(connection)
+}
+
+unsafe fn hosted_interrupt_thread_irql_matches(
+    inst: DriverInstance,
+    connection: HostedIrqConnection,
+) -> bool {
+    let Some(projection) = hosted_pool_allocation_exec_va(
+        inst.exec_pool_va,
+        connection.interrupt_object,
+        HOSTED_KINTERRUPT_SIZE,
+    ) else {
+        return false;
+    };
+    let synchronize_irql = read_unaligned(
+        (projection + HOSTED_KINTERRUPT_SYNCHRONIZE_IRQL) as *const u8,
+    );
+    synchronize_irql >= DISPATCH_LEVEL
+        && read_volatile((inst.exec_shared_va + SH_HOSTED_CURRENT_IRQL) as *const u8)
+            == synchronize_irql
+}
+
+unsafe fn reserve_hosted_interrupt_lock_holder_slot() -> bool {
+    let waiter_count = (*core::ptr::addr_of!(HOSTED_INTERRUPT_LOCK_WAITERS))
+        .as_ref()
+        .map_or(0, Vec::len);
+    let holders = hosted_interrupt_lock_holders_mut();
+    let required = match holders
+        .len()
+        .checked_add(waiter_count)
+        .and_then(|count| count.checked_add(1))
+    {
+        Some(required) => required,
+        None => return false,
+    };
+    required <= holders.capacity()
+        || holders
+            .try_reserve(required.saturating_sub(holders.len()))
+            .is_ok()
+}
+
+unsafe fn finish_hosted_interrupt_lock_wake(
+    waiter_index: usize,
+    waiter: HostedInterruptLockWaiter,
+    status: i32,
+) {
+    hosted_interrupt_lock_waiters_mut()[waiter_index].wake_started = true;
+    let result = crate::spawn_hosts::shared_ingress::owner::runtime::wake_service(
+        waiter.shared.route,
+        waiter.shared.dispatch,
+        waiter.reply_cap,
+        waiter.shared.token,
+        status,
+    );
+    if result.is_err() {
+        // Reply completion is uncertain. Retain both the waiter and any holder published before
+        // this call; neither the lease nor the Reply can be replayed or reassigned.
+        return;
+    }
+    let removed = hosted_interrupt_lock_waiters_mut().remove(waiter_index);
+    debug_assert_eq!(removed.instance, waiter.instance);
+    debug_assert_eq!(removed.thread_handle, waiter.thread_handle);
+    let _ = hosted_driver_thread_table_mut(waiter.instance)
+        .and_then(|table| table.set_ready(waiter.thread_handle).ok());
+}
+
+unsafe fn wake_hosted_interrupt_lock_waiter(actual_lock: InterruptActualLockIdentity) {
+    let waiter_index = (*core::ptr::addr_of!(HOSTED_INTERRUPT_LOCK_WAITERS))
+        .as_ref()
+        .and_then(|waiters| {
+            waiters
+                .iter()
+                .enumerate()
+                .filter(|(_, waiter)| waiter.actual_lock == actual_lock && !waiter.wake_started)
+                .min_by_key(|(_, waiter)| waiter.shared.token)
+                .map(|(index, _)| index)
+        });
+    let Some(waiter_index) = waiter_index else {
+        return;
+    };
+    let waiter = hosted_interrupt_lock_waiters_mut()[waiter_index];
+    let connection_live = hosted_irq_connections().is_some_and(|connections| {
+        connections.iter().copied().any(|connection| {
+            connection.rundown.identity() == waiter.connection
+                && connection.actual_lock == waiter.actual_lock
+                && connection.interrupt_object == waiter.interrupt_object
+                && connection.binding.projection_instance == waiter.instance
+                && connection.binding.projection_domain == waiter.domain
+                && hosted_irq_connection_active(connection)
+                && hosted_irq_projection_matches(connection)
+                && validate_hosted_irq_actual_lock(connection).is_ok()
+        })
+    });
+    if !connection_live {
+        finish_hosted_interrupt_lock_wake(
+            waiter_index,
+            waiter,
+            STATUS_INVALID_DEVICE_REQUEST,
+        );
+        return;
+    }
+    match hosted_irq_actual_locks_mut().acquire(waiter.actual_lock, waiter.connection) {
+        Ok(lease) => {
+            let holders = hosted_interrupt_lock_holders_mut();
+            debug_assert!(holders.len() < holders.capacity());
+            holders.push(HostedInterruptLockHolder {
+                instance: waiter.instance,
+                domain: waiter.domain,
+                thread_handle: waiter.thread_handle,
+                interrupt_object: waiter.interrupt_object,
+                connection: waiter.connection,
+                lease,
+                old_irql: waiter.old_irql,
+            });
+            finish_hosted_interrupt_lock_wake(waiter_index, waiter, STATUS_SUCCESS);
+        }
+        Err(InterruptActualLockError::Busy) => {
+            // Another retained authority acquired the lock first. It will select this FIFO head
+            // when it releases; the original Reply remains parked and owned by this row.
+        }
+        Err(error) => finish_hosted_interrupt_lock_wake(
+            waiter_index,
+            waiter,
+            hosted_irq_actual_lock_status(error).raw(),
+        ),
+    }
+}
+
+unsafe fn acquire_hosted_interrupt_lock_for_thread(
+    instance_index: usize,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    caller: HostedDriverCaller,
+    connection: HostedIrqConnection,
+    old_irql: u8,
+    active_reply_cap: u64,
+) -> HostedDriverInterruptServiceResult {
+    if old_irql > connection.route.tokens.synchronize_irql
+        || !hosted_interrupt_thread_irql_matches(inst, connection)
+    {
+        return HostedDriverInterruptServiceResult::Reply {
+            status: STATUS_INVALID_DEVICE_REQUEST,
+            interrupt_id: 0,
+            grant_generation: 0,
+        };
+    }
+    let duplicate_holder = (*core::ptr::addr_of!(HOSTED_INTERRUPT_LOCK_HOLDERS))
+        .as_ref()
+        .is_some_and(|holders| {
+            holders.iter().any(|holder| {
+                holder.instance == instance_index
+                    && holder.domain == domain
+                    && holder.thread_handle == caller.thread_handle
+                    && holder.lease.identity == connection.actual_lock
+            })
+        });
+    let duplicate_waiter = (*core::ptr::addr_of!(HOSTED_INTERRUPT_LOCK_WAITERS))
+        .as_ref()
+        .is_some_and(|waiters| {
+            waiters.iter().any(|waiter| {
+                waiter.reply_cap == active_reply_cap
+                    || waiter.instance == instance_index
+                        && waiter.thread_handle == caller.thread_handle
+                        && waiter.actual_lock == connection.actual_lock
+            })
+        });
+    if duplicate_holder || duplicate_waiter {
+        return HostedDriverInterruptServiceResult::Reply {
+            status: STATUS_POSSIBLE_DEADLOCK,
+            interrupt_id: 0,
+            grant_generation: 0,
+        };
+    }
+    let dispatch = match crate::spawn_hosts::shared_ingress::owner::runtime::dispatch(caller.route)
+    {
+        Ok(dispatch) => dispatch,
+        Err(_) => {
+            return HostedDriverInterruptServiceResult::Reply {
+                status: STATUS_ACCESS_DENIED,
+                interrupt_id: 0,
+                grant_generation: 0,
+            }
+        }
+    };
+    if !matches!(
+        crate::spawn_hosts::shared_ingress::owner::runtime::current_reply(caller.route),
+        Ok(reply) if reply == active_reply_cap
+    )
+        || !reserve_hosted_interrupt_lock_holder_slot()
+    {
+        return HostedDriverInterruptServiceResult::Reply {
+            status: STATUS_INSUFFICIENT_RESOURCES,
+            interrupt_id: 0,
+            grant_generation: 0,
+        };
+    }
+    match hosted_irq_actual_locks_mut()
+        .acquire(connection.actual_lock, connection.rundown.identity())
+    {
+        Ok(lease) => {
+            hosted_interrupt_lock_holders_mut().push(HostedInterruptLockHolder {
+                instance: instance_index,
+                domain,
+                thread_handle: caller.thread_handle,
+                interrupt_object: connection.interrupt_object,
+                connection: connection.rundown.identity(),
+                lease,
+                old_irql,
+            });
+            HostedDriverInterruptServiceResult::Reply {
+                status: STATUS_SUCCESS,
+                interrupt_id: 0,
+                grant_generation: 0,
+            }
+        }
+        Err(InterruptActualLockError::Busy) => {
+            let waiters = hosted_interrupt_lock_waiters_mut();
+            if waiters.len() == waiters.capacity() && waiters.try_reserve(1).is_err() {
+                return HostedDriverInterruptServiceResult::Reply {
+                    status: STATUS_INSUFFICIENT_RESOURCES,
+                    interrupt_id: 0,
+                    grant_generation: 0,
+                };
+            }
+            let token = crate::next_dispatcher_wait_sequence();
+            let shared = HostedDriverSharedWait {
+                route: caller.route,
+                dispatch,
+                token,
+            };
+            waiters.push(HostedInterruptLockWaiter {
+                instance: instance_index,
+                domain,
+                thread_handle: caller.thread_handle,
+                interrupt_object: connection.interrupt_object,
+                connection: connection.rundown.identity(),
+                actual_lock: connection.actual_lock,
+                old_irql,
+                reply_cap: active_reply_cap,
+                shared,
+                wake_started: false,
+            });
+            let live = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_TABLES))
+                .as_ref()
+                .and_then(|tables| tables.get(instance_index))
+                .and_then(|table| table.get(caller.thread_handle))
+                .is_some_and(|thread| thread.exit_status.is_none());
+            let parked = live
+                && crate::spawn_hosts::shared_ingress::owner::runtime::park_service(
+                    shared.route,
+                    shared.token,
+                )
+                .is_ok();
+            if !parked {
+                let index = hosted_interrupt_lock_waiters_mut()
+                    .iter()
+                    .position(|waiter| {
+                        waiter.instance == instance_index
+                            && waiter.thread_handle == caller.thread_handle
+                            && waiter.reply_cap == active_reply_cap
+                            && waiter.shared.token == token
+                    })
+                    .expect("uncommitted interrupt-lock waiter disappeared");
+                hosted_interrupt_lock_waiters_mut().remove(index);
+                return HostedDriverInterruptServiceResult::Reply {
+                    status: STATUS_INSUFFICIENT_RESOURCES,
+                    interrupt_id: 0,
+                    grant_generation: 0,
+                };
+            }
+            hosted_driver_thread_table_mut(instance_index)
+                .and_then(|table| table.set_waiting(caller.thread_handle).ok())
+                .expect("validated interrupt-lock waiter disappeared after parking");
+            HostedDriverInterruptServiceResult::SharedParked {
+                route: shared.route,
+                dispatch: shared.dispatch,
+                reply: active_reply_cap,
+                token: shared.token,
+            }
+        }
+        Err(error) => HostedDriverInterruptServiceResult::Reply {
+            status: hosted_irq_actual_lock_status(error).raw(),
+            interrupt_id: 0,
+            grant_generation: 0,
+        },
+    }
+}
+
+unsafe fn release_hosted_interrupt_lock_for_thread(
+    instance_index: usize,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    caller: HostedDriverCaller,
+    connection: HostedIrqConnection,
+    old_irql: u8,
+) -> i32 {
+    if !hosted_interrupt_thread_irql_matches(inst, connection) {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    let Some(holder_index) = (*core::ptr::addr_of!(HOSTED_INTERRUPT_LOCK_HOLDERS))
+        .as_ref()
+        .and_then(|holders| {
+            holders.iter().position(|holder| {
+                holder.instance == instance_index
+                    && holder.domain == domain
+                    && holder.thread_handle == caller.thread_handle
+                    && holder.interrupt_object == connection.interrupt_object
+                    && holder.connection == connection.rundown.identity()
+                    && holder.lease.identity == connection.actual_lock
+                    && holder.lease.owner == connection.rundown.identity()
+                    && holder.old_irql == old_irql
+            })
+        })
+    else {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    };
+    // A new authenticated Call from the selected thread proves that an earlier wake whose kernel
+    // result was uncertain did in fact deliver. Retire that retained Reply record before releasing
+    // its exact holder; without this proof neither record is reusable.
+    if let Some(waiter_index) = (*core::ptr::addr_of!(HOSTED_INTERRUPT_LOCK_WAITERS))
+        .as_ref()
+        .and_then(|waiters| {
+            waiters.iter().position(|waiter| {
+                waiter.wake_started
+                    && waiter.instance == instance_index
+                    && waiter.domain == domain
+                    && waiter.thread_handle == caller.thread_handle
+                    && waiter.interrupt_object == connection.interrupt_object
+                    && waiter.connection == connection.rundown.identity()
+                    && waiter.actual_lock == connection.actual_lock
+            })
+        })
+    {
+        hosted_interrupt_lock_waiters_mut().remove(waiter_index);
+        let _ = hosted_driver_thread_table_mut(instance_index)
+            .and_then(|table| table.set_ready(caller.thread_handle).ok());
+    }
+    let lease = hosted_interrupt_lock_holders_mut()[holder_index].lease;
+    if let Err(error) = hosted_irq_actual_locks_mut().release(lease) {
+        return hosted_irq_actual_lock_status(error).raw();
+    }
+    hosted_interrupt_lock_holders_mut().remove(holder_index);
+    wake_hosted_interrupt_lock_waiter(lease.identity);
+    STATUS_SUCCESS
+}
+
 pub(crate) fn service_hosted_driver_interrupt(
     ch: &crate::spawn_hosts::PumpChannel,
     operation: u64,
     interrupt_object: u64,
+    old_irql: u64,
+    caller_badge: u64,
     active_reply_cap: u64,
-) -> (i32, u64, u64) {
+) -> HostedDriverInterruptServiceResult {
     let Some((instance_index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         unsafe {
             trace_hosted_interrupt_broker_rejection(b"channel", None, None);
         }
-        return (STATUS_ACCESS_DENIED, 0, 0);
+        return HostedDriverInterruptServiceResult::Reply {
+            status: STATUS_ACCESS_DENIED,
+            interrupt_id: 0,
+            grant_generation: 0,
+        };
     };
+    let Some(domain) = instance_domain_identity(inst) else {
+        return HostedDriverInterruptServiceResult::Reply {
+            status: STATUS_ACCESS_DENIED,
+            interrupt_id: 0,
+            grant_generation: 0,
+        };
+    };
+    if ch.shared_va != inst.exec_shared_va {
+        return HostedDriverInterruptServiceResult::Reply {
+            status: STATUS_ACCESS_DENIED,
+            interrupt_id: 0,
+            grant_generation: 0,
+        };
+    }
+    if matches!(
+        operation,
+        HOSTED_INTERRUPT_OP_ACQUIRE_LOCK | HOSTED_INTERRUPT_OP_RELEASE_LOCK
+    ) {
+        if old_irql > u8::MAX as u64 {
+            return HostedDriverInterruptServiceResult::Reply {
+                status: STATUS_INVALID_PARAMETER,
+                interrupt_id: 0,
+                grant_generation: 0,
+            };
+        }
+        let Some(caller) = hosted_driver_caller(instance_index, inst, caller_badge) else {
+            return HostedDriverInterruptServiceResult::Reply {
+                status: STATUS_ACCESS_DENIED,
+                interrupt_id: 0,
+                grant_generation: 0,
+            };
+        };
+        let connection = match unsafe {
+            hosted_interrupt_connection_for_thread_lock(
+                instance_index,
+                domain,
+                interrupt_object,
+            )
+        } {
+            Ok(connection) => connection,
+            Err(status) => {
+                return HostedDriverInterruptServiceResult::Reply {
+                    status,
+                    interrupt_id: 0,
+                    grant_generation: 0,
+                }
+            }
+        };
+        return if operation == HOSTED_INTERRUPT_OP_ACQUIRE_LOCK {
+            unsafe {
+                acquire_hosted_interrupt_lock_for_thread(
+                    instance_index,
+                    inst,
+                    domain,
+                    caller,
+                    connection,
+                    old_irql as u8,
+                    active_reply_cap,
+                )
+            }
+        } else {
+            HostedDriverInterruptServiceResult::Reply {
+                status: unsafe {
+                    release_hosted_interrupt_lock_for_thread(
+                        instance_index,
+                        inst,
+                        domain,
+                        caller,
+                        connection,
+                        old_irql as u8,
+                    )
+                },
+                interrupt_id: 0,
+                grant_generation: 0,
+            }
+        };
+    }
     let binding = match current_hosted_device_dispatch_binding_for_projection(instance_index) {
         Ok(binding) => binding,
         Err(rejection) => {
@@ -54656,21 +55675,31 @@ pub(crate) fn service_hosted_driver_interrupt(
                     Some(instance_index),
                 );
             }
-            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0);
+            return HostedDriverInterruptServiceResult::Reply {
+                status: STATUS_INVALID_DEVICE_REQUEST,
+                interrupt_id: 0,
+                grant_generation: 0,
+            };
         }
     };
-    if instance_domain_identity(inst) != Some(binding.projection_domain)
-        || ch.shared_va != inst.exec_shared_va
-    {
+    if domain != binding.projection_domain {
         unsafe {
             trace_hosted_interrupt_broker_rejection(b"domain", Some(binding), Some(instance_index));
         }
-        return (STATUS_ACCESS_DENIED, 0, 0);
+        return HostedDriverInterruptServiceResult::Reply {
+            status: STATUS_ACCESS_DENIED,
+            interrupt_id: 0,
+            grant_generation: 0,
+        };
     }
     let sh = ch.shared_va;
     let active = unsafe { read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64) };
     if interrupt_object == 0 || active != interrupt_object {
-        return (STATUS_INVALID_PARAMETER, 0, 0);
+        return HostedDriverInterruptServiceResult::Reply {
+            status: STATUS_INVALID_PARAMETER,
+            interrupt_id: 0,
+            grant_generation: 0,
+        };
     }
     match operation {
         HOSTED_INTERRUPT_OP_CONNECT => unsafe {
@@ -54688,12 +55717,24 @@ pub(crate) fn service_hosted_driver_interrupt(
                         .map(|connection| connection.grant.grant_generation)
                         .unwrap_or(0);
                     if interrupt_id == 0 || grant_generation == 0 {
-                        (STATUS_INVALID_DEVICE_REQUEST, 0, 0)
+                        HostedDriverInterruptServiceResult::Reply {
+                            status: STATUS_INVALID_DEVICE_REQUEST,
+                            interrupt_id: 0,
+                            grant_generation: 0,
+                        }
                     } else {
-                        (STATUS_SUCCESS, interrupt_id, grant_generation)
+                        HostedDriverInterruptServiceResult::Reply {
+                            status: STATUS_SUCCESS,
+                            interrupt_id,
+                            grant_generation,
+                        }
                     }
                 }
-                Err(status) => (status.raw(), 0, 0),
+                Err(status) => HostedDriverInterruptServiceResult::Reply {
+                    status: status.raw(),
+                    interrupt_id: 0,
+                    grant_generation: 0,
+                },
             }
         },
         HOSTED_INTERRUPT_OP_DISCONNECT => unsafe {
@@ -54705,16 +55746,32 @@ pub(crate) fn service_hosted_driver_interrupt(
                 })
             });
             if interrupt_id == 0 || !connection_present {
-                return (STATUS_INVALID_DEVICE_REQUEST, 0, 0);
+                return HostedDriverInterruptServiceResult::Reply {
+                    status: STATUS_INVALID_DEVICE_REQUEST,
+                    interrupt_id: 0,
+                    grant_generation: 0,
+                };
             }
             if let Err(status) = retire_hosted_irq_connection(binding, interrupt_id) {
-                return (status.raw(), 0, 0);
+                return HostedDriverInterruptServiceResult::Reply {
+                    status: status.raw(),
+                    interrupt_id: 0,
+                    grant_generation: 0,
+                };
             }
             write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
             refresh_hosted_device_resource_state(binding, sh);
-            (STATUS_SUCCESS, 0, 0)
+            HostedDriverInterruptServiceResult::Reply {
+                status: STATUS_SUCCESS,
+                interrupt_id: 0,
+                grant_generation: 0,
+            }
         },
-        _ => (STATUS_INVALID_PARAMETER, 0, 0),
+        _ => HostedDriverInterruptServiceResult::Reply {
+            status: STATUS_INVALID_PARAMETER,
+            interrupt_id: 0,
+            grant_generation: 0,
+        },
     }
 }
 
