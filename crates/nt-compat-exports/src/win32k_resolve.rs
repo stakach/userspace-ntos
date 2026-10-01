@@ -135,6 +135,14 @@ mod tests {
     }
 
     #[test]
+    fn system_image_bindings_declare_real_partial_contracts() {
+        for name in ["NtSetSystemInformation", "ZwSetSystemInformation"] {
+            let descriptor = export_descriptor(name).expect("declared system image import");
+            assert_eq!(descriptor.status, ExportStatus::Partial, "{name}");
+        }
+    }
+
+    #[test]
     fn registry_grows_past_bootstrap_reservation() {
         const NAMES: &[&str] = &[
             "win32k-export-00",

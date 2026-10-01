@@ -173,7 +173,8 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ZwUnmapViewOfSection", Partial, "virtual-memory/section ops routed to nt-memory-manager/nt-address-space"),
     e("ZwMapViewOfSection", Partial, "virtual-memory/section ops routed to nt-memory-manager/nt-address-space"),
     e("ZwCreateFile", Partial, "captures an ordinary KernelMode create and routes it through retained canonical file-create work; unsupported capture forms fail explicitly"),
-    e("ZwSetSystemInformation", StubSuccess, "system-information classes win32k needs return canned values; TODO Phase 2"),
+    e("ZwSetSystemInformation", Partial, "KernelMode GDI image load uses authenticated checked dependencies and pinned opaque module handles; unsupported unload retains ownership and fails explicitly"),
+    e("NtSetSystemInformation", Partial, "GDI image classes validate exact lengths and caller PreviousMode before authenticated image loading; unsupported classes and unload fail explicitly"),
     e("ZwClose", Partial, "handle/directory-object ops routed to nt-object-manager"),
     // --- Rtl ---
     e("RtlGetDefaultCodePage", Implemented, "returns the validated CP1252/CP437 table identities"),
