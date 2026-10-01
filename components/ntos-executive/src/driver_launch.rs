@@ -24,6 +24,9 @@
 #[allow(dead_code)]// Activated only by the atomic ISR/DPC/provider cutover tracked in the plan.
 mod hosted_irq_broker;
 
+#[path = "hosted_wmi.rs"]
+mod hosted_wmi;
+
 #[path = "hosted_ingress_sources.rs"]
 pub(crate) mod hosted_ingress_sources;
 
@@ -191,7 +194,7 @@ use driver_registry_handles::{
 
 use core::mem::MaybeUninit;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
-use core::sync::atomic::{compiler_fence, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -8458,7 +8461,7 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                         (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
                         device,
                     );
-                    s_io_complete_request(irp, 0);
+                    let completion = complete_hosted_irp(irp);
                     let (ack_label, ack_status, _, _, _) = call_on4(
                         (forward_label << 12) | 4,
                         2,
@@ -8472,12 +8475,9 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                             [forward_label, 2, irp, ack_status],
                         );
                     }
-                    s_io_free_irp(irp);
-                    print_str(b"[wdm-forward-final-free] irp=");
-                    print_hex64(irp);
-                    print_str(b" status=");
-                    print_hex(status as u32);
-                    print_str(b"\n");
+                    if completion == HostedIrpUnwindOutcome::Terminal {
+                        s_io_free_irp(irp);
+                    }
                     return status as u32 as i32;
                 }
                 return 0xC000_0010u32 as i32;
@@ -8547,6 +8547,60 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
         );
         s_io_complete_request(irp, 0);
         completion_status
+    }
+}
+
+#[repr(C)]
+struct HostedSyncForwardContext {
+    event: [u64; 3],
+    completed: AtomicBool,
+}
+
+extern "win64" fn s_io_forward_sync_completion(_device: u64, irp: u64, context: u64) -> i32 {
+    unsafe {
+        let state = &*(context as *const HostedSyncForwardContext);
+        state.completed.store(true, Ordering::Release);
+        if read_unaligned((irp + WDM_X64_IRP_PENDING_RETURNED_OFFSET) as *const u8) != 0 {
+            s_ke_set_event(context, 0, 0);
+        }
+    }
+    nt_status::NtStatus::MORE_PROCESSING_REQUIRED.raw()
+}
+
+/// The caller retains the IRP after the completion routine stops its unwind.
+extern "win64" fn s_io_forward_irp_synchronously(device: u64, irp: u64) -> u8 {
+    unsafe {
+        let Some((stack_count, current_location, _)) = validate_hosted_irp_packet(irp) else {
+            return 0;
+        };
+        if device == 0 || current_location > stack_count || current_location <= 1 {
+            return 0;
+        }
+        let mut context = HostedSyncForwardContext {
+            event: [0; 3],
+            completed: AtomicBool::new(false),
+        };
+        let event_ptr = context.event.as_mut_ptr() as u64;
+        s_ke_initialize_event(event_ptr, 0, 0);
+        s_io_copy_current_irp_stack_location_to_next(irp);
+        let next = irp_next_stack_location(irp);
+        write_unaligned(
+            (next + WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET) as *mut u64,
+            s_io_forward_sync_completion as *const () as usize as u64,
+        );
+        write_unaligned((next + WDM_X64_IO_STACK_CONTEXT_OFFSET) as *mut u64, event_ptr);
+        write_unaligned((next + WDM_X64_IO_STACK_CONTROL_OFFSET) as *mut u8, 0xe0);
+        let status = s_iof_call_driver(device, irp);
+        if status == nt_status::NtStatus::PENDING.raw() {
+            let wait_status = s_ke_wait_for_single_object(event_ptr, 5, 0, 0, 0);
+            if wait_status != nt_status::NtStatus::SUCCESS.raw() {
+                crate::provider_bugcheck::report(0xc4, [device, irp, event_ptr, wait_status as u32 as u64]);
+            }
+        }
+        if !context.completed.load(Ordering::Acquire) {
+            crate::provider_bugcheck::report(0xc4, [device, irp, event_ptr, status as u32 as u64]);
+        }
+        1
     }
 }
 
@@ -10938,6 +10992,10 @@ unsafe fn finish_driver_local_irp(irp: u64) {
 /// walk. Requestor IRPs publish through their exact retained owner only after the walk reaches the
 /// top; driver-local IRPs use normal IOSB/event delivery and are then reclaimed.
 extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
+    unsafe { complete_hosted_irp(irp); }
+}
+
+unsafe fn complete_hosted_irp(irp: u64) -> HostedIrpUnwindOutcome {
     unsafe {
         let claim = claim_pending_irp_completion(irp);
         if claim.is_none() && pending_irp_raw_identity_exists(irp) {
@@ -10999,7 +11057,7 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
                 if let Some(claim) = claim {
                     park_pending_irp_completion_claim(claim);
                 }
-                return;
+                return HostedIrpUnwindOutcome::MoreProcessingRequired;
             }
             Ok(HostedIrpUnwindOutcome::Terminal) => {}
             Err(()) => {
@@ -11016,7 +11074,7 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         }
         let Some(claim) = claim else {
             finish_driver_local_irp(irp);
-            return;
+            return HostedIrpUnwindOutcome::Terminal;
         };
         let node = claim.node;
         let target = claim.target;
@@ -11107,6 +11165,7 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
             print_u64(information);
             print_str(b"\n");
         }
+        HostedIrpUnwindOutcome::Terminal
     }
 }
 
@@ -32021,6 +32080,14 @@ fn register_fsd_trampolines() -> bool {
         s_io_get_device_property as *const () as usize as u64,
     );
     reg.bind(
+        "IoWMIOpenBlock",
+        hosted_wmi::open_block as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoWMIQueryAllData",
+        hosted_wmi::query_all_data as *const () as usize as u64,
+    );
+    reg.bind(
         "IoInvalidateDeviceRelations",
         s_io_invalidate_device_relations as *const () as usize as u64,
     );
@@ -32117,6 +32184,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "IoCallDriver",
         s_iof_call_driver as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoForwardIrpSynchronously",
+        s_io_forward_irp_synchronously as *const () as usize as u64,
     );
     reg.bind(
         "PoCallDriver",

@@ -1,0 +1,14 @@
+[package]
+name = "nt-wmi"
+description = "NT WMI GUID provider and data-block object ownership policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
