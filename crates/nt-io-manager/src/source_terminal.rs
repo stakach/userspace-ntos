@@ -81,7 +81,7 @@ impl PreparedTerminal {
 }
 
 pub fn same_terminal_packet(prepared: &[u8], current: &[u8], phase_offset: usize) -> bool {
-    let Some(end) = phase_offset.checked_add(8) else {
+    let Some(end) = phase_offset.checked_add(16) else {
         return false;
     };
     prepared.len() == current.len()

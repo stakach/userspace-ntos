@@ -151,7 +151,7 @@ fn terminal_header(packet: &[u8]) -> Result<SourceFsdTerminalHandoff<'_>, WireEr
         || u32_at(packet, 0) != TERMINAL_KIND
         || u32_at(packet, 4) != TERMINAL_VERSION
         || packet.len() != terminal_packet_len(u32_at(packet, 52) as usize)?
-        || u64_at(packet, 72) != 0
+        || (u64_at(packet, 72) != 0 && !matches!(u32_at(packet, 64), 3 | 4))
     {
         return Err(WireError::Malformed);
     }
@@ -176,6 +176,18 @@ pub fn decode_terminal_handoff(packet: &[u8]) -> Result<SourceFsdTerminalHandoff
         return Err(WireError::Malformed);
     }
     Ok(handoff)
+}
+
+/// A canonical deferred Set reserves this sequence before the origin retires its IRP.
+pub fn request_terminal_commit(packet: &mut [u8], signal_sequence: u64) -> Result<(), WireError> {
+    publish_terminal_ack(packet, TerminalPublication::CommitRequested)?;
+    put_u64(packet, 72, signal_sequence);
+    Ok(())
+}
+
+pub fn terminal_signal_sequence(packet: &[u8]) -> Result<u64, WireError> {
+    terminal_header(packet)?;
+    Ok(u64_at(packet, 72))
 }
 
 pub fn publish_terminal_ack(
@@ -479,9 +491,11 @@ mod tests {
         assert!(publish_terminal_ack(&mut packet, TerminalPublication::Committed).is_err());
         publish_terminal_ack(&mut packet, TerminalPublication::Published).unwrap();
         assert!(publish_terminal_ack(&mut packet, TerminalPublication::Published).is_err());
-        publish_terminal_ack(&mut packet, TerminalPublication::CommitRequested).unwrap();
+        request_terminal_commit(&mut packet, 41).unwrap();
+        assert_eq!(terminal_signal_sequence(&packet), Ok(41));
         assert_eq!(decode_terminal_ack(&packet).unwrap().handoff, handoff);
         publish_terminal_ack(&mut packet, TerminalPublication::Committed).unwrap();
+        assert_eq!(terminal_signal_sequence(&packet), Ok(41));
         assert_eq!(
             decode_terminal_ack(&packet).unwrap().publication,
             TerminalPublication::Committed

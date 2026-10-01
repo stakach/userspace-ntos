@@ -296,10 +296,11 @@ fn terminal_header(packet: &[u8]) -> Result<SourcePnpTerminalHandoff, WireError>
     if packet.len() != TERMINAL_PACKET_BYTES {
         return Err(WireError::LengthMismatch);
     }
-    if u32_at(packet, 0) != TERMINAL_KIND
+    if (u64_at(packet, 104) != 0 && !matches!(u32_at(packet, 96), 3 | 4))
+        || u32_at(packet, 0) != TERMINAL_KIND
         || u32_at(packet, 4) != TERMINAL_VERSION
         || u32_at(packet, 76) != 0
-        || packet[104..].iter().any(|byte| *byte != 0)
+        || packet[112..].iter().any(|byte| *byte != 0)
     {
         return Err(WireError::Malformed);
     }
@@ -346,6 +347,19 @@ pub fn terminal_matches_request(
 /// The origin publishes this only after it has durably written the terminal
 /// source IRP, IOSB, relation buffer, and any Event signal. A failed or missing
 /// acknowledgement leaves the provider completion indeterminate.
+
+/// A canonical deferred Set reserves this sequence before the origin retires its IRP.
+pub fn request_terminal_commit(packet: &mut [u8], signal_sequence: u64) -> Result<(), WireError> {
+    publish_terminal_ack(packet, TerminalPublication::CommitRequested)?;
+    put_u64(packet, 104, signal_sequence);
+    Ok(())
+}
+
+pub fn terminal_signal_sequence(packet: &[u8]) -> Result<u64, WireError> {
+    terminal_header(packet)?;
+    Ok(u64_at(packet, 104))
+}
+
 pub fn publish_terminal_ack(
     packet: &mut [u8],
     publication: TerminalPublication,
@@ -423,9 +437,11 @@ mod tests {
         assert!(publish_terminal_ack(&mut packet, TerminalPublication::Committed).is_err());
         publish_terminal_ack(&mut packet, TerminalPublication::Published).unwrap();
         assert!(publish_terminal_ack(&mut packet, TerminalPublication::Published).is_err());
-        publish_terminal_ack(&mut packet, TerminalPublication::CommitRequested).unwrap();
+        request_terminal_commit(&mut packet, 41).unwrap();
+        assert_eq!(terminal_signal_sequence(&packet), Ok(41));
         assert_eq!(decode_terminal_ack(&packet).unwrap().handoff, handoff);
         publish_terminal_ack(&mut packet, TerminalPublication::Committed).unwrap();
+        assert_eq!(terminal_signal_sequence(&packet), Ok(41));
         assert_eq!(
             decode_terminal_ack(&packet).unwrap().publication,
             TerminalPublication::Committed
