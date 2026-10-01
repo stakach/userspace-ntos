@@ -83,6 +83,7 @@ pub mod query_path_wire;
 pub mod io_create_file_wire;
 pub mod file_read_query_wire;
 pub mod retained_file_query_progress;
+pub mod retained_file_close_progress;
 pub mod retained_source_progress;
 pub mod win32k_async_read_wire;
 pub mod win32k_section_create_wire;

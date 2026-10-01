@@ -310,6 +310,8 @@ fn pending_lifecycle_retires_only_after_exact_completion_and_owned_ack() {
             .unwrap_err();
     assert_eq!(rejection.status(), NtStatus::INVALID_PARAMETER);
     let (_, retained) = rejection.into_parts();
+    assert!(!f.io.retained_file_lifecycle_ack_ready(&retained));
+    assert!(!Fixture::new().io.retained_file_lifecycle_ack_ready(&retained));
     assert!(f.io.publish_driver_completion(
         driver,
         DriverCompletion {
@@ -319,6 +321,7 @@ fn pending_lifecycle_retires_only_after_exact_completion_and_owned_ack() {
             file_context: None,
         }
     ));
+    assert!(f.io.retained_file_lifecycle_ack_ready(&retained));
     let ack = f.io.begin_retained_file_lifecycle_ack(retained).unwrap();
     assert_eq!(ack.completion().id, irp_id);
     let outcome = f
@@ -413,6 +416,7 @@ fn indeterminate_dispatch_resolves_only_by_genuine_cancelled_completion() {
         other => panic!("expected uncertain ACK owner, got {other:?}"),
     };
     assert!(retained.acknowledgement_is_uncertain());
+    assert!(!f.io.retained_file_lifecycle_ack_ready(&retained));
     let rejection =
         f.io.begin_retained_file_lifecycle_ack(retained)
             .unwrap_err();
