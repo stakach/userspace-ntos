@@ -5219,32 +5219,6 @@ impl ExecNtHandler {
         }
     }
 
-    fn journal_mutable_hive_op(
-        &mut self,
-        hive_sel: u32,
-        op: nt_hive_core::HiveLogOp<'_>,
-    ) -> Result<(), u32> {
-        let path = self
-            .mutable_hive_checkpoint_path_owned(hive_sel)
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        {
-            let hive = self
-                .mutable_hives
-                .hive_mut(hive_sel)
-                .ok_or(STATUS_INVALID_HANDLE)?;
-            let seq = hive.sequence.saturating_add(1);
-            let rec = nt_hive_core::encode_log_record(&op, seq);
-            let mut provider = crate::writable_fs::WritableHiveIoProvider::new(&path);
-            nt_hive_core::HiveIoProvider::append_log_record(&mut provider, &rec)
-                .map_err(Self::mutable_hive_journal_status)?;
-            nt_hive_core::HiveIoProvider::flush_log(&mut provider)
-                .map_err(Self::mutable_hive_journal_status)?;
-            nt_hive_core::replay_log(hive, &rec, seq.saturating_sub(1));
-        }
-        self.note_mutable_hive_journal_record(hive_sel);
-        Ok(())
-    }
-
     fn journal_create_mutable_subkey(
         &mut self,
         parent: ResolvedHiveKey,
@@ -5921,6 +5895,13 @@ impl ExecNtHandler {
         file_path: &str,
     ) -> Result<bool, u32> {
         const STATUS_REGISTRY_CORRUPT: u32 = 0xC000_014C;
+        let replay_status = |error| match error {
+            nt_hive_core::HiveLogReplayError::OutOfMemory
+            | nt_hive_core::HiveLogReplayError::CreateChild(
+                nt_hive_core::CreateChildError::InsufficientResources,
+            ) => STATUS_INSUFFICIENT_RESOURCES,
+            _ => STATUS_REGISTRY_CORRUPT,
+        };
 
         let mount_path = hive_mount(hive_sel);
         let log_bytes = unsafe { crate::writable_fs::hive_log_bytes_owned_if_mounted(file_path) }?
@@ -5933,7 +5914,8 @@ impl ExecNtHandler {
                 return Err(STATUS_REGISTRY_CORRUPT);
             };
             let base_sequence = hive.sequence;
-            let last_sequence = nt_hive_core::replay_log(hive, &log_bytes, base_sequence);
+            let last_sequence = nt_hive_core::try_replay_log(hive, &log_bytes, base_sequence)
+                .map_err(replay_status)?;
             self.mutable_hives.clear_hive_dirty(hive_sel);
             let root_subkeys = self
                 .mutable_hives
@@ -5956,7 +5938,8 @@ impl ExecNtHandler {
         };
         if let Ok(mut hive) = nt_hive_core::decode_image(&bytes) {
             let base_sequence = hive.sequence;
-            let last_sequence = nt_hive_core::replay_log(&mut hive, &log_bytes, base_sequence);
+            let last_sequence = nt_hive_core::try_replay_log(&mut hive, &log_bytes, base_sequence)
+                .map_err(replay_status)?;
             let root_subkeys = hive.subkey_count(hive.root()) as u64;
             if self
                 .mutable_hives
@@ -6004,7 +5987,8 @@ impl ExecNtHandler {
                 .hive(hive_sel)
                 .map_or(0, |hive| hive.sequence);
             let last_sequence = if let Some(hive) = self.mutable_hives.hive_mut(hive_sel) {
-                nt_hive_core::replay_log(hive, &log_bytes, base_sequence)
+                nt_hive_core::try_replay_log(hive, &log_bytes, base_sequence)
+                    .map_err(replay_status)?
             } else {
                 base_sequence
             };

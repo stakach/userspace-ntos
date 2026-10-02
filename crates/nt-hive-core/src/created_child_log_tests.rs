@@ -1,7 +1,8 @@
 use super::*;
 use crate::{
     encode_image, encode_log_record, replay_log, try_encode_log_record, try_replay_log,
-    CreateChildError, HiveKind, HiveLogOp,
+    CreateChildError, HiveIoProvider, HiveKind, HiveLogOp, HiveManager, KeyKind,
+    MemoryHiveIoProvider, RegistryValueType,
 };
 
 fn record() -> Vec<u8> {
@@ -77,7 +78,10 @@ fn replay_neither_manufactures_parents_nor_overwrites_existing_children() {
 #[test]
 fn malformed_complete_metadata_and_bad_checksum_publish_nothing() {
     for (parent, name, descriptor) in [
-        ("\\Parent", "Child", &b"sd"[..]),
+        ("\\\\Parent", "Child", &b"sd"[..]),
+        ("Parent\\\\Nested", "Child", &b"sd"[..]),
+        ("\\Parent\\\\Nested", "Child", &b"sd"[..]),
+        ("Parent\\", "Child", &b"sd"[..]),
         ("Parent", "a\\b", &b"sd"[..]),
         ("Parent", "Child", &b""[..]),
     ] {
@@ -107,6 +111,119 @@ fn malformed_complete_metadata_and_bad_checksum_publish_nothing() {
         Err(HiveLogReplayError::BadChecksum)
     );
     assert_eq!(encode_image(&h), before);
+}
+
+#[test]
+fn canonical_rooted_parent_journal_recovers_policy_attributes_and_child_metadata() {
+    let mut live = Hive::new(HiveKind::Security);
+    let mut provider = MemoryHiveIoProvider::new();
+    let descriptor = b"assigned policy security";
+    for (parent_path, name) in [
+        ("", "Policy"),
+        ("\\Policy", "PolAcDmN"),
+        ("\\Policy", "PolAcDmS"),
+    ] {
+        let parent = live.open_key(parent_path).unwrap();
+        let canonical_parent = live.key_path(parent).unwrap();
+        assert_eq!(canonical_parent, parent_path);
+        let mut manager = HiveManager::for_live_hive(provider, &live);
+        manager
+            .mutate_with_live_apply(
+                &mut live,
+                HiveLogOp::CreateChild {
+                    parent: &canonical_parent,
+                    name,
+                    class_name: Some("policy attribute"),
+                    descriptor,
+                },
+                |hive| {
+                    let mut transaction = hive.begin_transaction();
+                    transaction
+                        .try_create_child(
+                            parent,
+                            name.into(),
+                            Some("policy attribute".into()),
+                            descriptor.to_vec(),
+                        )
+                        .unwrap();
+                    transaction.commit();
+                    true
+                },
+            )
+            .unwrap();
+        provider = manager.into_provider();
+    }
+    for (path, data) in [
+        ("\\Policy\\PolAcDmN", &b"account domain"[..]),
+        ("\\Policy\\PolAcDmS", &b"domain SID"[..]),
+    ] {
+        let key = live.open_key(path).unwrap();
+        let mut manager = HiveManager::for_live_hive(provider, &live);
+        manager
+            .mutate_with_live_apply(
+                &mut live,
+                HiveLogOp::SetValue {
+                    path,
+                    name: "",
+                    value_type: RegistryValueType::Binary,
+                    data,
+                },
+                |hive| hive.set_value(key, "", RegistryValueType::Binary, data.to_vec()),
+            )
+            .unwrap();
+        provider = manager.into_provider();
+    }
+    provider.crash();
+    let journal = provider.read_log().unwrap();
+    let mut restored = Hive::new(HiveKind::Security);
+    assert_eq!(
+        try_replay_log(&mut restored, &journal, 0),
+        Ok(live.sequence)
+    );
+    for path in ["\\Policy", "\\Policy\\PolAcDmN", "\\Policy\\PolAcDmS"] {
+        let key = restored.open_key(path).unwrap();
+        assert_eq!(restored.key_kind(key), Some(KeyKind::Ordinary));
+        assert_eq!(restored.key_security_descriptor(key), Some(&descriptor[..]));
+        assert_eq!(restored.key_class(key), Some("policy attribute"));
+    }
+    for (path, data) in [
+        ("\\Policy\\PolAcDmN", &b"account domain"[..]),
+        ("\\Policy\\PolAcDmS", &b"domain SID"[..]),
+    ] {
+        let key = restored.open_key(path).unwrap();
+        assert_eq!(
+            restored.query_value(key, ""),
+            Some((RegistryValueType::Binary, data))
+        );
+    }
+}
+
+#[test]
+fn child_journal_accepts_empty_and_explicit_hive_root_parents() {
+    for parent in ["", "\\"] {
+        let mut restored = Hive::new(HiveKind::Security);
+        assert_eq!(restored.open_key(parent), Some(restored.root()));
+        let record = encode_log_record(
+            &HiveLogOp::CreateChild {
+                parent,
+                name: "Policy",
+                class_name: None,
+                descriptor: b"assigned policy security",
+            },
+            1,
+        );
+        assert_eq!(
+            try_replay_log(&mut restored, &record, 0),
+            Ok(1),
+            "parent {parent:?}"
+        );
+        let policy = restored.open_key("\\Policy").unwrap();
+        assert_eq!(restored.key_kind(policy), Some(KeyKind::Ordinary));
+        assert_eq!(
+            restored.key_security_descriptor(policy),
+            Some(&b"assigned policy security"[..])
+        );
+    }
 }
 
 #[test]

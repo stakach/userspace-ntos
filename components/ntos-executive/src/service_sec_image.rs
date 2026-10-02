@@ -37,6 +37,8 @@ mod pending_file_delivery;
 mod file_dispatch_handoff;
 #[path = "inline_file_retirement.rs"]
 pub(crate) mod inline_file_retirement;
+#[path = "hosted_gui_client_info.rs"]
+mod hosted_gui_client_info;
 
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -6705,149 +6707,9 @@ pub(crate) unsafe fn service_win32k_gui_client_info(
     reserved0: u64,
     reserved1: u64,
 ) -> i32 {
-    use nt_user_host::gui_client_info_snapshot::{
-        DesktopClientMapping, GuiClientInfoOwner, GuiClientInfoSnapshot, KeyboardLayoutClientInfo,
-    };
-    let invalid = nt_process::STATUS_INVALID_PARAMETER as i32;
-    if reserved0 != 0
-        || reserved1 != 0
-        || packet_bytes != core::mem::size_of::<win32k_subsystem::Win32kGuiClientInfoPacket>() as u64
-    {
-        return invalid;
-    }
-    let (route, dispatch, caller) = match authenticate_win32k_service_request(
-        channel,
-        reply_cap,
-        badge,
-        mi,
-        (win32k_subsystem::W32_GUI_CLIENT_INFO_LABEL << 12) | 4,
-    ) {
-        Ok(identity) => identity,
-        Err(status) => return status as i32,
-    };
-    let Some(logical) = channel.logical_caller else { return invalid };
-    let Some(wait_owner) = win32k_glue::current_provider_poll_owner(channel) else {
-        return invalid;
-    };
-    let Some(provider) = crate::current_win32k_provider_domain() else {
-        return invalid;
-    };
-    if wait_owner.provider_domain != provider.domain
-        || wait_owner.provider_generation != provider.generation
-        || logical.thread() != caller.original_thread()
-        || !validate_provider_logical_caller(logical)
-    {
-        return invalid;
-    }
-    let (_, bytes) = match win32k_subsystem::capture_provider_pool_packet(
-        packet_address,
-        packet_bytes as usize,
-    ) {
-        Ok(captured) => captured,
-        Err(status) => return status as i32,
-    };
-    let packet = core::ptr::read_unaligned(
-        bytes.as_ptr() as *const win32k_subsystem::Win32kGuiClientInfoPacket,
-    );
-    let pi = logical.pi();
-    let Some(pml4) = (SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler)
-        .as_mut()
-        .and_then(|handler| handler.hosted_process_vspace(pi))
-    else { return invalid };
-    let handler = &mut *(SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler);
-    let Some(process) = handler.capture_process_identity(pi) else { return invalid };
-    let thread = caller.original_thread();
-    if packet.magic != win32k_subsystem::W32_GUI_CLIENT_INFO_PACKET_MAGIC
-        || packet.dispatch_id != wait_owner.dispatch_id
-        || packet.client_pi != pi as u64
-        || packet.process_id != u64::from(process.pid)
-        || packet.process_generation != channel.client_generation
-        || packet.thread_id != u64::from(thread.thread_id())
-        || logical.process() != process
-        || handler.pm.thread_lifetime(thread.thread_id()) != Some(thread)
-        || handler.pm.thread_win32(thread.thread_id()) != Some(packet.thread_info)
-        || packet.keyboard_present > 1
-        || (packet.keyboard_present == 0 && (packet.keyboard_hkl != 0 || packet.keyboard_codepage != 0))
-    {
-        return invalid;
-    }
-    let admitted = GuiClientInfoOwner {
-        process,
-        thread,
-        provider,
-        dispatch: (route, dispatch, wait_owner.dispatch_id),
-    };
-    let claimed = GuiClientInfoOwner {
-        process: nt_user_host::process_identity::ProcessIdentity {
-            pid: packet.process_id as u32,
-            generation: nt_user_host::process_identity::ProcessGeneration::Hosted(packet.process_generation),
-        },
-        ..admitted
-    };
-    let keyboard = if packet.keyboard_present != 0 {
-        let Ok(codepage) = u16::try_from(packet.keyboard_codepage) else { return invalid };
-        Some(KeyboardLayoutClientInfo { hkl: packet.keyboard_hkl, codepage })
-    } else {
-        None
-    };
-    let mapping = DesktopClientMapping {
-        server_base: packet.server_base,
-        client_base: packet.client_base,
-        bytes: packet.mapping_bytes,
-        server_deskinfo: packet.server_deskinfo,
-        server_client_thread_info: packet.server_client_thread_info,
-        mapped_delta: packet.mapped_delta,
-    };
-    let Ok(snapshot) = GuiClientInfoSnapshot::capture(
-        claimed, admitted, packet.thread_info, mapping, keyboard,
-    ) else { return invalid };
-    let client_badge = logical.badge();
-    let Some(teb_alias) = hosted_gui_thread_teb_alias_for(
-        handler, pi, client_badge, packet.thread_id,
-        tp_worker_identity_from_badge(client_badge),
-    ) else { return invalid };
-    let Some(mapped_delta) = win32k_glue::map_win32k_user_heap_into_client(handler, pml4, pi)
-    else { return nt_process::STATUS_INSUFFICIENT_RESOURCES as i32 };
-    let current_process = handler.capture_process_identity(pi);
-    let current_thread = handler.pm.thread_lifetime(thread.thread_id());
-    let current_provider = crate::current_win32k_provider_domain();
-    let current_teb_alias = hosted_gui_thread_teb_alias_for(
-        handler, pi, client_badge, packet.thread_id,
-        tp_worker_identity_from_badge(client_badge),
-    );
-    if mapped_delta != packet.mapped_delta
-        || current_provider != Some(provider)
-        || win32k_glue::current_provider_poll_owner(channel) != Some(wait_owner)
-        || current_thread != Some(thread)
-        || current_process != Some(process)
-        || handler.hosted_process_generation(pi) != Some(channel.client_generation)
-        || handler.pm.thread_win32(thread.thread_id()) != Some(packet.thread_info)
-        || current_teb_alias != Some(teb_alias)
-    {
-        return invalid;
-    }
-    let current = GuiClientInfoOwner {
-        process: current_process.expect("revalidated GUI process disappeared"),
-        thread: current_thread.expect("revalidated GUI thread disappeared"),
-        provider: current_provider.expect("revalidated GUI provider disappeared"),
-        dispatch: (route, dispatch, wait_owner.dispatch_id),
-    };
-    let Ok(values) = snapshot.values_for(current) else { return invalid };
-    let old_pti = core::ptr::read_volatile((teb_alias + 0x78) as *const u64);
-    core::ptr::write_volatile((teb_alias + 0x78) as *mut u64, values.win32_thread_info);
-    core::ptr::write_volatile((teb_alias + 0x820) as *mut u64, values.client_deskinfo);
-    core::ptr::write_volatile((teb_alias + 0x828) as *mut u64, values.desktop_delta);
-    core::ptr::write_volatile((teb_alias + 0x860) as *mut u64, values.client_thread_info);
-    if let Some(keyboard) = values.keyboard_layout {
-        core::ptr::write_volatile((teb_alias + 0x890) as *mut u64, keyboard.hkl);
-        core::ptr::write_volatile((teb_alias + 0x898) as *mut u16, keyboard.codepage);
-    }
-    log_refreshed_gui_thread_client_info(
-        handler.hosted_process_role(pi) == Some(nt_exe_image::HostedProcessRole::InteractiveLogon),
-        pi, packet.thread_id, teb_alias, values.client_deskinfo, values.win32_thread_info,
-        values.desktop_delta, values.client_thread_info, old_pti,
-    );
-    0
+    hosted_gui_client_info::service(
+        channel, reply_cap, badge, mi, packet_address, packet_bytes, reserved0, reserved1,
+    )
 }
 
 fn hosted_gui_thread_teb_alias_for(

@@ -418,3 +418,10 @@ diagnosis-free failure.
   not a collision or permission to import a mutable shared projection.
 - Exercise revoke, reassign and terminal removal together. A function-scoped ownership check
   does not prove that adjacent lifecycle consumers still agree on the state transition.
+
+## Journal Contracts Must Match Live Producers
+- Replay tests must use paths produced by the live hive, including its single root separator,
+  rather than only hand-written unrooted examples. Preserve complete child metadata and reject
+  malformed empty components without rejecting the producer's canonical representation.
+- A complete invalid journal record is not a torn tail. Propagate strict replay failure before
+  publishing restored/clean state; a partially restored sentinel can suppress real initialization.
