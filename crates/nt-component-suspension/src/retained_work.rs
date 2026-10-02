@@ -43,6 +43,12 @@ pub struct RetainedWorkReservation {
     reply: u64,
 }
 
+impl RetainedWorkReservation {
+    pub(crate) fn identity(&self) -> u64 {
+        self.identity
+    }
+}
+
 /// The store keeps this Call's slot, route and Reply registered until restoration or exact finish.
 ///
 /// ```compile_fail

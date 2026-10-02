@@ -376,3 +376,10 @@ diagnosis-free failure.
 - Route IRQ/DPC kernel services through retained arena transactions, not the parked component's
   ordinary request bank. Share effect policy after exact lane/domain/grant authentication;
   never impersonate a primary thread to reuse its admission path.
+
+## Retained Ingress Must Not Depend on Slot Order
+- Reusable queue slots are storage, not arrival order. Select eligible retained Calls by their
+  immutable admission ordinal so recurring requests cannot overtake an older fault indefinitely.
+  Selection does not replace exact live-thread, generation, or physical Reply authentication.
+- Confirm reciprocal Reply ownership and the actual thread-state field before diagnosing a lost
+  fault. A retained fault awaiting dispatch needs fair scheduling, not cancellation or replay.

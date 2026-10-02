@@ -17,6 +17,8 @@ mod terminal;
 mod external_stop;
 mod external_ingress;
 pub use external_ingress::{ExternalIngress, ExternalIngressError, ExternalRestartObservation};
+mod external_selection;
+pub use external_selection::oldest_external_ingress;
 mod ingress;
 pub mod badge;
 pub mod source_registry;
