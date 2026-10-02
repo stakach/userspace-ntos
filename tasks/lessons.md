@@ -396,3 +396,9 @@ diagnosis-free failure.
 - Reserved startup arguments cannot select the executable or permit skipped initialization.
   Read the primary image from the current PEB; distinguish fresh process initialization from
   thread attachment before requiring arguments that only process initialization consumes.
+
+## Await Artifact Writers Before Consumers
+- A yielded shell call has not completed its filesystem effects. Wait for the actual exit of
+  copies as well as builds, image updates and VMs before any consumer or writer touches the
+  same artifact. Update a private image from an immutable backup and verify its bytes before
+  publishing it; never use file existence as copy-completion evidence.
