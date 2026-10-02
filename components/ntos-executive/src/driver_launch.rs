@@ -47317,25 +47317,86 @@ unsafe fn retire_hosted_device_port_caps(
     Ok(())
 }
 
-unsafe fn remove_hosted_device_resource_state(
+unsafe fn revoke_hosted_device_resource_state(
     binding: HostedDeviceBinding,
 ) -> Result<(), nt_status::NtStatus> {
     if hosted_video_caller_aperture::blocks_device_retirement(binding.device_id)
         || hosted_video_caller_aperture::blocks_device_retirement(binding.pdo_device_id) {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
+    let state = hosted_device_resource_state_by_device_id(binding.device_id)
+        .filter(|state| {
+            state.driver_id == binding.driver_id
+                && state.instance == binding.instance
+                && state.projection_domain == binding.projection_domain
+                && state.pdo_object == binding.pdo_object
+        })
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if let Some(lease) = state.pnp_context_lease {
+        crate::release_hosted_pnp_context_lease(lease)?;
+    }
+    let current = hosted_device_resource_states_mut()
+        .iter_mut()
+        .find(|current| {
+            current.device_id == binding.device_id
+                && current.projection_domain == binding.projection_domain
+        })
+        .expect("resource identity retained across acknowledged context release");
+    *current = HostedDeviceResourceState {
+        device_id: binding.device_id,
+        driver_id: binding.driver_id,
+        instance: binding.instance,
+        projection_domain: binding.projection_domain,
+        pdo_object: binding.pdo_object,
+        interface_type: state.interface_type,
+        bus_number: state.bus_number,
+        address: state.address,
+        ..HostedDeviceResourceState::default()
+    };
+    Ok(())
+}
+
+unsafe fn preflight_hosted_device_resource_identity_retirement(
+    binding: HostedDeviceBinding,
+) -> Result<(), nt_status::NtStatus> {
+    if hosted_video_caller_aperture::blocks_device_retirement(binding.device_id)
+        || hosted_video_caller_aperture::blocks_device_retirement(binding.pdo_device_id) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    if let Some(state) = hosted_device_resource_state_by_device_id(binding.device_id) {
+        if state.driver_id != binding.driver_id
+            || state.instance != binding.instance
+            || state.projection_domain != binding.projection_domain
+            || state.pdo_object != binding.pdo_object
+        {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        if state.pnp_context_lease.is_some()
+            || state.address_resource_count != 0
+            || state.interrupt_claim.is_some()
+            || state.pci_command_owned_bits != 0
+            || state.dma_frame_base != 0
+            || state.dma_pages != 0
+            || state.video_memory_phys != 0
+            || state.video_memory_len != 0
+            || state.video_memory_caller_va != 0
+        {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+    }
+    Ok(())
+}
+
+unsafe fn remove_hosted_device_resource_state(
+    binding: HostedDeviceBinding,
+) -> Result<(), nt_status::NtStatus> {
+    preflight_hosted_device_resource_identity_retirement(binding)?;
     let states = hosted_device_resource_states_mut();
     let Some(index) = states.iter().position(|state| {
-        state.device_id != 0
-            && state.device_id == binding.device_id
-            && state.projection_domain == binding.projection_domain
+        state.device_id == binding.device_id && state.projection_domain == binding.projection_domain
     }) else {
         return Ok(());
     };
-    if let Some(lease) = states[index].pnp_context_lease {
-        crate::release_hosted_pnp_context_lease(lease)?;
-        states[index].pnp_context_lease = None;
-    }
     states.remove(index);
     Ok(())
 }
@@ -51393,7 +51454,7 @@ unsafe fn clear_hosted_resource_projection(
     write_volatile((sh + SH_DMA_ALLOCATED_LOGICAL) as *mut u64, 0);
     write_volatile((sh + SH_DMA_FREED_LOGICAL) as *mut u64, 0);
     clear_dma_allocation_records(sh);
-    remove_hosted_device_resource_state(binding)?;
+    revoke_hosted_device_resource_state(binding)?;
     Ok(())
 }
 
@@ -53464,6 +53525,9 @@ fn teardown_hosted_device_binding(binding: HostedDeviceBinding) -> bool {
             return false;
         }
     }
+    if unsafe { preflight_hosted_device_resource_identity_retirement(binding) }.is_err() {
+        return false;
+    }
     let pointer_retired = unsafe { hosted_device_retirements_mut() }.iter().any(|retirement| {
         hosted_device_retirement_matches_binding(*retirement, binding)
             && retirement.pointer_retired
@@ -53480,7 +53544,18 @@ fn teardown_hosted_device_binding(binding: HostedDeviceBinding) -> bool {
         if io_manager_mut().retire_hosted_device_pointer(registration).is_err() {
             return false;
         }
+        for retirement in unsafe { hosted_device_retirements_mut() }.iter_mut() {
+            if hosted_device_retirement_matches_binding(*retirement, binding) {
+                retirement.pointer_retired = true;
+            }
+        }
     }
+    // No callbacks or native effects occur between the preflight and this pure row removal.
+    let removed = unsafe { remove_hosted_device_resource_state(binding) };
+    assert!(
+        removed.is_ok(),
+        "preflighted resource identity changed during canonical pointer retirement"
+    );
     unsafe { crate::power_manager::unregister_device(binding.pdo_device_id) };
     unsafe { release_hosted_registry_identity(binding.registry_identity_id) };
     true
@@ -62158,6 +62233,10 @@ unsafe fn dispatch_irp_for_instance_exact(
             sh,
         )
         .ok()?;
+    } else if let Some(binding) = dispatch_binding {
+        if let Err(status) = restore_hosted_device_resource_state(binding, sh, false) {
+            return Some(HostedIrpTransportResult::NotDispatched { status });
+        }
     }
     let ep = d.fault_ep;
     let pml4 = d.pml4;
