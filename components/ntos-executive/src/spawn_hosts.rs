@@ -32,6 +32,8 @@ const SEL4_RETYPE_FAN_OUT_LIMIT: u64 = 256;
 pub(crate) enum FrameSource {
     /// Fresh retype-zeroed 4K pages (private to this component; e.g. stack, heap, IPC buf).
     FreshZeroed,
+    /// Private zeroed pages committed on authenticated faults within the reserved region count.
+    DemandZeroed { initial_frames: u64 },
     /// `copy_cap`-aliased frames starting at this cap slot — the SAME physical frames are
     /// (or stay) mapped in the executive too (device BARs, DMA, staging buffers, shared pages).
     Alias(u64),
@@ -457,7 +459,7 @@ pub(crate) unsafe fn component_map_cap_bank_store(bank: &mut ComponentMapCapBank
     bank.count += 1;
 }
 
-unsafe fn component_map_cap_bank_tag(owner: u16, root_cap: u64) -> bool {
+pub(crate) unsafe fn component_map_cap_bank_tag(owner: u16, root_cap: u64) -> bool {
     if owner == 0 {
         return false;
     }
@@ -470,6 +472,9 @@ unsafe fn component_map_cap_bank_tag(owner: u16, root_cap: u64) -> bool {
 pub(crate) unsafe fn release_component_map_cap_bank(
     bank: ComponentMapCapBank,
 ) -> ComponentMapCapBankRelease {
+    if !crate::component_heap::release_bank(bank.owner) {
+        return ComponentMapCapBankRelease { caps: 0, failures: 1 };
+    }
     if bank.owner == 0 || bank.count == 0 {
         return ComponentMapCapBankRelease::default();
     }
@@ -496,6 +501,7 @@ pub(crate) unsafe fn release_component_map_cap_bank(
     if released != bank.count {
         failures = failures.saturating_add(bank.count.saturating_sub(released));
     }
+    if failures == 0 { crate::component_heap::bank_released(bank.owner); }
     ComponentMapCapBankRelease {
         caps: released,
         failures,
@@ -721,6 +727,22 @@ pub(crate) unsafe fn spawn_shared_component_worker_suspended(
 }
 
 unsafe fn spawn_component_inner(d: &ComponentDescriptor, resume: bool) -> SpawnedComponent {
+    for (index, region) in d.regions.iter().enumerate() {
+        if let FrameSource::DemandZeroed { initial_frames } = region.source {
+            assert_eq!(region.base_va, allocator::HEAP_BASE as u64);
+            assert!(initial_frames != 0 && initial_frames <= region.count && region.count <= allocator::HEAP_FRAMES);
+            assert_eq!(region.pts, 0, "heap page tables belong to the generic skeleton");
+            assert!(matches!(region.rights, Rights::Uniform(rights) if rights == RW_NX));
+            let end = region.base_va.checked_add(region.count.checked_mul(0x1000).expect("heap extent")).expect("heap end");
+            for (other_index, other) in d.regions.iter().enumerate() {
+                if other_index == index { continue; }
+                let frames = other.count.max(other.pts.checked_mul(512).expect("region page tables"));
+                if frames == 0 { continue; }
+                let other_end = other.base_va.checked_add(frames.checked_mul(0x1000).expect("region extent")).expect("region end");
+                assert!(other_end <= region.base_va || other.base_va >= end, "component heap overlaps another region");
+            }
+        }
+    }
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let heap_frames = component_allocator_heap_frames(d);
@@ -821,6 +843,9 @@ unsafe fn spawn_component_inner(d: &ComponentDescriptor, resume: bool) -> Spawne
     component_expect(b"tcb-set-ipcbuf", tcb, error);
     component_map_cap_bank_store(&mut map_cap_bank, ipcbuf);
     let stack_top = d.stack_base + d.stack_frames * 0x1000 - 8;
+    for region in d.regions {
+        crate::component_heap::stage(tcb, pml4, map_cap_bank.owner, region);
+    }
     let error = tcb_write_registers_r(tcb, d.entry as u64, stack_top, heap_frames);
     component_expect(b"tcb-write-registers", tcb, error);
     component_expect(b"tcb-set-priority", tcb, tcb_set_priority_r(tcb, d.prio));
@@ -881,15 +906,22 @@ unsafe fn map_region(pml4: u64, r: &Region, bank: &mut ComponentMapCapBank) {
             pml4,
         );
     }
-    let fresh_base = if r.source == FrameSource::FreshZeroed && r.count != 0 {
-        component_alloc_frame_run(b"region-frame-run", r.count)
+    let mapped_count = match r.source {
+        FrameSource::DemandZeroed { initial_frames } => {
+            assert!(initial_frames != 0 && initial_frames <= r.count);
+            initial_frames
+        }
+        _ => r.count,
+    };
+    let fresh_base = if matches!(r.source, FrameSource::FreshZeroed | FrameSource::DemandZeroed { .. }) && mapped_count != 0 {
+        component_alloc_frame_run(b"region-frame-run", mapped_count)
     } else {
         0
     };
     let mut first = 0;
-    for i in 0..r.count {
+    for i in 0..mapped_count {
         let cap = match r.source {
-            FrameSource::FreshZeroed => fresh_base + i,
+            FrameSource::FreshZeroed | FrameSource::DemandZeroed { .. } => fresh_base + i,
             FrameSource::Alias(base) => component_copy(b"region-alias-copy", base + i),
             FrameSource::AliasList(frames) => match frames.get(i as usize).copied() {
                 Some(frame) => component_copy(b"region-list-copy", frame),
@@ -905,7 +937,7 @@ unsafe fn map_region(pml4: u64, r: &Region, bank: &mut ComponentMapCapBank) {
         };
         if i == 0 {
             first = match r.source {
-                FrameSource::FreshZeroed => cap,
+                FrameSource::FreshZeroed | FrameSource::DemandZeroed { .. } => cap,
                 FrameSource::Alias(base) => base,
                 FrameSource::AliasList(frames) => frames.first().copied().unwrap_or(0),
             };
@@ -3827,6 +3859,7 @@ pub(crate) unsafe fn pump_service_vm_fault(
     faults: u64,
     demand: u64,
 ) -> bool {
+    if let Some(mapped) = crate::component_heap::service_fault(ch, addr, fsr) { return mapped; }
     // Ps storage is never generic demand-zero memory or an attached-client mapping. The
     // canonical owner must authenticate an exact provider alias before this branch can map it.
     if crate::ps_object_backing::contains_address(addr) {

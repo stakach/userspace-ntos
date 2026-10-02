@@ -16,7 +16,6 @@ impl Records {
         Self { blocks: Vec::new(), len: 0 }
     }
 
-    #[cfg(test)]
     pub(super) fn len(&self) -> usize { self.len }
 
     pub(super) fn get(&self, slot: usize) -> Option<&ProviderAllocationRecord> {

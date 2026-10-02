@@ -32603,6 +32603,14 @@ fn register_fsd_trampolines() -> bool {
     if !reg.reserve_initial(DRIVER_EXPORT_INITIAL_RESERVE) {
         return false;
     }
+    reg.bind(
+        "DbgBreakPoint",
+        crate::debug_traps::DbgBreakPoint as *const () as usize as u64,
+    );
+    reg.bind(
+        "DbgBreakPointWithStatus",
+        crate::debug_traps::DbgBreakPointWithStatus as *const () as usize as u64,
+    );
     // pool (ExAllocatePool* → the FSD arena)
     reg.bind(
         "ExAllocatePoolWithTag",

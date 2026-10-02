@@ -475,3 +475,5 @@ impl MemoryManager {
 
 #[cfg(test)]
 mod tests;
+
+pub mod component_heap;

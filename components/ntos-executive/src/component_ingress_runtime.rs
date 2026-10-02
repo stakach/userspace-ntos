@@ -209,6 +209,7 @@ pub(crate) unsafe fn register(
     if peers.iter().any(|peer| peer.source == source) {
         return Err(Error::Publication);
     }
+    crate::component_heap::bind_source(physical, verify).map_err(|_| Error::PhysicalIdentity)?;
     let index = peers.len();
     peers.push(NativePeer {
         source,

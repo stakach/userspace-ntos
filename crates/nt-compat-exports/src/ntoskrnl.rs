@@ -14,6 +14,9 @@ const fn e(name: &'static str, status: ExportStatus, notes: &'static str) -> Exp
 
 /// The MVP `ntoskrnl.exe` exports + their v0.1 status.
 pub const NTOSKRNL: &[ExportDescriptor] = &[
+    // --- debugger trap leaves ---
+    e("DbgBreakPoint", Implemented, "AMD64 int3 breakpoint leaf; returns only after exception continuation"),
+    e("DbgBreakPointWithStatus", Implemented, "AMD64 int3 breakpoint leaf preserving ECX status at RtlpBreakWithStatusInstruction"),
     // --- compiler memory helpers and thread owner identity ---
     e("memcpy", Implemented, "native byte copy returns the destination"),
     e("memmove", Implemented, "overlap-safe native byte copy returns the destination"),

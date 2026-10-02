@@ -1629,6 +1629,38 @@ pub fn provider_pool_census() -> ProviderPoolCensus {
     }
 }
 
+fn register_provider_allocation_observed(
+    catalog: &mut nt_provider_wait::ProviderAllocationCatalog,
+    arena: nt_provider_wait::ProviderArenaIdentity,
+    payload: u64,
+    capacity: u64,
+) -> bool {
+    match catalog.register(arena, payload, capacity) {
+        Ok(_) => true,
+        Err(nt_provider_wait::ProviderAllocationError::NoCapacity) => {
+            fn print_statistics(statistics: nt_provider_wait::ProviderAllocationStatistics) {
+                print_str(b" slots="); print_u64(statistics.slots as u64);
+                print_str(b" live="); print_u64(statistics.live as u64);
+                print_str(b" retiring="); print_u64(statistics.retiring as u64);
+                print_str(b" pins="); print_u64(statistics.pins as u64);
+                print_str(b"\n");
+            }
+            print_str(b"[provider-allocation-pressure] attempted-arena="); print_u64(arena.id);
+            print_str(b" generation="); print_u64(arena.generation);
+            print_str(b" address="); print_u64(payload);
+            print_str(b" capacity="); print_u64(capacity);
+            print_statistics(catalog.statistics());
+            for (arena, statistics) in catalog.arena_statistics() {
+                print_str(b"[provider-allocation-pressure] arena="); print_u64(arena.id);
+                print_str(b" generation="); print_u64(arena.generation);
+                print_statistics(statistics);
+            }
+            false
+        }
+        Err(_) => false,
+    }
+}
+
 unsafe fn provider_pool_alloc(size: u64, zero: bool) -> u64 {
     let Some(arena) = fixed_provider_arena_identity(PROVIDER_ARENA_SHARED_POOL_ID) else {
         return 0;
@@ -1649,7 +1681,7 @@ unsafe fn provider_pool_alloc(size: u64, zero: bool) -> u64 {
                     && provider_allocations_unlocked(&mut metadata)
                     .is_some_and(|catalog| {
                         let _scope = crate::allocator::enter_scope(b"provider-allocation-register");
-                        catalog.register(arena, payload, allocation.capacity).is_ok()
+                        register_provider_allocation_observed(catalog, arena, payload, allocation.capacity)
                     })
                 {
                     Ok(payload)
@@ -2146,7 +2178,7 @@ unsafe fn reclaiming_pool_alloc(size: u64) -> u64 {
     if provider_allocations_unlocked(&mut metadata)
         .is_some_and(|allocations| {
             let _scope = crate::allocator::enter_scope(b"provider-allocation-register");
-            allocations.register(arena, payload, capacity).is_ok()
+            register_provider_allocation_observed(allocations, arena, payload, capacity)
         })
     {
         payload
@@ -7853,7 +7885,7 @@ unsafe fn heap_alloc_in(
     let registered = provider_allocations_unlocked(&mut metadata)
         .is_some_and(|allocations| {
             let _scope = crate::allocator::enter_scope(b"provider-allocation-register");
-            allocations.register(arena, payload, capacity).is_ok()
+            register_provider_allocation_observed(allocations, arena, payload, capacity)
         });
     if registered {
         payload
@@ -14990,6 +15022,14 @@ fn register_trampolines() -> bool {
     if !reg.reserve_initial(DRIVER_EXPORT_INITIAL_RESERVE) {
         return false;
     }
+    reg.bind(
+        "DbgBreakPoint",
+        crate::debug_traps::DbgBreakPoint as *const () as usize as u64,
+    );
+    reg.bind(
+        "DbgBreakPointWithStatus",
+        crate::debug_traps::DbgBreakPointWithStatus as *const () as usize as u64,
+    );
     // pool (Driver Host arena)
     reg.bind(
         "ExAllocatePoolWithTag",
@@ -16306,7 +16346,7 @@ pub(crate) unsafe fn pool_alloc_export(size: u64) -> u64 {
 #[no_mangle]
 #[link_section = ".text.win32k_subsystem_entry"]
 pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
-    if !unsafe { allocator::initialize_mapped_heap(heap_frames) } {
+    if !unsafe { allocator::initialize_reserved_heap(heap_frames) } {
         park();
     }
     if !provider_pool_ready() {

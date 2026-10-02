@@ -23,6 +23,8 @@ mod acpi_platform;
 mod boot_namespace;
 mod ahci_maintenance;
 mod allocator;
+mod component_heap;
+mod debug_traps;
 mod alpc_selftest;
 pub(crate) use acpi_platform::*;
 mod cm_server;
@@ -31277,11 +31279,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     pts: 0,
                 }; 32];
                 let mut n = 0usize;
-                // Heap (uses the pre-built heap PT — map_heap_pt=true).
+                // Private heap reserves its band; physical pages commit on authenticated faults.
                 regions[n] = Region {
-                    source: FrameSource::FreshZeroed,
+                    source: FrameSource::DemandZeroed { initial_frames: allocator::DEFAULT_SERVICE_HEAP_FRAMES },
                     base_va: allocator::HEAP_BASE as u64,
-                    count: allocator::DEFAULT_SERVICE_HEAP_FRAMES,
+                    count: allocator::HEAP_FRAMES,
                     rights: Rights::Uniform(RW_NX),
                     pts: 0,
                 };

@@ -232,6 +232,7 @@ pub(crate) unsafe fn retire(route: PeerRoute) -> Result<(), Error> {
                         physical == row.physical && (row.verify)(physical)
                     })
                     .map_err(|error| failure("finish-source", error))?;
+                crate::component_heap::retire_source(row.physical).map_err(|_| Error::Source)?;
                 (&mut *core::ptr::addr_of_mut!(DRAINS))[drain_index].finished = true;
                 // Only the final receipt releases bounded installation capacity. Retired alone
                 // is insufficient: lane release, Reply return or source retirement may still fail.

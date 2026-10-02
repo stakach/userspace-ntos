@@ -7,8 +7,9 @@
 //! past them. Each component has its own heap frames at the same vaddr, while
 //! win32k lanes share one component heap and may allocate concurrently. The
 //! retype-zeroed heap gives empty metadata and a heap-resident allocator lock.
-//! Spawned components must publish the number of mapped heap frames
-//! before their first allocation; the initial executive retains the full arena.
+//! Spawned components publish their allocation limit before their first allocation. An eager
+//! heap maps that entire limit; a reserved heap commits missing pages through the authenticated
+//! root pager. The initial executive retains its separate root commitment protocol.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::{align_of, size_of};
@@ -45,7 +46,7 @@ const FREE_HEAD: usize = HEAP_BASE + 8; // 8-byte address of the first free-list
 /// Component-local metadata words available to modules that cannot use mutable image statics.
 pub const COMPONENT_LOCAL_WORD_BASE: usize = HEAP_BASE + 16;
 pub const COMPONENT_LOCAL_WORDS: usize = 5;
-const MAPPED_HEAP_BYTES: usize =
+const COMPONENT_HEAP_LIMIT_BYTES: usize =
     COMPONENT_LOCAL_WORD_BASE + COMPONENT_LOCAL_WORDS * size_of::<usize>();
 const OOM_REPORTED: usize = HEAP_BASE + 64;
 const OOM_CONTEXT: usize = HEAP_BASE + 72;
@@ -62,7 +63,7 @@ const ALLOC_UNLOCKED: usize = 0;
 const ALLOC_HELD: usize = 1;
 const ALLOC_POISONED: usize = 2;
 const DATA: usize = HEAP_BASE + 152; // allocations start past allocator/local metadata
-const _: () = assert!(MAPPED_HEAP_BYTES + size_of::<usize>() <= OOM_REPORTED);
+const _: () = assert!(COMPONENT_HEAP_LIMIT_BYTES + size_of::<usize>() <= OOM_REPORTED);
 const _: () = assert!(OOM_SCOPE_LEN + size_of::<usize>() <= TRANSIENT_CTR);
 const _: () = assert!(TRANSIENT_HIGH_WATER + size_of::<usize>() <= DATA);
 const _: () = assert!(ALLOC_LOCK + size_of::<usize>() <= DATA);
@@ -350,12 +351,16 @@ unsafe fn write_word(addr: usize, value: usize) {
     unsafe { write_volatile(addr as *mut usize, value) };
 }
 
-/// Publish the heap mapping installed by the component broker.
+/// Publish the allocation limit of an eagerly mapped component heap.
 ///
 /// This must be the first operation performed by a spawned executive-image component. A zero
 /// frame count is valid for components that never map or use the global heap. The initial
 /// executive does not call this function and therefore retains [`HEAP_FRAMES`].
 pub unsafe fn initialize_mapped_heap(frames: u64) -> bool {
+    unsafe { initialize_heap_limit(frames) }
+}
+
+unsafe fn initialize_heap_limit(frames: u64) -> bool {
     if frames == 0 {
         return true;
     }
@@ -366,19 +371,25 @@ pub unsafe fn initialize_mapped_heap(frames: u64) -> bool {
         return false;
     }
     let bytes = frames as usize * 0x1000;
-    let current = unsafe { read_word(MAPPED_HEAP_BYTES) };
+    let current = unsafe { read_word(COMPONENT_HEAP_LIMIT_BYTES) };
     if current != 0 && current != bytes {
         return false;
     }
-    unsafe { write_word(MAPPED_HEAP_BYTES, bytes) };
+    unsafe { write_word(COMPONENT_HEAP_LIMIT_BYTES, bytes) };
     true
+}
+
+/// Spawn passes a reservation limit, not a claim that all reserved pages are mapped. Missing
+/// pages are committed by the authenticated root pager without reentering this allocator.
+pub unsafe fn initialize_reserved_heap(frames: u64) -> bool {
+    unsafe { initialize_heap_limit(frames) }
 }
 
 /// Publish root heap pages only after their frame caps and RW mappings are installed. Called at
 /// boot and by the root's allocation path while the heap lock is held.
 pub(crate) unsafe fn publish_root_heap_commit(frames: u64) {
     let current = (unsafe { read_word(ROOT_COMMITTED_BYTES) } / 0x1000) as u64;
-    assert!(unsafe { read_word(MAPPED_HEAP_BYTES) } == 0);
+    assert!(unsafe { read_word(COMPONENT_HEAP_LIMIT_BYTES) } == 0);
     assert!(frames >= EXECUTIVE_INITIAL_HEAP_FRAMES);
     assert!(frames <= EXECUTIVE_DURABLE_HEAP_FRAMES);
     assert!(frames >= current);
@@ -414,7 +425,7 @@ pub(crate) fn root_commit_target(current_frames: u64, requested_end: usize) -> O
 
 #[inline]
 fn heap_size() -> usize {
-    let configured = unsafe { read_word(MAPPED_HEAP_BYTES) };
+    let configured = unsafe { read_word(COMPONENT_HEAP_LIMIT_BYTES) };
     if configured == 0 {
         HEAP_SIZE
     } else {
@@ -423,15 +434,15 @@ fn heap_size() -> usize {
 }
 
 #[inline]
-fn mapped_heap_end() -> usize {
+fn heap_limit_end() -> usize {
     HEAP_BASE + heap_size()
 }
 
 #[inline]
 fn transient_heap_size() -> usize {
     // A zero configured size identifies the initial/root executive. Every spawned component must
-    // publish its mapped size before allocating and retains that complete profile as durable heap.
-    if unsafe { read_word(MAPPED_HEAP_BYTES) } == 0 {
+    // publish its allocation limit before allocating; demand heaps commit pages independently.
+    if unsafe { read_word(COMPONENT_HEAP_LIMIT_BYTES) } == 0 {
         EXECUTIVE_TRANSIENT_HEAP_SIZE.min(heap_size())
     } else {
         0
@@ -440,7 +451,7 @@ fn transient_heap_size() -> usize {
 
 #[inline]
 fn transient_heap_start() -> usize {
-    mapped_heap_end() - transient_heap_size()
+    heap_limit_end() - transient_heap_size()
 }
 
 #[inline]
@@ -448,7 +459,7 @@ fn durable_heap_end() -> usize {
     if transient_heap_size() != 0 {
         HEAP_BASE + unsafe { read_word(ROOT_COMMITTED_BYTES) }
     } else {
-        mapped_heap_end()
+        heap_limit_end()
     }
 }
 
@@ -467,7 +478,7 @@ fn ensure_durable_end(end: usize) -> bool {
 
 #[inline]
 fn is_transient_pointer(ptr: usize) -> bool {
-    transient_heap_size() != 0 && ptr >= transient_heap_start() && ptr < mapped_heap_end()
+    transient_heap_size() != 0 && ptr >= transient_heap_start() && ptr < heap_limit_end()
 }
 
 unsafe fn free_node_size(node: usize) -> usize {
@@ -770,7 +781,7 @@ impl Bump {
             return null_mut();
         };
         let used = unsafe { read_word(TRANSIENT_CTR) };
-        let top = mapped_heap_end().saturating_sub(used);
+        let top = heap_limit_end().saturating_sub(used);
         let Some(unrounded) = top.checked_sub(size) else {
             report_oom(layout.size(), layout.align(), used, 0, usize::MAX);
             return null_mut();
@@ -786,7 +797,7 @@ impl Bump {
             );
             return null_mut();
         }
-        let consumed = mapped_heap_end() - start;
+        let consumed = heap_limit_end() - start;
         unsafe {
             write_word(TRANSIENT_CTR, consumed);
             if consumed > read_word(TRANSIENT_HIGH_WATER) {
