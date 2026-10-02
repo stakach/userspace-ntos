@@ -392,6 +392,39 @@ fn canonical_projection_authenticates_physical_route_and_acknowledges_mapping_re
 }
 
 #[test]
+fn bootstrap_ps_projection_uses_retained_vspace_not_later_public_readiness() {
+    let file = source("provider_ps_projection.rs");
+    let grant = function(&file, "grant");
+    struct PublicReadiness(bool);
+    impl<'ast> Visit<'ast> for PublicReadiness {
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            self.0 |= path
+                .path
+                .segments
+                .iter()
+                .any(|segment| segment.ident == "WIN32K_HOST_PML4");
+            syn::visit::visit_expr_path(self, path);
+        }
+    }
+    let mut readiness = PublicReadiness(false);
+    readiness.visit_block(&grant.block);
+    assert!(!readiness.0,
+        "DriverEntry owns an authenticated registered VSpace before public completion readiness; projection cannot require the later atomic");
+    let mut calls = Calls::default();
+    calls.visit_block(&grant.block);
+    for required in [
+        "physical_source",
+        "ProviderRoot::new",
+        "grant_referenced_body",
+    ] {
+        assert!(
+            calls.0.iter().any(|name| name.ends_with(required)),
+            "bootstrap projection still requires exact retained authority: {required}"
+        );
+    }
+}
+
+#[test]
 fn returned_ethread_projects_its_validated_published_process_before_thread_body() {
     let file = source("ps_object_backing.rs");
     let grant = function(&file, "grant_referenced_body");

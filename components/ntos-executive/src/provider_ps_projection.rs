@@ -26,7 +26,6 @@ pub(crate) unsafe fn grant(
             channel.fault_ep,
             channel.reply_cap,
         ) != Some(route.identity().lane)
-        || channel.pml4 != WIN32K_HOST_PML4.load(Ordering::Acquire)
     {
         return Err(invalid);
     }

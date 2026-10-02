@@ -1,5 +1,11 @@
 # Lessons
 
+## Bootstrap Authority Precedes Public Readiness
+- DriverEntry can legitimately reference canonical objects before its completion publishes
+  the provider's public ready state. Authenticate projections through the retained ingress
+  source and registered VSpace owner, not a later readiness atomic. Keep exact route,
+  dispatch, Reply, physical lane and generation checks intact.
+
 ## Shared Locks Across Suspended Provider Lanes
 - A root-side yield loop cannot acquire a lock held by an execution-held provider lane.
   Inspect live syscall return addresses and execution holds, not only the last fault RIP.
