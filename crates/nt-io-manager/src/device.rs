@@ -69,6 +69,8 @@ pub struct DeviceRecord {
     pub attached_to: Option<DeviceId>,
     pub top_of_stack: DeviceId,
     pub delete_pending: bool,
+    pub(crate) device_power_state: nt_power_types::DevicePowerState,
+    pub(crate) system_power_state: nt_power_types::SystemPowerState,
 }
 
 impl DeviceRecord {
@@ -97,6 +99,8 @@ impl DeviceRecord {
             attached_to: None,
             top_of_stack: DeviceId::NULL,
             delete_pending: false,
+            device_power_state: nt_power_types::DevicePowerState::Unspecified,
+            system_power_state: nt_power_types::SystemPowerState::Unspecified,
         }
     }
 

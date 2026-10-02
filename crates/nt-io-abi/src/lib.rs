@@ -11,6 +11,7 @@
 
 pub mod device_pointer;
 pub mod device_mutation;
+pub mod power_report;
 pub mod ioctl;
 pub mod major;
 pub mod opcodes;

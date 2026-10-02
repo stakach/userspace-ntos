@@ -377,6 +377,7 @@ name = "nt-io-abi"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "nt-power-types",
 ]
 
 [[package]]
@@ -410,6 +411,7 @@ dependencies = [
  "nt-memory-manager",
  "nt-object-manager",
  "nt-pnp-abi",
+ "nt-power-types",
  "nt-process",
  "nt-provider-wait",
  "nt-status",

@@ -21,6 +21,7 @@ nt-io-abi = { workspace = true }
 nt-io-completion = { workspace = true }
 nt-fs = { workspace = true }
 nt-pnp-abi = { workspace = true }
+nt-power-types = { workspace = true }
 nt-provider-wait = { workspace = true }
 nt-kernel-exec = { workspace = true }
 nt-object-manager = { workspace = true, optional = true }

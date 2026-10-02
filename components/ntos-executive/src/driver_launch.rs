@@ -152,6 +152,8 @@ mod hosted_kernel_file_control;
 mod hosted_kernel_file_read_query;
 #[path = "hosted_kernel_win32k_async_read.rs"]
 mod hosted_kernel_win32k_async_read;
+#[path = "hosted_power_broker.rs"]
+mod hosted_power_broker;
 #[path = "hosted_sync_relations.rs"]
 pub(crate) mod hosted_sync_relations;
 #[path = "hosted_kernel_win32k_buffered_ioctl.rs"]
@@ -5457,6 +5459,7 @@ const HOSTED_DEVICE_OP_ATTACH_SAFE: u64 = 17;
 const HOSTED_DEVICE_OP_ROLLBACK_ATTACH_SAFE: u64 = 18;
 const HOSTED_DEVICE_OP_REGISTER_FILE_SYSTEM: u64 = 19;
 const HOSTED_DEVICE_OP_UNREGISTER_FILE_SYSTEM: u64 = 20;
+const HOSTED_DEVICE_OP_REPORT_POWER_STATE: u64 = 21;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN: u64 = 0;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF: u64 = 2;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
@@ -5716,8 +5719,6 @@ pub(crate) struct DriverRegistryHandleSlot {
 static mut HOSTED_REGISTRY_IDENTITIES: Option<Vec<HostedRegistryIdentitySlot>> = None;
 static mut HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID: HostedRegistryIdentityId =
     INVALID_HOSTED_REGISTRY_IDENTITY_ID;
-static mut HOSTED_ADD_DEVICE_POWER_DEVNODE_ID: u64 = 0;
-static mut HOSTED_ADD_DEVICE_POWER_DRIVER_OBJECT: u64 = 0;
 static mut HOSTED_DEVICE_INTERFACE_REGISTRATIONS: Option<Vec<HostedDeviceInterfaceRegistration>> =
     None;
 
@@ -9212,32 +9213,9 @@ extern "win64" fn s_po_call_driver(device: u64, irp: u64) -> i32 {
 extern "win64" fn s_po_start_next_power_irp(_irp: u64) {}
 
 /// `POWER_STATE PoSetPowerState(PDEVICE_OBJECT, POWER_STATE_TYPE, POWER_STATE)` — update the
-/// authoritative record for this exact device stack and return that record's previous state.
+/// authoritative record for this exact device object and return that record's previous state.
 extern "win64" fn s_po_set_power_state(device: u64, power_type: u32, state: u32) -> u32 {
-    unsafe {
-        let Some(devnode_id) = hosted_power_devnode_by_device_object(device) else {
-            return nt_power_manager::DevicePowerState::Unspecified as u32;
-        };
-        match power_type {
-            nt_power_types::POWER_STATE_TYPE_DEVICE => {
-                let Some(state) = nt_power_manager::DevicePowerState::from_u32(state) else {
-                    return nt_power_manager::DevicePowerState::Unspecified as u32;
-                };
-                crate::power_manager::report_device_state(devnode_id, state)
-                    .map(|previous| previous as u32)
-                    .unwrap_or(nt_power_manager::DevicePowerState::Unspecified as u32)
-            }
-            nt_power_types::POWER_STATE_TYPE_SYSTEM => {
-                let Some(state) = nt_power_manager::SystemPowerState::from_u32(state) else {
-                    return nt_power_manager::SystemPowerState::Unspecified as u32;
-                };
-                crate::power_manager::report_system_state(devnode_id, state)
-                    .map(|previous| previous as u32)
-                    .unwrap_or(nt_power_manager::SystemPowerState::Unspecified as u32)
-            }
-            _ => nt_power_manager::DevicePowerState::Unspecified as u32,
-        }
-    }
+    unsafe { hosted_power_broker::component_report(device, power_type, state) }
 }
 
 /// `PMDL IoAllocateMdl(PVOID, ULONG, BOOLEAN, BOOLEAN, PIRP)` — allocate and initialize a
@@ -51687,8 +51665,12 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_ROLLBACK_ATTACH_SAFE
             | HOSTED_DEVICE_OP_REGISTER_FILE_SYSTEM
             | HOSTED_DEVICE_OP_UNREGISTER_FILE_SYSTEM
+            | HOSTED_DEVICE_OP_REPORT_POWER_STATE
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+    }
+    if op == HOSTED_DEVICE_OP_REPORT_POWER_STATE {
+        return hosted_power_broker::service_report(ch, pdo_object, arg2, arg3, active_reply_cap, caller_badge);
     }
     if matches!(op, HOSTED_DEVICE_OP_CREATE | HOSTED_DEVICE_OP_ATTACH | HOSTED_DEVICE_OP_DETACH | HOSTED_DEVICE_OP_DELETE | HOSTED_DEVICE_OP_ATTACH_SAFE | HOSTED_DEVICE_OP_ROLLBACK_ATTACH_SAFE | HOSTED_DEVICE_OP_REGISTER_FILE_SYSTEM | HOSTED_DEVICE_OP_UNREGISTER_FILE_SYSTEM) {
         let Some((_, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
@@ -52642,22 +52624,6 @@ fn hosted_driver_device_route_by_device_id(device_id: u64) -> Option<(usize, Dri
     let device_object = io_manager_mut()
         .hosted_device_address_by_identity(domain, nt_io_manager::DeviceId(device_id))?;
     Some((instance_index, inst, device_object))
-}
-
-unsafe fn hosted_power_devnode_by_device_object(device_object: u64) -> Option<u64> {
-    if let Some(binding) = hosted_device_binding_by_device_object(device_object)
-        .or_else(|| hosted_device_binding_by_pdo_object(device_object))
-    {
-        return Some(binding.pdo_device_id);
-    }
-
-    let devnode_id = read_volatile(core::ptr::addr_of!(HOSTED_ADD_DEVICE_POWER_DEVNODE_ID));
-    let expected_driver = read_volatile(core::ptr::addr_of!(HOSTED_ADD_DEVICE_POWER_DRIVER_OBJECT));
-    if device_object == 0 || devnode_id == 0 || expected_driver == 0 {
-        return None;
-    }
-    let actual_driver = read_unaligned((device_object + 0x08) as *const u64);
-    (actual_driver == expected_driver).then_some(devnode_id)
 }
 
 fn hosted_device_binding_by_stack_device_id(device_id: u64) -> Option<HostedDeviceBinding> {
@@ -59562,17 +59528,6 @@ unsafe fn call_add_device_for_existing_pdo(
         );
         crate::power_manager::prepare_device(pdo_device_id)?;
         hosted_add_device_rollback::record_power(rollback.as_ref().unwrap());
-        let power_driver_object = provider_route
-            .map(|route| route.provider_driver_object)
-            .unwrap_or(inst.driver_object);
-        write_volatile(
-            core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_POWER_DEVNODE_ID),
-            pdo_device_id,
-        );
-        write_volatile(
-            core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_POWER_DRIVER_OBJECT),
-            power_driver_object,
-        );
         hosted_add_device_rollback::begin_dispatch(rollback.as_ref().unwrap());
         let dispatch = dispatch_add_device_for_instance(index, inst, pdo_object, caller);
         let dispatch = match dispatch {
@@ -59583,14 +59538,6 @@ unsafe fn call_add_device_for_existing_pdo(
             }
         };
         hosted_add_device_rollback::completed_dispatch(rollback.as_ref().unwrap(), &dispatch);
-        write_volatile(
-            core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_POWER_DEVNODE_ID),
-            0,
-        );
-        write_volatile(
-            core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_POWER_DRIVER_OBJECT),
-            0,
-        );
         write_volatile(
             core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID),
             INVALID_HOSTED_REGISTRY_IDENTITY_ID,
@@ -59658,14 +59605,6 @@ unsafe fn call_add_device_for_existing_pdo(
         write_volatile(
             core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID),
             INVALID_HOSTED_REGISTRY_IDENTITY_ID,
-        );
-        write_volatile(
-            core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_POWER_DEVNODE_ID),
-            0,
-        );
-        write_volatile(
-            core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_POWER_DRIVER_OBJECT),
-            0,
         );
     }
     match result {
