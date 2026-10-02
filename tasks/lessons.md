@@ -383,3 +383,11 @@ diagnosis-free failure.
   Selection does not replace exact live-thread, generation, or physical Reply authentication.
 - Confirm reciprocal Reply ownership and the actual thread-state field before diagnosing a lost
   fault. A retained fault awaiting dispatch needs fair scheduling, not cancellation or replay.
+
+## Native Context and Diagnostics Need Exact Backing
+- Resolve a fault PC against the actual loaded module map before attributing an ABI failure.
+  Publish each successfully unwound non-target CONTEXT; restoring the initial inner frame loses
+  the target's nonvolatile registers. Do not publish the target frame's already-unwound caller.
+- A reserved virtual range or arithmetic mirror is not resident memory. Diagnostic stack scans
+  must read exact process-generation backing and stop at an unavailable word, not fault the
+  executive or substitute zero-filled or backing-image bytes.

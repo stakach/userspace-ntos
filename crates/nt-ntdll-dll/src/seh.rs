@@ -49,7 +49,7 @@ const CTX_RIP: usize = 0xF8;
 /// `CONTEXT.Xmm0` @ 0x1A0 (within FltSave).
 const CTX_XMM0: usize = 0x1A0;
 /// `CONTEXT` size in bytes.
-const CONTEXT_SIZE: usize = 0x4D0;
+const CONTEXT_SIZE: usize = ex::raw_context::RAW_CONTEXT_SIZE;
 /// `CONTEXT_AMD64 | CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT`.
 const CONTEXT_FULL: u32 = 0x0010_000b;
 
@@ -97,6 +97,17 @@ unsafe fn context_from_raw(ctx_ptr: *const u8) -> Context {
         }
     }
     c
+}
+
+/// Publish a completed non-target frame without changing the raw CONTEXT ABI.
+unsafe fn publish_completed_unwind_frame(restoration: *mut u8, unwound: *const u8) {
+    // SAFETY: both pointers refer to the live, full-sized contexts owned by this unwind walk.
+    unsafe {
+        let mut restored = core::ptr::read_unaligned(restoration.cast::<ex::raw_context::RawContext>());
+        let completed = core::ptr::read_unaligned(unwound.cast::<ex::raw_context::RawContext>());
+        nt_ntdll::rtl::unwind_context::publish_completed_frame(&mut restored, &completed);
+        core::ptr::write_unaligned(restoration.cast::<ex::raw_context::RawContext>(), restored);
+    }
 }
 
 /// Store our [`Context`] model back into a raw `CONTEXT*` (writes the 16 GPRs + Rip + XMM).
@@ -839,6 +850,8 @@ unsafe fn rtl_unwind_ex_from_context(
                 core::ptr::write_unaligned(work_ptr.add(CTX_RIP) as *mut u64, ret);
                 core::ptr::write_unaligned(work_ptr.add(CTX_RSP) as *mut u64, rsp + 8);
             }
+            // SAFETY: the leaf pop completed; the retained restoration context remains live.
+            unsafe { publish_completed_unwind_frame(context_record, work_ptr) };
             continue;
         }
 
@@ -897,6 +910,8 @@ unsafe fn rtl_unwind_ex_from_context(
                 unsafe { nt_raise_exception(record, context_record, 0) };
             }
         }
+        // SAFETY: this non-target frame and its termination handler completed successfully.
+        unsafe { publish_completed_unwind_frame(context_record, work_ptr) };
     }
 
     // Transfer control to the target: set Rip=target_ip, Rsp=target_frame (the __except handler runs

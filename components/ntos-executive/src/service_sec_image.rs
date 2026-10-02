@@ -2,6 +2,7 @@
 //! Extracted verbatim from `main.rs` (pure reorg; no logic change).
 #![allow(clippy::all)]
 use crate::exec_handler::HostedCreatePublication;
+use crate::fault_stack_diagnostics::read_fault_stack_word;
 use crate::*;
 use nt_user_host::hosted_return_target::HostedReturnTarget;
 
@@ -11260,6 +11261,7 @@ pub(crate) unsafe fn service_sec_image(
                         // Walk the REAL stack (TCB rsp) for return addresses (ntdll 0x100_00xxxxxx / a
                         // mapped DLL 0x80xxxxxx). The nearest one identifies the faulting caller.
                         let rsp = regs[1];
+                        let diagnostic_process = nt_handler.capture_process_identity(pi);
                         // ★ TRUNC PROBE: [rsp] is the return address the CALLER pushed with its
                         // `call [mem]` that jumped to the bare RVA. Print [rsp+0..0x20] unconditionally
                         // so the immediate caller (module+RVA) is visible.
@@ -11267,7 +11269,12 @@ pub(crate) unsafe fn service_sec_image(
                         {
                             let mut j: u64 = 0;
                             while j < 4 {
-                                let v = smss_stack_read(rsp + j * 8);
+                                let Some(v) = read_fault_stack_word(
+                                    &nt_handler, pi, diagnostic_process, rsp, j, scratch_base,
+                                ) else {
+                                    print_str(b" [unavailable]");
+                                    break;
+                                };
                                 print_str(b" [rsp+0x");
                                 print_hex((j * 8) as u32);
                                 print_str(b"]=0x");
@@ -11281,7 +11288,12 @@ pub(crate) unsafe fn service_sec_image(
                         let mut k: u64 = 0;
                         let mut printed: u64 = 0;
                         while k < 64 && printed < 12 {
-                            let v = smss_stack_read(rsp + k * 8);
+                            let Some(v) = read_fault_stack_word(
+                                &nt_handler, pi, diagnostic_process, rsp, k, scratch_base,
+                            ) else {
+                                print_str(b" [unavailable]");
+                                break;
+                            };
                             let is_ntdll = v >= 0x0000_0100_0000_0000 && v < 0x0000_0100_0100_0000;
                             // Widen to ALL mapped DLLs (0x8000_0000..0x8300_0000 covers rpcrt4/lsasrv/…)
                             // + hosted image/env pointers so the immediate rpcrt4/lsasrv caller +

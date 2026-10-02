@@ -109,6 +109,7 @@ mod provider_file_wait;
 mod ps_object_retirement;
 mod provider_ps;
 mod sec_image_diagnostic;
+mod fault_stack_diagnostics;
 use process_vm_retirement::reclaim_final_process_vm;
 mod hosted_driver_projection;
 mod hosted_safe_attach;
