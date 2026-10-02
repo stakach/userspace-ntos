@@ -140,6 +140,7 @@ pub enum HostedIrqServiceKind {
     AcquireActualLock = 4,
     ReleaseActualLock = 5,
     Mdl = 6,
+    PoolRetirement = 7,
 }
 
 impl HostedIrqServiceKind {
@@ -151,6 +152,7 @@ impl HostedIrqServiceKind {
             4 => Some(Self::AcquireActualLock),
             5 => Some(Self::ReleaseActualLock),
             6 => Some(Self::Mdl),
+            7 => Some(Self::PoolRetirement),
             _ => None,
         }
     }
@@ -480,6 +482,13 @@ impl HostedIrqServiceCommand {
                         && self.arguments[0] != 0
                         && self.arguments[1] != 0
                 }
+                HostedIrqServiceKind::PoolRetirement => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 2
+                        && matches!(self.arguments[0], 2 | 3)
+                        && self.arguments[1] != 0
+                        && self.arguments[2..].iter().all(|argument| *argument == 0)
+                }
                 HostedIrqServiceKind::ProviderImport
                 | HostedIrqServiceKind::ProviderCallbackRequest => {
                     self.authority_cookie != 0
@@ -488,6 +497,9 @@ impl HostedIrqServiceCommand {
             }
     }
 }
+
+#[path = "hosted_irq_pool_retirement.rs"]
+mod pool_retirement;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostedIrqArenaResult {
@@ -2330,7 +2342,11 @@ mod tests {
             HostedIrqServiceKind::from_raw(6),
             Some(HostedIrqServiceKind::Mdl)
         );
-        assert_eq!(HostedIrqServiceKind::from_raw(7), None);
+        assert_eq!(
+            HostedIrqServiceKind::from_raw(7),
+            Some(HostedIrqServiceKind::PoolRetirement)
+        );
+        assert_eq!(HostedIrqServiceKind::from_raw(8), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
 

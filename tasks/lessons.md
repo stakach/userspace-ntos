@@ -369,3 +369,10 @@ diagnosis-free failure.
   Verify enumeration followed by an exact retained relative open, not just a path-string rewrite.
 - Follow only admitted link authority. Invalid, cyclic, or unsupported targets must not expose a
   link's literal body or fall back to a mutable selector.
+
+## IRQ Services Use Their Own Arena
+- Decode a WALL label and message words against the current transport and staged ELF before
+  calling it a timeout or CPU fault. A legitimate kernel service can expose a routing gap.
+- Route IRQ/DPC kernel services through retained arena transactions, not the parked component's
+  ordinary request bank. Share effect policy after exact lane/domain/grant authentication;
+  never impersonate a primary thread to reuse its admission path.

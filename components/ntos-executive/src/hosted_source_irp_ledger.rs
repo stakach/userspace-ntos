@@ -609,6 +609,90 @@ unsafe fn projected_registration(
     Some((allocation, node_generation))
 }
 
+/// Allocation lifetime effects shared by authenticated ordinary and IRQ arena ingress.
+/// This does not admit IRPs or construct a logical caller on behalf of an interrupt lane.
+pub(super) fn retire_allocation(
+    instance_index: usize,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    op: u64,
+    component_address: u64,
+) -> (i32, u64, u64) {
+    if !matches!(op, 2 | 3)
+        || component_address == 0
+        || !inst.used
+        || instance_domain_identity(inst) != Some(domain)
+    {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    }
+    let _guard = lock();
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    if op == 3
+        && auxiliary().protected_pool_child(
+            SourceIrpOwner::HostedDriver(instance_index),
+            domain,
+            component_address,
+        )
+    {
+        return (nt_status::NtStatus::PENDING.raw(), 0, 0);
+    }
+    let owner = ledger().allocation_for(
+        SourceIrpOwner::HostedDriver(instance_index),
+        domain,
+        component_address,
+    );
+    let Some(owner) = owner else {
+        return if op == 3
+            && unsafe { hosted_instance_pool_allocation_is_free_unlocked(inst, component_address) }
+                == Some(false)
+            && unsafe { hosted_instance_pool_free_unlocked(inst, component_address) }
+        {
+            (STATUS_SUCCESS, 0, 0)
+        } else {
+            (STATUS_INVALID_HANDLE, 0, 0)
+        };
+    };
+    if allocation_unlocked(instance_index, inst, component_address, owner.bytes, owner.stack_count)
+        != Some(owner)
+    {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    }
+    match ledger().prepare_driver_free(instance_index, domain, component_address) {
+        Ok(SourceIrpRetirement::Retired(ticket)) => {
+            if !unsafe { hosted_instance_pool_free_unlocked(inst, component_address) } {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            }
+            if ledger().retire(ticket, owner).is_err() {
+                unsafe {
+                    crate::provider_bugcheck::report(
+                        0xc4,
+                        [FSD_SERVICE_SOURCE_IRP_LABEL, op, component_address, ticket.id.get()],
+                    );
+                }
+            }
+            match auxiliary().retire(ticket, owner) {
+                Ok(_) | Err(SourceIrpAuxiliaryError::NotFound) => {}
+                Err(_) => unsafe {
+                    crate::provider_bugcheck::report(
+                        0xc4,
+                        [FSD_SERVICE_SOURCE_IRP_LABEL, 6, component_address, ticket.id.get()],
+                    );
+                },
+            }
+            (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get())
+        }
+        Ok(SourceIrpRetirement::Deferred(ticket)) => (
+            nt_status::NtStatus::PENDING.raw(),
+            ticket.id.get(),
+            ticket.generation.get(),
+        ),
+        Err(SourceIrpLedgerError::Pinned) => (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0),
+        Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
+    }
+}
+
 pub(super) fn service(
     ch: &crate::spawn_hosts::PumpChannel,
     op: u64,
@@ -732,91 +816,7 @@ pub(super) fn service(
             let Some(domain) = instance_domain_identity(inst) else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
-            let _guard = lock();
-            let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) })
-            else {
-                return (STATUS_INVALID_HANDLE, 0, 0);
-            };
-            if op == 3
-                && auxiliary().protected_pool_child(
-                    SourceIrpOwner::HostedDriver(instance_index),
-                    domain,
-                    component_address,
-                )
-            {
-                return (nt_status::NtStatus::PENDING.raw(), 0, 0);
-            }
-            let owner = ledger().allocation_for(
-                SourceIrpOwner::HostedDriver(instance_index),
-                domain,
-                component_address,
-            );
-            let Some(owner) = owner else {
-                return if op == 3
-                    && unsafe {
-                        hosted_instance_pool_allocation_is_free_unlocked(inst, component_address)
-                    } == Some(false)
-                    && unsafe { hosted_instance_pool_free_unlocked(inst, component_address) }
-                {
-                    (STATUS_SUCCESS, 0, 0)
-                } else {
-                    (STATUS_INVALID_HANDLE, 0, 0)
-                };
-            };
-            if allocation_unlocked(
-                instance_index,
-                inst,
-                component_address,
-                owner.bytes,
-                owner.stack_count,
-            ) != Some(owner)
-            {
-                return (STATUS_INVALID_HANDLE, 0, 0);
-            }
-            match ledger().prepare_driver_free(instance_index, domain, component_address) {
-                Ok(SourceIrpRetirement::Retired(ticket)) => {
-                    if !unsafe { hosted_instance_pool_free_unlocked(inst, component_address) } {
-                        return (STATUS_INVALID_HANDLE, 0, 0);
-                    }
-                    if ledger().retire(ticket, owner).is_err() {
-                        unsafe {
-                            crate::provider_bugcheck::report(
-                                0xc4,
-                                [
-                                    FSD_SERVICE_SOURCE_IRP_LABEL,
-                                    op,
-                                    component_address,
-                                    ticket.id.get(),
-                                ],
-                            );
-                        }
-                    }
-                    match auxiliary().retire(ticket, owner) {
-                        Ok(_) | Err(SourceIrpAuxiliaryError::NotFound) => {}
-                        Err(_) => unsafe {
-                            crate::provider_bugcheck::report(
-                                0xc4,
-                                [
-                                    FSD_SERVICE_SOURCE_IRP_LABEL,
-                                    6,
-                                    component_address,
-                                    ticket.id.get(),
-                                ],
-                            );
-                        },
-                    }
-                    (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get())
-                }
-                Ok(SourceIrpRetirement::Deferred(ticket)) => (
-                    nt_status::NtStatus::PENDING.raw(),
-                    ticket.id.get(),
-                    ticket.generation.get(),
-                ),
-                Err(SourceIrpLedgerError::Pinned) => {
-                    (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0)
-                }
-                Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
-            }
+            retire_allocation(instance_index, inst, domain, op, component_address)
         }
         6 => {
             let node = component_address;

@@ -1050,6 +1050,41 @@ impl HostedIrqRootSession {
         service_result(status, None)
     }
 
+    unsafe fn pool_retirement_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let Ok(lane) = self.lane(lane_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let root_dpc_grant = self
+            .dpc_grant
+            .is_some_and(|(identity, grant)| identity == lane.identity && grant == command.grant);
+        if !root_dpc_grant && !lane_has_service_grant(lane, command.grant) {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let Ok(current_irql) = lane.arena().control.current_irql(lane.identity) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let Some((operation, address)) = command.pool_retirement_arguments(
+            lane.identity,
+            command.grant,
+            FSD_SERVICE_SOURCE_IRP_LABEL,
+            current_irql,
+        ) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let status = service_hosted_irq_lane_pool_retirement(
+            lane.projection_instance,
+            lane.identity.domain_id,
+            lane.identity.domain_cookie,
+            operation,
+            address,
+        );
+        service_result(status, None)
+    }
+
     unsafe fn execute_service(
         &mut self,
         lane_index: usize,
@@ -1066,6 +1101,9 @@ impl HostedIrqRootSession {
             }
             nt_hosted_runtime::HostedIrqServiceKind::Mdl => {
                 self.mdl_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::PoolRetirement => {
+                self.pool_retirement_service(lane_index, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::ProviderImport => {
                 self.provider_import_service(lane_index, service, command)

@@ -19,6 +19,13 @@ blocks; they cannot adopt root-owned storage. Root projection retirement retains
 its canonical object and wait preflights before exact shared-pool retirement,
 without reading a component's private-heap catalog.
 
+IRQ/DPC calls to `ExFreePool` and `IoFreeIrp` use a distinct, non-nesting
+retirement service in the retained IRQ arena, not the ordinary component request
+bank. The broker validates the exact lane, domain, grant and actual arena IRQL
+(at most DISPATCH_LEVEL) before entering the shared allocation retirement engine.
+The current hosted pool is nonpaged. A `STATUS_PENDING` result retains the
+allocation; acknowledging the arena service does not complete or retire its IRP.
+
 For a pending operation, the origin records the returned token before sending an
 authenticated pending-armed receipt. Completion delivery waits for that receipt.
 Inline and pending delivery are distinct immutable terminal packet properties.

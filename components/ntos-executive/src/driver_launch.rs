@@ -23,6 +23,8 @@
 #[path = "hosted_irq_broker.rs"]
 #[allow(dead_code)]// Activated only by the atomic ISR/DPC/provider cutover tracked in the plan.
 mod hosted_irq_broker;
+#[path = "hosted_source_retirement.rs"]
+mod hosted_source_retirement;
 
 #[path = "hosted_wmi.rs"]
 mod hosted_wmi;
@@ -6559,12 +6561,10 @@ extern "win64" fn s_ex_free_pool(p: u64) {
     if p == 0 {
         return;
     }
-    let (label, status, _, _, _) = unsafe {
-        call_on4((FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4, 3, p, 0, 0)
-    };
-    if label != 0 || (status as u32 as i32 != STATUS_SUCCESS && status as u32 != STATUS_PENDING) {
+    let status = unsafe { hosted_source_retirement::retire(3, p) };
+    if status != STATUS_SUCCESS && status as u32 != STATUS_PENDING {
         unsafe {
-            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 3, p, status]);
+            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 3, p, status as u32 as u64]);
         }
     }
 }
@@ -8200,20 +8200,14 @@ extern "win64" fn s_io_free_irp(irp: u64) {
         return;
     }
     unsafe {
-        let (label, status, _, _, _) = call_on4(
-            (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
-            2,
-            irp,
-            0,
-            0,
-        );
-        if label == 0 && status as u32 == STATUS_PENDING {
+        let status = hosted_source_retirement::retire(2, irp);
+        if status as u32 == STATUS_PENDING {
             // An explicitly armed cross-domain forward still owns this source allocation.
             // Its caller frees it after the local completion callback and exact terminal ACK.
             return;
         }
-        if label != 0 || status as u32 as i32 != STATUS_SUCCESS {
-            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 2, irp, status]);
+        if status != STATUS_SUCCESS {
+            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 2, irp, status as u32 as u64]);
         }
     }
 }
@@ -56142,6 +56136,34 @@ pub(crate) fn service_hosted_driver_mdl(
             length,
         )
     }
+}
+
+/// The IRQ arena broker supplies an authenticated lane domain, not a logical thread caller.
+pub(crate) unsafe fn service_hosted_irq_lane_pool_retirement(
+    instance_index: usize,
+    caller_domain_id: u64,
+    caller_domain_cookie: u64,
+    operation: u64,
+    address: u64,
+) -> i32 {
+    if caller_domain_id == 0 || caller_domain_cookie == 0 {
+        return STATUS_ACCESS_DENIED;
+    }
+    if !matches!(operation, 2 | 3) || address == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId(caller_domain_id),
+        cookie: caller_domain_cookie,
+    };
+    let Some(inst) = driver_instances()
+        .and_then(|instances| instances.get(instance_index))
+        .copied()
+        .filter(|inst| inst.used && instance_domain_identity(*inst) == Some(domain))
+    else {
+        return STATUS_INVALID_HANDLE;
+    };
+    hosted_source_irp_ledger::retire_allocation(instance_index, inst, domain, operation, address).0
 }
 
 pub(crate) unsafe fn service_hosted_irq_lane_mdl(
