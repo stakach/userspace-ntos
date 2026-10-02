@@ -79,3 +79,43 @@ fn deletion_and_slot_reuse_do_not_inherit_a_previous_object_state() {
     assert_eq!(io.report_device_power_state(new, DevicePowerState::D1),
         Ok(DevicePowerState::Unspecified));
 }
+
+#[test]
+fn producer_and_upper_stack_projections_share_only_the_exact_pdo_state() {
+    let (mut io, driver) = fixture();
+    let pdo = device(&mut io, driver);
+    let fdo = device(&mut io, driver);
+    io.attach_device_to_stack(fdo, pdo).unwrap();
+    let producer = io.register_hosted_domain();
+    let upper = io.register_hosted_domain();
+    io.bind_hosted_device_pointer(producer, 0x1000, pdo).unwrap();
+    io.bind_hosted_device_pointer(upper, 0x2000, pdo).unwrap();
+    io.bind_hosted_device_pointer(upper, 0x3000, fdo).unwrap();
+    assert_eq!(io.hosted_power_report_target(producer, 0x1000), Ok(pdo));
+    assert_eq!(io.hosted_power_report_target(upper, 0x2000), Ok(pdo));
+    let target = io.hosted_power_report_target(producer, 0x1000).unwrap();
+    assert_eq!(io.report_device_power_state(target, DevicePowerState::D0),
+        Ok(DevicePowerState::Unspecified));
+    let target = io.hosted_power_report_target(upper, 0x2000).unwrap();
+    assert_eq!(io.report_device_power_state(target, DevicePowerState::D3), Ok(DevicePowerState::D0));
+    assert_eq!(io.device_power_state(fdo), Ok(DevicePowerState::Unspecified));
+}
+
+#[test]
+fn power_projection_requires_a_live_exact_registration_and_device() {
+    let (mut io, driver) = fixture();
+    let object = device(&mut io, driver);
+    let domain = io.register_hosted_domain();
+    io.bind_hosted_device_identity(domain, 0x1000, object).unwrap();
+    assert_eq!(io.hosted_power_report_target(domain, 0x1000), Err(NtStatus::ACCESS_DENIED));
+    let registration = io.register_hosted_device_pointer(domain, 0x1000).unwrap();
+    assert_eq!(io.hosted_power_report_target(domain, 0x1000), Ok(object));
+    let stale = nt_io_manager::HostedDomainIdentity { cookie: domain.cookie + 1, ..domain };
+    assert_eq!(io.hosted_power_report_target(stale, 0x1000), Err(NtStatus::ACCESS_DENIED));
+    assert_eq!(io.hosted_power_report_target(domain, 0x2000), Err(NtStatus::ACCESS_DENIED));
+    io.device_mut(object).unwrap().delete_pending = true;
+    assert_eq!(io.hosted_power_report_target(domain, 0x1000), Err(NtStatus::DELETE_PENDING));
+    io.device_mut(object).unwrap().delete_pending = false;
+    io.unregister_hosted_device_pointer(registration).unwrap();
+    assert_eq!(io.hosted_power_report_target(domain, 0x1000), Err(NtStatus::ACCESS_DENIED));
+}

@@ -61,7 +61,7 @@ fn root_device_service_admits_the_power_report_operation() {
 fn root_power_report_resolves_exact_device_and_lifecycle_authority() {
     let file = source("hosted_power_broker.rs");
     let target = paths(function(&file, "resolve_report_target"));
-    for required in ["authenticated_hosted_device", "hosted_device_binding_by_device_id",
+    for required in ["authenticated_hosted_device", "hosted_power_report_target",
         "power_report_target"] {
         assert!(target.0.iter().any(|name| name == required),
             "power target resolution must preserve {required} authority");
@@ -70,6 +70,10 @@ fn root_power_report_resolves_exact_device_and_lifecycle_authority() {
         "AddDevice power authority belongs to the retained owner, not ambient globals");
     assert!(!target.0.iter().any(|name| name == "current_hosted_device_dispatch_binding"),
         "committed device reports must not require an active IRP");
+    for forbidden in ["hosted_device_binding_by_device_id", "hosted_device_binding_by_pdo_object"] {
+        assert!(!target.0.iter().any(|name| name == forbidden),
+            "stack routing must not revoke the producer's anchored pointer authority: {forbidden}");
+    }
     let service = paths(function(&file, "service_report"));
     for required in ["resolve_report_target", "report_device_power_state", "report_system_power_state"] {
         assert!(service.0.iter().any(|name| name == required),
