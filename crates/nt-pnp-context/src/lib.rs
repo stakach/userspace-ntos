@@ -8,6 +8,8 @@
 
 extern crate alloc;
 
+pub mod resource_mapping;
+
 use alloc::vec::Vec;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};

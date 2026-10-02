@@ -39,6 +39,10 @@ mod hosted_thread_resources;
 mod hosted_primary_retirement;
 #[path = "hosted_pretransport_retirement.rs"]
 mod hosted_pretransport_retirement;
+#[path = "hosted_resource_mapping.rs"]
+mod hosted_resource_mapping;
+#[path = "hosted_component_mmio_fault.rs"]
+pub(crate) mod hosted_component_mmio_fault;
 #[path = "hosted_exception_images.rs"]
 mod hosted_exception_images;
 #[path = "hosted_zw_load_driver.rs"]
@@ -38566,17 +38570,6 @@ struct HostedPagingMapping {
 
 static mut HOSTED_PAGING_MAPPINGS: Option<Vec<HostedPagingMapping>> = None;
 
-#[derive(Clone, Copy)]
-struct HostedResourceMapCap {
-    instance: usize,
-    domain: HostedDomainIdentity,
-    device_id: u64,
-    pnp_context_lease: nt_pnp_context::ContextLeaseIdentity,
-    cap: u64,
-}
-
-static mut HOSTED_RESOURCE_MAP_CAPS: Option<Vec<HostedResourceMapCap>> = None;
-
 unsafe fn hosted_paging_mappings_mut() -> &'static mut Vec<HostedPagingMapping> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PAGING_MAPPINGS);
     if slot.is_none() {
@@ -38700,38 +38693,8 @@ unsafe fn clear_hosted_paging_for_domain(domain: HostedDomainIdentity, pml4: u64
     failures
 }
 
-unsafe fn hosted_resource_map_caps_mut() -> &'static mut Vec<HostedResourceMapCap> {
-    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_RESOURCE_MAP_CAPS);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    slot.as_mut().unwrap()
-}
-
 unsafe fn reserve_hosted_resource_map_caps(additional: usize) -> Result<(), nt_status::NtStatus> {
-    let caps = hosted_resource_map_caps_mut();
-    caps.try_reserve_exact(additional)
-        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    Ok(())
-}
-
-unsafe fn record_hosted_resource_map_cap(
-    instance: usize,
-    domain: HostedDomainIdentity,
-    device_id: u64,
-    pnp_context_lease: nt_pnp_context::ContextLeaseIdentity,
-    cap: u64,
-) {
-    if cap == 0 {
-        return;
-    }
-    hosted_resource_map_caps_mut().push(HostedResourceMapCap {
-        instance,
-        domain,
-        device_id,
-        pnp_context_lease,
-        cap,
-    });
+    hosted_resource_mapping::reserve(additional)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -38746,60 +38709,8 @@ unsafe fn map_hosted_resource_frame_run(
     pages: u64,
     rights: u64,
 ) -> Result<(), nt_status::NtStatus> {
-    let bytes = pages
-        .checked_mul(0x1000)
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    if component_va == 0
-        || component_va & 0xFFF != 0
-        || component_va.checked_add(bytes).is_none()
-        || frame_base == 0
-        || pages == 0
-        || frame_base.checked_add(pages - 1).is_none()
-    {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
-    for window in 0..pages.div_ceil(512).max(1) {
-        let page = component_va
-            .checked_add(
-                window
-                    .checked_mul(HOSTED_PAGING_PT_SPAN)
-                    .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?,
-            )
-            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-        if !ensure_paging(page, inst.pml4, domain) {
-            return Err(nt_status::NtStatus::UNSUCCESSFUL);
-        }
-    }
-    let mut page = 0u64;
-    while page < pages {
-        let source_cap = frame_base
-            .checked_add(page)
-            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-        let map_va = component_va
-            .checked_add(
-                page.checked_mul(0x1000)
-                    .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?,
-            )
-            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-        let (map_cap, copy_error) = copy_cap_r(source_cap);
-        if copy_error != 0 {
-            return Err(nt_status::NtStatus::UNSUCCESSFUL);
-        }
-        let error = page_map_r(map_cap, map_va, rights, inst.pml4);
-        if error != 0 {
-            let _ = cnode_delete_recycle_r(map_cap);
-            return Err(nt_status::NtStatus::UNSUCCESSFUL);
-        }
-        record_hosted_resource_map_cap(
-            instance_index,
-            domain,
-            device_id,
-            pnp_context_lease,
-            map_cap,
-        );
-        page += 1;
-    }
-    Ok(())
+    hosted_resource_mapping::map_run(instance_index, inst, domain, device_id,
+        pnp_context_lease, component_va, frame_base, pages, rights)
 }
 
 unsafe fn clear_hosted_resource_map_caps(
@@ -38808,27 +38719,7 @@ unsafe fn clear_hosted_resource_map_caps(
     device_id: Option<u64>,
     pnp_context_lease: Option<nt_pnp_context::ContextLeaseIdentity>,
 ) -> u64 {
-    let Some(caps) = (*core::ptr::addr_of_mut!(HOSTED_RESOURCE_MAP_CAPS)).as_mut() else {
-        return 0;
-    };
-    let mut failures = 0u64;
-    let mut index = caps.len();
-    while index != 0 {
-        index -= 1;
-        let owned = caps[index].instance == instance
-            && caps[index].domain == domain
-            && device_id.is_none_or(|device_id| caps[index].device_id == device_id);
-        if owned && pnp_context_lease.is_some_and(|lease| caps[index].pnp_context_lease != lease) {
-            failures += 1;
-        } else if owned {
-            if caps[index].cap != 0 && cnode_delete_recycle_r(caps[index].cap) != 0 {
-                failures += 1;
-            } else {
-                caps.remove(index);
-            }
-        }
-    }
-    failures
+    hosted_resource_mapping::clear(instance, domain, device_id, pnp_context_lease)
 }
 
 unsafe fn clear_hosted_resource_map_caps_for_instance(
@@ -54530,12 +54421,11 @@ unsafe fn hosted_driver_device_lifetime_quiesced(
                 .iter()
                 .all(|registration| !registration.used || registration.owner_domain != domain)
         });
-    let resource_maps_quiesced = (*core::ptr::addr_of!(HOSTED_RESOURCE_MAP_CAPS))
-        .as_ref()
-        .is_none_or(|caps| {
-            caps.iter()
-                .all(|cap| cap.instance != instance && cap.domain != domain)
-        });
+    let resource_maps_quiesced = hosted_resource_mapping::table().iter().all(|row| {
+        row.key().domain != (nt_pnp_context::resource_mapping::MappingDomain {
+            id: domain.domain_id.raw(), cookie: domain.cookie,
+        }) && row.owners().all(|(_, owner)| owner.instance != instance)
+    });
     let property_transfers_quiesced = (*core::ptr::addr_of!(HOSTED_DEVICE_PROPERTY_TRANSFERS))
         .as_ref()
         .is_none_or(|transfers| !transfers.domain_busy(domain));
@@ -55513,6 +55403,20 @@ fn instance_by_shared_va(shared_va: u64) -> Option<(usize, DriverInstance)> {
     t.iter().copied().enumerate().find(|(_, entry)| {
         entry.used && entry.exec_shared_va != 0 && entry.exec_shared_va == shared_va
     })
+}
+
+fn physical_instance_for_pump_channel(
+    ch: &crate::spawn_hosts::PumpChannel,
+) -> Option<(usize, DriverInstance)> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let route = unsafe { runtime::channel_route(ch).ok()?? };
+    let source = unsafe { runtime::physical_source(route).ok()? };
+    if source.tcb != ch.tcb || source.pml4 != ch.pml4
+        || source.domain != runtime::PhysicalDomain::Hosted(ch.physical_domain?) {
+        return None;
+    }
+    let reply = unsafe { runtime::current_reply(route).ok()? };
+    instance_for_pump_channel(ch, reply)
 }
 
 fn instance_for_pump_channel(
@@ -59996,63 +59900,13 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             dma_frame_base,
             dma_pages,
         );
-        for window in 0..grant.map_pages.div_ceil(512).max(1) {
-            if !ensure_paging(
-                (grant.component_va & !0xFFF) + window * 0x20_0000,
-                inst.pml4,
-                paging_domain,
-            ) {
-                rollback_staged_hosted_resource_grant(
-                    binding,
-                    instance_index,
-                    inst,
-                    &mut issued_port_caps,
-                );
-                return Err(nt_status::NtStatus::UNSUCCESSFUL);
-            }
-        }
-        let mut page = 0u64;
-        while page < grant.map_pages {
-            let Some(source_cap) = grant.frame_base.checked_add(page) else {
-                rollback_staged_hosted_resource_grant(
-                    binding,
-                    instance_index,
-                    inst,
-                    &mut issued_port_caps,
-                );
-                return Err(nt_status::NtStatus::INVALID_PARAMETER);
-            };
-            let (map_cap, copy_error) = copy_cap_r(source_cap);
-            if copy_error != 0 {
-                rollback_staged_hosted_resource_grant(
-                    binding,
-                    instance_index,
-                    inst,
-                    &mut issued_port_caps,
-                );
-                return Err(nt_status::NtStatus::UNSUCCESSFUL);
-            }
-            let map_va = (grant.component_va & !0xFFF) + page * 0x1000;
-            let rights = if grant.writable { RW_NX } else { RO_NX };
-            let error = page_map_r(map_cap, map_va, rights, inst.pml4);
-            if error != 0 {
-                let _ = cnode_delete_recycle_r(map_cap);
-                rollback_staged_hosted_resource_grant(
-                    binding,
-                    instance_index,
-                    inst,
-                    &mut issued_port_caps,
-                );
-                return Err(nt_status::NtStatus::UNSUCCESSFUL);
-            }
-            record_hosted_resource_map_cap(
-                instance_index,
-                paging_domain,
-                device_id,
-                pnp_context_lease,
-                map_cap,
-            );
-            page += 1;
+        if let Err(status) = map_hosted_resource_frame_run(
+            instance_index, inst, paging_domain, device_id, pnp_context_lease,
+            grant.component_va & !0xfff, grant.frame_base, grant.map_pages,
+            if grant.writable { RW_NX } else { RO_NX },
+        ) {
+            rollback_staged_hosted_resource_grant(binding, instance_index, inst, &mut issued_port_caps);
+            return Err(status);
         }
         resources.push(SharedAddressResource {
             kind: SH_RESOURCE_ADDRESS_KIND_MEMORY,

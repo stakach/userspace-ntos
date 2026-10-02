@@ -12,6 +12,10 @@ const HOSTED_RESOURCE_COMPONENT_VA_LIMIT: u64 = crate::allocator::HEAP_BASE as u
 const _: () = assert!(HOSTED_RESOURCE_COMPONENT_VA_BASE & 0x1F_FFFF == 0);
 const _: () = assert!(HOSTED_RESOURCE_COMPONENT_VA_BASE < HOSTED_RESOURCE_COMPONENT_VA_LIMIT);
 
+pub(crate) fn is_component_resource_address(address: u64) -> bool {
+    (HOSTED_RESOURCE_COMPONENT_VA_BASE..HOSTED_RESOURCE_COMPONENT_VA_LIMIT).contains(&address)
+}
+
 #[derive(Clone)]
 pub(crate) struct HostedPnpPciMemoryDescriptor {
     pub(crate) bar_index: u8,
@@ -650,6 +654,56 @@ pub(crate) unsafe fn hosted_pnp_context_lease_is_live(lease: ContextLeaseIdentit
         .registry
         .description_by_identity(lease)
         .is_ok()
+}
+
+/// Resolve a mapping page from the exact retained context, not a shared projection bank.
+/// DMA source frames are context-owned RAM; their physical addresses are attested natively.
+pub(crate) unsafe fn hosted_pnp_mapping_frame(
+    lease: ContextLeaseIdentity,
+    source_cap: u64,
+    virtual_page: u64,
+) -> Result<Option<u64>, nt_status::NtStatus> {
+    let (owned_cap, physical) = hosted_pnp_mapping_page(lease, virtual_page)?;
+    if owned_cap != source_cap {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    Ok(physical)
+}
+
+pub(crate) unsafe fn hosted_pnp_mapping_page(
+    lease: ContextLeaseIdentity,
+    virtual_page: u64,
+) -> Result<(u64, Option<u64>), nt_status::NtStatus> {
+    let description = hosted_pnp_context_authority_mut().registry
+        .description_by_identity(lease)
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let page = |base: u64, pages: u64, va: u64| -> Option<(u64, u64)> {
+        let offset = virtual_page.checked_sub(va & !0xfff)?;
+        if offset & 0xfff != 0 || offset / 0x1000 >= pages {
+            return None;
+        }
+        Some((base.checked_add(offset / 0x1000)?, offset))
+    };
+    for window in &description.pci_windows {
+        for resource in &window.memory {
+            if let Some((cap, offset)) = page(resource.frame_base, resource.map_pages, resource.va) {
+                return (resource.phys & !0xfff).checked_add(offset).map(|physical| (cap, Some(physical)))
+                    .ok_or(nt_status::NtStatus::INVALID_PARAMETER);
+            }
+        }
+        if let Some((cap, _)) = page(window.dma_frame_base, window.dma_pages, window.dma_va) {
+            return Ok((cap, None));
+        }
+    }
+    for window in &description.platform_windows {
+        for resource in &window.memory {
+            if let Some((cap, offset)) = page(resource.frame_base, resource.pages, resource.va) {
+                return (resource.phys & !0xfff).checked_add(offset).map(|physical| (cap, Some(physical)))
+                    .ok_or(nt_status::NtStatus::INVALID_PARAMETER);
+            }
+        }
+    }
+    Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
 }
 
 pub(crate) unsafe fn hosted_pnp_pci_window_by_lease(

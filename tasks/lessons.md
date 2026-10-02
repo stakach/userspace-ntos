@@ -400,6 +400,10 @@ diagnosis-free failure.
   retirement before replacement, or remap the original retained capability.
 - Cache membership and a mapping catalog are not physical page residency. A failed PageMap
   cannot become success merely because those records exist.
+- Equivalent projections in one VSpace must share one retained physical leaf with distinct
+  exact owners. Rollback releases only its owner; the last owner deletes the mapped cap after
+  acknowledgement. Repair through a surviving context must use that retained cap, not a retired
+  source alias. Resource-window faults must never fall through to anonymous RAM backing.
 
 ## Loader Entry Uses Process-Owned Identity
 - Reserved startup arguments cannot select the executable or permit skipped initialization.

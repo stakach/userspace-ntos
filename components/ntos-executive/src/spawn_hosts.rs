@@ -3848,6 +3848,9 @@ pub(crate) unsafe fn pump_service_vm_fault(
     faults: u64,
     demand: u64,
 ) -> bool {
+    if let Some(mapped) = crate::driver_launch::hosted_component_mmio_fault::service_fault(ch, addr, fsr) {
+        return mapped;
+    }
     if let Some(mapped) = crate::component_heap::service_fault(ch, addr, fsr) { return mapped; }
     if crate::win32k_subsystem::is_reserved_win32k_video_aperture(addr) { return false; }
     // Ps storage is never generic demand-zero memory or an attached-client mapping. The
