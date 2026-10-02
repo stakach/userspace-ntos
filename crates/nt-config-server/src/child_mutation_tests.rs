@@ -11,6 +11,17 @@ fn volatile_server() -> CmServer {
     let select = hive.create_key("Select");
     hive.set_dword(select, "Current", 1);
     hive.create_key(r"ControlSet001\Services");
+    let system = nt_security::AccessToken::system();
+    let descriptor = nt_security::assign_registry_root_security(
+        &nt_security::CapturedSubjectTokens {
+            primary: &system, client: None, process_audit_id: 0,
+        },
+        &mut nt_security::SecurityAssignmentAudit::default(),
+    ).unwrap();
+    for path in ["", "Select", "ControlSet001", r"ControlSet001\Services"] {
+        let key = if path.is_empty() { hive.root() } else { hive.open_key(path).unwrap() };
+        assert!(hive.set_key_security_descriptor(key, &descriptor));
+    }
     let current_control_set = hive.current_control_set().unwrap();
     let hardware_profile =
         nt_hive_core::HardwareProfileAlias::capture(&hive, &current_control_set).unwrap();
@@ -54,6 +65,7 @@ fn volatile_child_leases_and_absolute_aliases_share_one_namespace() {
     assert!(server
         .prepare_system_hive_mutations(&mutations)
         .unwrap()
+        .durable_journal
         .is_empty());
     server.commit_system_hive_mutations(&mutations, 2).unwrap();
     let mounted = server.system_hive.as_ref().unwrap();
@@ -90,8 +102,8 @@ fn volatile_child_leases_and_absolute_aliases_share_one_namespace() {
             data: 2u32.to_le_bytes().to_vec(),
         },
     ];
-    server.prepare_system_hive_mutations(&selector).unwrap();
-    server.commit_system_hive_mutations(&selector, 3).unwrap();
+    let prepared = server.prepare_system_hive_mutations(&selector).unwrap();
+    server.commit_system_hive_mutations(&prepared.mutations, 3).unwrap();
     let mut later = vec![child("Anchored")];
     server
         .system_hive
@@ -102,6 +114,7 @@ fn volatile_child_leases_and_absolute_aliases_share_one_namespace() {
     assert!(server
         .prepare_system_hive_mutations(&later)
         .unwrap()
+        .durable_journal
         .is_empty());
     server.commit_system_hive_mutations(&later, 4).unwrap();
     let mounted = server.system_hive.as_ref().unwrap();
@@ -150,8 +163,8 @@ fn volatile_only_and_mixed_preparations_keep_durable_sequence_and_replay_exact()
             data: vec![1, 2, 3],
         },
     ];
-    let journal = server.prepare_system_hive_mutations(&volatile).unwrap();
-    assert!(journal.is_empty());
+    let prepared = server.prepare_system_hive_mutations(&volatile).unwrap();
+    assert!(prepared.durable_journal.is_empty());
     assert_eq!(
         nt_hive_core::encode_image(&server.system_hive.as_ref().unwrap().hive),
         before
@@ -162,8 +175,8 @@ fn volatile_only_and_mixed_preparations_keep_durable_sequence_and_replay_exact()
         expected_generation: 1,
         next_generation: 2,
         semantic_journal_len: 100,
-        mutations: volatile,
-        durable_journal: journal,
+        mutations: prepared.mutations,
+        durable_journal: prepared.durable_journal,
     });
     assert_eq!(
         server
@@ -212,18 +225,19 @@ fn volatile_only_and_mixed_preparations_keep_durable_sequence_and_replay_exact()
             path: alloc::format!("{}\\Transient", parent),
         },
     ];
-    let journal = server.prepare_system_hive_mutations(&mixed).unwrap();
+    let prepared = server.prepare_system_hive_mutations(&mixed).unwrap();
+    let journal = &prepared.durable_journal;
     assert!(!journal.is_empty());
     let mut replay = nt_hive_core::decode_image(&before).unwrap();
     assert_eq!(
-        nt_hive_core::try_replay_log(&mut replay, &journal, original_sequence).unwrap(),
+        nt_hive_core::try_replay_log(&mut replay, journal, original_sequence).unwrap(),
         original_sequence + 1
     );
     assert!(replay.open_key(r"ControlSet001\Services\Durable").is_some());
     assert!(replay
         .open_key(r"ControlSet001\Services\Transient")
         .is_none());
-    server.commit_system_hive_mutations(&mixed, 3).unwrap();
+    server.commit_system_hive_mutations(&prepared.mutations, 3).unwrap();
     let live = &server.system_hive.as_ref().unwrap().hive;
     assert_eq!(live.sequence, original_sequence + 1);
     assert!(live.open_key(r"ControlSet001\Services\Transient").is_none());

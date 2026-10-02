@@ -1,4 +1,4 @@
-use super::test_support::{ack, exchange, prepare, server};
+use super::test_support::{ack, exchange, prepare, secured_server as server};
 use super::*;
 use nt_config_abi::{hive_mutation_kind, CmHiveMutationRecord};
 

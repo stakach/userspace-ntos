@@ -176,10 +176,11 @@ impl CmServer {
                 let Some(next_generation) = current_generation.checked_add(1) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
                 };
-                let durable_journal = match self.prepare_system_hive_mutations(&mutations) {
-                    Ok(journal) => journal,
+                let prepared = match self.prepare_system_hive_mutations(&mutations) {
+                    Ok(prepared) => prepared,
                     Err(status) => return reply(status, current_generation),
                 };
+                let PreparedSystemHiveMutations { mutations, durable_journal } = prepared;
                 let Ok(durable_len) = u32::try_from(durable_journal.len()) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
                 };

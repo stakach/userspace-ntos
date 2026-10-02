@@ -2,6 +2,182 @@ use super::test_support::*;
 use super::*;
 
 #[test]
+fn live_create_key_retains_inherited_security_for_every_new_intermediate() {
+    let mut server = server();
+    let system = nt_security::AccessToken::system();
+    let subject = nt_security::CapturedSubjectTokens {
+        primary: &system,
+        client: None,
+        process_audit_id: 0,
+    };
+    let descriptor = nt_security::assign_registry_root_security(
+        &subject,
+        &mut nt_security::SecurityAssignmentAudit::default(),
+    ).unwrap();
+    {
+        let mounted = server.system_hive.as_mut().unwrap();
+        for path in ["", "Select", "ControlSet001", r"ControlSet001\Services"] {
+            let key = if path.is_empty() { mounted.hive.root() }
+                else { mounted.hive.open_key(path).unwrap() };
+            assert!(mounted.hive.set_key_security_descriptor(key, &descriptor));
+        }
+        server.cm = config_manager_from_system_hive(&mounted.hive, &mounted.current_control_set);
+    }
+    let mutations = alloc::vec![HiveMutation::CreateKey {
+        path: String::from(r"\Registry\Machine\System\CurrentControlSet\Services\Live\Nested\Leaf"),
+    }];
+    let mut replayed = nt_hive_core::decode_image(&nt_hive_core::encode_image(
+        &server.system_hive.as_ref().unwrap().hive,
+    )).unwrap();
+    let replay_start = replayed.sequence;
+    let prepared = server.prepare_system_hive_mutations(&mutations).unwrap();
+    let replay_journal = prepared.durable_journal.clone();
+    let token = server.identities.take().unwrap();
+    server.prepared_system_mutation = Some(PreparedSystemHiveMutation {
+        token,
+        expected_generation: 1,
+        next_generation: 2,
+        semantic_journal_len: 100,
+        mutations: prepared.mutations,
+        durable_journal: prepared.durable_journal,
+    });
+    let request = CmHiveMutationCommitRequest {
+        abi_size: core::mem::size_of::<CmHiveMutationCommitRequest>() as u16,
+        abi_version: CM_ABI_VERSION,
+        operation: operation::COMMIT,
+        mount: hive_mount::SYSTEM,
+        mutation_token: token,
+        expected_generation: 1,
+        semantic_journal_len: 100,
+        ..CmHiveMutationCommitRequest::default()
+    };
+    let receipt = exchange(&mut server, request).unwrap();
+    assert_eq!(receipt.next_generation, 2);
+    nt_hive_core::try_replay_log(&mut replayed, &replay_journal, replay_start).unwrap();
+    let hive = &server.system_hive.as_ref().unwrap().hive;
+    let parent = hive.open_key(r"ControlSet001\Services").unwrap();
+    assert_eq!(hive.key_security_descriptor(parent), Some(descriptor.as_slice()));
+    let replayed_parent = replayed.open_key(r"ControlSet001\Services").unwrap();
+    assert_eq!(replayed.key_security_descriptor(replayed_parent), Some(descriptor.as_slice()));
+    let mut expected = descriptor;
+    for path in [
+        r"ControlSet001\Services\Live",
+        r"ControlSet001\Services\Live\Nested",
+        r"ControlSet001\Services\Live\Nested\Leaf",
+    ] {
+        expected = nt_config_manager::inherit_generated_key_security(&expected).unwrap();
+        let key = hive.open_key(path).unwrap();
+        let actual = hive.key_security_descriptor(key).expect("live-created key security");
+        assert_eq!(actual, expected.as_slice(), "{path}");
+        let replayed_key = replayed.open_key(path).expect("replayed intermediate key");
+        assert_eq!(replayed.key_security_descriptor(replayed_key), Some(actual), "replay {path}");
+        let suffix = path.strip_prefix(r"ControlSet001\").unwrap();
+        let projection_path = alloc::format!(r"\Registry\Machine\System\CurrentControlSet\{suffix}");
+        let projection = server.cm.registry().open_key(&projection_path).expect("CM projected intermediate");
+        assert_eq!(server.cm.registry().key_security_descriptor(projection), Some(actual), "projection {path}");
+        assert!(nt_security::authorize_key_open(
+            &subject, actual, nt_security::KEY_GENERIC_MAPPING.generic_read,
+            nt_security::ProcessorMode::UserMode,
+        ).unwrap().granted(), "System must be able to open {path}");
+    }
+}
+
+#[test]
+fn live_create_key_rejects_missing_or_corrupt_parent_before_publication() {
+    for corrupt in [false, true] {
+        let mut server = server();
+        if corrupt {
+            let hive = &mut server.system_hive.as_mut().unwrap().hive;
+            let parent = hive.open_key(r"ControlSet001\Services").unwrap();
+            assert!(hive.set_key_security_descriptor(parent, &[1, 0, 4]));
+        }
+        let before = nt_hive_core::encode_image(&server.system_hive.as_ref().unwrap().hive);
+        let result = server.prepare_system_hive_mutations(&[HiveMutation::CreateKey {
+            path: String::from(r"\Registry\Machine\System\CurrentControlSet\Services\Live\Nested"),
+        }]);
+        assert!(result.is_err(), "corrupt={corrupt}: absent parent authority must not create keys");
+        assert_eq!(nt_hive_core::encode_image(&server.system_hive.as_ref().unwrap().hive), before);
+        assert_eq!(server.system_hive.as_ref().unwrap().generation, 1);
+        assert!(server.prepared_system_mutation.is_none());
+        assert!(!server.system_mutation_outcomes.is_pending());
+    }
+}
+
+#[test]
+fn live_create_key_inherits_staged_security_changes_in_batch_order() {
+    let mut server = server();
+    let security = |token: &nt_security::AccessToken| {
+        nt_security::assign_registry_root_security(
+            &nt_security::CapturedSubjectTokens {
+                primary: token, client: None, process_audit_id: 0,
+            },
+            &mut nt_security::SecurityAssignmentAudit::default(),
+        ).unwrap()
+    };
+    let initial = security(&nt_security::AccessToken::system());
+    let mut updated = security(&nt_security::AccessToken::admin(123));
+    let dacl = u32::from_le_bytes(updated[16..20].try_into().unwrap()) as usize;
+    updated[dacl + 12..dacl + 16]
+        .copy_from_slice(&nt_security::KEY_GENERIC_MAPPING.generic_read.to_le_bytes());
+    let explicit = security(&nt_security::AccessToken::admin(456));
+    {
+        let mounted = server.system_hive.as_mut().unwrap();
+        for path in ["", "Select", "ControlSet001", r"ControlSet001\Services"] {
+            let key = if path.is_empty() { mounted.hive.root() } else { mounted.hive.open_key(path).unwrap() };
+            assert!(mounted.hive.set_key_security_descriptor(key, &initial));
+        }
+        server.cm = config_manager_from_system_hive(&mounted.hive, &mounted.current_control_set);
+    }
+    let parent = r"\Registry\Machine\System\CurrentControlSet\Services";
+    let early_path = alloc::format!(r"{parent}\Early");
+    let mutations = alloc::vec![
+        HiveMutation::SetKeySecurity { path: parent.into(), descriptor: updated.clone() },
+        HiveMutation::CreateKey { path: alloc::format!(r"{early_path}\Nested") },
+        HiveMutation::SetKeySecurity { path: early_path, descriptor: explicit.clone() },
+        HiveMutation::CreateKey { path: alloc::format!(r"{parent}\Early\After") },
+    ];
+    let mut replayed = nt_hive_core::decode_image(&nt_hive_core::encode_image(
+        &server.system_hive.as_ref().unwrap().hive,
+    )).unwrap();
+    let replay_start = replayed.sequence;
+    let normalized = server.prepare_system_hive_mutations(&mutations).unwrap();
+    assert!(!normalized.mutations.iter().any(|mutation| matches!(mutation, HiveMutation::CreateKey { .. })));
+    let journal = normalized.durable_journal.clone();
+    let token = server.identities.take().unwrap();
+    server.prepared_system_mutation = Some(PreparedSystemHiveMutation {
+        token, expected_generation: 1, next_generation: 2, semantic_journal_len: 100,
+        mutations: normalized.mutations, durable_journal: normalized.durable_journal,
+    });
+    exchange(&mut server, CmHiveMutationCommitRequest {
+        abi_size: core::mem::size_of::<CmHiveMutationCommitRequest>() as u16,
+        abi_version: CM_ABI_VERSION,
+        operation: operation::COMMIT, mount: hive_mount::SYSTEM,
+        mutation_token: token, expected_generation: 1, semantic_journal_len: 100,
+        ..CmHiveMutationCommitRequest::default()
+    }).unwrap();
+    nt_hive_core::try_replay_log(&mut replayed, &journal, replay_start).unwrap();
+    let early_before_change = nt_config_manager::inherit_generated_key_security(&updated).unwrap();
+    let nested = nt_config_manager::inherit_generated_key_security(&early_before_change).unwrap();
+    let after = nt_config_manager::inherit_generated_key_security(&explicit).unwrap();
+    assert_ne!(nested, after, "the staged parent change must affect inherited ACEs");
+    for (suffix, expected) in [
+        ("Services", updated.as_slice()),
+        (r"Services\Early", explicit.as_slice()),
+        (r"Services\Early\Nested", nested.as_slice()),
+        (r"Services\Early\After", after.as_slice()),
+    ] {
+        let path = alloc::format!(r"ControlSet001\{suffix}");
+        let hive = &server.system_hive.as_ref().unwrap().hive;
+        assert_eq!(hive.key_security_descriptor(hive.open_key(&path).unwrap()), Some(expected), "live {path}");
+        assert_eq!(replayed.key_security_descriptor(replayed.open_key(&path).unwrap()), Some(expected), "replay {path}");
+        let projection = server.cm.registry().open_key(
+            &alloc::format!(r"\Registry\Machine\System\CurrentControlSet\{suffix}"),
+        ).unwrap();
+        assert_eq!(server.cm.registry().key_security_descriptor(projection), Some(expected), "projection {path}");
+    }
+}
+
+#[test]
 fn commit_replays_before_generation_check_and_old_ack_cannot_release_next_result() {
     let mut server = server();
     let request = prepare(&mut server, "First");
@@ -283,7 +459,7 @@ fn reconstructed_server_cannot_reuse_mutation_or_receipt_identity() {
 
 #[test]
 fn projection_failure_does_not_publish_device_action_and_exact_retry_can_commit() {
-    let mut server = server();
+    let mut server = secured_server();
     server.device_action_journal.seed(1, &[]).unwrap();
     let request = prepare(&mut server, "Unused");
     let instance = r"\Registry\Machine\System\ControlSet001\Enum\ROOT\DEVICE\0000";
@@ -311,9 +487,10 @@ fn projection_failure_does_not_publish_device_action_and_exact_retry_can_commit(
             instance_id: r"ROOT\DEVICE\0000".into()
         },
     ];
-    let durable = server.prepare_system_hive_mutations(&mutations).unwrap();
+    let normalized = server.prepare_system_hive_mutations(&mutations).unwrap();
+    let durable = normalized.durable_journal;
     let prepared = server.prepared_system_mutation.as_mut().unwrap();
-    prepared.mutations = mutations;
+    prepared.mutations = normalized.mutations;
     prepared.durable_journal = durable.clone();
     // Deliberately break only the semantic projection after successful PREPARE. The hive applies
     // successfully, so this catches an event published too early, not an earlier hive failure.

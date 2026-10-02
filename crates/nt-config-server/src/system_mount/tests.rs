@@ -41,6 +41,7 @@ fn image() -> Vec<u8> {
         RegistryValueType::Sz,
         nt_config_manager::encode_sz(r"\Device\MountIdentityTest"),
     );
+    crate::mutation_commit::test_support::secure_fixture_hive(&mut hive);
     hive.finish_clean_import();
     nt_hive_core::encode_image(&hive)
 }

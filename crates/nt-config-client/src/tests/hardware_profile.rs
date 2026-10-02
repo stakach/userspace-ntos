@@ -16,6 +16,7 @@ fn hive() -> Hive {
             hive.set_dword(key, "Identity", profile);
         }
     }
+    secure_fixture_hive(&mut hive);
     hive.finish_clean_import();
     hive
 }

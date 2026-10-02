@@ -255,6 +255,7 @@ dependencies = [
  "nt-config-abi",
  "nt-config-manager",
  "nt-hive-core",
+ "nt-security",
  "nt-status",
 ]
 

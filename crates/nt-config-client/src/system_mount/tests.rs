@@ -28,6 +28,7 @@ fn image() -> Vec<u8> {
     let select = hive.create_key("Select");
     hive.set_dword(select, "Current", 1);
     hive.create_key(r"ControlSet001\Services\Stable");
+    crate::tests::secure_fixture_hive(&mut hive);
     hive.finish_clean_import();
     encode_image(&hive)
 }

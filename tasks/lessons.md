@@ -359,3 +359,6 @@ diagnosis-free failure.
   never repair missing authority with an access-time default ACL or a fabricated readiness event.
 - Validate the imported bytes before choosing a security fix. A stack scan can label pointers into
   `.rdata` as callers; confirm executable sections and the actual call instruction first.
+- Audit setup composition and later live creation separately. Normalize path creation into exact
+  descriptor-bearing child operations during preparation, and retain those same operations for
+  journal replay, live commit, and projections; an in-memory fix alone is not durable security.

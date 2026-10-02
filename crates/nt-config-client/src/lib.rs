@@ -3917,6 +3917,32 @@ impl<B: Backend> ConfigClient<B> {
 
 #[cfg(test)]
 mod tests {
+    pub(crate) fn secure_fixture_hive(hive: &mut nt_hive_core::Hive) {
+        let system = nt_security::AccessToken::system();
+        let descriptor = nt_security::assign_registry_root_security(
+            &nt_security::CapturedSubjectTokens {
+                primary: &system, client: None, process_audit_id: 0,
+            },
+            &mut nt_security::SecurityAssignmentAudit::default(),
+        ).unwrap();
+        if hive.key_security_descriptor(hive.root()).is_none() {
+            assert!(hive.set_key_security_descriptor(hive.root(), &descriptor));
+        }
+        let mut pending = alloc::vec![hive.root()];
+        while let Some(parent) = pending.pop() {
+            for name in hive.enum_subkeys(parent) {
+                let child = hive.open_subkey(parent, &name).unwrap();
+                if hive.key_security_descriptor(child).is_none() {
+                    let descriptor = nt_config_manager::inherit_generated_key_security(
+                        hive.key_security_descriptor(parent).expect("secured fixture parent"),
+                    ).unwrap();
+                    assert!(hive.set_key_security_descriptor(child, &descriptor));
+                }
+                pending.push(child);
+            }
+        }
+    }
+
     mod runtime_security;
     mod hardware_profile;
     mod key_creation;
@@ -4296,6 +4322,7 @@ mod tests {
         hive.create_subkey(existing, "Child");
         let obsolete = hive.create_key(r"ControlSet001\Services\Obsolete");
         hive.set_dword(obsolete, "Value", 1);
+        secure_fixture_hive(&mut hive);
         hive.finish_clean_import();
         let mut replayed = hive.clone();
 
@@ -5137,6 +5164,7 @@ mod tests {
         let select = hive.create_key("Select");
         hive.set_dword(select, "Current", 1);
         hive.create_key("ControlSet001");
+        secure_fixture_hive(&mut hive);
         hive.finish_clean_import();
 
         let mut client = ConfigClient::new(Framed {
