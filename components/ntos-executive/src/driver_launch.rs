@@ -166,6 +166,8 @@ mod hosted_kernel_win32k_source_ioctl;
 mod hosted_source_terminal_packet;
 #[path = "hosted_video_caller_aperture.rs"]
 mod hosted_video_caller_aperture;
+#[path = "hosted_video_memory_mapping.rs"]
+mod hosted_video_memory_mapping;
 #[path = "hosted_kernel_win32k_source_pnp.rs"]
 mod hosted_kernel_win32k_source_pnp;
 #[path = "hosted_lower_pnp_capture.rs"]
@@ -16320,21 +16322,6 @@ unsafe fn hosted_memory_range_granted(start: u64, len: u64) -> bool {
     .is_some()
 }
 
-unsafe fn hosted_video_memory_caller_va(start: u64, len: u64) -> Option<u64> {
-    let grant_start = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_MEMORY_PHYS) as *const u64);
-    let grant_len = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_MEMORY_LEN) as *const u64);
-    let caller_va = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_MEMORY_CALLER_VA) as *const u64);
-    if grant_start == 0
-        || grant_len == 0
-        || caller_va == 0
-        || !hosted_memory_range_granted(start, len)
-        || !range_within_grant(grant_start, grant_len, start, len)
-    {
-        return None;
-    }
-    Some(caller_va + (start - grant_start))
-}
-
 unsafe fn hosted_video_memory_64k_units() -> Option<u16> {
     let bytes = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_MEMORY_LEN) as *const u64);
     let units = bytes / VIDEO_MEMORY_64K_UNIT;
@@ -16782,7 +16769,7 @@ extern "win64" fn s_video_port_map_memory(
                 0
             }
         } else {
-            match hosted_video_memory_caller_va(physical_address, requested_len as u64) {
+            match hosted_video_memory_mapping::caller_va(physical_address, requested_len as u64) {
                 Some(caller_va) => caller_va,
                 None => 0,
             }

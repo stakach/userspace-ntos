@@ -8,6 +8,7 @@
 #![no_std]
 
 pub mod caller_aperture;
+pub mod caller_memory;
 pub mod mode_evidence;
 mod control;
 pub use control::{classify_start_io_status, VideoControlCompletion, VideoControlProtocolError};
