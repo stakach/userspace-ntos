@@ -278,18 +278,94 @@ pub(super) unsafe fn grant_published_body(
             index
         }
     };
-    if arena.rows[index].phase != BodyPhase::Published { return Err(INVALID); }
-    let _durable = allocator::enter_durable();
-    let row = &mut arena.rows[index];
-    let mut io = Io {
-        paging: &mut arena.paging,
-        providers: &mut arena.providers,
-        root: arena.root,
-        scratch_base,
-        address: row.page.descriptor().address,
-        borrow: &borrow,
+    arena.map_published_row(index, target, scratch_base, &borrow)
+}
+
+/// Project an already referenced canonical Ps body before publishing its pointer to a provider.
+///
+/// # Safety
+/// The caller holds the newly acquired PM pointer reference until this operation returns and
+/// authenticates `target` from the physical service caller. No component IPC may be pumped while
+/// PM or this arena is borrowed. Failed mapping effects remain owned by the canonical page even
+/// when the caller rolls back its unpublished pointer reference.
+pub(super) unsafe fn grant_referenced_body(
+    pm: &ProcessManager,
+    body: u64,
+    target: ProviderRoot,
+    scratch_base: u64,
+) -> Result<(), u32> {
+    let borrow = Borrow::acquire()?;
+    let arena = (&mut *core::ptr::addr_of_mut!(ARENA))
+        .as_mut()
+        .ok_or(INVALID)?;
+    arena.validate(pm)?;
+    arena.providers.mapping_root(target)?;
+    let initial = ps_bootstrap::initial_system_projection().ok_or(INVALID)?;
+    let mut dependent_process = None;
+    let index = if let Some(pid) = pm.pid_for_kernel_process_object(body) {
+        if pid == arena.root.system.process_id() {
+            if initial.identity != arena.root.system || body != initial.process_body {
+                return Err(INVALID);
+            }
+            // This constructor's dedicated image page is retained by the provider image owner.
+            return Ok(());
+        }
+        let index = arena.existing(BodyId::Process(pid)).ok_or(INVALID)?;
+        if arena.rows[index].page.descriptor().address != body {
+            return Err(INVALID);
+        }
+        index
+    } else if let Some(tid) = pm.tid_for_kernel_thread_object(body) {
+        let lifetime = pm.thread_lifetime(tid).ok_or(INVALID)?;
+        if lifetime == arena.root.system.thread() {
+            if initial.identity != arena.root.system || body != initial.thread_body {
+                return Err(INVALID);
+            }
+            return Ok(());
+        }
+        let index = arena.existing(BodyId::Thread(tid)).ok_or(INVALID)?;
+        if arena.rows[index].page.descriptor().address != body
+            || arena.rows[index].current_thread_lifetime != Some(lifetime)
+        {
+            return Err(INVALID);
+        }
+        let Initialization::Thread { fields, .. } =
+            arena.rows[index].page.descriptor().initialization
+        else {
+            return Err(INVALID);
+        };
+        let process_body = fields.process_body.0;
+        if pm.process_kernel_object(lifetime.process_id()) != Some(process_body) {
+            return Err(INVALID);
+        }
+        if lifetime.process_id() == arena.root.system.process_id() {
+            if initial.identity != arena.root.system || process_body != initial.process_body {
+                return Err(INVALID);
+            }
+        } else {
+            let process_index = arena
+                .existing(BodyId::Process(lifetime.process_id()))
+                .ok_or(INVALID)?;
+            if arena.rows[process_index].page.descriptor().address != process_body
+                || arena.rows[process_index].phase != BodyPhase::Published
+            {
+                return Err(INVALID);
+            }
+            dependent_process = Some(process_index);
+        }
+        index
+    } else {
+        return Err(INVALID);
     };
-    row.page.map_alias(MappingTarget::Provider(target), ROOT_ALIAS_RIGHTS, &mut io)
+    if arena.rows[index].phase != BodyPhase::Published {
+        return Err(INVALID);
+    }
+    if let Some(process_index) = dependent_process {
+        // PM process_object_delete_blockers includes this thread's pointer references, so the
+        // acquired ETHREAD reference also prevents withdrawal of its owning EPROCESS.
+        arena.map_published_row(process_index, target, scratch_base, &borrow)?;
+    }
+    arena.map_published_row(index, target, scratch_base, &borrow)
 }
 
 /// # Safety
@@ -329,6 +405,30 @@ impl FrameRelease<'_> {
 }
 
 impl Arena {
+    fn map_published_row(
+        &mut self,
+        index: usize,
+        target: ProviderRoot,
+        scratch_base: u64,
+        borrow: &Borrow,
+    ) -> Result<(), u32> {
+        let row = self.rows.get_mut(index).ok_or(INVALID)?;
+        if row.phase != BodyPhase::Published {
+            return Err(INVALID);
+        }
+        let _durable = allocator::enter_durable();
+        let mut io = Io {
+            paging: &mut self.paging,
+            providers: &mut self.providers,
+            root: self.root,
+            scratch_base,
+            address: row.page.descriptor().address,
+            borrow,
+        };
+        row.page
+            .map_alias(MappingTarget::Provider(target), ROOT_ALIAS_RIGHTS, &mut io)
+    }
+
     fn validate(&self, pm: &ProcessManager) -> Result<(), u32> {
         if pm.initial_system_identity() == Some(self.root.system) {
             Ok(())

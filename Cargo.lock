@@ -217,6 +217,7 @@ version = "0.1.0"
 name = "nt-compat-exports"
 version = "0.1.0"
 dependencies = [
+ "nt-process",
  "syn",
 ]
 

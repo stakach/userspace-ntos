@@ -5319,7 +5319,9 @@ pub(crate) unsafe fn service_win32k_ps_request(
     {
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     }
-    provider_ps::dispatch(&mut handler.pm, op, object, value)
+    provider_ps::dispatch(&mut handler.pm, op, object, value, |pm, body| {
+        provider_ps_projection::grant(channel, pm, body)
+    })
 }
 
 /// Serialized memory-only ownership operation, across the bootstrap-to-live Ps store transfer.

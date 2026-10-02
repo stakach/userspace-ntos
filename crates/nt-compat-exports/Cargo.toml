@@ -11,4 +11,5 @@ authors.workspace = true
 undocumented_unsafe_blocks = "deny"
 
 [dev-dependencies]
+nt-process = { path = "../nt-process" }
 syn = { version = "2", features = ["full", "visit"] }

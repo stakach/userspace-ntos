@@ -108,6 +108,7 @@ mod provider_dispatcher_backend;
 mod provider_file_wait;
 mod ps_object_retirement;
 mod provider_ps;
+mod provider_ps_projection;
 mod sec_image_diagnostic;
 mod fault_stack_diagnostics;
 use process_vm_retirement::reclaim_final_process_vm;
