@@ -391,6 +391,15 @@ diagnosis-free failure.
 - A reserved virtual range or arithmetic mirror is not resident memory. Diagnostic stack scans
   must read exact process-generation backing and stop at an unavailable word, not fault the
   executive or substitute zero-filled or backing-image bytes.
+- Different address spaces can place unrelated images at the same numeric address. Match the
+  faulting process's loaded image and staged binary before using any symbol table.
+
+## Mapping Replacement Retires the Old Effect First
+- A mapped frame capability owns an ASID/address/physical leaf. Deleting an old alias after
+  mapping the same frame at that address can remove the new leaf. Acknowledge exact old mapping
+  retirement before replacement, or remap the original retained capability.
+- Cache membership and a mapping catalog are not physical page residency. A failed PageMap
+  cannot become success merely because those records exist.
 
 ## Loader Entry Uses Process-Owned Identity
 - Reserved startup arguments cannot select the executable or permit skipped initialization.

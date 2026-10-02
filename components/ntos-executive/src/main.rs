@@ -9369,27 +9369,6 @@ unsafe fn shared_image_mapping_put_banked(
     }
 }
 
-unsafe fn shared_image_mapping_replace_banked_after_map(
-    pi: u64,
-    process: nt_memory_manager::ProcessIdentity,
-    page: u64,
-    map_cap: u64,
-) -> bool {
-    if pi > u8::MAX as u64 || map_cap == 0 {
-        SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    if shared_image_mapping_find_for(pi, process, page).is_err() {
-        SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    if let Ok(Some(old_map_cap)) = shared_image_mapping_take_for(pi, process, page) {
-        let _ = cnode_delete_recycle_r(old_map_cap);
-        IMAGE_MAP_CAP_REPLACEMENTS.fetch_add(1, Ordering::Relaxed);
-    }
-    shared_image_mapping_put_banked(pi, process, page, map_cap)
-}
-
 unsafe fn shared_image_mapping_contains_for(
     pi: u64,
     process: nt_memory_manager::ProcessIdentity,

@@ -3710,6 +3710,15 @@ pub(crate) unsafe fn service_image_page_residency(
 
     nt_handler.ensure_process_working_set_admission(pi, page, scratch_base)?;
 
+    let replacing_shared_mapping = shareable && fault_observed && shared_mapping_registered;
+    if replacing_shared_mapping {
+        let end = page
+            .checked_add(0x1000)
+            .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
+        // Retire the old mapped cap before installing a sibling for the same physical frame.
+        shared_image_mapping_unmap_range(pi as u64, process, page, end)?;
+    }
+
     if !shareable {
         let resident = nt_memory_manager::admit_resident_reprotect(
             pi as u64,
@@ -3806,21 +3815,17 @@ pub(crate) unsafe fn service_image_page_residency(
     if map_error != 0 {
         let _ = cnode_delete_recycle_r(map_cap);
         discard_unpublished_image_backing(private_source_cap, faults);
-        let duplicate_shared_fault = fault_observed
-            && map_error == 8
-            && shareable
-            && (cached != 0 || shared_mapping_registered);
-        if duplicate_shared_fault {
-            return Ok(());
-        }
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
 
     if shareable {
-        if !shared_image_mapping_replace_banked_after_map(pi as u64, process, page, map_cap) {
+        if !shared_image_mapping_put_banked(pi as u64, process, page, map_cap) {
             let _ = page_unmap_r(map_cap);
             let _ = cnode_delete_recycle_r(map_cap);
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        if replacing_shared_mapping {
+            IMAGE_MAP_CAP_REPLACEMENTS.fetch_add(1, Ordering::Relaxed);
         }
     } else if private_source_cap != 0 {
         if !csrss_frame_put_at_cap_source_backing(
