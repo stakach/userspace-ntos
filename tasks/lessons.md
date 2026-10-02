@@ -319,3 +319,10 @@ diagnosis-free failure.
 - Reply acknowledgement does not prove the resumed origin has recorded its pending token. Use an
   authenticated pending-armed receipt before sibling completion delivery, rather than guessing
   from a private phase or repeatedly invoking a no-effect terminal callback.
+
+## Cleanup Proof Must Execute Cleanup
+- Queuing a last-handle release does not prove that CLEANUP ran. A retained-file regression must
+  drive and observe the lifecycle transition before reading through the independent reference.
+- Sharing admission and FILE_OBJECT body ownership have different lifetimes. Release sharing at
+  CLEANUP, but retain metadata and position until CLOSE; reuse the existing independent-reference
+  contract rather than duplicating file state in a second table.

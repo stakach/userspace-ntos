@@ -38,6 +38,56 @@ fn add_device(io: &mut IoManager<MockObjectPort>, driver: DriverId) -> DeviceId 
 }
 
 #[test]
+fn retained_pointer_reference_creates_independent_owner_without_existing_caller() {
+    let (mut io, _, device, domain) = setup();
+    let registration = io.register_hosted_device_pointer(domain, 0x1000).unwrap();
+    assert_eq!(io.hosted_device_pointer_count(registration), Ok(0));
+    assert_eq!(io.device_reference_count(device), 1);
+    assert!(io.take_hosted_device_pointer_reference(registration).is_err());
+
+    let mut owner = io.retain_hosted_device_pointer_reference(registration).unwrap();
+    assert!(owner.is_held());
+    assert_eq!(owner.device_id(), device);
+    assert_eq!(io.hosted_device_pointer_count(registration), Ok(0));
+    assert_eq!(io.device_reference_count(device), 2);
+    owner.release(&mut io).unwrap();
+    assert!(!owner.is_held());
+    assert_eq!(io.device_reference_count(device), 1);
+}
+
+#[test]
+fn retained_pointer_reference_does_not_consume_an_existing_caller() {
+    let (mut io, _, device, domain) = setup();
+    let registration = io.register_hosted_device_pointer(domain, 0x1000).unwrap();
+    io.reference_hosted_device_pointer(registration).unwrap();
+    let mut owner = io.retain_hosted_device_pointer_reference(registration).unwrap();
+    assert_eq!(io.hosted_device_pointer_count(registration), Ok(1));
+    assert_eq!(io.device_reference_count(device), 3);
+    io.dereference_hosted_device_pointer(registration).unwrap();
+    assert!(owner.is_held());
+    assert_eq!(io.device_reference_count(device), 2);
+    owner.release(&mut io).unwrap();
+    assert_eq!(io.device_reference_count(device), 1);
+}
+
+#[test]
+fn retained_pointer_reference_rejects_foreign_and_retired_registration_without_effect() {
+    let (mut io, _, device, domain) = setup();
+    let registration = io.register_hosted_device_pointer(domain, 0x1000).unwrap();
+    let (mut foreign, _, foreign_device, _) = setup();
+    assert!(foreign.retain_hosted_device_pointer_reference(registration).is_err());
+    assert_eq!(foreign.device_reference_count(foreign_device), 0);
+    assert_eq!(io.device_reference_count(device), 1);
+
+    io.retire_hosted_device_pointer(registration).unwrap();
+    let replacement = io.bind_hosted_device_pointer(domain, 0x1000, device).unwrap();
+    assert_ne!(registration, replacement);
+    assert!(io.retain_hosted_device_pointer_reference(registration).is_err());
+    assert_eq!(io.device_reference_count(device), 1);
+    assert_eq!(io.hosted_device_pointer_count(replacement), Ok(0));
+}
+
+#[test]
 fn own_projection_anchor_does_not_prevent_driver_unload_callback() {
     let (mut io, driver, device, domain) = setup();
     io.bind_hosted_driver_identity(domain, 0x2000, driver).unwrap();

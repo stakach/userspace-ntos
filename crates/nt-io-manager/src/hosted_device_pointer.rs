@@ -272,6 +272,17 @@ impl<P> IoManager<P> {
         })
     }
 
+    /// Acquire a new independently owned reference through an exact live registration. This does
+    /// not consume or publish a projected caller reference; failure leaves all counts unchanged.
+    pub fn retain_hosted_device_pointer_reference(
+        &mut self,
+        registration: HostedDevicePointerRegistration,
+    ) -> Result<HostedDevicePointerReference, NtStatus> {
+        self.live_pointer_row_index(registration)?;
+        let reference = self.retain_device_reference(registration.device)?;
+        Ok(HostedDevicePointerReference { reference })
+    }
+
     /// Detach exactly one already-owned caller reference for result publication or rollback.
     pub fn take_hosted_device_pointer_reference(
         &mut self,

@@ -1,8 +1,9 @@
 //! Canonical File IRP dispatch for regular files on the mounted FAT volume.
 //!
-//! The installed layer is immutable. CREATE owns both a generation-fenced File context and a
-//! share-access open; CLEANUP drops the share open and CLOSE drops the File context. No later
-//! operation re-resolves the name to select a different backing file.
+//! The installed layer is immutable. CREATE owns both a generation-fenced File context and an
+//! installed open with independent handle-sharing and body references. CLEANUP releases sharing;
+//! CLOSE releases the body and File context. Position and mode survive CLEANUP for pointer-owned
+//! operations. No later operation re-resolves the name to select a different backing file.
 
 use alloc::vec::Vec;
 
@@ -23,7 +24,8 @@ const PATH_CAP: usize = nt_fs::LAYERED_OPEN_NAME_CAP;
 #[derive(Clone, Copy)]
 struct MountedBinding {
     context: nt_fs::LayeredOpenContextId,
-    share_open: Option<u32>,
+    installed_open: Option<u32>,
+    installed_handle_open: bool,
     directory_open: Option<u32>,
     overlay_open: bool,
     is_directory: bool,
@@ -284,7 +286,8 @@ impl MountedVolumeBackend {
         debug_assert!(self.bindings[index].is_none());
         self.bindings[index] = Some(MountedBinding {
             context,
-            share_open: None,
+            installed_open: None,
+            installed_handle_open: false,
             directory_open: Some(directory_open),
             overlay_open: false,
             is_directory: true,
@@ -311,7 +314,7 @@ impl MountedVolumeBackend {
         options: u32,
     ) -> Result<DispatchOutcome, NtStatus> {
         let context = self.opens.reserve(file_id, units).map_err(status)?;
-        let share_open = match self.shares.create(
+        let installed_open = match self.shares.create(
             installed.first_cluster,
             installed.metadata.end_of_file.min(u32::MAX as u64) as u32,
             relative,
@@ -321,7 +324,7 @@ impl MountedVolumeBackend {
             installed.metadata,
             installed.alternate_name,
         ) {
-            Ok(share_open) => share_open,
+            Ok(installed_open) => installed_open,
             Err(error) => {
                 self.opens
                     .cancel(context, file_id)
@@ -329,6 +332,11 @@ impl MountedVolumeBackend {
                 return Err(status(error));
             }
         };
+        if let Err(error) = self.shares.retain_io(installed_open) {
+            self.shares.release(installed_open).expect("unpublished installed handle");
+            self.opens.cancel(context, file_id).expect("owned reservation");
+            return Err(status(error));
+        }
         self.opens
             .finish(
                 context,
@@ -344,7 +352,8 @@ impl MountedVolumeBackend {
         debug_assert!(self.bindings[index].is_none());
         self.bindings[index] = Some(MountedBinding {
             context,
-            share_open: Some(share_open),
+            installed_open: Some(installed_open),
+            installed_handle_open: true,
             directory_open: None,
             overlay_open: false,
             is_directory: false,
@@ -451,7 +460,8 @@ impl MountedVolumeBackend {
         debug_assert!(self.bindings[index].is_none());
         self.bindings[index] = Some(MountedBinding {
             context,
-            share_open: None,
+            installed_open: None,
+            installed_handle_open: false,
             directory_open: None,
             overlay_open: true,
             is_directory,
@@ -549,9 +559,9 @@ impl MountedVolumeBackend {
         else {
             return Err(NtStatus::INVALID_HANDLE);
         };
-        let share_open = binding.share_open.ok_or(NtStatus::INVALID_HANDLE)?;
+        let installed_open = binding.installed_open.ok_or(NtStatus::INVALID_HANDLE)?;
         let offset = u32::try_from(parameters.offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
-        self.shares.get(share_open).map_err(status)?;
+        self.shares.get(installed_open).map_err(status)?;
         let eof = metadata.end_of_file.min(u32::MAX as u64) as u32;
         if offset >= eof {
             return Err(NtStatus::END_OF_FILE);
@@ -569,12 +579,12 @@ impl MountedVolumeBackend {
         if written != expected {
             return Err(status(nt_fs::STATUS_DATA_ERROR));
         }
-        if self.shares.get(share_open).map_err(status)?.create_options
+        if self.shares.get(installed_open).map_err(status)?.create_options
             & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
             != 0
         {
             self.shares
-                .get_mut(share_open)
+                .get_mut(installed_open)
                 .map_err(status)?
                 .current_offset = u64::from(offset) + written as u64;
         }
@@ -618,7 +628,7 @@ impl MountedVolumeBackend {
                 } else {
                     let open = self
                         .shares
-                        .get(binding.share_open.ok_or(NtStatus::INVALID_HANDLE)?)
+                        .get(binding.installed_open.ok_or(NtStatus::INVALID_HANDLE)?)
                         .map_err(status)?;
                     (
                         metadata,
@@ -858,12 +868,13 @@ impl MountedVolumeBackend {
     ) -> Result<DispatchOutcome, NtStatus> {
         let (context, binding) = self.binding(irp)?;
         let index = context_index(context).ok_or(NtStatus::INVALID_HANDLE)?;
-        if let Some(share_open) = binding.share_open {
-            self.shares.release(share_open).map_err(status)?;
+        if binding.installed_handle_open {
+            let installed_open = binding.installed_open.ok_or(NtStatus::INVALID_HANDLE)?;
+            self.shares.release(installed_open).map_err(status)?;
             self.bindings[index]
                 .as_mut()
                 .expect("validated binding")
-                .share_open = None;
+                .installed_handle_open = false;
         }
         if let Some(directory_open) = binding.directory_open {
             self.directories.release(directory_open).map_err(status)?;
@@ -890,6 +901,10 @@ impl MountedVolumeBackend {
             }
         }
         if close {
+            if let Some(installed_open) = binding.installed_open {
+                self.shares.release_io(installed_open).map_err(status)?;
+                self.bindings[index].as_mut().expect("validated binding").installed_open = None;
+            }
             self.opens.release(context, file_id.raw()).map_err(status)?;
             self.bindings[index] = None;
         }

@@ -45001,6 +45001,13 @@ pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
         io_manager_mut().queue_external_file_release(client, file)
             .map_err(|status| status.raw() as u32)?;
         release_queued = true;
+        io_manager_mut().pump();
+        if !io_manager_mut().file(file).is_some_and(|file| {
+            matches!(file.state, nt_io_manager::FileState::CleanupComplete
+                | nt_io_manager::FileState::ClosePending) && !file.close_dispatched
+        }) {
+            return Ok(false);
+        }
         let current = crate::routed_section_io::query_standard(file.raw(), device.raw())?;
         let mut signature = [0u8; 4];
         let (status, information) = crate::routed_section_io::read(

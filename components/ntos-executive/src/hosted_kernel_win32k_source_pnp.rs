@@ -562,9 +562,17 @@ impl Work {
             return false;
         }
         if self.source_pdo.is_none() {
-            let Ok(source_reference) = io_manager_mut()
-                .take_hosted_device_pointer_reference(source_registration)
-            else { return false };
+            let Ok(owned) = self.source_allocation.as_mut().expect("claimed PnP source allocation")
+                .take_owned_reference(source_registration) else { return false };
+            let source_reference = match owned {
+                Some(reference) => reference,
+                None => {
+                    let Ok(reference) = io_manager_mut()
+                        .take_hosted_device_pointer_reference(source_registration)
+                    else { return false };
+                    reference
+                }
+            };
             self.source_pdo = Some(source_reference);
         }
         if !self.source_pdo.as_ref().is_some_and(|reference| {
@@ -575,6 +583,8 @@ impl Work {
             Err(_) => return false,
         };
         self.projected_pdo = Some(projected_pdo);
+        let source_allocation = self.source_allocation.as_ref()
+            .expect("claimed PnP source allocation");
         if !source_allocation.validate() || !self.relation_live() {
             return false;
         }
@@ -866,9 +876,17 @@ impl Work {
                         .hosted_device_pointer_registration(domain, objects[0])
                     else { return false };
                     if registration.device_id() != pdo { return false; }
-                    let Ok(reference) = io_manager_mut()
-                        .take_hosted_device_pointer_reference(registration)
-                    else { return false };
+                    let Ok(owned) = self.source_allocation.as_mut().expect("cancelled PnP source allocation")
+                        .take_owned_reference(registration) else { return false };
+                    let reference = match owned {
+                        Some(reference) => reference,
+                        None => {
+                            let Ok(reference) = io_manager_mut()
+                                .take_hosted_device_pointer_reference(registration)
+                            else { return false };
+                            reference
+                        }
+                    };
                     self.source_pdo = Some(reference);
                 }
             } else if receipt.information() != 0 {

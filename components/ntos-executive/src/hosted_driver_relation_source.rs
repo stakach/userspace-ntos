@@ -60,6 +60,31 @@ impl DriverRelationSource {
                 == self.bytes.as_slice()
     }
 
+    /// Transfer the already-owned VideoPort result, rather than consuming an unrelated projected
+    /// caller count. Native driver results without this owner still use their returned caller ref.
+    pub(super) unsafe fn take_owned_reference(
+        &mut self,
+        registration: nt_io_manager::HostedDevicePointerRegistration,
+    ) -> Result<Option<nt_io_manager::HostedDevicePointerReference>, nt_status::NtStatus> {
+        if !self.validate() || self.domain() != Some(registration.domain())
+            || io_manager_mut().hosted_device_pointer_registration(
+                registration.domain(), registration.address(),
+            ) != Some(registration)
+        {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        let objects = nt_pnp_manager::copy_device_relations_x64(&self.bytes)
+            .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+        if objects.as_slice() != [registration.address()]
+            || self.video_reference.as_ref().is_some_and(|reference| {
+                reference.device_id() != registration.device_id()
+            })
+        {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        Ok(self.video_reference.take().map(|reference| reference.into_reference()))
+    }
+
     /// Only after canonical ACK and after transferring the caller's independent PDO reference.
     pub(super) unsafe fn retire(mut self) -> bool {
         let Some(_guard) = hosted_instance_pool_lock(self.inst.exec_pool_va) else { return false };

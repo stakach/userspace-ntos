@@ -39,6 +39,14 @@ pub(super) struct SourceReference {
 }
 
 impl SourceReference {
+    pub(super) fn device_id(&self) -> nt_io_manager::DeviceId {
+        self.reference.device_id()
+    }
+
+    pub(super) fn into_reference(self) -> nt_io_manager::HostedDevicePointerReference {
+        self.reference
+    }
+
     pub(super) unsafe fn release(mut self) -> bool {
         self.reference.release(io_manager_mut()).is_ok()
     }
@@ -116,7 +124,7 @@ pub(super) unsafe fn dispatch(
         trace_rejection(b"device-registration", binding, Some(allocation_index), Some(domain));
         return rejected(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     };
-    let Ok(mut reference) = io_manager_mut().take_hosted_device_pointer_reference(registration)
+    let Ok(mut reference) = io_manager_mut().retain_hosted_device_pointer_reference(registration)
     else {
         trace_rejection(b"device-reference", binding, Some(allocation_index), Some(domain));
         return rejected(nt_status::NtStatus::INVALID_DEVICE_REQUEST);

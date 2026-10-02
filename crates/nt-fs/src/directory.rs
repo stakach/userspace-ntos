@@ -1490,25 +1490,49 @@ mod tests {
 
     #[test]
     fn readonly_file_io_reference_survives_last_handle_cleanup() {
-        let mut table = ReadOnlyFileOpenTable::<1>::new();
+        let mut table = ReadOnlyFileOpenTable::<2>::new();
+        let metadata = crate::FileMetadata { end_of_file: 64, file_id: 41,
+            ..crate::FileMetadata::default() };
+        let options = crate::FILE_SYNCHRONOUS_IO_NONALERT;
         let object = table
             .create(
                 41,
                 64,
                 b"reactos\\system32\\ntdll.dll",
+                crate::FILE_READ_DATA,
                 0,
-                0,
-                0,
-                crate::FileMetadata::default(),
+                options,
+                metadata,
                 crate::FatShortName::EMPTY,
             )
             .unwrap();
+        assert_eq!(table.check_share(
+            b"reactos\\system32\\ntdll.dll", metadata, crate::FILE_READ_DATA, 0),
+            Err(STATUS_SHARING_VIOLATION));
         table.retain_io(object).unwrap();
+        table.get_mut(object).unwrap().current_offset = 17;
         table.release(object).unwrap();
         assert_eq!(table.is_final_reference(object), Err(STATUS_INVALID_HANDLE));
+        let body = table.get(object).unwrap();
+        assert_eq!(body.metadata, metadata);
+        assert_eq!(body.first_cluster, 41);
+        assert_eq!(body.size, 64);
+        assert_eq!(body.current_offset, 17);
+        assert_eq!(body.create_options, options);
+        let reopened = table.create(41, 64, b"reactos\\system32\\ntdll.dll",
+            crate::FILE_READ_DATA, 0, options, metadata, crate::FatShortName::EMPTY).unwrap();
+        assert_eq!(table.get(reopened).unwrap().current_offset, 0);
         assert_eq!(table.set_signaled(object, true), Ok(()));
         table.release_io(object).unwrap();
         assert_eq!(table.get(object), Err(STATUS_INVALID_HANDLE));
+        table.release(reopened).unwrap();
+        let reused = table.create(41, 64, b"reactos\\system32\\ntdll.dll",
+            crate::FILE_READ_DATA, 0, options, metadata, crate::FatShortName::EMPTY).unwrap();
+        assert_ne!(reused, object);
+        assert_eq!(table.retain_io(object), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.release_io(object), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.get_mut(object), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.get(reused).unwrap().current_offset, 0);
     }
 
     #[test]
