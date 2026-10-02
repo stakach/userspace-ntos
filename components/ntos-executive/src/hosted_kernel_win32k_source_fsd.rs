@@ -207,9 +207,8 @@ struct Work {
     ack_claimed: bool,
     cancel_requested: bool,
     nonce: u64,
-    terminal_packet: Option<crate::win32k_subsystem::ProviderPoolPacketLease>,
+    terminal_packet: Option<super::hosted_source_terminal_packet::RetainedTerminalPacket>,
     terminal_acknowledged: bool,
-    origin_commit_requested: bool,
     origin_committed: bool,
     discarding: bool,
     indeterminate: bool,
@@ -365,7 +364,7 @@ pub(crate) unsafe fn submit(
         event_claimed: false,
         event_signaled: false, event_barrier: None, packet_prepared: false, reply_entered: false,
         reply_acked: false, ack_claimed: false, cancel_requested: false,
-        nonce, terminal_packet: None, terminal_acknowledged: false, origin_commit_requested: false, origin_committed: false, discarding: false,
+        nonce, terminal_packet: None, terminal_acknowledged: false, origin_committed: false, discarding: false,
         indeterminate: false,
     };
     let index = if let Some(index) = slot {
@@ -420,6 +419,13 @@ impl Work {
             super::source_observability::Kind::Write
         }
     }
+    unsafe fn terminal_step_ready(&self) -> bool {
+        self.terminal_packet.as_ref().is_none_or(|packet| {
+            !packet.needs_lane(self.discarding || self.terminal_acknowledged)
+                || crate::win32k_glue::source_terminal_dispatch_ready()
+        })
+    }
+
     unsafe fn ready_for_nested_step(&self) -> bool {
         use nt_io_manager::retained_source_progress::RetainedSourceProgress as Progress;
         let progress = if self.indeterminate {
@@ -431,7 +437,7 @@ impl Work {
                 broker_stopped: runtime::retained_service_owner_stopped_at_broker(
                     self.route, self.dispatch, self.reply, self.token,
                 ) && self.event_barrier.is_none(),
-                source_lane_ready: crate::win32k_glue::source_terminal_dispatch_ready(),
+                source_lane_ready: self.terminal_step_ready(),
             }
         } else if !self.entered {
             Progress::AwaitingDispatch { provider_ready:
@@ -450,7 +456,7 @@ impl Work {
                 cancellation_pending: false,
             }
         } else if !self.origin_committed {
-            Progress::Terminal { source_lane_ready: crate::win32k_glue::source_terminal_dispatch_ready() }
+            Progress::Terminal { source_lane_ready: self.terminal_step_ready() }
         } else {
             Progress::Retirement
         };
@@ -460,7 +466,7 @@ impl Work {
     fn progress_state(&self) -> [u64; 16] {
         [self.entered as u64, self.pending as u64, self.reply_entered as u64,
             self.reply_acked as u64, self.terminal.is_some() as u64, self.output_captured as u64,
-            self.terminal_acknowledged as u64, self.origin_commit_requested as u64,
+            self.terminal_acknowledged as u64, self.terminal_packet.as_ref().map_or(0, |packet| packet.progress()),
             self.origin_committed as u64, self.event_claimed as u64, self.event_signaled as u64,
             self.ack_claimed as u64, self.cancel_requested as u64, self.discarding as u64,
             self.indeterminate as u64, self.terminal_packet.is_some() as u64]
@@ -527,76 +533,45 @@ impl Work {
 
     unsafe fn deliver_terminal(&mut self) -> bool {
         if self.terminal_acknowledged { return true; }
-        if !self.source.validate() { return false; }
+        if self.indeterminate { return false; }
         let (status, information) = self.terminal.expect("FSD terminal");
         let length = self.output_len();
         if self.terminal_packet.is_none() {
             let valid_information = if self.source.major == major::IRP_MJ_READ {
                 information <= u64::from(self.source.output_capacity)
-            } else {
-                information <= self.source.input.len() as u64
-            };
+            } else { information <= self.source.input.len() as u64 };
             if !valid_information || !self.source.validate()
                 || (!self.discarding && (self.output_target.address_if_live(self.route).is_none()
                     || self.iosb_target.address_if_live(self.route).is_none()))
             { return false; }
             let handoff = wire::SourceFsdTerminalHandoff {
-            delivery: if self.pending { wire::TerminalDelivery::Pending } else { wire::TerminalDelivery::Inline },
-                nonce: self.nonce,
-                token: self.token,
-                source_irp_va: self.source_address,
-                source_ticket_serial: self.source_ticket,
-                native_allocation_generation: self.source_generation,
+                delivery: if self.pending { wire::TerminalDelivery::Pending } else { wire::TerminalDelivery::Inline },
+                nonce: self.nonce, token: self.token, source_irp_va: self.source_address,
+                source_ticket_serial: self.source_ticket, native_allocation_generation: self.source_generation,
                 status, information, output: &self.output[..length],
             };
             let Ok(packet_len) = wire::terminal_packet_len(length) else { return false };
-            let Some((lease, mut packet)) =
-                crate::win32k_subsystem::allocate_root_provider_pool_packet(packet_len)
-            else { return false };
-            if wire::encode_terminal_handoff(handoff, &mut packet).is_err()
-                || !crate::win32k_subsystem::publish_provider_pool_packet(lease, &packet)
-            {
-                if !crate::win32k_subsystem::retire_root_provider_pool_packet(lease) {
-                    crate::provider_bugcheck::report(0xc4, [self.source_address, self.token, 0, 61]);
-                }
-                return false;
-            }
-            self.terminal_packet = Some(lease);
+            let mut packet = Vec::new();
+            if packet.try_reserve_exact(packet_len).is_err() { return false; }
+            packet.resize(packet_len, 0);
+            if wire::encode_terminal_handoff(handoff, &mut packet).is_err() { return false; }
+            self.terminal_packet = Some(super::hosted_source_terminal_packet::RetainedTerminalPacket::new(packet));
         }
+        let transport = self.terminal_packet.as_mut().expect("retained FSD terminal transport");
+        let ready = if self.discarding { transport.publish() }
+            else { transport.prepare(crate::win32k_glue::dispatch_source_fsd_terminal) };
+        if !ready { self.indeterminate |= transport.indeterminate(); return false; }
         if self.discarding { return true; }
-        let lease = self.terminal_packet.expect("retained FSD terminal packet");
-        let dispatch = crate::win32k_glue::dispatch_source_fsd_terminal(
-            lease.address(), wire::terminal_packet_len(length).unwrap() as u64,
-        );
-        match dispatch {
-            crate::win32k_glue::SourcePnpTerminalDispatch::NotEntered(_) => return false,
-            crate::win32k_glue::SourcePnpTerminalDispatch::Returned(status)
-                if status == nt_io_manager::source_terminal::TERMINAL_NOT_READY => return false,
-            crate::win32k_glue::SourcePnpTerminalDispatch::Returned(0) => {}
-            _ => { self.indeterminate = true; return false; }
-        }
-        let (actual, packet) = match crate::win32k_subsystem::capture_provider_pool_packet(
-            lease.address(), wire::terminal_packet_len(length).unwrap(),
-        ) {
-            Ok(captured) => captured,
-            Err(_) => { self.indeterminate = true; return false; }
-        };
-        let ack = wire::decode_terminal_ack(&packet);
-        if actual.native_identity() != lease.native_identity()
-            || !matches!(ack, Ok(ack) if
-                ack.handoff.nonce == self.nonce
-                    && ack.handoff.token == self.token
-                    && ack.handoff.source_irp_va == self.source_address
-                    && ack.handoff.source_ticket_serial == self.source_ticket
-                    && ack.handoff.native_allocation_generation == self.source_generation
-                    && ack.handoff.status == status
-                    && ack.handoff.information == information
-                    && ack.handoff.output == &self.output[..length]
-                    && ack.publication == wire::TerminalPublication::Published)
-        {
-            self.indeterminate = true;
-            return false;
-        }
+        let valid = matches!(wire::decode_terminal_ack(transport.ack()), Ok(ack) if
+            ack.handoff.delivery == (if self.pending { wire::TerminalDelivery::Pending } else { wire::TerminalDelivery::Inline })
+                && ack.handoff.nonce == self.nonce && ack.handoff.token == self.token
+                && ack.handoff.source_irp_va == self.source_address
+                && ack.handoff.source_ticket_serial == self.source_ticket
+                && ack.handoff.native_allocation_generation == self.source_generation
+                && ack.handoff.status == status && ack.handoff.information == information
+                && ack.handoff.output == &self.output[..length]
+                && ack.publication == wire::TerminalPublication::Published);
+        if !transport.acknowledge_prepare(valid) { self.indeterminate = true; return false; }
         self.terminal_acknowledged = true;
         true
     }
@@ -640,9 +615,13 @@ impl Work {
             self.packet_prepared = true;
         }
         let Some(packet_lease) = self.packet_lease else { return false };
-        if !crate::win32k_subsystem::publish_provider_pool_packet(
+        if let Err(error) = crate::win32k_subsystem::try_publish_root_provider_pool_packet(
             packet_lease, &self.packet,
-        ) { return false; }
+        ) {
+            self.indeterminate |= matches!(error, crate::win32k_subsystem::RootPoolError::InvalidIdentity
+                | crate::win32k_subsystem::RootPoolError::Indeterminate);
+            return false;
+        }
         self.reply_entered = true;
         self.packet_lease = None;
         drop(core::mem::take(&mut self.packet));
@@ -668,13 +647,12 @@ impl Work {
         if self.indeterminate { return false; }
         if self.origin_committed { return self.event_barrier.is_none(); }
         if !self.terminal_acknowledged || !self.event_signaled { return false; }
-        let length = wire::terminal_packet_len(self.output_len()).unwrap();
-        if !super::hosted_kernel_win32k_source_ioctl::commit_origin_packet(
-            &mut self.terminal_packet, length, 64,
-            &mut self.origin_commit_requested, &mut self.indeterminate, false,
-            self.event_barrier.map_or(0, |barrier| barrier.sequence()),
-            crate::win32k_glue::dispatch_source_fsd_terminal,
-        ) { return false; }
+        if !self.terminal_packet.as_mut().expect("retained terminal transport").finish(
+            64, false, self.event_barrier.map_or(0, |barrier| barrier.sequence()), crate::win32k_glue::dispatch_source_fsd_terminal,
+        ) {
+            self.indeterminate |= self.terminal_packet.as_ref().is_some_and(|packet| packet.indeterminate());
+            return false;
+        }
         self.origin_committed = true;
         super::source_observability::origin(self.observation_kind());
         if let Some(barrier) = self.event_barrier {
@@ -731,7 +709,7 @@ impl Work {
         if !runtime::retained_service_owner_stopped_at_broker(
             self.route, self.dispatch, self.reply, self.token,
         ) { return false; }
-        if self.event_barrier.is_some() {
+        if self.event_barrier.is_some() || self.origin_committed {
             // Canonical transfer/signal preparation already began; do not turn an uncertain
             // committed terminal into a new cancellation transaction.
             return false;
@@ -749,12 +727,12 @@ impl Work {
             if self.terminal_packet.is_none() { self.terminal = Some((0xc000_0120, 0)); }
             self.discarding = true;
             if !self.deliver_terminal() { return false; }
-            let length = wire::terminal_packet_len(self.output_len()).unwrap();
-            if !super::hosted_kernel_win32k_source_ioctl::commit_origin_packet(
-                &mut self.terminal_packet, length, 64,
-                &mut self.origin_commit_requested, &mut self.indeterminate, true, 0,
-                crate::win32k_glue::dispatch_source_fsd_terminal,
-            ) { return false; }
+            if !self.terminal_packet.as_mut().expect("retained terminal transport").finish(
+                64, true, 0, crate::win32k_glue::dispatch_source_fsd_terminal,
+            ) {
+                self.indeterminate |= self.terminal_packet.as_ref().is_some_and(|packet| packet.indeterminate());
+                return false;
+            }
             self.origin_committed = true;
         }
         if let Some(event) = self.event.take() { release_event(handler, event); }

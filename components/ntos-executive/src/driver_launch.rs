@@ -158,6 +158,8 @@ pub(crate) mod hosted_sync_relations;
 mod hosted_kernel_win32k_buffered_ioctl;
 #[path = "hosted_kernel_win32k_source_ioctl.rs"]
 mod hosted_kernel_win32k_source_ioctl;
+#[path = "hosted_source_terminal_packet.rs"]
+mod hosted_source_terminal_packet;
 #[path = "hosted_video_caller_aperture.rs"]
 mod hosted_video_caller_aperture;
 #[path = "hosted_kernel_win32k_source_pnp.rs"]
@@ -39261,7 +39263,7 @@ unsafe fn nested_irp_completion_ready_exact(irp_id: u64) -> bool {
     false
 }
 
-unsafe fn nested_file_irp_completion_ready_exact(irp_id: u64) -> bool {
+pub(crate) unsafe fn nested_file_irp_completion_ready_exact(irp_id: u64) -> bool {
     io_manager_mut().irp(IrpId(irp_id)).is_some_and(|irp| irp.file_id.is_some())
         && nested_irp_completion_ready_exact(irp_id)
 }
@@ -57266,6 +57268,10 @@ pub(crate) unsafe fn nested_win32k_source_work_ready() -> bool {
     hosted_kernel_win32k_source_ioctl::nested_work_ready()
         || hosted_kernel_win32k_source_pnp::nested_work_ready()
         || hosted_kernel_win32k_source_fsd::nested_work_ready()
+}
+
+pub(crate) unsafe fn provider_section_target_dispatch_ready(device_id: nt_io_manager::DeviceId) -> bool {
+    hosted_kernel_win32k_source_ioctl::target_dispatch_ready(device_id)
 }
 
 pub(crate) unsafe fn redrive_nested_win32k_source_work(handler: *mut ExecNtHandler) -> bool {

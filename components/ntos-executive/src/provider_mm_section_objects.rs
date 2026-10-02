@@ -371,10 +371,6 @@ unsafe fn retire_object(row: *mut Object) -> Result<(), u32> {
     Ok(())
 }
 
-pub(crate) unsafe fn blocks_domain_retirement(domain: runtime::PhysicalDomain) -> bool {
-    (&*core::ptr::addr_of!(OBJECTS)).iter().any(|row| row.physical.domain == domain)
-}
-
 /// Retry known incomplete cleanup only; uncertain effects keep every exact owner quarantined.
 pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
     let Ok(sections) = table(handler) else { return; };

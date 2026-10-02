@@ -5547,7 +5547,7 @@ pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
     let lifecycle = crate::driver_launch::redrive_nested_hosted_file_lifecycle_work();
     let close = crate::hosted_routed_file_close_work::redrive_nested_ready(handler);
     let source = crate::driver_launch::redrive_nested_win32k_source_work(handler);
-    let section = crate::provider_section_broker::redrive(&mut *handler);
+    let section = crate::provider_section_broker::redrive_nested_ready(handler);
     crate::provider_mm_section_objects::redrive(handler);
     create || query || write || read || flush || query_information || lower_pnp || kernel_file_query || lifecycle || close || source || section
 }
@@ -9446,7 +9446,7 @@ pub(crate) unsafe fn service_sec_image(
             crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
             crate::section_metadata_work::redrive(&mut nt_handler, delay_queue);
             crate::section_pagein_work::redrive(&mut nt_handler);
-            crate::provider_section_broker::redrive(&mut nt_handler);
+            crate::provider_section_broker::redrive(nt_handler as *mut _);
             crate::provider_mm_section_objects::redrive(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_driver_io_create_file(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_path_forward(nt_handler as *mut _);

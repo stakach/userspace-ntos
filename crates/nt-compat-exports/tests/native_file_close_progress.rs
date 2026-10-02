@@ -30,6 +30,29 @@ fn accepted_file_close_is_ready_inside_its_parked_parent_pump() {
 }
 
 #[test]
+fn retained_section_metadata_is_ready_inside_its_parked_parent_pump() {
+    let pump = include_str!("../../../components/ntos-executive/src/component_shared_pump.rs");
+    assert!(calls(pump, "provider_section_broker", "nested_work_ready"),
+        "MmCreateSection metadata must progress while its native caller is parked");
+}
+
+#[test]
+fn section_metadata_redrive_does_not_borrow_handler_across_provider_dispatch() {
+    let parsed = syn::parse_file(include_str!(
+        "../../../components/ntos-executive/src/provider_section_broker.rs"
+    )).unwrap();
+    let redrive = parsed.items.iter().find_map(|item| match item {
+        syn::Item::Fn(item) if item.sig.ident == "redrive" => Some(item),
+        _ => None,
+    }).expect("Section metadata redrive boundary");
+    let syn::FnArg::Typed(handler) = redrive.sig.inputs.first().unwrap() else {
+        panic!("Section redrive requires explicit handler ownership");
+    };
+    assert!(matches!(&*handler.ty, syn::Type::Ptr(_)),
+        "external metadata dispatch can reenter the executive; no exclusive handler borrow may span it");
+}
+
+#[test]
 fn nested_file_work_runner_steps_retained_close_without_outer_loop() {
     let source = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
     let parsed = syn::parse_file(source).unwrap();

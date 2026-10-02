@@ -40,6 +40,7 @@ struct Work {
     entered: bool,
     terminal: Option<(u32, u64)>,
     relation: Option<nt_pnp_manager::TargetRelationDelivery>,
+    relation_packet: Option<[u8; nt_pnp_manager::TARGET_DEVICE_RELATIONS_X64_BYTES]>,
     projected_pdo: Option<u64>,
     relation_allocation: crate::win32k_subsystem::ProviderPoolPacketLease,
     relation_address: u64,
@@ -56,9 +57,8 @@ struct Work {
     event_signaled: bool,
     event_barrier: Option<crate::source_event_completion::Barrier>,
     terminal_handoff: Option<wire::SourcePnpTerminalHandoff>,
-    terminal_packet: Option<crate::win32k_subsystem::ProviderPoolPacketLease>,
+    terminal_packet: Option<super::hosted_source_terminal_packet::RetainedTerminalPacket>,
     terminal_acknowledged: bool,
-    origin_commit_requested: bool,
     origin_committed: bool,
     discarding: bool,
     packet_prepared: bool,
@@ -302,7 +302,7 @@ pub(crate) unsafe fn submit(
         route, dispatch, reply, token, source_address, source_ticket, source_generation,
         nonce: request.nonce, iosb_va: request.iosb_va, source, target, event,
         packet_lease: Some(packet_lease), packet, canonical_irp: None, receipt: None, pending: false, origin_armed: false, entered: false,
-        terminal: None, relation: None, projected_pdo: None, relation_allocation,
+        terminal: None, relation: None, relation_packet: None, projected_pdo: None, relation_allocation,
         relation_address: request.relation_allocation_va,
         relation_generation: request.relation_allocation_generation,
         source_allocation: None,
@@ -311,7 +311,7 @@ pub(crate) unsafe fn submit(
         relation_claimed: false,
         terminal_claimed: false, terminal_published: false, event_claimed: false,
         event_signaled: false, event_barrier: None, terminal_handoff: None, terminal_packet: None,
-        terminal_acknowledged: false, origin_commit_requested: false, origin_committed: false, discarding: false,
+        terminal_acknowledged: false, origin_committed: false, discarding: false,
         packet_prepared: false, reply_entered: false,
         reply_acked: false, ack_claimed: false, resources_claimed: false,
         resources_committed: false, relation_transferred: false, cancel_requested: false,
@@ -364,6 +364,13 @@ pub(super) unsafe fn arm_pending(
 }
 
 impl Work {
+    unsafe fn terminal_step_ready(&self) -> bool {
+        self.terminal_packet.as_ref().is_none_or(|packet| {
+            !packet.needs_lane(self.discarding || self.terminal_acknowledged)
+                || crate::win32k_glue::source_terminal_dispatch_ready()
+        })
+    }
+
     unsafe fn ready_for_nested_step(&self) -> bool {
         use nt_io_manager::retained_source_progress::RetainedSourceProgress as Progress;
         let progress = if self.indeterminate {
@@ -375,7 +382,7 @@ impl Work {
                 broker_stopped: runtime::retained_service_owner_stopped_at_broker(
                     self.route, self.dispatch, self.reply, self.token,
                 ) && self.event_barrier.is_none(),
-                source_lane_ready: crate::win32k_glue::source_terminal_dispatch_ready(),
+                source_lane_ready: self.terminal_step_ready(),
             }
         } else if !self.entered {
             Progress::AwaitingDispatch { provider_ready:
@@ -394,7 +401,7 @@ impl Work {
                 cancellation_pending: false,
             }
         } else if !self.origin_committed {
-            Progress::Terminal { source_lane_ready: crate::win32k_glue::source_terminal_dispatch_ready() }
+            Progress::Terminal { source_lane_ready: self.terminal_step_ready() }
         } else {
             Progress::Retirement
         };
@@ -404,11 +411,11 @@ impl Work {
     fn progress_state(&self) -> [u64; 18] {
         [self.entered as u64, self.pending as u64, self.reply_entered as u64,
             self.reply_acked as u64, self.receipt.is_some() as u64, self.terminal.is_some() as u64,
-            self.terminal_acknowledged as u64, self.origin_commit_requested as u64,
+            self.terminal_acknowledged as u64, self.terminal_packet.as_ref().map_or(0, |packet| packet.progress()),
             self.origin_committed as u64, self.event_claimed as u64, self.event_signaled as u64,
             self.ack_claimed as u64, self.cancel_requested as u64, self.resources_committed as u64,
             self.indeterminate as u64, self.terminal_packet.is_some() as u64,
-            self.relation.is_some() as u64, self.relation_transferred as u64]
+            self.relation.is_some() as u64 | ((self.relation_packet.is_some() as u64) << 1), self.relation_transferred as u64]
     }
 
     unsafe fn source_live(&self) -> bool {
@@ -496,9 +503,13 @@ impl Work {
             self.packet_prepared = true;
         }
         let Some(packet_lease) = self.packet_lease else { return false };
-        if !crate::win32k_subsystem::publish_provider_pool_packet(
+        if let Err(error) = crate::win32k_subsystem::try_publish_root_provider_pool_packet(
             packet_lease, &self.packet,
-        ) { return false; }
+        ) {
+            self.indeterminate |= matches!(error, crate::win32k_subsystem::RootPoolError::InvalidIdentity
+                | crate::win32k_subsystem::RootPoolError::Indeterminate);
+            return false;
+        }
         self.reply_entered = true;
         self.packet_lease = None;
         drop(core::mem::take(&mut self.packet));
@@ -611,15 +622,20 @@ impl Work {
                 if relation.write_relation(io_manager_mut(), &self.allocations, &mut bytes).is_err() {
                     return false;
                 }
-                if !crate::win32k_subsystem::publish_provider_pool_packet(
-                    self.relation_allocation, &bytes,
-                ) {
-                    self.indeterminate = true;
-                    return false;
-                }
+                self.relation_packet = Some(bytes);
             }
             nt_pnp_manager::TargetRelationPhase::RelationWritten => {}
             _ => return false,
+        }
+        if let Some(bytes) = &self.relation_packet {
+            if let Err(error) = crate::win32k_subsystem::try_publish_root_provider_pool_packet(
+                self.relation_allocation, bytes,
+            ) {
+                self.indeterminate |= matches!(error, crate::win32k_subsystem::RootPoolError::InvalidIdentity
+                    | crate::win32k_subsystem::RootPoolError::Indeterminate);
+                return false;
+            }
+            self.relation_packet = None;
         }
         self.terminal = Some((receipt.status().raw() as u32, self.relation_address));
         true
@@ -627,69 +643,34 @@ impl Work {
 
     unsafe fn deliver_terminal(&mut self) -> bool {
         if self.terminal_acknowledged { return true; }
+        if self.indeterminate { return false; }
         let (status, information) = self.terminal.expect("PnP terminal result");
-        if self.terminal_handoff.is_none() {
+        if self.terminal_packet.is_none() {
             if !self.source_live() || !self.relation_live() { return false; }
             let handoff = wire::SourcePnpTerminalHandoff {
-            delivery: if self.pending { wire::TerminalDelivery::Pending } else { wire::TerminalDelivery::Inline },
-                nonce: self.nonce,
-                token: self.token,
-                source_irp_va: self.source_address,
-                source_ticket_serial: self.source_ticket,
-                native_allocation_generation: self.source_generation,
-                iosb_va: self.iosb_va,
-                relation_allocation_va: self.relation_address,
-                relation_allocation_generation: self.relation_generation,
-                status,
-                information,
+                delivery: if self.pending { wire::TerminalDelivery::Pending } else { wire::TerminalDelivery::Inline },
+                nonce: self.nonce, token: self.token, source_irp_va: self.source_address,
+                source_ticket_serial: self.source_ticket, native_allocation_generation: self.source_generation,
+                iosb_va: self.iosb_va, relation_allocation_va: self.relation_address,
+                relation_allocation_generation: self.relation_generation, status, information,
                 pdo_va: if status & 0x8000_0000 == 0 { self.projected_pdo.unwrap_or(0) } else { 0 },
             };
-            let Some((lease, mut packet)) =
-                crate::win32k_subsystem::allocate_root_provider_pool_packet(
-                    wire::TERMINAL_PACKET_BYTES,
-                )
-            else { return false };
-            if wire::encode_terminal_handoff(handoff, &mut packet).is_err()
-                || !crate::win32k_subsystem::publish_provider_pool_packet(lease, &packet)
-            {
-                if !crate::win32k_subsystem::retire_root_provider_pool_packet(lease) {
-                    crate::provider_bugcheck::report(0xc4, [self.source_address, self.token, 0, 63]);
-                }
-                return false;
-            }
+            let mut packet = Vec::new();
+            if packet.try_reserve_exact(wire::TERMINAL_PACKET_BYTES).is_err() { return false; }
+            packet.resize(wire::TERMINAL_PACKET_BYTES, 0);
+            if wire::encode_terminal_handoff(handoff, &mut packet).is_err() { return false; }
             self.terminal_handoff = Some(handoff);
-            self.terminal_packet = Some(lease);
+            self.terminal_packet = Some(super::hosted_source_terminal_packet::RetainedTerminalPacket::new(packet));
         }
+        let transport = self.terminal_packet.as_mut().expect("retained PnP terminal transport");
+        let ready = if self.discarding { transport.publish() }
+            else { transport.prepare(crate::win32k_glue::dispatch_source_pnp_terminal) };
+        if !ready { self.indeterminate |= transport.indeterminate(); return false; }
         if self.discarding { return true; }
-        let lease = self.terminal_packet.expect("retained terminal packet");
-        let dispatch = crate::win32k_glue::dispatch_source_pnp_terminal(
-            lease.address(), wire::TERMINAL_PACKET_BYTES as u64,
-        );
-        match dispatch {
-            crate::win32k_glue::SourcePnpTerminalDispatch::NotEntered(_) => return false,
-            crate::win32k_glue::SourcePnpTerminalDispatch::Returned(status)
-                if status == nt_io_manager::source_terminal::TERMINAL_NOT_READY => return false,
-            crate::win32k_glue::SourcePnpTerminalDispatch::Returned(0) => {}
-            _ => { self.indeterminate = true; return false; }
-        }
-        let (actual, packet) = match crate::win32k_subsystem::capture_provider_pool_packet(
-            lease.address(), wire::TERMINAL_PACKET_BYTES,
-        ) {
-            Ok(captured) => captured,
-            Err(_) => {
-                self.indeterminate = true;
-                return false;
-            }
-        };
-        let ack = wire::decode_terminal_ack(&packet);
-        if actual.native_identity() != lease.native_identity()
-            || !matches!(ack, Ok(ack) if
-                ack.handoff == self.terminal_handoff.expect("retained terminal handoff")
-                    && ack.publication == wire::TerminalPublication::Published)
-        {
-            self.indeterminate = true;
-            return false;
-        }
+        let valid = matches!(wire::decode_terminal_ack(transport.ack()), Ok(ack) if
+            ack.handoff == self.terminal_handoff.expect("retained terminal handoff")
+                && ack.publication == wire::TerminalPublication::Published);
+        if !transport.acknowledge_prepare(valid) { self.indeterminate = true; return false; }
         self.terminal_acknowledged = true;
         true
     }
@@ -745,13 +726,12 @@ impl Work {
         if self.indeterminate { return false; }
         if self.origin_committed { return self.event_barrier.is_none(); }
         if !self.terminal_acknowledged || !self.event_signaled { return false; }
-        let length = wire::TERMINAL_PACKET_BYTES;
-        if !super::hosted_kernel_win32k_source_ioctl::commit_origin_packet(
-            &mut self.terminal_packet, length, 96,
-            &mut self.origin_commit_requested, &mut self.indeterminate, false,
-            self.event_barrier.map_or(0, |barrier| barrier.sequence()),
-            crate::win32k_glue::dispatch_source_pnp_terminal,
-        ) { return false; }
+        if !self.terminal_packet.as_mut().expect("retained terminal transport").finish(
+            96, false, self.event_barrier.map_or(0, |barrier| barrier.sequence()), crate::win32k_glue::dispatch_source_pnp_terminal,
+        ) {
+            self.indeterminate |= self.terminal_packet.as_ref().is_some_and(|packet| packet.indeterminate());
+            return false;
+        }
         self.origin_committed = true;
         super::source_observability::origin(super::source_observability::Kind::Pnp);
         if let Some(barrier) = self.event_barrier {
@@ -911,12 +891,12 @@ impl Work {
             if self.terminal_packet.is_none() { self.terminal = Some((0xc000_0120, 0)); }
             self.discarding = true;
             if !self.deliver_terminal() { return false; }
-            let length = wire::TERMINAL_PACKET_BYTES;
-            if !super::hosted_kernel_win32k_source_ioctl::commit_origin_packet(
-                &mut self.terminal_packet, length, 96,
-                &mut self.origin_commit_requested, &mut self.indeterminate, true, 0,
-                crate::win32k_glue::dispatch_source_pnp_terminal,
-            ) { return false; }
+            if !self.terminal_packet.as_mut().expect("retained terminal transport").finish(
+                96, true, 0, crate::win32k_glue::dispatch_source_pnp_terminal,
+            ) {
+                self.indeterminate |= self.terminal_packet.as_ref().is_some_and(|packet| packet.indeterminate());
+                return false;
+            }
             self.origin_committed = true;
             if let Some(mut reference) = self.source_pdo.take() {
                 reference.release(io_manager_mut()).expect("stopped PnP source PDO");

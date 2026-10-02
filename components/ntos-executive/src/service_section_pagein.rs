@@ -207,8 +207,15 @@ pub(crate) unsafe fn service_publish_section_frame_from_bytes(
         return Err(STATUS_IO_DEVICE_ERROR);
     }
     reserve_pagein_cleanup()?;
+    let scratch = scratch_base.checked_add(DEMAND_SCRATCH_WINDOW - 0x3000)
+        .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
+    let zero_scratch = scratch_base.checked_add(DEMAND_SCRATCH_WINDOW - 0x1000)
+        .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
+    // Acquiring a cached frame already maps its zeroing alias into this root-owned window.
+    if !ensure_executive_paging(scratch) || !ensure_executive_paging(zero_scratch) {
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
     let frame = vm_frame_acquire(scratch_base)?;
-    let scratch = scratch_base + DEMAND_SCRATCH_WINDOW - 0x3000;
     if page_map_r(frame, scratch, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
         release_unpublished_section_frame(frame);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);

@@ -430,9 +430,43 @@ enum MetadataStep {
 }
 
 impl MetadataWork {
+    unsafe fn ready_for_nested_step(&self, owner: Owner, owner_cancelled: bool) -> bool {
+        use nt_memory_manager::section_metadata_progress::SectionMetadataProgress as Progress;
+        let cancelled = runtime::retained_service_cancelled(
+            owner.route, owner.dispatch, self.reply, owner.token,
+        );
+        let provider_ready = || self.capture.as_ref().is_some_and(|capture|
+            driver_launch::provider_section_target_dispatch_ready(DeviceId(capture.device_id())));
+        let progress = match self.phase {
+            MetadataPhase::Indeterminate => Progress::Indeterminate,
+            MetadataPhase::ReplyEntered => Progress::AwaitingReply {
+                acknowledged: runtime::retained_service_reply_acknowledged(
+                    owner.route, owner.dispatch, self.reply, owner.token,
+                ).unwrap_or(false),
+                cancelled,
+            },
+            MetadataPhase::Pending { irp, .. } => Progress::AwaitingCompletion {
+                completion_ready: driver_launch::nested_file_irp_completion_ready_exact(irp.raw()),
+                cancel_pending: (cancelled || owner_cancelled) && !self.cancel_requested,
+                provider_ready: provider_ready(),
+            },
+            MetadataPhase::Copying { .. } | MetadataPhase::AckPending { .. } =>
+                Progress::CopyOrAcknowledge { provider_ready: provider_ready() },
+            _ if cancelled => Progress::Local,
+            _ if owner_cancelled => Progress::Indeterminate,
+            MetadataPhase::Query if self.metadata.next_query(self.metadata_id).is_some() =>
+                Progress::Query { provider_ready: provider_ready() },
+            MetadataPhase::ReadyReply => if runtime::retained_service_reply_not_entered(
+                owner.route, owner.dispatch, self.reply, owner.token,
+            ).unwrap_or(false) { Progress::Local } else { Progress::Indeterminate },
+            MetadataPhase::Query | MetadataPhase::Reserve => Progress::Local,
+        };
+        progress.ready()
+    }
+
     unsafe fn advance(
         &mut self,
-        handler: &mut ExecNtHandler,
+        handler: *mut ExecNtHandler,
         owner: Owner,
         cancelled: bool,
     ) -> MetadataStep {
@@ -514,12 +548,17 @@ impl MetadataWork {
                 MetadataStep::Progress
             }
             MetadataPhase::Pending { irp, length } => {
-                if cancelled && !self.cancel_requested {
+                let mut cancel_sent = false;
+                if cancelled && !self.cancel_requested
+                    && self.capture.as_ref().is_some_and(|capture|
+                        driver_launch::provider_section_target_dispatch_ready(DeviceId(capture.device_id())))
+                {
                     self.cancel_requested = true;
+                    cancel_sent = true;
                     let _ = driver_launch::cancel_irp_if_pending(irp.raw());
                 }
                 let Some(completion) = driver_launch::completed_irp_exact(irp.raw()) else {
-                    return MetadataStep::Wait;
+                    return if cancel_sent { MetadataStep::Progress } else { MetadataStep::Wait };
                 };
                 let capture = self
                     .capture
@@ -617,7 +656,7 @@ impl MetadataWork {
                     self.capture.take();
                     return MetadataStep::Cancelled;
                 }
-                if let Err(status) = self.reference.validate(&handler.pm) {
+                if let Err(status) = self.reference.validate(&(*handler).pm) {
                     self.capture.take();
                     self.status = status;
                     self.phase = MetadataPhase::ReadyReply;
@@ -630,7 +669,7 @@ impl MetadataWork {
                         .expect("provider Section admission capture"),
                     metadata,
                 };
-                match handler.reserve_generic_data_section(
+                match (&mut *handler).reserve_generic_data_section(
                     owner.caller,
                     self.owner_pi,
                     self.request.desired_access,
@@ -641,7 +680,7 @@ impl MetadataWork {
                     self.request.file_handle,
                     Some(admission),
                 ) {
-                    Ok(reserved) => match Publication::prepare(handler, reserved, self.physical) {
+                    Ok(reserved) => match Publication::prepare(&mut *handler, reserved, self.physical) {
                         Ok(publication) => self.reserved = Some(publication),
                         Err(status) => self.status = status,
                     },
@@ -654,10 +693,10 @@ impl MetadataWork {
                 if cancelled {
                     return MetadataStep::Cancelled;
                 }
-                if self.reference.validate(&handler.pm).is_err() {
+                if self.reference.validate(&(*handler).pm).is_err() {
                     self.status = STATUS_CANCELLED;
                     if let Some(reserved) = self.reserved.take() {
-                        reserved.abort(handler);
+                        reserved.abort(&mut *handler);
                     }
                 }
                 self.phase = MetadataPhase::ReplyEntered;
@@ -686,7 +725,11 @@ impl MetadataWork {
                 {
                     self.phase = MetadataPhase::ReadyReply;
                 }
-                MetadataStep::Wait
+                if matches!(self.phase, MetadataPhase::ReplyEntered) {
+                    MetadataStep::Progress
+                } else {
+                    MetadataStep::Wait
+                }
             }
             MetadataPhase::ReplyEntered => {
                 if matches!(
@@ -731,8 +774,25 @@ pub(crate) fn wake_due(now: u64) -> u64 {
     u64::from(next_deadline().is_some_and(|deadline| now >= deadline))
 }
 
-pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) -> bool {
-    if next_deadline().is_none_or(|deadline| crate::monotonic_time_100ns() < deadline) {
+pub(crate) unsafe fn nested_work_ready() -> bool {
+    !EXECUTING.load(Ordering::Acquire)
+        && (&*core::ptr::addr_of!(PENDING)).iter().any(|entry| {
+            entry.metadata.as_ref().is_some_and(|work| work.ready_for_nested_step(
+                entry.owner, matches!(entry.phase, Phase::CancelledCreating),
+            ))
+        })
+}
+
+pub(crate) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
+    redrive_one(handler, true)
+}
+
+pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) -> bool {
+    redrive_one(handler, false)
+}
+
+unsafe fn redrive_one(handler: *mut ExecNtHandler, nested: bool) -> bool {
+    if handler.is_null() || (!nested && next_deadline().is_none_or(|deadline| crate::monotonic_time_100ns() < deadline)) {
         return false;
     }
     if EXECUTING.swap(true, Ordering::AcqRel) {
@@ -748,6 +808,9 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) -> bool {
     let selected = (0..count).find_map(|step| {
         let index = (start + step) % count;
         let entry = &mut (&mut *core::ptr::addr_of_mut!(PENDING))[index];
+        if !entry.metadata.as_ref().is_some_and(|work| work.ready_for_nested_step(
+            entry.owner, matches!(entry.phase, Phase::CancelledCreating),
+        )) { return None; }
         entry.metadata.take().map(|work| (entry.owner, work, index))
     });
     let mut progressed = false;
@@ -761,6 +824,7 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) -> bool {
                     Phase::CancelledCreating,
                 )
             });
+            if !work.ready_for_nested_step(owner, cancelled) { break; }
             step = work.advance(handler, owner, cancelled);
             progressed |= matches!(step, MetadataStep::Progress | MetadataStep::Replied);
             if !matches!(step, MetadataStep::Progress) {
@@ -773,14 +837,14 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) -> bool {
         match step {
             MetadataStep::Replied => {
                 work.reference
-                    .release(&mut handler.pm)
+                    .release(&mut (*handler).pm)
                     .expect("acknowledged provider Section requestor");
                 if matches!(
                     (&*core::ptr::addr_of!(PENDING))[index].phase,
                     Phase::CancelledCreating,
                 ) {
                     if let Some(reserved) = work.reserved.take() {
-                        reserved.abort(handler);
+                        reserved.abort(&mut *handler);
                     }
                     (&mut *core::ptr::addr_of_mut!(PENDING)).swap_remove(index);
                 } else if let Some(reserved) = work.reserved.take() {
@@ -808,14 +872,14 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) -> bool {
                     return progressed;
                 }
                 if let Some(reserved) = work.reserved.take() {
-                    reserved.abort(handler);
+                    reserved.abort(&mut *handler);
                 }
                 work.capture.take();
                 spawn_hosts::shared_ingress::owner::runtime::acknowledge_retained_service_cancellation(
                     owner.route, owner.dispatch, work.reply, owner.token,
                 ).expect("cancelled provider Section Reply retirement");
                 work.reference
-                    .release(&mut handler.pm)
+                    .release(&mut (*handler).pm)
                     .expect("cancelled provider Section requestor");
                 (&mut *core::ptr::addr_of_mut!(PENDING)).swap_remove(index);
                 progressed = true;
