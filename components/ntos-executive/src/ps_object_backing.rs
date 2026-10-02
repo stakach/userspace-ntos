@@ -151,8 +151,8 @@ pub(super) fn owns_root_cap(cap: u64) -> bool {
     }
 }
 
-/// This entire branch is owned by Ps, including unallocated addresses. Until exact provider
-/// grants are wired, every provider fault here is refused before client/private mapping paths.
+/// This entire branch is owned by Ps, including unallocated addresses. Provider publication
+/// must acknowledge its exact alias first; faults never authorize anonymous client backing.
 pub(super) fn contains_address(address: u64) -> bool {
     (PS_OBJECT_ARENA_BASE..PS_OBJECT_ARENA_LIMIT).contains(&address)
 }
@@ -230,6 +230,52 @@ pub(super) fn references_provider_vspace(pml4: u64) -> bool {
 pub(super) enum PublishedBody {
     Process,
     Thread,
+}
+
+/// Read provider-published Win32Thread state from this owner's acknowledged canonical body.
+/// The PM mirror may not yet have been imported while the provider's dispatch is still entered.
+pub(super) fn read_thread_win32(
+    pm: &ProcessManager,
+    lifetime: ThreadLifetime,
+) -> Result<u64, u32> {
+    let _borrow = Borrow::acquire()?;
+    let arena = unsafe { &*core::ptr::addr_of!(ARENA) }
+        .as_ref()
+        .ok_or(INVALID)?;
+    arena.validate(pm)?;
+    if pm.thread_lifetime(lifetime.thread_id()) != Some(lifetime) {
+        return Err(INVALID);
+    }
+    let body = pm
+        .thread_kernel_object(lifetime.thread_id())
+        .ok_or(INVALID)?;
+    if lifetime == arena.root.system.thread() {
+        let initial = ps_bootstrap::initial_system_projection().ok_or(INVALID)?;
+        if initial.identity != arena.root.system || body != initial.thread_body {
+            return Err(INVALID);
+        }
+        // These constructor-owned static pages remain mapped in the executive image.
+    } else {
+        let index = arena
+            .existing(BodyId::Thread(lifetime.thread_id()))
+            .ok_or(INVALID)?;
+        let row = &arena.rows[index];
+        if row.phase != BodyPhase::Published
+            || row.current_thread_lifetime != Some(lifetime)
+            || row.page.descriptor().address != body
+            || !row.page.is_initialized()
+            || !row
+                .page
+                .live_alias(MappingTarget::Executive(arena.root))
+                .is_some_and(|(cap, rights)| cap != 0 && rights == ROOT_ALIAS_RIGHTS)
+        {
+            return Err(INVALID);
+        }
+    }
+    let field = body
+        .checked_add(abi::KTHREAD_WIN32_THREAD as u64)
+        .ok_or(INVALID)?;
+    Ok(unsafe { core::ptr::read_volatile(field as *const u64) })
 }
 
 /// # Safety
@@ -495,8 +541,8 @@ impl Arena {
     }
 }
 
-/// Prepare fresh unpublished storage only. This deliberately does not change PM lookup or
-/// win32k dispatch; callers may publish only in the later, complete provider/retirement cutover.
+/// Prepare fresh unpublished storage without changing PM lookup or provider dispatch. Publish
+/// only after initialization and canonical ownership admission have completed.
 pub(super) unsafe fn prepare_process(
     pm: &ProcessManager,
     pid: ProcessId,

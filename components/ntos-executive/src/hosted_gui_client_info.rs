@@ -153,12 +153,16 @@ pub(super) unsafe fn service(
         return reject(b"process-identity", invalid);
     };
     let thread = caller.original_thread();
+    let thread_info = match ps_object_backing::read_thread_win32(&handler.pm, thread) {
+        Ok(thread_info) => thread_info,
+        Err(status) => return reject(b"canonical-thread-body", status as i32),
+    };
     let expected = [
         pi as u64,
         u64::from(process.pid),
         channel.client_generation,
         u64::from(thread.thread_id()),
-        handler.pm.thread_win32(thread.thread_id()).unwrap_or(0),
+        thread_info,
         wait_owner.dispatch_id,
         0,
         0,
@@ -176,7 +180,7 @@ pub(super) unsafe fn service(
         || packet.thread_id != u64::from(thread.thread_id())
         || logical.process() != process
         || handler.pm.thread_lifetime(thread.thread_id()) != Some(thread)
-        || handler.pm.thread_win32(thread.thread_id()) != Some(packet.thread_info)
+        || thread_info != packet.thread_info
         || packet.keyboard_present > 1
         || (packet.keyboard_present == 0
             && (packet.keyboard_hkl != 0 || packet.keyboard_codepage != 0))
@@ -241,6 +245,7 @@ pub(super) unsafe fn service(
     };
     let current_process = handler.capture_process_identity(pi);
     let current_thread = handler.pm.thread_lifetime(thread.thread_id());
+    let current_thread_info = ps_object_backing::read_thread_win32(&handler.pm, thread);
     let current_provider = crate::current_win32k_provider_domain();
     let current_teb_alias = hosted_gui_thread_teb_alias_for(
         handler,
@@ -255,7 +260,7 @@ pub(super) unsafe fn service(
         || current_thread != Some(thread)
         || current_process != Some(process)
         || handler.hosted_process_generation(pi) != Some(channel.client_generation)
-        || handler.pm.thread_win32(thread.thread_id()) != Some(packet.thread_info)
+        || current_thread_info != Ok(packet.thread_info)
         || current_teb_alias != Some(teb_alias)
     {
         let expected = [
@@ -263,7 +268,7 @@ pub(super) unsafe fn service(
             current_process.map_or(0, |process| u64::from(process.pid)),
             handler.hosted_process_generation(pi).unwrap_or(0),
             current_thread.map_or(0, |thread| u64::from(thread.thread_id())),
-            handler.pm.thread_win32(thread.thread_id()).unwrap_or(0),
+            current_thread_info.unwrap_or(0),
             win32k_glue::current_provider_poll_owner(channel).map_or(0, |owner| owner.dispatch_id),
             mapped_delta,
             current_teb_alias.unwrap_or(0),
