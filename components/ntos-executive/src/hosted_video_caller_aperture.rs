@@ -31,6 +31,18 @@ struct Mapping {
 }
 static mut MAPPINGS: Vec<alloc::boxed::Box<Mapping>> = Vec::new();
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ModeIdentity {
+    device: nt_io_manager::HostedDevicePointerRegistration,
+    provider: HostedDomainIdentity,
+    context: nt_pnp_context::ContextLeaseIdentity,
+    resource_index: u8,
+    physical: u64,
+    length: u64,
+}
+static mut MODE_EVIDENCE: nt_video_miniport::mode_evidence::ModeEvidence<ModeIdentity> =
+    nt_video_miniport::mode_evidence::ModeEvidence::new();
+
 pub(super) unsafe fn blocks_device_retirement(device: u64) -> bool {
     (&*core::ptr::addr_of!(MAPPINGS)).iter().any(|row| {
         row.transaction.phase() != AperturePhase::Retired
@@ -57,9 +69,15 @@ pub(super) unsafe fn observe_terminal(
     target: &HostedForwardTarget,
     code: u32,
     status: u32,
+    input: &[u8],
+    information: u64,
     output: &[u8],
 ) {
-    if status != 0 || code != nt_video_miniport::IOCTL_VIDEO_QUERY_CURRENT_MODE {
+    if status != 0 || !matches!(code,
+        nt_video_miniport::IOCTL_VIDEO_QUERY_CURRENT_MODE
+        | nt_video_miniport::IOCTL_VIDEO_QUERY_NUM_AVAIL_MODES
+        | nt_video_miniport::IOCTL_VIDEO_QUERY_AVAIL_MODES
+        | nt_video_miniport::IOCTL_VIDEO_SET_CURRENT_MODE) {
         return;
     }
     if !read_volatile(core::ptr::addr_of!(DRIVER_IO_MANAGER_INIT)) { return; }
@@ -76,14 +94,23 @@ pub(super) unsafe fn observe_terminal(
     if scanout == 0 || pages == 0 || state.video_memory_phys != scanout
         || state.video_memory_len == 0 || state.video_memory_len > pages * 0x1000
         || state.video_memory_caller_va != crate::win32k_subsystem::WIN32K_FB_VA
-        || io.hosted_domain_identity(state.projection_domain.domain_id) != Some(state.projection_domain)
-        || !hosted_state_address_resources(&state).iter().any(|resource| {
-            resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY
-                && resource.translated_start == scanout && resource.len == state.video_memory_len
-        }) {
+        || io.hosted_domain_identity(state.projection_domain.domain_id) != Some(state.projection_domain) {
         return;
     }
-    if let Ok(mode) = nt_video_miniport::parse_video_mode_information(output) {
+    let Some(context) = state.pnp_context_lease else { return; };
+    if !crate::hosted_pnp_context::hosted_pnp_context_lease_is_live(context) { return; }
+    let Some(resource) = hosted_state_address_resources(&state).iter().find(|resource| {
+        resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY
+            && resource.translated_start == scanout && resource.len == state.video_memory_len
+    }) else { return; };
+    let identity = ModeIdentity {
+        device: target.registration(), provider: state.projection_domain, context,
+        resource_index: resource.resource_index, physical: resource.translated_start,
+        length: resource.len,
+    };
+    // This root-only metadata update cannot dispatch or reenter; the Work capture latch owns it once.
+    if let Ok(Some(mode)) = (&mut *core::ptr::addr_of_mut!(MODE_EVIDENCE))
+        .observe(identity, code, input, status, information, output) {
         let offset = crate::FB_SCANOUT_BAR_OFFSET.load(Ordering::Acquire);
         let Some(available) = state.video_memory_len.checked_sub(offset) else { return; };
         let Some(bytes) = mode.framebuffer_bytes() else { return; };

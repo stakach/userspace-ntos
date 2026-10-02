@@ -614,7 +614,7 @@ impl Work {
             }
         }
         super::hosted_video_caller_aperture::observe_terminal(
-            &self.target, self.code, status, &self.output[..length],
+            &self.target, self.code, status, &self.input, information, &self.output[..length],
         );
         self.output_captured = true;
         true

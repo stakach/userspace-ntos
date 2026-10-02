@@ -334,3 +334,11 @@ diagnosis-free failure.
   framebuffer pixels; never let generic anonymous fault fill manufacture a device aperture.
 - Stack routing is not pointer authority. Attaching an upper driver must not revoke a producer's
   independently anchored, generation-checked projection of the same canonical device.
+
+## Test Layout Without Instantiating It
+- Check maximum-schema type sizes in a function that does not instantiate the type. A large local
+  array can overflow the test thread's stack in its prologue, before the intended size assertion.
+  Exercise growth and lifetime behavior with smaller fixtures that still cross the old limit.
+- A syntax visitor does not expand macro token bodies. Boundary tests that inspect `matches!`
+  must parse and visit its expression and pattern, rather than report absent paths or change
+  production code to accommodate an incomplete visitor.

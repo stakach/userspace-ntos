@@ -18,7 +18,9 @@ use crate::fs_loader::{
     fat_open_path_metadata_from, fat_read_file_range, fat_visit_directory_checked, FatOpenMetadata,
 };
 
-const OPEN_CAP: usize = 64;
+// Directory and installed-file handles encode a 16-bit slot index plus a 16-bit generation.
+// This is the identity-schema ceiling, not an eagerly allocated resource reservation.
+const OPEN_CAP: usize = nt_fs::MAX_FAT_OPEN_SLOTS;
 const PATH_CAP: usize = nt_fs::LAYERED_OPEN_NAME_CAP;
 
 #[derive(Clone, Copy)]
@@ -44,19 +46,56 @@ pub(crate) struct MountedVolumeBackend {
 }
 
 impl MountedVolumeBackend {
-    pub(crate) fn new(fs: crate::Fat32) -> Result<Self, NtStatus> {
-        let mut bindings = Vec::new();
-        bindings
-            .try_reserve_exact(OPEN_CAP)
-            .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
-        bindings.resize(OPEN_CAP, None);
-        Ok(Self {
+    pub(crate) fn new(fs: crate::Fat32) -> Self {
+        Self {
             fs,
             opens: nt_fs::LayeredOpenTable::new(),
             shares: nt_fs::ReadOnlyFileOpenTable::new(),
             directories: nt_fs::DirectoryOpenTable::new(),
-            bindings,
-        })
+            bindings: Vec::new(),
+        }
+    }
+
+    fn note_create_capacity_failure(&self, stage: &[u8], file_id: u64, error: NtStatus) {
+        if error != NtStatus::INSUFFICIENT_RESOURCES { return; }
+        crate::print_str(b"[mounted-create-capacity] stage=");
+        crate::print_str(stage);
+        crate::print_str(b" file=");
+        crate::print_u64(file_id);
+        crate::print_str(b" binding-slots=");
+        crate::print_u64(self.bindings.len() as u64);
+        crate::print_str(b" live-bindings=");
+        crate::print_u64(self.bindings.iter().filter(|row| row.is_some()).count() as u64);
+        crate::print_str(b" schema-slots=");
+        crate::print_u64(OPEN_CAP as u64);
+        crate::print_str(b"\n");
+    }
+
+    fn reserve_open_context(
+        &mut self,
+        file_id: u64,
+        units: &[u16],
+    ) -> Result<nt_fs::LayeredOpenContextId, NtStatus> {
+        let context = match self.opens.reserve(file_id, units) {
+            Ok(context) => context,
+            Err(error) => {
+                let error = status(error);
+                self.note_create_capacity_failure(b"context", file_id, error);
+                return Err(error);
+            }
+        };
+        let index = context_index(context).expect("context index fits shared handle schema");
+        if index >= self.bindings.len() {
+            let additional = index + 1 - self.bindings.len();
+            if self.bindings.try_reserve(additional).is_err() {
+                self.opens.cancel(context, file_id).expect("unpublished context reservation");
+                self.note_create_capacity_failure(b"binding", file_id, NtStatus::INSUFFICIENT_RESOURCES);
+                return Err(NtStatus::INSUFFICIENT_RESOURCES);
+            }
+            self.bindings.resize(index + 1, None);
+        }
+        assert!(self.bindings[index].is_none(), "new context cannot reuse a retained binding");
+        Ok(context)
     }
 
     fn create(&mut self, irp: &IrpProjection) -> Result<DispatchOutcome, NtStatus> {
@@ -241,7 +280,7 @@ impl MountedVolumeBackend {
         share: u32,
         options: u32,
     ) -> Result<DispatchOutcome, NtStatus> {
-        let context = self.opens.reserve(file_id, units).map_err(status)?;
+        let context = self.reserve_open_context(file_id, units)?;
         let directory_open = match self.directories.create(
             installed.first_cluster,
             relative,
@@ -253,6 +292,7 @@ impl MountedVolumeBackend {
         ) {
             Ok(open) => open,
             Err(error) => {
+                self.note_create_capacity_failure(b"directory", file_id, status(error));
                 self.opens
                     .cancel(context, file_id)
                     .expect("owned reservation");
@@ -301,7 +341,7 @@ impl MountedVolumeBackend {
         share: u32,
         options: u32,
     ) -> Result<DispatchOutcome, NtStatus> {
-        let context = self.opens.reserve(file_id, units).map_err(status)?;
+        let context = self.reserve_open_context(file_id, units)?;
         let installed_open = match self.shares.create(
             installed.first_cluster,
             installed.metadata.end_of_file.min(u32::MAX as u64) as u32,
@@ -314,6 +354,7 @@ impl MountedVolumeBackend {
         ) {
             Ok(installed_open) => installed_open,
             Err(error) => {
+                self.note_create_capacity_failure(b"installed-file", file_id, status(error));
                 self.opens
                     .cancel(context, file_id)
                     .expect("owned reservation");
@@ -368,15 +409,16 @@ impl MountedVolumeBackend {
         is_directory: bool,
         parameters: &nt_io_manager::CreateParameters,
     ) -> Result<DispatchOutcome, NtStatus> {
+        let context = self.reserve_open_context(file_id, units)?;
         let access = parameters.desired_access.bits();
         let share = parameters.share_access.bits();
         let options = parameters.create_options.bits();
         if let Some(source) = installed {
-            self.shares
-                .check_share(relative, source.metadata, access, share)
-                .map_err(status)?;
+            if let Err(error) = self.shares.check_share(relative, source.metadata, access, share) {
+                self.opens.cancel(context, file_id).expect("unpublished overlay context");
+                return Err(status(error));
+            }
         }
-        let context = self.opens.reserve(file_id, units).map_err(status)?;
         let result = (|| -> Result<(u64, u64), NtStatus> {
             if let Some(parent) = relative
                 .iter()
@@ -429,6 +471,7 @@ impl MountedVolumeBackend {
         let (overlay_file, information) = match result {
             Ok(result) => result,
             Err(error) => {
+                self.note_create_capacity_failure(b"overlay", file_id, error);
                 self.opens
                     .cancel(context, file_id)
                     .expect("owned reservation");
