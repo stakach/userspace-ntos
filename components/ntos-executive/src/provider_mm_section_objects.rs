@@ -12,10 +12,13 @@ const NO_MEMORY: u32 = nt_process::STATUS_INSUFFICIENT_RESOURCES;
 const FAILED: u32 = 0xc000_0001;
 const NOT_SUPPORTED: u32 = 0xc000_00bb;
 const BUSY: u32 = 0x8000_0011;
-const VIEW_START: u64 = 0x0000_0100_2000_0000;
+const VIEW_START: u64 = crate::allocator::HEAP_BASE as u64
+    + crate::allocator::HEAP_FRAMES * 0x1000;
 const VIEW_END: u64 = 0x0000_0100_3000_0000;
 const TABLE_SIZE: u64 = 0x20_0000;
 const DESCRIPTOR_SIZE: u64 = 8;
+const _: () = assert!(VIEW_START & (TABLE_SIZE - 1) == 0);
+const _: () = assert!(VIEW_START < VIEW_END);
 
 #[derive(Clone, Copy, Default)]
 struct Cap {

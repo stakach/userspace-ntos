@@ -31012,12 +31012,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for _ in 1..win32k_subsystem::WIN32K_ARG_FRAMES {
                 let _ = alloc_frame();
             }
-            // Dedicated cross-AS video IOCTL staging. EngDeviceIoControl runs in win32k, but hosted
-            // miniport IRPs are executive-owned and must cross the component boundary explicitly.
-            let video_ioctl_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_VIDEO_IOCTL_FRAMES {
-                let _ = alloc_frame();
-            }
             // Pointer-free kernel LPC staging. The executive owns the isolated LPC broker caps;
             // win32k reaches them only through its component-pump service boundary.
             let lpc_request_base = alloc_frame();
@@ -31121,14 +31115,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = page_map(
                     copy_cap(arg_base + i),
                     win32k_subsystem::WIN32K_ARG_VADDR + i * 0x1000,
-                    RW_NX,
-                    CAP_INIT_THREAD_VSPACE,
-                );
-            }
-            for i in 0..win32k_subsystem::WIN32K_VIDEO_IOCTL_FRAMES {
-                let _ = page_map(
-                    copy_cap(video_ioctl_base + i),
-                    win32k_subsystem::WIN32K_VIDEO_IOCTL_VADDR + i * 0x1000,
                     RW_NX,
                     CAP_INIT_THREAD_VSPACE,
                 );
@@ -31416,15 +31402,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     source: FrameSource::Alias(arg_base),
                     base_va: win32k_subsystem::WIN32K_ARG_VADDR,
                     count: win32k_subsystem::WIN32K_ARG_FRAMES,
-                    rights: Rights::Uniform(RW_NX),
-                    pts: 0,
-                };
-                n += 1;
-                // Video IOCTL staging (aux PT window).
-                regions[n] = Region {
-                    source: FrameSource::Alias(video_ioctl_base),
-                    base_va: win32k_subsystem::WIN32K_VIDEO_IOCTL_VADDR,
-                    count: win32k_subsystem::WIN32K_VIDEO_IOCTL_FRAMES,
                     rights: Rights::Uniform(RW_NX),
                     pts: 0,
                 };

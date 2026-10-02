@@ -2433,12 +2433,6 @@ unsafe fn component_pump_loop(
             };
             pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, module, 0, 0);
             continue;
-        } else if label == crate::win32k_subsystem::W32_VIDEO_IOCTL_LABEL
-            && ch.caps.kind == ReqKind::Syscall
-        {
-            let status = pump_service_video_device_io_control();
-            pump_reply_recv_into!(ch, *reply_cap, msg, REQUEST_TAG_LEN, status as u64);
-            continue;
         } else if label == crate::win32k_subsystem::W32_LPC_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
@@ -3840,11 +3834,6 @@ unsafe fn pump_service_user_callback(
 }
 
 #[inline(never)]
-unsafe fn pump_service_video_device_io_control() -> u32 {
-    crate::win32k_subsystem::service_video_device_io_control()
-}
-
-#[inline(never)]
 unsafe fn pump_service_lpc_request() -> i32 {
     crate::win32k_subsystem::service_lpc_request()
 }
@@ -3860,6 +3849,7 @@ pub(crate) unsafe fn pump_service_vm_fault(
     demand: u64,
 ) -> bool {
     if let Some(mapped) = crate::component_heap::service_fault(ch, addr, fsr) { return mapped; }
+    if crate::win32k_subsystem::is_reserved_win32k_video_aperture(addr) { return false; }
     // Ps storage is never generic demand-zero memory or an attached-client mapping. The
     // canonical owner must authenticate an exact provider alias before this branch can map it.
     if crate::ps_object_backing::contains_address(addr) {

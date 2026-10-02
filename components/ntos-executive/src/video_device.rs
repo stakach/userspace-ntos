@@ -15,10 +15,7 @@ use nt_io_manager::{
 };
 use nt_status::NtStatus;
 use crate::win32k_subsystem::RootProviderPoolAllocation;
-use nt_video_miniport::{
-    VideoMiniportError, IOCTL_VIDEO_INIT_WIN32K_CALLBACKS, IOCTL_VIDEO_UNMAP_VIDEO_MEMORY,
-    VIDEO_DEVICE_MAP_KEY, VIDEO_DEVICE_MAP_MAX_OBJECT_VALUE, VIDEO_WIN32K_CALLBACKS_SIZE_X64,
-};
+use nt_video_miniport::{VIDEO_DEVICE_MAP_KEY, VIDEO_DEVICE_MAP_MAX_OBJECT_VALUE};
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_NO_MEMORY: i32 = 0xC000_0017u32 as i32;
@@ -748,104 +745,4 @@ pub(crate) unsafe fn release_video_file_projection(object: u64) -> Result<u64, i
 pub(crate) unsafe fn video_file_projection_reference_count() -> u64 {
     let route = video_state_snapshot().route;
     video_projection_owners::pointer_reference_count(route.owner_id).unwrap_or(0) as u64
-}
-
-pub(crate) unsafe fn video_device_io_control(
-    hdev: u64,
-    ioctl: u64,
-    in_buf: u64,
-    in_len: u64,
-    out_buf: u64,
-    out_len: u64,
-    bytes_ret: *mut u32,
-) -> u32 {
-    if !projected_video_route_ready() {
-        return 1;
-    }
-    let state = video_state_snapshot();
-    let objects = state.objects;
-    if hdev != objects.device {
-        return 1;
-    }
-    if ioctl > u32::MAX as u64 {
-        return 1;
-    }
-    let set_ret = |n: u32| {
-        if !bytes_ret.is_null() {
-            write_unaligned(bytes_ret, n);
-        }
-    };
-    let input = if in_len == 0 {
-        &[]
-    } else if in_buf != 0 {
-        core::slice::from_raw_parts(in_buf as *const u8, in_len as usize)
-    } else {
-        return 1;
-    };
-    let output = if out_len == 0 {
-        &mut []
-    } else if out_buf != 0 {
-        core::slice::from_raw_parts_mut(out_buf as *mut u8, out_len as usize)
-    } else {
-        return 1;
-    };
-    if let Some(information) =
-        dispatch_video_port_owned_control(ioctl as u32, input, output, objects.device)
-    {
-        match information {
-            Ok(information) if information <= u32::MAX as usize => {
-                set_ret(information as u32);
-                return 0;
-            }
-            _ => return 1,
-        }
-    }
-    match state.route.backend {
-        VideoRouteBackend::HostedIoManager => {
-            match crate::driver_launch::device_control_on_io_handle(
-                state.route.file_handle,
-                ioctl as u32,
-                input,
-                output,
-            ) {
-                Ok(information) if information <= u32::MAX as u64 => {
-                    set_ret(information as u32);
-                    0
-                }
-                _ => 1,
-            }
-        }
-        VideoRouteBackend::Empty => 1,
-    }
-}
-
-fn dispatch_video_port_owned_control(
-    ioctl: u32,
-    input: &[u8],
-    output: &mut [u8],
-    video_device_object: u64,
-) -> Option<Result<usize, VideoMiniportError>> {
-    match ioctl {
-        IOCTL_VIDEO_INIT_WIN32K_CALLBACKS => {
-            if input.len() < 16 {
-                return Some(Err(VideoMiniportError::BufferTooSmall { needed: 16 }));
-            }
-            if output.len() < VIDEO_WIN32K_CALLBACKS_SIZE_X64 {
-                return Some(Err(VideoMiniportError::BufferTooSmall {
-                    needed: VIDEO_WIN32K_CALLBACKS_SIZE_X64,
-                }));
-            }
-            let mut phys_disp = [0u8; 8];
-            phys_disp.copy_from_slice(&input[..8]);
-            let mut callout = [0u8; 8];
-            callout.copy_from_slice(&input[8..16]);
-            output[..VIDEO_WIN32K_CALLBACKS_SIZE_X64].fill(0);
-            output[..8].copy_from_slice(&phys_disp);
-            output[8..16].copy_from_slice(&callout);
-            output[24..32].copy_from_slice(&video_device_object.to_le_bytes());
-            Some(Ok(VIDEO_WIN32K_CALLBACKS_SIZE_X64))
-        }
-        IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Some(Err(VideoMiniportError::UnsupportedIoctl)),
-        _ => None,
-    }
 }

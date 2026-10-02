@@ -196,51 +196,39 @@ impl MountedVolumeBackend {
         let access = parameters.desired_access.bits();
         let share = parameters.share_access.bits();
         let options = parameters.create_options.bits();
-        if options & nt_fs::FILE_NON_DIRECTORY_FILE != 0 {
-            return Err(status(nt_fs::STATUS_FILE_IS_A_DIRECTORY));
-        }
-        if overlay.is_some_and(|entry| !entry.is_directory)
-            || (overlay.is_none() && installed.is_some_and(|entry| !entry.metadata.is_directory))
-        {
-            return Err(status(nt_fs::STATUS_NOT_A_DIRECTORY));
-        }
-        if overlay.is_none() && installed.is_none() {
-            return Err(NtStatus::NOT_SUPPORTED);
-        }
-        if relative.is_empty() && options & nt_fs::FILE_DELETE_ON_CLOSE != 0 {
-            return Err(status(nt_fs::STATUS_CANNOT_DELETE));
-        }
-        if !matches!(
+        let decision = nt_fs::layered_directory_open_decision(
+            installed.map(|entry| entry.metadata.is_directory),
+            overlay.map(|entry| entry.is_directory),
             parameters.create_disposition,
-            nt_fs::FILE_CREATE | nt_fs::FILE_OPEN | nt_fs::FILE_OPEN_IF
-        ) {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-        if parameters.create_disposition == nt_fs::FILE_CREATE {
-            return Err(NtStatus::OBJECT_NAME_COLLISION);
-        }
-        if let Some(source) = installed.filter(|source| source.metadata.is_directory) {
-            self.directories
-                .check_share(relative, source.metadata, access, share)
-                .map_err(status)?;
-            let action = nt_fs::installed_file_open_action(
-                access,
-                parameters.create_disposition,
-                options & !nt_fs::FILE_DIRECTORY_FILE,
-            )
-            .map_err(status)?;
-            if action != nt_fs::InstalledFileOpenAction::ReadOnly {
-                return Err(NtStatus::NOT_SUPPORTED);
-            }
-            if overlay.is_none() || relative.is_empty() {
-                return self.create_installed_directory(
+            options,
+            relative.is_empty(),
+        ).map_err(status)?;
+        match decision {
+            nt_fs::LayeredDirectoryOpenDecision::Installed => {
+                let source = installed.expect("directory policy selected installed backing");
+                // Directory ADD_FILE/ADD_SUBDIRECTORY grants apply to layered children, not writes
+                // to immutable FAT bytes. Deleting a lower entry still requires whiteout support.
+                if options & nt_fs::FILE_DELETE_ON_CLOSE != 0 {
+                    return Err(NtStatus::NOT_SUPPORTED);
+                }
+                self.create_installed_directory(
                     file_id, units, relative, source, access, share, options,
-                );
+                )
             }
+            nt_fs::LayeredDirectoryOpenDecision::Overlay => {
+                if let Some(source) = installed.filter(|source| source.metadata.is_directory) {
+                    self.directories
+                        .check_share(relative, source.metadata, access, share)
+                        .map_err(status)?;
+                }
+                self.create_overlay(
+                    file_id, units, relative, installed, None, false, true, parameters,
+                )
+            }
+            nt_fs::LayeredDirectoryOpenDecision::CreateOverlay => self.create_overlay(
+                file_id, units, relative, None, None, true, true, parameters,
+            ),
         }
-        self.create_overlay(
-            file_id, units, relative, installed, None, false, true, parameters,
-        )
     }
 
     fn create_installed_directory(

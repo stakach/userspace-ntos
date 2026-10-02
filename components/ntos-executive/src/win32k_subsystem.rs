@@ -345,16 +345,10 @@ const _: () = assert!(
 );
 const _: () =
     assert!(WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET + 8 <= WIN32K_MESSAGE_STAGE_SLOT_BYTES);
-/// Dedicated cross-address-space video-control window. `EngDeviceIoControl` runs in the win32k
-/// component, but hosted miniport IRPs are executive-owned; this window carries bounded METHOD_BUFFERED
-/// input/output bytes without reusing the live syscall ARG frame or the user-callback shared page.
-pub const WIN32K_VIDEO_IOCTL_VADDR: u64 = 0x0000_0100_071C_0000;
-pub const WIN32K_VIDEO_IOCTL_FRAMES: u64 = 4;
-pub const WIN32K_VIDEO_IOCTL_BYTES: usize = (WIN32K_VIDEO_IOCTL_FRAMES as usize) * 0x1000;
 /// Dedicated cross-address-space LPC request window. Kernel LPC imports execute inside the win32k
 /// component, while the isolated LPC broker channel belongs to the executive's CSpace. The
 /// component therefore stages one bounded, pointer-free request here and calls the executive pump.
-pub const WIN32K_LPC_VADDR: u64 = WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000;
+pub const WIN32K_LPC_VADDR: u64 = 0x0000_0100_071C_4000;
 pub const WIN32K_LPC_FRAMES: u64 = 1;
 pub const WIN32K_LPC_BYTES: usize = (WIN32K_LPC_FRAMES as usize) * 0x1000;
 /// Dedicated pointer-free staging for native atom services redirected to a job-private win32k
@@ -374,9 +368,7 @@ pub const WIN32K_REGISTRY_BYTES: usize = (WIN32K_REGISTRY_FRAMES as usize) * 0x1
 /// generic ARG window, so it gets a dedicated shared 2 MiB PT window between AUX and the session heap.
 pub const WIN32K_BULK_ARG_VADDR: u64 = 0x0000_0100_0720_0000;
 pub const WIN32K_BULK_ARG_FRAMES: u64 = 512;
-const _: () = assert!(WIN32K_ARG_VADDR + WIN32K_ARG_FRAMES * 0x1000 <= WIN32K_VIDEO_IOCTL_VADDR);
-const _: () =
-    assert!(WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000 <= WIN32K_LPC_VADDR);
+const _: () = assert!(WIN32K_ARG_VADDR + WIN32K_ARG_FRAMES * 0x1000 <= WIN32K_LPC_VADDR);
 const _: () =
     assert!(WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_FRAMES * 0x1000 <= WIN32K_BULK_ARG_VADDR);
 /// Kernel-mode KUSER_SHARED_DATA mapping used by win32k's direct `SharedUserData` reads. User
@@ -1301,9 +1293,6 @@ pub const W32_USER_CALLBACK_RESUME_LABEL: u64 = 0x773;
 /// cannot do executive-owned filesystem/capability work in win32k's VSpace, so it sends the bounded
 /// driver leaf through the shared page and waits while the executive performs the real load.
 pub const W32_GDI_LOAD_LABEL: u64 = 0x774;
-/// A component-side `EngDeviceIoControl` request. The display driver and win32k run in the win32k
-/// component, while hosted video miniport IRPs belong to the executive's generic IO manager.
-pub const W32_VIDEO_IOCTL_LABEL: u64 = 0x775;
 /// A component-side kernel LPC request. Broker capabilities stay executive-owned; the component
 /// passes only an operation, an opaque broker handle, and a bounded native PORT_MESSAGE frame.
 pub const W32_LPC_LABEL: u64 = 0x776;
@@ -1471,21 +1460,6 @@ unsafe fn provider_event_projection_begin_reclaim(
     (&mut *core::ptr::addr_of_mut!(WIN32K_EVENT_PROJECTIONS))
         .begin_reclaim(body, nt_kernel_exec::EventObjectId(nt_types::ObjectId(raw_id)))
 }
-
-const VIDEO_IOCTL_HDEV: u64 = 0x00;
-const VIDEO_IOCTL_CODE: u64 = 0x08;
-const VIDEO_IOCTL_IN_LEN: u64 = 0x10;
-const VIDEO_IOCTL_OUT_LEN: u64 = 0x18;
-const VIDEO_IOCTL_STATUS: u64 = 0x20;
-const VIDEO_IOCTL_BYTES_RETURNED: u64 = 0x28;
-const VIDEO_IOCTL_IN_BUF: u64 = 0x100;
-const VIDEO_IOCTL_IN_CAP: usize = 0x1000;
-const VIDEO_IOCTL_OUT_BUF: u64 = VIDEO_IOCTL_IN_BUF + VIDEO_IOCTL_IN_CAP as u64;
-const VIDEO_IOCTL_OUT_CAP: usize = WIN32K_VIDEO_IOCTL_BYTES - VIDEO_IOCTL_OUT_BUF as usize;
-const _: () =
-    assert!(VIDEO_IOCTL_OUT_BUF as usize + VIDEO_IOCTL_OUT_CAP <= WIN32K_VIDEO_IOCTL_BYTES);
-static WIN32K_VIDEO_IOCTL_TRACE: AtomicU64 = AtomicU64::new(0);
-static WIN32K_VIDEO_IOCTL_REQUEST_TRACE: AtomicU64 = AtomicU64::new(0);
 
 const LPC_SERVICE_PORT_HANDLE: u64 = 0x00;
 const LPC_SERVICE_OPERATION: u64 = 0x08;
@@ -14476,207 +14450,6 @@ extern "win64" fn s_io_get_related_device_object(file_object: u64) -> u64 {
     }
 }
 
-#[inline]
-unsafe fn write_eng_device_io_control_bytes_returned(bytes_ret: *mut u32, value: u32) {
-    if !bytes_ret.is_null() {
-        write_unaligned(bytes_ret, value);
-    }
-}
-
-#[inline(never)]
-unsafe fn request_video_device_io_control(
-    hdev: u64,
-    ioctl: u32,
-    in_buf: u64,
-    in_len: u32,
-    out_buf: u64,
-    out_len: u32,
-    bytes_ret: *mut u32,
-) -> u32 {
-    write_eng_device_io_control_bytes_returned(bytes_ret, 0);
-    let in_len = in_len as u64;
-    let out_len = out_len as u64;
-    let invalid = in_len > VIDEO_IOCTL_IN_CAP as u64
-        || out_len > VIDEO_IOCTL_OUT_CAP as u64
-        || (in_len != 0 && in_buf == 0)
-        || (out_len != 0 && out_buf == 0);
-    let seq = WIN32K_VIDEO_IOCTL_REQUEST_TRACE.fetch_add(1, Ordering::Relaxed);
-    if seq < 64 {
-        print_str(b"[win32k-video-ioctl-request] hdev=0x");
-        print_hex((hdev >> 32) as u32);
-        print_hex(hdev as u32);
-        print_str(b" ioctl=0x");
-        print_hex(ioctl as u32);
-        print_str(b" in/out=");
-        print_u64(in_len);
-        print_str(b"/");
-        print_u64(out_len);
-        print_str(b" inbuf=0x");
-        print_hex((in_buf >> 32) as u32);
-        print_hex(in_buf as u32);
-        print_str(b" outbuf=0x");
-        print_hex((out_buf >> 32) as u32);
-        print_hex(out_buf as u32);
-        print_str(b" bytes=0x");
-        print_hex(((bytes_ret as u64) >> 32) as u32);
-        print_hex((bytes_ret as u64) as u32);
-        print_str(b" invalid=");
-        print_u64(invalid as u64);
-        print_str(b"\n");
-    }
-    if invalid {
-        return 1;
-    }
-
-    let sh = WIN32K_VIDEO_IOCTL_VADDR;
-    for index in 0..in_len as usize {
-        let value = read_volatile((in_buf + index as u64) as *const u8);
-        write_volatile((sh + VIDEO_IOCTL_IN_BUF + index as u64) as *mut u8, value);
-    }
-    for index in 0..out_len as usize {
-        write_volatile((sh + VIDEO_IOCTL_OUT_BUF + index as u64) as *mut u8, 0);
-    }
-    write_volatile((sh + VIDEO_IOCTL_HDEV) as *mut u64, hdev);
-    write_volatile((sh + VIDEO_IOCTL_CODE) as *mut u64, ioctl as u64);
-    write_volatile((sh + VIDEO_IOCTL_IN_LEN) as *mut u64, in_len);
-    write_volatile((sh + VIDEO_IOCTL_OUT_LEN) as *mut u64, out_len);
-    write_volatile((sh + VIDEO_IOCTL_STATUS) as *mut u32, 1);
-    write_volatile((sh + VIDEO_IOCTL_BYTES_RETURNED) as *mut u32, 0);
-
-    let _ = crate::driver_launch::call_on(W32_VIDEO_IOCTL_LABEL << 12);
-    let status = read_volatile((sh + VIDEO_IOCTL_STATUS) as *const u32);
-    let bytes_returned = read_volatile((sh + VIDEO_IOCTL_BYTES_RETURNED) as *const u32);
-    let copy_len = core::cmp::min(bytes_returned as u64, out_len) as usize;
-    if status == 0 {
-        for index in 0..copy_len {
-            let value = read_volatile((sh + VIDEO_IOCTL_OUT_BUF + index as u64) as *const u8);
-            write_volatile((out_buf + index as u64) as *mut u8, value);
-        }
-    }
-    write_eng_device_io_control_bytes_returned(bytes_ret, bytes_returned);
-    status
-}
-
-#[inline(never)]
-pub(crate) unsafe fn service_video_device_io_control() -> u32 {
-    let sh = WIN32K_VIDEO_IOCTL_VADDR;
-    let hdev = read_volatile((sh + VIDEO_IOCTL_HDEV) as *const u64);
-    let ioctl = read_volatile((sh + VIDEO_IOCTL_CODE) as *const u64);
-    let in_len = read_volatile((sh + VIDEO_IOCTL_IN_LEN) as *const u64);
-    let out_len = read_volatile((sh + VIDEO_IOCTL_OUT_LEN) as *const u64);
-    let mut bytes_returned = 0u32;
-    let status = if ioctl > u32::MAX as u64
-        || in_len > VIDEO_IOCTL_IN_CAP as u64
-        || out_len > VIDEO_IOCTL_OUT_CAP as u64
-    {
-        1
-    } else {
-        crate::video_device::video_device_io_control(
-            hdev,
-            ioctl,
-            sh + VIDEO_IOCTL_IN_BUF,
-            in_len,
-            sh + VIDEO_IOCTL_OUT_BUF,
-            out_len,
-            &mut bytes_returned as *mut u32,
-        )
-    };
-    if status != 0 {
-        bytes_returned = 0;
-    } else if ioctl == nt_video_miniport::IOCTL_VIDEO_QUERY_CURRENT_MODE as u64
-        && bytes_returned as usize >= nt_video_miniport::VIDEO_MODE_INFORMATION_SIZE
-    {
-        let output = core::slice::from_raw_parts(
-            (sh + VIDEO_IOCTL_OUT_BUF) as *const u8,
-            bytes_returned as usize,
-        );
-        if let Ok(mode) = nt_video_miniport::parse_video_mode_information(output) {
-            let _ = crate::publish_active_framebuffer_mode(mode);
-        }
-    } else if ioctl == nt_video_miniport::IOCTL_VIDEO_SET_CURRENT_MODE as u64 {
-        let mut current_mode_bytes = 0u32;
-        let query_status = crate::video_device::video_device_io_control(
-            hdev,
-            nt_video_miniport::IOCTL_VIDEO_QUERY_CURRENT_MODE as u64,
-            0,
-            0,
-            sh + VIDEO_IOCTL_OUT_BUF,
-            nt_video_miniport::VIDEO_MODE_INFORMATION_SIZE as u64,
-            &mut current_mode_bytes,
-        );
-        if query_status == 0
-            && current_mode_bytes as usize >= nt_video_miniport::VIDEO_MODE_INFORMATION_SIZE
-        {
-            let output = core::slice::from_raw_parts(
-                (sh + VIDEO_IOCTL_OUT_BUF) as *const u8,
-                current_mode_bytes as usize,
-            );
-            if let Ok(mode) = nt_video_miniport::parse_video_mode_information(output) {
-                let _ = crate::publish_active_framebuffer_mode(mode);
-            }
-        }
-    }
-    write_volatile((sh + VIDEO_IOCTL_STATUS) as *mut u32, status);
-    write_volatile(
-        (sh + VIDEO_IOCTL_BYTES_RETURNED) as *mut u32,
-        bytes_returned,
-    );
-    let seq = WIN32K_VIDEO_IOCTL_TRACE.fetch_add(1, Ordering::Relaxed);
-    if seq < 64 {
-        print_str(b"[win32k-video-ioctl] hdev=0x");
-        print_hex((hdev >> 32) as u32);
-        print_hex(hdev as u32);
-        print_str(b" ioctl=0x");
-        print_hex(ioctl as u32);
-        print_str(b" in/out=");
-        print_u64(in_len);
-        print_str(b"/");
-        print_u64(out_len);
-        print_str(b" status=");
-        print_u64(status as u64);
-        print_str(b" bytes=");
-        print_u64(bytes_returned as u64);
-        print_str(b"\n");
-    }
-    status
-}
-
-/// win32k's `EngDeviceIoControl` — INTERCEPTED (win32k's export is patched to jmp here in
-/// `load_into`, so both the display DLL's imported calls and win32k's own internal calls route into
-/// the executive-owned video-device boundary). Returns 0 (ERROR_SUCCESS) on handled, nonzero on
-/// unhandled. win64: rcx=hDev, edx=ioctl, r8=inbuf, r9d=inlen, stack: outbuf, outlen(ULONG),
-/// bytesret.
-extern "win64" fn s_eng_device_io_control(
-    hdev: u64,
-    ioctl: u32,
-    in_buf: u64,
-    in_len: u32,
-    out_buf: u64,
-    out_len: u32,
-    bytes_ret: *mut u32,
-) -> u32 {
-    unsafe {
-        request_video_device_io_control(hdev, ioctl, in_buf, in_len, out_buf, out_len, bytes_ret)
-    }
-}
-
-/// Patch win32k's exported `EngDeviceIoControl` to `jmp s_eng_device_io_control`. Runs in `load_into`
-/// while win32k's image is mapped RW in the executive (before spawn maps it RX). 12 bytes:
-/// `mov rax, imm64 (48 B8 ..); jmp rax (FF E0)`. Both the display DLL's IAT-resolved import AND win32k's own
-/// internal EngDeviceIoControl callers then route to our video-IOCTL handler.
-unsafe fn patch_eng_device_io_control() {
-    let va = pe_export_lookup(WIN32K_CODE_VA, b"EngDeviceIoControl\0");
-    if va == 0 {
-        print_str(b"[win32k fb] WARN: EngDeviceIoControl export not found\n");
-        return;
-    }
-    let tgt = s_eng_device_io_control as usize as u64;
-    write_volatile(va as *mut u8, 0x48);
-    write_volatile((va + 1) as *mut u8, 0xB8);
-    write_unaligned((va + 2) as *mut u64, tgt);
-    write_volatile((va + 10) as *mut u8, 0xFF);
-    write_volatile((va + 11) as *mut u8, 0xE0);
-}
 
 /// win32k's KeGetCurrentIrql helper RVA — `mov rax, cr8` (bytes 44 0F 20 C0) followed by `ret`. The
 /// unique CR8 access in the image (verified by opcode scan).
@@ -16312,9 +16085,6 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) ->
             desc_rva += 20;
         }
     }
-
-    // Patch win32k's EngDeviceIoControl export to the executive-owned video-device boundary.
-    patch_eng_device_io_control();
 
     // CR8 is privileged; its getter must observe the exact executing provider activation.
     if !patch_ke_get_current_irql() {
@@ -18512,6 +18282,12 @@ unsafe fn record_registered_ntuser_handler() {
 /// Reserved caller aperture for the assigned display resource grant. Actual visibility belongs
 /// to the video-memory mapping transaction, never to loading a particular display image.
 pub const WIN32K_FB_VA: u64 = 0x0000_0100_0900_0000;
+
+/// Reservation geometry is not mapping authority. Only the resource-backed transaction may
+/// populate this band; an unbacked fault must never acquire anonymous private memory.
+pub(crate) const fn is_reserved_win32k_video_aperture(address: u64) -> bool {
+    address >= WIN32K_FB_VA && address < WIN32K_POOL_VADDR
+}
 
 
 /// Walk an already-mapped image's export table (data-dir 0) at `base`; return the VA of the export

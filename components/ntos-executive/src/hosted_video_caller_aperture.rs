@@ -52,6 +52,46 @@ fn native_error(error: u64) -> nt_status::NtStatus {
     }
 }
 
+/// Observe captured completion bytes without issuing I/O or altering the source IRP result.
+pub(super) unsafe fn observe_terminal(
+    target: &HostedForwardTarget,
+    code: u32,
+    status: u32,
+    output: &[u8],
+) {
+    if status != 0 || code != nt_video_miniport::IOCTL_VIDEO_QUERY_CURRENT_MODE {
+        return;
+    }
+    if !read_volatile(core::ptr::addr_of!(DRIVER_IO_MANAGER_INIT)) { return; }
+    let io = (&*core::ptr::addr_of!(DRIVER_IO_MANAGER)).assume_init_ref();
+    if target.validate(io).is_err()
+        || io.device(target.device_id()).is_none_or(|device| device.delete_pending) {
+        return;
+    }
+    let Some(state) = hosted_device_resource_state_by_device_id(target.device_id().raw()) else {
+        return;
+    };
+    let scanout = crate::FB_BAR_PADDR.load(Ordering::Acquire);
+    let pages = crate::FB_BAR_FRAME_COUNT.load(Ordering::Acquire);
+    if scanout == 0 || pages == 0 || state.video_memory_phys != scanout
+        || state.video_memory_len == 0 || state.video_memory_len > pages * 0x1000
+        || state.video_memory_caller_va != crate::win32k_subsystem::WIN32K_FB_VA
+        || io.hosted_domain_identity(state.projection_domain.domain_id) != Some(state.projection_domain)
+        || !hosted_state_address_resources(&state).iter().any(|resource| {
+            resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY
+                && resource.translated_start == scanout && resource.len == state.video_memory_len
+        }) {
+        return;
+    }
+    if let Ok(mode) = nt_video_miniport::parse_video_mode_information(output) {
+        let offset = crate::FB_SCANOUT_BAR_OFFSET.load(Ordering::Acquire);
+        let Some(available) = state.video_memory_len.checked_sub(offset) else { return; };
+        let Some(bytes) = mode.framebuffer_bytes() else { return; };
+        if bytes == 0 || bytes > available { return; }
+        let _ = crate::publish_active_framebuffer_mode(mode);
+    }
+}
+
 /// No caller-visible address is returned before every page has an acknowledged mapping.
 pub(super) unsafe fn prepare(
     route: nt_component_suspension::peer_registry::PeerRoute,

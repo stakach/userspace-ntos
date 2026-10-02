@@ -45052,21 +45052,6 @@ pub(crate) fn open_io_device(
     Ok((handle.0, file_id.raw(), device_id.raw(), file_object_id.0))
 }
 
-pub(crate) fn device_control_on_io_handle(
-    handle: u64,
-    ioctl: u32,
-    input: &[u8],
-    output: &mut [u8],
-) -> Result<u64, nt_status::NtStatus> {
-    io_manager_mut().device_control(
-        ClientId(IO_MANAGER_COMPONENT_ID),
-        HandleValue(handle),
-        ioctl,
-        input,
-        output,
-    )
-}
-
 #[inline(never)]
 pub(crate) fn close_io_handle(handle: u64) -> Result<(), nt_status::NtStatus> {
     io_manager_mut().close(ClientId(IO_MANAGER_COMPONENT_ID), HandleValue(handle))

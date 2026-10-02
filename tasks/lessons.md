@@ -326,3 +326,11 @@ diagnosis-free failure.
 - Sharing admission and FILE_OBJECT body ownership have different lifetimes. Release sharing at
   CLEANUP, but retain metadata and position until CLOSE; reuse the existing independent-reference
   contract rather than duplicating file state in a second table.
+
+## Reservations Are Address-Space Ownership
+- Expanding a demand-backed heap reserves virtual addresses and page-table coverage even before
+  physical pages commit. Check neighboring arenas against the full reservation, not initial pages.
+- Successful callbacks and drawing calls do not prove scanout. Verify assigned device backing and
+  framebuffer pixels; never let generic anonymous fault fill manufacture a device aperture.
+- Stack routing is not pointer authority. Attaching an upper driver must not revoke a producer's
+  independently anchored, generation-checked projection of the same canonical device.
