@@ -1802,12 +1802,10 @@ unsafe fn lpc_component_wait_select_ready() -> u64 {
 
 unsafe fn lpc_component_reply_commit_drain(
     nt_handler: &mut ExecNtHandler,
-    procs: &mut [ProcExec],
-    pfilled: &mut [[u64; 512]],
 ) -> u64 {
     let selected = lpc_component_wait_select_ready();
     if selected != 0 {
-        let _ = component_suspension_drain_ready(nt_handler, procs, pfilled);
+        let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
     }
     selected
 }
@@ -1823,24 +1821,6 @@ enum ComponentSuspensionRuntimeOutcome {
     Parked,
     Terminal,
     Rearmed,
-}
-
-unsafe fn component_suspension_resume_top(
-    nt_handler: &mut ExecNtHandler,
-) -> Option<ComponentSuspensionRuntimeOutcome> {
-    if component_resume::is_running() {
-        return None;
-    }
-    loop {
-        let candidate = component_resume::next_ready(&nt_handler.pm)?;
-        if matches!(candidate.continuation, ComponentNativeContinuation::Kernel(_)) {
-            return None;
-        }
-        match component_resume::run_hosted(core::ptr::from_mut(nt_handler), candidate)? {
-            ComponentSuspensionRuntimeOutcome::Rearmed => continue,
-            outcome => return Some(outcome),
-        }
-    }
 }
 
 pub(crate) fn provider_wait_oldest_event_consumer_sequence<B>(
@@ -2175,38 +2155,6 @@ unsafe fn lpc_wait_admit_current(
     true
 }
 
-unsafe fn component_suspension_drain_ready(
-    nt_handler: &mut ExecNtHandler,
-    procs: &mut [ProcExec],
-    pfilled: &mut [[u64; 512]],
-) -> u64 {
-    if component_resume::is_running() {
-        return 0;
-    }
-    let mut drained = 0;
-    loop {
-        drained += component_terminal::drain(nt_handler, procs, pfilled);
-        let Some(outcome) = component_suspension_resume_top(nt_handler) else {
-            break;
-        };
-        match outcome {
-            // This lane yielded the execution token while re-arming a new provider/LPC wait.
-            // Another lane may already have a selected completion, so keep draining until the
-            // coordinator reports that no resumable lane remains.
-            ComponentSuspensionRuntimeOutcome::Parked
-            | ComponentSuspensionRuntimeOutcome::Rearmed
-            | ComponentSuspensionRuntimeOutcome::Terminal => continue,
-        }
-    }
-    if nt_handler.lpc_endpoint_progress {
-        // A component-originated request bypasses ExecNtHandler's normal syscall post-action.
-        // Redrive the ordinary broker waiters here so the server can accept the request before the
-        // next recv. Reply selection is owned by the server's explicit native-reply/park barrier.
-        let _ = lpc_endpoint_redrive_all(nt_handler);
-    }
-    drained
-}
-
 unsafe fn component_suspension_cancel_scope(
     nt_handler: &mut ExecNtHandler,
     scope: nt_component_suspension::SuspensionScope,
@@ -2266,10 +2214,10 @@ unsafe fn component_suspension_cancel_scope(
         PROVIDER_WAIT_CANCELLATIONS.fetch_add(1, Ordering::Relaxed);
     }
 
-    let Some(ctx) = nt_handler.loop_ctx else {
+    if nt_handler.loop_ctx.is_none() {
         return false;
-    };
-    let _ = component_suspension_drain_ready(nt_handler, &mut *ctx.procs, &mut *ctx.pfilled);
+    }
+    let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
     !(&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).contains_scope(scope)
 }
 
@@ -2749,7 +2697,7 @@ unsafe fn drain_deferred_user_callback_returns(
                         }),
                     ));
                     retained_reply = true;
-                    let _ = component_suspension_drain_ready(nt_handler, procs, pfilled);
+                    let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                 }
                 win32k_glue::CompletedUserCallback::LpcWaitSuspended {
                     pending,
@@ -2766,7 +2714,7 @@ unsafe fn drain_deferred_user_callback_returns(
                         }),
                     ));
                     retained_reply = true;
-                    let _ = component_suspension_drain_ready(nt_handler, procs, pfilled);
+                    let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                 }
             }
         } else {
@@ -9358,11 +9306,10 @@ pub(crate) unsafe fn service_sec_image(
     // each win32k dispatch is a whole-component TCG round-trip taking SECONDS, so the loop does only
     // ~1-2 iterations/sec and an iter-count stall never trips within the boot budget). `last_progress_t`
     // is the monotonic time (100ns units) at the last epoch bump (a new image/page publication,
-    // one-shot shell milestone, or committed registry mutation). If no progress happens for STALL_BUDGET_100NS of
-    // WALL-CLOCK time, forward progress is impossible (every live process cooperatively parked with no
-    // signaler, or a slow win32k live-lock that WALLs without loading/filling anything new) → QUIESCE
-    // (break → run the gate + qemu_exit). Generous enough that a genuinely-advancing (even if slow)
-    // boot phase — which keeps filling pages / loading DLLs — never trips; only a true stall does.
+    // finite credential/dialog or shell milestone, or committed registry mutation). An expired
+    // milestone window requests bounded stall validation, not proof of a deadlock. Evaluate it
+    // only without an owned client ingress: every accepted Call must reach dispatch and its
+    // exact reply/park boundary before validation may stop the service loop.
     const STALL_BUDGET_100NS: u64 = 45 * 10_000_000; // 45 s of NO forward progress
     let progress_epoch = || {
         boot_progress_epoch().wrapping_add(
@@ -9573,7 +9520,7 @@ pub(crate) unsafe fn service_sec_image(
             // Timer drains are scheduler bookkeeping, not forward progress by themselves. The
             // resumed waiter records a boot milestone if it publishes a new image/page or crosses a
             // shell frontier; counting the wake itself can keep boot alive forever on timeout churn.
-            if crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) != 0 {
+            if ingress.is_none() && crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) != 0 {
                 if watchdog_defer_if_hosted_work_can_run(b"overdue-timer") {
                     wait_parked = wait_parked_owner_mask(&nt_handler);
                 } else if crate::watchdog_confirm_trip() {
@@ -9623,7 +9570,9 @@ pub(crate) unsafe fn service_sec_image(
                 last_progress_epoch = ep;
                 last_progress_t = now;
                 let _ = stall_deferrals.observe_progress(ep);
-            } else if now.wrapping_sub(last_progress_t) >= STALL_BUDGET_100NS {
+            } else if ingress.is_none()
+                && now.wrapping_sub(last_progress_t) >= STALL_BUDGET_100NS
+            {
                 let deferral =
                     progress_stall_deferral_snapshot(&nt_handler, crash_parked, wait_parked);
                 if deferral.is_some() && stall_deferrals.grant(ep, deferral.unwrap()) {
@@ -9661,7 +9610,7 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
         }
-        if crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) != 0 {
+        if ingress.is_none() && crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) != 0 {
             if watchdog_defer_if_hosted_work_can_run(b"service-loop-top") {
                 wait_parked = wait_parked_owner_mask(&nt_handler);
             } else if crate::watchdog_confirm_trip() {
@@ -12162,11 +12111,7 @@ pub(crate) unsafe fn service_sec_image(
                                     procs[pi].first = first;
                                     procs[pi].ntfaults = ntfaults;
                                     pfilled[pi] = *filled_pages;
-                                    let _ = component_suspension_drain_ready(
-                                        &mut nt_handler,
-                                        procs,
-                                        pfilled,
-                                    );
+                                    let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                                     if component_suspension_owns_hosted_dispatch(dispatch_id) {
                                         mark_wait_parked!(pi, resume_ip);
                                     }
@@ -12200,11 +12145,7 @@ pub(crate) unsafe fn service_sec_image(
                                     procs[pi].first = first;
                                     procs[pi].ntfaults = ntfaults;
                                     pfilled[pi] = *filled_pages;
-                                    let _ = component_suspension_drain_ready(
-                                        &mut nt_handler,
-                                        procs,
-                                        pfilled,
-                                    );
+                                    let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                                     if component_suspension_owns_hosted_dispatch(dispatch_id) {
                                         mark_wait_parked!(pi, resume_ip);
                                     }
@@ -18086,7 +18027,7 @@ pub(crate) unsafe fn service_sec_image(
                 procs[pi].first = first;
                 procs[pi].ntfaults = ntfaults;
                 pfilled[pi] = *filled_pages;
-                let _ = component_suspension_drain_ready(&mut nt_handler, procs, pfilled);
+                let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                 if component_suspension_owns_hosted_dispatch(component_suspension_admitted_dispatch_id)
                 {
                     mark_wait_parked!(pi, resume_ip);
@@ -18237,8 +18178,6 @@ pub(crate) unsafe fn service_sec_image(
                     if nt_handler.lpc_reply_published {
                         let _ = lpc_component_reply_commit_drain(
                             &mut nt_handler,
-                            procs,
-                            pfilled,
                         );
                     }
                     // The component drain can synchronously publish another broker request and
@@ -18838,8 +18777,8 @@ pub(crate) unsafe fn service_sec_image(
             }
             // Event/timer processing may have selected an older provider continuation while this
             // syscall was in flight. The nested provider dispatch has returned to its retained
-            // rendezvous by this point, so only now may the executive resume the LIFO top.
-            let _ = component_suspension_drain_ready(&mut nt_handler, procs, pfilled);
+            // rendezvous by this point. Resume only admissions from this pass, not fresh reparks.
+            let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
             // ★ PHASE 3 — ONE reply shape for every serviced client syscall: resume the caller
             // through the reply object the KERNEL bound to it at its recv (`decode_reply` →
             // `replies[idx].bound_tcb`), then recv the next event re-registering that same object.
@@ -18924,7 +18863,7 @@ pub(crate) unsafe fn service_sec_image(
                         "LPC server native reply failed before component continuation selection"
                     );
                     let _ =
-                        lpc_component_reply_commit_drain(&mut nt_handler, procs, pfilled);
+                        lpc_component_reply_commit_drain(&mut nt_handler);
                     (component_recv!(fault_ep, reply_main), delivered)
                 } else {
                     let received =

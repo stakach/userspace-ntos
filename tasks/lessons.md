@@ -308,6 +308,9 @@ diagnosis-free failure.
   executive allocator and token SID metadata by sharing a private-heap vector header.
 
 ## Accepted Work Needs Nested Progress
+- Bound pre-reply continuation drains to their starting admission sequence. A polling worker's
+  newly rearmed wait belongs to the next pass; draining to global emptiness can starve a completed
+  caller forever. A validation watchdog must not abandon an already admitted Call before dispatch.
 - Fixing an admission rejection can expose a masked deadlock. Every retained service accepted
   during a synchronous component pump needs a ready/step path that does not depend on returning
   to the outer service loop. Exclude pending, uncertain, and delivery-only states from busy retry.

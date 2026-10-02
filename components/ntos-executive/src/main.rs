@@ -3457,8 +3457,14 @@ pub(crate) unsafe fn winlogon_credential_started() -> bool {
 /// keystrokes that genuinely came back out of win32k's queue.
 pub(crate) unsafe fn winlogon_credential_observe_retrieved(hwnd: u64, message: u32, wparam: u64) {
     let mut state = winlogon_credential_load();
+    let previous = state;
     if state.observe_retrieved(hwnd, message, wparam) {
         winlogon_credential_store(state);
+        if state.retrieved_chars() != previous.retrieved_chars()
+            || state.retrieved_return() != previous.retrieved_return()
+        {
+            note_boot_progress(BootProgress::CredentialRetrieved);
+        }
         if message == nt_user_callback::WM_KEYDOWN {
             print_str(
                 b"[cred-inject] real queue delivered VK_RETURN to the IDD_LOGON edit control\n",
@@ -3706,6 +3712,12 @@ unsafe fn winlogon_dialog_modal_store(state: nt_user_callback::DialogModalPumpSe
     WINLOGON_DIALOG_MODAL_COMPLETED.store(state.is_complete() as u64, Ordering::Relaxed);
     WINLOGON_DIALOG_MODAL_PAINTS.store(state.paint_dispatches() as u64, Ordering::Relaxed);
     WINLOGON_DIALOG_MODAL_DRAINED.store(state.is_drained() as u64, Ordering::Relaxed);
+    if state.is_complete() {
+        note_boot_progress(BootProgress::DialogModalCompleted);
+    }
+    if state.is_drained() {
+        note_boot_progress(BootProgress::DialogModalDrained);
+    }
 }
 
 pub(crate) unsafe fn winlogon_dialog_modal_expected_ssn() -> u64 {
@@ -6795,8 +6807,9 @@ fn lsa_selfrpc_bounded_spec(passed: &mut u64) {
     );
 }
 /// Boot-readiness milestone epoch used by the progress-stall watchdog. Only durable movement toward
-/// the validation frontier belongs here: a new image/page mapping or the first observation of an
-/// Explorer paint milestone. Registry traffic, handle churn, waiter wakes, and IPC completions are
+/// the validation frontier belongs here: a new image/page mapping, finite credential/dialog
+/// advancement, or the first observation of an Explorer paint milestone. Handle churn, waiter wakes,
+/// and IPC completions are
 /// normal runtime activity and must not extend the readiness deadline.
 static BOOT_PROGRESS_EPOCH: AtomicU64 = AtomicU64::new(0);
 static BOOT_PROGRESS_MILESTONES: AtomicU64 = AtomicU64::new(0);
@@ -6806,6 +6819,9 @@ static BOOT_PROGRESS_SEALED: AtomicBool = AtomicBool::new(false);
 pub(crate) enum BootProgress {
     ImageActivated,
     PageMappingPublished,
+    CredentialRetrieved,
+    DialogModalCompleted,
+    DialogModalDrained,
     UserShellImageAttempted,
     ExplorerMessageRegistrationObserved,
     ExplorerDirectDrawObserved,
@@ -6817,13 +6833,15 @@ pub(crate) enum BootProgress {
 impl BootProgress {
     const fn one_shot_bit(self) -> u64 {
         match self {
-            Self::ImageActivated | Self::PageMappingPublished => 0,
+            Self::ImageActivated | Self::PageMappingPublished | Self::CredentialRetrieved => 0,
             Self::UserShellImageAttempted => 1 << 0,
             Self::ExplorerMessageRegistrationObserved => 1 << 1,
             Self::ExplorerDirectDrawObserved => 1 << 2,
             Self::ExplorerBeginPaintObserved => 1 << 3,
             Self::ExplorerEndPaintObserved => 1 << 4,
             Self::ExplorerGdiBatchObserved => 1 << 5,
+            Self::DialogModalCompleted => 1 << 6,
+            Self::DialogModalDrained => 1 << 7,
         }
     }
 }
