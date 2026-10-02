@@ -4576,7 +4576,14 @@ pub(crate) unsafe fn service_win32k_section_create_request(
         (crate::win32k_subsystem::W32_SECTION_CREATE_LABEL << 12) | 4,
     ) {
         Ok(owner) => owner,
-        Err(status) => return SubmitResult::Ready((status as i32, 0, 0, 0)),
+        Err(status) => {
+            print_str(b"[kernel-section-service-failed] stage=authentication op=0x");
+            print_hex_u64(op);
+            print_str(b" first=0x"); print_hex_u64(first);
+            print_str(b" tcb=0x"); print_hex_u64(channel.tcb);
+            print_str(b" status=0x"); print_hex(status); print_str(b"\n");
+            return SubmitResult::Ready((status as i32, 0, 0, 0));
+        }
     };
     let handler = match registry_live_handler() {
         Ok(handler) if handler.loop_ctx.is_some() => handler,
@@ -4591,7 +4598,12 @@ pub(crate) unsafe fn service_win32k_section_create_request(
         }
         let physical = match spawn_hosts::shared_ingress::owner::runtime::physical_source(route) {
             Ok(physical) => physical,
-            Err(_) => return SubmitResult::Ready((nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0)),
+            Err(_) => {
+                print_str(b"[kernel-section-service-failed] stage=physical-source op=0x");
+                print_hex_u64(op);
+                print_str(b" first=0x"); print_hex_u64(first); print_str(b"\n");
+                return SubmitResult::Ready((nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0));
+            }
         };
         let handler = handler as *mut ExecNtHandler;
         let result = match op {

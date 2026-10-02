@@ -98,22 +98,27 @@ pub(super) unsafe fn dispatch(
     // ReactOS VideoPort's TargetDeviceRelation handler.
     let Some(allocation_index) = hosted_relation_allocation_instance(DriverId(binding.driver_id))
     else {
+        trace_rejection(b"allocation-owner", binding, None, None);
         return rejected(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     };
     let Some(allocation_inst) = instance(allocation_index) else {
+        trace_rejection(b"allocation-instance", binding, Some(allocation_index), None);
         return rejected(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     };
     let Some(domain) = instance_domain_identity(allocation_inst) else {
+        trace_rejection(b"allocation-domain", binding, Some(allocation_index), None);
         return rejected(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     };
     let Some(registration) = io_manager_mut()
         .hosted_device_pointer_registration(domain, binding.device_object)
         .filter(|registration| registration.device_id().raw() == binding.device_id)
     else {
+        trace_rejection(b"device-registration", binding, Some(allocation_index), Some(domain));
         return rejected(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     };
     let Ok(mut reference) = io_manager_mut().take_hosted_device_pointer_reference(registration)
     else {
+        trace_rejection(b"device-reference", binding, Some(allocation_index), Some(domain));
         return rejected(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     };
 
@@ -137,6 +142,7 @@ pub(super) unsafe fn dispatch(
             .ok()
         });
     if generation == 0 || written != Some(bytes) {
+        trace_rejection(b"relation-backing", binding, Some(allocation_index), Some(domain));
         if !free_hosted_instance_pool_allocation_exact(allocation_inst, relation) {
             crate::provider_bugcheck::report(0xc4, [binding.device_object, relation, 0, 63]);
         }
@@ -177,6 +183,35 @@ pub(super) unsafe fn dispatch(
         status: nt_status::NtStatus::SUCCESS,
         information: relation,
     }
+}
+
+fn trace_rejection(
+    reason: &[u8],
+    binding: HostedDeviceBinding,
+    allocation_index: Option<usize>,
+    allocation_domain: Option<HostedDomainIdentity>,
+) {
+    print_str(b"[video-target-relation] rejected reason="); print_str(reason);
+    print_str(b" device="); print_u64(binding.device_id);
+    print_str(b" driver="); print_u64(binding.driver_id);
+    print_str(b" address="); print_u64(binding.device_object);
+    print_str(b" projection-instance="); print_u64(binding.projection_instance as u64);
+    print_str(b" projection-domain="); print_u64(binding.projection_domain.domain_id.raw());
+    print_str(b" projection-cookie="); print_u64(binding.projection_domain.cookie);
+    print_str(b" allocation-instance=");
+    match allocation_index {
+        Some(index) => print_u64(index as u64),
+        None => print_str(b"none"),
+    }
+    print_str(b" allocation-domain=");
+    match allocation_domain {
+        Some(domain) => {
+            print_u64(domain.domain_id.raw());
+            print_str(b" allocation-cookie="); print_u64(domain.cookie);
+        }
+        None => print_str(b"none"),
+    }
+    print_str(b"\n");
 }
 
 fn rejected(status: nt_status::NtStatus) -> PnpBackendDispatch {

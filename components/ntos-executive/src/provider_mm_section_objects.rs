@@ -49,6 +49,13 @@ struct Object {
 
 static mut OBJECTS: Vec<Box<Object>> = Vec::new();
 
+fn map_failure(stage: &[u8], address: u64, status: u32) -> u32 {
+    print_str(b"[kernel-section-map-failed] stage="); print_str(stage);
+    print_str(b" pointer=0x"); print_hex_u64(address);
+    print_str(b" status=0x"); print_hex(status); print_str(b"\n");
+    status
+}
+
 unsafe fn table(handler: *mut ExecNtHandler) -> Result<*mut GenericSectionTable, u32> {
     if handler.is_null() { return Err(INVALID); }
     (*handler).loop_ctx.map(|ctx| ctx.generic_sections).ok_or(0xc000_00a3)
@@ -211,13 +218,16 @@ pub(crate) unsafe fn map(
     handler: *mut ExecNtHandler, address: u64, physical: runtime::PhysicalSource, requested_size: u64,
 ) -> Result<(u64, u64), u32> {
     let _durable = crate::allocator::enter_durable();
-    let row = object(address, physical)?;
-    if !(*row).published || (*row).retiring || (*row).uncertain { return Err(INVALID); }
-    let identity = (*row).references.last().copied().ok_or(INVALID)?.identity();
-    let sections = table(handler)?;
+    let row = object(address, physical).map_err(|status| map_failure(b"object-owner", address, status))?;
+    if !(*row).published || (*row).retiring || (*row).uncertain {
+        return Err(map_failure(b"publication-state", address, INVALID));
+    }
+    let identity = (*row).references.last().copied()
+        .ok_or_else(|| map_failure(b"object-reference", address, INVALID))?.identity();
+    let sections = table(handler).map_err(|status| map_failure(b"section-table", address, status))?;
     let section = (&*sections).section(identity.index()).filter(|_| {
         (&*sections).section_identity(identity.index()) == Some(identity)
-    }).ok_or(INVALID)?;
+    }).ok_or_else(|| map_failure(b"section-identity", address, INVALID))?;
     let size = if requested_size == 0 { section.size } else { requested_size };
     if size == 0 || size > section.size { return Err(0xc000_001f); }
     let rights = rights(section.protection)?;
@@ -258,10 +268,10 @@ pub(crate) unsafe fn map(
             let frame = crate::service_sec_image::service_generic_section_frame(
                 sections, identity.index(), identity, section, index as u64,
                 EXECUTIVE_WIN32K_SCRATCH_BASE, false,
-            )?;
+            ).map_err(|status| map_failure(b"frame-fill", address, status))?;
             if (&*sections).section_identity(identity.index()) != Some(identity)
                 || (&*sections).provider_view_for_page(view.owner, base + index as u64 * 0x1000) != Some(view) {
-                return Err(INVALID);
+                return Err(map_failure(b"frame-view-identity", address, INVALID));
             }
             let slot = try_alloc_slot().ok_or(NO_MEMORY)?;
             (&mut (*mapping).frames)[index].slot = slot;

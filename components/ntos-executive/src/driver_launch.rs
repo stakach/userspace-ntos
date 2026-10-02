@@ -44402,8 +44402,21 @@ impl DriverDispatchBackend for HostedDriverBackend {
         };
         let binding = hosted_device_binding_by_device_id(irp.device_id.raw())
             .filter(|binding| binding.instance == route_instance);
+        let target_relation = irp.minor == nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS
+            && matches!(&irp.parameters, IoParameters::Pnp(parameters)
+                if parameters.relation_type() == Some(nt_pnp_abi::TARGET_DEVICE_RELATION));
         if let Some(binding) = binding {
             let video_port_initialized = unsafe { hosted_instance_video_port_initialized(route_inst) };
+            if target_relation && !video_port_initialized {
+                print_str(b"[video-target-relation] not-intercepted reason=video-port-uninitialized device=");
+                print_u64(irp.device_id.raw());
+                print_str(b" route-instance="); print_u64(route_instance as u64);
+                print_str(b" backend-instance="); print_u64(self.instance as u64);
+                print_str(b" projection-instance="); print_u64(binding.projection_instance as u64);
+                print_str(b" projection-domain="); print_u64(binding.projection_domain.domain_id.raw());
+                print_str(b" projection-cookie="); print_u64(binding.projection_domain.cookie);
+                print_str(b"\n");
+            }
             if nt_video_miniport::owns_target_device_relation(
                 video_port_initialized,
                 irp.minor,
@@ -44429,6 +44442,12 @@ impl DriverDispatchBackend for HostedDriverBackend {
                     )
                 };
             }
+        } else if target_relation {
+            print_str(b"[video-target-relation] not-intercepted reason=binding-missing device=");
+            print_u64(irp.device_id.raw());
+            print_str(b" route-instance="); print_u64(route_instance as u64);
+            print_str(b" backend-instance="); print_u64(self.instance as u64);
+            print_str(b"\n");
         }
         let input = Vec::from(&ctx.system_buffer[..input_len]);
         let output = if output_len == 0 {
