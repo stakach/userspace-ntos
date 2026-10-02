@@ -1,5 +1,8 @@
 #![no_std]
 
+mod windowproc;
+pub use windowproc::windowproc_lparam_span;
+
 pub const CALLBACK_MAGIC: u32 = u32::from_le_bytes(*b"UCBK");
 pub const CALLBACK_VERSION: u16 = 1;
 pub const CALLBACK_KIND_USER_MODE: u16 = 1;
@@ -2182,6 +2185,7 @@ pub fn checked_payload_range(length: usize) -> Result<core::ops::Range<usize>, V
     Ok(start..end)
 }
 
+/// Rebase a byte-span target within the complete copied callback input.
 pub fn client_payload_reference(
     input_pointer: u64,
     input_length: usize,
@@ -2191,9 +2195,8 @@ pub fn client_payload_reference(
     let offset = reference_offset as usize;
     if input_pointer == 0
         || reference_offset == NO_PAYLOAD_REFERENCE
-        || offset
-            .checked_add(core::mem::size_of::<u64>())
-            .is_none_or(|end| end > input_length)
+        || offset > input_length
+        || input_pointer.checked_add(input_length as u64).is_none()
     {
         return Err(ValidationError::Length);
     }
@@ -2214,8 +2217,7 @@ pub fn validate_request(header: &CallbackHeader) -> Result<(), ValidationError> 
     checked_payload_length(header.output_capacity as usize)?;
     if header.payload_reference_offset != NO_PAYLOAD_REFERENCE {
         let offset = header.payload_reference_offset as usize;
-        let end = offset.checked_add(8).ok_or(ValidationError::Length)?;
-        if end > header.input_length as usize {
+        if offset > header.input_length as usize {
             return Err(ValidationError::Length);
         }
     }
@@ -3004,7 +3006,7 @@ mod tests {
         bad.callback_id = 0;
         assert_eq!(validate_request(&bad), Err(ValidationError::Sequence));
         bad = header;
-        bad.payload_reference_offset = 60;
+        bad.payload_reference_offset = 65;
         assert_eq!(validate_request(&bad), Err(ValidationError::Length));
     }
 
@@ -3052,7 +3054,7 @@ mod tests {
         header.begin_request(0, 128, 128).unwrap();
         header.payload_reference_offset = 0x40;
         assert_eq!(validate_request(&header), Ok(()));
-        header.payload_reference_offset = 124;
+        header.payload_reference_offset = 129;
         assert_eq!(validate_request(&header), Err(ValidationError::Length));
     }
 
@@ -3064,12 +3066,55 @@ mod tests {
         );
         assert_eq!(
             client_payload_reference(0x7fff_1000, 0x40, 0x40),
-            Err(ValidationError::Length)
+            Ok(0x7fff_1040)
         );
         assert_eq!(
             client_payload_reference(0, 0x90, 0x40),
             Err(ValidationError::Length)
         );
+    }
+
+    #[test]
+    fn windowproc_payload_reference_accepts_short_and_empty_blob_spans() {
+        // ReactOS copies lParamBufferSize bytes after the 64-byte argument header;
+        // user32 rebases lParam to that byte span, not to an embedded pointer field.
+        for blob_length in 0..8u32 {
+            let input_length = 0x40 + blob_length;
+            let mut header = CallbackHeader::idle(3, 2, 6, 4);
+            header.begin_request(USER32_CALLBACK_WINDOWPROC, input_length as usize, 0x50).unwrap();
+            header.payload_reference_offset = 0x40;
+            assert_eq!(validate_request(&header), Ok(()), "blob bytes={blob_length}");
+            assert_eq!(client_payload_reference(0x7fff_1000, input_length as usize, 0x40),
+                Ok(0x7fff_1040));
+        }
+    }
+
+    #[test]
+    fn payload_reference_rejects_offsets_outside_copied_blob_span() {
+        let mut header = CallbackHeader::idle(3, 2, 6, 4);
+        header.begin_request(USER32_CALLBACK_WINDOWPROC, 0x42, 0x50).unwrap();
+        for offset in [0x43, u32::MAX - 1] {
+            header.payload_reference_offset = offset;
+            assert_eq!(validate_request(&header), Err(ValidationError::Length));
+        }
+        assert_eq!(client_payload_reference(0x7fff_1000, 0x42, 0x43),
+            Err(ValidationError::Length));
+        assert_eq!(client_payload_reference(0x7fff_1000, 0x42, NO_PAYLOAD_REFERENCE),
+            Err(ValidationError::Length));
+        for offset in [0, 0x3f, 0x40, 0x41, 0x42] {
+            header.payload_reference_offset = offset;
+            assert_eq!(validate_request(&header), Ok(()));
+        }
+    }
+
+    #[test]
+    fn client_blob_reference_checks_the_entire_copied_address_span() {
+        assert_eq!(client_payload_reference(u64::MAX - 0x40, 0x42, 0x40),
+            Err(ValidationError::Length));
+        assert_eq!(client_payload_reference(u64::MAX - 0x40, 0x40, 0x40), Ok(u64::MAX));
+        assert_eq!(client_payload_reference(u64::MAX - 0x3f, 0x40, 0x40),
+            Err(ValidationError::Length));
+        assert_eq!(client_payload_reference(0, 0x40, 0x40), Err(ValidationError::Length));
     }
 
     #[test]

@@ -345,3 +345,10 @@ diagnosis-free failure.
 - A syntax visitor does not expand macro token bodies. Boundary tests that inspect `matches!`
   must parse and visit its expression and pattern, rather than report absent paths or change
   production code to accommodate an incomplete visitor.
+
+## Separate Pointer Fields From Referenced Bytes
+- Validate an ABI pointer field at its full stored width, but validate its target against the
+  actual referenced byte span. An appended zero-length or short blob does not contain a pointer
+  word. Derive that span once from the source ABI and reuse it at capture and transfer boundaries.
+- Decode native syscall histograms against the current service constants before naming a hot
+  operation. A saved return instruction and elapsed loop interval do not establish a CPU spin.

@@ -14549,14 +14549,20 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
                 read_volatile((input + offset as u64) as *const u8),
             );
         }
-        if api == USER32_CB_WINDOWPROC && input_len as usize >= 0x40 {
-            let lparam_size = read_volatile((input + 0x30) as *const i32);
-            if lparam_size >= 0
-                && 0x40usize
-                    .checked_add(lparam_size as usize)
-                    .is_some_and(|end| end <= input_len as usize)
-            {
-                header.payload_reference_offset = 0x40;
+        if api == USER32_CB_WINDOWPROC {
+            let payload = core::slice::from_raw_parts(
+                core::ptr::addr_of!((*frame).payload) as *const u8,
+                input_len as usize,
+            );
+            let span = match nt_user_callback::windowproc_lparam_span(payload) {
+                Ok(span) => span,
+                Err(_) => return 0xC000_0004u32 as i32,
+            };
+            header.payload_reference_offset = span.as_ref().map_or(
+                nt_user_callback::NO_PAYLOAD_REFERENCE,
+                |span| span.start as u32,
+            );
+            if span.is_some() {
                 for offset in 0x28..0x30 {
                     write_volatile(core::ptr::addr_of_mut!((*frame).payload[offset]), 0);
                 }

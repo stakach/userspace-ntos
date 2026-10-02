@@ -3059,7 +3059,18 @@ pub(crate) unsafe fn service_user_callback(
         if !base_shape_valid {
             return false;
         }
-        if matches!(contract, nt_user_callback::UserCallbackContract::Lpk) {
+        if matches!(contract, nt_user_callback::UserCallbackContract::WindowProc) {
+            let payload = core::slice::from_raw_parts(
+                core::ptr::addr_of!((*frame).payload) as *const u8,
+                request.input_length as usize,
+            );
+            nt_user_callback::windowproc_lparam_span(payload).is_ok_and(|span| {
+                request.payload_reference_offset == span.as_ref().map_or(
+                    nt_user_callback::NO_PAYLOAD_REFERENCE,
+                    |span| span.start as u32,
+                )
+            })
+        } else if matches!(contract, nt_user_callback::UserCallbackContract::Lpk) {
             contract.accepts_lpk_layout(
                 request.input_length,
                 callback_payload_u64(frame, 0),
@@ -3624,6 +3635,17 @@ unsafe fn redirect_pending_user_callback(
             + core::mem::size_of::<nt_user_callback::CallbackHeader>() as u64)
             as *const u8;
         let input = core::slice::from_raw_parts(shared, request.input_length as usize);
+        if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC {
+            let Ok(span) = nt_user_callback::windowproc_lparam_span(input) else {
+                return false;
+            };
+            if request.payload_reference_offset != span.as_ref().map_or(
+                nt_user_callback::NO_PAYLOAD_REFERENCE,
+                |span| span.start as u32,
+            ) {
+                return false;
+            }
+        }
         if !crate::img_spawn::client_write_mapped(
             client.pi as u64,
             layout.input_pointer,

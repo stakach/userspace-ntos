@@ -101,6 +101,17 @@ impl CallbackTransfer {
         win32k_glue::validate_callback_transfer_binding(binding)?;
         let client = binding.client();
         let request = binding.request();
+        if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC {
+            let span = nt_user_callback::windowproc_lparam_span(
+                &self.input[..request.input_length as usize],
+            ).map_err(|_| INVALID)?;
+            if request.payload_reference_offset != span.as_ref().map_or(
+                nt_user_callback::NO_PAYLOAD_REFERENCE,
+                |span| span.start as u32,
+            ) {
+                return Err(INVALID);
+            }
+        }
         let saved = crate::thread_context::LegacyThreadContext::read(client.tcb)
             .map_err(|_| UNSUCCESSFUL)?
             .registers;
