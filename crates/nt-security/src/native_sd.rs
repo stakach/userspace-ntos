@@ -641,6 +641,28 @@ struct DescriptorBuild<'a> {
     control: u16,
 }
 
+/// Validate the complete self-relative descriptor layout without interpreting access ACE policy.
+/// Structurally valid opaque ACEs remain intact for their consuming authority.
+pub fn validate_security_descriptor_bytes(bytes: &[u8]) -> Result<(), u32> {
+    if bytes.len() < SECURITY_DESCRIPTOR_RELATIVE_SIZE {
+        return Err(STATUS_INVALID_SECURITY_DESCR);
+    }
+    for field in [4, 8, 12, 16] {
+        let offset = read_u32(bytes, field) as usize;
+        if offset != 0 && (offset < SECURITY_DESCRIPTOR_RELATIVE_SIZE || offset & 3 != 0) {
+            return Err(STATUS_INVALID_SECURITY_DESCR);
+        }
+    }
+    let parsed = parse_self_relative_descriptor(bytes)?;
+    for sid in [parsed.owner, parsed.group].into_iter().flatten() {
+        Sid::validate_native_bytes(sid)?;
+    }
+    for acl in [parsed.sacl, parsed.dacl].into_iter().flatten() {
+        NativeAcl::validated_prefix(acl).map_err(|error| error.status())?;
+    }
+    Ok(())
+}
+
 fn parse_self_relative_descriptor(bytes: &[u8]) -> Result<ParsedDescriptor<'_>, u32> {
     if bytes.len() < SECURITY_DESCRIPTOR_RELATIVE_SIZE {
         return Err(STATUS_INVALID_SECURITY_DESCR);

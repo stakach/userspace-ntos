@@ -66,7 +66,8 @@ pub use config_import::{
 };
 pub use hive::{
     CreateChildError,
-    compose_hive_overlay, compose_system_hive_overlay, CellId, CurrentControlSet,
+    compose_hive_overlay, compose_system_hive_overlay, compose_system_hive_overlay_secured,
+    CellId, CurrentControlSet,
     CurrentControlSetError, DeleteKeyError, Hive, HiveId, HiveKind, HiveMountTable,
     HiveOverlayError, HiveTransaction, HiveValueBlobCompactError, HiveValueBlobCompaction,
     MutableHiveSet, RegistryValueCopyProvenance, RegistryValueCopyProvenanceTable,

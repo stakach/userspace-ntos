@@ -352,3 +352,10 @@ diagnosis-free failure.
   word. Derive that span once from the source ABI and reuse it at capture and transfer boundaries.
 - Decode native syscall histograms against the current service constants before naming a hot
   operation. A saved return instruction and elapsed loop interval do not establish a CPU spin.
+
+## Materialize Security Before Publishing Keys
+- A data-only configuration overlay is not yet an admitted NT registry tree. Assign real
+  container security to newly created keys under their actual secured parents before publication;
+  never repair missing authority with an access-time default ACL or a fabricated readiness event.
+- Validate the imported bytes before choosing a security fix. A stack scan can label pointers into
+  `.rdata` as callers; confirm executable sections and the actual call instruction first.

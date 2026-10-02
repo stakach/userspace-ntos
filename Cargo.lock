@@ -354,6 +354,7 @@ version = "0.1.0"
 dependencies = [
  "nt-config-manager",
  "nt-config-store",
+ "nt-security",
 ]
 
 [[package]]
@@ -362,6 +363,7 @@ version = "0.1.0"
 dependencies = [
  "nt-config-manager",
  "nt-hive-core",
+ "nt-security",
 ]
 
 [[package]]

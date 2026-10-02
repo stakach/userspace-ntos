@@ -1110,7 +1110,7 @@ pub fn compose_boot_system_hive(
         .map_err(BootSystemHiveComposeError::PersistedLog)?;
     let generated = nt_hive_core::decode_image(generated_overlay_image)
         .map_err(BootSystemHiveComposeError::GeneratedOverlay)?;
-    let hive = nt_hive_core::compose_system_hive_overlay(&base, &generated)
+    let hive = nt_hive_core::compose_system_hive_overlay_secured(&base, &generated)
         .map_err(BootSystemHiveComposeError::Compose)?;
     Ok(ComposedBootSystemHive {
         hive,
@@ -2261,6 +2261,37 @@ mod tests {
         );
     }
 
+    fn system_fixture_security() -> Vec<u8> {
+        let system = nt_security::AccessToken::system();
+        nt_security::assign_registry_root_security(
+            &nt_security::CapturedSubjectTokens {
+                primary: &system,
+                client: None,
+                process_audit_id: 0,
+            },
+            &mut nt_security::SecurityAssignmentAudit::default(),
+        )
+        .expect("System fixture security")
+    }
+
+    fn secured_services_test_hive() -> (Vec<u8>, Vec<u8>) {
+        const SECURITY: u32 = 0x1280;
+        const KEYS: &[u32] = &[
+            0x20, 0x100, 0x180, 0x240, 0x300, 0x880, 0x900, 0xb00, 0xb80, 0xc00,
+            0xc80, 0x1100,
+        ];
+        let mut data = services_test_hive();
+        let descriptor = system_fixture_security();
+        write_security_cell(&mut data, SECURITY, KEYS.len() as u32, &descriptor);
+        let cell_size = (0x18 + descriptor.len() + 7) & !7;
+        let offset = HBIN_BASE + SECURITY as usize;
+        data[offset..offset + 4].copy_from_slice(&(-(cell_size as i32)).to_le_bytes());
+        for &key in KEYS {
+            set_nk_security(&mut data, key, SECURITY);
+        }
+        (data, descriptor)
+    }
+
     fn generated_overlay_image() -> Vec<u8> {
         let mut generated = Hive::new(HiveKind::System);
         let select = generated.create_key("Select");
@@ -2283,6 +2314,24 @@ mod tests {
         persisted.set_dword(inactive, "Sentinel", 1);
         let active = persisted.create_key(r"ControlSet002\Services\Persistent");
         persisted.set_dword(active, "Primary", 2);
+        let parent_security = system_fixture_security();
+        for path in [
+            "",
+            "Select",
+            "ControlSet001",
+            r"ControlSet001\Services",
+            r"ControlSet001\Services\Inactive",
+            "ControlSet002",
+            r"ControlSet002\Services",
+            r"ControlSet002\Services\Persistent",
+        ] {
+            let key = if path.is_empty() {
+                persisted.root()
+            } else {
+                persisted.open_key(path).unwrap()
+            };
+            assert!(persisted.set_key_security_descriptor(key, &parent_security));
+        }
         let base_sequence = persisted.sequence;
         let primary = nt_hive_core::encode_image(&persisted);
         let log = nt_hive_core::encode_log_record(
@@ -2318,6 +2367,18 @@ mod tests {
             .hive
             .open_key(r"ControlSet002\Services\GeneratedDriver")
             .is_some());
+        let services = composed.hive.open_key(r"ControlSet002\Services").unwrap();
+        assert_eq!(
+            composed.hive.key_security_descriptor(services),
+            Some(parent_security.as_slice())
+        );
+        let generated = composed.hive
+            .open_key(r"ControlSet002\Services\GeneratedDriver").unwrap();
+        let inherited = nt_config_manager::inherit_generated_key_security(&parent_security).unwrap();
+        assert_eq!(
+            composed.hive.key_security_descriptor(generated),
+            Some(inherited.as_slice())
+        );
         let inactive = composed
             .hive
             .open_key(r"ControlSet001\Services\Inactive")
@@ -2357,7 +2418,7 @@ mod tests {
 
     #[test]
     fn boot_system_composition_uses_installed_regf_only_when_persistence_is_absent() {
-        let installed_bytes = services_test_hive();
+        let (installed_bytes, parent_security) = secured_services_test_hive();
         let installed = RegfHive::new(&installed_bytes).expect("installed REGF");
         let composed =
             compose_boot_system_hive(Some(&installed), None, &[], &generated_overlay_image())
@@ -2371,6 +2432,18 @@ mod tests {
             .hive
             .open_key(r"ControlSet001\Services\GeneratedDriver")
             .is_some());
+        let services = composed.hive.open_key(r"ControlSet001\Services").unwrap();
+        assert_eq!(
+            composed.hive.key_security_descriptor(services),
+            Some(parent_security.as_slice())
+        );
+        let generated = composed.hive
+            .open_key(r"ControlSet001\Services\GeneratedDriver").unwrap();
+        let inherited = nt_config_manager::inherit_generated_key_security(&parent_security).unwrap();
+        assert_eq!(
+            composed.hive.key_security_descriptor(generated),
+            Some(inherited.as_slice())
+        );
     }
 
     #[test]

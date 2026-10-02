@@ -67,6 +67,7 @@ pub use native_sd::{
     assign_object_security, assign_object_security_with_audit, capture_object_type_list,
     capture_security_descriptor_bytes, capture_security_descriptor_for_access,
     security_descriptor_bytes_for_access,
+    validate_security_descriptor_bytes,
     native_acl_to_access_acl,
     query_security_descriptor_bytes, set_security_descriptor_bytes, ObjectSecurityAssignment,
     prepare_device_parameters_security,
