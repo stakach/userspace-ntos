@@ -47187,6 +47187,7 @@ unsafe fn install_pending_hosted_pnp_context_lease(
     bus_identity: HostedBusIdentity,
     lease: nt_pnp_context::ContextLeaseIdentity,
 ) -> Result<(), nt_status::NtStatus> {
+    validate_hosted_device_resources_revoked(binding)?;
     let state = HostedDeviceResourceState {
         device_id: binding.device_id,
         driver_id: binding.driver_id,
@@ -47203,17 +47204,14 @@ unsafe fn install_pending_hosted_pnp_context_lease(
         pnp_context_lease: Some(lease),
         ..HostedDeviceResourceState::default()
     };
-    let states = hosted_device_resource_states_mut();
-    if states
-        .iter()
-        .any(|current| current.device_id == binding.device_id)
-    {
-        return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
-    }
-    states
-        .try_reserve(1)
-        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    states.push(state);
+    let current = hosted_device_resource_states_mut()
+        .iter_mut()
+        .find(|current| {
+            current.device_id == binding.device_id
+                && current.projection_domain == binding.projection_domain
+        })
+        .expect("validated revoked identity retained before lease publication");
+    *current = state;
     Ok(())
 }
 
@@ -47356,33 +47354,66 @@ unsafe fn revoke_hosted_device_resource_state(
     Ok(())
 }
 
-unsafe fn preflight_hosted_device_resource_identity_retirement(
+unsafe fn validate_hosted_device_resources_revoked(
     binding: HostedDeviceBinding,
 ) -> Result<(), nt_status::NtStatus> {
     if hosted_video_caller_aperture::blocks_device_retirement(binding.device_id)
         || hosted_video_caller_aperture::blocks_device_retirement(binding.pdo_device_id) {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
-    if let Some(state) = hosted_device_resource_state_by_device_id(binding.device_id) {
-        if state.driver_id != binding.driver_id
-            || state.instance != binding.instance
-            || state.projection_domain != binding.projection_domain
-            || state.pdo_object != binding.pdo_object
-        {
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-        }
-        if state.pnp_context_lease.is_some()
-            || state.address_resource_count != 0
-            || state.interrupt_claim.is_some()
-            || state.pci_command_owned_bits != 0
-            || state.dma_frame_base != 0
-            || state.dma_pages != 0
-            || state.video_memory_phys != 0
-            || state.video_memory_len != 0
-            || state.video_memory_caller_va != 0
-        {
-            return Err(nt_status::NtStatus::DEVICE_BUSY);
-        }
+    let state = hosted_device_resource_state_by_device_id(binding.device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if state.device_id != binding.device_id
+        || state.driver_id != binding.driver_id
+        || state.instance != binding.instance
+        || state.projection_domain != binding.projection_domain
+        || state.pdo_object != binding.pdo_object
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    if state.pnp_context_lease.is_some()
+        || state.address_resource_count != 0
+        || state.address_resources.iter()
+            .any(|resource| *resource != SharedAddressResource::default())
+        || state.interrupt_claim.is_some()
+        || state.interrupt_line != 0
+        || state.interrupt_affinity != 0
+        || state.interrupt_shared
+        || state.interrupt_latched
+        || state.interrupt_active_low
+        || state.pci_command_owned_bits != 0
+        || state.io_port_supplemental
+        || state.dma_broker_va != 0
+        || state.dma_frame_base != 0
+        || state.dma_pages != 0
+        || state.video_memory_phys != 0
+        || state.video_memory_len != 0
+        || state.video_memory_caller_va != 0
+        || [
+            state.evidence.resource_mmio_phys,
+            state.evidence.resource_mmio_len,
+            state.evidence.resource_mmio_map_len,
+            state.evidence.resource_io_port_len,
+            state.evidence.resource_io_port_cap,
+            state.evidence.resource_io_port_component_cap,
+            state.evidence.mmio_mapped_phys,
+            state.evidence.mmio_mapped_len,
+            u64::from(state.evidence.interrupt_vector),
+            state.evidence.interrupt_id,
+            state.evidence.interrupt_object,
+            state.evidence.interrupt_routine,
+            state.evidence.interrupt_context,
+            state.evidence.dma_adapter_id,
+            state.evidence.dma_adapter_blob,
+            state.evidence.dma_common_va,
+            state.evidence.dma_common_len,
+            state.evidence.dma_common_logical,
+            state.evidence.dma_requested_len,
+            state.evidence.dma_allocated_va,
+            state.evidence.dma_allocated_logical,
+        ].iter().any(|value| *value != 0)
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     Ok(())
 }
@@ -47390,7 +47421,7 @@ unsafe fn preflight_hosted_device_resource_identity_retirement(
 unsafe fn remove_hosted_device_resource_state(
     binding: HostedDeviceBinding,
 ) -> Result<(), nt_status::NtStatus> {
-    preflight_hosted_device_resource_identity_retirement(binding)?;
+    validate_hosted_device_resources_revoked(binding)?;
     let states = hosted_device_resource_states_mut();
     let Some(index) = states.iter().position(|state| {
         state.device_id == binding.device_id && state.projection_domain == binding.projection_domain
@@ -52798,7 +52829,6 @@ unsafe fn read_hosted_device_resource_state_from_shared(
 ) -> HostedDeviceResourceState {
     let previous_state = hosted_device_resource_state_by_device_id(binding.device_id);
     let (address_resource_count, address_resources) = previous_state
-        .filter(|state| state.address_resource_count != 0)
         .map(|state| (state.address_resource_count, state.address_resources))
         .or_else(|| snapshot_shared_address_resources(sh).filter(|(count, _)| *count != 0))
         .unwrap_or((
@@ -52827,7 +52857,7 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         driver_id: binding.driver_id,
         instance: binding.instance,
         projection_domain: binding.projection_domain,
-        pdo_object: read_volatile((sh + SH_RESOURCE_PDO_OBJECT) as *const u64),
+        pdo_object: binding.pdo_object,
         address_resource_count,
         address_resources,
         interrupt_line: previous_state
@@ -53525,7 +53555,7 @@ fn teardown_hosted_device_binding(binding: HostedDeviceBinding) -> bool {
             return false;
         }
     }
-    if unsafe { preflight_hosted_device_resource_identity_retirement(binding) }.is_err() {
+    if unsafe { validate_hosted_device_resources_revoked(binding) }.is_err() {
         return false;
     }
     let pointer_retired = unsafe { hosted_device_retirements_mut() }.iter().any(|retirement| {

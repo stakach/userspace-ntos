@@ -65,7 +65,7 @@ fn terminal_binding_teardown_removes_identity_only_after_pointer_retirement() {
             < position("remove_hosted_device_resource_state")
     );
     assert!(
-        position("preflight_hosted_device_resource_identity_retirement")
+        position("validate_hosted_device_resources_revoked")
             < position("retire_hosted_device_pointer")
     );
     assert!(
@@ -82,7 +82,7 @@ fn terminal_identity_removal_has_no_fallible_native_lease_release() {
     let removal = calls(&function("remove_hosted_device_resource_state"));
     assert!(removal
         .iter()
-        .any(|call| call == "preflight_hosted_device_resource_identity_retirement"));
+        .any(|call| call == "validate_hosted_device_resources_revoked"));
     assert!(
         !removal
             .iter()
@@ -189,4 +189,99 @@ fn lease_release_failure_propagates_before_identity_reset() {
         propagation.0,
         "failed lease release must retain the canonical row and propagate the error"
     );
+}
+
+#[test]
+fn pending_lease_installation_validates_and_reuses_the_exact_revoked_identity() {
+    let installer = function("install_pending_hosted_pnp_context_lease");
+    let operations = calls(&installer);
+    assert!(
+        operations
+            .iter()
+            .any(|call| call == "validate_hosted_device_resources_revoked"),
+        "the retained identity must be validated before publishing its next lease"
+    );
+    assert!(
+        !operations
+            .iter()
+            .any(|call| matches!(call.as_str(), "push" | "try_reserve")),
+        "lease installation replaces a retained exact identity, never creates another row"
+    );
+    #[derive(Default)]
+    struct PublicationOrder {
+        validated: bool,
+        published: bool,
+    }
+    impl<'ast> Visit<'ast> for PublicationOrder {
+        fn visit_expr_try(&mut self, expression: &'ast syn::ExprTry) {
+            if matches!(expression.expr.as_ref(), syn::Expr::Call(call)
+                if matches!(call.func.as_ref(), syn::Expr::Path(path)
+                    if path.path.segments.last().is_some_and(|segment|
+                        segment.ident == "validate_hosted_device_resources_revoked")))
+            {
+                self.validated = true;
+            }
+            syn::visit::visit_expr_try(self, expression);
+        }
+        fn visit_expr_assign(&mut self, assignment: &'ast syn::ExprAssign) {
+            if matches!(assignment.left.as_ref(), syn::Expr::Unary(unary)
+                if matches!(unary.op, syn::UnOp::Deref(_)))
+            {
+                assert!(
+                    self.validated,
+                    "lease publication cannot precede propagated validation"
+                );
+                self.published = true;
+            }
+            syn::visit::visit_expr_assign(self, assignment);
+        }
+    }
+    let mut order = PublicationOrder::default();
+    order.visit_block(&installer.block);
+    assert!(
+        order.published,
+        "the exact retained row must be replaced in place"
+    );
+}
+
+#[test]
+fn shared_revoked_state_validation_refuses_missing_identity_and_active_grants() {
+    let validator = function("validate_hosted_device_resources_revoked");
+    assert!(
+        calls(&validator).iter().any(|call| call == "ok_or"),
+        "a missing canonical row is not an implicit revoked identity"
+    );
+    #[derive(Default)]
+    struct Fields(Vec<String>);
+    impl<'ast> Visit<'ast> for Fields {
+        fn visit_expr_field(&mut self, expression: &'ast syn::ExprField) {
+            if let syn::Member::Named(name) = &expression.member {
+                self.0.push(name.to_string());
+            }
+            syn::visit::visit_expr_field(self, expression);
+        }
+    }
+    let mut fields = Fields::default();
+    fields.visit_block(&validator.block);
+    for required in [
+        "device_id",
+        "driver_id",
+        "instance",
+        "projection_domain",
+        "pdo_object",
+        "pnp_context_lease",
+        "address_resource_count",
+        "interrupt_claim",
+        "pci_command_owned_bits",
+        "dma_frame_base",
+        "dma_pages",
+        "video_memory_phys",
+        "video_memory_len",
+        "video_memory_caller_va",
+    ] {
+        assert!(
+            fields.0.iter().any(|field| field == required),
+            "missing exact revoked-state check: {required}"
+        );
+    }
 }

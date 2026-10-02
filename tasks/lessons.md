@@ -402,3 +402,10 @@ diagnosis-free failure.
   copies as well as builds, image updates and VMs before any consumer or writer touches the
   same artifact. Update a private image from an immutable backup and verify its bytes before
   publishing it; never use file existence as copy-completion evidence.
+
+## Audit Both Ends of Lifecycle Transitions
+- When resource revocation starts retaining identity, audit the next grant installer as well as
+  STOP and final retirement. An existing empty canonical row is authoritative absence of grants,
+  not a collision or permission to import a mutable shared projection.
+- Exercise revoke, reassign and terminal removal together. A function-scoped ownership check
+  does not prove that adjacent lifecycle consumers still agree on the state transition.
