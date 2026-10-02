@@ -214,6 +214,19 @@ impl<'a> RegfHive<'a> {
     /// A cell body given a *file* offset already past the size word is not needed — everything is
     /// keyed by hbin-relative cell offset via `cell_body`.
 
+    /// Exact NK object kind; a key named `Current` is not necessarily a registry link.
+    pub fn key_kind(&self, nk: KeyRef) -> Result<nt_hive_core::KeyKind, RegfHiveImportError> {
+        let body = self.allocated_cell_body(nk)
+            .filter(|body| body.get(..2) == Some(&b"nk"[..]))
+            .ok_or(RegfHiveImportError::InvalidKey)?;
+        let flags = u16le(body, 2).ok_or(RegfHiveImportError::InvalidKey)?;
+        Ok(if flags & 0x10 != 0 {
+            nt_hive_core::KeyKind::SymbolicLink
+        } else {
+            nt_hive_core::KeyKind::Ordinary
+        })
+    }
+
     /// The name of a key node (ASCII or UTF-16LE per its flags), lowercased for case-insensitive
     /// comparison.
     fn key_name_folded(&self, nk: u32) -> Option<String> {
@@ -1001,6 +1014,9 @@ fn import_regf_key_into_hive(
         .try_reserve(1)
         .map_err(|_| RegfHiveImportError::OutOfMemory)?;
     visited.push(source_key);
+    if !target.set_key_kind(target_key, source.key_kind(source_key)?) {
+        return Err(RegfHiveImportError::InvalidKey);
+    }
     if let Some(class_name) = source.key_class(source_key)? {
         if !target.set_key_class(target_key, Some(&class_name)) {
             return Err(RegfHiveImportError::InvalidKey);
@@ -1262,6 +1278,23 @@ mod tests {
             out.extend_from_slice(&unit.to_le_bytes());
         }
         out
+    }
+
+    #[test]
+    fn imported_nk_link_kind_survives_image_and_subtree_export() {
+        let (mut bytes, _) = metadata_test_hive();
+        let child_body = HBIN_BASE + 0xa0 + 4;
+        write_u16(&mut bytes, child_body + 2, 0x20 | 0x10);
+        let source = RegfHive::new(&bytes).unwrap();
+        assert_eq!(source.key_kind(source.root()), Ok(nt_hive_core::KeyKind::Ordinary));
+        assert_eq!(source.key_kind(0xa0), Ok(nt_hive_core::KeyKind::SymbolicLink));
+        let (hive, _) = try_import_regf_into_hive(&source, HiveKind::System).unwrap();
+        let child = hive.open_key("Child").unwrap();
+        assert_eq!(hive.key_kind(child), Some(nt_hive_core::KeyKind::SymbolicLink));
+        let restored = nt_hive_core::decode_image(&nt_hive_core::encode_image(&hive)).unwrap();
+        assert_eq!(restored.key_kind(restored.open_key("Child").unwrap()), Some(nt_hive_core::KeyKind::SymbolicLink));
+        let subtree = nt_hive_core::decode_image(&nt_hive_core::try_encode_subtree_image(&hive, child).unwrap()).unwrap();
+        assert_eq!(subtree.key_kind(subtree.root()), Some(nt_hive_core::KeyKind::SymbolicLink));
     }
 
     fn metadata_test_hive() -> (Vec<u8>, Vec<u8>) {

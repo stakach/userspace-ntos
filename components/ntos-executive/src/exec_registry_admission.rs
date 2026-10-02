@@ -419,7 +419,9 @@ impl ExecNtHandler {
                 if status == STATUS_OBJECT_NAME_NOT_FOUND {
                     self.note_registry_open_miss(&state.path);
                 }
-                crate::registry_security_audit::admission_error(b"open", &state.path, status);
+                crate::registry_security_audit::admission_error(
+                    b"open", &state.path, status, self.pi, self.current_tid,
+                );
                 self.abort_hosted_registry_publication(&mut state);
                 status
             }
@@ -643,7 +645,9 @@ impl ExecNtHandler {
         match result {
             Ok(()) => 0,
             Err(status) => {
-                crate::registry_security_audit::admission_error(b"create", &state.path, status);
+                crate::registry_security_audit::admission_error(
+                    b"create", &state.path, status, self.pi, self.current_tid,
+                );
                 self.abort_hosted_registry_publication(&mut state);
                 status
             }

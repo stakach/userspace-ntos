@@ -44,8 +44,16 @@ impl HiveKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyKind {
+    #[default]
+    Ordinary,
+    SymbolicLink,
+}
+
 #[derive(Clone)]
 pub(crate) struct KeyCell {
+    pub kind: KeyKind,
     pub id: CellId,
     pub parent: Option<CellId>,
     pub name: String,
@@ -613,6 +621,7 @@ impl Hive {
     pub(crate) fn alloc_key(&mut self, parent: Option<CellId>, name: &str) -> CellId {
         let id = self.alloc_id();
         self.push_cell(Cell::Key(KeyCell {
+            kind: KeyKind::Ordinary,
             id,
             parent,
             name: name.into(),
@@ -790,6 +799,23 @@ impl Hive {
 
     pub fn key_security_descriptor(&self, key: CellId) -> Option<&[u8]> {
         self.key(key)?.security_descriptor.as_deref()
+    }
+
+    pub fn key_kind(&self, key: CellId) -> Option<KeyKind> {
+        Some(self.key(key)?.kind)
+    }
+
+    /// Storage metadata for import/setup; changing a key's kind is not a native creation grant.
+    pub fn set_key_kind(&mut self, key: CellId, kind: KeyKind) -> bool {
+        let Some(current) = self.key(key) else { return false; };
+        if current.kind == kind { return true; }
+        if !current.volatile { self.sequence += 1; }
+        let sequence = self.sequence;
+        let current = self.key_mut(key).expect("existing kind target");
+        current.kind = kind;
+        current.last_write_sequence = sequence;
+        self.mark_dirty(key);
+        true
     }
 
     pub fn is_volatile(&self, key: CellId) -> bool {

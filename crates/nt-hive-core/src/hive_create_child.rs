@@ -32,6 +32,7 @@ fn copy_string(source: &str) -> Result<String, CreateChildError> {
 
 fn snapshot_key(key: &KeyCell) -> Result<KeyCell, CreateChildError> {
     Ok(KeyCell {
+        kind: key.kind,
         id: key.id,
         parent: key.parent,
         name: copy_string(&key.name)?,
@@ -142,6 +143,7 @@ impl HiveTransaction<'_> {
         let id = CellId(self.hive.next_id);
         self.hive.cells.resize_with(new_len, || None);
         self.hive.cells[index] = Some(Cell::Key(KeyCell {
+            kind: super::KeyKind::Ordinary,
             id,
             parent: Some(parent),
             name,

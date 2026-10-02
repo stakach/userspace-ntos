@@ -17,6 +17,11 @@ pub(super) fn create_child(
     secured: bool,
 ) -> Result<CellId, HiveOverlayError> {
     if let Some(existing) = composed.open_subkey(parent, name) {
+        if overlay.key_kind(source) == Some(super::KeyKind::SymbolicLink)
+            && composed.key_kind(existing) != Some(super::KeyKind::SymbolicLink)
+        {
+            return Err(HiveOverlayError::InvalidSource);
+        }
         return Ok(existing);
     }
     let descriptor = if secured {
@@ -39,6 +44,9 @@ pub(super) fn create_child(
     let child = composed.create_subkey_in_storage(
         parent, name, volatile || composed.is_volatile(parent),
     );
+    if !composed.set_key_kind(child, overlay.key_kind(source).ok_or(HiveOverlayError::InvalidSource)?) {
+        return Err(HiveOverlayError::InvalidSource);
+    }
     if let Some(descriptor) = descriptor {
         if !composed.set_key_security_descriptor(child, &descriptor) {
             return Err(HiveOverlayError::InvalidSource);

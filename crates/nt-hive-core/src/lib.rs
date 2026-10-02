@@ -67,7 +67,7 @@ pub use config_import::{
 pub use hive::{
     CreateChildError,
     compose_hive_overlay, compose_system_hive_overlay, compose_system_hive_overlay_secured,
-    CellId, CurrentControlSet,
+    CellId, CurrentControlSet, KeyKind,
     CurrentControlSetError, DeleteKeyError, Hive, HiveId, HiveKind, HiveMountTable,
     HiveOverlayError, HiveTransaction, HiveValueBlobCompactError, HiveValueBlobCompaction,
     MutableHiveSet, RegistryValueCopyProvenance, RegistryValueCopyProvenanceTable,
@@ -82,3 +82,6 @@ pub use io::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod key_kind_tests;

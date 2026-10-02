@@ -17,6 +17,14 @@ pluggable I/O provider.
   record_count, payload_len, payload+header CRC-32C} + KeyCell/ValueCell TLV records
   (subkey/value links reconstructed from parent IDs). `encode_image`/`decode_image` round-trips a
   hive; both CRCs + schema validated.
+- Schema 3 retains ordinary versus symbolic-link key identity, including the imported REGF
+  `KEY_SYM_LINK` flag. Schema 1/2 zero flags decode as ordinary; unsupported key flags fail
+  closed. Subtree export and additive overlays preserve this identity.
+- Mounted hardware-profile resolution distinguishes an ordinary `Hardware Profiles\Current`
+  tree from a link. An ordinary tree remains directly accessible; an actual link captures its
+  counted `REG_LINK` target, not `CurrentConfig`. Missing Current keys use the boot-established
+  selector only when its physical profile exists. Cycles and unsupported link targets are
+  refused, never opened as ordinary key bodies.
 - Log codec (§12): `HLR1` per-record header + payload; ops CreateKey/SetValue/DeleteValue.
   `encode_log_record`/`replay_log` (sequence > base, idempotent, stops at a torn/invalid tail).
 - I/O providers (§10): `HiveIoProvider` trait + `MemoryHiveIoProvider` (RAM),

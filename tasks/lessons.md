@@ -362,3 +362,10 @@ diagnosis-free failure.
 - Audit setup composition and later live creation separately. Normalize path creation into exact
   descriptor-bearing child operations during preparation, and retain those same operations for
   journal replay, live commit, and projections; an in-memory fix alone is not durable security.
+
+## Registry Identity Precedes Alias Policy
+- Preserve native key-kind metadata through import, snapshots, and overlays before resolving
+  aliases. A key named `Current`, or containing `SymbolicLinkValue`, is not necessarily a link.
+  Verify enumeration followed by an exact retained relative open, not just a path-string rewrite.
+- Follow only admitted link authority. Invalid, cyclic, or unsupported targets must not expose a
+  link's literal body or fall back to a mutable selector.

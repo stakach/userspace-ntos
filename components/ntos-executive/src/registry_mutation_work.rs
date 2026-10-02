@@ -812,6 +812,10 @@ unsafe fn advance(
                     let handler = &mut *context.as_mut().unwrap().0;
                     match &mut caller.completion {
                         HostedCompletion::Create { publication, parent_owner, .. } => {
+                            crate::registry_security_audit::admission_error(
+                                b"create-completion", &publication.path, work.status,
+                                caller.pi, caller.tid,
+                            );
                             if !work.published {
                                 handler.abort_hosted_registry_publication(publication);
                             }
@@ -820,9 +824,22 @@ unsafe fn advance(
                                 handler.release_registry_key_target(target);
                             }
                         }
-                        HostedCompletion::Existing { key_owner, .. } => {
+                        HostedCompletion::Existing { key_owner, kind } => {
                             if let Some(target) = key_owner.abort(&mut handler.pm)
                                 .expect("retained existing Key") {
+                                if work.status != 0 {
+                                    if let Some(path) = handler.registry_target_path(target) {
+                                        let operation: &[u8] = match kind {
+                                            ExistingMutationKind::SetValue => b"set-value-completion",
+                                            ExistingMutationKind::DeleteValue => b"delete-value-completion",
+                                            ExistingMutationKind::SetSecurity => b"set-security-completion",
+                                            ExistingMutationKind::DeleteKey => b"delete-key-completion",
+                                        };
+                                        crate::registry_security_audit::admission_error(
+                                            operation, &path, work.status, caller.pi, caller.tid,
+                                        );
+                                    }
+                                }
                                 handler.release_registry_key_target(target);
                             }
                         }

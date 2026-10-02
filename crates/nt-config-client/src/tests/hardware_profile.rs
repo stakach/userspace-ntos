@@ -53,6 +53,129 @@ fn mounted_alias_agrees_across_path_snapshot_and_retained_lease() {
 }
 
 #[test]
+fn ordinary_current_enumerated_child_keeps_exact_relative_open_authority() {
+    let mut hive = Hive::new(HiveKind::System);
+    let select = hive.create_key("Select");
+    hive.set_dword(select, "Current", 1);
+    let config = hive.create_key(r"ControlSet001\Control\IDConfigDB");
+    hive.set_dword(config, "CurrentConfig", 0);
+    hive.create_key(r"ControlSet001\Control\IDConfigDB\Hardware Profiles\0000");
+    let fonts = hive.create_key(r"ControlSet001\Hardware Profiles\Current\Software\Fonts");
+    hive.set_dword(fonts, "LogPixels", 96);
+    assert!(hive.open_key(r"ControlSet001\Hardware Profiles\0000").is_none());
+    secure_fixture_hive(&mut hive);
+    hive.finish_clean_import();
+
+    let mut client = client();
+    client.import_system_hive(&encode_image(&hive)).unwrap();
+    let parent = retained_test_keys::open(
+        &mut client,
+        r"\Registry\Machine\System\ControlSet001\Hardware Profiles",
+    );
+    let child = client.enumerate_leased_system_hive_subkey(parent.lease, 0).unwrap();
+    assert_eq!(child.name, "Current");
+    assert_eq!(
+        client.enumerate_leased_system_hive_subkey(parent.lease, 1),
+        Err(STATUS_NO_MORE_ENTRIES)
+    );
+
+    let mut open_relative = |root, path: &str| {
+        let mut manager = SystemHiveKeyOpenAttempts::new();
+        let mut attempt = manager.reserve_relative(root, path).unwrap();
+        for operation in [
+            SystemHiveKeyOpenOperation::Query,
+            SystemHiveKeyOpenOperation::Begin,
+            SystemHiveKeyOpenOperation::Acknowledge,
+        ] {
+            let mut exchange = manager.begin_exchange(&mut attempt, operation).unwrap();
+            let response = client.exchange_system_hive_key_open(&exchange);
+            manager.complete_exchange(&mut attempt, &mut exchange, response).unwrap();
+        }
+        assert_eq!(attempt.outcome_status(), Some(0), "relative OPEN must admit the enumerated ordinary key");
+        let generation = attempt.known_lease().unwrap().opened_generation;
+        let opened = manager.take_validated(&mut attempt, generation).unwrap();
+        manager.release(&mut attempt).unwrap();
+        opened
+    };
+    let current = open_relative(parent.lease, &child.name);
+    let fonts = open_relative(current.lease, r"Software\Fonts");
+    assert_eq!(
+        current.physical_path,
+        r"\Registry\Machine\System\ControlSet001\Hardware Profiles\Current"
+    );
+    assert_eq!(
+        fonts.physical_path,
+        r"\Registry\Machine\System\ControlSet001\Hardware Profiles\Current\Software\Fonts"
+    );
+    let value = client.query_leased_system_hive_value(fonts.lease, "LogPixels").unwrap();
+    assert_eq!(value.value_type, RegistryValueType::Dword as u32);
+    assert_eq!(value.data, 96u32.to_le_bytes());
+    let physical = retained_test_keys::open(&mut client, &fonts.physical_path);
+    assert_eq!(
+        client.query_leased_system_hive_key_information(fonts.lease).unwrap(),
+        client.query_leased_system_hive_key_information(physical.lease).unwrap()
+    );
+    for lease in [physical.lease, fonts.lease, current.lease, parent.lease] {
+        retained_test_keys::close(&mut client, lease).unwrap();
+    }
+}
+
+#[test]
+fn actual_current_link_uses_its_target_not_the_profile_selector() {
+    let mut hive = hive();
+    let target = r"\Registry\Machine\System\ControlSet001\Hardware Profiles\0009";
+    let child = hive.create_key(r"ControlSet001\Hardware Profiles\0009\Software\Fonts");
+    hive.set_dword(child, "LogPixels", 144);
+    let link = hive.create_key(r"ControlSet001\Hardware Profiles\Current");
+    assert!(hive.set_key_kind(link, nt_hive_core::KeyKind::SymbolicLink));
+    hive.set_value(
+        link,
+        "SymbolicLinkValue",
+        RegistryValueType::Link,
+        target.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+    );
+    secure_fixture_hive(&mut hive);
+    hive.finish_clean_import();
+
+    let mut client = client();
+    client.import_system_hive(&encode_image(&hive)).unwrap();
+    let opened = retained_test_keys::open(&mut client, CURRENT);
+    assert_eq!(opened.physical_path, target);
+    assert_eq!(
+        client.query_leased_system_hive_value(opened.lease, "Identity").unwrap().data,
+        9u32.to_le_bytes()
+    );
+    let fonts_path = format!(r"{CURRENT}\Software\Fonts");
+    let fonts = retained_test_keys::open(&mut client, &fonts_path);
+    assert_eq!(fonts.physical_path, format!(r"{target}\Software\Fonts"));
+    let physical = retained_test_keys::open(&mut client, &fonts.physical_path);
+    assert_eq!(
+        client.query_leased_system_hive_key_information(fonts.lease).unwrap(),
+        client.query_leased_system_hive_key_information(physical.lease).unwrap()
+    );
+    let selector_change = mutate(
+        &mut client,
+        1,
+        &[SystemHiveMutation::SetValue {
+            path: CONFIG,
+            name: "CurrentConfig",
+            value_type: RegistryValueType::Dword as u32,
+            data: &0u32.to_le_bytes(),
+        }],
+    );
+    assert_eq!(selector_change.next_generation, 2);
+    assert_eq!(client.resolve_system_hive_path(CURRENT).unwrap().physical_path, target);
+    assert_eq!(
+        client.query_leased_system_hive_value(fonts.lease, "LogPixels").unwrap().data,
+        144u32.to_le_bytes()
+    );
+    assert_eq!(client.query_system_hive_key(&fonts_path).unwrap().values[0].data, 144u32.to_le_bytes());
+    for lease in [physical.lease, fonts.lease, opened.lease] {
+        retained_test_keys::close(&mut client, lease).unwrap();
+    }
+}
+
+#[test]
 fn selector_write_does_not_move_alias_and_mutation_log_is_physical() {
     let mut original = hive();
     let mut client = client();
@@ -123,7 +246,7 @@ fn replacement_mount_recaptures_profile_and_invalidates_old_leases() {
 }
 
 #[test]
-fn unavailable_alias_never_uses_a_literal_current_key_or_default_profile() {
+fn unavailable_alias_without_an_ordinary_key_never_uses_a_default_profile() {
     for invalid in [
         None,
         Some((RegistryValueType::Sz, vec![7, 0, 0, 0])),
@@ -135,7 +258,6 @@ fn unavailable_alias_never_uses_a_literal_current_key_or_default_profile() {
         if let Some((kind, bytes)) = invalid {
             hive.set_value(config, "CurrentConfig", kind, bytes);
         }
-        hive.create_key(r"ControlSet001\Hardware Profiles\Current");
         let mut client = client();
         assert_eq!(client.import_system_hive(&encode_image(&hive)), Ok(1));
         assert_eq!(
@@ -165,11 +287,12 @@ fn unavailable_alias_never_uses_a_literal_current_key_or_default_profile() {
 fn deleted_profile_remains_selected_without_retargeting() {
     let mut client = client();
     client.import_system_hive(&encode_image(&hive())).unwrap();
-    mutate(
+    let deletion = mutate(
         &mut client,
         1,
         &[SystemHiveMutation::DeleteKey { path: CURRENT }],
     );
+    assert_eq!(deletion.next_generation, 2);
     assert_eq!(
         client
             .resolve_system_hive_path(CURRENT)
@@ -187,7 +310,7 @@ fn deleted_profile_remains_selected_without_retargeting() {
 fn control_set_selection_does_not_transplant_the_profile_alias() {
     let mut client = client();
     client.import_system_hive(&encode_image(&hive())).unwrap();
-    mutate(
+    let selector_change = mutate(
         &mut client,
         1,
         &[SystemHiveMutation::SetValue {
@@ -197,6 +320,7 @@ fn control_set_selection_does_not_transplant_the_profile_alias() {
             data: &2u32.to_le_bytes(),
         }],
     );
+    assert_eq!(selector_change.next_generation, 2);
     assert_eq!(
         client.query_system_hive_key(CURRENT),
         Err(STATUS_OBJECT_NAME_NOT_FOUND)
