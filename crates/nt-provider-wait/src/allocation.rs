@@ -1,6 +1,8 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+mod records;
+
 static NEXT_ALLOCATION_CATALOG_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,7 +134,7 @@ impl ProviderAllocationRecord {
 /// follows the innermost heap allocation.
 pub struct ProviderAllocationCatalog {
     catalog_id: u64,
-    records: Vec<ProviderAllocationRecord>,
+    records: records::Records,
     pins: Vec<ProviderAllocationPinRecord>,
     next_pin_id: u64,
 }
@@ -141,7 +143,7 @@ impl ProviderAllocationCatalog {
     pub const fn new() -> Self {
         Self {
             catalog_id: 0,
-            records: Vec::new(),
+            records: records::Records::new(),
             pins: Vec::new(),
             next_pin_id: 1,
         }
@@ -174,20 +176,14 @@ impl ProviderAllocationCatalog {
             return Err(ProviderAllocationError::AddressInUse);
         }
 
-        let slot = if let Some(slot) = self
+        let reusable_slot = self
             .records
             .iter()
             .position(|record| !record.live && record.arena == arena && record.base == base)
-        {
-            slot
-        } else if let Some(slot) = self.records.iter().position(|record| !record.live) {
-            slot
-        } else {
-            self.records
-                .try_reserve(1)
-                .map_err(|_| ProviderAllocationError::NoCapacity)?;
-            self.records.push(ProviderAllocationRecord::EMPTY);
-            self.records.len() - 1
+            .or_else(|| self.records.iter().position(|record| !record.live));
+        let slot = match reusable_slot {
+            Some(slot) => slot,
+            None => self.records.try_append().map_err(|_| ProviderAllocationError::NoCapacity)?,
         };
         let generation = self.records[slot]
             .generation
@@ -819,5 +815,55 @@ mod tests {
         let reused = catalog.register(arena(1), 0xa000, 0x1000).unwrap();
         assert_ne!(reused.identity, allocation.identity);
         assert_eq!(catalog.pin_containing(0xa100, 0x10).unwrap().0, reused);
+    }
+
+    // Record backing must grow in bounded blocks, independently of the catalog's total size.
+    fn maximum_record_block_capacity(catalog: &ProviderAllocationCatalog) -> usize {
+        catalog.records.maximum_block_capacity()
+    }
+
+    #[test]
+    fn allocation_catalog_growth_preserves_record_storage_without_large_relocation() {
+        let mut catalog = ProviderAllocationCatalog::new();
+        let first = catalog.register(arena(1), 0x1000, 0x100).unwrap();
+        let address = catalog.records.get(0).unwrap() as *const ProviderAllocationRecord as usize;
+        let (_, pin) = catalog.pin_containing(first.base, 1).unwrap();
+        for slot in 1..4097 {
+            let allocation = catalog.register(arena(1), 0x1000 + slot * 0x1000, 0x100).unwrap();
+            assert_eq!(allocation.identity.allocation_id, slot + 1);
+            assert_eq!(catalog.snapshot(first.identity), Ok(first));
+        }
+        assert!(maximum_record_block_capacity(&catalog) <= 256,
+            "catalog growth must not allocate a replacement for its entire live record array");
+        assert_eq!(catalog.records.get(0).unwrap() as *const ProviderAllocationRecord as usize,
+            address, "growth must preserve existing record backing");
+        assert_eq!(catalog.retire(first.identity), Err(ProviderAllocationError::Pinned));
+        catalog.release_pin(pin).unwrap();
+        catalog.retire(first.identity).unwrap();
+        let reused = catalog.register(arena(1), first.base, first.capacity).unwrap();
+        assert_eq!(reused.identity.allocation_id, first.identity.allocation_id);
+        assert!(reused.identity.generation > first.identity.generation);
+        assert_eq!(catalog.snapshot(first.identity), Err(ProviderAllocationError::StaleIdentity));
+    }
+
+    #[test]
+    fn allocation_catalog_repeated_slot_reuse_never_revives_stale_identity_or_pin() {
+        let mut catalog = ProviderAllocationCatalog::new();
+        let mut current = catalog.register(arena(1), 0x1000, 0x100).unwrap();
+        let mut retired = Vec::new();
+        for _ in 0..128 {
+            let (_, pin) = catalog.pin_containing(current.base, 1).unwrap();
+            catalog.release_pin(pin).unwrap();
+            catalog.retire(current.identity).unwrap();
+            retired.push(current.identity);
+            let next = catalog.register(arena(1), current.base, current.capacity).unwrap();
+            assert_eq!(next.identity.allocation_id, current.identity.allocation_id);
+            assert!(next.identity.generation > current.identity.generation);
+            for identity in &retired {
+                assert_eq!(catalog.snapshot(*identity), Err(ProviderAllocationError::StaleIdentity));
+            }
+            assert_eq!(catalog.release_pin(pin), Err(ProviderAllocationError::StalePin));
+            current = next;
+        }
     }
 }

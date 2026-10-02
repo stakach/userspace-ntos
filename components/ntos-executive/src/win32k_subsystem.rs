@@ -1647,7 +1647,10 @@ unsafe fn provider_pool_alloc(size: u64, zero: bool) -> u64 {
                 let payload = WIN32K_POOL_VADDR + allocation.payload_offset;
                 if shared_pool::validate_private_admission(&memory, allocation.identity).is_ok()
                     && provider_allocations_unlocked(&mut metadata)
-                    .is_some_and(|catalog| catalog.register(arena, payload, allocation.capacity).is_ok())
+                    .is_some_and(|catalog| {
+                        let _scope = crate::allocator::enter_scope(b"provider-allocation-register");
+                        catalog.register(arena, payload, allocation.capacity).is_ok()
+                    })
                 {
                     Ok(payload)
                 } else if shared_pool::allocation_identity(&memory, allocation.payload_offset)
@@ -2141,7 +2144,10 @@ unsafe fn reclaiming_pool_alloc(size: u64) -> u64 {
         park();
     };
     if provider_allocations_unlocked(&mut metadata)
-        .is_some_and(|allocations| allocations.register(arena, payload, capacity).is_ok())
+        .is_some_and(|allocations| {
+            let _scope = crate::allocator::enter_scope(b"provider-allocation-register");
+            allocations.register(arena, payload, capacity).is_ok()
+        })
     {
         payload
     } else {
@@ -7845,7 +7851,10 @@ unsafe fn heap_alloc_in(
         park();
     };
     let registered = provider_allocations_unlocked(&mut metadata)
-        .is_some_and(|allocations| allocations.register(arena, payload, capacity).is_ok());
+        .is_some_and(|allocations| {
+            let _scope = crate::allocator::enter_scope(b"provider-allocation-register");
+            allocations.register(arena, payload, capacity).is_ok()
+        });
     if registered {
         payload
     } else {
