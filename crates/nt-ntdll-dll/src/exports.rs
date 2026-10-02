@@ -5473,9 +5473,9 @@ pub extern "system" fn ldr_set_mui_cache_type(_cache_type: u32) -> NtStatus {
 /// ULONG_PTR ApcContext)`.
 ///
 /// ReactOS' amd64 thunk moves the APC context from R9 into RCX and jumps to `LdrpInit`. Our live
-/// loader entry is `LdrpInitialize(Context, NtDllBase, ImageBase)`, so keep the same register
-/// mapping: argument 4 becomes the loader context, arguments 2/3 remain the image bases supplied by
-/// the executive/trampoline.
+/// loader entry takes `(Context, SystemArgument1, SystemArgument2)`: argument 4 is the context,
+/// argument 2 supplies the system-DLL base for process initialization, and argument 3 is reserved.
+/// The executable image always comes from the current PEB.
 ///
 /// # Safety
 /// Called by the initial user-mode thread/APC trampoline with loader-owned context values.
@@ -5483,11 +5483,11 @@ pub extern "system" fn ldr_set_mui_cache_type(_cache_type: u32) -> NtStatus {
 pub unsafe extern "system" fn ldr_initialize_thunk(
     _unknown1: usize,
     ntdll_base: *mut c_void,
-    image_base: *mut c_void,
+    system_argument2: *mut c_void,
     apc_context: *mut c_void,
 ) {
     // SAFETY: forwards the trampoline-provided loader context to the real in-process loader entry.
-    unsafe { crate::LdrpInitialize(apc_context, ntdll_base, image_base) };
+    unsafe { crate::LdrpInitialize(apc_context, ntdll_base, system_argument2) };
 }
 
 // =================================================================================================

@@ -1311,34 +1311,17 @@ pub(crate) unsafe fn dbg_print_bytes(msg: *const u8, len: usize) {
     }
 }
 
-/// `LdrpInitialize` — the loader entry the executive's spawn trampoline transfers to.
-///
-/// Real-ntdll ABI (x64): `VOID LdrpInitialize(PCONTEXT Context, PVOID NtDllBase)`. Our Step-4.B
-/// trampoline additionally passes **smss's image base in `R8`** (the C-ABI 3rd arg `smss_base`) —
-/// the real ntdll ignores SystemArgument2, but our in-process loader needs it to snap smss's imports
-/// against OUR export table (see [`on_target`]).
-///
-/// **Step 4.B — the live in-process loader drive.** Runs IN smss's VSpace (Step 4.A proved control
-/// reaches here + a trap is serviced). It:
-/// 1. emits a diagnostic marker (the 4.A proof line, kept),
-/// 2. creates the **process heap** (`NtAllocateVirtualMemory` → serviced) + installs the global
-///    allocator, then
-/// 3. **snaps smss's ntdll imports in-process** against OUR export directory — writing our export
-///    addresses directly into smss's IAT slots (fixing the 4.A IAT-RVA mismatch).
-/// 4. emits a second marker reporting the snap result, then returns to the trampoline, which chains
-///    to smss's real entry (`NtProcessStartup`) — now running under OUR ntdll.
-///
-/// It never fabricates a completed init; each step is real (heap committed, IAT written) or an
-/// honest no-op (a missing base → skip, logged).
+/// Initialize the current process from its PEB, or attach a thread to its existing loader state.
+/// SystemArgument2 is reserved; it cannot select or replace the executable image.
 ///
 /// # Safety
-/// Called by the kernel/trampoline with `(Context, NtDllBase, smss_base)`. Issues syscall traps +
-/// in-process image reads/writes (target x86_64 only).
+/// The current TEB/PEB and startup context must be readable. Fresh process initialization also
+/// requires a mapped system-DLL image supplied in SystemArgument1. Issues in-process syscalls.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn LdrpInitialize(
     context: *mut c_void,
     ntdll_base: *mut c_void,
-    smss_base: *mut c_void,
+    system_argument2: *mut c_void,
 ) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1350,28 +1333,58 @@ pub unsafe extern "C" fn LdrpInitialize(
                 options(nostack, preserves_flags, readonly)
             )
         };
-        if peb != 0 && unsafe { core::ptr::read_unaligned((peb + 0x18) as *const u64) } != 0 {
-            let status = unsafe { on_target::ldr_initialize_thread() };
-            if status != 0 {
-                unsafe { exports::rtl_raise_status(status) };
+        let (image_base, loader_data) = if peb == 0 {
+            (0, 0)
+        } else {
+            unsafe {
+                (
+                    core::ptr::read_unaligned((peb + 0x10) as *const u64),
+                    core::ptr::read_unaligned((peb + 0x18) as *const u64),
+                )
             }
-            return;
-        }
+        };
+        let entry = nt_ntdll::loader::entry::select_loader_entry(
+            peb,
+            image_base,
+            loader_data,
+            ntdll_base as u64,
+            system_argument2 as u64,
+        );
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                let status = match error {
+                    nt_ntdll::loader::entry::LoaderEntryError::MissingImage => 0xC000_007B,
+                    _ => nt_ntdll::STATUS_INVALID_PARAMETER,
+                };
+                unsafe { exports::rtl_raise_status(status) };
+                return;
+            }
+        };
+        let image_base = match entry {
+            nt_ntdll::loader::entry::LoaderEntry::InitializeThread => {
+                let status = unsafe { on_target::ldr_initialize_thread() };
+                if status != 0 {
+                    unsafe { exports::rtl_raise_status(status) };
+                }
+                return;
+            }
+            nt_ntdll::loader::entry::LoaderEntry::InitializeProcess { image_base } => image_base,
+        };
         unsafe {
             reset_process_heap_state_for_new_process();
             on_target::reset_process_runtime_state_for_new_process();
         }
-        // (1) The Step-4.A proof line (kept as a diagnostic; stack buffer — see dbg_print_bytes).
+        // Retain the existing startup trace consumed by native validation.
         let marker: [u8; 53] = *b"nt-ntdll: Step 4.B in-process loader drive (LdrpInit)";
         // SAFETY: on-target, marker is a mapped stack buffer.
         unsafe { dbg_print_bytes(marker.as_ptr(), marker.len()) };
 
         let ntdll = ntdll_base as u64;
-        let smss = smss_base as u64;
-        if smss != 0 && ntdll != 0 {
-            // (2)+(3) Real heap + in-process import snap against OUR export table.
+        {
+            // Initialize the process heap, imports, loader lists and attach notifications.
             // SAFETY: on-target; both are mapped PE images in this VSpace.
-            let res = unsafe { on_target::ldrp_drive(smss, ntdll, context as u64) };
+            let res = unsafe { on_target::ldrp_drive(image_base, ntdll, context as u64) };
 
             #[cfg(feature = "rtl_work_item_probe")]
             {
@@ -1413,7 +1426,7 @@ pub unsafe extern "C" fn LdrpInitialize(
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (ntdll_base, smss_base);
+        let _ = (ntdll_base, system_argument2);
     }
     core::hint::black_box(context);
 }

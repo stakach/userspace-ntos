@@ -391,3 +391,8 @@ diagnosis-free failure.
 - A reserved virtual range or arithmetic mirror is not resident memory. Diagnostic stack scans
   must read exact process-generation backing and stop at an unavailable word, not fault the
   executive or substitute zero-filled or backing-image bytes.
+
+## Loader Entry Uses Process-Owned Identity
+- Reserved startup arguments cannot select the executable or permit skipped initialization.
+  Read the primary image from the current PEB; distinguish fresh process initialization from
+  thread attachment before requiring arguments that only process initialization consumes.
