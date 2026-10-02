@@ -26,14 +26,33 @@ const fn crc32c_table() -> [u32; 256] {
     table
 }
 
+/// Incremental CRC-32C (Castagnoli) over exactly the supplied bytes.
+pub struct Crc32c {
+    crc: u32,
+}
+
+impl Crc32c {
+    pub fn new() -> Self {
+        Self { crc: 0xFFFF_FFFF }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        for &byte in data {
+            let index = ((self.crc ^ u32::from(byte)) & 0xff) as usize;
+            self.crc = (self.crc >> 8) ^ CRC32C_TABLE[index];
+        }
+    }
+
+    pub fn finish(self) -> u32 {
+        !self.crc
+    }
+}
+
 /// CRC-32C (Castagnoli, reflected poly 0x82F63B78) — the snapshot/journal checksum (spec §9.3).
 pub fn crc32c(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        let idx = ((crc ^ b as u32) & 0xff) as usize;
-        crc = (crc >> 8) ^ CRC32C_TABLE[idx];
-    }
-    !crc
+    let mut crc = Crc32c::new();
+    crc.update(data);
+    crc.finish()
 }
 
 /// An append-only little-endian byte writer.

@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+nt-config-store = { workspace = true }
 nt-hive-core = { workspace = true }
 nt-cache-manager = { workspace = true }
 nt-io-completion = { workspace = true }

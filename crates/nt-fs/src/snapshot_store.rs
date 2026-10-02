@@ -6,6 +6,7 @@
 //! A failed/torn update preserves the previous payload-valid slot.
 
 use alloc::vec::Vec;
+use nt_config_store::codec::{crc32c, Crc32c};
 
 #[cfg(test)]
 #[path = "snapshot_store_tests.rs"]
@@ -682,33 +683,6 @@ impl<D: SnapshotBlockDevice> SnapshotPayloadReader for PayloadSectorReader<'_, D
     }
 }
 
-struct Crc32c {
-    crc: u32,
-}
-
-impl Crc32c {
-    fn new() -> Self {
-        Self { crc: 0xFFFF_FFFF }
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        for &b in data {
-            self.crc ^= b as u32;
-            for _ in 0..8 {
-                self.crc = if self.crc & 1 != 0 {
-                    (self.crc >> 1) ^ 0x82F6_3B78
-                } else {
-                    self.crc >> 1
-                };
-            }
-        }
-    }
-
-    fn finish(self) -> u32 {
-        !self.crc
-    }
-}
-
 fn encode_header(out: &mut [u8], header: SlotHeader) {
     out[..HEADER_LEN].fill(0);
     out[0..8].copy_from_slice(&STORE_MAGIC);
@@ -774,10 +748,4 @@ fn read_u32(bytes: &[u8]) -> u32 {
 
 fn read_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes.try_into().unwrap())
-}
-
-fn crc32c(data: &[u8]) -> u32 {
-    let mut crc = Crc32c::new();
-    crc.update(data);
-    crc.finish()
 }
