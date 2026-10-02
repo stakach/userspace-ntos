@@ -135,6 +135,46 @@ fn retained_mmio_fault_resolver_never_allocates_anonymous_backing() {
     }
 }
 
+#[test]
+fn numeric_resource_band_is_not_authority_over_another_physical_domain() {
+    let file = source("hosted_component_mmio_fault.rs");
+    let fault = function(&file, "service_fault");
+    let mut calls = Calls::default();
+    calls.visit_block(&fault.block);
+    let domain = calls
+        .0
+        .iter()
+        .position(|name| name.ends_with("authenticated_pump_channel_domain"))
+        .expect("classify the exact retained physical source before claiming a hosted resource VA");
+    let instance = calls
+        .0
+        .iter()
+        .position(|name| name.ends_with("physical_instance_for_pump_channel"))
+        .unwrap();
+    assert!(domain < instance);
+    struct ProviderOutsideHostedReservation(bool);
+    impl<'ast> Visit<'ast> for ProviderOutsideHostedReservation {
+        fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+            if matches!(&arm.pat, Pat::TupleStruct(outer)
+                if outer.path.is_ident("Some") && outer.elems.len() == 1
+                    && matches!(outer.elems.first(), Some(Pat::Struct(pattern))
+                        if pattern.path.segments.last().is_some_and(|segment| segment.ident == "Provider")))
+            {
+                self.0 = matches!(&*arm.body, Expr::Return(value)
+                    if matches!(value.expr.as_deref(), Some(Expr::Path(path))
+                        if path.path.is_ident("None")));
+            }
+            syn::visit::visit_arm(self, arm);
+        }
+    }
+    let mut provider = ProviderOutsideHostedReservation(false);
+    provider.visit_block(&fault.block);
+    assert!(
+        provider.0,
+        "an authenticated provider is outside the hosted reservation, not an unowned MMIO repair"
+    );
+}
+
 fn field_is(expression: &Expr, base: &str, member: &str) -> bool {
     matches!(expression, Expr::Field(field)
         if matches!(&*field.base, Expr::Path(path) if path.path.is_ident(base))

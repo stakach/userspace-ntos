@@ -55405,6 +55405,19 @@ fn instance_by_shared_va(shared_va: u64) -> Option<(usize, DriverInstance)> {
     })
 }
 
+fn authenticated_pump_channel_domain(
+    ch: &crate::spawn_hosts::PumpChannel,
+) -> Option<crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalDomain> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let route = unsafe { runtime::channel_route(ch).ok()?? };
+    let source = unsafe { runtime::physical_source(route).ok()? };
+    let reply = unsafe { runtime::current_reply(route).ok()? };
+    if source.tcb != ch.tcb || source.pml4 != ch.pml4 || reply == 0 {
+        return None;
+    }
+    Some(source.domain)
+}
+
 fn physical_instance_for_pump_channel(
     ch: &crate::spawn_hosts::PumpChannel,
 ) -> Option<(usize, DriverInstance)> {

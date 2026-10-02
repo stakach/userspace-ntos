@@ -404,6 +404,9 @@ diagnosis-free failure.
   exact owners. Rollback releases only its owner; the last owner deletes the mapped cap after
   acknowledgement. Repair through a surviving context must use that retained cap, not a retired
   source alias. Resource-window faults must never fall through to anonymous RAM backing.
+- A numeric resource VA band is scoped to its authenticated physical domain. Another VSpace
+  can legitimately use the same address for client backing; classify retained source authority
+  before applying reservation policy, rather than exempting a named driver or guessing by VA.
 
 ## Loader Entry Uses Process-Owned Identity
 - Reserved startup arguments cannot select the executable or permit skipped initialization.

@@ -11,6 +11,13 @@ pub(crate) unsafe fn service_fault(
     if !crate::hosted_pnp_context::is_component_resource_address(address) {
         return None;
     }
+    match authenticated_pump_channel_domain(channel) {
+        Some(crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalDomain::Provider {
+            ..
+        }) => return None,
+        Some(crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalDomain::Hosted(_)) => {}
+        None => return Some(false),
+    }
     let Some((instance, inst)) = physical_instance_for_pump_channel(channel) else {
         return Some(false);
     };
