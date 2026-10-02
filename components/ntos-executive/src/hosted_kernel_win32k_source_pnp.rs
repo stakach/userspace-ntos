@@ -473,7 +473,11 @@ impl Work {
                 self.indeterminate = true;
                 return false;
             }
-            Ok(nt_io_manager::ExternalPnpDispatchResult::Indeterminate { irp_id, .. }) => {
+            Ok(nt_io_manager::ExternalPnpDispatchResult::Indeterminate { irp_id, transport_status }) => {
+                print_str(b"[source-pnp-quarantine] device="); print_hex64(self.target.device_id().raw());
+                print_str(b" irp="); print_hex64(irp_id.raw());
+                print_str(b" transport-status="); print_hex(transport_status.raw() as u32);
+                print_str(b"\n");
                 self.canonical_irp = Some(irp_id);
                 self.indeterminate = true;
                 return false;

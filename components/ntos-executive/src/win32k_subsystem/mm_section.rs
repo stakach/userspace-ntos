@@ -34,6 +34,13 @@ pub(super) unsafe fn create(
         core::slice::from_raw_parts_mut(packet as *mut u8, wire::PACKET_BYTES))
         .expect("fixed kernel Section packet length");
     let (status, token, object) = call(CREATE, packet, wire::PACKET_BYTES as u64);
+    if status != 0 {
+        print_str(b"[kernel-section-create] status="); print_hex(status as u32);
+        print_str(b" file-handle="); crate::print_hex_u64(file_handle);
+        print_str(b" file-object="); crate::print_hex_u64(file_object);
+        print_str(b" protection="); print_hex(protection);
+        print_str(b"\n");
+    }
     assert!(provider_pool_free(packet), "kernel Section request packet retirement");
     if status < 0 { return status; }
     if status != 0 || token == 0 || object == 0 {
@@ -69,7 +76,14 @@ pub(super) unsafe fn reference(object: u64, release: bool) -> Result<u64, i32> {
 }
 
 pub(super) unsafe fn map(object: u64, size: u64) -> Result<(u64, u64), i32> {
+    let requested_size = size;
     let (status, base, size) = call(MAP, object, size);
+    if status != 0 {
+        print_str(b"[kernel-section-map-failure] status="); print_hex(status as u32);
+        print_str(b" object="); crate::print_hex_u64(object);
+        print_str(b" requested-size="); crate::print_hex_u64(requested_size);
+        print_str(b"\n");
+    }
     if status != 0 { return Err(status); }
     if base == 0 || size == 0 {
         crate::provider_bugcheck::report(0xc4, [W32_SECTION_CREATE_LABEL, MAP, object, base]);
