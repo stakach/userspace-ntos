@@ -1,6 +1,9 @@
 use super::*;
 use crate::snapshot_test_device::{CachedDisk, Event};
 
+#[path = "snapshot_store_tests/batched_reads.rs"]
+mod batched_reads;
+
 fn two_generations() -> (SnapshotBlockStore, CachedDisk) {
     let store = SnapshotBlockStore::new(0, 16);
     let mut dev = CachedDisk::new();

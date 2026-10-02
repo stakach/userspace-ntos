@@ -89,24 +89,54 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
         if out.len() != self.sector_size() {
             return Err(nt_fs::SnapshotBlockStoreError::InvalidGeometry);
         }
-        let absolute = self.absolute_lba(lba)?;
-        let tfd = unsafe {
-            ahci_read_sector(
-                self.fat.ahci_vaddr,
-                self.fat.dma_vaddr,
-                self.fat.dma_paddr,
-                absolute,
-            )
-        };
-        if tfd & nt_ahci::TASK_FILE_FAILURE != 0 {
-            return Err(nt_fs::SnapshotBlockStoreError::Io);
+        self.read_sectors(lba, out)
+    }
+
+    fn read_sectors(
+        &mut self,
+        lba: u64,
+        out: &mut [u8],
+    ) -> Result<(), nt_fs::SnapshotBlockStoreError> {
+        let sector_size = self.sector_size();
+        if sector_size == 0 || out.len() % sector_size != 0 {
+            return Err(nt_fs::SnapshotBlockStoreError::InvalidGeometry);
         }
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (self.fat.dma_vaddr + 0x800) as *const u8,
-                out.as_mut_ptr(),
-                out.len(),
-            );
+        let total_sectors = u64::try_from(out.len() / sector_size)
+            .map_err(|_| nt_fs::SnapshotBlockStoreError::InvalidGeometry)?;
+        let end = lba
+            .checked_add(total_sectors)
+            .ok_or(nt_fs::SnapshotBlockStoreError::InvalidGeometry)?;
+        if end > u64::from(self.sectors) {
+            return Err(nt_fs::SnapshotBlockStoreError::InvalidGeometry);
+        }
+
+        let max_chunk = AHCI_MAX_SECTORS_PER_READ as usize;
+        let mut sector_index = 0usize;
+        while sector_index < total_sectors as usize {
+            let chunk_sectors = (total_sectors as usize - sector_index).min(max_chunk);
+            let absolute = self.absolute_lba(lba + sector_index as u64)?;
+            let byte_start = sector_index * sector_size;
+            let byte_end = byte_start + chunk_sectors * sector_size;
+            let tfd = unsafe {
+                ahci_read_sectors(
+                    self.fat.ahci_vaddr,
+                    self.fat.dma_vaddr,
+                    self.fat.dma_paddr,
+                    absolute,
+                    chunk_sectors as u32,
+                )
+            };
+            if tfd & nt_ahci::TASK_FILE_FAILURE != 0 {
+                return Err(nt_fs::SnapshotBlockStoreError::Io);
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (self.fat.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8,
+                    out[byte_start..byte_end].as_mut_ptr(),
+                    byte_end - byte_start,
+                );
+            }
+            sector_index += chunk_sectors;
         }
         Ok(())
     }

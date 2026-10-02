@@ -82,6 +82,9 @@ impl<D: SnapshotBlockDevice, I> SnapshotBlockDevice for SnapshotReserveLease<'_,
     fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
         self.device_mut().read_sector(lba, out)
     }
+    fn read_sectors(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.device_mut().read_sectors(lba, out)
+    }
     fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), SnapshotBlockStoreError> {
         self.device_mut().write_sector(lba, data)
     }
