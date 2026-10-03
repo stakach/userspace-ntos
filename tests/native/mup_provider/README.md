@@ -64,6 +64,11 @@ python3 -m unittest discover -s tests/native/mup_provider -p test_verify_log.py
 ```
 
 These checks exercise retained ownership through genuine delayed terminal errors.
+The source performs these operations inside its registered device's real READ
+handler, invoked through `ZwReadFile`. That primary dispatch remains waiting on
+lower completions, so an idle-primary-only completion adapter cannot pass. The
+runner also requires ordered primary entry, terminal intent and actual delivered
+Zw result; the intent marker alone is not completion proof.
 They do not prove uncertain native-effect quarantine, stale protocol replay denial,
 or absence of every canonical reference leak. Those require exact canonical
 completion/ACK/retirement observations or separate admitted failure injection;

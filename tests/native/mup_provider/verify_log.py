@@ -27,6 +27,27 @@ SPECS = {
 STATUS_FIELDS = {"status", "call", "release", "wait", "iosb", "event"}
 
 
+def verify_primary_execution(text):
+    identity = verify(text)
+    lines = text.splitlines()
+    expected = (
+        "[source-primary-probe] entered",
+        "[source-primary-probe] terminal-intent status=0x00000000",
+        "[source-primary-probe] delivered call=0x00000000 iosb=0x00000000 info=0 output-unchanged=1",
+    )
+    markers = [(position, line) for position, line in enumerate(lines)
+               if "[source-primary-probe]" in line]
+    if tuple(line for _, line in markers) != expected:
+        raise ValueError("missing, duplicate, malformed or misordered primary execution receipt")
+    entered, terminal, _ = (position for position, _ in markers)
+    # Provider CLEANUP/CLOSE can be asynchronous; source execution must stay inside its handler.
+    source_positions = [position for position, line in enumerate(lines)
+                        if line.startswith("[terminal-failure-")]
+    if not all(entered < position < terminal for position in source_positions):
+        raise ValueError("failure operations were not executed by the waiting primary handler")
+    return identity
+
+
 def verify(text):
     records = {}
     for position, line in enumerate(text.splitlines()):
@@ -111,7 +132,7 @@ def main():
     parser.add_argument("--verify-log", required=True, type=Path)
     args = parser.parse_args()
     try:
-        source, provider, generation = verify(args.verify_log.read_text())
+        source, provider, generation = verify_primary_execution(args.verify_log.read_text())
     except (ValueError, OSError) as error:
         parser.exit(1, f"Mup pending failure proof rejected: {error}\n")
     print(f"Mup pending failure delivery/File reference proof: source=0x{source:016x} "

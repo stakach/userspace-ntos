@@ -16,10 +16,16 @@ typedef void *HANDLE;
 #define STATUS_IO_DEVICE_ERROR ((NTSTATUS)0xc0000185u)
 #define STATUS_TIMEOUT ((NTSTATUS)0x102)
 #define NT_SUCCESS(status) ((status) >= 0)
+#define IRP_MJ_CREATE 0x00
+#define IRP_MJ_CLOSE 0x02
 #define IRP_MJ_READ 0x03
 #define IRP_MJ_WRITE 0x04
 #define IRP_MJ_FLUSH_BUFFERS 0x09
 #define IRP_MJ_QUERY_INFORMATION 0x05
+#define IRP_MJ_CLEANUP 0x12
+#define IRP_MJ_MAXIMUM_FUNCTION 0x1b
+#define DO_BUFFERED_IO 0x04
+#define DO_DEVICE_INITIALIZING 0x80
 #define FileStandardInformation 5
 #define FileInternalInformation 6
 #define IRP_BUFFERED_IO 0x10
@@ -63,7 +69,9 @@ typedef struct {
 } FILE_STANDARD_INFORMATION;
 
 typedef struct {
-    uint8_t Reserved[0x4c];
+    uint8_t Reserved[0x30];
+    uint32_t Flags;
+    uint8_t Reserved34[0x18];
     uint8_t StackSize;
 } DEVICE_OBJECT;
 
@@ -123,9 +131,11 @@ typedef struct {
 } IRP;
 
 typedef void (__stdcall *DRIVER_UNLOAD)(void *);
+typedef NTSTATUS (__stdcall *DRIVER_DISPATCH)(DEVICE_OBJECT *, IRP *);
 typedef struct {
     uint8_t Reserved0[0x68];
     DRIVER_UNLOAD DriverUnload;
+    DRIVER_DISPATCH MajorFunction[IRP_MJ_MAXIMUM_FUNCTION + 1];
 } DRIVER_OBJECT;
 
 _Static_assert(sizeof(UNICODE_STRING) == 16, "UNICODE_STRING x64 ABI");
@@ -133,6 +143,7 @@ _Static_assert(sizeof(OBJECT_ATTRIBUTES) == 48, "OBJECT_ATTRIBUTES x64 ABI");
 _Static_assert(sizeof(IO_STATUS_BLOCK) == 16, "IO_STATUS_BLOCK x64 ABI");
 _Static_assert(sizeof(FILE_STANDARD_INFORMATION) == 24, "FILE_STANDARD_INFORMATION x64 ABI");
 _Static_assert(offsetof(DEVICE_OBJECT, StackSize) == 0x4c, "device stack x64 ABI");
+_Static_assert(offsetof(DEVICE_OBJECT, Flags) == 0x30, "device flags x64 ABI");
 _Static_assert(sizeof(IO_STACK_LOCATION) == 0x48, "IO stack x64 ABI");
 _Static_assert(offsetof(IRP, Flags) == 0x10, "IRP flags x64 ABI");
 _Static_assert(offsetof(IRP, AssociatedSystemBuffer) == 0x18, "IRP buffer x64 ABI");
@@ -141,6 +152,7 @@ _Static_assert(offsetof(IRP, UserBuffer) == 0x70, "IRP user buffer x64 ABI");
 _Static_assert(offsetof(IRP, CurrentStackLocation) == 0xb8, "IRP stack x64 ABI");
 _Static_assert(offsetof(IRP, OriginalFileObject) == 0xc0, "IRP original File x64 ABI");
 _Static_assert(offsetof(DRIVER_OBJECT, DriverUnload) == 0x68, "driver unload x64 ABI");
+_Static_assert(offsetof(DRIVER_OBJECT, MajorFunction) == 0x70, "driver dispatch x64 ABI");
 
 __declspec(dllimport) NTSTATUS __stdcall ZwCreateFile(HANDLE *, uint32_t,
     OBJECT_ATTRIBUTES *, IO_STATUS_BLOCK *, int64_t *, uint32_t, uint32_t,
@@ -158,6 +170,10 @@ __declspec(dllimport) IRP *__stdcall IoAllocateIrp(uint8_t, uint8_t);
 __declspec(dllimport) void __stdcall IoFreeIrp(IRP *);
 __declspec(dllimport) IO_STACK_LOCATION *__stdcall IoGetNextIrpStackLocation(IRP *);
 __declspec(dllimport) NTSTATUS __stdcall IofCallDriver(DEVICE_OBJECT *, IRP *);
+__declspec(dllimport) void __stdcall IofCompleteRequest(IRP *, uint8_t);
+__declspec(dllimport) NTSTATUS __stdcall IoCreateDevice(DRIVER_OBJECT *, uint32_t,
+    UNICODE_STRING *, uint32_t, uint32_t, uint8_t, DEVICE_OBJECT **);
+__declspec(dllimport) void __stdcall IoDeleteDevice(DEVICE_OBJECT *);
 __declspec(dllimport) void *__stdcall ExAllocatePoolWithTag(uint32_t, size_t, uint32_t);
 __declspec(dllimport) void __stdcall ExFreePoolWithTag(void *, uint32_t);
 __declspec(dllimport) NTSTATUS __stdcall KeDelayExecutionThread(uint8_t, uint8_t, int64_t *);
@@ -186,6 +202,12 @@ static const FILE_STANDARD_INFORMATION ExpectedSectionStandardInfo = {
     4096, 4096, 1, 0, 0, {0, 0}
 };
 static const uint64_t ExpectedSectionInternalIndex = 0x53656374696f6e31ull;
+static WCHAR PrimaryProbeName[] = {
+    '\\', 'D', 'e', 'v', 'i', 'c', 'e', '\\', 'N', 't', 'o', 's', 'F', 'o', 'r',
+    'w', 'a', 'r', 'd', 'P', 'r', 'o', 'b', 'e', 0
+};
+static DEVICE_OBJECT *PrimaryProbeDevice;
+static uint32_t PrimaryProbeEntered;
 
 static NTSTATUS ForwardOnce(void *file, DEVICE_OBJECT *device, int64_t offset)
 {
@@ -746,6 +768,56 @@ static NTSTATUS CheckTerminalFailures(void)
     return result;
 }
 
+static NTSTATUS CompletePrimaryProbe(IRP *irp, NTSTATUS status)
+{
+    irp->IoStatus.Status = status;
+    irp->IoStatus.Information = 0;
+    IofCompleteRequest(irp, 0);
+    return status;
+}
+
+static NTSTATUS __stdcall PrimaryProbeLifecycle(DEVICE_OBJECT *device, IRP *irp)
+{
+    (void)device;
+    return CompletePrimaryProbe(irp, STATUS_SUCCESS);
+}
+
+static NTSTATUS __stdcall PrimaryProbeRead(DEVICE_OBJECT *device, IRP *irp)
+{
+    (void)device;
+    if (__atomic_exchange_n(&PrimaryProbeEntered, 1, __ATOMIC_ACQ_REL) != 0)
+        return CompletePrimaryProbe(irp, STATUS_UNSUCCESSFUL);
+    DbgPrint("[source-primary-probe] entered\n");
+    // A real primary dispatch waits on lower completions. Its own lane cannot deliver them.
+    NTSTATUS status = CheckTerminalFailures();
+    DbgPrint("[source-primary-probe] terminal-intent status=0x%08x\n", (uint32_t)status);
+    return CompletePrimaryProbe(irp, status);
+}
+
+static NTSTATUS CheckPrimaryTerminalFailures(void)
+{
+    UNICODE_STRING name = {sizeof(PrimaryProbeName) - sizeof(WCHAR),
+                           sizeof(PrimaryProbeName), PrimaryProbeName};
+    OBJECT_ATTRIBUTES attrs = {sizeof(attrs), NULL, &name, OBJ_CASE_INSENSITIVE, NULL, NULL};
+    HANDLE handle = NULL;
+    IO_STATUS_BLOCK iosb = {STATUS_UNSUCCESSFUL, 0, 0x12345678};
+    NTSTATUS status = ZwCreateFile(&handle, FILE_READ_DATA, &attrs, &iosb, NULL, 0,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN, 0, NULL, 0);
+    if (!NT_SUCCESS(status) || !NT_SUCCESS(iosb.Status) || handle == NULL)
+        return STATUS_UNSUCCESSFUL;
+    uint8_t output = 0xcc;
+    int64_t offset = 0;
+    iosb.Status = STATUS_UNSUCCESSFUL;
+    iosb.Information = 0x12345678;
+    NTSTATUS call = ZwReadFile(handle, NULL, NULL, NULL, &iosb, &output, 1, &offset, NULL);
+    DbgPrint("[source-primary-probe] delivered call=0x%08x iosb=0x%08x info=%u output-unchanged=%u\n",
+             (uint32_t)call, (uint32_t)iosb.Status, (uint32_t)iosb.Information, output == 0xcc);
+    NTSTATUS close = ZwClose(handle);
+    return call == STATUS_SUCCESS && iosb.Status == STATUS_SUCCESS &&
+        iosb.Information == 0 && output == 0xcc && close == STATUS_SUCCESS
+        ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
 static void __stdcall ReadWorker(void *context)
 {
     (void)context;
@@ -790,7 +862,7 @@ dereference:
     ObfDereferenceObject(file);
 close:
     ZwClose(handle);
-    if (status == STATUS_SUCCESS) status = CheckTerminalFailures();
+    if (status == STATUS_SUCCESS) status = CheckPrimaryTerminalFailures();
     if (status == STATUS_SUCCESS) status = CheckSectionFile();
 fail:
     if (!NT_SUCCESS(status))
@@ -800,11 +872,20 @@ fail:
 
 NTSTATUS __stdcall DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *registry_path)
 {
-    (void)driver;
     (void)registry_path;
+    UNICODE_STRING name = {sizeof(PrimaryProbeName) - sizeof(WCHAR),
+                           sizeof(PrimaryProbeName), PrimaryProbeName};
+    NTSTATUS status = IoCreateDevice(driver, 0, &name, 0x22, 0, 0, &PrimaryProbeDevice);
+    if (!NT_SUCCESS(status)) return status;
+    driver->MajorFunction[IRP_MJ_CREATE] = PrimaryProbeLifecycle;
+    driver->MajorFunction[IRP_MJ_CLEANUP] = PrimaryProbeLifecycle;
+    driver->MajorFunction[IRP_MJ_CLOSE] = PrimaryProbeLifecycle;
+    driver->MajorFunction[IRP_MJ_READ] = PrimaryProbeRead;
+    PrimaryProbeDevice->Flags = (PrimaryProbeDevice->Flags | DO_BUFFERED_IO) & ~DO_DEVICE_INITIALIZING;
     HANDLE worker = NULL;
-    NTSTATUS status = PsCreateSystemThread(&worker, 0, NULL, NULL, NULL, ReadWorker, NULL);
+    status = PsCreateSystemThread(&worker, 0, NULL, NULL, NULL, ReadWorker, NULL);
     if (NT_SUCCESS(status) && worker != NULL) ZwClose(worker);
+    if (!NT_SUCCESS(status)) IoDeleteDevice(PrimaryProbeDevice);
     DbgPrint("[read-forward-entry] worker=0x%08x\n", (uint32_t)status);
     return status;
 }

@@ -1,6 +1,6 @@
 import unittest
 
-from verify_log import verify
+from verify_log import verify, verify_primary_execution
 
 
 SOURCE = "file=0x0000010003000100 generation=0x0000000000000007"
@@ -33,6 +33,31 @@ def accepted_lines():
 
 
 class MupFailureLogTests(unittest.TestCase):
+    def test_worker_only_failure_proof_is_not_primary_execution_proof(self):
+        with self.assertRaises(ValueError):
+            verify_primary_execution("\n".join(accepted_lines()))
+
+    def test_primary_execution_requires_causal_entry_terminal_and_delivered_result(self):
+        lines = ["[source-primary-probe] entered", *accepted_lines(),
+                 "[source-primary-probe] terminal-intent status=0x00000000",
+                 "[source-primary-probe] delivered call=0x00000000 iosb=0x00000000 info=0 output-unchanged=1"]
+        self.assertEqual(verify_primary_execution("\n".join(lines)),
+                         (0x10003000100, 0x10007000200, 7))
+        for index in (0, len(lines) - 2, len(lines) - 1):
+            with self.subTest(missing=index), self.assertRaises(ValueError):
+                verify_primary_execution("\n".join(lines[:index] + lines[index + 1:]))
+        with self.assertRaises(ValueError):
+            verify_primary_execution("\n".join([*lines[1:], lines[0]]))
+        for marker in (lines[0], lines[-2], lines[-1]):
+            with self.subTest(duplicate=marker), self.assertRaises(ValueError):
+                verify_primary_execution("\n".join([*lines, marker]))
+        with self.assertRaises(ValueError):
+            verify_primary_execution("\n".join(lines).replace(
+                "terminal-intent status=0x00000000", "terminal-intent status=0xc0000001"))
+        with self.assertRaises(ValueError):
+            verify_primary_execution("\n".join(lines).replace(
+                "info=0 output-unchanged=1", "info=1 output-unchanged=1"))
+
     def test_cross_domain_addresses_are_distinct_but_actual_generation_matches(self):
         self.assertEqual(verify("\n".join(accepted_lines())), (0x10003000100, 0x10007000200, 7))
 
