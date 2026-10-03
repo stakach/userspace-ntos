@@ -1782,7 +1782,7 @@ pub(crate) unsafe fn retire_pinned_root_provider_pool_packet(
 
 mod root_pool;
 pub(crate) use root_pool::{RootProviderPoolAllocation, allocate_root_provider_pool_allocation,
-    retire_root_provider_pool_allocation, RootPoolError,
+    retire_root_provider_pool_allocation, root_provider_pool_census, RootPoolError,
     try_allocate_root_provider_pool_allocation, try_retire_root_provider_pool_allocation,
     try_capture_root_provider_pool_packet, try_publish_root_provider_pool_packet};
 

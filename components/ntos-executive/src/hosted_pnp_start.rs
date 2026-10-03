@@ -2017,6 +2017,9 @@ unsafe fn try_publish_hosted_video_route(
     instance_id: &str,
     report: &mut HostedPnpStartReport,
 ) {
+    if crate::current_win32k_provider_domain().is_none() {
+        return;
+    }
     if !driver_launch::hosted_device_video_port_initialized(device_id) {
         return;
     }

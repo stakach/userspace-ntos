@@ -9837,25 +9837,28 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(context_lifetime.token_handle_releases);
     print_str(b"/");
     print_u64(context_lifetime.retirement_failures);
-    let provider_pool = win32k_subsystem::provider_pool_census();
     print_str(b" w32-provider-pool=");
-    print_u64(provider_pool.live_bytes >> 10);
-    print_str(b"KiB/");
-    print_u64(provider_pool.live_high_water >> 10);
-    print_str(b"KiB arena-hw=");
-    print_u64(provider_pool.arena_high_water >> 10);
-    print_str(b"KiB alloc/free/reuse/invalid=");
-    print_u64(provider_pool.allocations);
-    print_str(b"/");
-    print_u64(provider_pool.frees);
-    print_str(b"/");
-    print_u64(provider_pool.reuses);
-    print_str(b"/");
-    print_u64(provider_pool.invalid_frees);
-    print_str(b" oom/corrupt=");
-    print_u64(provider_pool.out_of_memory);
-    print_str(b"/");
-    print_u64(provider_pool.corruptions);
+    if let Some(provider_pool) = win32k_subsystem::root_provider_pool_census() {
+        print_u64(provider_pool.live_bytes >> 10);
+        print_str(b"KiB/");
+        print_u64(provider_pool.live_high_water >> 10);
+        print_str(b"KiB arena-hw=");
+        print_u64(provider_pool.arena_high_water >> 10);
+        print_str(b"KiB alloc/free/reuse/invalid=");
+        print_u64(provider_pool.allocations);
+        print_str(b"/");
+        print_u64(provider_pool.frees);
+        print_str(b"/");
+        print_u64(provider_pool.reuses);
+        print_str(b"/");
+        print_u64(provider_pool.invalid_frees);
+        print_str(b" oom/corrupt=");
+        print_u64(provider_pool.out_of_memory);
+        print_str(b"/");
+        print_u64(provider_pool.corruptions);
+    } else {
+        print_str(b"unavailable");
+    }
     if let Some(security) = win32k_subsystem::object_security_census() {
         print_str(b" object-security=get/release/live/entries/retiring:");
         print_u64(security.acquisitions);
