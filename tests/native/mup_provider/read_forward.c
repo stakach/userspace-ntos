@@ -12,8 +12,11 @@ typedef void *HANDLE;
 #define STATUS_INSUFFICIENT_RESOURCES ((NTSTATUS)0xc000009au)
 #define STATUS_OBJECT_NAME_NOT_FOUND ((NTSTATUS)0xc0000034u)
 #define STATUS_OBJECT_PATH_NOT_FOUND ((NTSTATUS)0xc000003au)
+#define STATUS_IO_DEVICE_ERROR ((NTSTATUS)0xc0000185u)
+#define STATUS_TIMEOUT ((NTSTATUS)0x102)
 #define NT_SUCCESS(status) ((status) >= 0)
 #define IRP_MJ_READ 0x03
+#define IRP_MJ_WRITE 0x04
 #define IRP_MJ_FLUSH_BUFFERS 0x09
 #define IRP_MJ_QUERY_INFORMATION 0x05
 #define FileStandardInformation 5
@@ -78,6 +81,14 @@ typedef struct {
             int64_t ByteOffset;
             uint64_t Reserved2;
         } Read;
+        struct {
+            uint32_t Length;
+            uint32_t Reserved0;
+            uint32_t Key;
+            uint32_t Reserved1;
+            int64_t ByteOffset;
+            uint64_t Reserved2;
+        } Write;
         struct {
             uint32_t Length;
             uint32_t Reserved0;
@@ -525,6 +536,151 @@ close:
     return status;
 }
 
+static NTSTATUS ReleaseTerminalFailure(void *file, DEVICE_OBJECT *device, uint32_t operation)
+{
+    uint8_t *buffer = ExAllocatePoolWithTag(PagedPool, 2, 0x466e746e);
+    if (buffer == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+    buffer[0] = 0xa7; buffer[1] = (uint8_t)operation;
+    IRP *irp = IoAllocateIrp(device->StackSize, 0);
+    if (irp == NULL) {
+        ExFreePoolWithTag(buffer, 0x466e746e);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    IO_STACK_LOCATION *stack = IoGetNextIrpStackLocation(irp);
+    if (stack == NULL) {
+        IoFreeIrp(irp); ExFreePoolWithTag(buffer, 0x466e746e);
+        return STATUS_UNSUCCESSFUL;
+    }
+    IO_STATUS_BLOCK iosb = {STATUS_UNSUCCESSFUL, 0, 0};
+    uint64_t event[3] = {0};
+    KeInitializeEvent(event, 1, 0);
+    irp->Flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER;
+    irp->AssociatedSystemBuffer = buffer;
+    irp->UserIosb = &iosb;
+    irp->UserEvent = event;
+    irp->OriginalFileObject = file;
+    stack->MajorFunction = IRP_MJ_WRITE;
+    stack->Parameters.Write.Length = 2;
+    stack->Parameters.Write.ByteOffset = 0;
+    stack->DeviceObject = device;
+    stack->FileObject = file;
+    NTSTATUS call = IofCallDriver(device, irp);
+    NTSTATUS wait = call == STATUS_SUCCESS || call == STATUS_PENDING
+        ? KeWaitForSingleObject(event, 0, 0, 0, NULL) : STATUS_UNSUCCESSFUL;
+    return call == STATUS_SUCCESS && wait == STATUS_SUCCESS &&
+        iosb.Status == STATUS_SUCCESS && iosb.Information == 2 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
+static NTSTATUS TerminalFailureOnce(void *file, DEVICE_OBJECT *device, uint32_t operation)
+{
+    uint8_t output[32];
+    for (uint32_t i = 0; i < sizeof(output); ++i) output[i] = 0xcc;
+    const uint32_t length = operation == 0 ? sizeof(ExpectedBytes) : sizeof(FILE_STANDARD_INFORMATION);
+    void *buffer = NULL;
+    if (operation != 1) {
+        buffer = ExAllocatePoolWithTag(PagedPool, length, 0x466e746e);
+        if (buffer == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+        for (uint32_t i = 0; i < length; ++i) ((uint8_t *)buffer)[i] = 0xa5;
+    }
+    IRP *irp = IoAllocateIrp(device->StackSize, 0);
+    if (irp == NULL) {
+        if (buffer != NULL) ExFreePoolWithTag(buffer, 0x466e746e);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    IO_STACK_LOCATION *stack = IoGetNextIrpStackLocation(irp);
+    if (stack == NULL) {
+        IoFreeIrp(irp);
+        if (buffer != NULL) ExFreePoolWithTag(buffer, 0x466e746e);
+        return STATUS_UNSUCCESSFUL;
+    }
+    IO_STATUS_BLOCK iosb = {STATUS_UNSUCCESSFUL, 0, 0x12345678};
+    uint64_t event[3] = {0};
+    KeInitializeEvent(event, 1, 0);
+    irp->UserIosb = &iosb;
+    irp->UserEvent = event;
+    irp->OriginalFileObject = file;
+    stack->DeviceObject = device;
+    stack->FileObject = file;
+    if (operation != 1) {
+        irp->Flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION;
+        irp->AssociatedSystemBuffer = buffer;
+        irp->UserBuffer = output + 4;
+    }
+    if (operation == 0) {
+        stack->MajorFunction = IRP_MJ_READ;
+        stack->Parameters.Read.Length = length;
+        stack->Parameters.Read.ByteOffset = 0;
+    } else if (operation == 1) {
+        stack->MajorFunction = IRP_MJ_FLUSH_BUFFERS;
+    } else {
+        stack->MajorFunction = IRP_MJ_QUERY_INFORMATION;
+        stack->Parameters.QueryFile.Length = length;
+        stack->Parameters.QueryFile.FileInformationClass = FileStandardInformation;
+    }
+    NTSTATUS call = IofCallDriver(device, irp);
+    NTSTATUS wait = STATUS_UNSUCCESSFUL;
+    int before_unchanged = iosb.Status == STATUS_UNSUCCESSFUL && iosb.Information == 0x12345678;
+    for (uint32_t i = 0; i < sizeof(output); ++i)
+        if (output[i] != 0xcc) before_unchanged = 0;
+    int64_t zero = 0;
+    NTSTATUS pending_event = call == STATUS_PENDING
+        ? KeWaitForSingleObject(event, 0, 0, 0, &zero) : STATUS_UNSUCCESSFUL;
+    DbgPrint("[terminal-failure-retained] operation=%u event=0x%08x iosb-and-output-unchanged=%u\n",
+             operation, (uint32_t)pending_event, before_unchanged);
+    // Release even after an assertion mismatch: a live pending IRP still owns stack storage.
+    NTSTATUS release = call == STATUS_PENDING
+        ? ReleaseTerminalFailure(file, device, operation) : STATUS_UNSUCCESSFUL;
+    // Keep the File reference, stack IOSB, Event and output alive through actual completion.
+    if (call == STATUS_PENDING) wait = KeWaitForSingleObject(event, 0, 0, 0, NULL);
+    int untouched = 1;
+    for (uint32_t i = 0; i < sizeof(output); ++i)
+        if (output[i] != 0xcc) untouched = 0;
+    NTSTATUS result = call == STATUS_PENDING && wait == STATUS_SUCCESS &&
+        release == STATUS_SUCCESS && pending_event == STATUS_TIMEOUT && before_unchanged &&
+        iosb.Status == STATUS_IO_DEVICE_ERROR && iosb.Information == 0 && untouched
+        ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    DbgPrint("[terminal-failure-result] operation=%u call=0x%08x wait=0x%08x iosb=0x%08x info=%u output-unchanged=%u\n",
+             operation, (uint32_t)call, (uint32_t)wait, (uint32_t)iosb.Status,
+             (uint32_t)iosb.Information, untouched);
+    if (result == STATUS_SUCCESS) DbgPrint("[terminal-failure-verified-%u]\n", operation);
+    return result;
+}
+
+static NTSTATUS CheckTerminalFailures(void)
+{
+    static WCHAR path[] = {
+        '\\','D','e','v','i','c','e','\\','M','u','p','\\','n','t','o','s','-','p','r','o','b','e',
+        '\\','t','e','r','m','i','n','a','l','-','f','a','i','l','u','r','e',0
+    };
+    UNICODE_STRING name = {sizeof(path) - sizeof(WCHAR), sizeof(path), path};
+    OBJECT_ATTRIBUTES attrs = {sizeof(attrs), NULL, &name, OBJ_CASE_INSENSITIVE, NULL, NULL};
+    IO_STATUS_BLOCK open_iosb = {0};
+    HANDLE handle = NULL;
+    NTSTATUS result = ZwCreateFile(&handle, FILE_READ_DATA, &attrs, &open_iosb, NULL, 0,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN, 0, NULL, 0);
+    if (NT_SUCCESS(result)) result = open_iosb.Status;
+    if (!NT_SUCCESS(result) || handle == NULL) return STATUS_UNSUCCESSFUL;
+    void *file = NULL;
+    result = ObReferenceObjectByHandle(handle, FILE_READ_DATA, NULL, 0, &file, NULL);
+    if (NT_SUCCESS(result) && file != NULL) {
+        DEVICE_OBJECT *device = IoGetRelatedDeviceObject(file);
+        if (device == NULL || device->StackSize == 0 || device->StackSize > 32)
+            result = STATUS_UNSUCCESSFUL;
+        else for (uint32_t operation = 0; operation < 3 && NT_SUCCESS(result); ++operation)
+            result = TerminalFailureOnce(file, device, operation);
+        // Closing the handle must deliver CLEANUP but not CLOSE while this pointer is retained.
+        NTSTATUS close = ZwClose(handle);
+        handle = NULL;
+        if (!NT_SUCCESS(close)) result = close;
+        ObfDereferenceObject(file);
+    } else result = STATUS_UNSUCCESSFUL;
+    if (handle != NULL) {
+        NTSTATUS close = ZwClose(handle);
+        if (!NT_SUCCESS(close)) result = close;
+    }
+    return result;
+}
+
 static void __stdcall ReadWorker(void *context)
 {
     (void)context;
@@ -569,6 +725,7 @@ dereference:
     ObfDereferenceObject(file);
 close:
     ZwClose(handle);
+    if (status == STATUS_SUCCESS) status = CheckTerminalFailures();
     if (status == STATUS_SUCCESS) status = CheckSectionFile();
 fail:
     if (!NT_SUCCESS(status))

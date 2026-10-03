@@ -74,6 +74,24 @@ if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || ! grep -Fq '[mup-provider-query-file] count=3 class=5 bytes=24' "$RUN_LOG" \
    || ! grep -Fq '[zw-query-file-verified]' "$RUN_LOG" \
    || ! grep -Fq '[zw-read-file-verified]' "$RUN_LOG" \
+   || ! grep -Fq '[terminal-failure-verified-0]' "$RUN_LOG" \
+   || ! grep -Fq '[terminal-failure-verified-1]' "$RUN_LOG" \
+   || ! grep -Fq '[terminal-failure-verified-2]' "$RUN_LOG" \
+   || ! grep -Fq '[terminal-failure-retained] operation=0 event=0x00000102 iosb-and-output-unchanged=1' "$RUN_LOG" \
+   || ! grep -Fq '[terminal-failure-retained] operation=1 event=0x00000102 iosb-and-output-unchanged=1' "$RUN_LOG" \
+   || ! grep -Fq '[terminal-failure-retained] operation=2 event=0x00000102 iosb-and-output-unchanged=1' "$RUN_LOG" \
+   || ! grep -Fq '[mup-terminal-failure-release] operation=0' "$RUN_LOG" \
+   || ! grep -Fq '[mup-terminal-failure-release] operation=1' "$RUN_LOG" \
+   || ! grep -Fq '[mup-terminal-failure-release] operation=2' "$RUN_LOG" \
+   || [ "$(grep -Fc '[mup-terminal-failure-release]' "$RUN_LOG")" -ne 3 ] \
+   || ! grep -Fq '[mup-terminal-failure-complete] operation=0 status=0xc0000185 info=0 ownership-unchanged=1' "$RUN_LOG" \
+   || ! grep -Fq '[mup-terminal-failure-complete] operation=1 status=0xc0000185 info=0 ownership-unchanged=1' "$RUN_LOG" \
+   || ! grep -Fq '[mup-terminal-failure-complete] operation=2 status=0xc0000185 info=0 ownership-unchanged=1' "$RUN_LOG" \
+   || [ "$(grep -Fc '[mup-terminal-failure-pending]' "$RUN_LOG")" -ne 3 ] \
+   || [ "$(grep -Fc '[mup-terminal-failure-complete]' "$RUN_LOG")" -ne 3 ] \
+   || ! grep -Fq '[mup-terminal-failure-cleanup] count=1' "$RUN_LOG" \
+   || ! grep -Fq '[mup-terminal-failure-close] count=1' "$RUN_LOG" \
+   || grep -Fq '[read-forward-fail]' "$RUN_LOG" \
    || ! grep -Fq '[mup-provider-section-create] count=1' "$RUN_LOG" \
    || ! grep -Fq '[mup-provider-section-query-pending-dispatch] class=5 bytes=24' "$RUN_LOG" \
    || ! grep -Fq '[mup-provider-section-query-pending-complete] class=5 bytes=24' "$RUN_LOG" \
