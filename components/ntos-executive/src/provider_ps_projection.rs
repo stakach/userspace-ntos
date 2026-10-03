@@ -3,14 +3,10 @@
 use super::*;
 use spawn_hosts::shared_ingress::owner::runtime;
 
-/// The enclosing Ps service has authenticated its logical caller or kernel activation. This
-/// independently binds the mapping to its retained physical source, not ambient caller state.
-/// No component IPC may be pumped while the canonical manager and page owner are borrowed.
-pub(crate) unsafe fn grant(
+/// Bind every Ps operation to the retained physical invocation, independently of its subject.
+pub(crate) unsafe fn authenticated_target(
     channel: &spawn_hosts::PumpChannel,
-    pm: &nt_process::ProcessManager,
-    body: u64,
-) -> Result<(), u32> {
+) -> Result<ps_object_provider::ProviderRoot, u32> {
     let invalid = nt_process::STATUS_INVALID_HANDLE;
     let route = runtime::channel_route(channel)
         .map_err(|_| invalid)?
@@ -35,7 +31,16 @@ pub(crate) unsafe fn grant(
     if current_win32k_provider_domain() != Some(domain) {
         return Err(invalid);
     }
-    let target = ps_object_provider::ProviderRoot::new(catalog, domain, source.pml4)?;
+    ps_object_provider::ProviderRoot::new(catalog, domain, source.pml4)
+}
+
+/// The caller retains its authenticated target and acquired reference throughout this operation.
+/// No component IPC may be pumped while the canonical manager and page owner are borrowed.
+pub(crate) unsafe fn grant(
+    target: ps_object_provider::ProviderRoot,
+    pm: &nt_process::ProcessManager,
+    body: u64,
+) -> Result<(), u32> {
     ps_object_backing::grant_referenced_body(
         pm,
         body,

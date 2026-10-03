@@ -5300,6 +5300,10 @@ pub(crate) unsafe fn service_win32k_ps_request(
     if let Some(caller) = channel.kernel_caller {
         return kernel_provider_activation::service_ps(channel, caller, op, object, value);
     }
+    let target = match provider_ps_projection::authenticated_target(channel) {
+        Ok(target) => target,
+        Err(status) => return (status as i32, 0, 0, 0),
+    };
     let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if handler_ptr.is_null() {
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
@@ -5320,7 +5324,7 @@ pub(crate) unsafe fn service_win32k_ps_request(
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     }
     provider_ps::dispatch(&mut handler.pm, op, object, value, |pm, body| {
-        provider_ps_projection::grant(channel, pm, body)
+        provider_ps_projection::grant(target, pm, body)
     })
 }
 
@@ -17298,6 +17302,33 @@ pub(crate) unsafe fn service_sec_image(
                     && msg_returns_to_client
                     && message_output_stage.is_some()
                 {
+                    let report_output_failure = |published: Option<u32>| {
+                        print_str(b"[win32k-msg-output-rejected] ssn=");
+                        print_hex_u64(m0);
+                        print_str(b" pi=");
+                        print_u64(pi as u64);
+                        print_str(b" result=");
+                        print_hex_u64(st);
+                        print_str(b" expected=");
+                        print_u64(if nt_user_callback::message_dispatch_output_length_matches_result(m0, st, 0) {
+                            0
+                        } else {
+                            u64::from(nt_user_callback::DISPATCH_MESSAGE_OUTPUT_BYTES)
+                        });
+                        print_str(b" published=");
+                        if let Some(length) = published {
+                            print_u64(u64::from(length));
+                        } else {
+                            print_str(b"missing-or-invalid");
+                        }
+                        if let Some(stage) = message_output_stage {
+                            print_str(b" stage=");
+                            print_hex_u64(stage.provider_pointer);
+                            print_str(b" capacity=");
+                            print_u64(u64::from(stage.capacity));
+                        }
+                        print_str(b"\n");
+                    };
                     match message_output_stage
                         .and_then(|stage| win32k_glue::published_win32k_output_length(stage))
                     {
@@ -17308,12 +17339,14 @@ pub(crate) unsafe fn service_sec_image(
                         {
                             len
                         }
-                        Some(_) => {
+                        Some(length) => {
+                            report_output_failure(Some(length));
                             st = 0xC000_0001;
                             ok = false;
                             u32::MAX
                         }
                         None => {
+                            report_output_failure(None);
                             st = 0xC000_0001;
                             ok = false;
                             u32::MAX
@@ -17375,7 +17408,25 @@ pub(crate) unsafe fn service_sec_image(
                         ),
                     );
                     if !redirected_user_callback {
+                        print_str(b"[win32k-callback-redirect-cancel] phase=before ssn=");
+                        print_hex_u64(m0);
+                        print_str(b" pi=");
+                        print_u64(pi as u64);
+                        print_str(b" result=");
+                        print_hex_u64(st);
+                        print_str(b" ok=");
+                        print_u64(u64::from(ok));
+                        print_str(b"\n");
                         let resumed = win32k_glue::cancel_suspended_user_callback();
+                        print_str(b"[win32k-callback-redirect-cancel] phase=after ssn=");
+                        print_hex_u64(m0);
+                        print_str(b" pi=");
+                        print_u64(pi as u64);
+                        print_str(b" resumed-status=");
+                        print_hex_u64(u64::from(resumed.0 as u32));
+                        print_str(b" resumed-ok=");
+                        print_u64(u64::from(resumed.1));
+                        print_str(b"\n");
                         st = resumed.0 as u32 as u64;
                         ok = resumed.1;
                     }
@@ -17596,6 +17647,11 @@ pub(crate) unsafe fn service_sec_image(
                     let (_, _, drain_safe) =
                         drain_selected_gui_event_signals(&mut nt_handler);
                     if !drain_safe {
+                        print_str(b"[win32k-gui-event-drain-unsafe] ssn=");
+                        print_hex_u64(m0);
+                        print_str(b" pi=");
+                        print_u64(pi as u64);
+                        print_str(b"\n");
                         ok = false;
                         st = 0xC000_0001;
                     }

@@ -385,6 +385,10 @@ pub(super) unsafe fn service_ps(
     if authenticated_channel_caller(channel) != Ok(caller) {
         return (nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0);
     }
+    let target = match provider_ps_projection::authenticated_target(channel) {
+        Ok(target) => target,
+        Err(status) => return (status as i32, 0, 0, 0),
+    };
     match with_provider_process_manager(|pm| {
         (&*core::ptr::addr_of!(ACTIVATIONS)).validate(
             caller,
@@ -393,7 +397,7 @@ pub(super) unsafe fn service_ps(
             &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
         )?;
         Ok(provider_ps::dispatch(pm, op, object, value, |pm, body| {
-            provider_ps_projection::grant(channel, pm, body)
+            provider_ps_projection::grant(target, pm, body)
         }))
     }) {
         Ok(result) => result,

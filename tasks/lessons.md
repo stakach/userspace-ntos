@@ -438,3 +438,10 @@ diagnosis-free failure.
   malformed empty components without rejecting the producer's canonical representation.
 - A complete invalid journal record is not a torn tail. Propagate strict replay failure before
   publishing restored/clean state; a partially restored sentinel can suppress real initialization.
+
+## Object Type Is Independent of GUI Conversion
+- A successful Ps lookup can return a referenced process or thread that has never acquired a GUI
+  context. Classify its exact canonical identity through the authenticated manager, not a GUI
+  context table, address range, or guessed object header.
+- Distinguish an authenticated negative classification from failed transport or authority. A
+  rejected query must stop, not route the pointer to another object's retirement service.

@@ -172,6 +172,7 @@ mod win32k_subsystem {
     pub const W32_PS_OP_RETAIN_POINTER: u64 = 6;
     pub const W32_PS_OP_RELEASE_POINTER: u64 = 7;
     pub const W32_PS_OP_YIELD_EXECUTION: u64 = 8;
+    pub const W32_PS_OP_QUERY_OBJECT_KIND: u64 = 9;
 }
 mod sel4_rt {
     pub fn yield_now() {}
@@ -204,6 +205,64 @@ fn thread_references(pm: &nt_process::ProcessManager, tid: u32) -> u32 {
     pm.process_object_delete_blockers(pid)
         .unwrap()
         .thread_kernel_pointer_references
+}
+
+#[test]
+fn canonical_object_kind_does_not_depend_on_gui_conversion_or_change_references() {
+    let (mut pm, _, pid, tid) = fixture();
+    let before = (process_references(&pm, pid), thread_references(&pm, tid));
+    for (body, kind) in [(0x3000, 1), (0x4000, 2), (0x4001, 0), (0, 0)] {
+        let result = provider_ps::dispatch(
+            &mut pm,
+            win32k_subsystem::W32_PS_OP_QUERY_OBJECT_KIND,
+            body,
+            0,
+            |_, _| panic!("read-only classification cannot grant or retain backing"),
+        );
+        assert_eq!(result, (0, kind, 0, 0));
+    }
+    assert_eq!(
+        before,
+        (process_references(&pm, pid), thread_references(&pm, tid))
+    );
+}
+
+#[test]
+fn provider_object_kind_uses_canonical_broker_not_gui_context_presence() {
+    let file = source("win32k_subsystem.rs");
+    let mut calls = Calls::default();
+    calls.visit_block(&function(&file, "ps_projection_object_type").block);
+    assert!(calls.0.iter().any(|call| call == "win32k_ps_broker_call"));
+    assert!(calls
+        .0
+        .iter()
+        .any(|call| call == "crate::provider_bugcheck::report"));
+    assert!(!calls
+        .0
+        .iter()
+        .any(|call| call.ends_with("context_index_for_eprocess")
+            || call.ends_with("context_index_for_ethread")
+            || call.ends_with("initial_system_projection")));
+}
+
+#[test]
+fn every_ps_operation_authenticates_physical_provider_before_canonical_dispatch() {
+    for (file, entry) in [
+        ("service_sec_image.rs", "service_win32k_ps_request"),
+        ("kernel_provider_activation.rs", "service_ps"),
+    ] {
+        let file = source(file);
+        let mut calls = Calls::default();
+        calls.visit_block(&function(&file, entry).block);
+        let authentication = calls.0.iter().position(|call| call == "provider_ps_projection::authenticated_target")
+            .expect("read-only Ps classification must authenticate physical source before NotPs is meaningful");
+        let dispatch = calls
+            .0
+            .iter()
+            .position(|call| call == "provider_ps::dispatch")
+            .unwrap();
+        assert!(authentication < dispatch);
+    }
 }
 
 #[test]
@@ -330,8 +389,9 @@ fn invalid_lookup_does_not_invoke_projection() {
 fn canonical_projection_authenticates_physical_route_and_acknowledges_mapping_result() {
     let file = source("provider_ps_projection.rs");
     let grant = function(&file, "grant");
+    let authenticate = function(&file, "authenticated_target");
     let mut calls = Calls::default();
-    calls.visit_block(&grant.block);
+    calls.visit_block(&authenticate.block);
     for required in [
         "channel_route",
         "physical_source",
@@ -368,7 +428,7 @@ fn canonical_projection_authenticates_physical_route_and_acknowledges_mapping_re
         }
     }
     let mut comparisons = Comparisons(Vec::new());
-    comparisons.visit_block(&grant.block);
+    comparisons.visit_block(&authenticate.block);
     for member in ["tcb", "pml4"] {
         assert!(
             comparisons.0.contains(&(member.into(), member.into())),
@@ -394,7 +454,7 @@ fn canonical_projection_authenticates_physical_route_and_acknowledges_mapping_re
 #[test]
 fn bootstrap_ps_projection_uses_retained_vspace_not_later_public_readiness() {
     let file = source("provider_ps_projection.rs");
-    let grant = function(&file, "grant");
+    let grant = function(&file, "authenticated_target");
     struct PublicReadiness(bool);
     impl<'ast> Visit<'ast> for PublicReadiness {
         fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
@@ -412,6 +472,7 @@ fn bootstrap_ps_projection_uses_retained_vspace_not_later_public_readiness() {
         "DriverEntry owns an authenticated registered VSpace before public completion readiness; projection cannot require the later atomic");
     let mut calls = Calls::default();
     calls.visit_block(&grant.block);
+    calls.visit_block(&function(&file, "grant").block);
     for required in [
         "physical_source",
         "ProviderRoot::new",

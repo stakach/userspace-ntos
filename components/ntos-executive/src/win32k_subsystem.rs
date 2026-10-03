@@ -1321,6 +1321,7 @@ pub const W32_PS_OP_LOOKUP_THREAD: u64 = 5;
 pub const W32_PS_OP_RETAIN_POINTER: u64 = 6;
 pub const W32_PS_OP_RELEASE_POINTER: u64 = 7;
 pub const W32_PS_OP_YIELD_EXECUTION: u64 = 8;
+pub const W32_PS_OP_QUERY_OBJECT_KIND: u64 = 9;
 /// Bounded global-atom requests. The executive owns the one native atom table; win32k stages only
 /// explicit-length UTF-16 input and receives the resulting 16-bit atom.
 pub const W32_ATOM_LABEL: u64 = 0x77E;
@@ -3412,8 +3413,11 @@ extern "win64" fn s_ps_get_thread_process(thread: u64) -> u64 {
 }
 
 unsafe fn win32k_ps_broker_call(op: u64, object: u64, value: u64) -> (i32, u64, u64, u64) {
-    let (_label, status, out1, out2, out3) =
-        crate::driver_launch::call_on4((W32_PS_LABEL << 12) | 3, op, object, value, 0);
+    let (words, status, out1, out2, out3) =
+        crate::driver_launch::call_on4_raw((W32_PS_LABEL << 12) | 3, op, object, value, 0);
+    if words != 4 {
+        crate::provider_bugcheck::report(0xc4, [W32_PS_LABEL, object, words, status]);
+    }
     (status as u32 as i32, out1, out2, out3)
 }
 
@@ -4139,17 +4143,18 @@ fn classify_type(obj_type: u64) -> Option<ObKind> {
 }
 
 unsafe fn ps_projection_object_type(object: u64) -> Option<u64> {
-    let system = crate::ps_bootstrap::initial_system_projection();
-    if process_context_index_for_eprocess(object).is_some()
-        || system.is_some_and(|system| system.process_body == object)
-    {
-        Some(nt_object_manager::object_type::process_object_type_addr())
-    } else if thread_context_index_for_ethread(object).is_some()
-        || system.is_some_and(|system| system.thread_body == object)
-    {
-        Some(nt_object_manager::object_type::thread_object_type_addr())
-    } else {
-        None
+    let (status, kind, _, _) = win32k_ps_broker_call(W32_PS_OP_QUERY_OBJECT_KIND, object, 0);
+    if status != 0 {
+        crate::provider_bugcheck::report(
+            0xc4,
+            [W32_PS_LABEL, object, status as u32 as u64, kind],
+        );
+    }
+    match kind {
+        0 => None,
+        1 => Some(nt_object_manager::object_type::process_object_type_addr()),
+        2 => Some(nt_object_manager::object_type::thread_object_type_addr()),
+        _ => crate::provider_bugcheck::report(0xc4, [W32_PS_LABEL, object, 0, kind]),
     }
 }
 
@@ -4342,7 +4347,14 @@ extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
     }
     if !provider_event_projection_contains(object) {
         return unsafe { crate::driver_launch::win32k_device_pointers::dereference(object) }
-            .unwrap_or_else(|status| panic!("Device pointer dereference failed: {status:#010x}"));
+            .unwrap_or_else(|status| {
+                print_str(b"[win32k-device-dereference-rejected] object=");
+                print_hex_u64(object);
+                print_str(b" status=");
+                print_hex_u64(u64::from(status as u32));
+                print_str(b"\n");
+                panic!("Device pointer dereference failed: {status:#010x}")
+            });
     }
     let (status, count, _, _) =
         unsafe { win32k_event_broker_call(W32_EVENT_OP_DEREFERENCE, object, 0, 0) };

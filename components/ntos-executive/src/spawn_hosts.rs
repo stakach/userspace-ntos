@@ -2948,13 +2948,18 @@ unsafe fn component_pump_loop(
         } else if label == crate::win32k_subsystem::W32_PS_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
-            let (status, out1, out2, out3) = unsafe {
+            let (status, out1, out2, out3) = if shared_pump::authenticated_badge(ch, msg.badge)
+                && msg.mi == ((crate::win32k_subsystem::W32_PS_LABEL << 12) | 3)
+                && *reply_cap == ch.reply_cap
+            {
                 crate::service_sec_image::service_win32k_ps_request(
                     ch,
                     msg.m0,
                     msg.m1,
                     msg.m2,
                 )
+            } else {
+                (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0)
             };
             pump_reply_recv4_into!(
                 ch,

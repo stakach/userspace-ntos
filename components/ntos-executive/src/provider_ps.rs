@@ -36,6 +36,16 @@ pub(crate) fn dispatch(
                 )
             })
             .ok_or(INVALID_HANDLE),
+        W32_PS_OP_QUERY_OBJECT_KIND => {
+            let kind = if pm.pid_for_kernel_process_object(object).is_some() {
+                1
+            } else if pm.tid_for_kernel_thread_object(object).is_some() {
+                2
+            } else {
+                0
+            };
+            Ok((kind, 0, 0))
+        }
         W32_PS_OP_SET_THREAD_PRIORITY => pm
             .set_kernel_thread_priority(object, value as u32 as i32)
             .map(|previous| (u64::from(previous as u32), 0, 0)),
