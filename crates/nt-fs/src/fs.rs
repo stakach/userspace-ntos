@@ -3433,8 +3433,9 @@ struct FileObject {
     current_offset: u64,
     /// `FILE_OBJECT::Event` state shared by every duplicated process handle.
     signaled: bool,
-    /// Create options retained as `FILE_OBJECT` mode flags for `FileModeInformation`.
+    /// Immutable CREATE admission options.
     create_options: u32,
+    mode_state: crate::FileModeState,
     /// One share claim belongs to this open description, until final-handle cleanup completes.
     share: FileShareAccess,
     open_privileges: FileOpenPrivileges,
@@ -4792,7 +4793,8 @@ impl FileSystem {
 
     /// `ZwSetInformationFile` (spec §19) for the classes a writable volume must serve:
     /// `FileBasicInformation` (attributes), disposition classes (delete-on-close),
-    /// `FilePositionInformation`, and `FileEndOfFileInformation` / `FileAllocationInformation`
+    /// `FilePositionInformation`, `FileModeInformation`, and
+    /// `FileEndOfFileInformation` / `FileAllocationInformation`
     /// (truncate/extend). Returns the NTSTATUS; unhandled classes are reported honestly.
     pub fn zw_set_information_file(&mut self, handle: u64, class: u32, data: &[u8]) -> u32 {
         let Some(obj) = self.obj(handle) else {
@@ -4800,6 +4802,23 @@ impl FileSystem {
         };
         let node_id = obj.node_id;
         match class {
+            FILE_MODE_INFORMATION => {
+                if data.len() < 4 {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let requested = u32::from_le_bytes(data[..4].try_into().unwrap());
+                let next = match obj.mode_state.transition(requested) {
+                    Ok(next) => next,
+                    Err(status) => return status.raw() as u32,
+                };
+                debug_assert_eq!(
+                    next.io_mode().map(|mode| mode.is_synchronous()),
+                    crate::FileModeState::from_create_options(obj.create_options)
+                        .io_mode().map(|mode| mode.is_synchronous()),
+                );
+                self.obj_mut(handle).expect("validated local File body").mode_state = next;
+                STATUS_SUCCESS
+            }
             FILE_BASIC_INFORMATION => {
                 if data.len() < 40 {
                     return STATUS_INFO_LENGTH_MISMATCH;
@@ -5037,8 +5056,7 @@ impl FileSystem {
 
     /// I/O-Manager-owned `FileModeInformation` for this live `FILE_OBJECT`.
     pub fn file_mode(&self, handle: u64) -> Option<u32> {
-        self.obj(handle)
-            .map(|obj| crate::file_mode_from_create_options(obj.create_options))
+        self.obj(handle).map(|obj| obj.mode_state.query_bits())
     }
 
     /// Create every missing directory along `path`, and return whether the leaf is a directory.

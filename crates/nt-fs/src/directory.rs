@@ -152,6 +152,7 @@ impl DirectoryQueryState {
 pub struct DirectoryOpen {
     pub first_cluster: u32,
     pub create_options: u32,
+    mode_state: crate::FileModeState,
     pub metadata: crate::FileMetadata,
     pub alternate_name: crate::FatShortName,
     pub query: DirectoryQueryState,
@@ -165,6 +166,14 @@ pub struct DirectoryOpen {
 pub const DIRECTORY_OPEN_PATH_CAP: usize = 1024;
 
 impl DirectoryOpen {
+    pub const fn mode_state(&self) -> crate::FileModeState { self.mode_state }
+
+    pub fn set_mode(&mut self, requested: u32) -> Result<crate::FileModeState, u32> {
+        let next = self.mode_state.transition(requested).map_err(|status| status.raw() as u32)?;
+        self.mode_state = next;
+        Ok(next)
+    }
+
     pub fn volume_relative_path(&self) -> &[u8] {
         &self.path[..self.path_len as usize]
     }
@@ -202,6 +211,7 @@ impl DirectoryOpenSlot {
             open: DirectoryOpen {
                 first_cluster: 0,
                 create_options: 0,
+                mode_state: crate::FileModeState::from_create_options(0),
                 metadata: crate::FileMetadata {
                     creation_time: 0,
                     last_access_time: 0,
@@ -288,6 +298,7 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
             open: DirectoryOpen {
                 first_cluster,
                 create_options,
+                mode_state: crate::FileModeState::from_create_options(create_options),
                 metadata,
                 alternate_name,
                 query: DirectoryQueryState::new(),
@@ -474,6 +485,7 @@ pub struct ReadOnlyFileOpen {
     pub size: u32,
     pub current_offset: u64,
     pub create_options: u32,
+    mode_state: crate::FileModeState,
     pub metadata: crate::FileMetadata,
     pub alternate_name: crate::FatShortName,
     /// `FILE_OBJECT::Event` state shared by every duplicated process handle.
@@ -484,6 +496,14 @@ pub struct ReadOnlyFileOpen {
 }
 
 impl ReadOnlyFileOpen {
+    pub const fn mode_state(&self) -> crate::FileModeState { self.mode_state }
+
+    pub fn set_mode(&mut self, requested: u32) -> Result<crate::FileModeState, u32> {
+        let next = self.mode_state.transition(requested).map_err(|status| status.raw() as u32)?;
+        self.mode_state = next;
+        Ok(next)
+    }
+
     pub fn volume_relative_path(&self) -> &[u8] {
         &self.path[..self.path_len as usize]
     }
@@ -510,6 +530,7 @@ impl ReadOnlyFileOpenSlot {
                 size: 0,
                 current_offset: 0,
                 create_options: 0,
+                mode_state: crate::FileModeState::from_create_options(0),
                 metadata: crate::FileMetadata {
                     creation_time: 0,
                     last_access_time: 0,
@@ -596,6 +617,7 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
                 size,
                 current_offset: 0,
                 create_options,
+                mode_state: crate::FileModeState::from_create_options(create_options),
                 metadata,
                 alternate_name,
                 signaled: true,

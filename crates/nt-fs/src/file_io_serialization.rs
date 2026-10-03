@@ -22,13 +22,7 @@ pub struct FileIoState {
 
 impl FileObject {
     fn io_mode(&self) -> FileIoMode {
-        if self.create_options & FILE_SYNCHRONOUS_IO_ALERT != 0 {
-            FileIoMode::SynchronousAlertable
-        } else if self.create_options & FILE_SYNCHRONOUS_IO_NONALERT != 0 {
-            FileIoMode::SynchronousNonAlertable
-        } else {
-            FileIoMode::Asynchronous
-        }
+        self.mode_state.io_mode().expect("admitted local File mode")
     }
 
     fn minimum_references(&self) -> Result<u32, u32> {

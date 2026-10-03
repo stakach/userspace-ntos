@@ -17,6 +17,7 @@ mod directory;
 mod fat_directory;
 mod fat_directory_walk;
 mod file_backing;
+mod file_mode;
 mod flush;
 mod fs;
 mod hive_provider;
@@ -41,6 +42,7 @@ pub use directory::*;
 pub use fat_directory::*;
 pub use fat_directory_walk::*;
 pub use file_backing::FileBacking;
+pub use file_mode::FileModeState;
 pub use flush::file_flush_access_allowed;
 pub use fs::{
     installed_file_open_action, layered_file_open_decision,

@@ -347,6 +347,7 @@ dependencies = [
  "nt-config-store",
  "nt-hive-core",
  "nt-io-completion",
+ "nt-status",
 ]
 
 [[package]]

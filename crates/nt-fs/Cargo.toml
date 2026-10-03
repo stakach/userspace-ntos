@@ -12,6 +12,7 @@ nt-config-store = { workspace = true }
 nt-hive-core = { workspace = true }
 nt-cache-manager = { workspace = true }
 nt-io-completion = { workspace = true }
+nt-status = { workspace = true }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
