@@ -1750,6 +1750,12 @@ fn callback_process_role_code(role: Option<nt_exe_image::HostedProcessRole>) -> 
         Some(nt_exe_image::HostedProcessRole::InteractiveShell) => {
             win32k_subsystem::HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL as u32
         }
+        Some(nt_exe_image::HostedProcessRole::NativeApplication) => {
+            win32k_subsystem::HOSTED_PROCESS_ROLE_NATIVE_APPLICATION as u32
+        }
+        Some(nt_exe_image::HostedProcessRole::Application) => {
+            win32k_subsystem::HOSTED_PROCESS_ROLE_APPLICATION as u32
+        }
         None => win32k_subsystem::HOSTED_PROCESS_ROLE_NONE as u32,
     }
 }
@@ -1779,6 +1785,12 @@ fn callback_process_role_from_code(code: u32) -> Option<nt_exe_image::HostedProc
         }
         win32k_subsystem::HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL => {
             Some(nt_exe_image::HostedProcessRole::InteractiveShell)
+        }
+        win32k_subsystem::HOSTED_PROCESS_ROLE_NATIVE_APPLICATION => {
+            Some(nt_exe_image::HostedProcessRole::NativeApplication)
+        }
+        win32k_subsystem::HOSTED_PROCESS_ROLE_APPLICATION => {
+            Some(nt_exe_image::HostedProcessRole::Application)
         }
         _ => None,
     }
@@ -2303,51 +2315,8 @@ unsafe fn remember_active_dispatch_arg_snapshot(
         .is_ok()
 }
 
-fn winlogon_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
-    let winlogon_pi = callback_client_owner_pi(client)?;
-    if !callback_client_is_winlogon(client) || client.tid == 0 {
-        return None;
-    }
-    let alias = match client.role {
-        Some(HostedThreadRole::Main) => WINLOGON_MAIN_TEB_MIRROR_VA,
-        Some(HostedThreadRole::WinlogonListener) => {
-            WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000
-        }
-        Some(HostedThreadRole::WinlogonWorker { slot: 1 }) => {
-            WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000
-        }
-        Some(HostedThreadRole::WinlogonWorker { slot: 2 }) => {
-            WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000
-        }
-        Some(HostedThreadRole::TpWorker { slot }) => tp_worker_teb_mirror_va(winlogon_pi, slot),
-        _ => return None,
-    };
-    Some(alias)
-}
-
 fn main_gui_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
-    let pi = callback_client_owner_pi(client)?;
-    if client.tid == 0
-        || !client
-            .process_role
-            .is_some_and(nt_exe_image::HostedProcessRole::uses_win32_client_gdi)
-    {
-        return None;
-    }
-    match client.role {
-        Some(HostedThreadRole::Main)
-            if client.top_badge != 0 && client.badge == client.top_badge =>
-        {
-            let alias = crate::env_scratch_base_for_pi(pi);
-            (alias != 0).then_some(alias)
-        }
-        Some(HostedThreadRole::TpWorker { slot })
-            if tp_worker_identity_from_badge(client.badge) == Some((pi, slot)) =>
-        {
-            Some(tp_worker_teb_mirror_va(pi, slot))
-        }
-        _ => None,
-    }
+    crate::service_sec_image::callback_client_runtime(client).map(|(alias, _)| alias)
 }
 
 fn callback_client_owner_pi(client: crate::spawn_hosts::UserCallbackClient) -> Option<usize> {
@@ -2519,10 +2488,7 @@ unsafe fn trace_user_callback_stack_words(
             process,
             va,
             &mut bytes,
-            &[],
-            0,
             client.scratch_base,
-            true,
         ) {
             true => {
                 print_str(b"0x");
@@ -2535,26 +2501,17 @@ unsafe fn trace_user_callback_stack_words(
 }
 
 fn client_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
-    if callback_client_is_winlogon(client) {
-        winlogon_callback_teb_alias(client)
-    } else {
-        main_gui_callback_teb_alias(client)
-    }
+    main_gui_callback_teb_alias(client)
 }
 
 fn client_callback_supported_for_api(
     client: crate::spawn_hosts::UserCallbackClient,
     api_index: u32,
 ) -> bool {
-    if callback_client_owner_pi(client).is_none() {
+    let Some((_, converted)) = crate::service_sec_image::callback_client_runtime(client) else {
         return false;
-    }
-    if api_index == nt_user_callback::USER32_CALLBACK_CLIENTTHREADSTARTUP {
-        return true;
-    }
-    client
-        .process_role
-        .is_some_and(nt_exe_image::HostedProcessRole::uses_win32_client_gdi)
+    };
+    api_index == nt_user_callback::USER32_CALLBACK_CLIENTTHREADSTARTUP || converted
 }
 
 unsafe fn bind_client_callback_window(
@@ -2768,7 +2725,7 @@ unsafe fn client_copyin_process_u64(
     va: u64,
 ) -> Option<u64> {
     let mut bytes = [0u8; 8];
-    crate::img_spawn::client_copyin_process_mapped_for(pi, process, va, &mut bytes, &[], 0, scratch_base, false)
+    crate::img_spawn::client_copyin_process_mapped_for(pi, process, va, &mut bytes, scratch_base)
         .then_some(u64::from_le_bytes(bytes))
 }
 
@@ -2779,7 +2736,7 @@ unsafe fn client_copyin_process_u32(
     va: u64,
 ) -> Option<u32> {
     let mut bytes = [0u8; 4];
-    crate::img_spawn::client_copyin_process_mapped_for(pi, process, va, &mut bytes, &[], 0, scratch_base, false)
+    crate::img_spawn::client_copyin_process_mapped_for(pi, process, va, &mut bytes, scratch_base)
         .then_some(u32::from_le_bytes(bytes))
 }
 
@@ -2906,10 +2863,7 @@ unsafe fn copy_callback_result_to_shared(
         process,
         result_pointer,
         output,
-        &[],
-        0,
         client.scratch_base,
-        true,
     )
 }
 
@@ -3140,6 +3094,8 @@ pub(crate) unsafe fn service_user_callback(
         && contract_valid
         && !client_dead
         && !owner_mismatch
+        && (request.api_index != nt_user_callback::USER32_CALLBACK_CLIENTTHREADSTARTUP
+            || crate::service_sec_image::prepare_callback_gdi_projection(client))
     {
         let callback_table = if client.peb_mirror == 0 {
             0
@@ -3650,8 +3606,6 @@ unsafe fn redirect_pending_user_callback(
             client.pi as u64,
             layout.input_pointer,
             input,
-            &[],
-            0,
             client.scratch_base,
         ) {
             return false;
@@ -3671,8 +3625,6 @@ unsafe fn redirect_pending_user_callback(
             client.pi as u64,
             layout.input_pointer + WINDOWPROC_LPARAM_OFFSET,
             &reference.to_le_bytes(),
-            &[],
-            0,
             client.scratch_base,
         ) {
             return false;
@@ -3694,8 +3646,6 @@ unsafe fn redirect_pending_user_callback(
         client.pi as u64,
         layout.frame_pointer,
         frame_bytes,
-        &[],
-        0,
         client.scratch_base,
     ) {
         return false;
@@ -4525,27 +4475,6 @@ pub(crate) unsafe fn dump_client_callback_crash_state(client_pi: usize, tcb: u64
         print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_RSP]);
         print_str(b"\n");
     }
-    let teb = if client_pi == 2 {
-        WINLOGON_MAIN_TEB_MIRROR_VA
-    } else {
-        0
-    };
-    if teb == 0 {
-        print_str(b"[cb-crash] CLIENTINFO skipped: no executive-owned TEB mirror\n");
-    } else {
-        let read = |offset: u64| core::ptr::read_volatile((teb + offset) as *const u64);
-        print_str(b"[cb-crash] CLIENTINFO pDeskInfo=0x");
-        print_crash_hex64(read(0x820));
-        print_str(b" ulClientDelta=0x");
-        print_crash_hex64(read(0x828));
-        print_str(b" CallbackWnd{hWnd=0x");
-        print_hex(read(0x840) as u32);
-        print_str(b" pWnd=0x");
-        print_crash_hex64(read(0x848));
-        print_str(b" pActCtx=0x");
-        print_crash_hex64(read(0x850));
-        print_str(b"}\n");
-    }
     if let Some(frame) = active_frame {
         let request = frame.request();
         print_str(b"[cb-crash] active callback api=");
@@ -4869,10 +4798,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
                         process,
                         result_pointer + 0x38,
                         &mut returned_result,
-                        &[],
-                        0,
                         active_frame.client_scratch_base(),
-                        true,
                     )
                 });
             let mut expected_result = [0u8; 8];
@@ -4884,10 +4810,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
                         process,
                         expected + 0x38,
                         &mut expected_result,
-                        &[],
-                        0,
                         active_frame.client_scratch_base(),
-                        true,
                     )
                 });
             print_str(b"[callback-result] WM_NCCREATE pointer=0x");

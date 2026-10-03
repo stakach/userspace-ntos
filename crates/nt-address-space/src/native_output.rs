@@ -9,6 +9,32 @@ pub trait VmOutputMemory: WriteProbeMemory {
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), u32>;
 }
 
+pub use nt_io_completion::{file_create_output_plan, FileCreateOutputPlan};
+
+/// Publish a finalized CREATE/OPEN result without changing the already committed handle owner.
+/// The first output failure stops stores and preserves its exact origin and accepted prefix.
+pub fn publish_file_create_result_checked(
+    file_handle: u64,
+    iosb: u64,
+    handle: u64,
+    status: u32,
+    information: u64,
+    mut write_bytes: impl FnMut(u64, &[u8]) -> Result<(), MemoryCopyFailure>,
+) -> Result<(), MemoryCopyFailure> {
+    match file_create_output_plan(status) {
+        FileCreateOutputPlan::None => Ok(()),
+        FileCreateOutputPlan::IoStatus => {
+            publish_file_io_status_checked(iosb, status, information, write_bytes)
+        }
+        FileCreateOutputPlan::HandleAndIoStatus => {
+            file_handle.checked_add(7)
+                .ok_or(MemoryCopyFailure::UserFault(crate::STATUS_ACCESS_VIOLATION))?;
+            write_bytes(file_handle, &handle.to_le_bytes())?;
+            publish_file_io_status_checked(iosb, status, information, write_bytes)
+        }
+    }
+}
+
 /// Publish an x64 IO_STATUS_BLOCK with Status as the final completion indicator. Information
 /// precedes a release fence and the four-byte Status store; the union padding is untouched.
 /// Address-space admission belongs to the memory backend. Overflow is rejected before any store,

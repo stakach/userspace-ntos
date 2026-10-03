@@ -11,7 +11,21 @@ pub(crate) struct RoutedImageAdmission {
     pub(crate) capture: crate::driver_launch::hosted_file_capture::Capture,
     pub(crate) metadata: nt_memory_manager::RoutedSectionMetadata,
     pub(crate) header: Vec<u8>,
+    pub(crate) image_path: Vec<u8>,
+    pub(crate) observation_target: Option<nt_exe_image::CapturedImageObservation>,
     pub(crate) name: Option<crate::section_metadata_work::ImageObjectName>,
+}
+
+enum ImageSourceAdmission<'a> {
+    Routed {
+        capture: Option<crate::driver_launch::hosted_file_capture::Capture>,
+        path: Vec<u8>,
+    },
+    Local {
+        backing: nt_memory_manager::GenericSectionBacking,
+        file: &'a mut Option<crate::file_image_section::LocalImageFile>,
+        path: Vec<u8>,
+    },
 }
 
 #[must_use = "publish or abort the native image Section handle"]
@@ -27,7 +41,21 @@ impl ReservedNativeImageSection {
     }
 
     pub(crate) fn publish(&mut self, handler: &mut ExecNtHandler) -> Result<u64, u32> {
-        self.publication.publish(&mut handler.pm)
+        let value = self.publication.publish(&mut handler.pm)?;
+        let observation = handler.image_sections.source(self.id)
+            .and_then(|source| source.observation_target);
+        if let Some(proof) = observation {
+            match proof.target().role {
+                nt_exe_image::HostedProcessRole::InteractiveShellBootstrap => {
+                    USERINIT_IMAGE_SECTIONS.fetch_add(1, Ordering::Relaxed);
+                }
+                nt_exe_image::HostedProcessRole::InteractiveShell => {
+                    EXPLORER_IMAGE_SECTIONS.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+        Ok(value)
     }
 
     pub(crate) fn abort(&mut self, handler: &mut ExecNtHandler) {
@@ -83,6 +111,17 @@ fn validate_pe_header(header: &[u8], file_size: u64) -> Result<(), u32> {
 }
 
 impl ExecNtHandler {
+    /// Observe only the exact executable registration attached to this admitted File handle.
+    pub(crate) fn capture_native_image_observation(&self, file_handle: u64) -> Option<nt_exe_image::CapturedImageObservation> {
+        let ctx = self.loop_ctx?;
+        unsafe {
+            let table = &*ctx.exe_images;
+            let slot = table.get(table.index_for_file(self.pi, file_handle)?)?;
+            let target = slot.target?;
+            (&*ctx.exe_image_catalog).capture_image_observation(target)
+        }
+    }
+
     pub(crate) unsafe fn reserve_native_image_section(
         &mut self,
         caller: nt_process::native_handle::NativeHandleCaller,
@@ -93,17 +132,67 @@ impl ExecNtHandler {
         allocation_attrs: u32,
         admission: RoutedImageAdmission,
     ) -> Result<ReservedNativeImageSection, u32> {
+        if admission.metadata.is_directory {
+            return Err(STATUS_INVALID_IMAGE_FORMAT);
+        }
+        self.reserve_image_section(caller, desired_access, attributes, maximum_size,
+            page_protection, allocation_attrs, admission.metadata.file,
+            admission.metadata.end_of_file, admission.header, admission.name,
+            admission.observation_target,
+            ImageSourceAdmission::Routed {
+                capture: Some(admission.capture),
+                path: admission.image_path,
+            })
+    }
+
+    pub(crate) unsafe fn reserve_local_native_image_section(
+        &mut self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        desired_access: u32,
+        attributes: u32,
+        maximum_size: u64,
+        page_protection: u32,
+        allocation_attrs: u32,
+        backing: nt_memory_manager::GenericSectionBacking,
+        bytes: Vec<u8>,
+        path: Vec<u8>,
+        name: Option<crate::section_metadata_work::ImageObjectName>,
+        observation_target: Option<nt_exe_image::CapturedImageObservation>,
+        file: &mut Option<crate::file_image_section::LocalImageFile>,
+    ) -> Result<ReservedNativeImageSection, u32> {
+        let identity = backing.file.ok_or(STATUS_INVALID_HANDLE)?;
+        self.reserve_image_section(caller, desired_access, attributes, maximum_size,
+            page_protection, allocation_attrs, identity, backing.file_extent, bytes, name,
+            observation_target,
+            ImageSourceAdmission::Local { backing, file, path })
+    }
+
+    unsafe fn reserve_image_section(
+        &mut self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        desired_access: u32,
+        attributes: u32,
+        maximum_size: u64,
+        page_protection: u32,
+        allocation_attrs: u32,
+        file_identity: nt_memory_manager::SectionFileIdentity,
+        file_size: u64,
+        header: Vec<u8>,
+        name: Option<crate::section_metadata_work::ImageObjectName>,
+        observation_target: Option<nt_exe_image::CapturedImageObservation>,
+        mut admission: ImageSourceAdmission<'_>,
+    ) -> Result<ReservedNativeImageSection, u32> {
         if maximum_size != 0
             || !matches!(page_protection, 0x02 | 0x10 | 0x20)
             || allocation_attrs != SEC_IMAGE
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        if admission.metadata.is_directory || admission.metadata.end_of_file == 0 {
+        if file_size == 0 {
             return Err(STATUS_INVALID_IMAGE_FORMAT);
         }
-        validate_pe_header(&admission.header, admission.metadata.end_of_file)?;
-        if let Some(ref name) = admission.name {
+        validate_pe_header(&header, file_size)?;
+        if let Some(ref name) = name {
             let Some(root) = self.obj_ns.get(name.root_index) else {
                 return Err(STATUS_INVALID_HANDLE);
             };
@@ -118,7 +207,7 @@ impl ExecNtHandler {
             caller,
             attributes & (nt_process::native_handle::OBJ_KERNEL_HANDLE | 0x2),
         )?;
-        let mut image = match self.image_sections.reserve(admission.metadata.file) {
+        let mut image = match self.image_sections.reserve(file_identity) {
             Ok(image) => image,
             Err(error) => {
                 publication.abort(&mut self.pm).expect("unbound image handle reservation");
@@ -128,28 +217,44 @@ impl ExecNtHandler {
         let mut source = None;
         let mut routed_lease = None;
         if image.needs_source() {
-            let lease = match crate::hosted_routed_image_capture::reserve(admission.capture) {
-                Ok(lease) => lease,
-                Err(_capture) => {
-                    self.image_sections.abort(&mut image).expect("unpublished image reservation");
-                    publication.abort(&mut self.pm).expect("unbound image handle reservation");
-                    return Err(STATUS_INSUFFICIENT_RESOURCES);
+            let (backing, local_file, image_path) = match &mut admission {
+                ImageSourceAdmission::Routed { capture, path } => {
+                    let lease = match crate::hosted_routed_image_capture::reserve(
+                        capture.take().expect("image File capture"),
+                    ) {
+                        Ok(lease) => lease,
+                        Err(_capture) => {
+                            self.image_sections.abort(&mut image).expect("unpublished image reservation");
+                            publication.abort(&mut self.pm).expect("unbound image handle reservation");
+                            return Err(STATUS_INSUFFICIENT_RESOURCES);
+                        }
+                    };
+                    routed_lease = Some(lease);
+                    (nt_memory_manager::GenericSectionBacking::routed(
+                        lease, file_identity, file_size,
+                    ), None, Some(core::mem::take(path)))
+                }
+                ImageSourceAdmission::Local { backing, file, path } => {
+                    (*backing, file.take(), Some(core::mem::take(path)))
                 }
             };
-            routed_lease = Some(lease);
             source = Some(NativeImageSource {
-                backing: nt_memory_manager::GenericSectionBacking::routed(
-                    lease,
-                    admission.metadata.file,
-                    admission.metadata.end_of_file,
-                ),
-                pe_header: admission.header,
+                backing,
+                pe_header: header,
+                local_file,
+                image_path,
+                observation_target,
             });
         }
         let id = match self.image_sections.publish(&mut image, &mut source) {
             Ok(id) => id,
             Err(error) => {
                 self.image_sections.abort(&mut image).expect("unpublished image reservation");
+                if let ImageSourceAdmission::Local { file, .. } = &mut admission {
+                    if let Some(source) = source.as_mut() {
+                        **file = source.local_file.take();
+                    }
+                }
                 if let Some(lease) = routed_lease {
                     crate::hosted_routed_image_capture::cancel_unbound(lease).expect("unbound image File capture");
                 }
@@ -162,7 +267,7 @@ impl ExecNtHandler {
             assert!(crate::hosted_routed_image_capture::bind(lease, area));
         }
         let mut named = None;
-        if let Some(name) = admission.name {
+        if let Some(name) = name {
             let permanent = attributes & OBJ_PERMANENT != 0;
             if let Err(error) = self.image_sections.make_permanent(id) {
                 self.image_sections.close_handle_group(id).expect("failed image name pin");

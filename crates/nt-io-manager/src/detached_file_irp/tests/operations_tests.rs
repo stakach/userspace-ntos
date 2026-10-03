@@ -1,6 +1,76 @@
 use super::*;
 
 #[test]
+fn pending_failed_create_release_waits_for_exact_ack_and_projection_unbind() {
+    let mut f = fixture();
+    let child = create_file(&mut f, false);
+    let domain = f.io.register_hosted_domain();
+    let binding = f.io.bind_hosted_file_identity(domain, 0x9000, child).unwrap();
+    let object_reference = f.io.file(child).unwrap().object_reference;
+    let calls_before = f.trace.borrow().calls.clone();
+    let prepared = f.io.prepare_external_file_irp_owned(
+        create(&f, child), ExternalFileIrpBuffers::new(vec![], vec![]),
+    ).unwrap();
+    assert_eq!(prepared.projection().major, major::IRP_MJ_CREATE);
+    let invocation = f.io.begin_prepared_external_file_irp(prepared).unwrap();
+    let ExternalFileIrpResult::Pending(owner) = f.io.finish_external_file_irp(
+        invocation.returned(ExternalFileIrpOutcome::Pending),
+    ).unwrap() else { panic!("CREATE must retain its pending owner") };
+    let irp = owner.irp_id();
+
+    f.io.queue_external_file_release(f.client, child).unwrap();
+    f.io.queue_external_file_release(f.client, child).unwrap();
+    assert!(f.io.detached_file_irp_intent(f.client, irp).unwrap().abandoned);
+    let file = f.io.file(child).unwrap();
+    assert!(file.close_deferred && file.close_retry_queued);
+    assert_eq!(file.object_reference, object_reference);
+    assert_eq!(file.outstanding_irp_refs, 1);
+    assert_eq!(f.io.hosted_file_identity_at(domain, child, 0x9000), Ok(Some(binding)));
+    assert_eq!(f.trace.borrow().calls, calls_before);
+    assert!(f.trace.borrow().cancellations.is_empty());
+
+    f.trace.borrow_mut().ready.push(DriverCompletion {
+        irp_id: irp,
+        status: NtStatus::ACCESS_DENIED,
+        information: 0,
+        file_context: None,
+    });
+    f.io.pump();
+    let completion = f.io.prepare_external_file_irp_completion(owner).unwrap();
+    assert_eq!(f.io.file(child).unwrap().state, FileState::Closed,
+        "failed CREATE cannot retain abandoned success's CLOSE obligation");
+    assert_eq!(completion.completion().status, NtStatus::ACCESS_DENIED);
+    assert_eq!(completion.capture_len(), 0);
+    assert!(f.io.irp(irp).is_some(), "terminal completion is not acknowledgement");
+    assert_eq!(f.io.file(child).unwrap().outstanding_irp_refs, 1);
+    let ack = f.io.begin_external_file_irp_acknowledgement(completion).unwrap();
+    let (receipt, buffers) = f.io.finish_external_file_irp_completion(
+        ack.acknowledged(ExternalFileIrpAcknowledgement::Acknowledged),
+    ).unwrap();
+    assert_eq!(receipt.completion().status, NtStatus::ACCESS_DENIED);
+    assert!(buffers.output().is_empty());
+    assert!(f.io.irp(irp).is_none());
+    f.io.pump();
+    let file = f.io.file(child).unwrap();
+    assert_eq!(file.object_reference, object_reference);
+    assert_eq!(file.outstanding_irp_refs, 0);
+    assert_eq!(file.state, FileState::Closed);
+    assert!(file.close_deferred);
+    assert!(!file.close_dispatched);
+    assert_eq!(f.io.hosted_file_identity_at(domain, child, 0x9000), Ok(Some(binding)));
+    assert_eq!(f.trace.borrow().calls, calls_before,
+        "failed unopened CREATE must not receive CLEANUP or CLOSE");
+
+    assert_eq!(f.io.unbind_hosted_file_identity(binding), Ok(crate::HostedFileUnbindOutcome::Removed));
+    f.io.pump();
+    assert!(f.io.file(child).is_none());
+    assert!(f.io.irp(irp).is_none());
+    assert_eq!(f.io.hosted_file_identity_at(domain, child, 0x9000), Ok(None));
+    assert_eq!(f.trace.borrow().calls, calls_before);
+    f.io.unregister_hosted_domain(domain).unwrap();
+}
+
+#[test]
 fn reparse_create_does_not_open_the_source_file() {
     let mut f = fixture();
     let file = create_file(&mut f, false);

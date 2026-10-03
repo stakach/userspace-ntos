@@ -67,14 +67,32 @@ No kernel build or proprietary Windows binaries are required. The optional
 Windows 7 export test requires a locally supplied `references/ntdll.dll`:
 `cargo test -p nt-pe-loader --test ntdll_exports -- --ignored`.
 Native builds and end-to-end CI are separate follow-ups, not covered by these specs.
+CI also checks native acceptance log parsing and fixture lifetimes through Clang's
+source AST. These host-only checks do not prove guest execution.
 The local `tests/native/mup_provider/run_kernel_only.sh` gate checks real
 cross-domain driver READ, FLUSH, and buffered QUERY_INFORMATION requests,
 including immediate and pending completion through the source driver's event
 and IOSB. READ and QUERY_INFORMATION check exact output bytes; FLUSH checks
 zero completion information.
+Forwarded pending dispatch returns independently of terminal completion. Registered
+ordinary workers execute source completion routines, retaining exact IRP ownership
+and callback continuations without serializing unrelated jobs behind a waiting worker.
+Held inline completions retain their source ownership until a genuine resumed
+unwind or authenticated stop; caller-owned IRPs remain under their original owner.
+Its controlled pending-error checks correlate actual File generations, untouched
+precompletion buffers, delivered errors and retained-pointer cleanup ordering;
+these are separate from desktop proof and uncertain-effect quarantine.
 The optional `tests/native/source_irp/run.sh` profile checks real fileless READ/WRITE
 and all four IOCTL methods through win32k, including immediate and pending completion.
 It verifies bytes, IOSBs and retirement counters; production images omit its fixtures.
+The optional [native File acceptance profile](tests/native/file_acceptance/README.md)
+launches a public-ntdll-only executable through real SMSS to check relative opens,
+FileAll metadata and user-buffer fault precedence. Its process-exit receipts are
+separate from the whole-OS and screenshot gates.
+The optional `font-cleanup` image profile launches a private-font client through
+Explorer's ordinary Run key and checks exact Section-view retirement after process
+termination. Rebuild a fresh production image afterwards; fixture profiles are not
+production desktop evidence.
 
 The kernel is a **pinned git submodule**, not vendored source: `userspace-ntos`
 depends on an exact kernel SHA (its syscall/invocation ABI is tightly coupled),

@@ -2175,6 +2175,37 @@ pub(crate) unsafe fn component_pump_resume_lpc_wait(ch: &PumpChannel) -> PumpRes
     component_pump_inner(ch, PumpResume::LpcWait)
 }
 
+/// The caller owns the exact entered command and has resumed its acknowledged external service.
+/// Continue only the receive half: the service Reply already delivered its native result.
+pub(crate) unsafe fn component_pump_resume_hosted_wait(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+) -> Result<PumpResult, u32> {
+    use shared_ingress::owner::runtime;
+    let route = runtime::channel_route(ch).map_err(|_| nt_process::STATUS_INVALID_HANDLE)?
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let source = runtime::physical_source(route).map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+    if !matches!(source.domain, runtime::PhysicalDomain::Hosted(_))
+        || !matches!(source.kind, runtime::PhysicalSourceKind::DispatchWorker { .. })
+        || ch.caps.kind != ReqKind::Irp || ch.initial != InitialAction::RecvFirst
+        || previous.completed || previous.callback_suspended || previous.scheduler_yielded
+        || previous.provider_wait_suspended == previous.lpc_wait_suspended
+        || previous.reply_cap != ch.reply_cap
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    let mut accounting = previous.accounting;
+    let transferred_depth = accounting.resume_suspended()
+        .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+    if transferred_depth {
+        SUSPENDED_COMPONENT_OUTSTANDING.fetch_sub(1, Ordering::Relaxed);
+    }
+    let resume = if previous.provider_wait_suspended {
+        PumpResume::ProviderWait
+    } else { PumpResume::LpcWait };
+    Ok(component_pump_enter(ch, resume, accounting))
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum PumpResume {
     None,
@@ -2346,13 +2377,26 @@ unsafe fn component_pump_loop(
                 outcome.wall(msg);
                 break;
             }
-            let starting = ch.caps.kind == ReqKind::Syscall
-                && ch.initial == InitialAction::RecvFirst
-                && crate::win32k_glue::win32k_physical_lane_for_channel(
-                    ch.tcb, ch.fault_ep, ch.reply_cap,
-                ).is_some_and(|lane| {
-                    crate::service_sec_image::component_execution_lane_is_starting(lane)
-                });
+            let hosted_starting =
+                crate::driver_launch::hosted_source_completion_lane::startup_expected(ch).is_some();
+            if hosted_starting
+                && !crate::driver_launch::hosted_source_completion_lane::validate_startup_ready(
+                    ch,
+                    [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+                )
+            {
+                outcome.wall(msg);
+                break;
+            }
+            let starting = hosted_starting
+                || (ch.caps.kind == ReqKind::Syscall
+                    && ch.initial == InitialAction::RecvFirst
+                    && crate::win32k_glue::win32k_physical_lane_for_channel(
+                        ch.tcb, ch.fault_ep, ch.reply_cap,
+                    )
+                    .is_some_and(|lane| {
+                        crate::service_sec_image::component_execution_lane_is_starting(lane)
+                    }));
             // Only an authenticated secondary startup carries publication words. Ordinary
             // completions retain the exact zero-word, no-capability protocol shape.
             let expected_info = (ch.dispatch_label << 12) | if starting { 5 } else { 0 };
@@ -2460,7 +2504,7 @@ unsafe fn component_pump_loop(
                     pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u32 as u64, out1, out2, 0);
                 }
                 crate::registry_mutation_work::ProviderRegistryResult::Deferred => {
-                    if shared_pump::autonomous(ch) {
+                    if shared_pump::service_wait_yields(ch) {
                         outcome.provider_wait_suspended = true;
                         break;
                     }
@@ -2485,7 +2529,7 @@ unsafe fn component_pump_loop(
                     .expect("win32k CREATE reply");
                 pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
                     status, iosb_status, information, handle);
-            } else if shared_pump::autonomous(ch) {
+            } else if shared_pump::service_wait_yields(ch) {
                 outcome.provider_wait_suspended = true;
                 break;
             } else {
@@ -2521,7 +2565,7 @@ unsafe fn component_pump_loop(
                     pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
                 }
                 crate::hosted_routed_file_close_work::SubmitResult::Deferred => {
-                    if shared_pump::autonomous(ch) {
+                    if shared_pump::service_wait_yields(ch) {
                         outcome.provider_wait_suspended = true;
                         break;
                     }
@@ -2541,7 +2585,7 @@ unsafe fn component_pump_loop(
             };
             if let Some(status) = result {
                 pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
-            } else if shared_pump::autonomous(ch) {
+            } else if shared_pump::service_wait_yields(ch) {
                 outcome.provider_wait_suspended = true;
                 break;
             } else {
@@ -2560,7 +2604,7 @@ unsafe fn component_pump_loop(
             };
             if let Some(status) = result {
                 pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
-            } else if shared_pump::autonomous(ch) {
+            } else if shared_pump::service_wait_yields(ch) {
                 outcome.provider_wait_suspended = true;
                 break;
             } else {
@@ -2603,7 +2647,7 @@ unsafe fn component_pump_loop(
             };
             if let Some(status) = result {
                 pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
-            } else if shared_pump::autonomous(ch) {
+            } else if shared_pump::service_wait_yields(ch) {
                 outcome.provider_wait_suspended = true;
                 break;
             } else {
@@ -2646,7 +2690,7 @@ unsafe fn component_pump_loop(
             };
             if let Some(status) = result {
                 pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
-            } else if shared_pump::autonomous(ch) {
+            } else if shared_pump::service_wait_yields(ch) {
                 outcome.provider_wait_suspended = true;
                 break;
             } else {
@@ -2665,7 +2709,7 @@ unsafe fn component_pump_loop(
             };
             if let Some(status) = result {
                 pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
-            } else if shared_pump::autonomous(ch) {
+            } else if shared_pump::service_wait_yields(ch) {
                 outcome.provider_wait_suspended = true;
                 break;
             } else {
@@ -2684,7 +2728,7 @@ unsafe fn component_pump_loop(
             };
             if let Some(status) = result {
                 pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
-            } else if shared_pump::autonomous(ch) {
+            } else if shared_pump::service_wait_yields(ch) {
                 outcome.provider_wait_suspended = true;
                 break;
             } else {
@@ -2739,7 +2783,7 @@ unsafe fn component_pump_loop(
             };
             if let Some(status) = result {
                 pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
-            } else if shared_pump::autonomous(ch) {
+            } else if shared_pump::service_wait_yields(ch) {
                 outcome.provider_wait_suspended = true;
                 break;
             } else {
@@ -2814,7 +2858,7 @@ unsafe fn component_pump_loop(
                     );
                 }
                 crate::provider_section_broker::SubmitResult::Deferred => {
-                    if shared_pump::autonomous(ch) {
+                    if shared_pump::service_wait_yields(ch) {
                         outcome.provider_wait_suspended = true;
                         break;
                     }
@@ -3132,7 +3176,7 @@ unsafe fn component_pump_loop(
                 crate::driver_launch::HostedDriverInterruptServiceResult::SharedParked {
                     ..
                 } => {
-                    if shared_pump::autonomous(ch) {
+                    if shared_pump::service_wait_yields(ch) {
                         outcome.provider_wait_suspended = true;
                         break;
                     }
@@ -3366,7 +3410,7 @@ unsafe fn component_pump_loop(
                     pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
                 }
                 crate::driver_launch::HostedDriverWaitServiceResult::SharedParked { .. } => {
-                    if shared_pump::autonomous(ch) {
+                    if shared_pump::service_wait_yields(ch) {
                         outcome.provider_wait_suspended = true;
                         break;
                     }
@@ -3390,7 +3434,7 @@ unsafe fn component_pump_loop(
                     pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
                 }
                 crate::driver_launch::HostedDriverWaitServiceResult::SharedParked { .. } => {
-                    if shared_pump::autonomous(ch) {
+                    if shared_pump::service_wait_yields(ch) {
                         outcome.provider_wait_suspended = true;
                         break;
                     }
@@ -3494,7 +3538,7 @@ unsafe fn component_pump_loop(
                     .expect("provider CREATE service reply");
                 pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
                     status, iosb_status, information, handle);
-            } else if shared_pump::autonomous(ch) {
+            } else if shared_pump::service_wait_yields(ch) {
                 outcome.provider_wait_suspended = true;
                 break;
             } else {
@@ -3546,7 +3590,7 @@ unsafe fn component_pump_loop(
             if let Some((status, accepted)) = reply {
                 pump_reply_recv4_into!(ch, *reply_cap, msg, 2,
                     status as u32 as u64, u64::from(accepted), 0, 0);
-            } else if shared_pump::autonomous(ch) {
+            } else if shared_pump::service_wait_yields(ch) {
                 outcome.provider_wait_suspended = true;
                 break;
             } else {
@@ -3571,7 +3615,7 @@ unsafe fn component_pump_loop(
             if let Some(status) = status {
                 pump_reply_recv4_into!(ch, *reply_cap, msg, 1,
                     status as u32 as u64, 0, 0, 0);
-            } else if shared_pump::autonomous(ch) {
+            } else if shared_pump::service_wait_yields(ch) {
                 outcome.provider_wait_suspended = true;
                 break;
             } else {
@@ -3596,7 +3640,7 @@ unsafe fn component_pump_loop(
             if let Some(status) = status {
                 pump_reply_recv4_into!(ch, *reply_cap, msg, 1,
                     status as u32 as u64, 0, 0, 0);
-            } else if shared_pump::autonomous(ch) {
+            } else if shared_pump::service_wait_yields(ch) {
                 outcome.provider_wait_suspended = true;
                 break;
             } else {
@@ -3621,7 +3665,7 @@ unsafe fn component_pump_loop(
             if let Some(status) = status {
                 pump_reply_recv4_into!(ch, *reply_cap, msg, 1,
                     status as u32 as u64, 0, 0, 0);
-            } else if shared_pump::autonomous(ch) {
+            } else if shared_pump::service_wait_yields(ch) {
                 outcome.provider_wait_suspended = true;
                 break;
             } else {
@@ -3646,7 +3690,7 @@ unsafe fn component_pump_loop(
             if let Some(status) = status {
                 pump_reply_recv4_into!(ch, *reply_cap, msg, 1,
                     status as u32 as u64, 0, 0, 0);
-            } else if shared_pump::autonomous(ch) {
+            } else if shared_pump::service_wait_yields(ch) {
                 outcome.provider_wait_suspended = true;
                 break;
             } else {
@@ -3680,7 +3724,7 @@ unsafe fn component_pump_loop(
                     pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u32 as u64, out1, out2, 0);
                 }
                 crate::registry_mutation_work::ProviderRegistryResult::Deferred => {
-                    if shared_pump::autonomous(ch) {
+                    if shared_pump::service_wait_yields(ch) {
                         outcome.provider_wait_suspended = true;
                         break;
                     }

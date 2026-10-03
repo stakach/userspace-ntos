@@ -42,6 +42,8 @@ pub mod frame_acquisition;
 mod commit;
 mod copy_context;
 pub mod data_section;
+mod section_creation;
+pub use section_creation::validate_section_creation_parameters;
 pub mod pending_section_pagein;
 pub mod image_section;
 pub mod owned_paging_structure;

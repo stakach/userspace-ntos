@@ -208,6 +208,9 @@ impl SourceIrpLedger {
         if row.allocation != allocation {
             return Err(SourceIrpLedgerError::WrongIdentity);
         }
+        if row.retirement_started {
+            return Err(SourceIrpLedgerError::RetirementStarted);
+        }
         if row.pins != 0 {
             return Err(SourceIrpLedgerError::Pinned);
         }
@@ -220,7 +223,49 @@ impl SourceIrpLedger {
             .iter_mut()
             .find(|row| row.ticket == ticket)
             .ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        if row.retirement_started {
+            return Err(SourceIrpLedgerError::RetirementStarted);
+        }
         if row.pins == 0 {
+            return Err(SourceIrpLedgerError::WrongIdentity);
+        }
+        row.pins -= 1;
+        Ok(())
+    }
+
+    /// Identity observation remains valid during retirement, but fresh forwarding does not.
+    pub fn admits_forward(&self, ticket: SourceIrpTicket, allocation: SourceIrpAllocation) -> bool {
+        self.rows.iter().any(|row| row.ticket == ticket && row.allocation == allocation
+            && !row.retirement_started)
+    }
+
+    /// Release one completed forwarding owner. The last owner fences storage before native free.
+    /// The native adapter must hold its pool lock before this ownership transition.
+    pub fn begin_deferred_driver_retirement(
+        &mut self, ticket: SourceIrpTicket, allocation: SourceIrpAllocation,
+    ) -> Result<SourceIrpRetirement, SourceIrpLedgerError> {
+        let row = self.rows.iter_mut().find(|row| row.ticket == ticket && row.allocation == allocation)
+            .ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        if row.retirement_started { return Err(SourceIrpLedgerError::RetirementStarted); }
+        if !matches!(allocation.owner, SourceIrpOwner::HostedDriver(_))
+            || !row.free_requested || row.pins == 0 {
+            return Err(SourceIrpLedgerError::WrongIdentity);
+        }
+        row.pins -= 1;
+        if row.pins != 0 { return Ok(SourceIrpRetirement::Deferred(ticket)); }
+        row.retirement_started = true;
+        Ok(SourceIrpRetirement::Retired(ticket))
+    }
+
+    /// Called only after the native adapter validates the exact canonical terminal node.
+    /// This releases forwarding ownership, never the original caller's allocation ownership.
+    pub fn release_hosted_caller_terminal_pin(
+        &mut self, ticket: SourceIrpTicket, allocation: SourceIrpAllocation,
+    ) -> Result<(), SourceIrpLedgerError> {
+        let row = self.rows.iter_mut().find(|row| row.ticket == ticket && row.allocation == allocation)
+            .ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        if row.retirement_started { return Err(SourceIrpLedgerError::RetirementStarted); }
+        if !matches!(allocation.owner, SourceIrpOwner::HostedCaller(_)) || row.pins == 0 {
             return Err(SourceIrpLedgerError::WrongIdentity);
         }
         row.pins -= 1;
@@ -319,6 +364,9 @@ impl SourceIrpLedger {
                     && row.allocation.component_address == component_address
             })
             .ok_or(SourceIrpLedgerError::NotFound)?;
+        if self.rows[index].retirement_started {
+            return Err(SourceIrpLedgerError::RetirementStarted);
+        }
         if self.rows[index].pins != 0 {
             if !self.rows[index].defer_free_armed {
                 return Err(SourceIrpLedgerError::Pinned);
@@ -828,5 +876,106 @@ mod tests {
         ledger
             .finish_hosted_caller_retirement(caller_ticket, caller)
             .unwrap();
+    }
+
+    #[test]
+    fn pending_driver_final_pin_claim_retains_exact_identity_until_free_ack() {
+        let mut ledger = SourceIrpLedger::new();
+        let owner = allocation(0x5000, 21);
+        let ticket = ledger.register(owner).unwrap();
+        ledger.pin_hosted_forward(3, owner.domain, owner.component_address).unwrap();
+        ledger.arm_deferred_free(ticket).unwrap();
+        assert_eq!(ledger.begin_deferred_driver_retirement(ticket, owner),
+            Err(SourceIrpLedgerError::WrongIdentity));
+        assert_eq!(ledger.retirement_ready(ticket, owner), Err(SourceIrpLedgerError::Pinned));
+        assert_eq!(ledger.prepare_driver_free(3, owner.domain, owner.component_address),
+            Ok(SourceIrpRetirement::Deferred(ticket)));
+        let foreign = SourceIrpAllocation { pool_generation: owner.pool_generation + 1, ..owner };
+        assert_eq!(ledger.begin_deferred_driver_retirement(ticket, foreign),
+            Err(SourceIrpLedgerError::WrongIdentity));
+        assert_eq!(ledger.retirement_ready(ticket, owner), Err(SourceIrpLedgerError::Pinned));
+        assert_eq!(ledger.begin_deferred_driver_retirement(ticket, owner),
+            Ok(SourceIrpRetirement::Retired(ticket)));
+        assert!(ledger.matches(owner.owner, owner, ticket));
+        assert_eq!(ledger.pin_hosted_forward(3, owner.domain, owner.component_address),
+            Err(SourceIrpLedgerError::RetirementStarted));
+        assert!(!ledger.admits_forward(ticket, owner));
+        assert_eq!(ledger.begin_deferred_driver_retirement(ticket, owner),
+            Err(SourceIrpLedgerError::RetirementStarted));
+        assert_eq!(ledger.prepare_driver_free(3, owner.domain, owner.component_address),
+            Err(SourceIrpLedgerError::RetirementStarted));
+        assert_eq!(ledger.retirement_ready(ticket, owner),
+            Err(SourceIrpLedgerError::RetirementStarted));
+        assert_eq!(ledger.unpin(ticket), Err(SourceIrpLedgerError::RetirementStarted));
+        ledger.retire(ticket, owner).unwrap();
+        assert!(!ledger.matches(owner.owner, owner, ticket));
+        let reused = ledger.register(owner).unwrap();
+        assert_ne!(reused, ticket);
+        assert_eq!(ledger.begin_deferred_driver_retirement(ticket, owner),
+            Err(SourceIrpLedgerError::WrongIdentity));
+    }
+
+    #[test]
+    fn pending_driver_retirement_releases_each_owned_pin_and_claims_only_last() {
+        let mut ledger = SourceIrpLedger::new();
+        let owner = allocation(0x6000, 22);
+        let ticket = ledger.register(owner).unwrap();
+        ledger.pin_hosted_forward(3, owner.domain, owner.component_address).unwrap();
+        ledger.pin_hosted_forward(3, owner.domain, owner.component_address).unwrap();
+        ledger.arm_deferred_free(ticket).unwrap();
+        ledger.prepare_driver_free(3, owner.domain, owner.component_address).unwrap();
+        assert_eq!(ledger.begin_deferred_driver_retirement(ticket, owner),
+            Ok(SourceIrpRetirement::Deferred(ticket)));
+        assert_eq!(ledger.retirement_ready(ticket, owner), Err(SourceIrpLedgerError::Pinned));
+        assert_eq!(ledger.begin_deferred_driver_retirement(ticket, owner),
+            Ok(SourceIrpRetirement::Retired(ticket)));
+        ledger.retire(ticket, owner).unwrap();
+    }
+
+    #[test]
+    fn pending_caller_terminal_pin_release_preserves_original_graph_owner() {
+        let mut ledger = SourceIrpLedger::new();
+        let owner = caller_allocation(0x7000, 23);
+        let ticket = ledger.register(owner).unwrap();
+        ledger.pin_hosted_forward(3, owner.domain, owner.component_address).unwrap();
+        assert!(!ledger.deferred_free_requested(ticket));
+        let foreign = SourceIrpAllocation { pool_generation: owner.pool_generation + 1, ..owner };
+        assert_eq!(ledger.release_hosted_caller_terminal_pin(ticket, foreign),
+            Err(SourceIrpLedgerError::WrongIdentity));
+        assert_eq!(ledger.begin_hosted_caller_retirement(ticket, owner),
+            Err(SourceIrpLedgerError::Pinned));
+        ledger.release_hosted_caller_terminal_pin(ticket, owner).unwrap();
+        assert!(ledger.matches(owner.owner, owner, ticket));
+        assert_eq!(ledger.release_hosted_caller_terminal_pin(ticket, owner),
+            Err(SourceIrpLedgerError::WrongIdentity));
+        assert_eq!(ledger.prepare_driver_free(3, owner.domain, owner.component_address),
+            Err(SourceIrpLedgerError::NotFound));
+        assert_eq!(ledger.retire(ticket, owner), Err(SourceIrpLedgerError::WrongIdentity));
+        ledger.begin_hosted_caller_retirement(ticket, owner).unwrap();
+        assert!(ledger.matches(owner.owner, owner, ticket));
+        ledger.finish_hosted_caller_retirement(ticket, owner).unwrap();
+        let reused = ledger.register(owner).unwrap();
+        assert_ne!(reused, ticket);
+        assert_eq!(ledger.release_hosted_caller_terminal_pin(ticket, owner),
+            Err(SourceIrpLedgerError::WrongIdentity));
+    }
+
+    #[test]
+    fn pending_caller_each_terminal_owner_releases_one_pin_before_graph_admission() {
+        let mut ledger = SourceIrpLedger::new();
+        let owner = caller_allocation(0x8000, 24);
+        let ticket = ledger.register(owner).unwrap();
+        ledger.pin_hosted_forward(3, owner.domain, owner.component_address).unwrap();
+        ledger.pin_hosted_forward(3, owner.domain, owner.component_address).unwrap();
+        ledger.release_hosted_caller_terminal_pin(ticket, owner).unwrap();
+        assert_eq!(ledger.retirement_ready(ticket, owner), Err(SourceIrpLedgerError::Pinned));
+        assert_eq!(ledger.begin_hosted_caller_retirement(ticket, owner), Err(SourceIrpLedgerError::Pinned));
+        ledger.release_hosted_caller_terminal_pin(ticket, owner).unwrap();
+        assert_eq!(ledger.retirement_ready(ticket, owner), Ok(()));
+        ledger.begin_hosted_caller_retirement(ticket, owner).unwrap();
+        assert!(!ledger.admits_forward(ticket, owner));
+        assert!(ledger.matches(owner.owner, owner, ticket));
+        assert_eq!(ledger.release_hosted_caller_terminal_pin(ticket, owner), Err(SourceIrpLedgerError::RetirementStarted));
+        ledger.finish_hosted_caller_retirement(ticket, owner).unwrap();
     }
 }

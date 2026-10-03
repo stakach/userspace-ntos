@@ -44,6 +44,12 @@ pub(super) struct CapturedSourceQueryInformation {
 }
 
 impl CapturedSourceQueryInformation {
+    pub(super) fn completion_command(&self, token: u64) -> Result<hosted_source_completion_lane::SourceCompletionCommand, CaptureError> {
+        self.validate_source()?;
+        Ok(hosted_source_completion_lane::SourceCompletionCommand {
+            ticket: self.source, allocation: self.allocation, token,
+        })
+    }
     pub(super) fn source_irp_address(&self) -> u64 {
         self.allocation.component_address
     }
@@ -148,6 +154,23 @@ impl CapturedSourceQueryInformation {
         hosted_source_irp_ledger::deferred_free_requested(self.source)
     }
 
+    pub(super) fn completion_finished(&self) -> bool {
+        match self.allocation.owner {
+            nt_io_manager::source_irp_ledger::SourceIrpOwner::HostedDriver(_) =>
+                self.callback_requested_free(),
+            nt_io_manager::source_irp_ledger::SourceIrpOwner::HostedCaller(_) =>
+                hosted_source_irp_ledger::caller_terminal_ready(self.source, self.allocation),
+            nt_io_manager::source_irp_ledger::SourceIrpOwner::Win32k => false,
+        }
+    }
+
+    pub(super) fn retire_target_after_pending_source_completion(
+        &mut self,
+        terminal: TerminalQueryInformationForward,
+    ) -> Result<QueryInformationCompletion, (CaptureError, TerminalQueryInformationForward)> {
+        self.retire_target_after_source_completion(terminal)
+    }
+
     pub(super) fn prepare(&mut self) -> Result<PreparedQueryInformationForward, CaptureError> {
         self.validate_source()?;
         let target = self.target.take().ok_or(CaptureError::InvalidTarget)?;
@@ -165,7 +188,7 @@ impl CapturedSourceQueryInformation {
     ) -> Result<QueryInformationCompletion, (CaptureError, TerminalQueryInformationForward)> {
         if self.forward_identity != Some(terminal.identity())
             || self.target_retired
-            || !self.callback_requested_free()
+            || !self.completion_finished()
         {
             return Err((CaptureError::InvalidTarget, terminal));
         }
@@ -198,6 +221,14 @@ impl CapturedSourceQueryInformation {
     }
 
     pub(super) fn release(&mut self) -> Result<(), CaptureError> {
+        self.release_owned(false)
+    }
+
+    pub(super) fn release_pending_terminal(&mut self) -> Result<(), CaptureError> {
+        self.release_owned(true)
+    }
+
+    fn release_owned(&mut self, pending_terminal: bool) -> Result<(), CaptureError> {
         if !self.pinned {
             return Err(CaptureError::InvalidSourceIrp);
         }
@@ -214,7 +245,12 @@ impl CapturedSourceQueryInformation {
                 .map_err(|_| CaptureError::InvalidTarget)?;
             self.target = None;
         }
-        if !hosted_source_irp_ledger::unpin(self.source) {
+        let released = if pending_terminal {
+            hosted_source_irp_ledger::release_pending_terminal(self.source, self.allocation)
+        } else {
+            hosted_source_irp_ledger::unpin(self.source)
+        };
+        if !released {
             return Err(CaptureError::InvalidSourceIrp);
         }
         self.pinned = false;

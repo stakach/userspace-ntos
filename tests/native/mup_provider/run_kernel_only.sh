@@ -27,6 +27,8 @@ python3 scripts/run_with_timeout.py \
   --cwd "$ROOT/rust-micro" \
   --failure-file "$RUN_LOG" \
   --failure-text '[provider-bugcheck] terminal' \
+  --failure-text '[mup-provider-gate] terminal service-loop failure' \
+  --failure-text '[read-forward-fail]' \
   --completion-file "$RUN_LOG" \
   --completion-text '[section-read-verified]' \
   --completion-grace-seconds 15 \
@@ -74,6 +76,7 @@ if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || ! grep -Fq '[mup-provider-query-file] count=3 class=5 bytes=24' "$RUN_LOG" \
    || ! grep -Fq '[zw-query-file-verified]' "$RUN_LOG" \
    || ! grep -Fq '[zw-read-file-verified]' "$RUN_LOG" \
+   || grep -Fq '[read-forward-fail]' "$RUN_LOG" \
    || ! grep -Fq '[mup-provider-section-create] count=1' "$RUN_LOG" \
    || ! grep -Fq '[mup-provider-section-query-pending-dispatch] class=5 bytes=24' "$RUN_LOG" \
    || ! grep -Fq '[mup-provider-section-query-pending-complete] class=5 bytes=24' "$RUN_LOG" \
@@ -92,4 +95,6 @@ if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
   exit 1
 fi
 
-echo "Mup/provider registration, File WRITE, immediate/pending cross-domain READ, FLUSH and QUERY_INFORMATION, section-shaped class 5/class 6 metadata and pending page READ, Zw READ/QUERY, and CREATE/CLEANUP/CLOSE verified (IRP-level only): $RUN_LOG"
+python3 tests/native/mup_provider/verify_log.py --verify-log "$RUN_LOG"
+
+echo "Mup/provider registration, File WRITE, immediate/pending cross-domain READ, FLUSH and QUERY_INFORMATION, controlled pending failures, section-shaped class 5/class 6 metadata and pending page READ, Zw READ/QUERY, and CREATE/CLEANUP/CLOSE verified (IRP-level only): $RUN_LOG"

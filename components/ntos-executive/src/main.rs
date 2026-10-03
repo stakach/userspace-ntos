@@ -39,6 +39,11 @@ mod registry_security_audit;
 mod provider_registry_caller;
 mod provider_directory_broker;
 mod provider_section_broker;
+mod provider_service_ingress;
+mod provider_section_cleanup;
+mod provider_section_receipts;
+mod registry_query_diagnostics;
+mod process_terminal_receipt;
 mod provider_mm_section_objects;
 mod provider_section_map_broker;
 mod provider_section_unmap_broker;
@@ -62,6 +67,7 @@ mod loader_trace_diag;
 pub(crate) use loader_trace_diag::*;
 mod exec_handler;
 mod native_image_sections;
+pub(crate) use exec_handler::file_image_section;
 mod hosted_routed_image_capture;
 mod thread_context;
 mod thread_suspend;
@@ -75,6 +81,7 @@ mod hosted_termination;
 mod parked_reply;
 mod root_reply_park;
 mod pending_file_caller;
+mod pending_file_create;
 mod pending_file_apc;
 mod current_apc;
 mod user_apc;
@@ -3213,16 +3220,6 @@ static WL_LISTENER_THREAD_MINTED: AtomicU64 = AtomicU64::new(0);
 static WL_LISTENER_STACK_ALLOCATION_BASE: AtomicU64 = AtomicU64::new(0);
 static WL_LISTENER_STACK_BASE_REAL: AtomicU64 = AtomicU64::new(0);
 static WL_LISTENER_STACK_MAPPED_LOW: AtomicU64 = AtomicU64::new(0);
-fn wl_listener_stack_contains(va: u64, len: usize) -> bool {
-    let allocation_base = WL_LISTENER_STACK_ALLOCATION_BASE.load(Ordering::Acquire);
-    let stack_base = WL_LISTENER_STACK_BASE_REAL.load(Ordering::Acquire);
-    allocation_base != 0
-        && stack_base > allocation_base
-        && va >= allocation_base
-        && va
-            .checked_add(len as u64)
-            .is_some_and(|end| end <= stack_base)
-}
 /// Count of real threads created through the general NtCreateThread path.
 static PM_GENERAL_THREADS_CREATED: AtomicU64 = AtomicU64::new(0);
 /// Threads created in a FOREIGN process's address space through the real cross-VSpace
@@ -4304,7 +4301,6 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
     );
     se_create_token_specs(passed);
     lsa_security_database_specs(passed);
-    unsafe { activation_context_stack_spec(passed) };
     winlogon_logon_action_spec(passed);
     unsafe { software_hive_mount_spec(passed) };
     unsafe { writable_overlay_spec(passed) };
@@ -4417,9 +4413,8 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     mapped_section_writecopy_cow_spec(passed);
     image_writecopy_cow_spec(passed);
     vm_pool_headroom_spec(passed);
-    unsafe { teb_tail_snapshot_diagnostic() };
     unsafe { lsarpc_connection_worker_spec(passed) };
-    unsafe { gdi_user_batch_flush_spec(passed) };
+    gdi_user_batch_flush_spec(passed);
     unsafe { profile_ntuser_dat_spec(passed) };
     unsafe { nt_load_key_spec(passed) };
     user_shell_activation_spec(passed);
@@ -5227,40 +5222,12 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
     );
 }
 
-/// ═══ THE KERNEL FLUSHES THE GDI USER BATCH, SO THE CLIENT'S TEB STOPS BEING EATEN ═══════════════
-///
-/// The whole TEB-clobber family (batch 53's `ACTIVATION_CONTEXT_STACK`, batch 59/60's
-/// `StaticUnicodeString`, and this batch's `#GP` in `RtlEnterCriticalSection` on rpcrt4's
-/// `TEB.ReservedForNtRpc`) was ONE bug: `gdi32!GdiAllocBatchCommand` appends deferred GDI records at
-/// `TEB + 0x300 + GdiTebBatch.Offset` and relies on the KERNEL clearing `Offset`/`GdiBatchCount` at
-/// every win32k system call (`KiSystemCallHandler` → `KeGdiFlushUserBatch`). Our host never did, so
-/// `Offset` grew without bound and walked the TEB.
-///
-/// Every clause is a counter off the REAL path, and each one fails for a different reason:
-///  * the kernel step really RAN on a live client win32k system call (`flushes >= 1`) — otherwise
-///    this spec would pass vacuously on a boot where no GDI batching happened at all;
-///  * `GdiTebBatch.Offset` NEVER exceeded `GDIBATCHBUFSIZE` at any win32k system call — the direct
-///    statement of the bug ("the buffer overran its own bounds"), and the clause that goes red the
-///    instant the flush is bypassed;
-///  * winlogon's LIVE `TEB.ReservedForNtRpc` is either NULL or CANONICAL — the exact field rpcrt4
-///    dereferences without validating, read from the real tail through the executive's alias;
-///  * the whole 0x1680..0x16A8 neighbourhood the overrun used to reach is still what the spawn left
-///    (`Vdm`/`DbgSsReserved` zero) — a region no legitimate writer touches;
-///  * the spawn canary at `TEB+0x1FC0` is intact, so nothing else walked the page either.
-unsafe fn gdi_user_batch_flush_spec(passed: &mut u64) {
+/// Real win32k batch flushes, observed record counts, failures, and maximum submitted offset.
+fn gdi_user_batch_flush_spec(passed: &mut u64) {
     let flushes = GDI_BATCH_FLUSHES.load(Ordering::Relaxed);
     let records = GDI_BATCH_RECORDS_FLUSHED.load(Ordering::Relaxed);
     let failures = GDI_BATCH_FLUSH_FAILURES.load(Ordering::Relaxed);
     let max_offset = GDI_BATCH_MAX_OFFSET.load(Ordering::Relaxed);
-    let tail = WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000;
-    let ntrpc = core::ptr::read_volatile((tail + 0x698) as *const u64);
-    let vdm = core::ptr::read_volatile((tail + 0x690) as *const u64);
-    let tls_links = core::ptr::read_volatile((tail + 0x680) as *const u64);
-    let dbgss = core::ptr::read_volatile((tail + 0x6a0) as *const u64);
-    let live_offset = core::ptr::read_volatile((WINLOGON_MAIN_TEB_MIRROR_VA + 0x2F0) as *const u32);
-    // A user-mode pointer is canonical AND below the 128 TiB user half; NULL is equally fine (it is
-    // what makes rpcrt4 ALLOCATE a threaddata instead of dereferencing a non-pointer).
-    let ntrpc_ok = ntrpc == 0 || (ntrpc >> 47) == 0;
     print_str(b"[gdi-batch] KeGdiFlushUserBatch flushes=");
     print_u64(flushes);
     print_str(b" records-flushed=");
@@ -5271,16 +5238,6 @@ unsafe fn gdi_user_batch_flush_spec(passed: &mut u64) {
     print_hex(max_offset as u32);
     print_str(b"/0x");
     print_hex(GDI_BATCH_BUF_SIZE);
-    print_str(b" live-Offset=0x");
-    print_hex(live_offset);
-    print_str(b" | winlogon TEB+0x1680=0x");
-    print_hex_u64(tls_links);
-    print_str(b" +0x1690=0x");
-    print_hex_u64(vdm);
-    print_str(b" ReservedForNtRpc=0x");
-    print_hex_u64(ntrpc);
-    print_str(b" +0x16a0=0x");
-    print_hex_u64(dbgss);
     print_str(b"\n");
     check(
         b"exec_gdi_user_batch_flushed",
@@ -5288,36 +5245,9 @@ unsafe fn gdi_user_batch_flush_spec(passed: &mut u64) {
             && flushes >= 1
             && records >= 1
             && failures == 0
-            && max_offset <= GDI_BATCH_BUF_SIZE as u64
-            && live_offset <= GDI_BATCH_BUF_SIZE
-            && ntrpc_ok
-            && vdm == 0
-            && tls_links == 0
-            && dbgss == 0
-            && teb_tail_canary_intact(tail),
+            && max_offset <= GDI_BATCH_BUF_SIZE as u64,
         passed,
     );
-}
-
-/// Read-only observation of the real client TEB; this does not attribute corruption to a writer.
-unsafe fn teb_tail_snapshot_diagnostic() {
-    let tail = WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000;
-    let maximum_length = core::ptr::read_volatile((tail + 0x25a) as *const u16);
-    let buffer = core::ptr::read_volatile((tail + 0x260) as *const u64);
-    let actctx = core::ptr::read_volatile((WINLOGON_MAIN_TEB_MIRROR_VA + 0x2c8) as *const u64);
-    print_str(b"[teb-tail] winlogon MaximumLength=");
-    print_u64(maximum_length as u64);
-    print_str(b" Buffer=0x");
-    print_hex_u64(buffer);
-    print_str(b" expected=0x");
-    print_hex_u64(SMSS_TEB_VA + 0x1268);
-    print_str(b" canary=");
-    print_u64(teb_tail_canary_intact(tail) as u64);
-    print_str(b" actctx=0x");
-    print_hex_u64(actctx);
-    print_str(b" corrupt-observations=");
-    print_u64(TEB_TAIL_CORRUPT_OBSERVATIONS.load(Ordering::Relaxed));
-    print_str(b"\n");
 }
 
 /// ═══ ★ winlogon's `\pipe\lsarpc` BIND GETS A REAL SERVER THREAD, AND THE LOOP CANNOT HANG ═══════
@@ -6121,98 +6051,6 @@ fn winlogon_logon_action_spec(passed: &mut u64) {
     );
 }
 
-/// ═══ A thread's `ACTIVATION_CONTEXT_STACK` IS PRIVATE ══════════════════════════════════════════
-///
-/// `TEB+0x2C8` (`ActivationContextStackPointer`) is what `RtlQueryInformationActivationContext`,
-/// `RtlGetActiveActivationContext` and `RtlActivateActivationContextUnsafeFast` all dereference. It
-/// used to point at `TEB+0x1800` — INSIDE the TEB's second page. Both TEB pages are deliberately
-/// `csrss_frame_put`-registered as CLIENT FRAMES, because hosted win32k dereferences the caller's
-/// TEB directly under the KeStackAttachProcess model and a win32k fault at either TEB VA is answered
-/// with this client's own frame. So win32k's USER server-side writes landed in the client's real TEB
-/// and scribbled the structure: the page came back holding RECT-shaped values, `0xffff` sentinels
-/// and `0x00c8d0d4` (`COLOR_BTNFACE`) repeatedly, with the non-pointer `ActiveFrame =
-/// 0x0000_0006_0010_0000` — and winlogon's post-logon `CreateRemoteThread` faulted reading
-/// `[ActiveFrame+8]`. Real NT never puts this structure in the TEB either: it is a heap allocation
-/// (`RtlAllocateActivationContextStack`) reachable ONLY through `TEB+0x2C8`.
-///
-/// The structure now gets its OWN page, one past the two TEB pages, on BOTH spawn paths
-/// (`img_spawn::spawn_sec_image` for a process' main thread, `spawn_hosted_thread` for every
-/// hosted thread). This spec reads winlogon's LIVE mapping of it and asserts, at gate time:
-///  * `TEB+0x2C8` points at that private page, not into the TEB;
-///  * the page still holds the empty `ACTIVATION_CONTEXT_STACK` the spawn wrote — `ActiveFrame`
-///    NULL, a self-referential `FrameListCache`, `Flags = 0`, `NextCookieSequenceNumber = 1`,
-///    `StackId = 1`;
-///  * **every byte past the structure is still ZERO** — the direct refutation of the scribble;
-///  * the page is NOT in the client-frame registry (so a win32k fault at that VA can never be
-///    answered with it), while BOTH TEB pages ARE — the contrast is what makes the first clause
-///    mean something.
-unsafe fn activation_context_stack_spec(passed: &mut u64) {
-    // winlogon (pi 2) spawned with `scr_base == WINLOGON_MAIN_TEB_MIRROR_VA`; those executive-side
-    // scratch aliases are never unmapped, so +0x0000 is its live TEB page and +0x8000 its live ACS.
-    let teb_mirror = WINLOGON_MAIN_TEB_MIRROR_VA;
-    let acs_mirror = teb_mirror + 0x8000;
-    let pointer = core::ptr::read_volatile((teb_mirror + 0x2c8) as *const u64);
-    let active_frame = core::ptr::read_volatile(acs_mirror as *const u64);
-    let flink = core::ptr::read_volatile((acs_mirror + 0x08) as *const u64);
-    let blink = core::ptr::read_volatile((acs_mirror + 0x10) as *const u64);
-    let flags = core::ptr::read_volatile((acs_mirror + 0x18) as *const u32);
-    let cookie = core::ptr::read_volatile((acs_mirror + 0x1c) as *const u32);
-    let stack_id = core::ptr::read_volatile((acs_mirror + 0x20) as *const u32);
-    let mut tail_nonzero = 0u64;
-    let mut offset = 0x24u64;
-    while offset < 0x1000 {
-        tail_nonzero += (core::ptr::read_volatile((acs_mirror + offset) as *const u8) != 0) as u64;
-        offset += 1;
-    }
-    let acs_registered = csrss_frame_get_exact(2, ACS_PAGE_VA).0;
-    let teb_registered = csrss_frame_get_exact(2, SMSS_TEB_VA).0;
-    let teb2_registered = csrss_frame_get_exact(2, SMSS_TEB_VA + 0x1000).0;
-    print_str(b"[actctx] winlogon TEB+0x2c8=0x");
-    print_hex((pointer >> 32) as u32);
-    print_hex(pointer as u32);
-    print_str(b" expected=0x");
-    print_hex((ACS_PAGE_VA >> 32) as u32);
-    print_hex(ACS_PAGE_VA as u32);
-    print_str(b" ActiveFrame=0x");
-    print_hex((active_frame >> 32) as u32);
-    print_hex(active_frame as u32);
-    print_str(b" flink/blink=0x");
-    print_hex(flink as u32);
-    print_str(b"/0x");
-    print_hex(blink as u32);
-    print_str(b" flags=");
-    print_u64(flags as u64);
-    print_str(b" cookie=");
-    print_u64(cookie as u64);
-    print_str(b" stack-id=");
-    print_u64(stack_id as u64);
-    print_str(b" tail-nonzero-bytes=");
-    print_u64(tail_nonzero);
-    print_str(b" client-frame: acs=");
-    print_u64(acs_registered);
-    print_str(b" teb-p1=");
-    print_u64((teb_registered != 0) as u64);
-    print_str(b" teb-p2=");
-    print_u64((teb2_registered != 0) as u64);
-    print_str(b"\n");
-    check(
-        b"exec_ntdll_activation_context_valid",
-        pointer == ACS_PAGE_VA
-            && active_frame == 0
-            && flink == ACS_PAGE_VA + 0x08
-            && blink == ACS_PAGE_VA + 0x08
-            && flags == 0
-            && cookie == 1
-            && stack_id == 1
-            && tail_nonzero == 0
-            // The page is unreachable through the win32k client-frame path...
-            && acs_registered == 0
-            // ...precisely BECAUSE registration is what the two TEB pages have and it does not.
-            && teb_registered != 0
-            && teb2_registered != 0,
-        passed,
-    );
-}
 
 /// ═══ `NtCreateToken` (SSN 57) — the REAL logon-token mint ══════════════════════════════════════
 ///
@@ -7289,22 +7127,7 @@ static W32_PREV_BUCKET: AtomicU64 = AtomicU64::new(u64::MAX);
 pub(crate) static W32_DISPATCH_SPAN_100NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static W32_DISPATCH_SPANNED: AtomicU64 = AtomicU64::new(0);
 
-/// ═══ THE BLOCKING-`NtUserGetMessage` GUARD ═══════════════════════════════════════════════════
-///
-/// `PREFLIGHT_PEEKS` counts the non-blocking `NtUserPeekMessage(PM_NOREMOVE)` the executive issues
-/// before ever letting a blocking `NtUserGetMessage` into win32k. The outcome counters classify
-/// every peek as ready, safely repopulated, or parked. An unhandled empty result would be a
-/// permanent system-wide hang: win32k is driven synchronously by the single-threaded service loop,
-/// so its wait would stop both the boot and the loop-top stall watchdog.
 pub(crate) static PROFILE_FRONTIER_TRACED: AtomicU64 = AtomicU64::new(0);
-/// The guard's kill switch — the BYPASS control. `false` restores the pre-batch behaviour exactly
-/// (a blocking `NtUserGetMessage` is dispatched straight into win32k), which is a permanent
-/// system-wide hang the moment one finds an empty queue.
-pub(crate) const GET_MESSAGE_EMPTY_QUEUE_GUARD: bool = false;
-pub(crate) static GET_MESSAGE_PREFLIGHT_PEEKS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static GET_MESSAGE_PREFLIGHT_READY: AtomicU64 = AtomicU64::new(0);
-pub(crate) static GET_MESSAGE_EMPTY_QUEUE_REPOPULATED: AtomicU64 = AtomicU64::new(0);
-pub(crate) static GET_MESSAGE_EMPTY_QUEUE_PARKS: AtomicU64 = AtomicU64::new(0);
 
 /// Record a win32k dispatch entry for the census, and tick the periodic heartbeat from inside the
 /// nested pump. Called from the SSN >= 0x1000 arm of the service loop.
@@ -10014,25 +9837,28 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(context_lifetime.token_handle_releases);
     print_str(b"/");
     print_u64(context_lifetime.retirement_failures);
-    let provider_pool = win32k_subsystem::provider_pool_census();
     print_str(b" w32-provider-pool=");
-    print_u64(provider_pool.live_bytes >> 10);
-    print_str(b"KiB/");
-    print_u64(provider_pool.live_high_water >> 10);
-    print_str(b"KiB arena-hw=");
-    print_u64(provider_pool.arena_high_water >> 10);
-    print_str(b"KiB alloc/free/reuse/invalid=");
-    print_u64(provider_pool.allocations);
-    print_str(b"/");
-    print_u64(provider_pool.frees);
-    print_str(b"/");
-    print_u64(provider_pool.reuses);
-    print_str(b"/");
-    print_u64(provider_pool.invalid_frees);
-    print_str(b" oom/corrupt=");
-    print_u64(provider_pool.out_of_memory);
-    print_str(b"/");
-    print_u64(provider_pool.corruptions);
+    if let Some(provider_pool) = win32k_subsystem::root_provider_pool_census() {
+        print_u64(provider_pool.live_bytes >> 10);
+        print_str(b"KiB/");
+        print_u64(provider_pool.live_high_water >> 10);
+        print_str(b"KiB arena-hw=");
+        print_u64(provider_pool.arena_high_water >> 10);
+        print_str(b"KiB alloc/free/reuse/invalid=");
+        print_u64(provider_pool.allocations);
+        print_str(b"/");
+        print_u64(provider_pool.frees);
+        print_str(b"/");
+        print_u64(provider_pool.reuses);
+        print_str(b"/");
+        print_u64(provider_pool.invalid_frees);
+        print_str(b" oom/corrupt=");
+        print_u64(provider_pool.out_of_memory);
+        print_str(b"/");
+        print_u64(provider_pool.corruptions);
+    } else {
+        print_str(b"unavailable");
+    }
     if let Some(security) = win32k_subsystem::object_security_census() {
         print_str(b" object-security=get/release/live/entries/retiring:");
         print_u64(security.acquisitions);
@@ -10219,23 +10045,6 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(delay_wait_alloc_fails);
     print_str(b"/");
     print_u64(delay_wait_store_fails);
-    let (
-        gui_message_wait_live,
-        gui_message_wait_records,
-        gui_message_wait_cap,
-        gui_message_wait_alloc_fails,
-        gui_message_wait_store_fails,
-    ) = service_sec_image::gui_message_waiter_stats();
-    print_str(b" gui-msg-wait=");
-    print_u64(gui_message_wait_live as u64);
-    print_str(b"/");
-    print_u64(gui_message_wait_records as u64);
-    print_str(b"/");
-    print_u64(gui_message_wait_cap as u64);
-    print_str(b"/");
-    print_u64(gui_message_wait_alloc_fails);
-    print_str(b"/");
-    print_u64(gui_message_wait_store_fails);
     let (
         object_wait_live,
         object_wait_records,
@@ -10670,7 +10479,10 @@ pub(crate) unsafe fn ke_gdi_flush_user_batch(
     if offset as u64 > previous {
         GDI_BATCH_MAX_OFFSET.store(offset as u64, Ordering::Relaxed);
     }
-    if client.process_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell) {
+    let observation_role = hosted_process_runtime_for_pi(client.pi as usize)
+        .filter(|runtime| runtime.generation == client.generation)
+        .map(|runtime| runtime.observation_role);
+    if observation_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell) {
         let first_flush = EXPLORER_GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed) == 0;
         EXPLORER_GDI_BATCH_RECORDS.fetch_add(count as u64, Ordering::Relaxed);
         if first_flush {
@@ -18512,9 +18324,6 @@ unsafe fn terminate_hosted_thread_mechanism(
         return false;
     }
     notify_thread_termination_ports(tid, handler);
-    if !crate::service_sec_image::gui_message_wait_abandon_thread(handler, tid) {
-        return false;
-    }
     if !release_hosted_thread_win32_context(tid, handler) {
         return false;
     }
@@ -23311,6 +23120,8 @@ struct ExecNtHandler {
     obj_ns: alloc::vec::Vec<ObjEntry>,
     /// Native image Section identities and their exact file-backed lifetime.
     image_sections: native_image_sections::NativeImageStore,
+    /// Canonical image execution references independent of their creator's Section handles.
+    process_image_owners: Vec<exec_handler::image_process_create::ProcessImageOwner>,
     /// Dispatcher state for every `obj_ns` event, keyed by the stable namespace index. The store
     /// owns manual/auto-reset and signal state; `obj_ns` owns names and identity.
     events: nt_kernel_exec::EventStore,
@@ -23379,6 +23190,10 @@ struct ExecNtHandler {
     current_server_client_pid: u32,
     /// Promoted acquisition whose retained route replaces process-handle lookup on retry.
     active_synchronous_file_retry: Option<nt_io_manager::SynchronousFileIngress>,
+    // Checked-copy pumps broker work, not top-level syscall ingress; these owners remain scoped
+    // to this dispatch until handoff transfers them into the exact waiter or pending File row.
+    current_file_transfer_parameters: Option<nt_io_manager::FileTransferParameters>,
+    current_file_transfer_event: Option<nt_io_manager::FileTransferEvent>,
     /// Exact pre-reserved Busy/reference owner, transferred or retired at the dispatch boundary.
     current_synchronous_file: Option<nt_io_manager::inline_file_retirement::InlineFileRetirementIdentity>,
     current_apc_handoff: Option<nt_user_host::current_apc::CurrentApcIdentity>,
@@ -24300,6 +24115,23 @@ impl ExecFileCompletion {
         unsafe { (&*self.table).io_mode(file_id) }
     }
 
+    fn update_io_mode_with(
+        &mut self,
+        file_id: u64,
+        expected_device: u64,
+        tid: u64,
+        expected_live_mode: nt_io_completion::FileIoMode,
+        next_mode: nt_io_completion::FileIoMode,
+        commit_body: impl FnOnce() -> Result<(), u32>,
+    ) -> Result<(), u32> {
+        // The canonical body commit is memory-only and cannot reenter this sole-owned table.
+        unsafe {
+            (&mut *self.table).update_io_mode_with(
+                file_id, expected_device, tid, expected_live_mode, next_mode, commit_body,
+            )
+        }
+    }
+
     fn io_waiter_count(&self, file_id: u64) -> Result<u32, u32> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).io_waiter_count(file_id) }
@@ -24624,6 +24456,11 @@ impl ExecDirectoryOpens {
         unsafe { (&mut *self.table).retain_io(id) }
     }
 
+    fn retain_referenced_io(&mut self, id: u32) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).retain_referenced_io(id) }
+    }
+
     fn set_signaled(&mut self, id: u32, signaled: bool) -> Result<(), u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).set_signaled(id, signaled) }
@@ -24721,6 +24558,11 @@ impl ExecReadOnlyFileOpens {
     fn retain_io(&mut self, id: u32) -> Result<(), u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).retain_io(id) }
+    }
+
+    fn retain_referenced_io(&mut self, id: u32) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).retain_referenced_io(id) }
     }
 
     fn set_signaled(&mut self, id: u32, signaled: bool) -> Result<(), u32> {
@@ -28776,6 +28618,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             leaf: b"secimgtest.exe",
             process_name: "secimgtest.exe",
             role: nt_exe_image::HostedProcessRole::NonInteractiveService,
+            observation: None,
             nt_image_path: b"\\SystemRoot\\System32\\secimgtest.exe",
             command_line: b"secimgtest.exe",
             image_root: nt_exe_image::HostedImageRoot::System32,

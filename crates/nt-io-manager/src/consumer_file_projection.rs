@@ -18,6 +18,7 @@ pub struct ConsumerFileMetadata {
     pub file_name: Vec<u16>,
     pub create_options: u32,
     pub opened_case_sensitive: bool,
+    pub mode: crate::FileModeState,
 }
 
 pub fn consumer_file_metadata<P>(
@@ -38,6 +39,7 @@ pub fn consumer_file_metadata<P>(
         file_name,
         create_options: file.create_options.bits(),
         opened_case_sensitive: file.opened_case_sensitive(),
+        mode: file.mode_state(),
     })
 }
 
@@ -75,6 +77,11 @@ pub fn write_consumer_wdm_file_object<P>(
         },
     )
     .map_err(|_| NtStatus::INVALID_PARAMETER)?;
+    // A consumer may be published after a mode SET. CREATE admission remains immutable,
+    // but every new projection must begin with the current canonical File mode.
+    let flags = u32::from_le_bytes(bytes[0x50..0x54].try_into().unwrap());
+    let mode_flags = metadata.mode.wdm_mode_flags()?;
+    bytes[0x50..0x54].copy_from_slice(&((flags & !0x1003e) | mode_flags).to_le_bytes());
     // Normal CREATE has completed before a consumer receives this projection. The base
     // WDM writer also serves pre-CREATE objects, whose Event must remain unsignaled.
     bytes[0x9c..0xa0].copy_from_slice(&1u32.to_le_bytes());

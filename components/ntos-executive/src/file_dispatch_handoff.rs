@@ -54,10 +54,15 @@ pub(super) unsafe fn before_post_action(
         if let Some(identity) = nt_handler.current_synchronous_file {
             let owner = inline_file_retirement::active_owner(identity);
             assert_eq!(
-                pending
-                    .route
-                    .hosted_file_id()
-                    .map(nt_io_manager::FileIoWaitKey::Hosted),
+                match pending.route {
+                    nt_io_manager::PendingFileRoute::Hosted(file) => {
+                        Some(nt_io_manager::FileIoWaitKey::Hosted(file))
+                    }
+                    nt_io_manager::PendingFileRoute::Local(nt_io_manager::LocalFileObject::Overlay(file)) => {
+                        Some(nt_io_manager::FileIoWaitKey::LocalOverlay(file))
+                    }
+                    nt_io_manager::PendingFileRoute::Local(_) => None,
+                },
                 Some(owner.key)
             );
             assert_eq!(pending.tid, owner.tid);
@@ -71,7 +76,13 @@ pub(super) unsafe fn before_post_action(
         // The source remains in the handler until publication succeeds. Continuing synchronous
         // calls attach their reply in this same commit, never exposing an unarmed delivery row.
         let identity = reservation.identity();
-        let local_terminal = pending.local_terminal_result().is_some();
+        let local_terminal = pending.owned_terminal_result().is_some()
+            || matches!(pending.operation, nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(_));
+        if let Some(event) = nt_handler.current_file_transfer_event.take() {
+            assert!(pending.transfer_event.is_none());
+            assert!(pending.event_obj_idx == u64::MAX || pending.event_obj_idx == event.native_identity);
+            pending.transfer_event = Some(event);
+        }
         pending_file_io_transfer(
             pending,
             wait_for_completion,
@@ -117,6 +128,7 @@ pub(super) unsafe fn before_post_action(
         inline_file_retirement::retire(identity);
         inline_file_retirement::redrive(nt_handler);
     }
+    nt_handler.release_current_transfer_event();
     if let Some(owner) = published.as_ref().filter(|_| terminating) {
         // The current main Reply was never transferred. Post-action teardown deletes it; the
         // published File owner instead retains real cancellation/completion and Busy retirement.

@@ -132,15 +132,13 @@ impl ExecNtHandler {
             if pending_irp_id == 0 {
                 status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
                 information = 0;
+                if self.publish_file_io_status(iosb, status, information).is_err() {
+                    status = nt_syscall::STATUS_ACCESS_VIOLATION;
+                }
                 if synchronous_file {
                     let _ = self.signal_file_completion(file_id, status);
                 }
                 self.release_file_reference(file_id);
-                let mut iosb_bytes = [0u8; 16];
-                iosb_bytes[..4].copy_from_slice(&status.to_le_bytes());
-                if !self.xas_try_write_buf(iosb, &iosb_bytes) {
-                    status = nt_syscall::STATUS_ACCESS_VIOLATION;
-                }
             } else {
                 self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
                     route: PendingFileRoute::Hosted(file_id),
@@ -164,6 +162,7 @@ impl ExecNtHandler {
                     signal_file: synchronous_file,
                     publish_iocp: false,
                     event_obj_idx: u64::MAX,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -181,10 +180,7 @@ impl ExecNtHandler {
                 status = nt_syscall::STATUS_ACCESS_VIOLATION;
                 information = 0;
             }
-            let mut iosb_bytes = [0u8; 16];
-            iosb_bytes[..4].copy_from_slice(&status.to_le_bytes());
-            iosb_bytes[8..16].copy_from_slice(&information.to_le_bytes());
-            if !self.xas_try_write_buf(iosb, &iosb_bytes) {
+            if self.publish_file_io_status(iosb, status, information).is_err() {
                 status = nt_syscall::STATUS_ACCESS_VIOLATION;
             }
             if synchronous_file {

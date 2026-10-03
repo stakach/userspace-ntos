@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 nt-cache-manager = { workspace = true }
+nt-io-completion = { workspace = true }
 
 [dev-dependencies]
 nt-memory-manager = { workspace = true }

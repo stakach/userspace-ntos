@@ -178,6 +178,7 @@ name = "nt-address-space"
 version = "0.1.0"
 dependencies = [
  "nt-cache-manager",
+ "nt-io-completion",
  "nt-memory-manager",
 ]
 
@@ -217,8 +218,10 @@ version = "0.1.0"
 name = "nt-compat-exports"
 version = "0.1.0"
 dependencies = [
+ "nt-exe-image",
  "nt-kernel-abi",
  "nt-kernel-exec",
+ "nt-pe-loader",
  "nt-process",
  "syn",
 ]
@@ -347,6 +350,7 @@ dependencies = [
  "nt-config-store",
  "nt-hive-core",
  "nt-io-completion",
+ "nt-status",
 ]
 
 [[package]]

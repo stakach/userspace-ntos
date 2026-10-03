@@ -80,8 +80,8 @@ impl ExecNtHandler {
             route: PendingFileRoute::Local(route.file_object),
             irp_id: request_id,
             major: major::IRP_MJ_SET_INFORMATION,
-            operation: nt_io_manager::PendingFileIoOperation::LocalInline(
-                nt_io_manager::PendingLocalInline {
+            operation: nt_io_manager::PendingFileIoOperation::OwnedInline(
+                nt_io_manager::PendingOwnedInline {
                     status,
                     information: 0,
                 },

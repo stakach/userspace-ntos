@@ -1,0 +1,22 @@
+LIBRARY ntdll.dll
+EXPORTS
+    NtCreateFile
+    NtOpenFile
+    NtReadFile
+    NtWriteFile
+    NtQueryInformationFile
+    NtSetInformationFile
+    NtDuplicateObject
+    NtAllocateVirtualMemory
+    NtProtectVirtualMemory
+    NtFreeVirtualMemory
+    NtCreateEvent
+    NtWaitForSingleObject
+    NtClose
+    NtDisplayString
+    NtTerminateProcess
+    NtTerminateThread
+    RtlCreateUserThread
+    NtOpenKey
+    NtQueryKey
+    NtQueryInformationProcess

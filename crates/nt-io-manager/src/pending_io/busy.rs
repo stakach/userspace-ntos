@@ -94,12 +94,19 @@ impl PendingFileBusy {
             && self.owner.tid != 0
             && self.owner.tid != u64::MAX
             && self.owner.tid == pending.tid
-            && pending.hosted_file_id().map(FileIoWaitKey::Hosted) == Some(self.owner.key)
+            && match pending.route {
+                PendingFileRoute::Hosted(file) => self.owner.key == FileIoWaitKey::Hosted(file),
+                PendingFileRoute::Local(LocalFileObject::Overlay(file)) => {
+                    matches!(pending.operation, PendingFileIoOperation::OwnedInline(_)
+                        | PendingFileIoOperation::OwnedModePrecommit(_))
+                        && self.owner.key == FileIoWaitKey::LocalOverlay(file)
+                }
+                PendingFileRoute::Local(_) => false,
+            }
             && matches!(
                 self.owner.mode,
                 FileIoMode::SynchronousAlertable | FileIoMode::SynchronousNonAlertable
             )
-            && !pending.is_local()
             && !matches!(pending.operation, PendingFileIoOperation::Create(_))
     }
 
@@ -202,6 +209,9 @@ impl PendingFileIoTable {
             return Err(PendingFileBusyError::InvalidPhase);
         }
         let pending = self.get(slot).ok_or(PendingFileBusyError::WrongIdentity)?;
+        if matches!(pending.operation, PendingFileIoOperation::OwnedModePrecommit(_)) {
+            return Err(PendingFileBusyError::InvalidPhase);
+        }
         let busy = pending.busy.ok_or(PendingFileBusyError::WrongIdentity)?;
         if pending.irp_id != irp_id || !busy.identity.is_published() {
             return Err(PendingFileBusyError::WrongIdentity);

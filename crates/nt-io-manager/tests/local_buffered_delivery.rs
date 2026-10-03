@@ -65,7 +65,7 @@ impl Memory {
     ) -> Result<(), MemoryCopyFailure> {
         loop {
             let pending = table.get(slot).unwrap();
-            let terminal_length = pending.local_terminal_result().unwrap().1 as usize;
+            let terminal_length = pending.owned_terminal_result().unwrap().1 as usize;
             let offset = pending.output_offset as usize;
             if offset == terminal_length {
                 return Ok(());
@@ -172,11 +172,11 @@ fn finish(fs: &mut FileSystem, handle: u64, table: &mut PendingFileIoTable, slot
     table.mark_backend_acked_exact(slot, id).unwrap();
     assert!(table.finish_exact(slot, id).is_none());
     fs.zw_release_io_reference(handle).unwrap();
-    table.mark_local_reference_released_exact(slot, id).unwrap();
+    table.mark_owned_reference_released_exact(slot, id).unwrap();
     let retired = table.finish_exact(slot, id).unwrap();
     assert_eq!(
-        retired.local_terminal_result(),
-        pending.local_terminal_result()
+        retired.owned_terminal_result(),
+        pending.owned_terminal_result()
     );
     assert!(table.get(slot).is_none());
 }
@@ -202,7 +202,7 @@ fn closed_file_read_retains_accepted_bytes_and_retries_only_the_uncopied_suffix(
     let retry = table.get(slot).unwrap();
     assert_eq!(retry.output_offset, 4);
     assert_eq!(
-        retry.local_terminal_result(),
+        retry.owned_terminal_result(),
         Some((STATUS_SUCCESS, original.len() as u64))
     );
     assert_eq!(
@@ -255,7 +255,7 @@ fn permanent_read_copy_fault_preserves_transfer_information_and_filesystem_effec
         let faulted = table.get(slot).unwrap();
         assert_eq!(faulted.output_offset, 4);
         assert_eq!(
-            faulted.local_terminal_result(),
+            faulted.owned_terminal_result(),
             Some((status, original.len() as u64))
         );
         assert_eq!(faulted.delivery_state & IO_DELIVERY_BUFFER_PUBLISHED, 0);
@@ -360,7 +360,7 @@ fn directory_copy_retry_or_permanent_fault_never_repeats_accepted_enumeration() 
         let stopped = table.get(slot).unwrap();
         assert_eq!(stopped.output_offset, 4);
         assert_eq!(
-            stopped.local_terminal_result(),
+            stopped.owned_terminal_result(),
             Some((STATUS_SUCCESS, result.information as u64))
         );
         if permanent {

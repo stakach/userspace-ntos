@@ -128,6 +128,10 @@ mod hosted_query_path_work;
 mod hosted_write_work;
 #[path = "hosted_read_work.rs"]
 mod hosted_read_work;
+#[path = "hosted_source_completion_lane.rs"]
+pub(crate) mod hosted_source_completion_lane;
+#[path = "hosted_forward_origin.rs"]
+mod hosted_forward_origin;
 #[path = "hosted_flush_work.rs"]
 mod hosted_flush_work;
 #[path = "hosted_query_information_work.rs"]
@@ -144,6 +148,10 @@ mod hosted_create_security_graph;
 mod hosted_file_objects;
 #[path = "hosted_reparse_name.rs"]
 mod hosted_reparse_name;
+#[path = "hosted_file_mode.rs"]
+mod hosted_file_mode;
+pub(crate) use hosted_file_mode::prepare as prepare_hosted_file_mode;
+pub(crate) use hosted_file_mode::PreparationError as FileModePreparationError;
 #[path = "hosted_consumer_file_objects.rs"]
 pub(crate) mod hosted_consumer_file_objects;
 #[path = "hosted_io_create_file_adapter.rs"]
@@ -2363,6 +2371,19 @@ unsafe fn poll_hosted_completion(instance_index: usize) -> Option<nt_io_manager:
             let completion = entry.completion.completed();
             pending_irp_owner_state(node_exec).store(ready_state, Ordering::Release);
             if canonical_irp_id != 0 && entry.owner_domain == owner_domain {
+                if !hosted_source_irp_ledger::caller_completion_publishable(
+                    storage_instance,
+                    node,
+                    ready_state & !HOSTED_IRP_STATE_MASK,
+                    canonical_irp_id,
+                    entry.irp,
+                    entry.source_ticket_id,
+                    entry.source_ticket_generation,
+                ) {
+                    node = next;
+                    steps += 1;
+                    continue;
+                }
                 if let Some(completion) = completion {
                     if best
                         .as_ref()
@@ -8737,14 +8758,23 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     } else {
                         FSD_SERVICE_WRITE_FORWARD_LABEL
                     };
-                    let (reply_label, status, accepted, _, _) = call_on4(
+                    let (reply_label, status, accepted, token, _) = call_on4(
                         (forward_label << 12) | 4,
                         1,
                         device,
                         irp,
                         0,
                     );
-                    if reply_label != 0 || accepted > 1 {
+                    let typed_forward = matches!(major as u8,
+                        major::IRP_MJ_READ | major::IRP_MJ_FLUSH_BUFFERS | major::IRP_MJ_QUERY_INFORMATION);
+                    let disposition = if typed_forward {
+                        nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply::decode(
+                            status as u32 as i32, accepted,
+                        )
+                    } else { None };
+                    if reply_label != 0 || (typed_forward && disposition.is_none())
+                        || (typed_forward && status as u32 == STATUS_PENDING && token == 0)
+                        || (!typed_forward && accepted > 1) {
                         crate::provider_bugcheck::report(
                             0xc4,
                             [forward_label, 1, irp, reply_label],
@@ -8762,7 +8792,17 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                         (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
                         device,
                     );
-                    let completion = complete_hosted_irp(irp);
+                    if typed_forward && status as u32 == STATUS_PENDING {
+                        let control = (next + WDM_X64_IO_STACK_CONTROL_OFFSET) as *mut u8;
+                        write_unaligned(control, read_unaligned(control) | WDM_X64_SL_PENDING_RETURNED);
+                        hosted_forward_origin::arm_pending(forward_label, irp, token);
+                        return STATUS_PENDING as i32;
+                    }
+                    let completion = complete_hosted_irp_with_owner(irp);
+                    if typed_forward && completion.outcome == HostedIrpUnwindOutcome::MoreProcessingRequired {
+                        hosted_forward_origin::acknowledge_inline_held(forward_label, irp, token);
+                        return status as u32 as i32;
+                    }
                     let (ack_label, ack_status, _, _, _) = call_on4(
                         (forward_label << 12) | 4,
                         2,
@@ -8776,7 +8816,9 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                             [forward_label, 2, irp, ack_status],
                         );
                     }
-                    if completion == HostedIrpUnwindOutcome::Terminal {
+                    if completion.outcome == HostedIrpUnwindOutcome::Terminal
+                        && completion.storage_owner == HostedIrpStorageOwner::DriverLocal
+                    {
                         s_io_free_irp(irp);
                     }
                     return status as u32 as i32;
@@ -11469,11 +11511,30 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
 }
 
 unsafe fn complete_hosted_irp(irp: u64) -> HostedIrpUnwindOutcome {
+    unsafe { complete_hosted_irp_with_owner(irp).outcome }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostedIrpStorageOwner {
+    DriverLocal,
+    CanonicalCaller,
+}
+
+struct HostedIrpCompletionReceipt {
+    outcome: HostedIrpUnwindOutcome,
+    storage_owner: HostedIrpStorageOwner,
+}
+
+unsafe fn complete_hosted_irp_with_owner(irp: u64) -> HostedIrpCompletionReceipt {
     unsafe {
         let claim = claim_pending_irp_completion(irp);
         if claim.is_none() && pending_irp_raw_identity_exists(irp) {
             panic!("IoCompleteRequest attempted to complete an owned IRP twice");
         }
+        let storage_owner = match claim {
+            Some(_) => HostedIrpStorageOwner::CanonicalCaller,
+            None => HostedIrpStorageOwner::DriverLocal,
+        };
         let active_seq = FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Relaxed);
         if active_seq >= 128 && FSD_ACTIVE_COMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16
         {
@@ -11530,7 +11591,10 @@ unsafe fn complete_hosted_irp(irp: u64) -> HostedIrpUnwindOutcome {
                 if let Some(claim) = claim {
                     park_pending_irp_completion_claim(claim);
                 }
-                return HostedIrpUnwindOutcome::MoreProcessingRequired;
+                return HostedIrpCompletionReceipt {
+                    outcome: HostedIrpUnwindOutcome::MoreProcessingRequired,
+                    storage_owner,
+                };
             }
             Ok(HostedIrpUnwindOutcome::Terminal) => {}
             Err(()) => {
@@ -11547,7 +11611,10 @@ unsafe fn complete_hosted_irp(irp: u64) -> HostedIrpUnwindOutcome {
         }
         let Some(claim) = claim else {
             finish_driver_local_irp(irp);
-            return HostedIrpUnwindOutcome::Terminal;
+            return HostedIrpCompletionReceipt {
+                outcome: HostedIrpUnwindOutcome::Terminal,
+                storage_owner,
+            };
         };
         let node = claim.node;
         let target = claim.target;
@@ -11638,7 +11705,10 @@ unsafe fn complete_hosted_irp(irp: u64) -> HostedIrpUnwindOutcome {
             print_u64(information);
             print_str(b"\n");
         }
-        HostedIrpUnwindOutcome::Terminal
+        HostedIrpCompletionReceipt {
+            outcome: HostedIrpUnwindOutcome::Terminal,
+            storage_owner,
+        }
     }
 }
 
@@ -44622,7 +44692,10 @@ fn dispatch_external_irp_to_device_record_result_exact(
     )
     .ok_or(STATUS_INVALID_PARAMETER as u32)?;
     if registered_file_target(device_id, major)? == RegisteredFileTarget::Kernel {
-        if initial_information != 0 || (!in_data.is_empty() && !out.is_empty()) {
+        if !nt_io_abi::valid_initial_information(major, initial_information, input_len, output_len) {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER.raw() as u32);
+        }
+        if !in_data.is_empty() && !out.is_empty() {
             return Err(nt_status::NtStatus::NOT_SUPPORTED.raw() as u32);
         }
         let mut buffer = Vec::new();
@@ -44632,8 +44705,16 @@ fn dispatch_external_irp_to_device_record_result_exact(
             .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32)?;
         buffer.resize(capacity, 0);
         buffer[..in_data.len()].copy_from_slice(in_data);
+        let control_code = match &params {
+            IoParameters::DeviceControl(parameters)
+            | IoParameters::InternalDeviceControl(parameters) => parameters.ioctl_code,
+            _ => 0,
+        };
+        if nt_io_abi::initial_output_required(major, control_code, output_len) {
+            buffer[..out.len()].copy_from_slice(out);
+        }
         let result = io_manager_mut()
-            .build_and_dispatch_external_to_device_with_stack_flags(
+            .build_and_dispatch_external_to_device_with_stack_flags_and_initial_information(
                 ClientId(IO_MANAGER_COMPONENT_ID),
                 nt_io_manager::DeviceId(device_id),
                 canonical_file_id,
@@ -44644,6 +44725,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
                 stack_flags,
                 input_len,
                 output_len,
+                initial_information,
                 &mut buffer,
             )
             .map_err(|status| status.raw() as u32)?;
@@ -54070,6 +54152,17 @@ struct HostedDriverThreadRuntime {
 }
 
 #[derive(Clone, Copy)]
+struct HostedWorkerSharedBankSpec {
+    offset: u64,
+}
+
+#[derive(Clone, Copy)]
+struct HostedWorkerSharedBank {
+    component: u64,
+    executive: u64,
+}
+
+#[derive(Clone, Copy)]
 struct HostedDriverThreadSpawn {
     tcb: u64,
     reply_cap: u64,
@@ -54081,6 +54174,7 @@ struct HostedDriverThreadSpawn {
     raw_cnode: u64,
     cnode: u64,
     sched_context: u64,
+    shared_bank: Option<HostedWorkerSharedBank>,
 }
 
 struct HostedDriverRawWaiter {
@@ -54268,6 +54362,13 @@ fn hosted_driver_caller(
                     && row.ingress_route == Some(route))?;
             Some(runtime)
         }
+        PhysicalSourceKind::DispatchWorker { ordinal } => {
+            let runtime = unsafe { hosted_source_completion_lane::worker(instance, ordinal)? };
+            if runtime.domain != domain || runtime.tcb != source.tcb
+                || runtime.pml4 != source.pml4 || runtime.ingress_route != Some(route)
+            { return None; }
+            Some(runtime)
+        }
         _ => return None,
     };
     let (handle, tcb) = runtime.map_or((inst.main_thread_id, inst.tcb), |rt| (rt.handle, rt.tcb));
@@ -54313,9 +54414,14 @@ fn clear_hosted_driver_threads_for_instance(instance: usize) {
             let runtime = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES)).as_ref()
                 .and_then(|rows| rows.get(index)).copied();
             let Some(runtime) = runtime.filter(|runtime| runtime.instance == instance) else { continue; };
+            if !hosted_source_completion_lane::begin_worker_retirement(instance, runtime.handle) {
+                continue;
+            }
             let _ = hosted_driver_thread_table_mut(instance).and_then(|table|
                 table.terminate(runtime.handle, nt_status::NtStatus::CANCELLED.raw() as i32).ok());
-            let _ = hosted_thread_resources::retire_thread(instance, runtime.handle);
+            if hosted_thread_resources::retire_thread(instance, runtime.handle) {
+                hosted_source_completion_lane::finish_worker_retirement(instance, runtime.handle);
+            }
         }
     }
 }
@@ -55436,7 +55542,8 @@ fn instance_for_pump_channel(
     ch: &crate::spawn_hosts::PumpChannel,
     active_reply_cap: u64,
 ) -> Option<(usize, DriverInstance)> {
-    let (instance, inst) = instance_by_shared_va(ch.shared_va)?;
+    let (instance, inst) = instance_by_shared_va(ch.shared_va)
+        .or_else(|| unsafe { hosted_source_completion_lane::instance_for_shared(ch.shared_va) })?;
     let captured = nt_io_manager::HostedTransportIdentity {
         domain: ch.physical_domain?,
         endpoint: ch.fault_ep,
@@ -55449,7 +55556,10 @@ fn instance_for_pump_channel(
         vspace: inst.pml4,
         shared: inst.exec_shared_va,
     };
-    if !captured.matches_live(live) || active_reply_cap == 0 {
+    let completion_lane = unsafe {
+        hosted_source_completion_lane::matches_channel(instance, inst, ch)
+    };
+    if (!captured.matches_live(live) && !completion_lane) || active_reply_cap == 0 {
         return None;
     }
     let route = unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::channel_route(ch).ok()?? };
@@ -57372,6 +57482,10 @@ pub(crate) unsafe fn service_hosted_read_forward(
             .map(|status| (status, false)),
         2 if irp == 0 => hosted_read_work::acknowledge(ch, reply_cap, badge, address)
             .map(|status| (status, false)),
+        3 => hosted_read_work::arm_pending(ch, reply_cap, badge, address, irp)
+            .map(|status| (status, false)),
+        4 => hosted_read_work::acknowledge_held(ch, reply_cap, badge, address, irp)
+            .map(|status| (status, false)),
         _ => Some((STATUS_INVALID_PARAMETER, false)),
     }
 }
@@ -57392,6 +57506,10 @@ pub(crate) unsafe fn service_hosted_flush_forward(
         1 => hosted_flush_work::submit(ch, irp, address, badge, reply_cap)
             .map(|status| (status, false)),
         2 if irp == 0 => hosted_flush_work::acknowledge(ch, reply_cap, badge, address)
+            .map(|status| (status, false)),
+        3 => hosted_flush_work::arm_pending(ch, reply_cap, badge, address, irp)
+            .map(|status| (status, false)),
+        4 => hosted_flush_work::acknowledge_held(ch, reply_cap, badge, address, irp)
             .map(|status| (status, false)),
         _ => Some((STATUS_INVALID_PARAMETER, false)),
     }
@@ -57423,6 +57541,10 @@ pub(crate) unsafe fn service_hosted_query_information_forward(
         2 if irp == 0 => hosted_query_information_work::acknowledge(
             ch, reply_cap, badge, address,
         ).map(|status| (status, false)),
+        3 => hosted_query_information_work::arm_pending(ch, reply_cap, badge, address, irp)
+            .map(|status| (status, false)),
+        4 => hosted_query_information_work::acknowledge_held(ch, reply_cap, badge, address, irp)
+            .map(|status| (status, false)),
         _ => Some((STATUS_INVALID_PARAMETER, false)),
     }
 }
@@ -57782,6 +57904,20 @@ unsafe fn spawn_hosted_driver_worker_thread(
     start_routine: u64,
     start_context: u64,
 ) -> Option<HostedDriverThreadSpawn> {
+    spawn_hosted_driver_worker_thread_with_shared_bank(
+        instance, inst, handle, component_slot, start_routine, start_context, None,
+    )
+}
+
+unsafe fn spawn_hosted_driver_worker_thread_with_shared_bank(
+    instance: usize,
+    inst: DriverInstance,
+    handle: u64,
+    component_slot: usize,
+    start_routine: u64,
+    start_context: u64,
+    shared_bank_spec: Option<HostedWorkerSharedBankSpec>,
+) -> Option<HostedDriverThreadSpawn> {
     let component_base = hosted_worker_component_base_for_slot(component_slot)?;
     let stack_base = component_base;
     let ipcbuf_va = component_base.checked_add(FSD_WORKER_IPCBUF_OFFSET)?;
@@ -57793,9 +57929,27 @@ unsafe fn spawn_hosted_driver_worker_thread(
     let tramp_exec_va = exec_base.checked_add(FSD_WORKER_TRAMP_OFFSET)?;
     let scratch_exec_va = exec_base.checked_add(FSD_WORKER_SCRATCH_OFFSET)?;
     let kpcr_exec_va = exec_base.checked_add(FSD_WORKER_KPCR_OFFSET)?;
+    let shared_bank = match shared_bank_spec {
+        Some(spec) => {
+            if spec.offset & 0xfff != 0
+                || spec.offset < FSD_WORKER_KPCR_OFFSET.checked_add(0x1000)?
+                || spec.offset.checked_add(0x1000)? > FSD_WORKER_STRIDE
+            {
+                return None;
+            }
+            Some(HostedWorkerSharedBank {
+                component: component_base.checked_add(spec.offset)?,
+                executive: exec_base.checked_add(spec.offset)?,
+            })
+        }
+        None => None,
+    };
+    let additional_resources = if shared_bank.is_some() { 2 } else { 0 };
 
     let domain = instance_domain_identity(inst)?;
-    let Some(construction) = hosted_thread_resources::begin(instance, handle, domain, inst.pml4) else {
+    let Some(construction) = hosted_thread_resources::begin(
+        instance, handle, domain, inst.pml4, additional_resources,
+    ) else {
         print_str(b"[driver-thread] construction reservation failed\n");
         return None;
     };
@@ -57851,6 +58005,20 @@ unsafe fn spawn_hosted_driver_worker_thread(
         print_hex(status);
         print_str(b"\n");
         return None;
+    }
+
+    if let Some(bank) = shared_bank {
+        let frame = alloc_frame();
+        hosted_thread_resources::root(construction, frame);
+        let executive_frame = copy_cap(frame);
+        hosted_thread_resources::root(construction, executive_frame);
+        hosted_thread_resources::mapping(construction, frame);
+        if page_map_r(frame, bank.component, RW_NX, inst.pml4) != 0 { return None; }
+        hosted_thread_resources::mapping(construction, executive_frame);
+        if page_map_r(executive_frame, bank.executive, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+            return None;
+        }
+        core::ptr::write_bytes(bank.executive as *mut u8, 0, 0x1000);
     }
 
     let ipcbuf = alloc_frame();
@@ -57947,6 +58115,7 @@ unsafe fn spawn_hosted_driver_worker_thread(
         sched_context,
         component_scratch_va: scratch_va,
         exec_scratch_va: scratch_exec_va,
+        shared_bank,
     })
 }
 

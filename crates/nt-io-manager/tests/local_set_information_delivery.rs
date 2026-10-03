@@ -48,7 +48,7 @@ fn terminal(
         irp_id: id,
         tid: TID,
         major: nt_io_abi::major::IRP_MJ_SET_INFORMATION,
-        operation: PendingFileIoOperation::LocalInline(PendingLocalInline {
+        operation: PendingFileIoOperation::OwnedInline(PendingOwnedInline {
             status,
             information: 0,
         }),
@@ -103,7 +103,7 @@ impl Memory {
         pending: PendingFileIo,
         fault: Option<(usize, MemoryCopyFailure)>,
     ) -> Result<(), MemoryCopyFailure> {
-        let (status, information) = pending.local_terminal_result().unwrap();
+        let (status, information) = pending.owned_terminal_result().unwrap();
         let mut store = 0;
         publish_file_io_status_checked(pending.iosb_va, status, information, |address, bytes| {
             let index = store;
@@ -122,10 +122,10 @@ impl Memory {
 }
 
 fn reply_and_ack(table: &mut PendingFileIoTable, slot: usize, id: u64) {
-    let before = table.get(slot).unwrap().local_terminal_result();
+    let before = table.get(slot).unwrap().owned_terminal_result();
     assert_eq!(table.claim_reply_cap_exact(slot, id), Some(Some(REPLY)));
     table.restore_reply_cap_exact(slot, id, REPLY).unwrap();
-    assert_eq!(table.get(slot).unwrap().local_terminal_result(), before);
+    assert_eq!(table.get(slot).unwrap().owned_terminal_result(), before);
     assert!(table.finish_exact(slot, id).is_none());
     assert_eq!(table.claim_reply_cap_exact(slot, id), Some(Some(REPLY)));
     table.mark_reply_published_exact(slot, id).unwrap();
@@ -215,11 +215,11 @@ fn accepted_metadata_name_and_position_changes_survive_iosb_and_reply_retry() {
                     }
                     assert_eq!(&memory.bytes[4..8], &[0xcc; 4]);
                     assert_eq!(
-                        table.get(slot).unwrap().local_terminal_result(),
+                        table.get(slot).unwrap().owned_terminal_result(),
                         Some((STATUS_SUCCESS, 0))
                     );
                     assert_eq!(
-                        table.get(slot).unwrap().local_syscall_status(),
+                        table.get(slot).unwrap().owned_syscall_status(),
                         Some(STATUS_SUCCESS)
                     );
                     assert_eq!(fs.query_file_object_information(handle).unwrap(), info);
@@ -234,7 +234,7 @@ fn accepted_metadata_name_and_position_changes_survive_iosb_and_reply_retry() {
                     assert!(fs.query_file_object_information(handle).is_ok());
                     assert!(table.finish_exact(slot, id).is_none());
                     fs.zw_release_io_reference(handle).unwrap();
-                    table.mark_local_reference_released_exact(slot, id).unwrap();
+                    table.mark_owned_reference_released_exact(slot, id).unwrap();
                     table.finish_exact(slot, id).unwrap();
                     assert_eq!(mutations, 1);
                     assert_eq!(fs.export_volume_snapshot().unwrap(), snapshot);
@@ -291,7 +291,7 @@ fn negative_signed_scalar_uses_fast_or_dispatched_error_timing_without_mutation(
                     assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
                     assert!(fs.query_file_object_information(handle).is_ok());
                     fs.zw_release_io_reference(handle).unwrap();
-                    table.mark_local_reference_released_exact(slot, id).unwrap();
+                    table.mark_owned_reference_released_exact(slot, id).unwrap();
                     table.finish_exact(slot, id).unwrap();
                 } else {
                     assert!(table.is_empty());
@@ -356,14 +356,14 @@ fn readonly_fast_position_retains_without_reset_or_signal_even_after_iosb_fault(
         table.mark_iosb_faulted_exact(slot, id, IOSB).unwrap();
         assert!(!table.get(slot).unwrap().signal_file);
         assert_eq!(
-            table.get(slot).unwrap().local_syscall_status(),
+            table.get(slot).unwrap().owned_syscall_status(),
             Some(STATUS_SUCCESS)
         );
         reply_and_ack(&mut table, slot, id);
         assert_eq!(files.get(object).unwrap().current_offset, 53);
         assert_eq!(files.is_signaled(object), Ok(signaled));
         files.release_io(object).unwrap();
-        table.mark_local_reference_released_exact(slot, id).unwrap();
+        table.mark_owned_reference_released_exact(slot, id).unwrap();
         table.finish_exact(slot, id).unwrap();
         assert!(files.get(object).is_err());
     }
@@ -410,9 +410,9 @@ fn abandoned_completed_rename_keeps_namespace_change_and_releases_exact_referenc
     assert!(table.finish_exact(slot, id).is_none());
     assert_eq!(fs.zw_is_file_signaled(handle), Ok(false));
     fs.zw_release_io_reference(handle).unwrap();
-    table.mark_local_reference_released_exact(slot, id).unwrap();
+    table.mark_owned_reference_released_exact(slot, id).unwrap();
     let retired = table.finish_exact(slot, id).unwrap();
-    assert_eq!(retired.local_terminal_result(), Some((STATUS_SUCCESS, 0)));
+    assert_eq!(retired.owned_terminal_result(), Some((STATUS_SUCCESS, 0)));
     assert!(fs.file_bytes_owned(PATH).is_none());
     assert_eq!(
         fs.file_bytes_owned(RENAMED).as_deref(),

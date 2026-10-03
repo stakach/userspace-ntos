@@ -1,6 +1,9 @@
 //! Typed wait routes composed with canonical local and hosted File ownership.
 //! Retry outcomes are fixture inputs; these tests do not execute native IPC or syscall ingress.
 
+#[path = "synchronous_file_routes/transfer_owners.rs"]
+mod transfer_owners;
+
 use nt_fs::*;
 use nt_io_completion::{FileCompletionTable, FileIoAcquireResult, FileIoMode};
 use nt_io_manager::{

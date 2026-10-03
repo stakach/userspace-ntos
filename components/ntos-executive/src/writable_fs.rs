@@ -42,7 +42,8 @@ pub(crate) mod registry_journal;
 #[path = "writable_fs/file_cleanup.rs"]
 mod file_cleanup;
 pub(crate) use file_cleanup::{
-    cancel_file_io_waiter, cancel_promoted_file_io, file_io_waiter_count, promote_file_io_waiter,
+    acquire_file_io, adopt_file_io, cancel_file_io_waiter, cancel_promoted_file_io,
+    file_io_mode, file_io_waiter_count, promote_file_io_waiter, release_file_io, set_file_mode,
     redrive_file_cleanup_work,
 };
 use file_cleanup::publish_file_cleanup_effects;
@@ -118,7 +119,7 @@ pub(crate) const WRITABLE_OVERLAY_MOUNTED: bool = true;
 /// blew the TCG time budget ("post-logon UI work grows ~2.5x"). That was WRONG: host-side
 /// timestamps showed the boot going COMPLETELY SILENT for the last 245 s behind a blocking
 /// `NtUserGetMessage` that win32k could never answer — a deadlock, not a budget. With that fixed
-/// (see `GET_MESSAGE_EMPTY_QUEUE_GUARD`) the boot quiesces in 319-329 s of the ~555 s window with
+/// the boot quiesces in 319-329 s of the ~555 s window with
 /// the flow ON, and `userenv!CopyDirectory` really runs: 20 subdirectories created below
 /// `C:\Profiles\<user>` and 2 files copied byte-exact from the ISO's `Default User`
 /// (`exec_winlogon_profile_copied`). Materialisation itself is unchanged and still measured at
@@ -2111,6 +2112,10 @@ pub(crate) unsafe fn retain_io_reference(file_id: u64) -> Result<(), u32> {
 /// Retain the operation reference and clear the file signal as one checked transition.
 pub(crate) unsafe fn begin_file_io(file_id: u64) -> Result<(), u32> {
     writable_fs()?.zw_begin_file_io(file_id)
+}
+
+pub(crate) unsafe fn begin_referenced_file_io(file_id: u64) -> Result<(), u32> {
+    writable_fs()?.zw_begin_referenced_file_io(file_id)
 }
 
 pub(crate) unsafe fn release_io_reference(file_id: u64) -> Result<(), u32> {

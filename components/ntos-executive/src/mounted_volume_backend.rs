@@ -23,6 +23,17 @@ use crate::fs_loader::{
 const OPEN_CAP: usize = nt_fs::MAX_FAT_OPEN_SLOTS;
 const PATH_CAP: usize = nt_fs::LAYERED_OPEN_NAME_CAP;
 
+fn capture_manager_owned_query_fields(
+    class: u32,
+    input: &[u8],
+    metadata: &mut nt_fs::QueryMetadata,
+) -> Result<(), NtStatus> {
+    if class == nt_fs::FILE_ALL_INFORMATION {
+        nt_fs::capture_file_all_io_manager_information(input, metadata).map_err(status)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct MountedBinding {
     context: nt_fs::LayeredOpenContextId,
@@ -690,6 +701,7 @@ impl MountedVolumeBackend {
         query.current_byte_offset = current_offset;
         query.access_flags = binding.granted_access;
         query.mode = mode;
+        capture_manager_owned_query_fields(parameters.info_class, output, &mut query)?;
         let result = match parameters.info_class {
             nt_fs::FILE_NAME_INFORMATION | nt_fs::FILE_ALL_INFORMATION => {
                 nt_fs::encode_named_query_information(

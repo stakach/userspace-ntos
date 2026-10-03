@@ -664,7 +664,7 @@ fn local_zero_routes_require_their_own_terminal_receipt_and_preserve_exact_peers
             .table
             .get_exact(locals[1].0)
             .unwrap()
-            .local_terminal_result(),
+            .owned_terminal_result(),
         None
     );
     assert!(fixture.table.apc(locals[1].0).is_err());

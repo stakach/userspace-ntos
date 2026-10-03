@@ -19,12 +19,12 @@ mod services;
 pub(crate) use services::{
     acknowledge_retained_service_cancellation, cancel_parked_service, finish_autonomous,
     next_service_wait_token, park_retained_service, park_service, reconcile_retained_service_reply,
-    resume_acknowledged_retained_services, resume_service, retained_service_cancelled,
+    resume_acknowledged_retained_services, resume_service, retained_service_resume_ready, retained_service_cancelled,
     retained_service_owner_stopped, retained_service_owner_stopped_at_broker,
     retained_service_reply_acknowledged,
     retained_service_reply_not_entered, retained_service_resume_next_deadline,
     retire_stopped_acknowledged_retained_service, wake_file_create_service,
-    wake_query_path_rejected_service, wake_query_path_service, wake_registry_service,
+    wake_query_path_rejected_service, wake_query_path_service, wake_hosted_forward_service, wake_registry_service,
     wake_section_create_service, wake_service,
 };
 
@@ -977,23 +977,46 @@ pub(crate) unsafe fn complete_protocol(
         return Err(Error::Admission);
     }
     let (incoming, _) = next_message(route)?.ok_or(Error::Protocol)?;
+    let index = (&*core::ptr::addr_of!(NATIVE_PEERS))
+        .iter()
+        .position(|row| row.route == Some(route))
+        .ok_or(Error::UnknownPeer)?;
     let owner = owner();
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
-    owner
-        .receiver
-        .as_mut()
-        .expect("ready receiver")
-        .complete_protocol_from_message(
-            route,
-            dispatch,
-            incoming,
-            label,
-            words,
-            lanes(),
-            owner.peers.as_mut().expect("ready peers"),
-            |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
-        )
-        .map_err(|_| Error::Protocol)?;
+    if (&*core::ptr::addr_of!(NATIVE_PEERS))[index].bootstrap {
+        owner
+            .receiver
+            .as_mut()
+            .expect("ready receiver")
+            .complete_bootstrap_protocol_from_message(
+                route,
+                dispatch,
+                incoming,
+                label,
+                words,
+                lanes(),
+                owner.peers.as_ref().expect("ready peers"),
+                |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
+            )
+            .map_err(|_| Error::Protocol)?;
+        (&mut *core::ptr::addr_of_mut!(NATIVE_PEERS))[index].bootstrap = false;
+    } else {
+        owner
+            .receiver
+            .as_mut()
+            .expect("ready receiver")
+            .complete_protocol_from_message(
+                route,
+                dispatch,
+                incoming,
+                label,
+                words,
+                lanes(),
+                owner.peers.as_mut().expect("ready peers"),
+                |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
+            )
+            .map_err(|_| Error::Protocol)?;
+    }
     crate::service_sec_image::retire_win32k_directory_route(route, dispatch);
     crate::service_sec_image::retire_win32k_section_create_route(route, dispatch);
     crate::service_sec_image::retire_win32k_section_map_route(route, dispatch);

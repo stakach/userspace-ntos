@@ -9,7 +9,7 @@ fn inline(file: LocalFileObject) -> PendingFileIo {
         route: PendingFileRoute::Local(file),
         irp_id: IRP,
         major: nt_io_abi::major::IRP_MJ_READ,
-        operation: PendingFileIoOperation::LocalInline(PendingLocalInline {
+        operation: PendingFileIoOperation::OwnedInline(PendingOwnedInline {
             status: 0,
             information: 0,
         }),
@@ -51,7 +51,7 @@ fn local_zero_is_valid_in_each_independent_file_object_namespace() {
         assert!(table.completion_surfaces_settled_exact(slot, IRP));
         table.mark_backend_acked_exact(slot, IRP).unwrap();
         table
-            .mark_local_reference_released_exact(slot, IRP)
+            .mark_owned_reference_released_exact(slot, IRP)
             .unwrap();
         assert_eq!(
             table.finish_exact(slot, IRP).unwrap().route,
@@ -147,6 +147,10 @@ fn route_and_operation_domains_must_agree_before_owner_publication() {
     let local = LocalFileObject::Overlay(7);
     let mut local_on_hosted = inline(local);
     local_on_hosted.route = PendingFileRoute::Hosted(7);
+    local_on_hosted.operation = PendingFileIoOperation::LocalBuffered(PendingLocalBuffered {
+        status: 0,
+        information: 0,
+    });
     let mut provider_on_local = inline(local);
     provider_on_local.operation = PendingFileIoOperation::Transfer;
     let mut table = PendingFileIoTable::new();
@@ -292,7 +296,7 @@ fn abandonment_preserves_typed_route_through_terminal_reference_retirement() {
     table.mark_backend_acked_exact(slot, IRP).unwrap();
     assert!(table.finish_exact(slot, IRP).is_none());
     table
-        .mark_local_reference_released_exact(slot, IRP)
+        .mark_owned_reference_released_exact(slot, IRP)
         .unwrap();
     assert_eq!(
         table.finish_exact(slot, IRP).unwrap().route,

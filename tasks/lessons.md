@@ -1,5 +1,15 @@
 # Lessons
 
+## Serialize Parser Tests Too
+- A yielded Cargo session is still active. Do not launch even independent Python fixture/parser
+  tests until its actual exit is consumed; single-owner validation includes every test suite.
+
+## Observations Do Not Admit Execution
+- Retained Section bytes and native handle rights admit process creation. An expired observational
+  catalog association may refuse attribution, but must not reject an otherwise valid executable.
+- Test File-close-before-process creation: observer registration can retire before its retained
+  Section source, so validating both against the same lifetime silently couples policy to tracing.
+
 ## Runtime Ownership Is Not A Thread Role
 - Resolve GUI TEB aliases from the published executable runtime and retained logical caller,
   including the exact process and thread generations. A worker badge's slot encoding is not
@@ -466,3 +476,36 @@ diagnosis-free failure.
   and mounted-hive paths; do not infer progress from reads, timer churn, or filesystem snapshots.
 - Resolve the actual saved PC and retained IPC state before changing watchdog policy. Keep the
   strict desktop gate and hard boot limit; a successful test-harness exit is not desktop proof.
+
+## Referenced Bodies Do Not Reenter Handle Admission
+- Capture access and retain the exact File body before reentrant user-memory probes. Continue
+  through that retained route even if the originating handle closes or is reused.
+- A later operation-start transition must consume referenced-body authority, not repeat a
+  live-handle requirement. Keep fresh admission strict and exclude cleanup-only or counted
+  serializer references from the retained-body proof.
+
+## Match Evidence to Executed Observations
+- A fixture's completed-group count does not identify every check it reached. Verify each
+  claimed native case against its actual log record; do not promote host coverage or a later
+  source assertion into guest execution evidence.
+
+## Preserve Capture Timing Across Blocking
+- A user pointer retained in a retry frame is not the value captured before a wait.
+  Keep captured scalars and exact referenced objects with the parked request; a
+  reused handle must not redirect an already-admitted operation.
+- Preserve NT's distinct early probes and late buffered copies. A late copy
+  exception releases acquisition ownership without publishing an I/O completion;
+  moving every copy early can conceal a bug while changing observable semantics.
+
+## Address Windows Are Not Mapped Backing
+- A grown stack can overlap a historical heap address window. Numeric containment
+  does not prove an executive alias exists; copy through the exact registered
+  frame and its acknowledged alias, or its retained source capability.
+- Demand-fill history is an observation, not replacement backing after retirement.
+  A failed exact backing lookup must not fall through to a computed mirror.
+
+## Verify The Regression Failure Point
+- Inspect the full failure, not just the test count or exit code. A fixture
+  rejected at admission does not reproduce the later behavior it claims to test.
+- Give retained-owner fixtures valid reservation identities before testing
+  output ordering, and keep setup failures separate from behavioral evidence.

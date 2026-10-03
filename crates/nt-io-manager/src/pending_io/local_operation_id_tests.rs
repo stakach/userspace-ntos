@@ -5,7 +5,7 @@ fn terminal(id: u64) -> PendingFileIo {
         route: PendingFileRoute::Local(LocalFileObject::Overlay(1)),
         irp_id: id,
         major: nt_io_abi::major::IRP_MJ_LOCK_CONTROL,
-        operation: PendingFileIoOperation::LocalInline(PendingLocalInline {
+        operation: PendingFileIoOperation::OwnedInline(PendingOwnedInline {
             status: 0,
             information: 0,
         }),

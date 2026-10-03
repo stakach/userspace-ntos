@@ -15,6 +15,12 @@ mod file_flush;
 #[path = "exec_file_capture.rs"]
 mod file_capture;
 
+#[path = "exec_file_create.rs"]
+mod file_create;
+
+#[path = "file_image_section.rs"]
+pub(crate) mod file_image_section;
+
 #[path = "exec_file_query.rs"]
 mod file_query;
 
@@ -27,11 +33,20 @@ mod file_set_information;
 #[path = "exec_hosted_file_set.rs"]
 mod hosted_file_set;
 
+#[path = "exec_file_acquisition.rs"]
+mod exec_file_acquisition;
+#[path = "exec_file_transfer.rs"]
+mod exec_file_transfer;
+#[path = "exec_file_mode.rs"]
+mod exec_file_mode;
 #[path = "exec_local_file_io.rs"]
 mod local_file_io;
 
 #[path = "exec_virtual_memory_copy.rs"]
 mod virtual_memory_copy;
+
+#[path = "exec_registry_value_name.rs"]
+mod registry_value_name;
 
 #[path = "exec_virtual_memory_protect.rs"]
 mod virtual_memory_protect;
@@ -66,6 +81,9 @@ pub(crate) mod section_create;
 
 #[path = "exec_image_section_create.rs"]
 pub(crate) mod image_section_create;
+
+#[path = "exec_image_process_create.rs"]
+pub(crate) mod image_process_create;
 
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
@@ -971,7 +989,8 @@ impl nt_hive_core::ReactOsSetupSeedTarget for CollectSystemSetupSeedTarget {
 #[used]
 static NT_OPEN_FILE_SERVICE_ENTRY: ExecServiceHandler = exec_nt_open_file_service_entry;
 #[used]
-static NT_CREATE_PROCESS_SERVICE_ENTRY: ExecServiceHandler = exec_nt_create_process_service_entry;
+static NT_CREATE_PROCESS_SERVICE_ENTRY: unsafe extern "C" fn(*mut ExecNtHandler, *const u64, usize, u8) -> u32 =
+    exec_nt_create_process_service_entry;
 #[used]
 static NT_WAIT_FOR_DEBUG_EVENT_SERVICE_ENTRY: ExecServiceHandler =
     exec_nt_wait_for_debug_event_service_entry;
@@ -2376,9 +2395,15 @@ unsafe extern "C" fn exec_nt_create_process_service_entry(
     handler: *mut ExecNtHandler,
     args_ptr: *const u64,
     args_len: usize,
+    mode: u8,
 ) -> u32 {
     let args = unsafe { core::slice::from_raw_parts(args_ptr, args_len) };
-    unsafe { (&mut *handler).nt_create_process_service(args) }
+    let previous_mode = match mode {
+        0 => nt_syscall::ProcessorMode::KernelMode,
+        1 => nt_syscall::ProcessorMode::UserMode,
+        _ => return STATUS_INVALID_PARAMETER,
+    };
+    unsafe { (&mut *handler).nt_create_process_service(args, previous_mode) }
 }
 
 #[unsafe(no_mangle)]
@@ -3940,6 +3965,7 @@ impl ExecNtHandler {
         );
         write_field!(obj_ns, obj_ns);
         write_field!(image_sections, native_image_sections::NativeImageStore::new());
+        write_field!(process_image_owners, Vec::new());
         write_field!(events, events);
         write_field!(event_objects, event_objects);
         write_field!(provider_timers, provider_timers);
@@ -3977,6 +4003,8 @@ impl ExecNtHandler {
         write_field!(current_user_memory, SyscallUserMemory::CurrentProcess);
         write_field!(current_server_client_pid, 0);
         write_field!(active_synchronous_file_retry, None);
+        write_field!(current_file_transfer_parameters, None);
+        write_field!(current_file_transfer_event, None);
         write_field!(current_synchronous_file, None);
         write_field!(current_apc_handoff, None);
         write_field!(context_continue_redirected, false);
@@ -9315,6 +9343,10 @@ impl ExecNtHandler {
         self.hosted_process_image(pi).map(|image| image.role)
     }
 
+    pub(crate) fn hosted_process_observation_role(&self, pi: usize) -> Option<nt_exe_image::HostedProcessRole> {
+        self.hosted_process_image(pi).map(|image| image.observation_role())
+    }
+
     pub(crate) fn hosted_process_generation(&self, pi: usize) -> Option<u64> {
         self.process_mechanisms
             .get(pi)
@@ -9451,20 +9483,6 @@ impl ExecNtHandler {
 
     fn current_process_is_interactive_shell(&self) -> bool {
         self.current_process_has_role(nt_exe_image::HostedProcessRole::InteractiveShell)
-    }
-
-    fn current_process_uses_pe_backed_registry_strings(&self) -> bool {
-        matches!(
-            self.current_hosted_process_role(),
-            Some(
-                nt_exe_image::HostedProcessRole::InteractiveLogon
-                    | nt_exe_image::HostedProcessRole::ServiceControlManager
-                    | nt_exe_image::HostedProcessRole::LocalSecurityAuthority
-                    | nt_exe_image::HostedProcessRole::NonInteractiveService
-                    | nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
-                    | nt_exe_image::HostedProcessRole::InteractiveShell
-            )
-        )
     }
 
     fn current_hosted_thread_role(&self) -> Option<HostedThreadRole> {
@@ -11404,29 +11422,20 @@ impl ExecNtHandler {
         if pi >= MAX_PI {
             return false;
         }
-        let (filled, nfilled, scratch_base) = match self.loop_ctx {
+        let scratch_base = match self.loop_ctx {
             Some(ctx) => {
                 let procs = unsafe { &*ctx.procs };
-                let filled: &[u64] = if pi == self.pi {
-                    let current = unsafe { &*ctx.filled_pages };
-                    &current[..]
-                } else {
-                    let per_process = unsafe { &*ctx.pfilled };
-                    &per_process[pi][..]
-                };
-                (filled, procs[pi].faults as usize, procs[pi].scratch_base)
+                procs[pi].scratch_base
             }
             // Post-loop (the self-tests) there is no loop context; the PEB page is reachable through
             // its registered permanent alias, which `client_copyout_mapped` consults first.
-            None => (&[][..], 0usize, 0u64),
+            None => 0,
         };
         let written = unsafe {
             img_spawn::client_copyout_mapped(
                 pi as u64,
                 SMSS_PEB_VA + PEB_BEING_DEBUGGED_OFFSET,
                 &[u8::from(being_debugged)],
-                filled,
-                nfilled,
                 scratch_base,
             )
         };
@@ -11555,12 +11564,6 @@ impl ExecNtHandler {
         &mut self,
         object: nt_kernel_exec::DispatcherSignalObject,
     ) -> u32 {
-        let transitioned_event = match object {
-            nt_kernel_exec::DispatcherSignalObject::Event(identity) => {
-                (!self.events.read_state(identity)).then_some(identity as usize)
-            }
-            _ => None,
-        };
         match nt_kernel_exec::signal_dispatcher_for_wait(
             &mut self.events,
             &mut self.semaphores,
@@ -11573,11 +11576,6 @@ impl ExecNtHandler {
                 // interleave between the two halves of NtSignalAndWaitForSingleObject.
                 unsafe {
                     let _ = wait_wake_dispatcher_set(self);
-                    if let Some(index) = transitioned_event {
-                        if let Some(id) = self.event_id_for_index(index) {
-                            crate::service_sec_image::gui_message_wait_select_level(self, id);
-                        }
-                    }
                 }
                 0
             }
@@ -12671,8 +12669,7 @@ impl ExecNtHandler {
         if iosb == 0 || !self.probe_user_output(iosb, 16) {
             return false;
         }
-        self.xas_try_write_buf(iosb, &status.to_le_bytes())
-            && self.xas_try_write_buf(iosb + 8, &information.to_le_bytes())
+        self.publish_file_io_status(iosb, status, information).is_ok()
     }
 
     unsafe fn nt_device_io_control_file_service(&mut self, args: &[u64]) -> u32 {
@@ -12838,6 +12835,7 @@ impl ExecNtHandler {
                     signal_file: synchronous_file || event_obj_idx == u64::MAX,
                     publish_iocp: args[2] == 0,
                     event_obj_idx,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -12888,7 +12886,7 @@ impl ExecNtHandler {
                     operation.notify_id,
                 );
             }
-            nt_io_manager::PendingFileIoOperation::LocalInline(_)
+            nt_io_manager::PendingFileIoOperation::OwnedInline(_)
             | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
             | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => {}
             _ => {
@@ -12926,6 +12924,7 @@ impl ExecNtHandler {
             let pending = table.take_create_owner_exact(identity, irp_id)
                 .expect("new CREATE refused its unpublished-handle rollback");
             crate::pending_file_caller::retire(identity);
+            assert!(pending.transfer_event.is_none(), "CREATE inherited a transfer Event");
             self.abandon_file_create(pending);
         } else {
             let pending = table.abandon_transfer_owner_exact(identity, irp_id)
@@ -12952,6 +12951,7 @@ impl ExecNtHandler {
         (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
             .take_thread_creates_exact_with(tid, |identity, pending| {
                 crate::pending_file_caller::retire(identity);
+                assert!(pending.transfer_event.is_none(), "CREATE inherited a transfer Event");
                 creates.push(pending);
             });
         for pending in creates.iter().copied() {
@@ -13320,6 +13320,7 @@ impl ExecNtHandler {
                 signal_file: synchronous || event_obj_idx == u64::MAX,
                 publish_iocp: false,
                 event_obj_idx,
+                transfer_event: None,
                 reply_cap: 0,
                 reply_required: false,
                 native_call_transport: self.current_native_call_transport,
@@ -13394,6 +13395,7 @@ impl ExecNtHandler {
                 signal_file: synchronous || event_obj_idx == u64::MAX,
                 publish_iocp: apc_routine == 0,
                 event_obj_idx,
+                transfer_event: None,
                 reply_cap: 0,
                 reply_required: false,
                 native_call_transport: self.current_native_call_transport,
@@ -13591,6 +13593,7 @@ impl ExecNtHandler {
                         signal_file: synchronous || event_obj_idx == u64::MAX,
                         publish_iocp: false,
                         event_obj_idx,
+                        transfer_event: None,
                         reply_cap: 0,
                         reply_required: false,
                         native_call_transport: self.current_native_call_transport,
@@ -13668,6 +13671,7 @@ impl ExecNtHandler {
                     signal_file: synchronous || event_obj_idx == u64::MAX,
                     publish_iocp: apc_routine == 0,
                     event_obj_idx,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -13814,6 +13818,7 @@ impl ExecNtHandler {
                 signal_file: true,
                 publish_iocp: false,
                 event_obj_idx: u64::MAX,
+                transfer_event: None,
                 reply_cap: 0,
                 reply_required: false,
                 native_call_transport: self.current_native_call_transport,
@@ -17714,6 +17719,14 @@ impl ExecNtHandler {
                 let image = process_committed_image_allocation(target_pi as u64, plan.page)
                     .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;
                 let base = image.allocation_base;
+                let _image_reader = if base == PE_LOAD_BASE {
+                    let _durable = crate::allocator::enter_durable();
+                    let image = (&*ctx.exe_image_catalog).get_by_pi(target_pi)
+                        .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
+                    Some(crate::hosted_loaded_images::HostedImageReadScope::capture(
+                        ctx.hosted_loaded_images, nt_exe_image::SpawnTarget::from_image(image),
+                    ).map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?)
+                } else { None };
                 let pe = if base == PE_LOAD_BASE {
                     (&*ctx.hosted_loaded_images)
                         .pe_by_pi(target_pi)
@@ -20828,15 +20841,6 @@ impl ExecNtHandler {
                     {
                         return HostedProcessDeletionOutcome::Pending(candidate.phase);
                     }
-                    if !unsafe {
-                        crate::service_sec_image::gui_message_wait_abandon_process(
-                            self,
-                            pi,
-                            process_mechanism.generation,
-                        )
-                    } {
-                        return HostedProcessDeletionOutcome::Pending(candidate.phase);
-                    }
                     let thread_has_win32_context = self.pm.process(pid).is_some_and(|process| {
                         process
                             .threads
@@ -21034,6 +21038,7 @@ impl ExecNtHandler {
                         .release_exact(process_mechanism)
                         .expect("preflighted hosted process mechanism must retire exactly");
                     debug_assert_eq!(released.pid, pid);
+                    self.release_native_process_image(pi, pid, candidate.generation);
                     self.pool_used[pi] = 0;
                     self.drain_job_destructions();
                     self.refresh_process_manager_gates();
@@ -21649,24 +21654,17 @@ impl ExecNtHandler {
         if target_pi == self.pi {
             return self.xas_try_write_buf(address, &state);
         }
-        let (filled, faults, scratch_base) = match self.loop_ctx {
+        let scratch_base = match self.loop_ctx {
             Some(ctx) => {
                 let procs = &*ctx.procs;
-                let per_process = &*ctx.pfilled;
-                (
-                    &per_process[target_pi][..],
-                    procs[target_pi].faults as usize,
-                    procs[target_pi].scratch_base,
-                )
+                procs[target_pi].scratch_base
             }
-            None => (&[][..], 0, 0),
+            None => 0,
         };
         client_copyout_mapped(
             target_pi as u64,
             address,
             &state,
-            filled,
-            faults,
             scratch_base,
         )
     }
@@ -22612,34 +22610,12 @@ impl ExecNtHandler {
         }
     }
 
-    fn write_nt_open_file_handle_out(&mut self, ptr: u64, val: u64) {
-        if ptr == 0 {
-            return;
-        }
-        if self.pi >= 2 {
-            self.queue_write(ptr, val);
-        } else {
-            unsafe {
-                smss_stack_write(ptr, val);
-            }
-        }
-    }
-
     pub(crate) fn close_current_handle(&mut self, handle: u64) {
         if let Some(pid) = self.pm_pid_for_pi(self.pi) {
             let _ = self.close_process_handle(pid, handle);
         }
     }
-    /// Read a UNICODE_STRING's UTF-16 buffer from the faulting process for an LPC syscall, handling
-    /// a buffer that lives OUTSIDE the stack/heap mirrors — e.g. csrss's `NtConnectPort`
-    /// PortName `L"\\SmApiPort"` is a static string in csrsrv's `.rdata` (~0x8000_xxxx). The
-    /// UNICODE_STRING struct itself is a stack local (mirror-readable); its Buffer is read via the
-    /// per-fault scratch alias of the already-demand-faulted `.rdata` page (`scratch_for`). Empty on
-    /// failure (→ the caller's connect misses by name, a clean error, not a crash).
-    /// Read an OBJECT_ATTRIBUTES.ObjectName (OA+0x10 → PUNICODE_STRING) with the SAME .rdata-capable
-    /// fallback as `read_lpc_name`. The free `smss_read_objattr_name` is mirror-only, so csrss's
-    /// `NtCreatePort(\Windows\ApiPort)` (name in csrsrv .rdata) registered under an EMPTY name → the
-    /// broker couldn't match winlogon's connect. Use this so the port registers under its real name.
+    /// Read an OBJECT_ATTRIBUTES.ObjectName through the current process's admitted backing.
     pub(crate) unsafe fn read_objattr_name(&self, oa_va: u64) -> alloc::vec::Vec<u16> {
         let mut p = [0u8; 8];
         if !self.xas_read(oa_va + 0x10, &mut p) {
@@ -22669,18 +22645,6 @@ impl ExecNtHandler {
             if self.xas_read(va, &mut w) {
                 out.push(u16::from_le_bytes(w));
                 continue;
-            }
-            // Not in a mirror → try the scratch alias of an already-faulted page (csrsrv .rdata).
-            if let Some(ctx) = self.loop_ctx.as_ref() {
-                let fp = &*ctx.filled_pages;
-                let nf = *ctx.faults as usize;
-                if let Some(m) = scratch_for(va, fp, nf, ctx.scratch_base) {
-                    let p = m as *const u8;
-                    w[0] = *p;
-                    w[1] = *p.add(1);
-                    out.push(u16::from_le_bytes(w));
-                    continue;
-                }
             }
             break;
         }
@@ -22715,18 +22679,13 @@ impl ExecNtHandler {
             || process.generation != nt_memory_manager::ProcessGeneration::Hosted(ctx.owner_generation) {
             return false;
         }
-        let filled_pages = &*ctx.filled_pages;
-        let faults = *ctx.faults as usize;
         let stack_read = self.current_hosted_thread_user_stack_contains(va, dst.len());
         if client_copyin_process_mapped_for(
             self.pi as u64,
             process,
             va,
             dst,
-            filled_pages,
-            faults,
             ctx.scratch_base,
-            true,
         ) {
             return true;
         }
@@ -23341,13 +23300,17 @@ impl ExecNtHandler {
         output_va: u64,
         output_length: usize,
         result_length_va: u64,
+        query_arguments: Option<&[u64; 5]>,
     ) -> u32 {
         let Ok(result_length) = u32::try_from(information.len()) else {
             return STATUS_INSUFFICIENT_RESOURCES;
         };
         let result_length = result_length.to_le_bytes();
-        let result_length_written = self.xas_try_write_buf(result_length_va, &result_length);
-        if !result_length_written {
+        if let Err(failure) = self.process_memory_write_checked(self.pi, result_length_va, &result_length) {
+            if let Some(arguments) = query_arguments {
+                crate::registry_query_diagnostics::reject(self, b"result-length", arguments,
+                    STATUS_ACCESS_VIOLATION, Some(failure));
+            }
             return STATUS_ACCESS_VIOLATION;
         }
         if output_length < minimum_length {
@@ -23355,6 +23318,10 @@ impl ExecNtHandler {
         }
         let copy_len = output_length.min(information.len());
         if !self.xas_try_write_buf(output_va, &information[..copy_len]) {
+            if let Some(arguments) = query_arguments {
+                crate::registry_query_diagnostics::reject(self, b"output-copy", arguments,
+                    STATUS_ACCESS_VIOLATION, None);
+            }
             return STATUS_ACCESS_VIOLATION;
         }
         if output_length < information.len() {
@@ -23521,16 +23488,14 @@ impl ExecNtHandler {
     /// borrowed while resolving the device and constructing a canonical FILE_OBJECT/IRP, but no
     /// pointer into caller memory or this capture may be retained by a pending request.
     unsafe fn capture_file_object_attributes(
-        &self,
+        &mut self,
         oa_va: u64,
     ) -> Result<CapturedFileObjectAttributes, u32> {
         if oa_va == 0 {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let mut oa = [0u8; 0x30];
-        if !self.xas_read(oa_va, &mut oa) {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
+        self.process_memory_read_status(self.pi, oa_va, &mut oa)?;
         let length = u32::from_le_bytes(oa[0..4].try_into().unwrap());
         let attributes = u32::from_le_bytes(oa[24..28].try_into().unwrap());
         if length != oa.len() as u32 || attributes & !0x0000_07f2 != 0 {
@@ -23543,9 +23508,7 @@ impl ExecNtHandler {
         }
 
         let mut ustr = [0u8; 16];
-        if !self.xas_read(object_name, &mut ustr) {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
+        self.process_memory_read_status(self.pi, object_name, &mut ustr)?;
         let length = u16::from_le_bytes(ustr[0..2].try_into().unwrap()) as usize;
         let maximum = u16::from_le_bytes(ustr[2..4].try_into().unwrap()) as usize;
         let buffer = u64::from_le_bytes(ustr[8..16].try_into().unwrap());
@@ -23558,9 +23521,7 @@ impl ExecNtHandler {
             return Err(STATUS_OBJECT_NAME_INVALID);
         }
         let mut bytes = [0u8; FILE_OBJECT_NAME_CAP * 2];
-        if !self.xas_read(buffer, &mut bytes[..length]) {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
+        self.process_memory_read_status(self.pi, buffer, &mut bytes[..length])?;
         let name_len = length / 2;
         let mut name = [0u16; FILE_OBJECT_NAME_CAP];
         for (index, word) in bytes[..length].chunks_exact(2).enumerate() {
@@ -24430,37 +24391,6 @@ impl ExecNtHandler {
             .map(|(_, _, _, signaled)| signaled)
     }
 
-    pub(crate) fn acquire_gui_event_wait(
-        &mut self,
-        body: u64,
-    ) -> Result<(nt_kernel_exec::EventObjectId, nt_kernel_exec::EventLeaseId), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        let (id, _, kind, _) = self.provider_event_identity(body)?;
-        if !matches!(kind, nt_kernel_exec::EventKind::Synchronization) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let lease = self
-            .event_objects
-            .acquire_wait(id, nt_kernel_exec::EventLeaseKind::GuiWait)
-            .map_err(|_| STATUS_INVALID_PARAMETER)?;
-        Ok((id, lease))
-    }
-
-    pub(crate) fn release_gui_event_wait(
-        &mut self,
-        lease: nt_kernel_exec::EventLeaseId,
-    ) -> Result<(), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if let Some(retired) = self
-            .event_objects
-            .release_wait(lease, nt_kernel_exec::EventLeaseKind::GuiWait)
-            .map_err(|_| STATUS_INVALID_PARAMETER)?
-        {
-            self.finalize_retired_event_object(retired);
-        }
-        Ok(())
-    }
-
     pub(crate) fn event_ready_by_id(
         &self,
         id: nt_kernel_exec::EventObjectId,
@@ -24490,70 +24420,11 @@ impl ExecNtHandler {
             .ok_or(STATUS_INVALID_PARAMETER)
     }
 
-    pub(crate) fn queue_event_signal(
-        &mut self,
-        id: nt_kernel_exec::EventObjectId,
-    ) -> Result<(), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        self.event_objects
-            .queue_signal(id)
-            .map(|_| ())
-            .map_err(|_| STATUS_INVALID_PARAMETER)
-    }
-
-    pub(crate) fn take_event_signal(&mut self) -> Option<nt_kernel_exec::PendingEventSignal> {
-        self.event_objects.take_next_signal()
-    }
-
-    pub(crate) fn queued_event_signal_count(&self) -> usize {
-        self.event_objects.queued_signal_count()
-    }
-
-    pub(crate) fn retry_event_signal(
-        &mut self,
-        id: nt_kernel_exec::EventObjectId,
-    ) -> Result<(), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        self.event_objects
-            .retry_signal(id)
-            .map_err(|_| STATUS_INVALID_PARAMETER)
-    }
-
-    pub(crate) fn cancel_event_signal(
-        &mut self,
-        id: nt_kernel_exec::EventObjectId,
-    ) -> Result<(), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if let Some(retired) = self
-            .event_objects
-            .cancel_signal(id)
-            .map_err(|_| STATUS_INVALID_PARAMETER)?
-        {
-            self.finalize_retired_event_object(retired);
-        }
-        Ok(())
-    }
-
     pub(crate) fn event_id_for_index(
         &self,
         index: usize,
     ) -> Option<nt_kernel_exec::EventObjectId> {
         self.event_objects.id_for_native(index as u64)
-    }
-
-    pub(crate) fn complete_event_signal(
-        &mut self,
-        id: nt_kernel_exec::EventObjectId,
-    ) -> Result<(), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if let Some(retired) = self
-            .event_objects
-            .complete_signal(id)
-            .map_err(|_| STATUS_INVALID_PARAMETER)?
-        {
-            self.finalize_retired_event_object(retired);
-        }
-        Ok(())
     }
 
     pub(crate) fn provider_close_event(&mut self, pi: usize, handle: u64) -> Result<(), u32> {
@@ -26354,10 +26225,12 @@ impl ExecNtHandler {
         let Some(publication) = publication else {
             return STATUS_PENDING;
         };
-        self.write_nt_open_file_handle_out(file_handle_va, publication.handle);
-        self.xas_write_buf(iosb_va, &publication.status.to_le_bytes());
-        self.xas_write_buf(iosb_va + 8, &publication.information.to_le_bytes());
-        publication.status
+        match self.publish_file_create_result(
+            file_handle_va, iosb_va, publication.handle, publication.status, publication.information,
+        ) {
+            Ok(()) => publication.status,
+            Err(status) => status,
+        }
     }
 
     pub(crate) unsafe fn npfs_create_file(
@@ -26551,6 +26424,7 @@ impl ExecNtHandler {
                         status: STATUS_PENDING,
                         information: 0,
                         handle_value: 0,
+                        output: Default::default(),
                     },
                 ),
                 delivery_state: 0,
@@ -26569,6 +26443,7 @@ impl ExecNtHandler {
                 signal_file: false,
                 publish_iocp: false,
                 event_obj_idx: u64::MAX,
+                transfer_event: None,
                 reply_cap: 0,
                 reply_required: false,
                 native_call_transport: self.current_native_call_transport,
@@ -26810,7 +26685,7 @@ impl ExecNtHandler {
         let nt_io_manager::PendingFileIoOperation::Create(create) = pending.operation else {
             return;
         };
-        if pending.delivery_state & nt_io_manager::IO_DELIVERY_HANDLE_PUBLISHED != 0 {
+        if create.output.table_handle_committed() {
             return;
         }
         self.release_hosted_create_reservation(
@@ -27131,6 +27006,7 @@ impl ExecNtHandler {
                     signal_file: synchronous_file,
                     publish_iocp: false,
                     event_obj_idx: u64::MAX,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -27257,6 +27133,7 @@ impl ExecNtHandler {
                     signal_file: synchronous_file,
                     publish_iocp: false,
                     event_obj_idx: u64::MAX,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -27343,6 +27220,7 @@ impl ExecNtHandler {
                     signal_file: synchronous_file,
                     publish_iocp: false,
                     event_obj_idx: u64::MAX,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -27443,6 +27321,7 @@ impl ExecNtHandler {
                     signal_file: synchronous_file,
                     publish_iocp: false,
                     event_obj_idx: u64::MAX,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -27593,6 +27472,7 @@ impl ExecNtHandler {
                     signal_file: synchronous_file,
                     publish_iocp: false,
                     event_obj_idx: u64::MAX,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -27693,6 +27573,7 @@ impl ExecNtHandler {
                     signal_file: synchronous_file,
                     publish_iocp: false,
                     event_obj_idx: u64::MAX,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -28267,151 +28148,11 @@ impl ExecNtHandler {
         handle: u64,
         granted_access: u32,
     ) -> Result<bool, u32> {
-        const STATUS_USER_APC: u32 = 0x0000_00C0;
-        let wait_route = nt_io_manager::FileIoWaitRoute::Hosted {
+        self.prepare_owned_file_io(nt_io_manager::FileIoWaitRoute::Hosted {
             file_id: route.file_id,
             device_id: route.device_id,
             fs_context: route.fs_context,
-        };
-        let live_mode = self.file_completion.io_mode(route.file_id)?;
-        let retry = self.synchronous_file_retry_for(handle);
-        if self.active_synchronous_file_retry.is_some() && retry.is_none() {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let mode = if let Some(retry) = retry {
-            if retry.route != wait_route
-                || retry.mode.is_synchronous() != live_mode.is_synchronous()
-            {
-                return Err(STATUS_INVALID_PARAMETER);
-            }
-            retry.mode
-        } else {
-            live_mode
-        };
-        if mode == nt_io_completion::FileIoMode::Asynchronous {
-            self.file_completion.retain_file(route.file_id)?;
-            return Ok(true);
-        }
-
-        assert!(self.current_synchronous_file.is_none(),
-            "one syscall acquired more than one synchronous File");
-        let admission = crate::service_sec_image::inline_file_retirement::reserve(
-            nt_io_manager::FileIoBusyOwner {
-                key: nt_io_manager::FileIoWaitKey::Hosted(route.file_id),
-                tid: self.current_tid,
-                mode,
-            },
-        )?;
-
-        if retry.is_some() {
-            let mut ingress = self.active_synchronous_file_retry.take()
-                .expect("promoted File acquisition lost its ingress claim");
-            let identity = ingress.identity();
-            let mut attempt = match (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                .begin_adoption(&mut ingress)
-            {
-                Ok(attempt) => attempt,
-                Err(error) => {
-                    let status = if error == nt_io_manager::SynchronousFileIngressError::Exhausted {
-                        STATUS_INSUFFICIENT_RESOURCES
-                    } else {
-                        nt_fs::STATUS_CANCELLED
-                    };
-                    let identity = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                        .reject_ingress(&mut ingress, status)
-                        .expect("unstarted File adoption lost its claim");
-                    crate::service_sec_image::synchronous_file_cancellation::drive(self, identity);
-                    return Err(status);
-                }
-            };
-            let result = self.file_completion.adopt_io_grant(route.file_id, self.current_tid);
-            let adopted = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                .record_adoption(&mut attempt, result)
-                .expect("File adoption receipt lost its entered owner");
-            if let Some(owner) = adopted {
-                // The policy transition and transfer are memory-only. No callback can request
-                // cancellation between grant adoption and publication of current-syscall Busy.
-                assert!(!owner.cancellation_requested());
-                self.current_synchronous_file = Some(admission.activate());
-                return Ok(true);
-            }
-            crate::service_sec_image::synchronous_file_cancellation::drive(self, identity);
-            return Err(result.expect_err("rejected File adoption reported success"));
-        }
-
-        let reservation = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-            .reserve().ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
-            assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                .cancel_reservation(reservation));
-            return Err(STATUS_INSUFFICIENT_RESOURCES);
-        }
-        let mut waiter = nt_io_manager::SynchronousFileWaiter::waiting(
-            wait_route, handle as u32, granted_access, self.current_service_number,
-            self.pi as u32, self.current_tid, self.current_badge, mode,
-            self.current_native_call_transport, 0, self.current_resume_ip,
-            self.current_sp, self.current_flags,
-        );
-        // Capture before counting contention: copyin can re-enter the executive. A bad retry
-        // frame matters only if this acquisition actually needs to park.
-        let retry_ip = if waiter.native_call_transport {
-            Ok(0)
-        } else if let Some(ip) = waiter.resume_ip.checked_sub(2) {
-            let mut syscall = [0u8; 2];
-            if self.xas_read(ip, &mut syscall) && syscall == [0x0f, 0x05] {
-                Ok(ip)
-            } else {
-                Err(STATUS_ACCESS_VIOLATION)
-            }
-        } else {
-            Err(STATUS_ACCESS_VIOLATION)
-        };
-        if self.file_completion.is_synchronous(route.file_id) != Ok(mode.is_synchronous()) {
-            assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                .cancel_reservation(reservation));
-            return Err(STATUS_INVALID_HANDLE);
-        }
-        match self.file_completion.acquire_file_io_with_mode(route.file_id, waiter.tid, mode) {
-            Ok(nt_io_completion::FileIoAcquireResult::Acquired) => {
-                assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                    .cancel_reservation(reservation));
-                self.current_synchronous_file = Some(admission.activate());
-                Ok(true)
-            }
-            Ok(nt_io_completion::FileIoAcquireResult::Contended { alertable }) => {
-                let apc_queued = alertable && self.pm.peek_user_apc(waiter.tid as u32).is_some();
-                if apc_queued || retry_ip.is_err() {
-                    if !crate::service_sec_image::synchronous_file_cancellation::cancel_unpublished(
-                        self, reservation, waiter,
-                    ) {
-                        return Err(STATUS_UNSUCCESSFUL);
-                    }
-                    if !apc_queued {
-                        return Err(retry_ip.expect_err("File rollback lost its retry-frame refusal"));
-                    }
-                    // No counted File acquisition remains when APC staging takes ownership of
-                    // the current syscall's still-untransferred reply.
-                    return match self.try_deliver_current_user_apc(STATUS_USER_APC) {
-                        Ok(true) => Err(STATUS_USER_APC),
-                        Ok(false) => Err(STATUS_UNSUCCESSFUL),
-                        Err(status) => Err(status),
-                    };
-                }
-                waiter.retry_ip = retry_ip.expect("parked File lost its captured retry frame");
-                assert!(self.pending_synchronous_file_wait.is_none());
-                self.pending_synchronous_file_wait = Some((waiter, reservation));
-                Ok(false)
-            }
-            Ok(nt_io_completion::FileIoAcquireResult::Bypassed) => {
-                unreachable!("synchronous File admission bypassed its captured mode")
-            }
-            Err(status) => {
-                // Atomic admission rejected before retaining a reference or counting a waiter.
-                assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                    .cancel_reservation(reservation));
-                Err(status)
-            }
-        }
+        }, handle, granted_access)
     }
 
     /// Reference an optional file-I/O event with EVENT_MODIFY_STATE and clear it before the IRP is
@@ -29845,17 +29586,13 @@ impl ExecNtHandler {
                     return false;
                 };
                 let procs = &*ctx.procs;
-                let filled = &*ctx.pfilled;
                 pi < MAX_PI
                     && self.capture_process_identity(pi).is_some_and(|process| client_copyin_process_mapped_for(
                         pi as u64,
                         process,
                         va,
                         dst,
-                        &filled[pi],
-                        procs[pi].faults as usize,
                         procs[pi].scratch_base,
-                        false,
                     ))
             }
         }
@@ -31537,6 +31274,22 @@ impl ExecNtHandler {
         status
     }
 
+    unsafe fn publish_file_create_result(
+        &mut self,
+        file_handle_out: u64,
+        iosb: u64,
+        handle: u64,
+        status: u32,
+        information: u64,
+    ) -> Result<(), u32> {
+        // IopCreateFile leaves the committed handle in the table on a late output fault.
+        nt_address_space::native_output::publish_file_create_result_checked(
+            file_handle_out, iosb, handle, status, information,
+            |address, bytes| self.process_memory_write_checked(self.pi, address, bytes),
+        )
+            .map_err(nt_address_space::copy::MemoryCopyFailure::status)
+    }
+
     #[inline(never)]
     unsafe fn nt_open_file_service(&mut self, args: &[u64]) -> u32 {
         let ctx = self.loop_ctx.unwrap();
@@ -31554,6 +31307,16 @@ impl ExecNtHandler {
             open_options,
         ) {
             return status;
+        }
+        match self.current_user_memory {
+            SyscallUserMemory::CurrentProcess => {
+                if let Err(status) = self.probe_copy_output(self.pi, file_handle_out, 8) {
+                    return status;
+                }
+                if let Err(status) = self.probe_file_io_output(args[3], None) {
+                    return status;
+                }
+            }
         }
         let captured = match self.capture_file_object_attributes(args[2]) {
             Ok(captured) => captured,
@@ -31642,14 +31405,12 @@ impl ExecNtHandler {
                 let Some(publication) = publication else {
                     return STATUS_PENDING;
                 };
-                if publication.handle != 0 {
-                    self.queue_write(file_handle_out, publication.handle);
-                    self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
-                } else {
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
+                self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
+                if let Err(status) = self.publish_file_create_result(
+                    file_handle_out, args[3], publication.handle, publication.status, publication.information,
+                ) {
+                    return status;
                 }
-                self.xas_write_buf(args[3], &publication.status.to_le_bytes());
-                self.xas_write_buf(args[3] + 8, &publication.information.to_le_bytes());
                 trace_pipe_open(
                     b"NtOpenFile(relative)",
                     self.pi,
@@ -31677,17 +31438,15 @@ impl ExecNtHandler {
             let registry_slot = (status == nt_fs::STATUS_SUCCESS && handle != 0)
                 .then(|| reg.resolve_name(&nb[..nlen]))
                 .flatten();
+            if let Err(status) = self.publish_file_create_result(
+                file_handle_out, args[3], handle, status, information,
+            ) {
+                return status;
+            }
             if handle != 0 {
-                self.queue_write(file_handle_out, handle);
                 if let Some(index) = registry_slot {
                     reg.set_file_handle(self.pi, index, handle);
                 }
-            } else {
-                self.write_nt_open_file_handle_out(file_handle_out, 0);
-            }
-            if args[3] != 0 {
-                self.xas_write_buf(args[3], &status.to_le_bytes());
-                self.xas_write_buf(args[3] + 8, &information.to_le_bytes());
             }
             loader_trace_record(
                 self.pi,
@@ -31753,14 +31512,12 @@ impl ExecNtHandler {
                 let Some(publication) = publication else {
                     return STATUS_PENDING;
                 };
-                if publication.handle != 0 {
-                    self.queue_write(file_handle_out, publication.handle);
-                    self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
-                } else {
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
+                self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
+                if let Err(status) = self.publish_file_create_result(
+                    file_handle_out, args[3], publication.handle, publication.status, publication.information,
+                ) {
+                    return status;
                 }
-                self.xas_write_buf(args[3], &publication.status.to_le_bytes());
-                self.xas_write_buf(args[3] + 8, &publication.information.to_le_bytes());
                 trace_pipe_open(
                     b"NtOpenFile",
                     self.pi,
@@ -31828,11 +31585,10 @@ impl ExecNtHandler {
                         nt_fs::FILE_OPEN,
                         open_options,
                     );
-                    self.write_nt_open_file_handle_out(file_handle_out, opened_handle);
-                    let iosb = args[3];
-                    if iosb != 0 {
-                        self.xas_write_buf(iosb, &open_status.to_le_bytes());
-                        self.xas_write_buf(iosb + 8, &open_information.to_le_bytes());
+                    if let Err(status) = self.publish_file_create_result(
+                        file_handle_out, args[3], opened_handle, open_status, open_information,
+                    ) {
+                        return status;
                     }
                     loader_trace_record(
                         self.pi,
@@ -31853,23 +31609,14 @@ impl ExecNtHandler {
                     match self.mint_overlay_file_handle(file_id, desired_access) {
                         Some(handle) => {
                             opened_handle = handle;
-                            self.queue_write(file_handle_out, handle);
                         }
                         None => status = 0xC000_009A,
                     }
                 }
-                if opened_handle == 0 {
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
-                }
-                let iosb = args[3];
-                if iosb != 0 {
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    let info = if status == nt_fs::STATUS_SUCCESS {
-                        information
-                    } else {
-                        0
-                    };
-                    self.xas_write_buf(iosb + 8, &info.to_le_bytes());
+                if let Err(status) = self.publish_file_create_result(
+                    file_handle_out, args[3], opened_handle, status, information,
+                ) {
+                    return status;
                 }
                 loader_trace_record(
                     self.pi,
@@ -31890,11 +31637,6 @@ impl ExecNtHandler {
             let overlay_hit = match crate::writable_fs::query_metadata_relative_if_mounted(relative) {
                 Ok(info) => info.is_some(),
                 Err(status) => {
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
-                    if args[3] != 0 {
-                        self.xas_write_buf(args[3], &status.to_le_bytes());
-                        self.xas_write_buf(args[3] + 8, &0u64.to_le_bytes());
-                    }
                     return status;
                 }
             };
@@ -31913,23 +31655,14 @@ impl ExecNtHandler {
                     match self.mint_overlay_file_handle(file_id, desired_access) {
                         Some(handle) => {
                             opened_handle = handle;
-                            self.queue_write(file_handle_out, handle);
                         }
                         None => status = 0xC000_009A,
                     }
                 }
-                if opened_handle == 0 {
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
-                }
-                let iosb = args[3];
-                if iosb != 0 {
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    let info = if status == nt_fs::STATUS_SUCCESS {
-                        information
-                    } else {
-                        0
-                    };
-                    self.xas_write_buf(iosb + 8, &info.to_le_bytes());
+                if let Err(status) = self.publish_file_create_result(
+                    file_handle_out, args[3], opened_handle, status, information,
+                ) {
+                    return status;
                 }
                 loader_trace_record(
                     self.pi,
@@ -31960,11 +31693,10 @@ impl ExecNtHandler {
                     nt_fs::FILE_OPEN,
                     open_options,
                 );
-                self.write_nt_open_file_handle_out(file_handle_out, opened_handle);
-                let iosb = args[3];
-                if iosb != 0 {
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &information.to_le_bytes());
+                if let Err(status) = self.publish_file_create_result(
+                    file_handle_out, args[3], opened_handle, status, information,
+                ) {
+                    return status;
                 }
                 loader_trace_record(
                     self.pi,
@@ -32112,7 +31844,11 @@ impl ExecNtHandler {
         let loader_file = (hosted_exe_leaf.is_some() || dll_i.is_some())
             .then_some(volume_file)
             .flatten();
+        let loader_caller_pid = self.pm_pid_for_pi(self.pi);
         let loader_open = if let (Some(file), Some(path)) = (loader_file, volume_path) {
+            if loader_caller_pid.is_none() {
+                return STATUS_INVALID_HANDLE;
+            }
             Some(self.mint_disk_file_handle(file, path, desired_access, share_access, open_options))
         } else {
             None
@@ -32121,12 +31857,6 @@ impl ExecNtHandler {
             let h = match loader_open {
                 Ok(handle) => handle,
                 Err(status) => {
-                    let iosb = args[3];
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
-                    if iosb != 0 {
-                        smss_stack_write32(iosb, status);
-                        smss_stack_write(iosb + 8, 0);
-                    }
                     loader_trace_record(
                         self.pi,
                         LoaderOp::OpenFile,
@@ -32143,6 +31873,13 @@ impl ExecNtHandler {
             if let Some(image) = hosted_exe_image {
                 if let Err(error) = record_hosted_child_exe_open(ctx, self.pi, image, h) {
                     let status = hosted_exe_open_status(error);
+                    match self.close_process_handle_checked(
+                        loader_caller_pid.expect("loader handle has its captured canonical caller"),
+                        h,
+                    ) {
+                        Ok(closed) => assert!(closed, "unpublished loader handle lost its owner"),
+                        Err(status) => return status,
+                    }
                     if HOSTED_EXE_OPEN_FAILURE_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
                         print_str(b"[hosted-exe] open record failed pi=");
                         print_u64(self.pi as u64);
@@ -32151,12 +31888,6 @@ impl ExecNtHandler {
                         print_str(b" status=0x");
                         print_hex(status);
                         print_str(b"\n");
-                    }
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
-                    let iosb = args[3];
-                    if iosb != 0 {
-                        smss_stack_write32(iosb, status);
-                        smss_stack_write(iosb + 8, 0);
                     }
                     loader_trace_record(
                         self.pi,
@@ -32170,14 +31901,11 @@ impl ExecNtHandler {
                     return status;
                 }
             }
-            smss_stack_write(file_handle_out, h);
+            if let Err(status) = self.publish_file_create_result(file_handle_out, args[3], h, 0, 1) {
+                return status;
+            }
             if let Some(i) = dll_i {
                 reg.set_file_handle(self.pi, i, h);
-            }
-            let iosb = args[3];
-            if iosb != 0 {
-                smss_stack_write32(iosb, 0);
-                smss_stack_write(iosb + 8, 1);
             }
             0
         } else if let (Some(file), Some(path)) = (
@@ -32188,28 +31916,17 @@ impl ExecNtHandler {
             let opened =
                 self.mint_disk_file_handle(file, path, desired_access, share_access, open_options);
             let opened_handle = match opened {
-                Ok(handle) => {
-                    self.queue_write(file_handle_out, handle);
-                    handle
-                }
+                Ok(handle) => handle,
                 Err(open_status) => {
                     status = open_status;
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
                     0
                 }
             };
-            let iosb = args[3];
-            if iosb != 0 {
-                self.xas_write_buf(iosb, &status.to_le_bytes());
-                self.xas_write_buf(
-                    iosb + 8,
-                    &(if status == nt_fs::STATUS_SUCCESS {
-                        1u64
-                    } else {
-                        0
-                    })
-                    .to_le_bytes(),
-                );
+            if let Err(status) = self.publish_file_create_result(
+                file_handle_out, args[3], opened_handle, status,
+                u64::from(status == nt_fs::STATUS_SUCCESS),
+            ) {
+                return status;
             }
             loader_trace_record(
                 self.pi,
@@ -32242,14 +31959,11 @@ impl ExecNtHandler {
             opened_handle,
             &nb[..nlen],
         );
-        if status != 0 {
-            self.write_nt_open_file_handle_out(file_handle_out, 0);
-        }
         status
     }
 
     #[inline(never)]
-    unsafe fn nt_create_process_service(&mut self, args: &[u64]) -> u32 {
+    unsafe fn nt_create_process_service(&mut self, args: &[u64], previous_mode: nt_syscall::ProcessorMode) -> u32 {
         let legacy = self.current_service_number == SSN_NT_CREATE_PROCESS as u32;
         let create = match nt_process::decode_process_create_input(args, !legacy) {
             Ok(create) => create,
@@ -32279,6 +31993,14 @@ impl ExecNtHandler {
             || create.exception_port != 0
         {
             return STATUS_NOT_SUPPORTED;
+        }
+        match self.reserve_native_image_process(parent, create, nt_ulong_arg(args[1]), args[0], previous_mode) {
+            Ok(Some(request)) => {
+                self.exe_spawn_request = Some(request);
+                return 0;
+            }
+            Ok(None) => {}
+            Err(status) => return status,
         }
         let ctx = self.loop_ctx.unwrap();
         let sect = create.section_handle;
@@ -33211,6 +32933,7 @@ impl ExecNtHandler {
                         args[3],
                         output_length,
                         args[5],
+                        None,
                     );
                     trace_winlogon_post_lsa_registry(
                         self,
@@ -33259,6 +32982,7 @@ impl ExecNtHandler {
                     args[3],
                     output_length,
                     args[5],
+                    None,
                 );
                 trace_winlogon_post_lsa_registry(
                     self,
@@ -33277,11 +33001,15 @@ impl ExecNtHandler {
             // key's owning authority: CM for leased SYSTEM identities, otherwise the executive's
             // mounted/overlay namespaces.
             NativeService::NtQueryKey => unsafe {
+                let query_arguments = [args[0], args[1], args[2], args[3], args[4]];
                 let info_class = nt_ulong_arg(args[1]);
                 let required_access = if info_class == 3 { 0 } else { 0x1 };
                 let key = match self.resolve_registry_key(args[0], required_access) {
                     Ok(key) => key,
-                    Err(status) => return status,
+                    Err(status) => {
+                        crate::registry_query_diagnostics::reject(self, b"key-owner", &query_arguments, status, None);
+                        return status;
+                    }
                 };
                 let _transient = allocator::enter_transient();
                 let output_length = nt_ulong_arg(args[3]) as usize;
@@ -33292,7 +33020,10 @@ impl ExecNtHandler {
                                 lease,
                             ) {
                                 Ok(information) => Some(information),
-                                Err(status) => return status as u32,
+                                Err(status) => {
+                                    crate::registry_query_diagnostics::reject(self, b"leased-information", &query_arguments, status as u32, None);
+                                    return status as u32;
+                                }
                             }
                         }
                         None => None,
@@ -33301,7 +33032,10 @@ impl ExecNtHandler {
                     Some(information) => RegistryKeyStats::from_leased_key(information),
                     None => match self.registry_key_stats(key) {
                         Ok(stats) => stats,
-                        Err(status) => return status,
+                        Err(status) => {
+                            crate::registry_query_diagnostics::reject(self, b"key-stats", &query_arguments, status, None);
+                            return status;
+                        }
                     },
                 };
                 let full_path = leased_information.as_ref().map_or_else(
@@ -33312,7 +33046,10 @@ impl ExecNtHandler {
                     Some(information) => information.class_name.clone(),
                     None => match self.registry_key_class(key) {
                         Ok(class_name) => class_name,
-                        Err(status) => return status,
+                        Err(status) => {
+                            crate::registry_query_diagnostics::reject(self, b"key-class", &query_arguments, status, None);
+                            return status;
+                        }
                     },
                 };
                 let (info, minimum_length) = match build_registry_key_query_info(
@@ -33322,7 +33059,10 @@ impl ExecNtHandler {
                     class_name.as_deref(),
                 ) {
                     Ok(info) => info,
-                    Err(status) => return status,
+                    Err(status) => {
+                        crate::registry_query_diagnostics::reject(self, b"information-class", &query_arguments, status, None);
+                        return status;
+                    }
                 };
                 if Self::is_dynamic_user_volatile_env_canon(&full_path) {
                     USER_VOLATILE_ENV_QUERIED.fetch_add(1, Ordering::Relaxed);
@@ -33335,6 +33075,7 @@ impl ExecNtHandler {
                     args[2],
                     output_length,
                     args[4],
+                    Some(&query_arguments),
                 )
             },
             // NtCreateNamedPipeFile(FileHandle[R10], DesiredAccess[RDX], ObjectAttributes[R8],
@@ -33658,6 +33399,7 @@ impl ExecNtHandler {
                             signal_file: generic_synchronous_file || event_obj_idx == u64::MAX,
                             publish_iocp: args[2] == 0,
                             event_obj_idx,
+                            transfer_event: None,
                             reply_cap: 0,
                             reply_required: false,
                             native_call_transport: self.current_native_call_transport,
@@ -33759,13 +33501,7 @@ impl ExecNtHandler {
                 {
                     return 0xC000_0005;
                 }
-                // Hosted GUI/service processes commonly pass value names from DLL `.rdata` literals the
-                // stack/heap mirror can't reach, so read them from the backing PE (`read_ustr_pe`).
-                // read_ustr_pe uses xas_read → resolves any resident/PE page.
                 let key_path = self.registry_target_path(key);
-                let key_is_ifeo = key_path
-                    .as_deref()
-                    .is_some_and(|path| path.contains(r"\image file execution options\"));
                 let shell_com_inproc_bit = if self.current_process_is_interactive_shell() {
                     key_path
                         .as_deref()
@@ -33773,14 +33509,10 @@ impl ExecNtHandler {
                 } else {
                     0
                 };
-                let pe_backed_registry_strings =
-                    self.current_process_uses_pe_backed_registry_strings();
-                let name16 =
-                    if pe_backed_registry_strings || key_is_ifeo || shell_com_inproc_bit != 0 {
-                        self.read_ustr_pe(args[1])
-                    } else {
-                        smss_read_ustr(args[1])
-                    };
+                let name16 = match self.capture_registry_value_name(args[1]) {
+                    Ok(name) => name,
+                    Err(status) => return status,
+                };
                 let mut name_lc = alloc::string::String::new();
                 for &w in &name16 {
                     if let Some(c) = char::from_u32(w as u32) {
@@ -34982,9 +34714,8 @@ impl ExecNtHandler {
                 // LSASS connects during LsapRmInitializeServer; the executive owns the SRM side, drains
                 // the broker's connection request, accepts it, and completes it through the same LPC
                 // state machine as the user-mode SM/CSR/LSA rendezvous paths.
-                if self.current_process_is_lsass()
-                    && Self::lpc_name_equals_ascii(&name16, b"\\sermcommandport")
-                {
+                let srm_listen_handle = SRM_COMMAND_PORT_OBJECT_HANDLE.load(Ordering::Acquire);
+                if srm_listen_handle != 0 && listen_handle == srm_listen_handle {
                     if connector_view.is_some() || connector_remote_view.is_some() {
                         return STATUS_INVALID_PARAMETER;
                     }
@@ -38421,8 +38152,10 @@ impl ExecNtHandler {
                 if iosb & 7 != 0 || output & 3 != 0 {
                     return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
                 }
-                if !self.probe_user_output(iosb, 16) || !self.probe_user_output(output, length) {
-                    return nt_syscall::STATUS_ACCESS_VIOLATION;
+                if let Err(status) =
+                    self.probe_file_io_output(iosb, Some((output, length as u64)))
+                {
+                    return status;
                 }
                 let capture = match self.capture_hosted_file_unless_local_with_access(
                     args[0],
@@ -39576,570 +39309,7 @@ impl ExecNtHandler {
             // CreateOptions=args[8], EaBuffer=args[9], EaLength=args[10].
             // Route named-pipe client opens through the isolated npfs FSD for every hosted process.
             // Other file namespaces remain unsupported rather than receiving a fake handle.
-            NativeService::NtCreateFile => unsafe {
-                let file_handle_out = args[0];
-                let desired_access = nt_ulong_arg(args[1]);
-                let captured = match self.capture_file_object_attributes(args[2]) {
-                    Ok(captured) => captured,
-                    Err(status) => return status,
-                };
-                let parse_root = match self.resolve_file_parse_root(&captured) {
-                    Ok(root) => root,
-                    Err(status) => return status,
-                };
-                let mut namespace_path = [0u8; NAMED_OBJECT_PATH_CAP];
-                let mut absolute_name = [0u16; FILE_OBJECT_NAME_CAP];
-                let (parse_root, name16) = match self.normalize_object_directory_file_name(
-                    parse_root,
-                    captured.name(),
-                    &mut namespace_path,
-                    &mut absolute_name,
-                ) {
-                    Ok(resolved) => resolved,
-                    Err(status) => return status,
-                };
-                let iosb = args[3];
-                if file_handle_out == 0
-                    || iosb == 0
-                    || !self.probe_user_output(file_handle_out, 8)
-                    || !self.probe_user_output(iosb, 16)
-                {
-                    return STATUS_ACCESS_VIOLATION;
-                }
-                if args[4] != 0 {
-                    let mut allocation_size = [0u8; 8];
-                    if !self.xas_read(args[4], &mut allocation_size) {
-                        return STATUS_ACCESS_VIOLATION;
-                    }
-                    if i64::from_le_bytes(allocation_size) < 0 {
-                        return STATUS_INVALID_PARAMETER;
-                    }
-                }
-                let file_attributes = nt_ulong_arg(args[5]);
-                let share_access = nt_ulong_arg(args[6]);
-                let create_disposition = nt_ulong_arg(args[7]);
-                let create_options = nt_ulong_arg(args[8]);
-                if let Err(status) = nt_fs::validate_file_create_parameters(
-                    desired_access,
-                    file_attributes,
-                    share_access,
-                    create_disposition,
-                    create_options,
-                ) {
-                    return status;
-                }
-                let ea_length = nt_ulong_arg(args[10]) as usize;
-                let ea = if args[9] != 0 && ea_length != 0 {
-                    let mut bytes = match try_zeroed_transfer_buffer(ea_length) {
-                        Ok(bytes) => bytes,
-                        Err(status) => return status,
-                    };
-                    if !self.xas_read(args[9], &mut bytes) {
-                        return STATUS_ACCESS_VIOLATION;
-                    }
-                    if let Err(error) = nt_io_manager::validate_ea_buffer(&bytes) {
-                        const STATUS_EA_LIST_INCONSISTENT: u32 = 0x8000_0014;
-                        self.xas_write_buf(iosb, &STATUS_EA_LIST_INCONSISTENT.to_le_bytes());
-                        self.xas_write_buf(iosb + 8, &(error.offset as u64).to_le_bytes());
-                        return STATUS_EA_LIST_INCONSISTENT;
-                    }
-                    bytes
-                } else {
-                    alloc::vec::Vec::new()
-                };
-                if !NT_CREATE_FILE_FRONTIER_TRACED.swap(true, Ordering::Relaxed) {
-                    print_str(b"[nt-create-file-frontier] pi=");
-                    print_u64(self.pi as u64);
-                    print_str(b" access=0x");
-                    print_hex(desired_access);
-                    print_str(b" attrs=0x");
-                    print_hex(file_attributes);
-                    print_str(b" share=0x");
-                    print_hex(share_access);
-                    print_str(b" disposition=0x");
-                    print_hex(create_disposition);
-                    print_str(b" options=0x");
-                    print_hex(create_options);
-                    print_str(b" name=\"");
-                    for &unit in name16.iter().take(160) {
-                        debug_put_char(if (0x20..0x7f).contains(&unit) {
-                            unit as u8
-                        } else {
-                            b'?'
-                        });
-                    }
-                    print_str(b"\"\n");
-                }
-                if !matches!(parse_root, FileParseRoot::Absolute) {
-                    if let FileParseRoot::HostedFile { file_id, device_id } = parse_root {
-                        if name16.first() == Some(&(b'\\' as u16)) {
-                            return STATUS_OBJECT_NAME_INVALID;
-                        }
-                        if driver_launch::require_registered_kernel_filesystem_device(device_id)
-                            .is_ok()
-                        {
-                            return self.create_registered_kernel_file(
-                                parse_root,
-                                name16,
-                                captured.attributes,
-                                desired_access,
-                                share_access,
-                                create_disposition,
-                                file_attributes,
-                                create_options,
-                                &ea,
-                                file_handle_out,
-                                iosb,
-                            );
-                        }
-                        if driver_launch::device_id_by_name("\\Device\\NamedPipe")
-                            != Some(device_id)
-                        {
-                            return STATUS_INVALID_DEVICE_REQUEST;
-                        }
-                        if create_disposition != nt_fs::FILE_OPEN {
-                            return STATUS_INVALID_PARAMETER;
-                        }
-                        if create_options & nt_fs::FILE_DIRECTORY_FILE != 0 {
-                            return nt_fs::STATUS_OBJECT_NAME_COLLISION;
-                        }
-                        let provider_context = nt_io_manager::pipe_name_hash(name16);
-                        let dispatch = self.npfs_create_file(
-                            major::IRP_MJ_CREATE,
-                            name16,
-                            Some(file_id),
-                            captured.attributes,
-                            provider_context,
-                            desired_access,
-                            share_access,
-                            create_disposition,
-                            file_attributes,
-                            create_options,
-                            &ea,
-                            file_handle_out,
-                            iosb,
-                        );
-                        let publication = match dispatch {
-                            Ok(dispatch) => self.finish_registered_create_dispatch(
-                                dispatch,
-                                major::IRP_MJ_CREATE,
-                                desired_access,
-                                provider_context,
-                            ),
-                            Err(status) => Some(HostedCreatePublication {
-                                status,
-                                information: 0,
-                                handle: 0,
-                                wake_server_fid: 0,
-                            }),
-                        };
-                        let Some(publication) = publication else {
-                            return STATUS_PENDING;
-                        };
-                        if publication.handle != 0 {
-                            self.queue_write(file_handle_out, publication.handle);
-                            self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
-                        } else {
-                            self.queue_write(file_handle_out, 0);
-                        }
-                        self.xas_write_buf(iosb, &publication.status.to_le_bytes());
-                        self.xas_write_buf(iosb + 8, &publication.information.to_le_bytes());
-                        return publication.status;
-                    }
-                    let (status, information, handle) = self.create_local_file_relative(
-                        parse_root,
-                        name16,
-                        desired_access,
-                        file_attributes,
-                        share_access,
-                        create_disposition,
-                        create_options,
-                    );
-                    self.queue_write(file_handle_out, handle);
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &information.to_le_bytes());
-                    return status;
-                }
-                if create_options & nt_fs::FILE_DIRECTORY_FILE != 0
-                    && !Self::is_named_pipe_root_path(name16)
-                    && !nt_fs::is_named_pipe_path(name16)
-                {
-                    return self.create_registered_kernel_file(
-                        parse_root,
-                        name16,
-                        captured.attributes,
-                        desired_access,
-                        share_access,
-                        create_disposition,
-                        file_attributes,
-                        create_options,
-                        &ea,
-                        file_handle_out,
-                        iosb,
-                    );
-                }
-                let mut status;
-                let mut info = 0u64;
-                let mut pending_pipe_create = false;
-                let mut volume_folded = [0u8; FILE_OBJECT_NAME_CAP];
-                let mut volume_relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
-                let volume_relative_len = crate::writable_fs::volume_path_into(
-                    name16,
-                    &mut volume_folded,
-                    &mut volume_relative,
-                );
-                let mut writable_folded = [0u8; FILE_OBJECT_NAME_CAP];
-                let mut writable_relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
-                let writable_relative_len = crate::writable_fs::writable_path_into(
-                    name16,
-                    &mut writable_folded,
-                    &mut writable_relative,
-                );
-                if let Some(length) = writable_relative_len {
-                    if let Err(status) = crate::writable_fs::query_metadata_relative(
-                        &writable_relative[..length],
-                    ) {
-                        self.queue_write(file_handle_out, 0);
-                        self.xas_write_buf(iosb, &status.to_le_bytes());
-                        self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
-                        return status;
-                    }
-                }
-                let volume_overlay_hit = match volume_relative_len {
-                    Some(length) => match crate::writable_fs::query_metadata_relative_if_mounted(
-                        &volume_relative[..length],
-                    ) {
-                        Ok(info) => info.is_some(),
-                        Err(status) => {
-                            self.queue_write(file_handle_out, 0);
-                            self.xas_write_buf(iosb, &status.to_le_bytes());
-                            self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
-                            return status;
-                        }
-                    },
-                    None => false,
-                };
-                if Self::is_named_pipe_root_path(name16) {
-                    if create_disposition != nt_fs::FILE_OPEN {
-                        status = nt_fs::STATUS_INVALID_PARAMETER;
-                    } else {
-                        let root_name = [b'\\' as u16];
-                        let dispatch = self.npfs_create_file(
-                            major::IRP_MJ_CREATE,
-                            &root_name,
-                            None,
-                            captured.attributes,
-                            0,
-                            desired_access,
-                            share_access,
-                            create_disposition,
-                            file_attributes,
-                            create_options,
-                            &ea,
-                            file_handle_out,
-                            iosb,
-                        );
-                        let publication = match dispatch {
-                            Ok(dispatch) => self.finish_registered_create_dispatch(
-                                dispatch,
-                                major::IRP_MJ_CREATE,
-                                desired_access,
-                                0,
-                            ),
-                            Err(route_status) => Some(HostedCreatePublication {
-                                status: route_status,
-                                information: 0,
-                                handle: 0,
-                                wake_server_fid: 0,
-                            }),
-                        };
-                        if let Some(publication) = publication {
-                            status = publication.status;
-                            info = publication.information;
-                            if publication.handle != 0 {
-                                self.queue_write(file_handle_out, publication.handle);
-                            }
-                        } else {
-                            status = STATUS_PENDING;
-                            pending_pipe_create = true;
-                        }
-                    }
-                } else if nt_fs::is_named_pipe_path(name16) {
-                    if create_disposition != nt_fs::FILE_OPEN {
-                        status = nt_fs::STATUS_INVALID_PARAMETER;
-                    } else if create_options & nt_fs::FILE_DIRECTORY_FILE != 0 {
-                        status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
-                    } else {
-                        let mut leaf_buf = [0u16; FILE_OBJECT_NAME_CAP + 1];
-                        let Some(leaf_len) = Self::pipe_leaf16_into(name16, &mut leaf_buf) else {
-                            return STATUS_OBJECT_NAME_INVALID;
-                        };
-                        let leaf = &leaf_buf[..leaf_len];
-                        let pipe_hash = nt_io_manager::pipe_name_hash(leaf);
-                        let dispatch = self.npfs_create_file(
-                            major::IRP_MJ_CREATE,
-                            leaf,
-                            None,
-                            captured.attributes,
-                            pipe_hash,
-                            desired_access,
-                            share_access,
-                            create_disposition,
-                            file_attributes,
-                            create_options,
-                            &ea,
-                            file_handle_out,
-                            iosb,
-                        );
-                        let publication = match dispatch {
-                            Ok(dispatch) => self.finish_registered_create_dispatch(
-                                dispatch,
-                                major::IRP_MJ_CREATE,
-                                desired_access,
-                                pipe_hash,
-                            ),
-                            Err(route_status) => Some(HostedCreatePublication {
-                                status: route_status,
-                                information: 0,
-                                handle: 0,
-                                wake_server_fid: 0,
-                            }),
-                        };
-                        if let Some(publication) = publication {
-                            status = publication.status;
-                            info = publication.information;
-                            if publication.handle != 0 {
-                                self.queue_write(file_handle_out, publication.handle);
-                                self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
-                            }
-                        } else {
-                            status = STATUS_PENDING;
-                            pending_pipe_create = true;
-                        }
-                    }
-                } else if let Some((relative, source)) = volume_relative_len
-                    .filter(|_| !volume_overlay_hit)
-                    .and_then(|length| {
-                        Self::readonly_volume_metadata(name16)
-                            .filter(|entry| !entry.metadata.is_directory)
-                            .map(|entry| (&volume_relative[..length], entry))
-                    })
-                {
-                    let (open_status, information, handle) = self.open_installed_file(
-                        source,
-                        relative,
-                        desired_access,
-                        file_attributes,
-                        share_access,
-                        create_disposition,
-                        create_options,
-                    );
-                    status = open_status;
-                    info = information;
-                    if handle != 0 {
-                        self.queue_write(file_handle_out, handle);
-                    }
-                } else if let Some(relative_len) = writable_relative_len {
-                    let relative = &writable_relative[..relative_len];
-                    // ★ THE WRITABLE FILESYSTEM OVERLAY. The path resolved into a declared writable
-                    // mount prefix (see `writable_fs::WRITABLE_PREFIXES`) — this is the boundary the
-                    // previous batch's unserved namespace miss left open, and it is where
-                    // `CreateDirectoryW("C:\Profiles")` (userenv/profile.c:929) now lands. The
-                    // disposition, `FILE_DIRECTORY_FILE`, and `FileAttributes` are passed straight
-                    // through to a REAL file system: a create that cannot be satisfied still fails
-                    // with the correct NTSTATUS, and no handle is fabricated.
-                    let (st, file_id, information) = crate::writable_fs::create(
-                        relative,
-                        desired_access,
-                        file_attributes,
-                        share_access,
-                        create_disposition,
-                        create_options,
-                    );
-                    status = st;
-                    info = information;
-                    if file_id.is_some() {
-                        self.writable_fs_dirty = true;
-                    }
-                    if create_options & nt_fs::FILE_DIRECTORY_FILE != 0 {
-                        if status == nt_fs::STATUS_SUCCESS && info == nt_fs::FILE_CREATED as u64 {
-                            crate::writable_fs::note_directory_create(self.pi, relative, true);
-                        } else if status == nt_fs::STATUS_OBJECT_NAME_COLLISION {
-                            crate::writable_fs::note_directory_create(self.pi, relative, false);
-                        }
-                    } else if status == nt_fs::STATUS_SUCCESS && info == nt_fs::FILE_CREATED as u64
-                    {
-                        crate::writable_fs::note_profile_file_create(self.pi, relative);
-                    }
-                    if let Some(file_id) = file_id {
-                        match self.mint_overlay_file_handle(file_id, desired_access) {
-                            Some(handle) => self.queue_write(file_handle_out, handle),
-                            None => {
-                                status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
-                                info = 0;
-                            }
-                        }
-                    }
-                } else if let Some(relative) = volume_relative_len
-                    .filter(|_| create_disposition != nt_fs::FILE_OPEN || volume_overlay_hit)
-                    .map(|length| &volume_relative[..length])
-                {
-                    let disposition = create_disposition;
-                    let options = create_options;
-                    if disposition == nt_fs::FILE_OPEN {
-                        let (st, file_id, information) =
-                            crate::writable_fs::open_existing_relative_if_mounted(
-                                relative,
-                                desired_access,
-                                file_attributes,
-                                share_access,
-                                options,
-                            );
-                        status = st;
-                        info = information;
-                        if let Some(file_id) = file_id {
-                            self.writable_fs_dirty = true;
-                            match self.mint_overlay_file_handle(file_id, desired_access) {
-                                Some(handle) => self.queue_write(file_handle_out, handle),
-                                None => {
-                                    status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
-                                    info = 0;
-                                }
-                            }
-                        }
-                    } else if disposition == nt_fs::FILE_CREATE
-                        && Self::readonly_volume_entry(name16).is_some()
-                    {
-                        status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
-                    } else {
-                        if let Some(parent) = Self::volume_relative_parent(relative) {
-                            if Self::readonly_volume_relative_is_dir(parent) {
-                                match crate::writable_fs::ensure_installed_directory_relative(parent)
-                                {
-                                    Ok(true) => self.writable_fs_dirty = true,
-                                    Ok(false) => {}
-                                    Err(status) => {
-                                        self.queue_write(file_handle_out, 0);
-                                        self.xas_write_buf(iosb, &status.to_le_bytes());
-                                        self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
-                                        return status;
-                                    }
-                                }
-                            }
-                        }
-                        let (st, file_id, information) = crate::writable_fs::create(
-                            relative,
-                            desired_access,
-                            file_attributes,
-                            share_access,
-                            disposition,
-                            options,
-                        );
-                        status = st;
-                        info = information;
-                        if file_id.is_some() {
-                            self.writable_fs_dirty = true;
-                        }
-                        if options & nt_fs::FILE_DIRECTORY_FILE != 0 {
-                            if status == nt_fs::STATUS_SUCCESS && info == nt_fs::FILE_CREATED as u64
-                            {
-                                crate::writable_fs::note_directory_create(self.pi, relative, true);
-                            } else if status == nt_fs::STATUS_OBJECT_NAME_COLLISION {
-                                crate::writable_fs::note_directory_create(self.pi, relative, false);
-                            }
-                        } else if status == nt_fs::STATUS_SUCCESS
-                            && info == nt_fs::FILE_CREATED as u64
-                        {
-                            crate::writable_fs::note_profile_file_create(self.pi, relative);
-                        }
-                        if let Some(file_id) = file_id {
-                            match self.mint_overlay_file_handle(file_id, desired_access) {
-                                Some(handle) => self.queue_write(file_handle_out, handle),
-                                None => {
-                                    status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
-                                    info = 0;
-                                }
-                            }
-                        }
-                    }
-                } else if create_disposition == nt_fs::FILE_OPEN {
-                    if let Some(miss_status) = Self::readonly_disk_open_miss_status(name16) {
-                        status = miss_status;
-                    } else {
-                        status = self.unserved_nt_create_file_namespace(name16);
-                    }
-                } else {
-                    status = self.unserved_nt_create_file_namespace(name16);
-                }
-                if pending_pipe_create {
-                    return STATUS_PENDING;
-                }
-                if iosb != 0 {
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &info.to_le_bytes());
-                }
-                if status != nt_fs::STATUS_SUCCESS {
-                    if self.pi >= 2 {
-                        self.queue_write(file_handle_out, 0);
-                    } else {
-                        smss_stack_write(file_handle_out, 0);
-                    }
-                }
-                if nt_fs::is_named_pipe_path(name16)
-                    && (self.pi == 2 || self.pi == 3 || self.pi == 7)
-                {
-                    let trace = PIPE_CREATE_TRACE_N.fetch_add(1, Ordering::Relaxed);
-                    if trace < 64 || status != nt_fs::STATUS_SUCCESS {
-                        print_str(b"[pipe-create] #");
-                        print_u64(trace);
-                        print_str(b" pi=");
-                        print_u64(self.pi as u64);
-                        print_str(b" badge=");
-                        print_u64(self.current_badge);
-                        print_str(b" tid=");
-                        print_u64(self.current_tid);
-                        print_str(b" access=0x");
-                        print_hex(desired_access);
-                        print_str(b" share=0x");
-                        print_hex(share_access);
-                        print_str(b" disposition=0x");
-                        print_hex(create_disposition);
-                        print_str(b" options=0x");
-                        print_hex(create_options);
-                        print_str(b" status=0x");
-                        print_hex(status);
-                        print_str(b" info=");
-                        print_u64(info);
-                        print_str(b" name=\"");
-                        for &unit in name16.iter().take(96) {
-                            debug_put_char(if (0x20..0x7f).contains(&unit) {
-                                unit as u8
-                            } else {
-                                b'?'
-                            });
-                        }
-                        print_str(b"\"\n");
-                    }
-                }
-                if self.current_process_is_winlogon()
-                    && NT_CREATE_FILE_WINLOGON_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 40
-                {
-                    print_str(b"[nt-create-file-winlogon] status=0x");
-                    print_hex(status);
-                    print_str(b" info=");
-                    print_u64(info);
-                    print_str(b" name=\"");
-                    for &unit in name16.iter().take(96) {
-                        debug_put_char(if (0x20..0x7f).contains(&unit) {
-                            unit as u8
-                        } else {
-                            b'?'
-                        });
-                    }
-                    print_str(b"\"\n");
-                }
-                status
-            },
+            NativeService::NtCreateFile => unsafe { self.nt_create_file_service(args) },
             // NtCancelIoFile(FileHandle[R10], *IoStatusBlock[RDX]). Cancel all pending I/O issued by
             // the current thread for the target FILE_OBJECT. The cancelled IRPs complete through
             // their own IOSBs/events/file objects with STATUS_CANCELLED; this syscall's IOSB reports
@@ -40168,9 +39338,6 @@ impl ExecNtHandler {
                 let apc_context = args[3];
                 let completion_port_suppressed =
                     nt_io_completion::io_event_suppresses_completion_port(event);
-                if let Err(status) = self.probe_file_io_output(iosb, None) {
-                    return status;
-                }
                 // A promoted File grant is authoritative even if the process handle was reused.
                 // Capture fresh hosted identity/access before any offset, key or payload copyin.
                 let overlay_file = if self.active_synchronous_file_retry.is_none()
@@ -40183,16 +39350,85 @@ impl ExecNtHandler {
                 let overlay_access = overlay_file.and_then(|_| self.hosted_file_access_for(fh));
                 let hosted_write_capture = overlay_file.is_none()
                     .then(|| self.capture_hosted_file_transfer(fh, true));
+                let overlay_write_access = overlay_file.is_none()
+                    || overlay_access.is_some_and(|access| {
+                        access & (0x0000_0002 | 0x0000_0004 | 0x4000_0000 | 0x1000_0000) != 0
+                    });
+                if !overlay_write_access {
+                    return STATUS_ACCESS_DENIED;
+                }
+                if let Some(Err(status)) = hosted_write_capture.as_ref() {
+                    return *status;
+                }
+                let local_write_route = if overlay_file.is_some() {
+                    match self.local_file_io_route_for(fh) {
+                        Ok(Some(route)) => Some(route),
+                        Ok(None) => return STATUS_INVALID_HANDLE,
+                        Err(status) => return status,
+                    }
+                } else {
+                    None
+                };
+                let _local_reference = match local_write_route {
+                    Some(route) => match self.capture_local_file_io_reference(route.file_object) {
+                        Ok(reference) => Some(reference),
+                        Err(status) => return status,
+                    },
+                    None => None,
+                };
                 let trace = NT_WRITE_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8;
+                let retained_parameters = match self.retained_file_transfer_parameters(
+                    fh, hosted_write_capture.as_ref().and_then(|capture| capture.as_ref().ok())
+                        .map(|(capture, _)| capture.route),
+                ) {
+                    Ok(parameters) => parameters,
+                    Err(status) => return status,
+                };
+                // ProbeForRead checks the extent here, not resident page protection. The actual
+                // buffered copy occurs after Event reset and File acquisition, as in NT5 write.c.
+                if retained_parameters.is_none() {
+                    if let Err(status) = self.probe_file_io_output(iosb, None) {
+                        return status;
+                    }
+                    if let Err(status) = exec_file_transfer::validate_transfer_input_extent(buffer, len, 1) {
+                        return status;
+                    }
+                }
                 let mut offset_bytes = [0u8; 8];
-                let offset_ok = byte_offset == 0 || self.xas_read(byte_offset, &mut offset_bytes);
+                if let Some(parameters) = retained_parameters {
+                    offset_bytes = parameters.byte_offset.unwrap_or(0).to_le_bytes();
+                } else if byte_offset != 0 {
+                    if let Err(status) = exec_file_transfer::validate_transfer_input_extent(byte_offset, 8, 4) {
+                        return status;
+                    }
+                    if let Err(status) = self.process_memory_read_status(self.pi, byte_offset, &mut offset_bytes) {
+                        return status;
+                    }
+                }
                 let offset_value = u64::from_le_bytes(offset_bytes);
-                let offset_semantics_ok = byte_offset == 0
+                let captured_offset = retained_parameters.map_or_else(
+                    || (byte_offset != 0).then_some(i64::from_le_bytes(offset_bytes)),
+                    |parameters| parameters.byte_offset,
+                );
+                let offset_semantics_ok = captured_offset.is_none()
                     || i64::from_le_bytes(offset_bytes)
                         >= nt_io_manager::FILE_USE_FILE_POINTER_POSITION;
                 let mut key_bytes = [0u8; 4];
-                let key_ok = key == 0 || self.xas_read(key, &mut key_bytes);
+                if let Some(parameters) = retained_parameters {
+                    key_bytes = parameters.key.to_le_bytes();
+                } else if key != 0 {
+                    if let Err(status) = exec_file_transfer::validate_transfer_input_extent(key, 4, 4) {
+                        return status;
+                    }
+                    if let Err(status) = self.process_memory_read_status(self.pi, key, &mut key_bytes) {
+                        return status;
+                    }
+                }
                 let key_value = u32::from_le_bytes(key_bytes);
+                self.current_file_transfer_parameters = Some(nt_io_manager::FileTransferParameters {
+                    arguments: args[..9].try_into().expect("registered transfer requires nine arguments"),
+                    byte_offset: captured_offset, key: key_value,
+                });
                 let apc_completion_conflict = hosted_write_capture
                     .as_ref()
                     .and_then(|capture| capture.as_ref().ok())
@@ -40200,13 +39436,9 @@ impl ExecNtHandler {
                         apc_routine != 0
                             && self.file_completion.binding(capture.route.file_id).is_some()
                     });
-                // The writable overlay keeps its existing copy-loop staging bound. Hosted drivers
+                // The writable overlay keeps its existing per-operation bound. Hosted drivers
                 // stream arbitrary ULONG-sized requests through their per-instance transfer bank.
                 const OVERLAY_IO_CAP: usize = LOCAL_FILE_TRANSFER_CAP;
-                let overlay_write_access = overlay_file.is_none()
-                    || overlay_access.is_some_and(|access| {
-                        access & (0x0000_0002 | 0x0000_0004 | 0x4000_0000 | 0x1000_0000) != 0
-                    });
                 let append_only = overlay_access.is_some_and(|access| {
                     access & (0x0000_0002 | 0x0000_0004 | 0x4000_0000 | 0x1000_0000) == 0x0000_0004
                 });
@@ -40215,27 +39447,8 @@ impl ExecNtHandler {
                 } else {
                     len
                 };
-                let mut payload = if overlay_file.is_some() {
-                    alloc::vec::Vec::new()
-                } else {
-                    match try_zeroed_transfer_buffer(len) {
-                        Ok(payload) => payload,
-                        Err(status) => return status,
-                    }
-                };
-                let payload_ok = if len == 0 {
-                    true
-                } else if buffer == 0 || len > write_capacity {
-                    false
-                } else if overlay_file.is_some() {
-                    let scratch = core::slice::from_raw_parts_mut(
-                        core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
-                        OVERLAY_IO_CAP,
-                    );
-                    self.xas_read(buffer, &mut scratch[..len])
-                } else {
-                    self.xas_read(buffer, &mut payload)
-                };
+                let mut payload = alloc::vec::Vec::new();
+                let mut payload_ok = false;
 
                 let mut completion_event_index = None;
                 let mut information = 0u64;
@@ -40246,33 +39459,25 @@ impl ExecNtHandler {
                 let mut file_retained = false;
                 let mut local_file_io = None;
                 let mut operation_started = false;
-                let mut status = if !offset_ok || !key_ok {
-                    0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if !offset_semantics_ok && !append_only {
+                let mut status = if !offset_semantics_ok && !append_only {
                     STATUS_INVALID_PARAMETER
                 } else if len > write_capacity {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
-                } else if !payload_ok {
-                    0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if !overlay_write_access {
-                    STATUS_ACCESS_DENIED
                 } else if apc_completion_conflict {
                     STATUS_INVALID_PARAMETER
                 } else {
-                    match self.prepare_io_event_for_request(event) {
+                    match self.prepare_transfer_event(fh, event) {
                         Err(event_status) => event_status,
                         Ok(event_index) => {
                             completion_event_index = event_index;
                             if let Some(file_id) = overlay_file {
-                                operation_started = true;
-                                let route = self.local_file_io_route_for(fh);
+                                let route = local_write_route;
                                 let info = crate::writable_fs::file_object_information(file_id);
                                 match (route, info) {
-                                    (Ok(Some(route)), Ok(info)) => {
+                                    (Some(route), Ok(info)) => {
                                         let resolved =
                                             nt_io_manager::resolve_regular_file_write_offset(
-                                                (byte_offset != 0)
-                                                    .then_some(i64::from_le_bytes(offset_bytes)),
+                                                captured_offset,
                                                 route.synchronous,
                                                 info.current_offset,
                                                 info.metadata.end_of_file,
@@ -40283,9 +39488,27 @@ impl ExecNtHandler {
                                             Err(status) => return status.raw() as u32,
                                         };
                                         let actual_offset = resolved.value();
-                                        match self.begin_retained_local_file_io(route.file_object) {
+                                        match self.begin_referenced_local_file_io(
+                                            _local_reference.as_ref().expect("admitted local write lost its body reference"),
+                                        ) {
                                             Err(status) => status,
                                             Ok(request_id) => {
+                                                payload = {
+                                                    let _durable = allocator::enter_durable();
+                                                    match try_zeroed_transfer_buffer(len) {
+                                                        Ok(payload) => payload,
+                                                        Err(status) => {
+                                                            self.release_local_file_io_reference(route.file_object);
+                                                            return status;
+                                                        }
+                                                    }
+                                                };
+                                                if let Err(status) = self.process_memory_read_status(self.pi, buffer, &mut payload) {
+                                                    self.release_local_file_io_reference(route.file_object);
+                                                    return status;
+                                                }
+                                                payload_ok = true;
+                                                operation_started = true;
                                                 local_file_io = Some((
                                                     request_id,
                                                     route.file_object,
@@ -40306,17 +39529,12 @@ impl ExecNtHandler {
                                                 if lock_status != nt_fs::STATUS_SUCCESS {
                                                     lock_status
                                                 } else {
-                                                    let scratch = core::slice::from_raw_parts(
-                                                        core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH)
-                                                            as *const u8,
-                                                        len,
-                                                    );
                                                     let (status, written) =
                                                         crate::writable_fs::write_completed(
                                                             file_id,
                                                             resolved,
                                                             route.synchronous,
-                                                            scratch,
+                                                            &payload,
                                                         );
                                                     if written != 0 {
                                                         self.writable_fs_dirty = true;
@@ -40327,85 +39545,97 @@ impl ExecNtHandler {
                                             }
                                         }
                                     }
-                                    (Err(status), _) | (_, Err(status)) => status,
+                                    (_, Err(status)) => status,
                                     _ => nt_fs::STATUS_INVALID_HANDLE,
                                 }
                             } else {
-                                match hosted_write_capture
+                                let (capture, mode) = hosted_write_capture
                                     .as_ref()
                                     .expect("nonlocal write retains its admitted capture")
-                                {
-                                    Err(handle_status) => *handle_status,
-                                    Ok((capture, mode)) => {
-                                        let route = capture.route;
-                                        let file_id = route.file_id;
-                                        completion_file_id = file_id;
-                                        routed_fs_context = route.fs_context;
-                                        let synchronous = mode.is_synchronous();
-                                        let sync_reply_capacity = if synchronous {
-                                            REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
-                                                && wait_reply_pool_has_free()
-                                        } else {
-                                            true
-                                        };
-                                        let owner_capacity = if sync_reply_capacity {
-                                            self.reserve_pending_file_io_owner()
-                                        } else {
-                                            false
-                                        };
-                                        let prepared = if !owner_capacity || !sync_reply_capacity {
-                                            Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
-                                        } else {
-                                            match self.prepare_hosted_file_io(
-                                                route, fh, capture.granted_access,
-                                            ) {
-                                                Err(status) => Err(status),
-                                                Ok(false) => return STATUS_PENDING,
-                                                Ok(true) => {
-                                                    file_retained = true;
-                                                    match self
-                                                        .file_completion
-                                                        .set_signaled(file_id, false)
-                                                    {
-                                                        Ok(()) => Ok(()),
-                                                        Err(status) => {
-                                                            self.release_file_reference(file_id);
-                                                            file_retained = false;
-                                                            Err(status)
-                                                        }
-                                                    }
+                                    .as_ref()
+                                    .expect("write admission succeeded before user-memory access");
+                                let route = capture.route;
+                                let file_id = route.file_id;
+                                completion_file_id = file_id;
+                                routed_fs_context = route.fs_context;
+                                let synchronous = mode.is_synchronous();
+                                let sync_reply_capacity = if synchronous {
+                                    REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
+                                        && wait_reply_pool_has_free()
+                                } else {
+                                    true
+                                };
+                                let owner_capacity = if sync_reply_capacity {
+                                    self.reserve_pending_file_io_owner()
+                                } else {
+                                    false
+                                };
+                                let prepared = if !owner_capacity || !sync_reply_capacity {
+                                    Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
+                                } else {
+                                    match self.prepare_hosted_file_io(
+                                        route, fh, capture.granted_access,
+                                    ) {
+                                        Err(status) => Err(status),
+                                        Ok(false) => return STATUS_PENDING,
+                                        Ok(true) => {
+                                            file_retained = true;
+                                            match self
+                                                .file_completion
+                                                .set_signaled(file_id, false)
+                                            {
+                                                Ok(()) => Ok(()),
+                                                Err(status) => {
+                                                    self.release_file_reference(file_id);
+                                                    file_retained = false;
+                                                    Err(status)
+                                                }
+                                            }
+                                        }
+                                    }
+                                };
+                                match prepared {
+                                    Err(status) => status,
+                                    Ok(()) => {
+                                        payload = {
+                                            let _durable = allocator::enter_durable();
+                                            match try_zeroed_transfer_buffer(len) {
+                                                Ok(payload) => payload,
+                                                Err(status) => {
+                                                    self.release_file_reference(file_id);
+                                                    return status;
                                                 }
                                             }
                                         };
-                                        match prepared {
-                                            Err(status) => status,
-                                            Ok(()) => {
-                                                operation_started = true;
-                                                let mut output = [];
-                                                match self.dispatch_hosted_file_read_write_for(
-                                                    route,
-                                                    major::IRP_MJ_WRITE,
-                                                    nt_io_manager::ReadWriteParameters {
-                                                        length: len as u32,
-                                                        key: key_value,
-                                                        offset: offset_value,
-                                                    },
-                                                    &payload,
-                                                    &mut output,
-                                                ) {
-                                                    Ok((
-                                                        driver_status,
-                                                        completed,
-                                                        pending_irp_id,
-                                                    )) => {
-                                                        routed = true;
-                                                        information = completed;
-                                                        pending_write_irp_id = pending_irp_id;
-                                                        driver_status as u32
-                                                    }
-                                                    Err(route_status) => route_status,
-                                                }
+                                        if let Err(status) = self.process_memory_read_status(self.pi, buffer, &mut payload) {
+                                            self.release_file_reference(file_id);
+                                            return status;
+                                        }
+                                        payload_ok = true;
+                                        operation_started = true;
+                                        let mut output = [];
+                                        match self.dispatch_hosted_file_read_write_for(
+                                            route,
+                                            major::IRP_MJ_WRITE,
+                                            nt_io_manager::ReadWriteParameters {
+                                                length: len as u32,
+                                                key: key_value,
+                                                offset: offset_value,
+                                            },
+                                            &payload,
+                                            &mut output,
+                                        ) {
+                                            Ok((
+                                                driver_status,
+                                                completed,
+                                                pending_irp_id,
+                                            )) => {
+                                                routed = true;
+                                                information = completed;
+                                                pending_write_irp_id = pending_irp_id;
+                                                driver_status as u32
                                             }
+                                            Err(route_status) => route_status,
                                         }
                                     }
                                 }
@@ -40448,6 +39678,7 @@ impl ExecNtHandler {
                         signal_file: synchronous || event_obj_idx == u64::MAX,
                         publish_iocp: apc_routine == 0,
                         event_obj_idx,
+                        transfer_event: None,
                         reply_cap: 0,
                         reply_required: false,
                         native_call_transport: self.current_native_call_transport,
@@ -40563,17 +39794,13 @@ impl ExecNtHandler {
                     print_u64((apc_context != 0) as u64);
                     print_str(b" offset_ptr=");
                     print_u64((byte_offset != 0) as u64);
-                    print_str(b" offset_ok=");
-                    print_u64(offset_ok as u64);
-                    if byte_offset != 0 && offset_ok {
+                    if captured_offset.is_some() {
                         print_str(b" offset=0x");
                         print_hex(offset_value as u32);
                     }
                     print_str(b" key_ptr=");
                     print_u64((key != 0) as u64);
-                    print_str(b" key_ok=");
-                    print_u64(key_ok as u64);
-                    if key != 0 && key_ok {
+                    if key != 0 {
                         print_str(b" key=0x");
                         print_hex(key_value);
                     }
@@ -40581,14 +39808,7 @@ impl ExecNtHandler {
                     print_u64(payload_ok as u64);
                     print_str(b" prefix=");
                     if payload_ok {
-                        let prefix = if overlay_file.is_some() {
-                            core::slice::from_raw_parts(
-                                core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
-                                len.min(16),
-                            )
-                        } else {
-                            &payload[..payload.len().min(16)]
-                        };
+                        let prefix = &payload[..payload.len().min(16)];
                         for &byte in prefix {
                             print_hex(byte as u32);
                             debug_put_char(b' ');
@@ -40618,9 +39838,6 @@ impl ExecNtHandler {
                 let apc_context = args[3];
                 let completion_port_suppressed =
                     nt_io_completion::io_event_suppresses_completion_port(event);
-                if let Err(status) = self.probe_file_io_output(iosb, None) {
-                    return status;
-                }
                 // Hosted retry ownership precedes all fresh local-handle classification.
                 let fresh_handle = self.active_synchronous_file_retry.is_none()
                     && nt_process::Handle::try_from(fh).is_ok();
@@ -40640,17 +39857,82 @@ impl ExecNtHandler {
                     });
                 let hosted_read_capture = (matches!(disk_file, Ok(None)) && overlay_file.is_none())
                     .then(|| self.capture_hosted_file_transfer(fh, false));
+                if let Err(status) = disk_file {
+                    return status;
+                }
+                if !overlay_read_access {
+                    return STATUS_ACCESS_DENIED;
+                }
+                if let Some(Err(status)) = hosted_read_capture.as_ref() {
+                    return *status;
+                }
+                let local_read_route = if matches!(disk_file, Ok(Some(_))) || overlay_file.is_some() {
+                    match self.local_file_io_route_for(fh) {
+                        Ok(Some(route)) => Some(route),
+                        Ok(None) => return STATUS_INVALID_HANDLE,
+                        Err(status) => return status,
+                    }
+                } else {
+                    None
+                };
+                let _local_reference = match local_read_route {
+                    Some(route) => match self.capture_local_file_io_reference(route.file_object) {
+                        Ok(reference) => Some(reference),
+                        Err(status) => return status,
+                    },
+                    None => None,
+                };
+                let retained_parameters = match self.retained_file_transfer_parameters(
+                    fh, hosted_read_capture.as_ref().and_then(|capture| capture.as_ref().ok())
+                        .map(|(capture, _)| capture.route),
+                ) {
+                    Ok(parameters) => parameters,
+                    Err(status) => return status,
+                };
+                if retained_parameters.is_none() {
+                    if let Err(status) = self.probe_file_io_output(iosb, None) {
+                        return status;
+                    }
+                    if let Err(status) = self.probe_copy_output(self.pi, buffer, len as u64) {
+                        return status;
+                    }
+                }
                 let mut captured_offset_bytes = [0u8; 8];
-                let offset_ok =
-                    byte_offset == 0 || self.xas_read(byte_offset, &mut captured_offset_bytes);
+                if let Some(parameters) = retained_parameters {
+                    captured_offset_bytes = parameters.byte_offset.unwrap_or(0).to_le_bytes();
+                } else if byte_offset != 0 {
+                    if let Err(status) = exec_file_transfer::validate_transfer_input_extent(byte_offset, 8, 4) {
+                        return status;
+                    }
+                    if let Err(status) = self.process_memory_read_status(self.pi, byte_offset, &mut captured_offset_bytes) {
+                        return status;
+                    }
+                }
                 let offset_value = u64::from_le_bytes(captured_offset_bytes);
                 let signed_offset = i64::from_le_bytes(captured_offset_bytes);
-                let offset_semantics_ok = byte_offset == 0
+                let captured_offset = retained_parameters.map_or_else(
+                    || (byte_offset != 0).then_some(signed_offset),
+                    |parameters| parameters.byte_offset,
+                );
+                let offset_semantics_ok = captured_offset.is_none()
                     || signed_offset >= 0
                     || signed_offset == nt_io_manager::FILE_USE_FILE_POINTER_POSITION;
                 let mut key_bytes = [0u8; 4];
-                let key_ok = key == 0 || self.xas_read(key, &mut key_bytes);
+                if let Some(parameters) = retained_parameters {
+                    key_bytes = parameters.key.to_le_bytes();
+                } else if key != 0 {
+                    if let Err(status) = exec_file_transfer::validate_transfer_input_extent(key, 4, 4) {
+                        return status;
+                    }
+                    if let Err(status) = self.process_memory_read_status(self.pi, key, &mut key_bytes) {
+                        return status;
+                    }
+                }
                 let key_value = u32::from_le_bytes(key_bytes);
+                self.current_file_transfer_parameters = Some(nt_io_manager::FileTransferParameters {
+                    arguments: args[..9].try_into().expect("registered transfer requires nine arguments"),
+                    byte_offset: captured_offset, key: key_value,
+                });
                 let apc_completion_conflict = hosted_read_capture
                     .as_ref()
                     .and_then(|capture| capture.as_ref().ok())
@@ -40682,26 +39964,14 @@ impl ExecNtHandler {
                 let mut completion_event_index = None;
                 let mut completion_event_trace = Ok(None);
                 let mut operation_started = false;
-                let mut status = if !offset_ok || !key_ok {
-                    0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if !offset_semantics_ok {
+                let mut status = if !offset_semantics_ok {
                     STATUS_INVALID_PARAMETER
                 } else if overlay_file.is_some() && len > OVERLAY_IO_CAP {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
-                } else if len != 0 && buffer == 0 {
-                    0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if let Err(handle_status) = disk_file {
-                    handle_status
-                } else if !overlay_read_access {
-                    STATUS_ACCESS_DENIED
-                } else if let Some(Err(status)) = hosted_read_capture.as_ref() {
-                    *status
                 } else if apc_completion_conflict {
                     STATUS_INVALID_PARAMETER
-                } else if let Err(status) = self.probe_copy_output(self.pi, buffer, len as u64) {
-                    status
                 } else {
-                    match self.prepare_io_event_for_request(event) {
+                    match self.prepare_transfer_event(fh, event) {
                         Err(event_status) => {
                             completion_event_trace = Err(event_status);
                             event_status
@@ -40725,7 +39995,7 @@ impl ExecNtHandler {
                                         Err(status) => return status,
                                     };
                                 let resolved = nt_io_manager::resolve_regular_file_read_offset(
-                                    (byte_offset != 0).then_some(signed_offset),
+                                    captured_offset,
                                     synchronous,
                                     current,
                                 );
@@ -40733,8 +40003,8 @@ impl ExecNtHandler {
                                     Err(status) => status.raw() as u32,
                                     Ok(resolved) => {
                                         let offset = resolved.value();
-                                        match self.local_file_io_route_for(fh) {
-                                            Ok(Some(route)) => {
+                                        match local_read_route {
+                                            Some(route) => {
                                                 let plan = match nt_io_manager::BoundedFileReadPlan::new(
                                                     resolved, u64::from(file_size), len,
                                                 ) {
@@ -40742,7 +40012,10 @@ impl ExecNtHandler {
                                                     Err(status) => return status.raw() as u32,
                                                 };
                                                 let output_len = plan.transfer_len();
-                                                match self.begin_retained_local_buffered_io(route.file_object, output_len) {
+                                                match self.begin_referenced_local_buffered_io(
+                                                    _local_reference.as_ref().expect("admitted local read lost its body reference"),
+                                                    output_len,
+                                                ) {
                                                     Err(status) => status,
                                                     Ok(request_id) => {
                                                         local_file_io = Some((
@@ -40777,20 +40050,19 @@ impl ExecNtHandler {
                                                     }
                                                 }
                                             }
-                                            Ok(None) => nt_fs::STATUS_INVALID_HANDLE,
-                                            Err(status) => status,
+                                            None => nt_fs::STATUS_INVALID_HANDLE,
                                         }
                                     }
                                 }
                             } else if let Some(file_id) = overlay_file {
                                 operation_started = true;
-                                let route = self.local_file_io_route_for(fh);
+                                let route = local_read_route;
                                 let info = crate::writable_fs::file_object_information(file_id);
                                 match (route, info) {
-                                    (Ok(Some(route)), Ok(info)) => {
+                                    (Some(route), Ok(info)) => {
                                         let resolved =
                                             nt_io_manager::resolve_regular_file_read_offset(
-                                                (byte_offset != 0).then_some(signed_offset),
+                                                captured_offset,
                                                 route.synchronous,
                                                 info.current_offset,
                                             );
@@ -40798,7 +40070,10 @@ impl ExecNtHandler {
                                             Err(status) => status.raw() as u32,
                                             Ok(resolved) => {
                                                 let actual_offset = resolved.value();
-                                                match self.begin_retained_local_buffered_io(route.file_object, len) {
+                                                match self.begin_referenced_local_buffered_io(
+                                                    _local_reference.as_ref().expect("admitted local read lost its body reference"),
+                                                    len,
+                                                ) {
                                                     Err(status) => status,
                                                     Ok(request_id) => {
                                                         local_file_io = Some((
@@ -40842,120 +40117,114 @@ impl ExecNtHandler {
                                             }
                                         }
                                     }
-                                    (Err(status), _) | (_, Err(status)) => status,
+                                    (_, Err(status)) => status,
                                     _ => nt_fs::STATUS_INVALID_HANDLE,
                                 }
                             } else {
-                                match hosted_read_capture
+                                let (capture, mode) = hosted_read_capture
                                     .as_ref()
                                     .expect("nonlocal read retains its admitted capture")
-                                {
-                                    Err(handle_status) => {
-                                        npfs_route_status = *handle_status;
-                                        *handle_status
+                                    .as_ref()
+                                    .expect("read admission succeeded before user-memory access");
+                                let route = capture.route;
+                                npfs_route_status = nt_fs::STATUS_SUCCESS;
+                                let file_id = route.file_id;
+                                npfs_route_fid = route.fs_context;
+                                completion_file_id = file_id;
+                                let synchronous = mode.is_synchronous();
+                                let sync_reply_capacity = if synchronous {
+                                    REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
+                                        && wait_reply_pool_has_free()
+                                } else {
+                                    true
+                                };
+                                let owner_capacity = if sync_reply_capacity {
+                                    self.reserve_pending_file_io_owner()
+                                } else {
+                                    false
+                                };
+                                let prepared = if !owner_capacity || !sync_reply_capacity {
+                                    Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
+                                } else {
+                                    match self.prepare_hosted_file_io(
+                                        route, fh, capture.granted_access,
+                                    ) {
+                                        Err(status) => Err(status),
+                                        Ok(false) => return STATUS_PENDING,
+                                        Ok(true) => {
+                                            file_retained = true;
+                                            match self
+                                                .file_completion
+                                                .set_signaled(file_id, false)
+                                            {
+                                                Ok(()) => Ok(()),
+                                                Err(status) => {
+                                                    self.release_file_reference(file_id);
+                                                    file_retained = false;
+                                                    Err(status)
+                                                }
+                                            }
+                                        }
                                     }
-                                    Ok((capture, mode)) => {
-                                        let route = capture.route;
-                                        npfs_route_status = nt_fs::STATUS_SUCCESS;
-                                        let file_id = route.file_id;
-                                        npfs_route_fid = route.fs_context;
-                                        completion_file_id = file_id;
-                                        let synchronous = mode.is_synchronous();
-                                        let sync_reply_capacity = if synchronous {
-                                            REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
-                                                && wait_reply_pool_has_free()
-                                        } else {
-                                            true
-                                        };
-                                        let owner_capacity = if sync_reply_capacity {
-                                            self.reserve_pending_file_io_owner()
-                                        } else {
-                                            false
-                                        };
-                                        let prepared = if !owner_capacity || !sync_reply_capacity {
-                                            Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
-                                        } else {
-                                            match self.prepare_hosted_file_io(
-                                                route, fh, capture.granted_access,
-                                            ) {
-                                                Err(status) => Err(status),
-                                                Ok(false) => return STATUS_PENDING,
-                                                Ok(true) => {
-                                                    file_retained = true;
-                                                    match self
-                                                        .file_completion
-                                                        .set_signaled(file_id, false)
-                                                    {
-                                                        Ok(()) => Ok(()),
-                                                        Err(status) => {
-                                                            self.release_file_reference(file_id);
-                                                            file_retained = false;
-                                                            Err(status)
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        };
-                                        match prepared {
-                                            Err(status) => status,
-                                            Ok(()) => {
-                                                operation_started = true;
-                                                match self.dispatch_hosted_file_read_write_for(
-                                                    route,
-                                                    major::IRP_MJ_READ,
-                                                    nt_io_manager::ReadWriteParameters {
-                                                        length: len as u32,
-                                                        key: key_value,
-                                                        offset: offset_value,
-                                                    },
-                                                    &[],
-                                                    &mut output,
-                                                ) {
-                                                    Ok((
+                                };
+                                match prepared {
+                                    Err(status) => status,
+                                    Ok(()) => {
+                                        operation_started = true;
+                                        match self.dispatch_hosted_file_read_write_for(
+                                            route,
+                                            major::IRP_MJ_READ,
+                                            nt_io_manager::ReadWriteParameters {
+                                                length: len as u32,
+                                                key: key_value,
+                                                offset: offset_value,
+                                            },
+                                            &[],
+                                            &mut output,
+                                        ) {
+                                            Ok((
+                                                driver_status,
+                                                completed,
+                                                pending_irp_id,
+                                            )) => {
+                                                routed = true;
+                                                information = completed;
+                                                pending_read_irp_id = pending_irp_id;
+                                                let mut driver_status =
+                                                    driver_status as u32;
+                                                let copy_len =
+                                                    (completed as usize).min(output.len());
+                                                if driver_status != STATUS_PENDING
+                                                    && nt_io_completion::file_io_status_copies_output(
                                                         driver_status,
-                                                        completed,
-                                                        pending_irp_id,
-                                                    )) => {
-                                                        routed = true;
-                                                        information = completed;
-                                                        pending_read_irp_id = pending_irp_id;
-                                                        let mut driver_status =
-                                                            driver_status as u32;
-                                                        let copy_len =
-                                                            (completed as usize).min(output.len());
-                                                        if driver_status != STATUS_PENDING
-                                                            && nt_io_completion::file_io_status_copies_output(
-                                                                driver_status,
-                                                            )
-                                                        {
-                                                            if completed > output.len() as u64 {
-                                                                driver_status =
-                                                                    STATUS_INVALID_BUFFER_SIZE;
-                                                                information = 0;
-                                                            } else if copy_len != 0
-                                                                && self.xas_try_write_buf(
-                                                                buffer,
-                                                                &output[..copy_len],
-                                                            ) {
-                                                                self.observe_completed_npfs_read(
-                                                                    file_id,
-                                                                    self.current_badge,
-                                                                    driver_status,
-                                                                    completed,
-                                                                    &output[..copy_len],
-                                                                    true,
-                                                                );
-                                                            } else if copy_len != 0 {
-                                                                driver_status =
-                                                                    STATUS_ACCESS_VIOLATION;
-                                                                information = 0;
-                                                            }
-                                                        }
-                                                        driver_status
+                                                    )
+                                                {
+                                                    if completed > output.len() as u64 {
+                                                        driver_status =
+                                                            STATUS_INVALID_BUFFER_SIZE;
+                                                        information = 0;
+                                                    } else if copy_len != 0
+                                                        && self.xas_try_write_buf(
+                                                        buffer,
+                                                        &output[..copy_len],
+                                                    ) {
+                                                        self.observe_completed_npfs_read(
+                                                            file_id,
+                                                            self.current_badge,
+                                                            driver_status,
+                                                            completed,
+                                                            &output[..copy_len],
+                                                            true,
+                                                        );
+                                                    } else if copy_len != 0 {
+                                                        driver_status =
+                                                            STATUS_ACCESS_VIOLATION;
+                                                        information = 0;
                                                     }
-                                                    Err(route_status) => route_status,
                                                 }
+                                                driver_status
                                             }
+                                            Err(route_status) => route_status,
                                         }
                                     }
                                 }
@@ -40998,6 +40267,7 @@ impl ExecNtHandler {
                         signal_file: synchronous || event_obj_idx == u64::MAX,
                         publish_iocp: apc_routine == 0,
                         event_obj_idx,
+                        transfer_event: None,
                         reply_cap: 0,
                         reply_required: false,
                         native_call_transport: self.current_native_call_transport,
@@ -41123,7 +40393,11 @@ impl ExecNtHandler {
                 if iosb == 0 || !self.probe_user_output(iosb, 16) {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                if !self.probe_user_input(args[2], length) {
+                if information_class == nt_fs::FILE_MODE_INFORMATION {
+                    if let Err(status) = self.probe_file_mode_input_extent(args[2], length) {
+                        return status;
+                    }
+                } else if !self.probe_user_input(args[2], length) {
                     return STATUS_ACCESS_VIOLATION;
                 }
                 let capture = match self.capture_hosted_file_unless_local_with_access(
@@ -41132,6 +40406,11 @@ impl ExecNtHandler {
                     Ok(capture) => capture,
                     Err(status) => return status,
                 };
+                if let Some(status) = self.try_set_file_mode_information(
+                    args[0], iosb, args[2], length, information_class, capture.as_ref(),
+                ) {
+                    return status;
+                }
                 if let Some(capture) = capture.as_ref() {
                     return self.set_hosted_file_information(
                         args[0], iosb, args[2], length, information_class, capture,
@@ -41294,6 +40573,7 @@ impl ExecNtHandler {
                             signal_file: synchronous_file,
                             publish_iocp: false,
                             event_obj_idx: u64::MAX,
+                            transfer_event: None,
                             reply_cap: 0,
                             reply_required: false,
                             native_call_transport: self.current_native_call_transport,
@@ -41587,21 +40867,37 @@ impl ExecNtHandler {
                 const STATUS_INVALID_FILE_FOR_SECTION: u32 = 0xC000_0020;
                 let previous_mode = ctx.previous_mode;
                 let ctx = self.loop_ctx.unwrap();
-                let reg = &mut *ctx.reg;
                 let out = args[0];
                 let desired_access = nt_ulong_arg(args[1]);
+                let page_protection = nt_ulong_arg(args[4]);
+                let allocation_attrs = nt_ulong_arg(args[5]);
+                if let Err(status) = nt_memory_manager::validate_section_creation_parameters(
+                    allocation_attrs, page_protection,
+                ) {
+                    return status;
+                }
+                if previous_mode != nt_syscall::ProcessorMode::KernelMode {
+                    if let Err(status) = self.probe_copy_scalar::<8>(out) {
+                        return status;
+                    }
+                }
                 let maxsize_ptr = args[3];
                 let mut maxsize = 0u64;
                 if maxsize_ptr != 0 {
+                    if previous_mode != nt_syscall::ProcessorMode::KernelMode && maxsize_ptr & 7 != 0 {
+                        return STATUS_DATATYPE_MISALIGNMENT;
+                    }
                     let mut bytes = [0u8; 8];
-                    if !self.xas_read(maxsize_ptr, &mut bytes) {
-                        return STATUS_ACCESS_VIOLATION;
+                    if let Err(status) = self.process_memory_read_status(self.pi, maxsize_ptr, &mut bytes) {
+                        return status;
                     }
                     maxsize = u64::from_le_bytes(bytes);
                 }
-                let page_protection = nt_ulong_arg(args[4]);
-                let allocation_attrs = nt_ulong_arg(args[5]);
+                if let Err(status) = nt_memory_manager::data_section::data_section_file_access(page_protection) {
+                    return status;
+                }
                 let sec_file = args[6];
+                let reg = &mut *ctx.reg;
                 let registry_slot = reg.index_for_file(self.pi, sec_file);
 
                 if allocation_attrs & SEC_IMAGE != 0 {
@@ -41610,7 +40906,9 @@ impl ExecNtHandler {
                         Err(status) => return status,
                     };
                     if let Ok(source) = self.pm.lookup_native_section_file_source(caller, sec_file) {
-                        if matches!(source.object(), nt_process::HandleObject::RoutedFile { .. }) {
+                        if matches!(source.object(), nt_process::HandleObject::RoutedFile { .. }
+                            | nt_process::HandleObject::DiskFile { .. }
+                            | nt_process::HandleObject::OverlayFile(_)) {
                             let mut image_object_attributes = 0;
                             let named = if args[2] == 0 {
                                 None
@@ -41640,14 +40938,25 @@ impl ExecNtHandler {
                                     None
                                 }
                             };
-                            return match crate::section_metadata_work::submit_hosted(
-                                self, caller, source, out, desired_access,
-                                image_object_attributes,
-                                maxsize, page_protection, allocation_attrs, sec_file, named,
-                            ) {
-                                Ok(()) => 0x0000_0103,
-                                Err(status) => status,
-                            };
+                            match source.object() {
+                                nt_process::HandleObject::DiskFile { .. }
+                                | nt_process::HandleObject::OverlayFile(_) => {
+                                    return crate::file_image_section::submit_local_image_section(
+                                        self, caller, source, out, desired_access,
+                                        image_object_attributes, maxsize, page_protection,
+                                        allocation_attrs, sec_file, named,
+                                    );
+                                }
+                                nt_process::HandleObject::RoutedFile { .. } => return match crate::section_metadata_work::submit_hosted(
+                                    self, caller, source, out, desired_access,
+                                    image_object_attributes,
+                                    maxsize, page_protection, allocation_attrs, sec_file, named,
+                                ) {
+                                    Ok(()) => 0x0000_0103,
+                                    Err(status) => status,
+                                },
+                                _ => unreachable!("validated image File source"),
+                            }
                         }
                     }
                     let exe_known = (&*ctx.exe_images)
@@ -42146,7 +41455,8 @@ impl ExecNtHandler {
             NativeService::NtCreateProcess | NativeService::NtCreateProcessEx => unsafe {
                 let service =
                     core::ptr::read_volatile(core::ptr::addr_of!(NT_CREATE_PROCESS_SERVICE_ENTRY));
-                service(self as *mut ExecNtHandler, args.as_ptr(), args.len())
+                service(self as *mut ExecNtHandler, args.as_ptr(), args.len(),
+                    u8::from(ctx.previous_mode == nt_syscall::ProcessorMode::UserMode))
             },
             // NtTerminateProcess(ProcessHandle[R10]=args[0], ExitStatus[RDX]=args[1]). Route NT's two
             // user-mode shutdown phases through pm: NULL means terminate every other thread and return
@@ -42201,9 +41511,13 @@ impl ExecNtHandler {
                         Ok(files) => files,
                         Err(status) => return status,
                     };
+                    let was_terminated = self.pm.is_process_signaled(pid);
                     if let Err(status) = self.pm.terminate_process_at(pid, status, exit_time) {
                         self.cancel_rundown_hosted_files(&reserved_files);
                         return status;
+                    }
+                    if !was_terminated {
+                        crate::process_terminal_receipt::note_native_process_terminal(self, pid, process_index);
                     }
                     self.release_process_handles(pid, reserved_files);
                     if let Some(process_index) = process_index {
@@ -42283,13 +41597,7 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 let exit_time = nt_system_time_100ns() as i64;
-                let outcome = if self.current_process_is_csrss()
-                    && self.pm.main_thread(caller_pid) == Some(target)
-                {
-                    self.pm.exit_thread_at(target, status, exit_time)
-                } else {
-                    self.pm.terminate_thread_at(target, status, exit_time)
-                };
+                let outcome = self.pm.terminate_thread_at(target, status, exit_time);
                 if let Err(status) = outcome {
                     self.cancel_rundown_hosted_files(&reserved_files);
                     return status;

@@ -86,6 +86,7 @@ pub mod file_read_query_wire;
 pub mod retained_file_query_progress;
 pub mod retained_file_close_progress;
 pub mod retained_source_progress;
+pub mod hosted_forward_progress;
 pub mod win32k_async_read_wire;
 pub mod win32k_section_create_wire;
 pub mod win32k_mm_section_wire;
@@ -211,14 +212,16 @@ pub use pending_io::{
     FileIoBusyOwner, PendingFileBusy, PendingFileBusyError, PendingFileBusyPhase,
     PendingFileBusyReleaseAttempt, PendingFileBusyWakeAttempt,
     PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoParkError,
+    CreateOutputSettlement, PendingCreateOutput, PendingCreateOutputAction, PendingCreateOutputObservation,
     LocalFlushMode, PendingFileIoIdentity, PendingFileIoReservation, PendingFileIoTable, PendingLocalBuffered,
-    PendingLocalByteLock, PendingLocalDirectoryNotify, PendingLocalFlush, PendingLocalInline,
+    PendingLocalByteLock, PendingLocalDirectoryNotify, PendingLocalFlush, PendingOwnedInline,
+    PendingOwnedModePrecommit,
     PendingSetFileNameOperation,
     IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_BACKEND_ACKED, IO_DELIVERY_BUFFER_PUBLISHED,
     IO_DELIVERY_CREATE_COMMITTED,
     IO_DELIVERY_EVENT_PUBLISHED, IO_DELIVERY_FILE_LOCK_RELEASED, IO_DELIVERY_FILE_PUBLISHED,
     IO_DELIVERY_HANDLE_PUBLISHED, IO_DELIVERY_IOCP_PUBLISHED, IO_DELIVERY_IOSB_FAULTED,
-    IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_LOCAL_REFERENCE_RELEASED, IO_DELIVERY_OUTPUT_FAULTED,
+    IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_OWNED_REFERENCE_RELEASED, IO_DELIVERY_OUTPUT_FAULTED,
     IO_DELIVERY_REPLY_CLAIMED, IO_DELIVERY_REPLY_PUBLISHED, IO_DELIVERY_USER_APC_STAGED,
 };
 pub use pending_set_file_name::{
@@ -260,6 +263,7 @@ pub use synchronous_io::{
     SynchronousFileRetryStats,
     SynchronousFileRetryView, SynchronousFileWaitIdentity, SynchronousFileWaitReservation,
     SynchronousFileWaitState, SynchronousFileWaitTable, SynchronousFileWaiter,
+    FileTransferParameters, FileTransferEvent,
 };
 pub use volume_information::{
     query_volume_information_contract, set_volume_information_contract,

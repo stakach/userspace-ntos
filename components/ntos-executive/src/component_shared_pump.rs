@@ -121,6 +121,17 @@ pub(super) unsafe fn autonomous(ch: &PumpChannel) -> bool {
         Ok(source) if matches!(source.kind, runtime::PhysicalSourceKind::SystemThread { .. }))
 }
 
+/// Persistent dispatch workers retain their invocation across a service wait; unlike autonomous
+/// threads, the service ACK cannot finish their enclosing dispatch.
+pub(super) unsafe fn service_wait_yields(ch: &PumpChannel) -> bool {
+    if autonomous(ch) { return true; }
+    if ch.caps.kind != ReqKind::Irp { return false; }
+    matches!(runtime::channel_route(ch).and_then(|route| route.ok_or(runtime::Error::UnknownPeer))
+        .and_then(|route| runtime::physical_source(route)),
+        Ok(source) if matches!(source.domain, runtime::PhysicalDomain::Hosted(_))
+            && matches!(source.kind, runtime::PhysicalSourceKind::DispatchWorker { .. }))
+}
+
 pub(super) unsafe fn service_autonomous(route: PeerRoute) -> Result<(), runtime::Error> {
     let parent = runtime::nested::park_current()?;
     let serviced = (|| {
